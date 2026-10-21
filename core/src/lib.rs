@@ -1,13 +1,12 @@
 //! A columnar RDF serialization format and queryable quad store, built on
 //! [Vortex](https://docs.vortex.dev).
 //!
-//! Converts RDF quads (parsed from any format [`oxrdfio`] supports) into a
-//! Vortex [`StructArray`](vortex_array::arrays::struct_::StructArray),
-//! storable as a native-container `.vortex` file (or the same bytes in
-//! memory), and queryable in place through [`VortexRdfStore`] without
-//! decompressing or copying the underlying data. See the [repository README](https://github.com/vortex-rdf/vortex-rdf)
-//! for the full architecture: column layouts, secondary indexes, and
-//! ingestion builders.
+//! Converts RDF quads (in any format [`oxrdfio`] parses) into a Vortex
+//! [`StructArray`](vortex_array::arrays::struct_::StructArray), written as a
+//! native-container `.vortex` file or the same bytes in memory, and queried in
+//! place through [`VortexRdfStore`]. The
+//! [repository README](https://github.com/vortex-rdf/vortex-rdf) describes the
+//! column layouts, secondary indexes and builders.
 //!
 //! # Example
 //!
@@ -23,10 +22,9 @@
 //!         Term::Literal(Literal::new_simple_literal("hello")),
 //!         GraphName::DefaultGraph,
 //!     );
-//!     // Builders consume `RawQuad` — terms already in the canonical
-//!     // N-Triples form the columns store. `RawQuad::from_quad` and
-//!     // `parse_quads_from_reader` yield these; `RawQuad::canonical` makes
-//!     // one from strings.
+//!     // Builders consume `RawQuad`s: terms in the N-Triples form the columns
+//!     // store. `RawQuad::from_quad` and `parse_quads_from_reader` yield them;
+//!     // `RawQuad::canonical` makes one from strings.
 //!     let quads = stream::iter(vec![Ok::<_, VortexRdfError>(RawQuad::from_quad(&quad))]);
 //!
 //!     // Sort the stream globally by (s, p, o, g) and adopt the result as a
@@ -45,25 +43,47 @@
 //! });
 //! ```
 
+#[cfg(all(not(feature = "file-io"), not(target_arch = "wasm32")))]
+compile_error!(
+    "vortex-rdf-core supports two build configurations: native with `file-io` (on by default), \
+     and wasm32-unknown-unknown without default features. Enable `file-io` for a native build."
+);
+
+pub mod columns;
 pub mod common;
-pub mod debug;
-pub mod error;
+pub(crate) mod debug;
+mod error;
 pub mod io;
 mod session;
-/// The quad store: builders, layouts, indexes, matching and mutation.
-pub mod store;
+// The quad store. Its public items, like `error`'s, are re-exported below and
+// reached at the crate root only.
+mod store;
 
 pub use error::{Result, VortexRdfError};
-pub use store::columns;
 
 pub use store::{
-    BuiltArray, BuiltStream, CaseMap, ChunkStream, DictReader, DictSnapshot, DictionaryQuadSink,
-    IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad, RowId,
-    SharedQuad, SortedInMemoryBuilder, StoreParts, TermCode, TermPredicate, TextOptions, Verdict,
-    VortexArrayBuilder, VortexRdfStore, export_rdf,
+    BuiltArray, CaseMap, CodeChunkStream, CodePattern, DictReader, DictSnapshot,
+    DictionaryQuadSink, IndexComponentInfo, IndexType, Indexes, Keep, KindRanges, LayoutStrategy,
+    LocatedCodes, NumOp, Number, Probe, QuadColumn, RawQuad, RowChunkStream, RowCountHint, RowId,
+    SelectionKind, SharedQuad, SortOrder, SortedInMemoryBuilder, TermCode, TermPredicate,
+    TextOptions, TextPredicate, Verdict, ViewStatistics, VortexArrayBuilder, VortexRdfStore,
+    export_rdf,
 };
-// Compiled out on wasm along with the rest of the sorted-stream builder's
-// out-of-core merge (see the module gate in `store::builders`).
+
+/// The vortex scan interface behind [`VortexRdfStore::data_source`] and
+/// [`component_data_source`](VortexRdfStore::component_data_source): build
+/// `ScanRequest`s from this copy, the version the store was compiled against.
+pub use vortex_scan;
+
+/// The vortex session holding this crate's store layout, encodings and write
+/// editions: hand it to vortex's own integrations (its DataFusion table
+/// provider) beside a [`data_source`](VortexRdfStore::data_source), and to
+/// vortex's own reader to open this crate's files.
+pub fn vortex_session() -> &'static vortex_session::VortexSession {
+    &session::VORTEX_SESSION
+}
+
+// The out-of-core builder needs a filesystem to spill to.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use store::SortedStreamBuilder;
 
@@ -73,8 +93,8 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// Compiles the README's Rust snippets as doctests. The file-conversion
-/// snippet uses the `file-io` entry points, so the hook follows that gate.
+/// The README's Rust snippets as doctests; the file-conversion snippet needs
+/// `file-io`.
 #[cfg(all(doctest, feature = "file-io"))]
 #[doc = include_str!("../../README.md")]
 struct ReadmeDoctests;

@@ -1,6 +1,6 @@
 {
     "name": "@vortex-rdf/vortex-rdf-store",
-    "version": "0.12.1",
+    "version": "0.13.0",
     "description": "High-performance, zero-copy columnar RDF serialization format",
     "type": "module",
     "repository": {
@@ -32,6 +32,7 @@
     "files": [
         "entry/node.js",
         "entry/browser.js",
+        "entry/pin.js",
         "entry/types.d.ts",
         "pkg/web/vortex_rdf.js",
         "pkg/web/vortex_rdf.d.ts",
@@ -42,7 +43,7 @@
     "scripts": {
         "build:wasm": "wasm-pack build --target web --out-dir pkg/web --no-pack",
         "build:wasm:fast": "wasm-pack build --target web --out-dir pkg/web --no-pack --no-opt",
-        "build:hdt-wasm": "RUSTFLAGS='-C target-feature=+simd128' wasm-pack build bench/hdt-wasm --target web --out-dir ../hdt-pkg --no-pack && npm run build:hdt-clean-generated",
+        "build:hdt-wasm": "wasm-pack build bench/hdt-wasm --target web --out-dir ../hdt-pkg --no-pack && npm run build:hdt-clean-generated",
         "build:hdt-clean-generated": "node -e \"require('fs').rmSync('bench/hdt-pkg/.gitignore',{force:true})\"",
         "build:reset": "node -e \"require('fs').rmSync('pkg/web',{recursive:true,force:true})\"",
         "build:clean-generated": "node -e \"const fs=require('fs');for (const f of ['pkg/web/package.json','pkg/web/.gitignore']) fs.rmSync(f,{force:true})\"",

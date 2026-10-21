@@ -3,21 +3,25 @@
 
 use std::cell::RefCell;
 use std::io::Cursor;
+use std::rc::Rc;
 
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
-use vortex_rdf_core::common::terms::parse_quads_from_reader;
+use vortex_rdf_core::common::{formats::format_from_name, terms::parse_quads_from_reader};
 use vortex_rdf_core::{
     DictSnapshot, LayoutStrategy, Result as CoreResult, VortexRdfStore as CoreStore, export_rdf,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
-use crate::codes::{code_from_js, code_to_js, codes_to_js};
+use crate::chunks::{CodeChunks, ProbeAnswers, finished_iterable, handle_iterable, probe_codes};
+use crate::codes::{code_array, code_from_js, code_to_js};
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
-use crate::options::{build_array, parse_build_options, parse_format};
-use crate::terms::{JsPattern, js_to_quad};
+use crate::options::parse_build_options;
+use crate::probes::{batch_signal, chunk_probe, parse_probes, read_probe};
+use crate::resolve_now;
+use crate::terms::{JsPattern, quad_arg};
 
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
 extern "C" {
@@ -46,6 +50,10 @@ pub struct VortexRdfStore {
     // Dictionary-layout read and shared by every LazyTerm this store produces
     // (their `.equals` fast path keys on its identity). Not exposed to JS.
     dict_view: RefCell<Option<JsValue>>,
+    // Dropped with this handle when it is freed: the iterators the store
+    // hands out (`CodeChunks`, `ProbeAnswers`) hold a `Weak` of it and refuse
+    // to pull once it is gone.
+    alive: Rc<()>,
 }
 
 impl VortexRdfStore {
@@ -53,17 +61,24 @@ impl VortexRdfStore {
         Self {
             inner,
             dict_view: RefCell::new(None),
+            alive: Rc::new(()),
         }
     }
 
+    /// The store's dictionary as a snapshot, or `None` when the code path
+    /// does not apply. Core's [`dict_reader`](CoreStore::dict_reader) is the
+    /// one "codes are decodable" gate (Dictionary layout, no append tail — see
+    /// its doc for why anything less decodes to wrong terms), and a snapshot
+    /// needs the dictionary resident, as every dictionary in this build is.
+    fn dict_snapshot(&self) -> Option<DictSnapshot> {
+        self.inner.dict_reader()?.snapshot()
+    }
+
     /// The dictionary for decoding a match's code columns, or `None` when
-    /// the code path does not apply. Core's
-    /// [`code_read_snapshot`](CoreStore::code_read_snapshot) is the one
-    /// "codes are decodable" gate (Dictionary layout, no append tail, resident
-    /// dictionary — see its doc for why anything less decodes to wrong terms);
+    /// the code path does not apply (see [`dict_snapshot`](Self::dict_snapshot));
     /// reads it declines fall back to the always-correct term path.
     fn code_path_dict(&self) -> Option<JsValue> {
-        let snapshot = self.inner.code_read_snapshot()?;
+        let snapshot = self.dict_snapshot()?;
         Some(self.dict_view(snapshot))
     }
 
@@ -90,7 +105,7 @@ impl VortexRdfStore {
 
 /// An immutable handle on a store's term dictionary, decoding a term code to
 /// its N-Triples string. Codes are `u64` and cross as JS numbers, checked
-/// both ways (see [`crate::codes`]): exact up to 2^53 − 1, never rounded or
+/// both ways (see `crate::codes`): exact up to 2^53 − 1, never rounded or
 /// wrapped.
 ///
 /// Handed to the JS lazy read model so that codes produced by one read stay
@@ -122,14 +137,18 @@ impl TermDict {
         Ok(self.snapshot.decode(code))
     }
 
-    /// Encode an N-Triples term string to its code (inverse of
-    /// [`decode`](Self::decode)), or `undefined` when this dictionary does
-    /// not hold the term. Throws for a code past 2^53 − 1, which no JS number
-    /// holds exactly.
+    /// Encode a term to its code (inverse of [`decode`](Self::decode)), or
+    /// `undefined` when this dictionary does not hold the term. Tolerant of
+    /// spelling: an IRI with or without angle brackets, a literal with escape
+    /// variants, an `xsd:string` typing, an upper-case language tag, or
+    /// `default`/`[]` for the default graph all find the stored form's code.
+    /// Throws for a malformed term, and for a code past 2^53 − 1, which no JS
+    /// number holds exactly.
     #[wasm_bindgen(js_name = encode)]
     pub fn encode(&self, term: &str) -> Result<Option<f64>, JsValue> {
         self.snapshot
             .encode(term)
+            .map_err(js_err)?
             .map(code_to_js)
             .transpose()
             .map_err(js_err)
@@ -157,12 +176,12 @@ impl VortexRdfStore {
         format_name: &str,
         options: JsValue,
     ) -> Result<VortexRdfStore, JsValue> {
-        let format = parse_format(format_name)?;
+        let format = format_from_name(format_name).map_err(js_err)?;
         let config = parse_build_options(options)?;
         let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
-        let built = build_array(quads_stream, config).await?;
-
-        let inner = CoreStore::from_built(built).map_err(js_err)?;
+        let inner = CoreStore::from_quads(quads_stream, config.layout, config.indexes)
+            .await
+            .map_err(|e| js_err_ctx("Vortex build error", e))?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -181,9 +200,9 @@ impl VortexRdfStore {
         }
 
         let quad_stream = js_to_quad_stream(quads)?;
-        let built = build_array(quad_stream, config).await?;
-
-        let inner = CoreStore::from_built(built).map_err(js_err)?;
+        let inner = CoreStore::from_quads(quad_stream, config.layout, config.indexes)
+            .await
+            .map_err(|e| js_err_ctx("Vortex build error", e))?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -219,7 +238,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = toRdf, skip_typescript)]
     pub async fn to_rdf(&self, format_name: &str) -> Result<String, JsValue> {
-        let format = parse_format(format_name)?;
+        let format = format_from_name(format_name).map_err(js_err)?;
         let mut buffer = Vec::new();
         export_rdf(self.inner.clone(), &mut buffer, format)
             .await
@@ -227,17 +246,19 @@ impl VortexRdfStore {
         String::from_utf8(buffer).map_err(|e| js_err_ctx("UTF-8 error", e))
     }
 
+    /// Number of quads in the store. Returns synchronously: no wasm read path
+    /// performs I/O, so there is nothing to await (see `resolve_now`).
     #[wasm_bindgen(skip_typescript)]
-    pub async fn size(&self) -> Result<usize, JsValue> {
-        self.inner.size().await.map_err(js_err)
+    pub fn size(&self) -> Result<usize, JsValue> {
+        resolve_now(self.inner.size())?.map_err(js_err)
     }
 
-    /// Whether the quad is in the store. Rejects on a malformed quad object,
-    /// like `addQuad`/`deleteQuad`.
+    /// Whether the quad is in the store. Returns synchronously; throws on a
+    /// malformed quad object (`addQuad`/`deleteQuad` reject it).
     #[wasm_bindgen(skip_typescript)]
-    pub async fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
-        self.inner.contains(&quad).await.map_err(js_err)
+    pub fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
+        let quad = quad_arg(&quad_js)?;
+        resolve_now(self.inner.contains(&quad))?.map_err(js_err)
     }
 
     /// The inner store as one owning its rows, ready for in-place mutation;
@@ -265,7 +286,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = addQuad, skip_typescript)]
     pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
+        let quad = quad_arg(&quad_js)?;
         self.mutate(async |s| s.add_quad(quad).await).await
     }
 
@@ -277,7 +298,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = deleteQuad, skip_typescript)]
     pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
+        let quad = quad_arg(&quad_js)?;
         self.mutate(async |s| s.delete_quad(&quad).await).await
     }
 
@@ -330,7 +351,10 @@ impl VortexRdfStore {
     }
 
     /// Number of quads matching a pattern, counted from the match's row
-    /// selection alone — no term string is materialized.
+    /// selection alone — no term string is materialized. The `keep`, `limit`
+    /// and `offset` of `options` narrow the match as for
+    /// [`matchCodes`](Self::match_codes); a `limit` stops the count once that
+    /// many rows are known to exist.
     #[wasm_bindgen(js_name = countQuads, skip_typescript)]
     pub fn count_quads(
         &self,
@@ -338,12 +362,28 @@ impl VortexRdfStore {
         predicate: JsValue,
         object: JsValue,
         graph: JsValue,
+        options: Option<Object>,
     ) -> Result<usize, JsValue> {
-        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
-        resolve_now(async move {
-            let view = pattern.matched(&self.inner).await?;
-            view.size().await.map_err(js_err)
-        })?
+        let probe = read_probe(
+            JsPattern::parse(subject, predicate, object, graph)?,
+            options.as_deref(),
+        )?;
+        resolve_now(self.inner.count_probe(&probe))?.map_err(js_err)
+    }
+
+    /// [`countQuads`](Self::count_quads) for each of `probes`, one after
+    /// another in input order, as an array of numbers. Every probe is parsed
+    /// before any runs; the first that fails throws, and none after it runs.
+    /// Runs on every layout.
+    #[wasm_bindgen(js_name = countQuadsMany, skip_typescript)]
+    pub fn count_quads_many(&self, probes: JsValue) -> Result<js_sys::Array, JsValue> {
+        let probes = parse_probes(&probes)?;
+        let counts = js_sys::Array::new();
+        for probe in &probes {
+            let count = resolve_now(self.inner.count_probe(probe))?.map_err(js_err)?;
+            counts.push(&JsValue::from_f64(count as f64));
+        }
+        Ok(counts)
     }
 
     /// Low-level: resolve a pattern to the matched rows' raw term codes —
@@ -351,7 +391,14 @@ impl VortexRdfStore {
     /// `length` — with no term strings materialized; a code past 2^53 − 1
     /// throws. `null` unless the store's rows are code-addressable
     /// (Dictionary layout, no pending appends, resident dictionary); decode
-    /// codes through [`termDict`](Self::term_dict).
+    /// codes through [`termDict`](Self::term_dict). An invalid pattern term
+    /// or option throws whether or not the rows are code-addressable.
+    ///
+    /// `options.keep` narrows the match inside the store, before any row is
+    /// gathered: per position, a code set (a `Float64Array`, or an array of
+    /// codes of any length but two) or a code range (`[lo, hi]`, the
+    /// half-open codes `lo <= code < hi`). `options.offset` and
+    /// `options.limit` then window the kept rows in base row order.
     #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
     pub fn match_codes(
         &self,
@@ -359,53 +406,96 @@ impl VortexRdfStore {
         predicate: JsValue,
         object: JsValue,
         graph: JsValue,
+        options: Option<Object>,
     ) -> Result<JsValue, JsValue> {
-        // Same gate as `code_path_dict`: without a code-read snapshot the codes
-        // would not resolve via `termDict`.
-        if self.inner.code_read_snapshot().is_none() {
+        let probe = read_probe(
+            JsPattern::parse(subject, predicate, object, graph)?,
+            options.as_deref(),
+        )?;
+        // Same gate as `code_path_dict`: without a dictionary snapshot the
+        // codes would not resolve via `termDict`.
+        if self.dict_snapshot().is_none() {
             return Ok(JsValue::NULL);
         }
-        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
-        let matched = resolve_now(pattern.matched(&self.inner))??;
+        probe_codes(&self.inner, &probe)
+    }
 
-        let result = Object::new();
-        let Some(n) = resolve_now(set_code_columns(&result, &matched))?? else {
+    /// Low-level: [`matchCodes`](Self::match_codes) in chunks — an
+    /// `Iterable` whose items are `{ <column>: Float64Array, …, length }` of
+    /// at most `options.batchRows` rows (8,192 by default), in base row
+    /// order, holding the columns `options.columns` names (all four by
+    /// default) — or `null` under the same gate as `matchCodes`. This call
+    /// resolves the narrowed match (`keep`, `limit`, `offset`, as for
+    /// `matchCodes`); each `next()` reads or gathers one chunk's rows. An
+    /// aborted `options.signal` ends the iteration at the next `next()`, and
+    /// one aborted before the call makes it return a finished iterable
+    /// without resolving the match. `batchRows` 0, no column or an unknown
+    /// column name throws.
+    #[wasm_bindgen(js_name = matchCodeChunks, skip_typescript)]
+    pub fn match_code_chunks(
+        &self,
+        subject: JsValue,
+        predicate: JsValue,
+        object: JsValue,
+        graph: JsValue,
+        options: Option<Object>,
+    ) -> Result<JsValue, JsValue> {
+        let (probe, shape) = chunk_probe(
+            JsPattern::parse(subject, predicate, object, graph)?,
+            options.as_deref(),
+        )?;
+        if self.dict_snapshot().is_none() {
             return Ok(JsValue::NULL);
-        };
-        Reflect::set(&result, &"length".into(), &JsValue::from_f64(n as f64))?;
-        Ok(result.into())
+        }
+        if shape.signal.aborted {
+            return Ok(finished_iterable());
+        }
+        let matched = resolve_now(self.inner.run_probe(&probe))?.map_err(js_err)?;
+        let stream = matched
+            .code_chunks(&shape.columns, shape.batch_rows)
+            .map_err(js_err)?;
+        let chunks = CodeChunks::new(stream, shape.columns, Rc::downgrade(&self.alive));
+        Ok(handle_iterable(chunks, &shape.signal.value))
+    }
+
+    /// Low-level: [`matchCodes`](Self::match_codes) for each of `probes`, as
+    /// an `Iterable` answering one probe per `next()` in input order. A probe
+    /// is an array `[s, p, o, g]` of pattern terms or an object with keys
+    /// `s`, `p`, `o`, `g`, `keep`, `limit` and `offset`. Every probe is
+    /// parsed before any runs; the first that fails throws from its
+    /// `next()`. On a store whose rows are not code-addressable every answer
+    /// is `null` and no probe runs. An aborted `options.signal` ends the
+    /// iteration at the next `next()`, and one aborted before the call makes
+    /// it return a finished iterable.
+    #[wasm_bindgen(js_name = matchCodesMany, skip_typescript)]
+    pub fn match_codes_many(
+        &self,
+        probes: JsValue,
+        options: Option<Object>,
+    ) -> Result<JsValue, JsValue> {
+        let probes = parse_probes(&probes)?;
+        let signal = batch_signal(options.as_deref())?;
+        if signal.aborted {
+            return Ok(finished_iterable());
+        }
+        let store = self.dict_snapshot().map(|_| self.inner.clone());
+        let answers = ProbeAnswers::new(store, probes, Rc::downgrade(&self.alive));
+        Ok(handle_iterable(answers, &signal.value))
     }
 
     /// Low-level: an immutable [`TermDict`] handle on this store's term
     /// dictionary — the one door to code↔term translation (`decode`/`encode`
     /// of N-Triples term strings: `<iri>`, `_:blank`, `"lit"@lang`,
     /// `"lit"^^<dt>`, or `""` for the default graph). `undefined` short of
-    /// core's code-read gate ([`code_read_snapshot`](CoreStore::code_read_snapshot):
-    /// Dictionary layout, no append tail, resident dictionary). The handle
-    /// keeps decoding correctly after the store is mutated, because it retains
-    /// the dictionary its codes address.
+    /// core's [`dict_reader`](CoreStore::dict_reader) gate and a resident
+    /// snapshot (Dictionary layout, no append tail, resident dictionary). The
+    /// handle keeps decoding correctly after the store is mutated, because it
+    /// retains the dictionary its codes address.
     #[wasm_bindgen(js_name = termDict, skip_typescript)]
     pub fn term_dict(&self) -> Option<TermDict> {
-        let snapshot = self.inner.code_read_snapshot()?;
+        let snapshot = self.dict_snapshot()?;
         Some(TermDict { snapshot })
     }
-}
-
-/// Drive a read future to completion without suspending, or `Err` if it would
-/// have suspended.
-///
-/// The read paths are `async` because a file-backed store resolves its rows
-/// (and its dictionary) through I/O — but this crate builds core with
-/// `default-features = false`, so `file-io` is compiled out and no
-/// `QuadsSource::File` exists here. Every await in a wasm read is therefore
-/// already resolved; a future that did suspend surfaces as an error instead
-/// of a hang.
-fn resolve_now<F: std::future::Future>(future: F) -> Result<F::Output, JsValue> {
-    use futures::FutureExt;
-
-    future
-        .now_or_never()
-        .ok_or_else(|| js_err("read suspended: no wasm read path performs I/O"))
 }
 
 /// Resolve a pattern and pack the matched rows into the columnar payload the JS
@@ -439,7 +529,7 @@ async fn match_payload(
     // N-Triples spelling already (the default graph as the empty string, this
     // payload's vocabulary for it), so the bytes go straight into the
     // column — no parse into oxrdf terms, no re-render.
-    let mut chunks = matched.shared_quad_chunks().map_err(js_err)?;
+    let mut chunks = matched.shared_quad_chunks();
     // (offsets seeded with a leading 0, bytes) per s/p/o/g column.
     let mut cols: [(Vec<u32>, Vec<u8>); 4] = [
         (vec![0], Vec::new()),
@@ -467,22 +557,16 @@ async fn match_payload(
 }
 
 /// Set a matched view's four code columns on `payload` under `s`/`p`/`o`/`g`,
-/// as `Float64Array`s of the codes (exact JS numbers, see [`codes_to_js`]),
-/// returning the row count — or `None` when codes are not that view's
-/// vocabulary at all, in which case nothing is set and the caller falls back to
-/// the term path. A code past 2^53 − 1 is an error, never a rounded number.
+/// as `Float64Array`s of the codes ([`code_array`]), returning the row count
+/// — or `None` when codes are not that view's vocabulary at all, in which
+/// case nothing is set and the caller falls back to the term path.
 async fn set_code_columns(payload: &Object, matched: &CoreStore) -> Result<Option<usize>, JsValue> {
     let Some(cols) = matched.code_columns_gathered().await.map_err(js_err)? else {
         return Ok(None);
     };
     for (name, col) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
-        let numbers = codes_to_js(col.as_slice()).map_err(js_err)?;
-        // Copy into a JS-owned Float64Array (safe against wasm memory growth,
-        // which would detach a zero-copy view). A wasm32 store holds fewer
-        // rows than a u32 counts, so the length fits.
-        let ta = js_sys::Float64Array::new_with_length(numbers.len() as u32);
-        ta.copy_from(&numbers);
-        Reflect::set(payload, &(*name).into(), &ta)?;
+        let codes = code_array(col.as_slice())?;
+        Reflect::set(payload, &(*name).into(), &codes)?;
     }
     Ok(Some(cols[0].len()))
 }

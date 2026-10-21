@@ -1,20 +1,14 @@
-//! The file-backed arm of the Dictionary layout's residency axis: a term
-//! dictionary read in place from its serialized child. A file store is
-//! memory-mapped, so reading a window is slicing its segment out of the map
-//! and rebuilding the FSST array over those bytes (its code offsets are read
-//! once as 32-bit values); only the terms a call asks for are decompressed.
-//! Rebuilt windows are kept in a byte-bounded, least-recently-used cache
-//! ([`WINDOW_CACHE_BYTES`] per opened file), so probes and decodes landing in
-//! a recently used window do not rebuild it. The handle holds the child's
-//! layout (one flat leaf per FSST window) and each window's first and last
-//! term — read at open from the child's exact zone maps, or from the leaves
-//! of a child written without them (chunks of uneven length have no uniform
-//! zone to record) — and the kind ranges. A child whose shape a window
-//! search cannot address is not file-backed at all:
-//! [`store::open`](crate::store::open) lifts it resident instead. The policy
-//! enum choosing between this and the resident form is
-//! [`DictAccess`](super::access::DictAccess); the module only compiles with
-//! `file-io`, since without a file there is nothing to leave the terms in.
+//! A term dictionary read in place from its file's `dictionary` child, the
+//! file-backed arm of [`DictAccess`](super::handles::DictAccess). The handle
+//! holds the child's flat leaves (one per FSST window) and each window's
+//! first and last term, from the child's exact zone maps or else from the
+//! leaves. A call reads only the windows its terms are in: over a mapped
+//! file, a window is its segment sliced out of the map with the FSST array
+//! rebuilt over it, and only the terms asked for are decompressed. Rebuilt
+//! windows are kept in a byte-bounded, least-recently-used cache
+//! ([`WINDOW_CACHE_BYTES`] per open file). A child no window search can
+//! address is lifted resident instead
+//! ([`store::persist::open`](crate::store::persist::open)).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -24,79 +18,76 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use futures::{StreamExt as _, TryStreamExt as _};
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::serde::SerializedArray;
-use vortex_array::{ArrayRef, ExecutionCtx, VortexSessionExecute};
+use vortex_array::{ExecutionCtx, VortexSessionExecute};
 use vortex_buffer::Buffer;
-use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
-use vortex_layout::layouts::flat::Flat;
+use vortex_layout::layouts::flat::FlatLayout;
 use vortex_layout::layouts::struct_::Struct as StructLayout;
 use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
+use vortex_rdf_encoded_search::{fetch_flat, flat_leaves};
 
-use crate::common::terms::canonical_spelling;
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
 use crate::io::read::available_parallelism;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::StrColReader;
-use crate::store::native_file::NativeStoreFile;
+use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::schema::TermCode;
 
-use super::check_code;
-use super::predicates::{KindRanges, TermPredicate, Verdict};
+use super::predicates::{KindRanges, TermPredicate};
+use super::storage::{COL_DICT_TERM, TermChunk, chunk_of, window_bound_aggregates};
 use super::term_dict::{
-    COL_DICT_TERM, TermChunk, TermDictionary, check_candidates, chunk_of, code_rank,
-    prefix_successor, rank_code, split_verdicts, window_bound_aggregates,
+    CodeSpace, TermDictionary, check_candidates, check_code, find_by, kind_verdicts,
+    lower_bound_by, prefix_range_from, prefix_successor, split_verdicts, tolerant_fallback,
 };
 
 /// A window's first and last term.
 type Bounds = (Box<[u8]>, Box<[u8]>);
 
 /// The term column's flat leaves, each with its row count.
-type Leaves = Vec<(LayoutRef, usize)>;
+type Leaves = Vec<(FlatLayout, usize)>;
 
-/// One flat leaf of the term column — one FSST window as written — with the
-/// rank of its first term, its row count, and its first and last terms.
+/// One flat leaf of the term column (one FSST window as written): the rank of
+/// its first term, its row count (never 0), and its first and last terms.
 struct Window {
-    layout: LayoutRef,
+    layout: FlatLayout,
     start: usize,
     rows: usize,
     first: Box<[u8]>,
     last: Box<[u8]>,
 }
 
-/// What one opened file's window cache may hold: the bytes of its windows
-/// (see [`TermChunk::heap_bytes`]) plus [`WINDOW_ENTRY_OVERHEAD`] for each,
-/// least recently used evicted first. An FSST window of 65,536 terms costs
-/// about 256 KiB (its code offsets, 4 bytes each) plus the overhead, so about
-/// 15 windows fit. For a memory-mapped file store, which every `from_file`
-/// store is, a window's code bytes are slices of the map, so the charge
-/// bounds the heap the cache holds.
+/// The charge one open file's window cache may hold: its windows' bytes
+/// ([`TermChunk::heap_bytes`]) plus [`WINDOW_ENTRY_OVERHEAD`] each, the least
+/// recently used evicted first. A 65,536-term FSST window is charged about
+/// 260 KiB (4 bytes of code offsets per term, plus the overhead), so about 15
+/// fit. Over a mapped file (every `from_file` store) a window's code bytes are
+/// slices of the map, so the charge bounds the heap the cache holds.
 const WINDOW_CACHE_BYTES: usize = 4 << 20;
 
-/// What each cached window is charged beyond its chunk's bytes: the symbol
-/// table, the array, the `Arc` and the map entry it takes. It also bounds the
-/// windows a budget admits when they are tiny, to
-/// `WINDOW_CACHE_BYTES / WINDOW_ENTRY_OVERHEAD` (1,024).
+/// What each cached window is charged beyond its chunk's bytes: its symbol
+/// table, array, `Arc` and map entry. It also caps the windows a budget
+/// admits when they are tiny, at `WINDOW_CACHE_BYTES / WINDOW_ENTRY_OVERHEAD`
+/// (1,024).
 pub(super) const WINDOW_ENTRY_OVERHEAD: usize = 4 << 10;
 
-/// The rebuilt windows of one file, by window index, bounded by what they are
-/// charged: their chunks' bytes plus [`WINDOW_ENTRY_OVERHEAD`] each. A lookup
+/// The rebuilt windows of one file, by window index, bounded by their charge
+/// (their chunks' bytes plus [`WINDOW_ENTRY_OVERHEAD`] each). A lookup
 /// refreshes a window's recency; an insert evicts the least recently used
 /// windows until the new one fits, and a window charged more than the whole
-/// budget is not kept. A window evicted while a read still holds it lives
-/// until that read ends.
+/// budget is not kept. An evicted window a read still holds lives until that
+/// read ends.
 struct WindowCache {
     budget: usize,
-    /// What every cached window is charged.
+    /// The cached windows' total charge.
     bytes: usize,
     /// The last recency stamp handed out.
     clock: u64,
     windows: HashMap<usize, CachedWindow>,
 }
 
-/// A cached window with what it is charged and the stamp of its last use.
+/// A cached window, its charge and the stamp of its last use.
 struct CachedWindow {
     chunk: Arc<TermChunk>,
     bytes: usize,
@@ -159,62 +150,46 @@ impl WindowCache {
     }
 }
 
-/// What a [`FileBackedDict`] holds: the child's layout metadata, the
-/// per-window bounds and the bounded cache of rebuilt windows.
+/// What a [`FileBackedDict`] holds: the child's leaves and window bounds, and
+/// the cache of rebuilt windows.
 struct Windows {
-    /// The dictionary child's layout reader, for the transient whole-column
-    /// lift (serialization, compaction).
+    /// The identity of this dictionary (see
+    /// [`DictReader::dictionary_id`](crate::DictReader::dictionary_id)): one
+    /// per open, shared by every clone of the handle.
+    id: u64,
+    /// The child's layout reader, for the transient whole-column lift.
     reader: vortex_layout::LayoutReaderRef,
     windows: Vec<Window>,
     /// `starts[i]` = `windows[i].start`, ascending (for [`chunk_of`]).
     starts: Vec<usize>,
-    /// Number of terms.
-    len: usize,
-    /// Where the leaves' segments are read from — over a mapped file, the map.
+    code_space: CodeSpace,
+    /// Where the leaves' segments are read from: over a mapped file, the map.
     source: Arc<dyn SegmentSource>,
-    /// The kind ranges (three code ranges and the default graph's code),
-    /// computed on first use.
+    /// The kind ranges, computed on first use.
     kinds: OnceLock<KindRanges>,
-    /// Rebuilt windows, kept for reuse. The lock is held for a lookup or an
-    /// insert, never across an `.await`.
+    /// The rebuilt windows. The lock is held for a lookup or an insert, never
+    /// across an `.await`.
     cache: Mutex<WindowCache>,
-    /// Windows rebuilt since open (the cache's misses) — what the tests read
-    /// to pin that a call rebuilds only the windows holding its codes.
+    /// Test hook: windows rebuilt since open (the cache's misses).
     #[cfg(test)]
     rebuilt: std::sync::atomic::AtomicUsize,
-    /// Windows asked for since open, hits and misses alike — what the tests
-    /// read to pin that a call asks for no window at all.
+    /// Test hook: windows asked for since open, hits and misses alike.
     #[cfg(test)]
     requested: std::sync::atomic::AtomicUsize,
-    /// The code of the first term (see `term_dict::code_base`).
+    /// Test hook: whole-dictionary lifts since open.
     #[cfg(test)]
-    base: TermCode,
+    lifted: std::sync::atomic::AtomicUsize,
 }
 
 impl Windows {
-    /// The code of the first term: 0 outside the tests' code-base hook.
-    #[inline]
-    fn base(&self) -> TermCode {
-        #[cfg(test)]
-        {
-            self.base
-        }
-        #[cfg(not(test))]
-        {
-            0
-        }
-    }
-
-    /// The rank of `code`, or `None` when no term has that code.
-    #[inline]
-    fn rank_of(&self, code: TermCode) -> Option<usize> {
-        code_rank(code, self.base(), self.len)
-    }
-
-    /// The code of the term at `rank`.
-    #[inline]
-    fn code_at(&self, rank: usize) -> TermCode {
-        rank_code(rank, self.base())
+    /// The window holding `needle`'s lower bound, with its index: the first
+    /// whose last term is not below `needle`; `None` when every term is below
+    /// it.
+    fn locate(&self, needle: &[u8]) -> Option<(usize, &Window)> {
+        let w = self
+            .windows
+            .partition_point(|window| &*window.last < needle);
+        self.windows.get(w).map(|window| (w, window))
     }
 
     /// The cache's guard. Every entry is complete when it is inserted, so a
@@ -224,12 +199,10 @@ impl Windows {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Window `w` as a term chunk: the cached one, else its leaf rebuilt
-    /// over its segment and adopted through [`TermChunk::from_wire`] (FSST
-    /// stays compressed, its code offsets read once as 32-bit values; any
-    /// other encoding is canonicalized), then cached. The leaf is rebuilt with the lock
-    /// released, so two tasks missing one window both rebuild it and the
-    /// cache keeps the first insert.
+    /// Window `w`'s chunk: the cached one, else its leaf rebuilt over its
+    /// segment, adopted ([`TermChunk::from_wire`]) and cached. The rebuild
+    /// runs with the lock released, so two tasks missing one window both
+    /// rebuild it and the cache keeps the first insert.
     async fn window_chunk(&self, w: usize) -> Result<Arc<TermChunk>> {
         #[cfg(test)]
         self.requested
@@ -240,8 +213,7 @@ impl Windows {
         #[cfg(test)]
         self.rebuilt
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let window = &self.windows[w];
-        let leaf = rebuild_leaf(&window.layout, window.rows, &self.source).await?;
+        let leaf = fetch_flat(&self.windows[w].layout, &self.source, &VORTEX_SESSION).await?;
         let chunk = TermChunk::from_wire(leaf, &mut VORTEX_SESSION.create_execution_ctx())?;
         Ok(self.cache().insert(w, Arc::new(chunk)))
     }
@@ -249,7 +221,9 @@ impl Windows {
 
 /// A term dictionary left in its layout child: term → code probes and code →
 /// term decodes read the windows they need from the (mapped) file, through a
-/// bounded cache of rebuilt windows. Cloning is an `Arc` bump.
+/// bounded cache of rebuilt windows. Terms are read as UTF-8 unchecked, so
+/// the child must be a Utf8 column of a file this crate wrote or the caller
+/// trusts. Cloning is an `Arc` bump.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict(Arc<Windows>);
 
@@ -267,16 +241,10 @@ impl FileBackedDict {
 
     /// [`open`](Self::open) with a window cache of `budget` bytes.
     async fn open_with_budget(native: &NativeStoreFile, budget: usize) -> Result<Option<Self>> {
-        let Some((_, reader)) = native
-            .component_reader(DICT_COMPONENT_NAME)
-            .map_err(VortexRdfError::Vortex)?
-        else {
+        let Some(reader) = native.component_reader(DICT_COMPONENT_NAME)? else {
             return Ok(None);
         };
-        let Some(child) = native
-            .component_layout(DICT_COMPONENT_NAME)
-            .map_err(VortexRdfError::Vortex)?
-        else {
+        let Some(child) = native.component_layout(DICT_COMPONENT_NAME)? else {
             return Ok(None);
         };
         let Some((leaves, zones)) = term_column(&child) else {
@@ -313,10 +281,11 @@ impl FileBackedDict {
             start += rows;
         }
         Ok(Some(Self(Arc::new(Windows {
+            id: super::term_dict::next_dictionary_id(),
             reader,
             windows,
             starts,
-            len: start,
+            code_space: CodeSpace::new(start),
             source,
             kinds: OnceLock::new(),
             cache: Mutex::new(WindowCache::new(budget)),
@@ -325,99 +294,85 @@ impl FileBackedDict {
             #[cfg(test)]
             requested: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
-            base: super::term_dict::code_base(),
+            lifted: std::sync::atomic::AtomicUsize::new(0),
         }))))
     }
 
-    /// Number of terms.
-    pub(crate) fn len(&self) -> usize {
-        self.0.len
+    pub(crate) fn id(&self) -> u64 {
+        self.0.id
     }
 
-    /// Term → code: the window whose bounds enclose `term`, then a binary
-    /// search of that one window (through the window cache) — none at all
-    /// for a window's first or last term, or a term falling between two
-    /// windows.
-    pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
+    pub(crate) fn len(&self) -> usize {
+        self.0.code_space.len()
+    }
+
+    /// The code of `term` exactly as spelled: the window whose bounds enclose
+    /// it, then a binary search of that window's inside, read through the
+    /// cache. A window's first or last term, and a term between two windows,
+    /// read no window.
+    pub(crate) async fn encode_exact(&self, term: &str) -> Result<Option<TermCode>> {
         let inner = &*self.0;
         let needle = term.as_bytes();
-        let w = inner
-            .windows
-            .partition_point(|window| &*window.last < needle);
-        let Some(window) = inner.windows.get(w) else {
+        let Some((w, window)) = inner.locate(needle) else {
             return Ok(None);
         };
+        let code_at = |local: usize| inner.code_space.code_at(window.start + local);
         match needle.cmp(&*window.first) {
             Ordering::Less => return Ok(None),
-            Ordering::Equal => return Ok(Some(inner.code_at(window.start))),
+            Ordering::Equal => return Ok(Some(code_at(0))),
             Ordering::Greater => {}
         }
         if needle == &*window.last {
-            return Ok(Some(inner.code_at(window.start + window.rows - 1)));
+            return Ok(Some(code_at(window.rows - 1)));
         }
+        // first < needle < last: a hit lies strictly inside.
         let chunk = inner.window_chunk(w).await?;
         let mut cursor = chunk.cursor();
-        let (mut lo, mut hi) = (1, window.rows - 1);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match cursor.bytes_at(mid).cmp(needle) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Equal => return Ok(Some(inner.code_at(window.start + mid))),
-                Ordering::Greater => hi = mid,
-            }
-        }
-        Ok(None)
+        Ok(find_by(1..window.rows - 1, |local| {
+            cursor.bytes_at(local).cmp(needle)
+        })
+        .map(code_at))
     }
 
-    /// The code of the first term not below `needle` in byte order (the
-    /// term count when every term is below it).
+    /// The code of the first term not below `needle` in byte order; one past
+    /// the last code when every term is below it. Reads at most the one
+    /// window the bound is inside.
     pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<TermCode> {
         let inner = &*self.0;
-        let w = inner
-            .windows
-            .partition_point(|window| &*window.last < needle);
-        let Some(window) = inner.windows.get(w) else {
-            return Ok(inner.code_at(inner.len));
+        let Some((w, window)) = inner.locate(needle) else {
+            return Ok(inner.code_space.code_end());
         };
         if needle <= &*window.first {
-            return Ok(inner.code_at(window.start));
+            return Ok(inner.code_space.code_at(window.start));
         }
         // first < needle <= last: the bound lies inside, past the first term.
         let chunk = inner.window_chunk(w).await?;
         let mut cursor = chunk.cursor();
-        let (mut lo, mut hi) = (1, window.rows - 1);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if cursor.bytes_at(mid) < needle {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(inner.code_at(window.start + lo))
+        let local = lower_bound_by(1..window.rows - 1, |local| cursor.bytes_at(local) < needle);
+        Ok(inner.code_space.code_at(window.start + local))
     }
 
-    /// Visit the terms of `codes` (strictly ascending and inside the
-    /// dictionary, else an `InvalidOperation` error before any window is
-    /// read) in order: per window holding any of them, one cached chunk and
-    /// one cursor, which decompresses only the asked rows. `visit` gets each
-    /// code's position in `codes` and its term, trusted to be UTF-8 as the
-    /// column's dtype declares.
+    /// Visit the terms of `codes`, which must ascend strictly inside the
+    /// dictionary ([`check_candidates`], checked before any window is read),
+    /// in order: `visit` gets each code's position in `codes` and its term,
+    /// read unchecked as UTF-8 (see [`FileBackedDict`]). Each window holding
+    /// any of them is read once, through one cursor that decompresses only
+    /// the asked rows.
     async fn visit_terms(
         &self,
         codes: &[TermCode],
-        mut visit: impl FnMut(usize, Result<&str>),
+        mut visit: impl FnMut(usize, &str),
     ) -> Result<()> {
-        // Each window's run is found by a partition point, so a list out of
-        // order would leave a code before its window's start (wrapping
-        // `rank - window.start`) or a run of nothing (a loop that never
+        // Each window's run is a partition point, so a list out of order
+        // would put a code before its window's start (wrapping
+        // `rank - window.start`) or make a run of nothing (a loop that never
         // advances).
         let inner = &*self.0;
-        check_candidates(codes, inner.base(), inner.len)?;
+        check_candidates(codes, inner.code_space)?;
         // Every candidate is inside the dictionary (checked above), so its
         // offset from the first code is a rank below the term count: exact
         // as a `usize`.
-        let base = inner.base();
+        let base = inner.code_space.base();
         let rank = |code: TermCode| (code - base) as usize;
         let mut at = 0;
         while at < codes.len() {
@@ -443,36 +398,25 @@ impl FileBackedDict {
         Ok(())
     }
 
-    /// Code → term for `codes` (ascending, unique; out-of-range codes are an
-    /// error), reading only the windows that hold them.
+    /// The terms of `codes`, which must ascend strictly (else an
+    /// `InvalidInput` error); a code past the dictionary is a
+    /// `Deserialization` error. Reads only the windows that hold them.
     pub(crate) async fn decode_many(&self, codes: &[TermCode]) -> Result<Vec<Arc<str>>> {
         let Some(&max) = codes.last() else {
             return Ok(Vec::new());
         };
-        check_code(max, self.0.base(), self.len())?;
+        check_code(max, self.0.code_space)?;
         let mut terms = Vec::with_capacity(codes.len());
-        let mut failure = None;
-        self.visit_terms(codes, |_, term| match term {
-            Ok(term) => terms.push(Arc::from(term)),
-            Err(e) => {
-                failure.get_or_insert(e);
-            }
-        })
-        .await?;
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(terms),
-        }
+        self.visit_terms(codes, |_, term| terms.push(Arc::from(term)))
+            .await?;
+        Ok(terms)
     }
 
-    /// Code → term for `codes` in any order, repeats allowed, handed to
+    /// The terms of `codes`, in any order and with repeats, each handed to
     /// `visit(position, term)` once per position (`None` for an out-of-range
-    /// code): the positions of the in-range codes are sorted once by code,
-    /// each distinct code is read once through
-    /// [`visit_terms`](Self::visit_terms), and every position holding it is
-    /// visited with the borrowed term — no string is built per term. Out-of-
-    /// range positions are visited first; the rest in code order. Terms are
-    /// trusted to be UTF-8, as the column's dtype declares.
+    /// code), borrowed: no string is built per term. Out-of-range positions
+    /// are visited first, then the rest in code order, each distinct code
+    /// read once ([`visit_terms`](Self::visit_terms)).
     pub(crate) async fn decode_many_with(
         &self,
         codes: &[TermCode],
@@ -480,7 +424,7 @@ impl FileBackedDict {
     ) -> Result<()> {
         let mut sorted: Vec<(TermCode, usize)> = Vec::with_capacity(codes.len());
         for (i, &code) in codes.iter().enumerate() {
-            if self.0.rank_of(code).is_some() {
+            if self.0.code_space.rank_of(code).is_some() {
                 sorted.push((code, i));
             } else {
                 visit(i, None);
@@ -489,58 +433,42 @@ impl FileBackedDict {
         sorted.sort_unstable();
         let groups: Vec<&[(TermCode, usize)]> = sorted.chunk_by(|a, b| a.0 == b.0).collect();
         let distinct: Vec<TermCode> = groups.iter().map(|group| group[0].0).collect();
-        let mut failure = None;
-        self.visit_terms(&distinct, |j, term| match term {
-            Ok(term) => {
-                for &(_, i) in groups[j] {
-                    visit(i, Some(term));
-                }
-            }
-            Err(e) => {
-                failure.get_or_insert(e);
+        self.visit_terms(&distinct, |j, term| {
+            for &(_, i) in groups[j] {
+                visit(i, Some(term));
             }
         })
-        .await?;
-        failure.map_or(Ok(()), Err)
+        .await
     }
 
-    /// [`decode_many_with`](Self::decode_many_with) collected: one owned
-    /// string per decoded position.
-    pub(crate) async fn decode_many_any(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
-        let mut terms = vec![None; codes.len()];
-        self.decode_many_with(codes, |i, term| terms[i] = term.map(str::to_owned))
-            .await?;
-        Ok(terms)
-    }
-
-    /// The async twin of `TermDictionary::encode_tolerant`.
-    pub(crate) async fn encode_tolerant(&self, term: &str) -> Result<Option<TermCode>> {
-        if let Some(code) = self.encode(term).await? {
+    /// The code of `term`, tolerant of spelling as `TermDictionary::encode`.
+    pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
+        if let Some(code) = self.encode_exact(term).await? {
             return Ok(Some(code));
         }
-        let canonical = canonical_spelling(term)?;
-        if canonical == term {
-            return Ok(None);
+        match tolerant_fallback(term)? {
+            Some(canonical) => self.encode_exact(&canonical).await,
+            None => Ok(None),
         }
-        self.encode(&canonical).await
     }
 
-    /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
+    /// [`encode`](Self::encode) over a batch, in order, the lookups overlapped.
     pub(crate) async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
-        futures::stream::iter(terms.iter().map(|term| self.encode_tolerant(term)))
+        futures::stream::iter(terms.iter().map(|term| self.encode(term)))
             .buffered(available_parallelism().max(4))
             .try_collect()
             .await
     }
 
-    /// The async twin of `TermDictionary::prefix_range`.
+    /// The code range of the terms spelled with `prefix`, as
+    /// `TermDictionary::prefix_range`: two lower bounds.
     pub(crate) async fn prefix_range(&self, prefix: &str) -> Result<Range<TermCode>> {
         let lo = self.lower_bound(prefix.as_bytes()).await?;
         let hi = match prefix_successor(prefix.as_bytes()) {
-            Some(successor) => self.lower_bound(&successor).await?,
-            None => self.0.code_at(self.len()),
+            Some(successor) => Some(self.lower_bound(&successor).await?),
+            None => None,
         };
-        Ok(lo..hi.max(lo))
+        Ok(prefix_range_from(lo, hi, self.0.code_space.code_end()))
     }
 
     /// The kind ranges, computed once per handle (a few window searches;
@@ -549,25 +477,25 @@ impl FileBackedDict {
         if let Some(kinds) = self.0.kinds.get() {
             return Ok(kinds.clone());
         }
-        let default_graph = self
+        let code_space = self.0.code_space;
+        let first_is_empty = self
             .0
             .windows
             .first()
-            .filter(|window| window.first.is_empty())
-            .map(|_| self.0.code_at(0));
-        let kinds = KindRanges {
-            start: self.0.base(),
-            default_graph,
-            literals: self.prefix_range("\"").await?,
-            iris: self.prefix_range("<").await?,
-            blanks: self.prefix_range("_:").await?,
-            len: self.0.code_at(self.len()),
-        };
+            .is_some_and(|window| window.first.is_empty());
+        let kinds = KindRanges::new(
+            code_space.base(),
+            first_is_empty,
+            self.prefix_range("\"").await?,
+            self.prefix_range("<").await?,
+            self.prefix_range("_:").await?,
+            code_space.code_end(),
+        );
         Ok(self.0.kinds.get_or_init(|| kinds).clone())
     }
 
-    /// The file-backed twin of `TermDictionary::filter_codes`: candidates
-    /// whose kind decides them are not read; the rest are read through
+    /// `TermDictionary::filter_codes` over the file, under its precondition:
+    /// the candidates their kind does not decide are read through
     /// [`visit_terms`](Self::visit_terms), so only the windows holding them
     /// are read.
     pub(crate) async fn filter_codes(
@@ -575,36 +503,26 @@ impl FileBackedDict {
         predicate: &TermPredicate,
         codes: &[TermCode],
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
-        check_candidates(codes, self.0.base(), self.len())?;
+        check_candidates(codes, self.0.code_space)?;
         let kinds = self.kind_ranges().await?;
-        // Undecided until a verdict is set: a candidate no branch below reaches
-        // stays undecided rather than silently failing.
-        let mut verdicts = vec![Verdict::Unknown; codes.len()];
-        let (mut read_at, mut read) = (Vec::new(), Vec::new());
-        for (i, &code) in codes.iter().enumerate() {
-            match predicate.kind_verdict(kinds.kind_of_code(code)) {
-                Some(verdict) => verdicts[i] = verdict,
-                None => {
-                    read_at.push(i);
-                    read.push(code);
-                }
-            }
-        }
+        let (mut verdicts, read_at) = kind_verdicts(predicate, &kinds, codes);
+        let read: Vec<TermCode> = read_at.iter().map(|&at| codes[at]).collect();
         self.visit_terms(&read, |j, spelling| {
-            verdicts[read_at[j]] = match spelling {
-                Ok(spelling) => predicate.eval(spelling),
-                Err(_) => Verdict::Unknown,
-            };
+            verdicts[read_at[j]] = predicate.eval(spelling);
         })
         .await?;
         Ok(split_verdicts(codes, &verdicts))
     }
 
-    /// Lift the whole dictionary resident — the transient full-column read
-    /// behind [`DictAccess::ensure_resident`].
+    /// The whole dictionary lifted resident with one scan of the term
+    /// column: the transient read behind [`DictAccess::ensure_resident`].
     ///
-    /// [`DictAccess::ensure_resident`]: super::access::DictAccess::ensure_resident
+    /// [`DictAccess::ensure_resident`]: super::handles::DictAccess::ensure_resident
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
+        #[cfg(test)]
+        self.0
+            .lifted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TermDictionary::from_child_reader(self.0.reader.clone()).await
     }
 
@@ -620,10 +538,23 @@ impl FileBackedDict {
         self.0.windows.len()
     }
 
+    /// The rank of each window's first term, ascending.
+    #[cfg(test)]
+    pub(crate) fn debug_window_starts(&self) -> Vec<usize> {
+        self.0.starts.clone()
+    }
+
     /// Windows asked for since the handle opened, from the cache or not.
     #[cfg(test)]
     pub(crate) fn debug_windows_requested(&self) -> usize {
         self.0.requested.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whole-dictionary lifts ([`lift_resident`](Self::lift_resident)) since
+    /// the handle opened.
+    #[cfg(test)]
+    pub(crate) fn debug_lifts(&self) -> usize {
+        self.0.lifted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the window cache's windows are charged.
@@ -657,8 +588,8 @@ struct Zones {
     zone_len: usize,
 }
 
-/// The term column's flat leaves — one per FSST window, in row order, with
-/// their row counts — and, when the column is zone-mapped with exact window
+/// The term column's flat leaves (one per FSST window, in row order, with
+/// their row counts) and, when the column is zone-mapped with exact window
 /// bounds, its zone table. `None` for any shape a window search cannot
 /// address.
 fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<Zones>)> {
@@ -677,33 +608,19 @@ fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<Zones>)> {
         }
         _ => None,
     };
-    let data = unwrap_zoned(column)?;
     // An empty child has nothing to search; a term count past what a `usize`
     // holds cannot be ranked on this target.
-    let rows = usize::try_from(data.row_count())
-        .ok()
-        .filter(|&rows| rows > 0)?;
-    let mut leaves = Vec::new();
-    if data.is::<Flat>() {
-        leaves.push((data, rows));
-    } else if data.is::<ChunkedLayout>() {
-        for i in 0..data.nslots() {
-            let Some(LayoutChildType::Chunk(_)) = data.slot_type(i) else {
-                return None;
-            };
-            let leaf = unwrap_zoned(data.slot(i).ok().flatten()?)?;
-            let rows = usize::try_from(leaf.row_count()).ok()?;
-            if rows == 0 {
-                continue;
-            }
-            if !leaf.is::<Flat>() {
-                return None;
-            }
-            leaves.push((leaf, rows));
-        }
-    } else {
+    if !usize::try_from(column.row_count()).is_ok_and(|rows| rows > 0) {
         return None;
     }
+    // A dictionary layout's codes leaves hold codes, not terms.
+    let leaves = flat_leaves(&column)?
+        .into_iter()
+        .map(|leaf| {
+            let rows = usize::try_from(leaf.layout.row_count()).ok()?;
+            leaf.dict_values.is_none().then_some((leaf.layout, rows))
+        })
+        .collect::<Option<Leaves>>()?;
     Some((leaves, zones))
 }
 
@@ -714,20 +631,12 @@ fn exact_bounds(present: &[String]) -> bool {
         .all(|aggregate| present.contains(&aggregate.to_string()))
 }
 
-/// Descend through zoned wrappers to their data child (child 0).
-fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
-    while node.is::<Zoned>() {
-        node = node.slot(0).ok().flatten()?;
-    }
-    Some(node)
-}
-
 /// Whether zone `i` of `zones` covers exactly leaf `i`: one zone per leaf,
 /// every leaf but the last holding `zone_len` rows and the last at most that.
 /// A column written with its windows as zones is cut so; a foreign writer's
 /// may have as many zones as leaves and still cut them elsewhere, which would
 /// hand a window the bounds of other rows.
-fn zones_cut_at_leaves(zones: &Zones, leaves: &[(LayoutRef, usize)]) -> bool {
+fn zones_cut_at_leaves(zones: &Zones, leaves: &[(FlatLayout, usize)]) -> bool {
     let Some(((_, last), rest)) = leaves.split_last() else {
         return false;
     };
@@ -737,32 +646,27 @@ fn zones_cut_at_leaves(zones: &Zones, leaves: &[(LayoutRef, usize)]) -> bool {
         && *last <= zones.zone_len
 }
 
-/// Each window's bounds from the term column's zone table — one zone per
-/// window — or `None` when the table does not line up with the leaves (see
-/// [`zones_cut_at_leaves`]) or holds a null bound.
+/// Each window's bounds from the term column's zone table, one zone per
+/// window; `None` when the zones are not cut at the leaves
+/// ([`zones_cut_at_leaves`]) or a bound is null.
 async fn zone_bounds(
     zones: &Zones,
-    leaves: &[(LayoutRef, usize)],
+    leaves: &[(FlatLayout, usize)],
     source: &Arc<dyn SegmentSource>,
 ) -> Result<Option<Vec<Bounds>>> {
     if !zones_cut_at_leaves(zones, leaves) {
         return Ok(None);
     }
     let windows = leaves.len();
-    let reader = zones
-        .table
-        .new_reader(
-            "dictionary-zones".into(),
-            Arc::clone(source),
-            &VORTEX_SESSION,
-            &Default::default(),
-        )
-        .map_err(VortexRdfError::Vortex)?;
+    let reader = zones.table.new_reader(
+        "dictionary-zones".into(),
+        Arc::clone(source),
+        &VORTEX_SESSION,
+        &Default::default(),
+    )?;
     let table = crate::io::read::scan_all_reader(reader).await?;
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let table = table
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let table = table.execute::<StructArray>(&mut ctx)?;
     let aggregates = window_bound_aggregates();
     let Some(maxes) = bound_column(&table, &aggregates[0].to_string(), &mut ctx)? else {
         return Ok(None);
@@ -787,29 +691,23 @@ fn bound_column(
     let Ok(column) = table.unmasked_field_by_name(name) else {
         return Ok(None);
     };
-    if !column.all_valid(ctx).map_err(VortexRdfError::Vortex)? {
+    if !column.all_valid(ctx)? {
         return Ok(None);
     }
-    Ok(Some(
-        column
-            .clone()
-            .execute::<VarBinViewArray>(ctx)
-            .map_err(VortexRdfError::Vortex)?,
-    ))
+    Ok(Some(column.clone().execute::<VarBinViewArray>(ctx)?))
 }
 
-/// Each window's bounds read from its own leaf — the fallback for a term
-/// column without exact zone maps (chunks of uneven length, or a foreign
-/// writer): two single-term reads per window through a chunk cursor, at open.
-/// The windows are not cached.
+/// Each window's bounds read from its own leaf, for a term column without
+/// exact zone maps (chunks of uneven length, or a foreign writer's): every
+/// leaf is fetched at open for two single-term reads, and none is cached.
 async fn leaf_bounds(
-    leaves: &[(LayoutRef, usize)],
+    leaves: &[(FlatLayout, usize)],
     source: &Arc<dyn SegmentSource>,
 ) -> Result<Vec<Bounds>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let mut bounds = Vec::with_capacity(leaves.len());
     for (layout, rows) in leaves {
-        let leaf = rebuild_leaf(layout, *rows, source).await?;
+        let leaf = fetch_flat(layout, source, &VORTEX_SESSION).await?;
         let chunk = TermChunk::from_wire(leaf, &mut ctx)?;
         let mut cursor = chunk.cursor();
         let first = Box::from(cursor.bytes_at(0));
@@ -819,36 +717,11 @@ async fn leaf_bounds(
     Ok(bounds)
 }
 
-/// Whether window bounds are sorted and disjoint — `first <= last` within a
-/// window, `last < next first` across — what the window search relies on.
+/// Whether window bounds are sorted and disjoint (`first <= last` within a
+/// window, `last < next first` across), as the window search requires.
 fn ordered(bounds: &[Bounds]) -> bool {
     bounds.iter().all(|(first, last)| first <= last)
         && bounds.windows(2).all(|pair| pair[0].1 < pair[1].0)
-}
-
-/// A flat leaf rebuilt over its segment in the encoding it was written in —
-/// over a mapped file, metadata over a slice of the map; nothing is
-/// decompressed.
-async fn rebuild_leaf(
-    layout: &LayoutRef,
-    rows: usize,
-    source: &Arc<dyn SegmentSource>,
-) -> Result<ArrayRef> {
-    let flat = layout
-        .as_opt::<Flat>()
-        .expect("term leaves are validated flat at open");
-    let segment = source
-        .request(flat.segment_id())
-        .await
-        .map_err(VortexRdfError::Vortex)?;
-    let parts = match flat.array_tree().cloned() {
-        Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment),
-        None => SerializedArray::try_from(segment),
-    }
-    .map_err(VortexRdfError::Vortex)?;
-    parts
-        .decode(flat.dtype(), rows, flat.array_ctx(), &VORTEX_SESSION)
-        .map_err(VortexRdfError::Vortex)
 }
 
 #[cfg(test)]
@@ -891,6 +764,11 @@ mod tests {
         (fbd, terms)
     }
 
+    /// The public handle on `fbd`, which shares its window cache.
+    fn reader(fbd: &FileBackedDict) -> crate::DictReader {
+        super::super::handles::DictAccess::FileBacked(fbd.clone()).reader()
+    }
+
     /// What one 100-term FSST window costs the cache: its code offsets, one
     /// `u32` per term plus one, and the per-entry overhead.
     const WINDOW_BYTES: usize = 101 * size_of::<u32>() + WINDOW_ENTRY_OVERHEAD;
@@ -899,7 +777,10 @@ mod tests {
     /// windows.
     async fn touch(fbd: &FileBackedDict, terms: &[String], w: usize) {
         let i = w * 100 + 37;
-        assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+        assert_eq!(
+            fbd.encode_exact(&terms[i]).await.unwrap(),
+            Some(i as TermCode)
+        );
     }
 
     /// Windows that are each sorted but out of term order across the child
@@ -944,7 +825,7 @@ mod tests {
         assert_eq!(fbd.len(), 600);
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(
-                fbd.encode(term).await.unwrap(),
+                fbd.encode_exact(term).await.unwrap(),
                 Some(i as TermCode),
                 "{term}"
             );
@@ -957,7 +838,7 @@ mod tests {
                 .zip(&terms)
                 .all(|(got, want)| &**got == want.as_str())
         );
-        assert_eq!(fbd.encode("<http://zzz>").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("<http://zzz>").await.unwrap(), None);
     }
 
     /// A window's first and last term are answered from the bounds alone, an
@@ -969,17 +850,17 @@ mod tests {
         for w in 0..6 {
             let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
             assert_eq!(
-                fbd.encode(&terms[w * 100]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100]).await.unwrap(),
                 Some((w * 100) as TermCode)
             );
             assert_eq!(
-                fbd.encode(&terms[w * 100 + 99]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100 + 99]).await.unwrap(),
                 Some((w * 100 + 99) as TermCode)
             );
             assert_eq!(fbd.debug_windows_rebuilt(), before, "window {w}'s edges");
             assert_eq!(fbd.debug_windows_requested(), asked, "window {w}'s edges");
             assert_eq!(
-                fbd.encode(&terms[w * 100 + 37]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100 + 37]).await.unwrap(),
                 Some((w * 100 + 37) as TermCode)
             );
             assert_eq!(
@@ -997,11 +878,11 @@ mod tests {
         // moves no rebuild count: the request count is what pins "no leaf".
         let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let between = format!("{}~", terms[99]);
-        assert_eq!(fbd.encode(&between).await.unwrap(), None);
+        assert_eq!(fbd.encode_exact(&between).await.unwrap(), None);
         assert_eq!(fbd.lower_bound(between.as_bytes()).await.unwrap(), 100);
-        assert_eq!(fbd.encode("!").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("!").await.unwrap(), None);
         assert_eq!(fbd.lower_bound(b"!").await.unwrap(), 0);
-        assert_eq!(fbd.encode("~").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("~").await.unwrap(), None);
         assert_eq!(fbd.lower_bound(b"~").await.unwrap(), 600);
         assert_eq!(fbd.debug_windows_rebuilt(), before);
         assert_eq!(fbd.debug_windows_requested(), asked);
@@ -1034,16 +915,16 @@ mod tests {
         let (fbd, terms) = windowed_handle(600, 100).await;
         let before = fbd.debug_windows_rebuilt();
         for _ in 0..3 {
-            assert_eq!(fbd.encode(&terms[137]).await.unwrap(), Some(137));
+            assert_eq!(fbd.encode_exact(&terms[137]).await.unwrap(), Some(137));
         }
         assert_eq!(fbd.debug_windows_rebuilt() - before, 1);
-        assert_eq!(fbd.encode(&terms[142]).await.unwrap(), Some(142));
+        assert_eq!(fbd.encode_exact(&terms[142]).await.unwrap(), Some(142));
         let inside = format!("{}~", terms[150]);
         assert_eq!(fbd.lower_bound(inside.as_bytes()).await.unwrap(), 151);
         assert_eq!(fbd.debug_windows_rebuilt() - before, 1);
 
         fbd.debug_clear_cache();
-        assert_eq!(fbd.encode(&terms[137]).await.unwrap(), Some(137));
+        assert_eq!(fbd.encode_exact(&terms[137]).await.unwrap(), Some(137));
         assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
     }
 
@@ -1061,7 +942,10 @@ mod tests {
             }
         }
         assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
-        let any = fbd.decode_many_any(&[450, 105, 450, 9999]).await.unwrap();
+        let any = reader(&fbd)
+            .decode_many(&[450, 105, 450, 9999])
+            .await
+            .unwrap();
         assert_eq!(any[0].as_deref(), Some(terms[450].as_str()));
         assert_eq!(any[1].as_deref(), Some(terms[105].as_str()));
         assert_eq!(any[3], None);
@@ -1079,8 +963,7 @@ mod tests {
         let (fbd, _) = windowed_handle(600, 100).await;
         for w in [0, 2, 5] {
             let chunk = fbd.0.window_chunk(w).await.unwrap();
-            let window = &fbd.0.windows[w];
-            let leaf = rebuild_leaf(&window.layout, window.rows, &fbd.0.source)
+            let leaf = fetch_flat(&fbd.0.windows[w].layout, &fbd.0.source, &VORTEX_SESSION)
                 .await
                 .unwrap();
             let fsst = leaf.try_downcast::<FSST>().expect("an FSST leaf");
@@ -1108,14 +991,14 @@ mod tests {
             let (native, d) = native_over(&terms, window).await;
             let fbd = FileBackedDict::open(&native).await.unwrap().unwrap();
             for (i, term) in terms.iter().enumerate() {
-                assert_eq!(fbd.encode(term).await.unwrap(), Some(i as TermCode));
+                assert_eq!(fbd.encode_exact(term).await.unwrap(), Some(i as TermCode));
                 assert_eq!(
                     fbd.lower_bound(term.as_bytes()).await.unwrap(),
                     i as TermCode
                 );
             }
             let past_the_longest = format!("{}~", terms[9]);
-            assert_eq!(fbd.encode(&past_the_longest).await.unwrap(), None);
+            assert_eq!(fbd.encode_exact(&past_the_longest).await.unwrap(), None);
             assert_eq!(
                 fbd.lower_bound(past_the_longest.as_bytes()).await.unwrap(),
                 d.lower_bound(past_the_longest.as_bytes())
@@ -1127,7 +1010,7 @@ mod tests {
             assert!(decoded.iter().zip(&terms).all(|(got, want)| &**got == want));
             // Any order, repeats included.
             let scattered: Vec<TermCode> = [9, 0, 5, 9, 15, 2, 1, 5, 7, 12, 3, 9].into();
-            let got = fbd.decode_many_any(&scattered).await.unwrap();
+            let got = reader(&fbd).decode_many(&scattered).await.unwrap();
             for (code, term) in scattered.iter().zip(&got) {
                 assert_eq!(term.as_deref(), Some(terms[*code as usize].as_str()));
             }
@@ -1157,7 +1040,7 @@ mod tests {
             .map(|&code| terms.get(code as usize).cloned())
             .collect();
         assert_eq!(got, want);
-        assert_eq!(fbd.decode_many_any(&codes).await.unwrap(), want);
+        assert_eq!(reader(&fbd).decode_many(&codes).await.unwrap(), want);
     }
 
     /// The cache holds at most its budget and evicts the least recently used
@@ -1306,7 +1189,10 @@ mod tests {
         assert!(60 * 5 * size_of::<u32>() < budget / 2);
         for w in 0..60 {
             let i = w * 4 + 1;
-            assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+            assert_eq!(
+                fbd.encode_exact(&terms[i]).await.unwrap(),
+                Some(i as TermCode)
+            );
             assert!(fbd.debug_cached_bytes() <= budget, "after window {w}");
         }
         let cached = fbd.debug_cached_windows();
@@ -1355,7 +1241,7 @@ mod tests {
             assert!(
                 matches!(
                     fbd.decode_many(&codes).await,
-                    Err(VortexRdfError::InvalidOperation(_))
+                    Err(VortexRdfError::InvalidInput(_))
                 ),
                 "{codes:?}"
             );
@@ -1381,13 +1267,14 @@ mod tests {
         let terms: Vec<String> = (0..600).map(|i| format!("{prefix}/term/{i:04}>")).collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let d = TermDictionary::compress_windowed(plain, 100).unwrap();
-        let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&d).await);
-        let descriptor = native
-            .components()
+        let bytes = crate::tests::write_dict_only_store(&d).await;
+        let (_, components) = crate::io::container::store_metadata_of_bytes(&bytes);
+        let descriptor = components
             .iter()
             .find(|c| c.name == DICT_COMPONENT_NAME)
             .unwrap();
         assert_eq!(descriptor.version, 2);
+        let native = crate::tests::open_native_bytes(bytes);
 
         let column = crate::tests::dict_term_column(&native);
         let zoned = column
@@ -1479,17 +1366,24 @@ mod tests {
         assert_eq!(fbd.debug_window_count(), 4);
         // Eight edge terms (a window's first and last) read no leaf.
         for i in (0..4).flat_map(|w| [w * 100, w * 100 + 99]) {
-            assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+            assert_eq!(
+                fbd.encode_exact(&terms[i]).await.unwrap(),
+                Some(i as TermCode)
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 0);
         // Every term finds its own code; each window is rebuilt once.
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(fbd.encode(term).await.unwrap(), Some(i as TermCode), "{i}");
+            assert_eq!(
+                fbd.encode_exact(term).await.unwrap(),
+                Some(i as TermCode),
+                "{i}"
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 4);
         // A near miss — the last byte changed — is absent, not a neighbour.
         let near = format!("{}?", &terms[150][..terms[150].len() - 1]);
-        assert_eq!(fbd.encode(&near).await.unwrap(), None);
+        assert_eq!(fbd.encode_exact(&near).await.unwrap(), None);
         assert_eq!(fbd.lower_bound(near.as_bytes()).await.unwrap(), 151);
     }
 
@@ -1507,12 +1401,10 @@ mod tests {
         let bytes =
             crate::tests::write_dict_only_store_as(&d, crate::io::container::DICT_VERSION, false)
                 .await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("unzoned-windows.vortex");
-        std::fs::write(&path, &bytes).unwrap();
+        let (_dir, path) = crate::tests::temp_store_file(&bytes);
         let native = crate::tests::open_mapped(&path).await;
-        let descriptor = native
-            .components()
+        let (_, components) = crate::io::container::store_metadata_of_bytes(&bytes);
+        let descriptor = components
             .iter()
             .find(|c| c.name == DICT_COMPONENT_NAME)
             .unwrap();
@@ -1545,13 +1437,16 @@ mod tests {
         // The edge terms are answered from the bounds read at open.
         for code in (0..6).flat_map(|w| [w * 100, w * 100 + 99]) {
             let term = column.str_at(code).unwrap();
-            assert_eq!(fbd.encode(term).await.unwrap(), Some(code as TermCode));
+            assert_eq!(
+                fbd.encode_exact(term).await.unwrap(),
+                Some(code as TermCode)
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 0);
         for code in 0..600 {
             let term = column.str_at(code).unwrap();
             assert_eq!(
-                fbd.encode(term).await.unwrap(),
+                fbd.encode_exact(term).await.unwrap(),
                 Some(code as TermCode),
                 "{term}"
             );
@@ -1563,9 +1458,11 @@ mod tests {
         for (code, term) in decoded.iter().enumerate() {
             assert_eq!(&**term, column.str_at(code).unwrap(), "code {code}");
         }
-        assert_eq!(fbd.encode("<http://zzz>").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("<http://zzz>").await.unwrap(), None);
         assert_eq!(
-            fbd.encode("<http://example.org/term/0100>~").await.unwrap(),
+            fbd.encode_exact("<http://example.org/term/0100>~")
+                .await
+                .unwrap(),
             None
         );
     }
@@ -1709,7 +1606,7 @@ mod tests {
             assert!(
                 matches!(
                     fbd.filter_codes(&predicate, &codes).await,
-                    Err(VortexRdfError::InvalidOperation(_))
+                    Err(VortexRdfError::InvalidInput(_))
                 ),
                 "{codes:?}"
             );
@@ -1817,7 +1714,8 @@ mod tests {
     /// leaves are: every leaf but the last holds exactly `zone_len` rows, the
     /// last at most that. The same zone count over leaves cut elsewhere (a
     /// foreign writer's) would hand a window the bounds of other rows, so the
-    /// bounds are read from the leaves instead.
+    /// bounds are read from the leaves instead, as they are for a table cut
+    /// at the leaves that lacks a bound column or holds a null bound.
     #[tokio::test]
     async fn zone_bounds_need_zones_cut_at_the_leaves() {
         let terms: Vec<String> = (0..400)
@@ -1872,5 +1770,65 @@ mod tests {
                 "{rows:?}"
             );
         }
+
+        // Tables cut at the leaves, as a foreign writer could leave them:
+        // without the maximum, without the minimum, or with a null bound. No
+        // bounds come from them, and the leaves give the open the same bounds
+        // the zones did.
+        use vortex_array::IntoArray as _;
+        use vortex_file::WriteOptionsSessionExt as _;
+        let names: Vec<String> = window_bound_aggregates()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let (max, min) = (names[0].as_str(), names[1].as_str());
+        let firsts =
+            || VarBinViewArray::from_iter_str((0..4).map(|w| terms[w * 100].as_str())).into_array();
+        let lasts = |null: Option<usize>| {
+            VarBinViewArray::from_iter_nullable_str(
+                (0..4).map(|w| (Some(w) != null).then(|| terms[w * 100 + 99].as_str())),
+            )
+            .into_array()
+        };
+        for columns in [
+            vec![(min, firsts())],
+            vec![(max, lasts(None))],
+            vec![(max, lasts(Some(2))), (min, firsts())],
+        ] {
+            let (fields, arrays): (Vec<&str>, Vec<_>) = columns.into_iter().unzip();
+            let table = StructArray::try_new(
+                fields.into(),
+                arrays,
+                4,
+                vortex_array::validity::Validity::NonNullable,
+            )
+            .unwrap()
+            .into_array();
+            let stream = vortex_array::stream::ArrayStreamAdapter::new(
+                table.dtype().clone(),
+                futures::stream::iter([Ok(table)]),
+            );
+            let mut bytes = Vec::new();
+            VORTEX_SESSION
+                .write_options()
+                .write(&mut bytes, stream)
+                .await
+                .unwrap();
+            let file = VORTEX_SESSION
+                .open_options()
+                .open_buffer(ByteBuffer::from(bytes))
+                .unwrap();
+            let hand = Zones {
+                table: file.footer().layout().clone(),
+                zone_len: 100,
+            };
+            assert!(
+                zone_bounds(&hand, &leaves, &file.segment_source())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(leaf_bounds(&leaves, &source).await.unwrap(), bounds);
     }
 }

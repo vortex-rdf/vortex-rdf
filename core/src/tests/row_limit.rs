@@ -120,27 +120,21 @@ fn a_row_id_past_the_index_width_is_refused_not_narrowed() {
 #[tokio::test]
 async fn in_memory_index_builds_refuse_row_ids_past_the_top() {
     let _base = RowIdBase::set(TOP);
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         let label = format!("{layout:?}");
         let over =
             build_array::<SortedInMemoryBuilder>(quad_stream(quads(LIMIT + 1)), layout, indexes())
                 .await;
         assert_refused(over, &label);
-        let at = build_array::<SortedInMemoryBuilder>(quad_stream(quads(LIMIT)), layout, indexes())
-            .await
-            .unwrap();
-        assert_reads_back(&VortexRdfStore::from_built(at).unwrap(), LIMIT, &label).await;
-        let unindexed =
-            build_array::<SortedInMemoryBuilder>(quad_stream(quads(LIMIT + 1)), layout, vec![])
-                .await
-                .unwrap();
+        assert_reads_back(
+            &built_store(quads(LIMIT), layout, indexes()).await,
+            LIMIT,
+            &label,
+        )
+        .await;
         assert_eq!(
-            VortexRdfStore::from_built(unindexed)
-                .unwrap()
+            built_store(quads(LIMIT + 1), layout, vec![])
+                .await
                 .size()
                 .await
                 .unwrap(),
@@ -175,7 +169,6 @@ async fn the_out_of_core_merge_refuses_row_ids_past_the_top() {
         assert_reads_back(&VortexRdfStore::from_built(at).unwrap(), LIMIT, &label).await;
     }
 
-    #[cfg(feature = "file-io")]
     {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("over.vortex");
@@ -233,7 +226,6 @@ async fn rebuilds_refuse_a_store_grown_past_the_top() {
         "the append itself is a tail"
     );
     assert_refused(grown.compact().await, "compaction");
-    #[cfg(feature = "file-io")]
     assert_refused(grown.to_bytes().await, "serialization of the tail");
     assert_reads_back(&store, LIMIT, "the store grown from").await;
 }

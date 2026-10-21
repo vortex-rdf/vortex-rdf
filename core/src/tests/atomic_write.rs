@@ -39,6 +39,20 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
     entries
 }
 
+/// Write a store file all-or-nothing in one call, the protocol every writer
+/// runs: `PendingStore::create`, then `PendingStore::write` with `write`
+/// filling the temp file.
+async fn write_store_atomically<F, Fut>(path: &Path, write: F) -> crate::error::Result<()>
+where
+    F: FnOnce(tokio::fs::File) -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<()>>,
+{
+    crate::io::write::PendingStore::create(path)
+        .await?
+        .write(write)
+        .await
+}
+
 const BOTH_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
 
 /// A build whose input fails mid-stream — after valid quads — writes nothing
@@ -46,11 +60,7 @@ const BOTH_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::Sec
 /// file and no temp file.
 #[tokio::test]
 async fn test_failed_build_leaves_nothing_at_a_fresh_path() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         for indexes in [vec![], BOTH_INDEXES.to_vec()] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("store.vortex");
@@ -157,33 +167,50 @@ fn recording_stream(
 }
 
 /// A path that cannot take a store is reported before the input is read: a
-/// missing directory fails at once, not after the whole ingest, sort and
-/// dictionary have run.
+/// missing directory, or a regular file where a directory should be, fails at
+/// once with an error naming the path, not after the whole ingest, sort and
+/// dictionary have run, and creates nothing.
 #[tokio::test]
 async fn test_a_missing_directory_fails_before_the_input_is_read() {
+    use std::io::ErrorKind;
+
     for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing").join("store.vortex");
-        let polled = Arc::new(AtomicBool::new(false));
+        for (parent, name, parent_is_a_file, kind) in [
+            ("missing", "store.vortex", false, ErrorKind::NotFound),
+            ("a_file", "out.vortex", true, ErrorKind::NotADirectory),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            if parent_is_a_file {
+                std::fs::write(dir.path().join(parent), b"not a directory").unwrap();
+            }
+            let before = entries(dir.path());
+            let path = dir.path().join(parent).join(name);
+            let polled = Arc::new(AtomicBool::new(false));
 
-        let error = crate::io::quads_stream_to_vortex_file(
-            recording_stream(polled.clone()),
-            &path,
-            layout,
-            vec![],
-        )
-        .await
-        .expect_err("there is nowhere to put the store");
+            let error = crate::io::quads_stream_to_vortex_file(
+                recording_stream(polled.clone()),
+                &path,
+                layout,
+                vec![],
+            )
+            .await
+            .expect_err("there is nowhere to put the store");
 
-        assert!(
-            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
-            "{layout:?}: {error}"
-        );
-        assert!(
-            !polled.load(Ordering::SeqCst),
-            "{layout:?}: the input was read before the output path was known to take a store"
-        );
-        assert_eq!(entries(dir.path()), Vec::<PathBuf>::new(), "{layout:?}");
+            let tag = format!("{layout:?} {parent}/{name}");
+            assert!(
+                matches!(&error, VortexRdfError::Io(e) if e.kind() == kind),
+                "{tag}: {error}"
+            );
+            assert!(
+                error.to_string().contains(&format!("{path:?}")),
+                "{tag}: the error names the path: {error}"
+            );
+            assert!(
+                !polled.load(Ordering::SeqCst),
+                "{tag}: the input was read before the output path was known to take a store"
+            );
+            assert_eq!(entries(dir.path()), before, "{tag}");
+        }
     }
 }
 
@@ -223,7 +250,6 @@ async fn test_a_directory_at_the_path_is_refused_before_the_input_is_read() {
 /// directory untouched and removes the temp file.
 #[tokio::test]
 async fn test_a_rename_failing_after_the_write_removes_the_temp_file() {
-    use crate::io::ser::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -251,7 +277,6 @@ async fn test_a_rename_failing_after_the_write_removes_the_temp_file() {
 /// was: absent, or the previous store's exact bytes.
 #[tokio::test]
 async fn test_write_failing_after_the_temp_file_exists_removes_it() {
-    use crate::io::ser::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     for existing in [false, true] {
@@ -292,7 +317,6 @@ async fn test_write_failing_after_the_temp_file_exists_removes_it() {
 /// to exist while the write is stalled, so the cleanup is what removed it.
 #[tokio::test]
 async fn test_dropping_the_write_removes_the_temp_file() {
-    use crate::io::ser::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -324,7 +348,6 @@ async fn test_dropping_the_write_removes_the_temp_file() {
 /// and leaves the previous store as it was.
 #[tokio::test]
 async fn test_a_panic_in_the_write_removes_the_temp_file() {
-    use crate::io::ser::write_store_atomically;
     use futures::FutureExt as _;
     use vortex_io::VortexWrite as _;
 
@@ -362,7 +385,6 @@ async fn test_a_panic_in_the_write_removes_the_temp_file() {
 /// be mistaken for a store, and a successful write leaves only `path`.
 #[tokio::test]
 async fn test_temp_file_is_a_sibling_and_gone_after_success() {
-    use crate::io::ser::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -385,15 +407,16 @@ async fn test_temp_file_is_a_sibling_and_gone_after_success() {
     assert_eq!(std::fs::read(&path).unwrap(), b"a store");
 }
 
-/// Dropping the creation of a pending store at any of its steps leaves no
-/// temp file behind. Each poll starts one filesystem call and the sleep lets
-/// it finish, so every drop lands on a call that has been made and not yet
-/// seen by the future.
+/// Dropping the creation of a pending store at any of its steps, up to the
+/// one that completes it, leaves no temp file behind. Each poll starts one
+/// filesystem call and the sleep lets it finish, so every drop lands on a
+/// call that has been made and not yet seen by the future; the check then
+/// waits up to a second for the directory to hold only the store.
 #[tokio::test]
 async fn test_dropping_the_creation_at_any_step_leaves_no_temp_file() {
-    use crate::io::ser::PendingStore;
+    use crate::io::write::PendingStore;
     use std::task::Poll;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     for existing in [false, true] {
         for steps in 1..=12 {
@@ -403,23 +426,37 @@ async fn test_dropping_the_creation_at_any_step_leaves_no_temp_file() {
                 std::fs::write(&path, b"the previous store").unwrap();
             }
             let mut create = Box::pin(PendingStore::create(&path));
+            let mut completed = false;
             for _ in 0..steps {
                 match futures::poll!(create.as_mut()) {
-                    Poll::Ready(_) => break,
+                    Poll::Ready(_) => {
+                        completed = true;
+                        break;
+                    }
                     Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
             drop(create);
-            std::thread::sleep(Duration::from_millis(50));
 
-            let leftovers: Vec<PathBuf> = entries(dir.path())
-                .into_iter()
-                .filter(|entry| entry != &path)
-                .collect();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let leftovers = loop {
+                let leftovers: Vec<PathBuf> = entries(dir.path())
+                    .into_iter()
+                    .filter(|entry| entry != &path)
+                    .collect();
+                if leftovers.is_empty() || Instant::now() >= deadline {
+                    break leftovers;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
             assert!(
                 leftovers.is_empty(),
                 "existing={existing}, dropped after {steps} steps: {leftovers:?}"
             );
+            // Every larger step count replays the completed creation.
+            if completed {
+                break;
+            }
         }
     }
 }
@@ -690,7 +727,6 @@ mod links_and_permissions {
     /// temp file.
     #[tokio::test]
     async fn test_the_temp_file_has_the_old_permissions_while_it_is_written() {
-        use crate::io::ser::write_store_atomically;
         use vortex_io::VortexWrite as _;
 
         let (dir, path) =
@@ -721,7 +757,7 @@ mod links_and_permissions {
     /// new file gets.
     #[tokio::test]
     async fn test_a_temp_standing_in_for_a_store_is_born_private() {
-        use crate::io::ser::create_temp;
+        use crate::io::write::create_temp;
 
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("plain");
@@ -925,9 +961,11 @@ mod links_and_permissions {
     /// the store replaces, links followed — not beside the link the store was
     /// opened through. Through `current -> versions/v3.vortex` in a directory
     /// that takes no new files, the compaction succeeds because `versions/`
-    /// does, and nothing is left in either directory.
+    /// does, and nothing is left in either directory. The run directory is
+    /// named after the file it sits beside, not after the link.
     #[tokio::test]
     async fn test_compaction_spills_beside_the_file_it_replaces_not_the_link() {
+        use crate::store::builders::spill::spill_hooks;
         // `VORTEX_RDF_SPILL_DIR` outranks any placement by design: only assert
         // the default placement when it is absent.
         if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
@@ -946,6 +984,8 @@ mod links_and_permissions {
         let Some(_read_only) = read_only_dir(dir.path()) else {
             return;
         };
+        // The setup's own build spilled beside `v3.vortex` as well.
+        let setup_spill = spill_hooks::last_dir();
 
         let compacted = tailed
             .compact()
@@ -964,8 +1004,115 @@ mod links_and_permissions {
             13
         );
         let versions = dir.path().join("versions");
+        let spilled = spill_hooks::last_dir().expect("the compaction made a run directory");
+        assert_ne!(
+            Some(&spilled),
+            setup_spill.as_ref(),
+            "the compaction made a run directory of its own"
+        );
+        assert_eq!(spilled.parent(), Some(versions.as_path()));
+        let name = spilled.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".v3.vortex.spill-"), "{name}");
         assert_eq!(entries(dir.path()), vec![current.clone(), versions.clone()]);
         assert_eq!(entries(&versions), vec![v3]);
+    }
+
+    /// A spill run that cannot be written fails with an error that names the
+    /// directory it was to be written in and the `VORTEX_RDF_SPILL_DIR` way
+    /// out (a writable directory), and keeps the I/O error's kind: here, a
+    /// run file in a directory that takes no new files.
+    #[test]
+    fn test_spill_write_error_names_the_directory_and_the_hint() {
+        use crate::store::RawQuad;
+        use crate::store::builders::spill::RunWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let Some(_read_only) = read_only_dir(dir.path()) else {
+            return;
+        };
+
+        let error = RunWriter::<RawQuad>::create(&dir.path().join("quads_run_0.bin"))
+            .err()
+            .expect("a directory that takes no new files takes no spill run");
+
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("; set VORTEX_RDF_SPILL_DIR to a writable directory"),
+            "{message}"
+        );
+    }
+
+    /// A run directory that cannot be created fails the same way, naming the
+    /// directory it was to be created in: `.` for the working directory, the
+    /// one a bare relative output path is in.
+    #[test]
+    fn test_spill_directory_error_names_the_directory_and_the_hint() {
+        use crate::store::builders::spill::{TempRunsGuard, spill_io_error};
+        // `VORTEX_RDF_SPILL_DIR` outranks the base by design: only assert
+        // where it is absent.
+        if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
+            eprintln!("skipped: VORTEX_RDF_SPILL_DIR is set");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some(_read_only) = read_only_dir(dir.path()) else {
+            return;
+        };
+
+        let error = TempRunsGuard::create(None, Some(dir.path()))
+            .err()
+            .expect("a directory that takes no new files takes no run directory");
+
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("; set VORTEX_RDF_SPILL_DIR to a writable directory"),
+            "{message}"
+        );
+        let in_cwd = spill_io_error(
+            Path::new(""),
+            "directory creation",
+            std::io::ErrorKind::PermissionDenied.into(),
+        );
+        assert!(in_cwd.to_string().contains(" failed in .: "), "{in_cwd}");
+    }
+
+    /// A serialization to a file spills beside it, on the volume that takes
+    /// the store: the run directory is a hidden sibling named after the
+    /// output, and it is gone once the write is done.
+    #[tokio::test]
+    async fn test_serialize_spills_beside_the_output() {
+        use crate::store::builders::spill::spill_hooks;
+        // `VORTEX_RDF_SPILL_DIR` outranks any placement by design: only assert
+        // the default placement when it is absent.
+        if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
+            eprintln!("skipped: VORTEX_RDF_SPILL_DIR is set");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.vortex");
+
+        rebuild(&path, modular_quads(12, 3, 4)).await.unwrap();
+
+        let spilled = spill_hooks::last_dir().expect("the build made a run directory");
+        assert_eq!(spilled.parent(), Some(dir.path()));
+        let name = spilled.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".out.vortex.spill-"), "{name}");
+        assert_eq!(entries(dir.path()), vec![path]);
     }
 
     /// 4,200 new quads: past the 4,096-row auto-compaction floor.
@@ -998,13 +1145,7 @@ mod links_and_permissions {
         let appended_subject =
             NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00100").unwrap());
         assert_eq!(
-            appended
-                .match_pattern(Some(&appended_subject), None, None, None)
-                .await
-                .unwrap()
-                .size()
-                .await
-                .unwrap(),
+            matched_size(&appended, Some(&appended_subject), None, None, None).await,
             1
         );
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
@@ -1014,13 +1155,7 @@ mod links_and_permissions {
             .filter(|quad| quad.predicate == p0)
             .count();
         assert_eq!(
-            appended
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap()
-                .size()
-                .await
-                .unwrap(),
+            matched_size(&appended, None, Some(&p0), None, None).await,
             expected_p0
         );
         assert_eq!(crate::store::test_hooks::gathers(), gathered);
@@ -1189,6 +1324,33 @@ mod links_and_permissions {
         assert_eq!(entries(dir.path()), vec![path.clone()]);
     }
 
+    /// A file removed since the store opened it is no other file: compaction
+    /// writes the store's rows to the path again, and leaves nothing else
+    /// beside them.
+    #[tokio::test]
+    async fn test_compacting_a_store_whose_file_was_removed_writes_it_again() {
+        let quads = modular_quads(12, 3, 4);
+        let (dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let extra = make_quad(
+            "http://example.org/s99",
+            "http://example.org/p0",
+            "object 9",
+            GraphName::DefaultGraph,
+        );
+        let tailed = store.add_quad(extra.clone()).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let compacted = tailed.compact().await.unwrap();
+
+        let mut want = quads;
+        want.push(extra);
+        assert_eq!(view_strings(&compacted).await, quad_strings(&want));
+        let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(view_strings(&reopened).await, quad_strings(&want));
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
+
     /// The append that crosses the auto-compaction threshold does not take
     /// the refusal for the writer's "unwritable": it comes back as the error
     /// it is, and the rebuilt file is untouched.
@@ -1217,7 +1379,7 @@ mod links_and_permissions {
     #[tokio::test]
     async fn test_a_file_replaced_during_the_write_is_not_overwritten() {
         use crate::io::read::FileIdentity;
-        use crate::io::ser::PendingStore;
+        use crate::io::write::PendingStore;
         use vortex_io::VortexWrite as _;
 
         let (dir, path) =
@@ -1251,8 +1413,6 @@ mod links_and_permissions {
     /// any other, and an append does not hide it.
     #[tokio::test]
     async fn test_only_the_refusal_before_the_build_counts_as_unwritable() {
-        use crate::io::ser::write_store_atomically;
-
         let (dir, path) =
             write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
         if !read_only_is_honoured(&path) {
@@ -1313,6 +1473,14 @@ mod special_targets {
         std::fs::symlink_metadata(path).unwrap().file_type()
     }
 
+    /// Make a pipe at `path` with `mkfifo`; false when the tool is not there.
+    fn make_fifo(path: &Path) -> bool {
+        std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     async fn write_to(path: &Path) -> crate::error::Result<()> {
         crate::io::quads_stream_to_vortex_file(
             quad_stream(modular_quads(12, 3, 4)),
@@ -1337,11 +1505,7 @@ mod special_targets {
     async fn test_a_pipe_is_written_through_while_a_reader_drains_it() {
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("pipe");
-        if !std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !make_fifo(&fifo) {
             eprintln!("skipped: mkfifo is not available");
             return;
         }
@@ -1398,5 +1562,48 @@ mod special_targets {
         assert!(!polled.load(Ordering::SeqCst), "the input was read");
         assert!(file_type(&socket).is_socket(), "the socket was replaced");
         assert_eq!(entries(dir.path()), vec![socket]);
+    }
+
+    /// A store opened from a file is never written into a pipe that has
+    /// taken the file's path since: its compaction is refused as replaced
+    /// since the open, and the pipe is left alone. The compaction runs on a
+    /// thread of its own and is waited for at most 10 s, since one that
+    /// opened the pipe, which has no reader, would block there.
+    #[tokio::test]
+    async fn test_compaction_refuses_a_path_turned_into_a_pipe_since_the_store_opened() {
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Dictionary, vec![]).await;
+        let tailed = VortexRdfStore::from_file(&path)
+            .await
+            .unwrap()
+            .add_quads(appended_quads(2))
+            .await
+            .unwrap();
+        let fifo = dir.path().join("pipe");
+        if !make_fifo(&fifo) {
+            eprintln!("skipped: mkfifo is not available");
+            return;
+        }
+        std::fs::rename(&fifo, &path).unwrap();
+
+        let (sender, compacted) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = sender.send(runtime.block_on(tailed.compact()).err());
+        });
+        let error = compacted
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the compaction returns within 10 s")
+            .expect("a pipe is not the file the store opened");
+        assert!(
+            matches!(&error, VortexRdfError::InvalidOperation(m)
+                if m.contains("was replaced since this store opened it")),
+            "{error}"
+        );
+        assert!(file_type(&path).is_fifo(), "the pipe was replaced");
+        assert_eq!(entries(dir.path()), vec![path]);
     }
 }

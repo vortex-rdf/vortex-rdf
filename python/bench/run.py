@@ -1,4 +1,4 @@
-"""Orchestrate the Python comparative benchmark and emit `results.json`.
+"""Orchestrate the Python comparative benchmark and emit `target/bench/python.json`.
 
 Provisions one virtualenv per library, generates the shared dataset files once,
 runs each adapter in its own subprocess, and aggregates the rows into the shape
@@ -17,7 +17,7 @@ is abi3 and `python/vortex_rdf/` is a plain package directory, so putting it on
 PYTHONPATH is enough and avoids a maturin build per run.
 
 Every adapter counts every query pattern before timing it; a disagreement
-between libraries is recorded under `config.countWarnings` in `results.json`.
+between libraries is recorded under `config.countWarnings` in that file.
 A phase a library lacks is emitted as an explained `unsupported` cell instead
 of a missing row, so the dashboard can say why the cell is empty.
 """
@@ -305,7 +305,8 @@ def main() -> int:
             "availableMemoryMb": mem.get("MemAvailable"),
         },
     }
-    dest = BENCH_DIR / "results.json"
+    dest = REPO_ROOT / "target" / "bench" / "python.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(out, indent=2), encoding="utf-8")
     log(
         f"\nWrote {len(rows)} benchmark rows, {len(memory)} memory readings, "

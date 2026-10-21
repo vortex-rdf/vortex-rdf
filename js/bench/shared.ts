@@ -202,10 +202,10 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
 // The hdt crate's wasm surface is read-only: HDT *construction* (`read_nt`)
 // spawns OS threads and uses rayon, which trap on wasm32, so the artifact is
 // built natively and only opened here. The Rust comparative bench writes one
-// from the same shared dataset as part of its run (`cargo bench --bench
-// compare`, at BENCH_SIZE = this tab's D³) — point `HDT_FILE` elsewhere to
-// override. The wasm module itself is the bench's own build of the crate's
-// bindings: `npm run build:hdt-wasm` → bench/hdt-pkg (see bench/hdt-wasm).
+// from the same shared dataset as part of its run (`cargo bench --manifest-path
+// bench-compare/Cargo.toml`, at BENCH_SIZE = this tab's D³) — point `HDT_FILE`
+// elsewhere to override. The wasm module itself is the bench's own build of the
+// crate's bindings: `npm run build:hdt-wasm` → bench/hdt-pkg (see bench/hdt-wasm).
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const HDT_FILE = process.env.HDT_FILE
@@ -262,7 +262,8 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
             if (!existsSync(HDT_FILE)) {
                 throw new Error(
                     `no HDT artifact at ${HDT_FILE} — the Rust comparative bench builds it `
-                    + '(cargo bench --bench compare), or point HDT_FILE at one');
+                    + '(cargo bench --manifest-path bench-compare/Cargo.toml), '
+                    + 'or point HDT_FILE at one');
             }
             const mod = await hdtMod();
             const h = new mod.Hdt(readFileSync(HDT_FILE));
@@ -271,7 +272,8 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
                 h.free();
                 throw new Error(
                     `HDT artifact at ${HDT_FILE} holds ${n} triples but this run's dataset has `
-                    + `${quads.length} — rebuild it: BENCH_SIZE=${quads.length} cargo bench --bench compare`);
+                    + `${quads.length} — rebuild it: BENCH_SIZE=${quads.length} `
+                    + 'cargo bench --manifest-path bench-compare/Cargo.toml');
             }
             return h;
         },

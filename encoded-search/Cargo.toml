@@ -45,6 +45,10 @@ vortex-sparse = { workspace = true }
 name = "layout"
 required-features = ["layout"]
 
+[[test]]
+name = "inline_array_tree"
+required-features = ["layout"]
+
 [[bench]]
 name = "probe"
 harness = false

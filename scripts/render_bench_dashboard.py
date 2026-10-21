@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Turn a `cargo bench --bench benchmark` run into the static HTML dashboard.
+"""Turn the four benchmark suites' results into the static HTML dashboard.
 
-Usage:
-    cargo bench --bench benchmark | tee bench_output.txt
-    python3 scripts/render_bench_dashboard.py bench_output.txt public/index.html
+Usage (`scripts/refresh.sh` runs the suites, then this over their outputs):
+    python3 scripts/render_bench_dashboard.py target/bench/rust.txt target/bench/public/index.html
+        [--rust-compare target/bench/rust-compare.json] [--js target/bench/js.json]
+        [--python target/bench/python.json]
+
+The first argument is the log of `cargo bench --bench benchmark` and
+`--bench match_lazy`, whose `#dataset` line gives the run's dataset; the
+other three suites write dashboard-shaped JSON (see `load_suite`), and a
+suite left out renders as its tab's placeholder.
 
 Divan (via codspeed-divan-compat) has no machine-readable output mode, so this
 parses its tree-table text output directly. The tree-drawing glyph (U+2502,
@@ -12,6 +18,7 @@ separator, so a naive split on "│" misaligns nested rows by one column --
 the tree prefix is stripped first, and the name/first-value pair (which share
 a cell with no separator between them) is split on runs of 2+ spaces instead.
 """
+import argparse
 import json
 import os
 import re
@@ -22,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+TEMPLATE = Path(__file__).resolve().parent / "bench_dashboard_template.html"
 PREFIX_RE = re.compile(r"^[\s│]*([├╰])─\s*(.*)$")
 UNIT_NS = {"ns": 1.0, "µs": 1_000.0, "us": 1_000.0, "ms": 1_000_000.0, "s": 1_000_000_000.0}
 
@@ -191,14 +199,6 @@ def cpu_model():
     return "unknown CPU"
 
 
-def default_bench_size():
-    """The fallback dataset size baked into `core/benches/support/mod.rs`'s
-    `bench_size()`, i.e. what a run used if it didn't override `BENCH_SIZE`."""
-    src = (REPO_ROOT / "core" / "benches" / "support" / "mod.rs").read_text(encoding="utf-8")
-    m = re.search(r"fn bench_size.*?unwrap_or\(([\d_]+)\)", src, re.DOTALL)
-    return int(m.group(1).replace("_", "")) if m else None
-
-
 def measured_at(source=None):
     """The dashboard's shared "Measured …" stamp: UTC, to the minute.
 
@@ -234,40 +234,21 @@ def sample_counts(results):
     return [c for c, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
-def build_rust_config(bench_size=None, dataset=None):
-    """Context the Rust tab needs but divan's text output does not carry.
-
-    The JavaScript and Python harnesses emit their own config alongside their
-    results; the Rust suite is scraped from stdout, so its dataset size has to
-    be reconstructed here and injected -- otherwise the template can only
-    hardcode it, which is how it came to claim 100,000 quads long after that had
-    changed. The run's repetition counts go into the provenance line instead
-    (see `build_provenance`), which is where every tab now states them.
-
-    `dataset` is the run's own `#dataset` stamp and outranks both the CLI
-    override and the source default: it is the row count the binary generated,
-    not the one the caller meant to ask for.
-    """
-    size = bench_size if bench_size is not None else default_bench_size()
-    if dataset:
-        size = dataset.get("quads", size)
-    return {"benchSize": size, "dataset": dataset}
-
-
-def build_provenance(results, timer_precision, bench_size=None, source=None):
+def build_provenance(results, timer_precision, quads, source):
+    """The Rust tab's provenance line. Divan's text output carries no config,
+    so the run's repetition counts are read off its rows and its size off its
+    `#dataset` stamp: `quads` is the row count the binary generated."""
     commit = os.environ.get("GITHUB_SHA", git("rev-parse", "HEAD"))[:7]
     branch = os.environ.get("GITHUB_REF_NAME", git("rev-parse", "--abbrev-ref", "HEAD", default="unknown"))
     samples = sample_counts(results)
     samples_str = f"{samples[0]} samples/benchmark" if samples else "? samples/benchmark"
     if len(samples) > 1:
         samples_str += f" ({', '.join(samples[1:])} for the heavy phases)"
-    size = bench_size if bench_size is not None else default_bench_size()
-    size_str = f"{size:,}" if size else "unknown"
     precision = f", {timer_precision} precision" if timer_precision else ""
 
     return (
         f"Measured {measured_at(source)} · commit {commit} ({branch}) · {cpu_model()}, {os.cpu_count()} threads · "
-        f"BENCH_SIZE = {size_str} quads · {samples_str} · "
+        f"BENCH_SIZE = {quads:,} quads · {samples_str} · "
         f"codspeed-divan-compat, wall-clock (os) timer{precision}"
     )
 
@@ -319,182 +300,134 @@ def check_scale_agreement(rust_quads, suites):
     distinct-term count off the cross-library config, so the tiles can state a
     dataset that never existed. The page cannot detect this; only the render,
     which sees all four configs at once, can.
+
+    Every suite records its row count as `triplesCount`.
     """
-    if not rust_quads:
-        return
     for name, config in suites:
-        quads = (config or {}).get("quadsCount")
-        if quads and quads != rust_quads:
+        rows = config.get("triplesCount")
+        if rows and rows != rust_quads:
             print(
-                f"WARNING: the {name} results measured {quads:,} quads but the Rust run "
+                f"WARNING: the {name} results measured {rows:,} quads but the Rust run "
                 f"measured {rust_quads:,} -- the page will mix both scales. "
                 f"Re-run that suite (scripts/refresh.sh --only <stage>,render).",
                 file=sys.stderr,
             )
 
 
-def load_rust_compare(path):
-    """Load `core/benches/compare.rs`'s output -- the Rust tab's cross-library
-    comparison against oxigraph, sophia and hdt.
+class SuiteError(Exception):
+    """A suite's results file the page cannot be built from."""
 
-    Same dashboard shape as the JavaScript and Python comparative suites
-    (`{"results": [...], "sizes": [...], "config": {...}}`), because that suite
-    emits the rows directly rather than being scraped from divan text. Returns
-    `(results_list, sizes_list, memory_list, config_dict)` -- `memory` holds one
-    `{slug, label, role, peakRssMb}` entry per library process, like its JavaScript
-    and Python counterparts.
+
+def load_suite(path, stage):
+    """One comparative suite's results, with every key the page reads.
+
+    `bench-compare/benches/compare.rs`, `js/bench/compare.bench.ts` and
+    `python/bench/run.py` each write one dashboard-shaped JSON object, with the
+    keys that suite has:
+      - `results`: the rows. A row for an operation a library's API does not
+        offer carries `"unsupported": true`, a `reason` and `median_ns: null`,
+        so the panels leave it out of the column's best/ratio arithmetic.
+      - `memory`: one `{slug, label, role, peakRssMb}` entry per library process.
+      - `sizes` (Rust cross-library, Python): one `{slug, label, bytes}` entry
+        per library's on-disk artifact; `bytes` is null for a store that lives
+        only in memory.
+      - `provenance` (JavaScript, Python): the suite's own provenance line.
+      - `failures` (JavaScript): the phases a worker could not measure.
+      - `config`: the dataset sizes and iteration counts the run used.
+
+    A suite with no file gets every default, and the page renders that tab's
+    placeholder instead of its tables. A file that does not read as one JSON
+    object raises `SuiteError`, naming the refresh.sh `stage` that writes it.
     """
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return (
-        data.get("results", []),
-        data.get("sizes", []),
-        data.get("memory", []),
-        data.get("config", {}),
-    )
-
-
-def load_js_results(path):
-    """Load the JavaScript benchmark results emitted by `js/bench/compare.bench.ts`.
-
-    That file is already dashboard-shaped. It may be either a bare list of result
-    rows, or an object `{"provenance": str, "results": [...], "memory": [...],
-    "config": {...}}` (`memory` holds one `{slug, label, role, peakRssMb}` entry per
-    adapter process -- see shared.ts's `peakRssMb`; `config` holds the dataset
-    sizes and iteration counts the run used). Returns
-    `(results_list, provenance_str, memory_list, failures_list, config_dict)`.
-    """
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if isinstance(data, dict):
-        return (
-            data.get("results", []),
-            data.get("provenance", ""),
-            data.get("memory", []),
-            data.get("failures", []),
-            data.get("config", {}),
-        )
-    return data, "", [], [], {}
-
-
-def load_python_results(path):
-    """Load the Python benchmark results emitted by `python/bench/run.py`.
-
-    Same dashboard shape as the JavaScript results plus `sizes`, a list of
-    `{slug, label, bytes}` giving each library's on-disk artifact -- the Python
-    comparison is between file-backed formats, so artifact size is a first-class
-    axis there rather than an afterthought. `bytes` is null for a library whose
-    store lives only in memory.
-
-    Rows may additionally carry `"unsupported": true` with a `reason`, for an
-    operation a library's API does not offer at all (see the mutation column).
-    Those rows have `median_ns: null` so the panels exclude them from the
-    column's best/ratio arithmetic.
-    """
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return (
-        data.get("results", []),
-        data.get("provenance", ""),
-        data.get("memory", []),
-        data.get("sizes", []),
-        data.get("config", {}),
-    )
+    data = {}
+    if path:
+        rerun = f"re-run its stage (scripts/refresh.sh --only {stage},render)"
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise SuiteError(f"cannot read {path} ({e}) -- {rerun}.") from None
+        if not isinstance(data, dict):
+            raise SuiteError(f"{path} holds a JSON {type(data).__name__}, not a results object -- {rerun}.")
+    defaults = {"results": [], "provenance": "", "memory": [], "failures": [], "sizes": [], "config": {}}
+    return {key: data.get(key, default) for key, default in defaults.items()}
 
 
 def main():
-    if len(sys.argv) < 3:
-        print(
-            f"usage: {sys.argv[0]} <bench-output.txt> <output.html> "
-            "[--js <js-results.json>] [--python <py-results.json>] "
-            "[--rust-compare <compare-results.json>] [--bench-size <n>]",
-            file=sys.stderr,
-        )
+    parser = argparse.ArgumentParser(description="Render the benchmark dashboard (see the module docstring).")
+    parser.add_argument("rust_log", type=Path, help="the Rust internals' `cargo bench` log, with its `#dataset` line")
+    parser.add_argument("out", type=Path, help="the page to write")
+    parser.add_argument("--rust-compare", type=Path, help="bench-compare/benches/compare.rs's results")
+    parser.add_argument("--js", type=Path, help="js/bench/compare.bench.ts's results")
+    parser.add_argument("--python", type=Path, help="python/bench/run.py's results")
+    args = parser.parse_args()
+
+    try:
+        bench_text = args.rust_log.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"ERROR: cannot read the Rust log ({e}) -- run the rust stage first "
+              "(scripts/refresh.sh --only rust,render).", file=sys.stderr)
         return 1
-
-    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
-    in_path, out_path = Path(positional[0]), Path(positional[1])
-    js_path = None
-    if "--js" in sys.argv:
-        js_path = sys.argv[sys.argv.index("--js") + 1]
-    py_path = None
-    if "--python" in sys.argv:
-        py_path = sys.argv[sys.argv.index("--python") + 1]
-    rc_path = None
-    if "--rust-compare" in sys.argv:
-        rc_path = sys.argv[sys.argv.index("--rust-compare") + 1]
-
-    bench_size_override = None
-    if "--bench-size" in sys.argv:
-        bench_size_override = int(sys.argv[sys.argv.index("--bench-size") + 1])
-
-    template_path = Path(__file__).resolve().parent / "bench_dashboard_template.html"
-
-    bench_text = in_path.read_text(encoding="utf-8")
     results, timer_precision = parse_bench_output(bench_text)
-    rust_dataset = parse_dataset_shape(bench_text)
-    if rust_dataset and bench_size_override not in (None, rust_dataset.get("quads")):
-        print(
-            f"note: --bench-size {bench_size_override} disagrees with the run's own "
-            f"{rust_dataset.get('quads')} quads; using the run's",
-            file=sys.stderr,
-        )
-        bench_size_override = rust_dataset["quads"]
     if not results:
         print("no benchmark results parsed -- is the input the raw `cargo bench` output?", file=sys.stderr)
         return 1
+    dataset = parse_dataset_shape(bench_text)
+    if not dataset or not isinstance(dataset.get("quads"), int):
+        print(f"ERROR: {args.rust_log} has no `#dataset` line with a quad count. Each Rust bench "
+              "target prints one before it measures, and the page takes the run's dataset size "
+              "from it; re-run the rust stage (scripts/refresh.sh --only rust,render).",
+              file=sys.stderr)
+        return 1
+    quads = dataset["quads"]
 
-    js_results, js_provenance, js_memory, js_failures, js_config = ([], "", [], [], {})
-    if js_path:
-        js_results, js_provenance, js_memory, js_failures, js_config = load_js_results(js_path)
-
-    rc_results, rc_sizes, rc_memory, rc_config = ([], [], [], {})
-    if rc_path:
-        rc_results, rc_sizes, rc_memory, rc_config = load_rust_compare(rc_path)
-        rc_config["measuredAt"] = measured_at(Path(rc_path))
-
-    py_results, py_provenance, py_memory, py_sizes, py_config = ([], "", [], [], {})
-    if py_path:
-        py_results, py_provenance, py_memory, py_sizes, py_config = load_python_results(py_path)
-
+    try:
+        compare = load_suite(args.rust_compare, "compare")
+        js = load_suite(args.js, "js")
+        py = load_suite(args.python, "python")
+    except SuiteError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    if args.rust_compare:
+        compare["config"]["measuredAt"] = measured_at(args.rust_compare)
     check_scale_agreement(
-        (rust_dataset or {}).get("quads") or bench_size_override,
-        [("Rust cross-library", rc_config), ("JavaScript", js_config), ("Python", py_config)],
+        quads, [("Rust cross-library", compare["config"]), ("JavaScript", js["config"]), ("Python", py["config"])],
     )
 
     # One duration format across all four sources (see `fmt_duration`).
-    for rows in (results, rc_results, js_results, py_results):
+    for rows in (results, compare["results"], js["results"], py["results"]):
         normalize_durations(rows)
 
-    provenance = build_provenance(results, timer_precision, bench_size_override, in_path)
-    template = template_path.read_text(encoding="utf-8")
-    out = (
-        template
-        .replace("__BENCH_DATA__", json.dumps(results))
-        .replace("__PROVENANCE__", json.dumps(provenance))
-        .replace("__RUST_CONFIG_DATA__",
-                 json.dumps(build_rust_config(bench_size_override, rust_dataset)))
-        .replace("__RUST_COMPARE_DATA__", json.dumps(rc_results))
-        .replace("__RUST_COMPARE_SIZES__", json.dumps(rc_sizes))
-        .replace("__RUST_COMPARE_MEMORY__", json.dumps(rc_memory))
-        .replace("__RUST_COMPARE_CONFIG__", json.dumps(rc_config))
-        .replace("__JS_BENCH_DATA__", json.dumps(js_results))
-        .replace("__JS_PROVENANCE__", json.dumps(js_provenance))
-        .replace("__JS_MEMORY_DATA__", json.dumps(js_memory))
-        .replace("__JS_FAILURE_DATA__", json.dumps(js_failures))
-        .replace("__JS_CONFIG_DATA__", json.dumps(js_config))
-        .replace("__PY_BENCH_DATA__", json.dumps(py_results))
-        .replace("__PY_PROVENANCE__", json.dumps(py_provenance))
-        .replace("__PY_MEMORY_DATA__", json.dumps(py_memory))
-        .replace("__PY_SIZE_DATA__", json.dumps(py_sizes))
-        .replace("__PY_CONFIG_DATA__", json.dumps(py_config))
-    )
+    # The template's placeholders, each filled with its value as JSON.
+    values = {
+        "__BENCH_DATA__": results,
+        "__PROVENANCE__": build_provenance(results, timer_precision, quads, args.rust_log),
+        "__RUST_CONFIG_DATA__": {"benchSize": quads, "dataset": dataset},
+        "__RUST_COMPARE_DATA__": compare["results"],
+        "__RUST_COMPARE_SIZES__": compare["sizes"],
+        "__RUST_COMPARE_MEMORY__": compare["memory"],
+        "__RUST_COMPARE_CONFIG__": compare["config"],
+        "__JS_BENCH_DATA__": js["results"],
+        "__JS_PROVENANCE__": js["provenance"],
+        "__JS_MEMORY_DATA__": js["memory"],
+        "__JS_FAILURE_DATA__": js["failures"],
+        "__JS_CONFIG_DATA__": js["config"],
+        "__PY_BENCH_DATA__": py["results"],
+        "__PY_PROVENANCE__": py["provenance"],
+        "__PY_MEMORY_DATA__": py["memory"],
+        "__PY_SIZE_DATA__": py["sizes"],
+        "__PY_CONFIG_DATA__": py["config"],
+    }
+    out = re.sub(r"__[A-Z_]+__", lambda m: json.dumps(values[m.group(0)]),
+                 TEMPLATE.read_text(encoding="utf-8"))
 
-    if not check_script_syntax(out, out_path):
+    if not check_script_syntax(out, args.out):
         return 1
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(out, encoding="utf-8")
-    print(f"parsed {len(results)} Rust + {len(rc_results)} Rust-compare + {len(js_results)} JS + {len(py_results)} Python "
-          f"benchmark results ({len(js_memory) + len(py_memory)} memory readings, "
-          f"{len(py_sizes)} artifact sizes) -> {out_path}")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(out, encoding="utf-8")
+    print(f"parsed {len(results)} Rust + {len(compare['results'])} Rust-compare + {len(js['results'])} JS + "
+          f"{len(py['results'])} Python benchmark results ({len(js['memory']) + len(py['memory'])} memory "
+          f"readings, {len(py['sizes'])} artifact sizes) -> {args.out}")
     return 0
 
 

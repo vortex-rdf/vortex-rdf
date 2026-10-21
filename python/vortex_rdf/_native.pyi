@@ -29,7 +29,25 @@ _KeepSpec = Dict[Union[str, int], Union[_U64s, range, Tuple[int, int]]]
 _Probe = Union[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]], Dict[str, Any]]
 
 class VortexRdfError(Exception):
-    """Raised when a Vortex-RDF store operation fails."""
+    """Raised when a Vortex-RDF store operation fails: a store that does not
+    read, an operation the store refuses. An invalid argument raises
+    ``ValueError`` instead, and an I/O failure ``OSError``."""
+
+class JoinTooLarge(VortexRdfError):
+    """Raised when a join would make more row pairs than its ``max_pairs``
+    allows, before any pair is built. ``pairs`` is the join's pair count;
+    ``args`` is ``(message, pairs)``, the message naming the count and the
+    cap."""
+
+    @property
+    def pairs(self) -> int:
+        """The join's pair count (``args[1]``)."""
+        ...
+
+class Cancelled(VortexRdfError):
+    """Raised by a call or a pull whose `CancelToken` was cancelled before it
+    completed: the work it had in flight is dropped, and an iterator that
+    raises it stops."""
 
 class TermDict:
     def decode(self, code: int) -> Optional[str]:
@@ -128,16 +146,18 @@ class TermDict:
     @property
     def file_backed(self) -> bool:
         """Whether terms are read from the store's file on demand rather
-        than held in memory."""
+        than held in memory. A read of the file that fails raises
+        ``VortexRdfError`` (``OSError`` for an I/O failure)."""
         ...
     def decode_many(self, codes: _U64s) -> List[Optional[str]]:
         """Decode a batch of codes in one GIL-released call.
 
-        A `U64Column`, a u64 buffer (``memoryview(col).cast("Q")``,
-        ``array("Q", ...)``, a uint64 NumPy array), a non-negative int64
-        buffer or the raw byte view a `U64Column` exports is read in one
-        copy; a buffer of other items (a ``cast("I")`` view, a u32 array)
-        raises ``ValueError``. Any int sequence works element by element.
+        A `U64Column` is shared, not copied. A u64 buffer
+        (``memoryview(col).cast("Q")``, ``array("Q", ...)``, a uint64 NumPy
+        array), a non-negative int64 buffer or the raw byte view a
+        `U64Column` exports is read in one copy; a buffer of other items (a
+        ``cast("I")`` view, a u32 array) raises ``ValueError``. Any int
+        sequence works element by element.
         A repeated code usually shares one string object: a small cache of
         recently decoded codes serves repeats, and a code it has dropped is
         decoded again as an equal, separate string."""
@@ -157,6 +177,11 @@ class U64Column:
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
+    def slice(self, start: int, stop: int) -> "U64Column":
+        """The values from `start` up to, not including, `stop`, sharing
+        this column's memory rather than copying it; ``IndexError`` when
+        `start` is past `stop` or `stop` past the end."""
+        ...
     def distinct(self) -> "U64Column":
         """The distinct values, each at its first occurrence, in that
         order."""
@@ -169,16 +194,129 @@ class U64Column:
         """The values at `indices`, in that order; an index past the end
         raises ``IndexError``."""
         ...
-    def join_indices(self, other: _U64s) -> Tuple["U64Column", "U64Column"]:
+    def join_count(self, other: _U64s) -> int:
+        """The number of row pairs `join_indices` makes with `other`, counted
+        without building them."""
+        ...
+    def join_indices(
+        self, other: _U64s, *, max_pairs: Optional[int] = None
+    ) -> Tuple["U64Column", "U64Column"]:
         """``(left_indices, right_indices)`` of the rows where this column's
         value equals `other`'s — an equi-join on the two as keys, in
         nested-loop order (this column's rows in order, each with its matches
         in `other` in their original order). Gather joined columns with
-        `take`."""
+        `take`. A join of more than `max_pairs` pairs raises `JoinTooLarge`
+        before any pair is built."""
+        ...
+    def groups(self) -> "CodeGroups":
+        """This column's rows grouped by value: the right side of
+        `join_indices`, built once and joined with any number of left
+        columns."""
         ...
     # The buffer protocol is implemented natively (`__getbuffer__`);
     # `__buffer__` is the Python 3.12+ spelling `memoryview()` reports for it.
     def __buffer__(self, flags: int, /) -> memoryview: ...
+
+class CodeGroups:
+    """A column's rows grouped by value (`U64Column.groups`): the right side
+    of an equi-join, built once and joined with any number of left columns,
+    so a join too large for one call runs as a loop over slices of its left
+    column (`U64Column.slice`). It holds one u64 per grouped row, plus a slot
+    per value of the column's span or per distinct value, until it is
+    dropped."""
+
+    def __len__(self) -> int: ...
+    def count(self, column: _U64s) -> int:
+        """The number of row pairs `join` makes with `column`, counted
+        without building them."""
+        ...
+    def join(
+        self, column: _U64s, *, max_pairs: Optional[int] = None
+    ) -> Tuple[U64Column, U64Column]:
+        """``(left_indices, right_indices)`` of the rows where `column`'s
+        value equals a grouped row's, in nested-loop order (`column`'s rows
+        in order, each with its grouped rows in their column's order). The
+        left indices count from `column`'s first row, so the joins of
+        consecutive slices of a left column, each offset by its slice's
+        start, concatenate to `U64Column.join_indices` of the whole column.
+        A join of more than `max_pairs` pairs raises `JoinTooLarge` before
+        any pair is built."""
+        ...
+    def gather(
+        self,
+        column: _U64s,
+        left_columns: Sequence[_U64s],
+        right_columns: Sequence[_U64s],
+        *,
+        max_pairs: Optional[int] = None,
+    ) -> Tuple[U64Column, ...]:
+        """The columns the join of `column` with the grouped rows gathers,
+        filled while the pairs are found instead of through `join`'s
+        indices: for each pair in nested-loop order, each of `left_columns`
+        (parallel to `column`) at the pair's left row, then each of
+        `right_columns` (parallel to the grouped column) at its right row,
+        one `U64Column` per column in that order. Each equals
+        `U64Column.take` of its column at the matching index column of
+        `join`. A column of the wrong length raises ``ValueError``, and a
+        join of more than `max_pairs` pairs raises `JoinTooLarge` before any
+        output is built."""
+        ...
+
+class ProbeAnswers:
+    """The answers of `VortexRdfStore.match_codes_many`, one per probe in
+    input order: its four code columns ``(s, p, o, g)``, or None where the
+    code path does not apply. Each `__next__` waits, with the GIL released,
+    for the next answer; the probes run from the call on, at most 2 ×
+    `lookahead` of them running or answered but not yet pulled. The first
+    failing probe, or a pull whose `CancelToken` is cancelled
+    (`Cancelled`), raises at its position and ends the iteration; dropping
+    the iterator aborts the probes still in flight."""
+
+    def __iter__(self) -> "ProbeAnswers": ...
+    def __next__(self) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]: ...
+    def __len__(self) -> int:
+        """The number of probes, answered or not."""
+        ...
+
+class CodeChunks:
+    """The chunks of `VortexRdfStore.match_code_chunks`: a match's code
+    columns in chunks of at most `batch_rows` rows, in base row order. Each
+    `__next__` pulls one chunk with the GIL released and returns one
+    zero-copy `U64Column` per name in `columns`, in that order. The end of
+    the match, an error or a cancelled `CancelToken` (`Cancelled`) ends the
+    iteration; every later `__next__` raises ``StopIteration``."""
+
+    def __iter__(self) -> "CodeChunks": ...
+    def __next__(self) -> Tuple[U64Column, ...]: ...
+    @property
+    def columns(self) -> Tuple[str, ...]:
+        """The names of the columns each chunk holds, in order."""
+        ...
+    @property
+    def batch_rows(self) -> int:
+        """The most rows a chunk holds."""
+        ...
+
+class CancelToken:
+    """A cancel token for one query's long calls: passed as ``cancel=`` to
+    `VortexRdfStore.match_codes`, `count_quads`, `match_codes_many`,
+    `count_quads_many` and `match_code_chunks`, it stops them from any
+    thread. A call or pull still in progress when the token is cancelled
+    stops at its next wait for data (on file, the next split boundary) and
+    raises `Cancelled`; one that finishes without waiting again (in memory,
+    a chunk's or a probe's gather) returns its result, and the next call or
+    pull given the token raises `Cancelled`. Cancelling is final. Without a
+    token those calls run on the calling thread, unraced."""
+
+    def __init__(self) -> None: ...
+    def cancel(self) -> None:
+        """Cancel the token, from any thread; cancelling it again does
+        nothing."""
+        ...
+    @property
+    def cancelled(self) -> bool:
+        """Whether the token has been cancelled."""
+        ...
 
 class VortexRdfStore:
     def __init__(self, path: _StrPath, *, in_memory: bool = False) -> None:
@@ -189,9 +327,7 @@ class VortexRdfStore:
         ``serialize_rdf`` already writes that way (on Windows it fails until
         the store mapping the file, and every `TermDict` and `U64Column` taken
         from it, is dropped). The mapping lives as long as the store or any
-        `TermDict` or `U64Column` taken from it. A file written by
-        vortex-rdf 0.11 or earlier is refused (``VortexRdfError``): rebuild
-        it from its RDF source with ``serialize_rdf``."""
+        `TermDict` or `U64Column` taken from it."""
         ...
     @staticmethod
     def from_bytes(data: bytes) -> "VortexRdfStore": ...
@@ -218,6 +354,7 @@ class VortexRdfStore:
         keep: Optional[_KeepSpec] = None,
         limit: Optional[int] = None,
         offset: int = 0,
+        cancel: Optional[CancelToken] = None,
     ) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]:
         """The matching rows as four zero-copy u64 code columns ``(s, p, o,
         g)`` decodable through `term_dict`, or None when the code path does
@@ -229,22 +366,69 @@ class VortexRdfStore:
         code range (a ``range`` with step 1, or a 2-tuple ``(lo, hi)``, the
         half-open codes ``lo <= code < hi``; a 2-tuple is never a set).
         `offset` and `limit` window the rows in base order; a filtered file
-        scan stops at the first block that fills the window."""
+        scan stops at the first block that fills the window. With a
+        `cancel` token the match races it (`CancelToken`)."""
+        ...
+    def match_code_chunks(
+        self,
+        s: Optional[str] = None,
+        p: Optional[str] = None,
+        o: Optional[str] = None,
+        g: Optional[str] = None,
+        *,
+        keep: Optional[_KeepSpec] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        columns: Sequence[str] = ("s", "p", "o", "g"),
+        batch_rows: int = 65536,
+        cancel: Optional[CancelToken] = None,
+    ) -> Optional[CodeChunks]:
+        """`match_codes` in chunks: an iterator (`CodeChunks`) of at most
+        `batch_rows` rows a chunk, in base row order, each chunk one
+        zero-copy `U64Column` per name in `columns` (``"s"``, ``"p"``,
+        ``"o"``, ``"g"``, in the order given), or None when the code path
+        does not apply. `keep`, `limit` and `offset` narrow the match as for
+        `match_codes`; this call resolves the narrowed match. In memory each
+        chunk is sliced or gathered when it is pulled; on file a scan reads a
+        bounded window of splits ahead of the pulls. With a `cancel` token
+        this call and every pull race it (`CancelToken`). ``batch_rows=0``,
+        no column or an unknown name raises ``ValueError``."""
         ...
     def match_codes_many(
-        self, probes: Sequence[_Probe]
-    ) -> List[Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]]:
-        """`match_codes` for a batch of probes in one GIL-released call,
-        answering in input order. A probe is an ``(s, p, o, g)`` tuple of
+        self,
+        probes: Sequence[_Probe],
+        *,
+        lookahead: Optional[int] = None,
+        cancel: Optional[CancelToken] = None,
+    ) -> ProbeAnswers:
+        """`match_codes` for a batch of probes, answered in input order by an
+        iterator (`ProbeAnswers`). A probe is an ``(s, p, o, g)`` tuple of
         optional term strings or a dict with keys ``s``, ``p``, ``o``,
         ``g``, ``keep``, ``limit``, ``offset``. Every probe is parsed before
-        any is evaluated (``ValueError`` first); the probes run concurrently.
-        The call raises the error of the first failing probe in input order
-        and cancels the probes after it."""
+        any is evaluated (``ValueError`` first). The probes run concurrently
+        from the call on, whether or not the iterator is pulled: at most 2 ×
+        `lookahead` of them running or answered but not yet pulled.
+        `lookahead` is by default twice the machine's parallelism and at
+        least 64; ``0`` raises ``ValueError``; an explicit value is used as
+        given. The first failing probe in input order raises at its position
+        and the probes after it are aborted, as are the probes in flight
+        when the iterator is dropped. With a `cancel` token every pull races
+        it (`CancelToken`): a cancelled pull raises `Cancelled` at its
+        position and aborts the probes in flight. On a store whose rows have
+        no codes every answer is None and no probe runs."""
         ...
-    def count_quads_many(self, probes: Sequence[_Probe]) -> List[int]:
+    def count_quads_many(
+        self,
+        probes: Sequence[_Probe],
+        *,
+        lookahead: Optional[int] = None,
+        cancel: Optional[CancelToken] = None,
+    ) -> List[int]:
         """`count_quads` for a batch of probes (see `match_codes_many`), in
-        input order."""
+        input order, in one GIL-released call through the same bounded
+        window. The call raises the error of the first failing probe in
+        input order and aborts the probes after it. With a `cancel` token
+        the whole batch races it (`CancelToken`)."""
         ...
     def get_quads(
         self,
@@ -265,11 +449,16 @@ class VortexRdfStore:
         *,
         keep: Optional[_KeepSpec] = None,
         limit: Optional[int] = None,
+        offset: int = 0,
+        cancel: Optional[CancelToken] = None,
     ) -> int:
         """Number of quads matching the pattern, counted from the row
         selection; no term is materialized. `keep` narrows as for
-        `match_codes` (Dictionary layout only); `limit` caps the count and
-        stops the read once that many rows are known to exist."""
+        `match_codes` (Dictionary layout only). `offset` and `limit` window
+        the rows in base order as `match_codes` does: `offset` skips that
+        many matched rows, and `limit` caps the count and stops the read
+        once that many rows are known to exist. With a `cancel` token the
+        count races it (`CancelToken`)."""
         ...
     def match_columns(
         self,
@@ -293,6 +482,9 @@ def serialize_rdf(
 
     The options after the two paths are keyword-only. `format` is detected
     from the input file extension when omitted; `layout` defaults to
-    `"dictionary"`, the default shared by the JS bindings and the CLI.
+    `"dictionary"`, the default shared by the JS bindings and the CLI. An
+    unknown format, layout or index name raises ``ValueError``, a failed read
+    or write ``OSError``, and an input that does not parse
+    ``VortexRdfError``.
     """
     ...

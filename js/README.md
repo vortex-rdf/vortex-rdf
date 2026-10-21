@@ -59,7 +59,7 @@ const store = VortexRdfStore.empty();
 
 ### Querying
 
-`match` implements the RDF/JS [`Source.match`](https://rdf.js.org/stream-spec/#source-interface) contract. It takes a `(subject, predicate, object, graph)` pattern — `null`/`undefined` or an RDF/JS `Variable` for a wildcard position, a bare string for a NamedNode IRI — and returns **synchronously** an RDF/JS `Stream<Quad>`:
+`match` implements the RDF/JS [`Source.match`](https://rdf.js.org/stream-spec/#source-interface) contract. It takes a `(subject, predicate, object, graph)` pattern — `null`/`undefined` or an RDF/JS `Variable` for a wildcard position, a bare string for a NamedNode IRI (in a pattern only, never inside a quad) — and returns **synchronously** an RDF/JS `Stream<Quad>`:
 
 ```javascript
 store.match(null, myPredicate, null, null)
@@ -86,16 +86,16 @@ const n = store.countQuads(null, myPredicate, null, null);
 
 The quads implement the RDF/JS `Quad`/`Term` interface (`.subject.value`, `.equals`, …) and interoperate with foreign RDF/JS terms via `.equals` in both directions. They are lazy views into the producing store, so — unlike a plain data object — don't `structuredClone` them or rely on enumerating own properties.
 
-Test membership of a single quad with `has` (an exact four-component lookup) and read the quad count with `size`; both return promises:
+Test membership of a single quad with `has` (an exact four-component lookup) and read the quad count with `size`; both are synchronous, like `getQuads` and `countQuads`:
 
 ```javascript
-if (await store.has(myQuad)) {
+if (store.has(myQuad)) {
   console.log('present');
 }
-console.log(await store.size());
+console.log(store.size());
 ```
 
-An invalid pattern term or a malformed quad object throws (or rejects) with an `Error`.
+An invalid pattern term, or a malformed quad object given to `has`, throws an `Error`; a malformed quad object given to a mutation or to `fromQuads` rejects with one. Every quad entry point (`has`, `addQuad`, `addQuads`, `deleteQuad`, and `fromQuads` on an array or a stream) validates a quad by one rule: each term must be an RDF/JS term object (a bare string is not one) of its position's kind, and its IRI, blank-node label, language tag or datatype IRI must be valid. An absent graph is the default graph.
 
 ### Mutation
 
@@ -131,7 +131,7 @@ if (dict) {
 }
 ```
 
-`decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
+`decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. `encode` also takes the variant spellings of those — an IRI without angle brackets, an `xsd:string`-typed literal, an upper-case language tag, `default` or `[]` for the default graph — and returns the stored form's code; a malformed term throws. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
 
 `matchCodes` is its pattern-matching counterpart: it resolves a pattern to the matched rows' raw term codes — four columnar `Float64Array`s `{ s, p, o, g }` of exact integer codes plus a `length` — without materializing any term strings, and returns `null` under the same conditions `termDict()` returns `undefined`:
 
@@ -143,6 +143,26 @@ if (cols) {
 ```
 
 `match`/`getQuads` are the supported way to read quads; `matchCodes` is the low-level path for callers that join, count and de-duplicate in code space and decode each distinct term once.
+
+`matchCodes` and `countQuads` take an optional fifth argument that narrows the match inside the store, before any row is gathered. `keep` keeps, per position, the rows whose code is in a code set — a `Float64Array` (a column `matchCodes` returned, say) or an array of codes of any length but two — or in a code range, a two-element array `[lo, hi]` holding the codes `lo <= code < hi`. `offset` and `limit` then window the kept rows in base row order, and `countQuads(…, { limit: 1 })` is an existence test. A keep needs code-addressable rows: without them `matchCodes` answers `null` as always, and `countQuads` throws for a keep. A window works on every layout:
+
+```javascript
+const people = store.matchCodes(null, rdfType, foafPerson, null);
+if (people) {
+  const named = store.countQuads(null, foafName, null, null, { keep: { s: people.s } });
+  const page = store.matchCodes(null, foafName, null, null, { keep: { s: people.s }, offset: 100, limit: 100 });
+}
+```
+
+`matchCodeChunks` reads the same columns in chunks: a synchronous iterable of `{ s, p, o, g, length }` chunks of at most `batchRows` rows (8,192 by default), in base row order, each holding a `Float64Array` copy of only the `columns` you name. It takes `matchCodes`'s options plus `columns`, `batchRows` and an `AbortSignal` as `signal`, and returns `null` where `matchCodes` does. Each pull reads one chunk, so the work stops when the pulls stop; an aborted signal ends the iteration at the next pull, a convenience over breaking out yourself, and a signal aborted before the call returns a finished iterable without resolving the match. The iterable's wasm-side handle is freed at its end, when a `for…of` leaves it early, and by `using`:
+
+```javascript
+for (const chunk of store.matchCodeChunks(null, foafKnows, null, null, { columns: ['s', 'o'] }) ?? []) {
+  join(chunk.s, chunk.o, chunk.length);
+}
+```
+
+`matchCodesMany` answers a batch of probes, each an array `[s, p, o, g]` or an object `{ s, p, o, g, keep, limit, offset }`, as an iterable of per-probe `{ s, p, o, g, length }` columns in input order (`null` for each where `matchCodes` answers `null`, and then no probe runs); `countQuadsMany` returns the probes' counts as an array, on every layout. Every probe is parsed before any runs and the probes run one after another: the batch saves boundary crossings and parsing. A chunk or batch iterable holds its store, which stays alive until the iterable is done; once the store is freed with `free()`, `next()` throws.
 
 ## Build options
 
@@ -184,7 +204,7 @@ const vortex = await serializeRdf(turtleText, 'turtle', { layout: 'dictionary' }
 const nquads = await deserializeRdf(vortex, 'nquads');
 ```
 
-`toBytes` writes the same exchange format the CLI and the Python bindings read, so a buffer can be written to disk as a `.vortex` file or handed across bindings. Bytes written by vortex-rdf 0.11 or earlier are refused: `fromBytes` rejects with an error saying so, and the store has to be rebuilt from its RDF source (`serializeRdf`, or the CLI's `serialize`).
+`toBytes` writes the same exchange format the CLI and the Python bindings read, so a buffer can be written to disk as a `.vortex` file or handed across bindings.
 
 A `VortexRdfStore` is a wasm-side handle: call `free()` when you are done with it, or declare it with `using` (`free` is wired to `Symbol.dispose`); an unfreed store is reclaimed only when its JS wrapper is garbage-collected.
 

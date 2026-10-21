@@ -1,10 +1,9 @@
-//! The resolved probe tree and its search/access operations.
-//!
-//! A [`Node`] mirrors one encoded array node, borrowing its buffers; every
-//! operation is a slice read, integer arithmetic, or a single bit-packed word
-//! extraction — no `ExecutionCtx`, no decoding, no allocation. The one
-//! exception is [`DeltaNode`], whose values are running sums: it decodes a
-//! 1024-value block the first time one of its values is read, and keeps it.
+//! The resolved probe tree. A [`Node`] mirrors one encoded array node,
+//! borrowing its buffers; every operation is a slice read, integer
+//! arithmetic or one bit-packed word extraction, with no `ExecutionCtx`, no
+//! decode and no allocation. The exception is [`DeltaNode`], whose values
+//! are running sums: it decodes a 1024-value block the first time one of its
+//! values is read, and keeps it.
 
 use std::sync::OnceLock;
 
@@ -35,8 +34,8 @@ impl Words<'_> {
         }
     }
 
-    /// First index whose value is `>= needle`, via the native monomorphized
-    /// `partition_point`. A needle above the width's maximum finds nothing.
+    /// First index whose value is `>= needle`, by the native monomorphized
+    /// `partition_point`; the length for a needle past the width's maximum.
     fn lower_bound(&self, needle: u64) -> usize {
         fn bound<T: Copy + Ord + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
             match T::try_from(needle) {
@@ -51,32 +50,15 @@ impl Words<'_> {
             Words::U64(s) => bound(s, needle),
         }
     }
-
-    /// First index whose value is `> needle`.
-    fn upper_bound(&self, needle: u64) -> usize {
-        fn bound<T: Copy + Ord + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
-            match T::try_from(needle) {
-                Ok(n) => s.partition_point(|&v| v <= n),
-                Err(_) => s.len(),
-            }
-        }
-        match self {
-            Words::U8(s) => bound(s, needle),
-            Words::U16(s) => bound(s, needle),
-            Words::U32(s) => bound(s, needle),
-            Words::U64(s) => bound(s, needle),
-        }
-    }
 }
 
-/// One resolved chunk of a [`Node::Chunked`] tree, with its logical start
-/// row. Chunk extremes are read on demand during bounds searches and then
-/// memoized — resolving stays downcast-only (a borrowed probe is resolved
-/// per call), while a long-lived owned probe pays each extreme once.
+/// One resolved chunk of a [`Node::Chunked`] tree, never empty, with its
+/// logical start row. Its last value is read when a bounds search first
+/// probes the chunk, then kept, so resolution stays downcast-only and a
+/// long-lived owned probe pays the read once.
 pub(crate) struct Chunk<'a> {
     pub(crate) start: usize,
     pub(crate) node: Node<'a>,
-    first: std::sync::OnceLock<u64>,
     last: std::sync::OnceLock<u64>,
 }
 
@@ -85,14 +67,8 @@ impl<'a> Chunk<'a> {
         Self {
             start,
             node,
-            first: std::sync::OnceLock::new(),
             last: std::sync::OnceLock::new(),
         }
-    }
-
-    /// The chunk's first value, read once.
-    fn first(&self) -> u64 {
-        *self.first.get_or_init(|| self.node.value_at(0))
     }
 
     /// The chunk's last value, read once.
@@ -181,9 +157,10 @@ impl PackedNode<'_> {
     }
 }
 
-/// One node of the resolved probe tree. Variants mirror the supported
-/// encodings; children are resolved recursively at [`crate::SortedProbe::resolve`]
-/// time so every operation below is non-fallible.
+/// One node of the resolved probe tree, a variant per supported encoding.
+/// Children are resolved with their parent
+/// ([`crate::SortedProbe::resolve`]), so every operation below is
+/// infallible.
 pub(crate) enum Node<'a> {
     Primitive(Words<'a>),
     Constant {
@@ -253,13 +230,11 @@ impl DeltaWidth {
 }
 
 /// A FastLanes delta-encoded node: every 1024-value block stores one base
-/// per lane and the transposed, delta-encoded values (typically bit-packed
-/// beneath). A value cannot be read in place — it is a running sum down its
-/// lane — so a block is decoded whole the first time any of its values is
-/// asked for, through the same `undelta` and `untranspose` kernels the
-/// encoding's own decompressor runs, and kept for the node's lifetime. A
-/// bounds search therefore decodes the handful of blocks its bisection
-/// crosses, never the chunk.
+/// per lane and the transposed deltas (typically bit-packed beneath). A
+/// value is a running sum down its lane, so a block is decoded whole the
+/// first time any of its values is read, by the encoding's own `undelta`
+/// and `untranspose` kernels, and kept for the node's lifetime: a bounds
+/// search decodes only the blocks its bisection crosses.
 pub(crate) struct DeltaNode<'a> {
     bases: Box<Node<'a>>,
     deltas: Box<Node<'a>>,
@@ -274,8 +249,9 @@ pub(crate) struct DeltaNode<'a> {
 }
 
 impl<'a> DeltaNode<'a> {
-    /// A node over resolved `bases` and `deltas` children; `None` when the
-    /// children are too short for the blocks `offset + len` spans.
+    /// A node over resolved `bases` and `deltas` children; `None` for an
+    /// `offset` of a whole block or more, or children too short for the
+    /// blocks `offset + len` spans.
     pub(crate) fn new(
         bases: Node<'a>,
         deltas: Node<'a>,
@@ -336,8 +312,7 @@ where
     T: fastlanes::Delta + fastlanes::Transpose + Copy + Default + Into<u64> + TryFrom<u64>,
 {
     // The children hold values of width `T` by construction (the array's
-    // dtype), so the narrowing conversions cannot fail; a child that lied
-    // about its width would already have declined resolution.
+    // dtype), so the narrowing conversions cannot fail.
     let narrow = |v: u64| T::try_from(v).unwrap_or_default();
     let mut chunk = [T::default(); 1024];
     for (j, slot) in chunk.iter_mut().enumerate() {
@@ -413,12 +388,15 @@ impl Node<'_> {
                 let c = partition(chunks.len(), |c| chunks[c].start <= i) - 1;
                 chunks[c].node.value_at(i - chunks[c].start)
             }
+            // A code is below the values' length (a construction invariant),
+            // so it fits a `usize`.
             Node::Dict { codes, values } => values.value_at(codes.value_at(i) as usize),
             Node::Delta(d) => d.value_at(i),
         }
     }
 
-    /// First index whose value is `>= needle`; requires ascending order.
+    /// First index whose value is `>= needle`, the length when every value is
+    /// below it; requires ascending order.
     pub(crate) fn lower_bound(&self, needle: u64) -> usize {
         match self {
             Node::Primitive(w) => w.lower_bound(needle),
@@ -482,64 +460,28 @@ impl Node<'_> {
         }
     }
 
-    /// First index whose value is `> needle`; requires ascending order.
+    /// First index whose value is `> needle`: values are integers, so it is
+    /// the lower bound of `needle + 1`, and the length when `needle` is
+    /// `u64::MAX`. Requires ascending order.
     pub(crate) fn upper_bound(&self, needle: u64) -> usize {
+        needle
+            .checked_add(1)
+            .map_or(self.len(), |next| self.lower_bound(next))
+    }
+
+    /// `(lower_bound, upper_bound)` of `needle`; requires ascending order. A
+    /// RunEnd node finds the needle's run once and reads both ends of it from
+    /// `ends`, where the two bounds would each search the runs again.
+    #[inline]
+    pub(crate) fn bounds(&self, needle: u64) -> (usize, usize) {
         match self {
-            Node::Primitive(w) => w.upper_bound(needle),
-            Node::Constant { value, len } => {
-                if *value <= needle {
-                    *len
-                } else {
-                    0
-                }
-            }
-            Node::Sequence {
-                base,
-                multiplier,
-                len,
-            } => {
-                if needle < *base {
-                    0
-                } else {
-                    // `q + 1` values are `<= needle`; saturating keeps a
-                    // quotient of `u64::MAX` past every position.
-                    clamp_to_len(((needle - *base) / *multiplier).saturating_add(1), *len)
-                }
-            }
             Node::RunEnd {
                 ends,
                 values,
                 offset,
                 len,
-            } => {
-                let (first, span) = window_runs(ends, *offset, *len);
-                let k = partition(span, |k| values.value_at(first + k) <= needle);
-                run_start(ends, first + k, *offset, *len)
-            }
-            Node::FoR { reference, child } => {
-                if needle < *reference {
-                    0
-                } else {
-                    child.upper_bound(needle - *reference)
-                }
-            }
-            Node::BitPacked(p) => partition(p.len, |i| p.value_at(i) <= needle),
-            // Window-only search; see `lower_bound`.
-            Node::Slice { child, start, len } => {
-                partition(*len, |i| child.value_at(*start + i) <= needle)
-            }
-            Node::Chunked { chunks, .. } => {
-                let c = partition(chunks.len(), |c| chunks[c].first() <= needle);
-                if c == 0 {
-                    0
-                } else {
-                    chunks[c - 1].start + chunks[c - 1].node.upper_bound(needle)
-                }
-            }
-            Node::Dict { codes, values } => partition(codes.len(), |i| {
-                values.value_at(codes.value_at(i) as usize) <= needle
-            }),
-            Node::Delta(d) => partition(d.len(), |i| d.value_at(i) <= needle),
+            } => runend_bounds(ends, values, *offset, *len, needle),
+            _ => (self.lower_bound(needle), self.upper_bound(needle)),
         }
     }
 
@@ -594,15 +536,49 @@ fn clamp_to_len<I: TryFrom<u64> + Ord + Copy>(q: u64, len: I) -> I {
     I::try_from(q).map_or(len, |n| n.min(len))
 }
 
+/// [`Node::bounds`] of a RunEnd node: the needle's first run by one search of
+/// the window's run values, both bounds from `ends`.
+fn runend_bounds(
+    ends: &Node<'_>,
+    values: &Node<'_>,
+    offset: usize,
+    len: usize,
+    needle: u64,
+) -> (usize, usize) {
+    let (first, span) = window_runs(ends, offset, len);
+    let k = partition(span, |k| values.value_at(first + k) < needle);
+    // Adjacent runs may repeat a value, so the run past the needle's is
+    // searched for unless the next run already holds a larger value.
+    let past = if k == span || values.value_at(first + k) != needle {
+        k
+    } else if k + 1 == span || values.value_at(first + k + 1) > needle {
+        k + 1
+    } else {
+        k + 1
+            + partition(span - k - 1, |j| {
+                values.value_at(first + k + 1 + j) <= needle
+            })
+    };
+    (
+        run_start(ends, first + k, offset, len),
+        run_start(ends, first + past, offset, len),
+    )
+}
+
 /// The runs overlapping the window `[offset, offset + len)`, as
 /// `(first_run, run_count)`. Sortedness is asserted for the window only, so
-/// run searches must stay inside these runs — a sliced RunEnd keeps its full
+/// run searches must stay inside these runs: a sliced RunEnd keeps its full
 /// children, whose out-of-window values are in unspecified order.
 fn window_runs(ends: &Node<'_>, offset: usize, len: usize) -> (usize, usize) {
     if len == 0 {
         return (0, 0);
     }
     let nruns = ends.len();
+    // An unsliced node: its last run ends at its length, so every run lies in
+    // the window (the ends ascend).
+    if offset == 0 && nruns > 0 && ends.value_at(nruns - 1) == len as u64 {
+        return (0, nruns);
+    }
     let first = partition(nruns, |r| ends.value_at(r) <= offset as u64);
     let last = partition(nruns, |r| ends.value_at(r) <= (offset + len - 1) as u64);
     (first, (last + 1).min(nruns) - first)
@@ -664,11 +640,6 @@ mod tests {
         }
         assert_eq!(clamp_to_len(3, len), 3);
         assert_eq!(clamp_to_len(u64::from(u32::MAX), len), len);
-        // The upper bound's `q + 1` past u32::MAX clamps too.
-        assert_eq!(
-            clamp_to_len(u64::from(u32::MAX).saturating_add(1), len),
-            len
-        );
         // The native width.
         assert_eq!(clamp_to_len(u64::MAX, 7usize), 7);
         assert_eq!(clamp_to_len(4, 7usize), 4);
@@ -737,6 +708,51 @@ mod tests {
         assert_eq!(n.value_at(0), 2);
         assert_eq!(n.value_at(2), 5);
         assert_eq!(n.value_at(5), 5);
+    }
+
+    #[test]
+    fn runend_bounds_search_once_and_cross_repeated_values() {
+        // ends [2, 3, 6, 7, 9, 12] over values [1, 4, 4, 4, 7, 9]: adjacent
+        // runs repeat 4, which a RunEnd may hold although a writer merges
+        // them. Logical rows: [1, 1, 4, 4, 4, 4, 4, 7, 7, 9, 9, 9].
+        let ends = [2u64, 3, 6, 7, 9, 12];
+        let values = [1u64, 4, 4, 4, 7, 9];
+        let rows: Vec<u64> = values
+            .iter()
+            .zip(ends.iter())
+            .scan(0u64, |start, (&v, &end)| {
+                let run = (*start..end).map(move |_| v);
+                *start = end;
+                Some(run)
+            })
+            .flatten()
+            .collect();
+        // Unsliced, then three windows (one a single run, one ending mid-run).
+        for (offset, len) in [(0usize, 12usize), (2, 6), (3, 4), (8, 1), (5, 0)] {
+            let n = Node::RunEnd {
+                ends: Box::new(Node::Primitive(Words::U64(&ends))),
+                values: Box::new(Node::Primitive(Words::U64(&values))),
+                offset,
+                len,
+            };
+            let window = &rows[offset..offset + len];
+            for needle in (0..=10).chain([u64::MAX]) {
+                let want = (
+                    window.partition_point(|&v| v < needle),
+                    window.partition_point(|&v| v <= needle),
+                );
+                assert_eq!(
+                    n.bounds(needle),
+                    want,
+                    "offset {offset} len {len} needle {needle}"
+                );
+                assert_eq!(
+                    (n.lower_bound(needle), n.upper_bound(needle)),
+                    want,
+                    "offset {offset} len {len} needle {needle}"
+                );
+            }
+        }
     }
 
     #[test]

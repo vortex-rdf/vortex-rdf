@@ -23,19 +23,39 @@ pub enum VortexRdfError {
 
     /// Serialized bytes cannot be interpreted as a store: a foreign root
     /// layout, a missing or unknown required component, a code outside its
-    /// dictionary, malformed metadata.
+    /// dictionary, malformed metadata. Also an RDF document that does not
+    /// parse.
     #[error("Deserialization error: {0}")]
     Deserialization(String),
 
-    /// The operation is not valid on this store as it stands — a mutation on
-    /// a view derived from `match_pattern`, which does not own its rows.
+    /// The operation is not valid on this store as it stands: a mutation on a
+    /// view derived from `match_pattern`, which does not own its rows.
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
+
+    /// An argument a caller supplied is not valid: a term spelling, a layout,
+    /// index or format name, a term predicate's kind or argument, candidate
+    /// codes that are not ascending, unique and inside the dictionary, a
+    /// chunk export's zero batch size or empty column list. What the store or
+    /// a document holds never raises it.
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }
 
-/// Whether an I/O error of this kind says a file cannot be written by this
-/// process: the permission is denied, or the filesystem is read-only. Both
-/// mean "do not write this store", and neither goes away by trying again.
+/// This crate's error as the vortex error a stream or `DataSource` reports. A
+/// wrapped [`VortexError`] passes through unchanged.
+impl From<VortexRdfError> for VortexError {
+    fn from(e: VortexRdfError) -> Self {
+        match e {
+            VortexRdfError::Vortex(v) => v,
+            other => vortex_error::vortex_err!("vortex-rdf: {other}"),
+        }
+    }
+}
+
+/// Whether an I/O error of this kind means this process cannot write the
+/// file: permission denied, or a read-only filesystem. Neither goes away by
+/// trying again.
 #[cfg(feature = "file-io")]
 pub(crate) fn kind_means_unwritable(kind: std::io::ErrorKind) -> bool {
     matches!(
@@ -55,14 +75,13 @@ pub(crate) fn path_error(what: &str, path: &std::path::Path, e: std::io::Error) 
 }
 
 /// The source of the `Io` error a store writer returns when it finds, before
-/// anything is built, that the store file (or the directory it lives in)
-/// cannot be written by this process. The error keeps its kind
-/// ([`kind_means_unwritable`]) and its message; this marker is what
-/// [`VortexRdfError::is_unwritable`] looks for.
+/// anything is built, that this process cannot write the store file or its
+/// directory; [`VortexRdfError::is_unwritable`] looks for it. The error keeps
+/// its kind ([`kind_means_unwritable`]) and its message.
 ///
-/// A permission error from further into a rewrite (a spill directory, a
-/// rename over a file someone else owns) is not this refusal: it comes after
-/// the work was done, and is reported as the failure it is.
+/// A permission error later in a rewrite (a spill directory, a rename over a
+/// file someone else owns) is not this refusal: it comes after the work was
+/// done, and is reported as the failure it is.
 #[cfg(feature = "file-io")]
 #[derive(Error, Debug)]
 #[error("{0}")]
@@ -79,11 +98,10 @@ impl StoreNotWritable {
 }
 
 impl VortexRdfError {
-    /// Whether this is a store writer's refusal to write a file this process
-    /// cannot write ([`StoreNotWritable`]) — made before anything is built —
-    /// as opposed to any other I/O failure. It is what lets an append do
-    /// without the compaction of a read-only store. Never true without
-    /// `file-io`, where no store is written to a path.
+    /// Whether this is a store writer's refusal ([`StoreNotWritable`]), made
+    /// before anything is built, rather than any other I/O failure: the one
+    /// error on which an append's auto-compaction keeps the batch in the tail.
+    /// Never true without `file-io`, where no store is written to a path.
     pub(crate) fn is_unwritable(&self) -> bool {
         #[cfg(feature = "file-io")]
         if let Self::Io(error) = self {
@@ -98,7 +116,7 @@ impl VortexRdfError {
 /// `std::result::Result` with [`VortexRdfError`] as the error type.
 pub type Result<T> = std::result::Result<T, VortexRdfError>;
 
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};

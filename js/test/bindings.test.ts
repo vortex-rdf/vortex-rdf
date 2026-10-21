@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'vitest';
+import { beforeAll, describe, test, expect } from 'vitest';
 import { DataFactory } from 'rdf-data-factory';
 import { Readable } from 'node:stream';
 import type { Quad, Term, Literal, Stream } from '@rdfjs/types';
@@ -8,7 +8,15 @@ import {
     serializeRdf,
     deserializeRdf,
     type BuildOptions,
+    type CodeChunk,
+    type CodeColumns,
+    type ChunkOptions,
+    type CodeKeep,
+    type Probe,
+    type ReadOptions,
 } from '@vortex-rdf/vortex-rdf-store';
+// The wasm iterator handles, which the package entries do not re-export.
+import { CodeChunks, ProbeAnswers } from '../pkg/web/vortex_rdf.js';
 
 const df = new DataFactory();
 
@@ -19,6 +27,36 @@ async function collect(stream: Stream<Quad>): Promise<Quad[]> {
     return out;
 }
 
+/** The rows of code columns as `[s, p, o, g]` tuples, in column order. */
+function codeRows(cols: CodeColumns): number[][] {
+    return Array.from({ length: cols.length }, (_, i) => [cols.s[i], cols.p[i], cols.o[i], cols.g[i]]);
+}
+
+type Position = 's' | 'p' | 'o' | 'g';
+
+/** Every chunk of `chunks` pulled: the codes of each column a chunk holds,
+ *  concatenated across the chunks, and each chunk's row count. */
+function drainChunks(chunks: Iterable<CodeChunk>): { cols: Partial<Record<Position, number[]>>; sizes: number[] } {
+    const cols: Partial<Record<Position, number[]>> = {};
+    const sizes: number[] = [];
+    for (const chunk of chunks) {
+        sizes.push(chunk.length);
+        for (const position of ['s', 'p', 'o', 'g'] as const) {
+            const column = chunk[position];
+            if (column === undefined) continue;
+            expect(column).toBeInstanceOf(Float64Array);
+            expect(column.length).toBe(chunk.length);
+            (cols[position] ??= []).push(...column);
+        }
+    }
+    return { cols, sizes };
+}
+
+/** All four columns of a `matchCodes` result as arrays, as `drainChunks` collects them. */
+function columnArrays(cols: CodeColumns): Record<Position, number[]> {
+    return { s: [...cols.s], p: [...cols.p], o: [...cols.o], g: [...cols.g] };
+}
+
 const NQUADS = [
     '<http://example.org/s1> <http://example.org/p1> <http://example.org/o1> .',
     '<http://example.org/s1> <http://example.org/p2> "lit" .',
@@ -27,6 +65,20 @@ const NQUADS = [
     '<http://example.org/s3> <http://example.org/p3> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .',
     '<http://example.org/s4> <http://example.org/p4> "hola"@es .',
 ].join('\n') + '\n';
+
+/** A quad no term of `NQUADS` appears in: absent from any store built from it. */
+const NEW_QUAD = df.quad(
+    df.namedNode('http://example.org/s9'),
+    df.namedNode('http://example.org/p9'),
+    df.literal('new'),
+);
+
+/** The first quad of `NQUADS`: present in any store built from it. */
+const EXISTING_QUAD = df.quad(
+    df.namedNode('http://example.org/s1'),
+    df.namedNode('http://example.org/p1'),
+    df.namedNode('http://example.org/o1'),
+);
 
 /** Every build variant reachable from JS, in the canonical kebab-case
  *  vocabulary — the only spellings accepted, and what `layout()` reports. */
@@ -59,6 +111,18 @@ describe('build variants', () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
                 expect(await store.size()).toBe(6);
                 expect(store.layout()).toBe(options.layout);
+            });
+
+            test('size and has return values, not promises', async () => {
+                const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
+                const ex = (name: string) => df.namedNode(`http://example.org/${name}`);
+
+                expect(store.size()).toBe(6);
+                expect(store.has(df.quad(ex('s1'), ex('p1'), ex('o1')))).toBe(true);
+                expect(store.has(df.quad(ex('s2'), ex('p1'), ex('o2'), ex('g1')))).toBe(true);
+                // An exact four-component lookup: the same triple in the
+                // default graph is a different quad.
+                expect(store.has(df.quad(ex('s2'), ex('p1'), ex('o2')))).toBe(false);
             });
 
             test('matches every quad-position pattern', async () => {
@@ -95,7 +159,7 @@ describe('build variants', () => {
                 expect(count(df.namedNode('http://example.org/nope'), null, null, null)).toBe(0);
             });
 
-            test('round-trips typed and language literals', async () => {
+            test('round-trips typed, language and escaped literals', async () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
 
                 const typed = store.getQuads(
@@ -107,6 +171,22 @@ describe('build variants', () => {
 
                 const lang = store.getQuads(null, null, df.literal('hola', 'es'), null);
                 expect(lang.length).toBe(1);
+
+                // Values whose stored N-Triples spelling escapes a character (a
+                // quote, a backslash, a newline, and a control character
+                // written as a \u escape) read back exactly as they went in.
+                const subject = df.namedNode('http://example.org/escaped');
+                const text = df.namedNode('http://example.org/text');
+                const values = ['say "hi"', 'C:\\temp', 'two\nlines', 'bell\u0007'];
+                const escaped = await VortexRdfStore.fromQuads(
+                    values.map((value) => df.quad(subject, text, df.literal(value))),
+                    options,
+                );
+                const objects = escaped.getQuads(subject, text, null, null).map((quad) => quad.object);
+                expect(objects.map((object) => object.value).sort()).toEqual([...values].sort());
+                for (const value of values) {
+                    expect(objects.some((object) => object.equals(df.literal(value))), value).toBe(true);
+                }
             });
 
             test('toBytes/fromBytes preserves the store', async () => {
@@ -232,59 +312,6 @@ describe('a built store holds each quad once', () => {
     });
 });
 
-// The vortex-rdf.store.v2 readers rely on guarantees only a v2 writer gives
-// (each quad stored once; reference-index children in (val, rid) order), so a
-// store with the v1 root layout (vortex-rdf 0.11 and earlier) is refused. The
-// two ids are the same length, so renaming one into the other in a written
-// store moves no offset (a Vortex file has no checksum over its footer): that
-// is how a v1 file is made here.
-describe('stores with the v1 root layout are refused', () => {
-    const encode = (text: string) => new TextEncoder().encode(text);
-    const current = encode('vortex-rdf.store.v2');
-    const legacy = encode('vortex-rdf.store.v1');
-    const findAll = (bytes: Uint8Array, needle: Uint8Array): number[] => {
-        const at: number[] = [];
-        for (let i = 0; i + needle.length <= bytes.length; i++) {
-            if (needle.every((byte, k) => bytes[i + k] === byte)) at.push(i);
-        }
-        return at;
-    };
-    const asWrittenBefore012 = (bytes: Uint8Array): Uint8Array => {
-        const copy = bytes.slice();
-        const at = findAll(copy, current);
-        expect(at.length).toBe(1);
-        copy.set(legacy, at[0]);
-        return copy;
-    };
-
-    for (const { name, options } of VARIANTS) {
-        test(`${name}: a store written now carries the v2 root; a v1 one is refused`, async () => {
-            const bytes = await (await VortexRdfStore.fromString(NQUADS, 'nquads', options)).toBytes();
-            expect(findAll(bytes, current).length).toBe(1);
-            expect(findAll(bytes, legacy).length).toBe(0);
-
-            const refused = VortexRdfStore.fromBytes(asWrittenBefore012(bytes));
-            await expect(refused).rejects.toThrow(/written by vortex-rdf 0\.11 or earlier/);
-            await expect(VortexRdfStore.fromBytes(asWrittenBefore012(bytes))).rejects.toThrow(
-                /rebuild it from its RDF source with vortex-rdf 0\.12 or later.*serializeRdf/,
-            );
-            await expect(VortexRdfStore.fromBytes(asWrittenBefore012(bytes))).rejects.toThrow(
-                /^(?!.*(not a vortex-rdf store file|Invalid encoding ID))/s,
-            );
-
-            // The current bytes still open.
-            expect(await (await VortexRdfStore.fromBytes(bytes)).size()).toBe(6);
-        });
-    }
-
-    test('deserializeRdf refuses a v1 file the same way', async () => {
-        const bytes = await serializeRdf(NQUADS, 'nquads');
-        await expect(deserializeRdf(asWrittenBefore012(bytes), 'nquads')).rejects.toThrow(
-            /written by vortex-rdf 0\.11 or earlier/,
-        );
-    });
-});
-
 describe('match returns an RDF/JS Stream<Quad>', () => {
     test('for-await and data/end events both yield the matches', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
@@ -375,10 +402,12 @@ describe('RDF format support', () => {
         expect(await store.size()).toBe(1);
     });
 
+    // Core's invalid-input error, its kind first, listing the accepted names.
     test('rejects an unsupported format', async () => {
-        await expect(VortexRdfStore.fromString(TURTLE, 'nope' as any)).rejects.toThrow(
-            /unknown RDF format "nope"/,
-        );
+        const refusal = /^Invalid input: unknown RDF format "nope"; expected one of: ntriples, nt,/;
+        await expect(VortexRdfStore.fromString(TURTLE, 'nope' as any)).rejects.toThrow(refusal);
+        const store = await VortexRdfStore.fromString(TURTLE, 'turtle');
+        await expect(store.toRdf('nope' as any)).rejects.toThrow(refusal);
     });
 });
 
@@ -476,12 +505,12 @@ describe('lazy terms outliving a dictionary rebuild', () => {
 describe('option validation', () => {
     test('rejects an unknown layout', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Nope' as any })).rejects
-            .toThrow(/unknown layout strategy/);
+            .toThrow(/^Invalid input: unknown layout strategy/);
     });
 
     test('rejects an unknown index', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { indexes: ['Nope'] as any })).rejects
-            .toThrow(/unknown index type/);
+            .toThrow(/^Invalid input: unknown index type/);
     });
 
     test('rejects retired spellings, naming the canonical vocabulary', async () => {
@@ -514,6 +543,7 @@ describe('multi-chunk payloads', () => {
     // Builders emit chunks of DEFAULT_CHUNK_SIZE (100,000) quads; a payload one
     // row past the boundary exercises every multi-chunk read path.
     const CHUNK_SIZE = 100_000;
+    const N = CHUNK_SIZE + 1;
 
     const manyNquads = (n: number): string => {
         let out = '';
@@ -523,25 +553,53 @@ describe('multi-chunk payloads', () => {
         return out;
     };
 
+    // Built once for the cases below: the payload's `serializeRdf` bytes, a
+    // store built from its text, and that store's `toBytes`.
+    let serialized: Uint8Array;
+    let built: VortexRdfStore;
+    let builtBytes: Uint8Array;
+    beforeAll(async () => {
+        const text = manyNquads(N);
+        serialized = await serializeRdf(text, 'nquads');
+        built = await VortexRdfStore.fromString(text, 'nquads');
+        builtBytes = await built.toBytes();
+    }, 120_000);
+
     test('serializeRdf/deserializeRdf round-trips nquads across a chunk boundary', async () => {
-        const n = CHUNK_SIZE + 1;
-        const bytes = await serializeRdf(manyNquads(n), 'nquads');
-        const out = await deserializeRdf(bytes, 'nquads');
-        expect(out.trim().split('\n').filter(Boolean).length).toBe(n);
+        const out = await deserializeRdf(serialized, 'nquads');
+        expect(out.trim().split('\n').filter(Boolean).length).toBe(N);
     });
 
     test('fromBytes recovers every chunk', async () => {
-        const n = CHUNK_SIZE + 1;
-        const bytes = await serializeRdf(manyNquads(n), 'nquads');
-        const store = await VortexRdfStore.fromBytes(bytes);
-        expect(await store.size()).toBe(n);
+        const store = await VortexRdfStore.fromBytes(serialized);
+        expect(await store.size()).toBe(N);
     });
 
     test('toBytes/fromBytes round-trips a multi-chunk store', async () => {
-        const n = CHUNK_SIZE + 1;
-        const store = await VortexRdfStore.fromString(manyNquads(n), 'nquads');
-        const restored = await VortexRdfStore.fromBytes(await store.toBytes());
-        expect(await restored.size()).toBe(n);
+        const restored = await VortexRdfStore.fromBytes(builtBytes);
+        expect(await restored.size()).toBe(N);
+    });
+
+    test('matchCodeChunks at batchRows 701 and the default concatenate to matchCodes', async () => {
+        // Adopted from bytes, the store reads its rows from the encoded columns.
+        const adopted = await VortexRdfStore.fromBytes(builtBytes);
+        // Every tenth row: a predicate match the store gathers by row id. A
+        // batch of 701 rows divides neither its 10,000 rows nor the default
+        // batch of 8,192.
+        const p3 = df.namedNode('http://example.org/p3');
+        const cases: [Term | null, number | undefined][] = [[null, undefined], [p3, undefined], [p3, 701]];
+        for (const store of [built, adopted]) {
+            for (const [predicate, batchRows] of cases) {
+                const whole = store.matchCodes(null, predicate, null, null)!;
+                const options = batchRows === undefined ? undefined : { batchRows };
+                const { cols, sizes } = drainChunks(store.matchCodeChunks(null, predicate, null, null, options)!);
+                expect(cols).toEqual(columnArrays(whole));
+                const most = batchRows ?? 8192;
+                expect(sizes.slice(0, -1).every((size) => size === most), `${sizes}`).toBe(true);
+                expect(sizes.at(-1)).toBe(whole.length - most * (sizes.length - 1));
+                expect(sizes.length).toBe(Math.ceil(whole.length / most));
+            }
+        }
     });
 }, 120_000);
 
@@ -648,14 +706,9 @@ describe('adding quads', () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         // Every term here is absent from the dictionary built at load time;
         // the quad lands in the string tail and must still be found by match.
-        const quad = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        await store.addQuad(quad);
+        await store.addQuad(NEW_QUAD);
         expect(await store.size()).toBe(7);
-        expect(await store.has(quad)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
         const matched = store.getQuads(null, df.namedNode('http://example.org/p9'), null, null);
         expect(matched.length).toBe(1);
         // Decoded values must be correct: appended terms live in the string tail,
@@ -671,48 +724,28 @@ describe('adding quads', () => {
         // are re-encoded against a fresh dictionary).
         const restored = await VortexRdfStore.fromBytes(await store.toBytes());
         expect(await restored.size()).toBe(7);
-        expect(await restored.has(quad)).toBe(true);
+        expect(await restored.has(NEW_QUAD)).toBe(true);
     });
 
     test('Default layout supports addQuad', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
-        const quad = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        await store.addQuad(quad);
+        await store.addQuad(NEW_QUAD);
         expect(await store.size()).toBe(7);
-        expect(await store.has(quad)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
     });
 
     test('addQuad ignores a quad already present (RDF/JS set semantics)', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        const quad = df.quad(
-            df.namedNode('http://example.org/s1'),
-            df.namedNode('http://example.org/p1'),
-            df.namedNode('http://example.org/o1'),
-        );
-        expect(await store.has(quad)).toBe(true);
-        await store.addQuad(quad);
+        expect(await store.has(EXISTING_QUAD)).toBe(true);
+        await store.addQuad(EXISTING_QUAD);
         expect(await store.size()).toBe(6);
     });
 
     test('addQuads appends a batch, skipping duplicates', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        const fresh = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        const existing = df.quad(
-            df.namedNode('http://example.org/s1'),
-            df.namedNode('http://example.org/p1'),
-            df.namedNode('http://example.org/o1'),
-        );
-        await store.addQuads([fresh, fresh, existing]);
+        await store.addQuads([NEW_QUAD, NEW_QUAD, EXISTING_QUAD]);
         expect(await store.size()).toBe(7);
-        expect(await store.has(fresh)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
     });
 });
 
@@ -826,16 +859,17 @@ describe('matchCodes / termDict gates', () => {
             expect(store.matchCodes(null, p1, null, null)).toBeNull();
             expect(store.termDict()).toBeUndefined();
         });
+
+        test(`${layout}: matchCodes throws on an invalid pattern instead of returning null`, async () => {
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout });
+            expect(() => store.matchCodes(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
+        });
     }
 
     test('a pending append closes the code path', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         expect(store.matchCodes(null, p1, null, null)).not.toBeNull();
-        await store.addQuad(df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        ));
+        await store.addQuad(NEW_QUAD);
         expect(store.matchCodes(null, p1, null, null)).toBeNull();
         expect(store.termDict()).toBeUndefined();
         // The term path still answers.
@@ -851,6 +885,26 @@ describe('matchCodes / termDict gates', () => {
         expect(typeof dict.encode('')).toBe('number');
         const code = dict.encode('<http://example.org/s1>')!;
         expect(dict.decode(code)).toBe('<http://example.org/s1>');
+    });
+
+    test('TermDict.encode takes variant spellings and throws on a malformed one', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        // Each variant finds the code of the stored form it spells.
+        const spellings: [string, string][] = [
+            ['http://example.org/s1', '<http://example.org/s1>'],
+            ['"hola"@ES', '"hola"@es'],
+            ['"lit"^^<http://www.w3.org/2001/XMLSchema#string>', '"lit"'],
+            ['default', ''],
+        ];
+        for (const [variant, stored] of spellings) {
+            const code = dict.encode(stored);
+            expect(code, stored).toBeDefined();
+            expect(dict.encode(variant), variant).toBe(code);
+        }
+        // An absent variant is still `undefined`; a malformed term throws.
+        expect(dict.encode('http://example.org/nope')).toBeUndefined();
+        expect(() => dict.encode('"unterminated')).toThrow(/Invalid input/);
     });
 
     // Codes are u64 and cross as JS numbers, exact up to 2^53 - 1. A code
@@ -905,14 +959,241 @@ describe('matchCodes / termDict gates', () => {
             }
         }
     });
+
+    test('keep, limit and offset narrow matchCodes and countQuads as filtering matchCodes() does', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        const code = (term: string) => dict.encode(term)!;
+        const [p1c, p2c, p4c] = ['p1', 'p2', 'p4'].map((p) => code(`<http://example.org/${p}>`));
+        const o1c = code('<http://example.org/o1>');
+        const o2c = code('<http://example.org/o2>');
+        const litc = code('"lit"');
+        const all = codeRows(store.matchCodes()!);
+        // A two-element array is a half-open range [lo, hi); a Float64Array,
+        // or an array of any other length, is a set.
+        const cases: [CodeKeep, (row: number[]) => boolean][] = [
+            [{ p: Float64Array.of(p1c, p2c) }, (r) => r[1] === p1c || r[1] === p2c],
+            [{ o: Float64Array.of(litc, o2c) }, (r) => r[2] === litc || r[2] === o2c],
+            [{ o: [litc, o2c] }, (r) => litc <= r[2] && r[2] < o2c],
+            [{ p: [p4c, p1c, p1c] }, (r) => r[1] === p1c || r[1] === p4c],
+            [{ p: [p1c] }, (r) => r[1] === p1c],
+            [{ o: [o1c, o1c + 1] }, (r) => r[2] === o1c],
+            [{ o: [o1c + 1, o1c] }, () => false],
+            [{ s: [0, Number.MAX_SAFE_INTEGER] }, () => true],
+            [{ g: [code('')] }, (r) => r[3] === code('')],
+            [{ s: [] }, () => false],
+            [{ p: [2 ** 40] }, () => false],
+            [{ p: [p1c], o: [o1c, o1c + 1] }, (r) => r[1] === p1c && r[2] === o1c],
+        ];
+        for (const [keep, admits] of cases) {
+            const want = all.filter(admits);
+            const name = JSON.stringify(keep);
+            expect(codeRows(store.matchCodes(null, null, null, null, { keep })!), name).toEqual(want);
+            expect(store.countQuads(null, null, null, null, { keep }), name).toBe(want.length);
+            expect(store.countQuads(null, null, null, null, { keep, limit: 1 }), name).toBe(Math.min(1, want.length));
+        }
+        const windows: [number, number | undefined][] = [[0, 2], [1, 3], [3, 10], [6, 1], [0, 0], [2, undefined]];
+        for (const [offset, limit] of windows) {
+            const want = all.slice(offset, limit === undefined ? undefined : offset + limit);
+            expect(codeRows(store.matchCodes(null, null, null, null, { offset, limit })!), `${offset} ${limit}`)
+                .toEqual(want);
+            expect(store.countQuads(null, null, null, null, { offset, limit }), `${offset} ${limit}`)
+                .toBe(want.length);
+        }
+        // The keep applies to the pattern's match, and the window to the kept rows.
+        const kept = all.filter((r) => r[1] === p1c && r[2] === o1c);
+        const narrowed: ReadOptions = { keep: { o: [o1c, o1c + 1] }, offset: 1, limit: 1 };
+        expect(codeRows(store.matchCodes(null, p1, null, null, narrowed)!)).toEqual(kept.slice(1, 2));
+        expect(store.countQuads(null, p1, null, null, narrowed)).toBe(1);
+    });
+
+    test('malformed narrowing options throw before the store is read', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const strings = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
+        const bad: [unknown, ErrorConstructor][] = [
+            ['keep', TypeError],
+            [{ keep: 'p' }, TypeError],
+            [{ keep: { x: [1] } }, TypeError],
+            [{ keep: { p: new Uint32Array([1]) } }, TypeError],
+            [{ keep: { p: ['1'] } }, TypeError],
+            [{ keep: { p: [-1] } }, RangeError],
+            [{ keep: { p: [1.5] } }, RangeError],
+            [{ keep: { p: Float64Array.of(NaN) } }, RangeError],
+            [{ keep: { p: [0, 2 ** 53] } }, RangeError],
+            [{ limit: -1 }, RangeError],
+            [{ offset: 1.5 }, RangeError],
+            [{ limit: '2' }, TypeError],
+            [{ bogus: 1 }, TypeError],
+        ];
+        for (const each of [store, strings]) {
+            for (const [options, error] of bad) {
+                const name = JSON.stringify(options);
+                expect(() => each.matchCodes(null, null, null, null, options as ReadOptions), name).toThrow(error);
+                expect(() => each.countQuads(null, null, null, null, options as ReadOptions), name).toThrow(error);
+            }
+        }
+    });
+
+    test('matchCodeChunks yields the columns asked for, narrowed as matchCodes narrows', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const o1c = store.termDict()!.encode('<http://example.org/o1>')!;
+        const narrowings: ReadOptions[] = [{}, { keep: { o: [o1c, o1c + 1] } }, { limit: 2, offset: 1 }];
+        for (const narrowing of narrowings) {
+            const whole = store.matchCodes(null, null, null, null, narrowing)!;
+            for (const batchRows of [1, 2, 8192]) {
+                const chunks = store.matchCodeChunks(null, null, null, null, { ...narrowing, batchRows })!;
+                const { cols, sizes } = drainChunks(chunks);
+                const name = `${JSON.stringify(narrowing)} ${batchRows}`;
+                expect(cols, name).toEqual(columnArrays(whole));
+                expect(sizes.every((size) => size > 0 && size <= batchRows), name).toBe(true);
+            }
+        }
+        // Only the columns asked for are set.
+        const whole = store.matchCodes(null, p1, null, null)!;
+        const iterator = store.matchCodeChunks(null, p1, null, null, { columns: ['o'] })![Symbol.iterator]();
+        const first = iterator.next();
+        expect(first.done).toBe(false);
+        expect(Object.keys(first.value).sort()).toEqual(['length', 'o']);
+        expect([...first.value.o]).toEqual([...whole.o]);
+        // An exhausted iterator stays exhausted.
+        for (let i = 0; i < 2; i++) expect(iterator.next()).toEqual({ done: true, value: undefined });
+        const picked = drainChunks(store.matchCodeChunks(null, p1, null, null, { columns: ['g', 's', 'g'] })!);
+        expect(picked.cols).toEqual({ s: [...whole.s], g: [...whole.g] });
+    });
+
+    test('matchCodeChunks is null without codes and refuses bad chunk options', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const strings = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
+        expect(strings.matchCodeChunks(null, p1, null, null)).toBeNull();
+        const bad: [unknown, ErrorConstructor][] = [
+            [{ batchRows: 0 }, RangeError],
+            [{ batchRows: 1.5 }, RangeError],
+            [{ batchRows: '8' }, TypeError],
+            [{ columns: [] }, RangeError],
+            [{ columns: ['x'] }, TypeError],
+            [{ columns: 'o' }, TypeError],
+            [{ signal: {} }, TypeError],
+            [{ keep: { p: [-1] } }, RangeError],
+        ];
+        for (const each of [store, strings]) {
+            for (const [options, error] of bad) {
+                expect(() => each.matchCodeChunks(null, null, null, null, options as ChunkOptions), JSON.stringify(options))
+                    .toThrow(error);
+            }
+        }
+    });
+
+    test('matchCodesMany answers each probe in input order, as matchCodes does', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const o1c = store.termDict()!.encode('<http://example.org/o1>')!;
+        const probes: Probe[] = [
+            [null, p1, null, null],
+            ['http://example.org/s1', null, null, null],
+            { s: df.namedNode('http://example.org/nobody') },
+            { p: p1, keep: { o: [o1c, o1c + 1] }, limit: 1, offset: 1 },
+            { s: df.namedNode('http://example.org/s2'), limit: 1 },
+            {},
+        ];
+        const single = (probe: Probe) => Array.isArray(probe)
+            ? store.matchCodes(...probe)
+            : store.matchCodes(probe.s, probe.p, probe.o, probe.g, {
+                keep: probe.keep, limit: probe.limit, offset: probe.offset,
+            });
+        const answers = [...store.matchCodesMany(probes)];
+        expect(answers.length).toBe(probes.length);
+        answers.forEach((cols, i) => expect(codeRows(cols!), `probe ${i}`).toEqual(codeRows(single(probes[i])!)));
+        expect([...store.matchCodesMany([])]).toEqual([]);
+        // Every probe is parsed before any runs: a malformed one throws from the call.
+        for (const many of [store.matchCodesMany.bind(store), store.countQuadsMany.bind(store)]) {
+            expect(() => many([{}, [null, null, null]] as unknown as Probe[])).toThrow(TypeError);
+            expect(() => many([{}, { bogus: 1 }] as unknown as Probe[])).toThrow(TypeError);
+            expect(() => many([{}, 'probe'] as unknown as Probe[])).toThrow(TypeError);
+            expect(() => many({} as unknown as Probe[])).toThrow(TypeError);
+            expect(() => many([{}, [null, 'not an iri', null, null]])).toThrow(/Invalid predicate term/);
+            expect(() => many([{}, { p: 'not an iri' }])).toThrow(/Invalid predicate term/);
+            expect(() => many([{}, { keep: { p: [-1] } }])).toThrow(RangeError);
+        }
+    });
+
+    test('matchCodesMany answers null per probe without codes, evaluating none', async () => {
+        const strings = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
+        // Run, this probe throws: a keep needs the Dictionary layout.
+        const failing: Probe = { p: p1, keep: { o: [0, 5] } };
+        expect(() => strings.countQuadsMany([failing])).toThrow(/keep needs the Dictionary layout/);
+        expect([...strings.matchCodesMany([failing, failing, failing])]).toEqual([null, null, null]);
+    });
+
+    test('countQuadsMany counts each probe as countQuads does, on every layout', async () => {
+        for (const layout of ['dictionary', 'default', 'typed-object'] as const) {
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout });
+            const probes: Probe[] = [
+                [null, p1, null, null],
+                { s: 'http://example.org/s1' },
+                { s: df.namedNode('http://example.org/nobody'), limit: 1 },
+                { offset: 2, limit: 3 },
+                { p: p1, limit: 2 },
+                {},
+            ];
+            const single = (probe: Probe) => Array.isArray(probe)
+                ? store.countQuads(...probe)
+                : store.countQuads(probe.s, probe.p, probe.o, probe.g, { limit: probe.limit, offset: probe.offset });
+            expect(store.countQuadsMany(probes), layout).toEqual(probes.map(single));
+            expect(store.countQuadsMany([]), layout).toEqual([]);
+        }
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const o1c = store.termDict()!.encode('<http://example.org/o1>')!;
+        const kept: Probe = { keep: { o: [o1c, o1c + 1] } };
+        expect(store.countQuadsMany([kept, { ...kept, limit: 1 }])).toEqual([2, 1]);
+        // On a store without codes, the first probe with a keep makes the call throw.
+        const strings = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
+        expect(() => strings.countQuadsMany([{}, { p: p1, keep: { o: [0, 5] } }]))
+            .toThrow(/keep needs the Dictionary layout/);
+    });
+
+    test('an aborted signal ends a chunk iteration and a batch at the next pull', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const chunking = new AbortController();
+        const chunks = store.matchCodeChunks(null, null, null, null, { batchRows: 2, signal: chunking.signal })!;
+        const iterator = chunks[Symbol.iterator]();
+        expect(iterator.next().value.length).toBe(2);
+        chunking.abort();
+        for (let i = 0; i < 2; i++) expect(iterator.next()).toEqual({ done: true, value: undefined });
+
+        const batching = new AbortController();
+        const answers = store.matchCodesMany([{}, {}, {}], { signal: batching.signal })[Symbol.iterator]();
+        expect(answers.next().done).toBe(false);
+        batching.abort();
+        expect(answers.next()).toEqual({ done: true, value: undefined });
+        expect(() => store.matchCodesMany([{}], { signal: true } as unknown as { signal: AbortSignal }))
+            .toThrow(TypeError);
+    });
+
+    test('a signal aborted before the call returns a finished iterable, once the arguments are checked', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const signal = AbortSignal.abort();
+        const chunks = store.matchCodeChunks(null, null, null, null, { signal })![Symbol.iterator]();
+        expect(chunks.next()).toEqual({ done: true, value: undefined });
+        const answers = store.matchCodesMany([{}, [null, p1, null, null]], { signal })[Symbol.iterator]();
+        expect(answers.next()).toEqual({ done: true, value: undefined });
+        // The arguments are checked first, and `null` still means no codes.
+        expect(() => store.matchCodeChunks(null, null, null, null, { batchRows: 0, signal })).toThrow(RangeError);
+        expect(() => store.matchCodesMany([{ bogus: 1 } as unknown as Probe], { signal })).toThrow(TypeError);
+        const strings = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
+        expect(strings.matchCodeChunks(null, null, null, null, { signal })).toBeNull();
+    });
+
+    test('an empty match yields no chunk', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const nobody = df.namedNode('http://example.org/nobody');
+        const empty: [Term | null, ChunkOptions][] = [[nobody, {}], [null, { keep: { s: [] } }], [null, { limit: 0 }]];
+        for (const [subject, options] of empty) {
+            const iterator = store.matchCodeChunks(subject, null, null, null, options)![Symbol.iterator]();
+            expect(iterator.next(), JSON.stringify(options)).toEqual({ done: true, value: undefined });
+        }
+    });
 });
 
 describe('deleteQuad tombstones a base row', () => {
-    const target = df.quad(
-        df.namedNode('http://example.org/s1'),
-        df.namedNode('http://example.org/p1'),
-        df.namedNode('http://example.org/o1'),
-    );
     const p1 = df.namedNode('http://example.org/p1');
     const s1 = df.namedNode('http://example.org/s1');
 
@@ -928,19 +1209,19 @@ describe('deleteQuad tombstones a base row', () => {
     for (const { name, options } of LAYOUTS) {
         test(name, async () => {
             const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
-            await store.deleteQuad(target);
+            await store.deleteQuad(EXISTING_QUAD);
             expect(await store.size()).toBe(5);
-            expect(await store.has(target)).toBe(false);
+            expect(await store.has(EXISTING_QUAD)).toBe(false);
             expect(store.countQuads(null, p1, null, null)).toBe(2);
             expect(store.getQuads(s1, null, null, null).length).toBe(1);
 
             // Deleting an absent quad is a no-op.
-            await store.deleteQuad(target);
+            await store.deleteQuad(EXISTING_QUAD);
             expect(await store.size()).toBe(5);
 
             const restored = await VortexRdfStore.fromBytes(await store.toBytes());
             expect(await restored.size()).toBe(5);
-            expect(await restored.has(target)).toBe(false);
+            expect(await restored.has(EXISTING_QUAD)).toBe(false);
             expect(restored.countQuads(null, p1, null, null)).toBe(2);
         });
     }
@@ -996,11 +1277,7 @@ describe('graph and blank-node terms', () => {
 });
 
 describe('term validation and malformed input', () => {
-    const good = df.quad(
-        df.namedNode('http://example.org/s9'),
-        df.namedNode('http://example.org/p9'),
-        df.literal('new'),
-    );
+    const good = NEW_QUAD;
     const s = { termType: 'NamedNode', value: 'http://example.org/s' };
     const p = { termType: 'NamedNode', value: 'http://example.org/p' };
     const o = { termType: 'Literal', value: 'o' };
@@ -1026,12 +1303,12 @@ describe('term validation and malformed input', () => {
         expect(await store.size()).toBe(6);
     });
 
-    test('addQuad / deleteQuad / has reject a malformed quad object with an Error', async () => {
+    test('addQuad / deleteQuad reject and has throws a malformed quad object as an Error', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
         await expect(store.addQuad({} as any)).rejects.toThrow(/Invalid quad/);
         await expect(store.deleteQuad({} as any)).rejects.toThrow(/Invalid quad/);
-        await expect(store.has({} as any)).rejects.toThrow(/Invalid quad/);
-        await expect(store.has({} as any)).rejects.toBeInstanceOf(Error);
+        expect(() => store.has({} as any)).toThrow(/Invalid quad/);
+        expect(() => store.has({} as any)).toThrow(Error);
         expect(await store.size()).toBe(6);
     });
 
@@ -1040,7 +1317,7 @@ describe('term validation and malformed input', () => {
         await expect(VortexRdfStore.fromQuads(42 as any)).rejects.toThrow();
     });
 
-    test('a term of the wrong kind in a quad position is rejected', async () => {
+    test('every quad entry point rejects a malformed term', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
         const cases = [
             { subject: s, predicate: p, object: { termType: 'Variable', value: 'v' } },
@@ -1049,11 +1326,32 @@ describe('term validation and malformed input', () => {
             { subject: s, predicate: p, object: o, graph: { termType: 'Variable', value: 'g' } },
             { subject: s, predicate: p, object: { termType: 'Literal' } },
             { subject: { termType: 'NamedNode', value: 'not an iri' }, predicate: p, object: o },
-        ];
+            // A bare string is a NamedNode only in a pattern, never in a quad.
+            { subject: s, predicate: p, object: 'http://example.org/o' },
+            // An invalid datatype IRI is an error, never a plain literal.
+            {
+                subject: s,
+                predicate: p,
+                object: { termType: 'Literal', value: 'o', datatype: { termType: 'NamedNode', value: 'not an iri' } },
+            },
+            // So is a language that is not a string.
+            { subject: s, predicate: p, object: { termType: 'Literal', value: 'o', language: 42 } },
+            // A datatype is a NamedNode, never a bare IRI string.
+            {
+                subject: s,
+                predicate: p,
+                object: { termType: 'Literal', value: '5', datatype: 'http://www.w3.org/2001/XMLSchema#integer' },
+            },
+        ] as unknown as Quad[];
         for (const quad of cases) {
-            await expect(store.addQuad(quad as unknown as Quad)).rejects.toThrow(/Invalid quad object/);
-            await expect(VortexRdfStore.fromQuads([quad as unknown as Quad])).rejects
-                .toThrow(/Invalid quad object at index 0/);
+            // Soft, so that one run reports every entry point that accepts a case.
+            expect.soft(() => store.has(quad)).toThrow(/Invalid quad object/);
+            await expect.soft(store.addQuad(quad)).rejects.toThrow(/Invalid quad object/);
+            await expect.soft(store.deleteQuad(quad)).rejects.toThrow(/Invalid quad object/);
+            await expect.soft(store.addQuads([quad])).rejects.toThrow(/Invalid quad object at index 0/);
+            await expect.soft(VortexRdfStore.fromQuads([quad])).rejects.toThrow(/Invalid quad object at index 0/);
+            await expect.soft(VortexRdfStore.fromQuads(Readable.from([quad], { objectMode: true }))).rejects
+                .toThrow(/Invalid quad object in RDF\/JS stream at position 0/);
         }
         expect(await store.size()).toBe(6);
     });
@@ -1072,7 +1370,7 @@ describe('term validation and malformed input', () => {
         const bad = df.quad(df.blankNode('not a label'), df.namedNode('http://example.org/p'), df.literal('o'));
         await expect(store.addQuad(bad)).rejects.toThrow(/Invalid quad object/);
         await expect(VortexRdfStore.fromQuads([bad])).rejects.toThrow(/Invalid quad object at index 0/);
-        await expect(store.has(bad)).rejects.toThrow(/Invalid quad object/);
+        expect(() => store.has(bad)).toThrow(/Invalid quad object/);
     });
 
     test('an invalid pattern term throws instead of matching everything', async () => {
@@ -1084,6 +1382,12 @@ describe('term validation and malformed input', () => {
         expect(() => store.match(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
         expect(() => store.matchCodes(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
         expect(() => store.countQuads(df.namedNode('not an iri'), null, null, null)).toThrow(Error);
+        // An invalid datatype IRI throws instead of matching the plain literal "lit".
+        expect(() => store.countQuads(null, null, df.literal('lit', df.namedNode('not an iri')), null))
+            .toThrow(/Invalid object term/);
+        // So does a datatype that is a bare IRI string, not a NamedNode.
+        const bareDatatype = { termType: 'Literal', value: '42', datatype: 'http://www.w3.org/2001/XMLSchema#integer' };
+        expect(() => store.countQuads(null, null, bareDatatype as unknown as Term, null)).toThrow(/Invalid object term/);
     });
 
     test('a Variable term is a wildcard', async () => {
@@ -1113,10 +1417,53 @@ describe('disposal', () => {
         expect(() => dict.decode(0)).toThrow();
     });
 
-    test('Symbol.dispose is free on both handles', () => {
+    test('Symbol.dispose is free on every wasm handle', () => {
         expect(typeof VortexRdfStore.prototype[Symbol.dispose]).toBe('function');
         expect(VortexRdfStore.prototype[Symbol.dispose]).toBe(VortexRdfStore.prototype.free);
         expect(typeof TermDict.prototype[Symbol.dispose]).toBe('function');
         expect(TermDict.prototype[Symbol.dispose]).toBe(TermDict.prototype.free);
+        // The iterator handles under matchCodeChunks and matchCodesMany, which
+        // the package does not export: their iterables free them.
+        expect(typeof CodeChunks.prototype[Symbol.dispose]).toBe('function');
+        expect(CodeChunks.prototype[Symbol.dispose]).toBe(CodeChunks.prototype.free);
+        expect(typeof ProbeAnswers.prototype[Symbol.dispose]).toBe('function');
+        expect(ProbeAnswers.prototype[Symbol.dispose]).toBe(ProbeAnswers.prototype.free);
+    });
+
+    test('an iterable over a freed store throws on its next pull, then ends', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
+        const chunks = store.matchCodeChunks(null, null, null, null, { batchRows: 2 })![Symbol.iterator]();
+        const answers = store.matchCodesMany([{}, {}])[Symbol.iterator]();
+        expect(chunks.next().done).toBe(false);
+        expect(answers.next().done).toBe(false);
+        store.free();
+        expect(() => chunks.next()).toThrow(/VortexRdfStore .*freed/);
+        expect(() => answers.next()).toThrow(/VortexRdfStore .*freed/);
+        expect(chunks.next()).toEqual({ done: true, value: undefined });
+        expect(answers.next()).toEqual({ done: true, value: undefined });
+    });
+
+    test('return() and Symbol.dispose end the iterables', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
+        const makers = [
+            () => store.matchCodeChunks(null, null, null, null, { batchRows: 1 })!,
+            () => store.matchCodesMany([{}, {}, {}]),
+        ];
+        for (const make of makers) {
+            // A for…of left early calls return().
+            const left = make();
+            let pulled = 0;
+            for (const _ of left) {
+                pulled++;
+                break;
+            }
+            expect(pulled).toBe(1);
+            expect(left[Symbol.iterator]().next()).toEqual({ done: true, value: undefined });
+            const disposed = make();
+            expect(disposed[Symbol.iterator]().next().done).toBe(false);
+            disposed[Symbol.dispose]();
+            disposed[Symbol.dispose]();
+            expect(disposed[Symbol.iterator]().next()).toEqual({ done: true, value: undefined });
+        }
     });
 });

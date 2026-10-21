@@ -68,7 +68,8 @@ search path. Supporting a new encoding is therefore always additive.
 
 If the probe must outlive the borrow of the array (caching it beside the data,
 for instance), `OwnedSortedProbe` holds the `ArrayRef` and the probe tree
-together in one self-referential value.
+together in one self-referential value; its `probe()` is the `SortedProbe`
+every query goes through.
 
 ## Supported encodings
 
@@ -99,14 +100,13 @@ order.
 
 Off by default. With it, `ColumnChunks` extends the same treatment to a column
 inside a written Vortex file: it locates one field's flat chunk leaves in a
-layout tree, then answers global bounds queries, point reads and takes at
-ascending rows by fetching only the chunks a binary search over chunk extremes,
-or the rows, actually touch; a take has each leaf take its rows from its
-array. Each
-fetched chunk is reconstructed in its wire encoding (`SerializedArray::decode`
-rebuilds metadata over the segment buffers — it does not decompress), resolved
-into a probe once, and cached, so repeated queries against a hot file do no
-further I/O.
+layout tree, then answers global lower bounds, bounds queries, point reads and
+takes at ascending rows by fetching only the chunks a binary search over the
+chunks' last values, or the rows, actually touch; a take has each leaf take its
+rows from its array. Each fetched chunk is reconstructed in its wire encoding
+(`SerializedArray::decode` rebuilds metadata over the segment buffers — it does
+not decompress), resolved into a probe once, and cached, so repeated queries
+against a hot file do no further I/O.
 
 A column the writer dictionary-encoded at the layout level (a `vortex.dict`
 node — a values leaf beside a codes subtree, possibly one of a chunked run of
@@ -114,6 +114,11 @@ such dictionaries) is probed through its codes leaves: each is composed with
 the dictionary's values, fetched once and shared, into a dictionary array the
 probe resolves like any other. Because the probe's dictionary node bisects the
 decoded values, the order the writer assigned codes in never matters.
+
+The walk and the fetch beneath `ColumnChunks` serve columns of any dtype:
+`flat_leaves` lists the flat leaves holding a column's rows (a `FlatLeaf` is
+the leaf, its first row, and the values leaf of the dictionary whose codes it
+holds, if any), and `fetch_flat` reads one leaf's array in its wire encoding.
 
 ```console
 cargo add vortex-rdf-encoded-search --features layout

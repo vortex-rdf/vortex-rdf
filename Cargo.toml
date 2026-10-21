@@ -1,12 +1,16 @@
 [workspace]
 resolver = "2"
 members = ["core", "encoded-search", "js", "cli", "python"]
+# The DataFusion conformance crate and the comparative benchmark harness are
+# workspaces of their own (see interface-tests/Cargo.toml and
+# bench-compare/Cargo.toml), kept out of this one's build and test surface.
+exclude = ["interface-tests", "bench-compare"]
 # The python crate is a PyO3 extension module built by maturin; keep it out of
 # the default cargo build/test surface.
 default-members = ["core", "encoded-search", "js", "cli"]
 
 [workspace.package]
-version = "0.12.1"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Julián Rojas <julianandres.rojasmelendez@ugent.be>"]
@@ -18,8 +22,8 @@ keywords = ["rdf", "columnar", "vortex", "semantic-web", "quad-store"]
 categories = ["database-implementations", "encoding", "data-structures"]
 
 [workspace.dependencies]
-vortex-rdf-core = { path = "core", version = "0.12.1" }
-vortex-rdf-encoded-search = { path = "encoded-search", version = "0.12.1" }
+vortex-rdf-core = { path = "core", version = "0.13.0" }
+vortex-rdf-encoded-search = { path = "encoded-search", version = "0.13.0" }
 vortex = { version = "0.88.0", default-features = false }
 vortex-array = { version = "0.88.0" }
 vortex-btrblocks = "0.88.0"

@@ -11,7 +11,7 @@
 //! answer computed from the distinct set of the parsed quads.
 
 use super::*;
-use crate::common::terms::{canonical_spelling, parse_pattern_checked, parse_quads_from_reader};
+use crate::common::terms::{canonical_spelling, parse_quads_from_reader};
 use crate::store::RawQuad;
 use crate::store::builders::{BuiltArray, sorted_stream};
 use oxrdfio::RdfFormat;
@@ -57,7 +57,6 @@ const DATASET_LINES: usize = 14;
 const DATASET_DISTINCT: usize = 7;
 
 const ALL_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
-type Row = (String, String, String, String);
 
 fn row(q: &RawQuad) -> Row {
     (q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone())
@@ -92,7 +91,7 @@ async fn distinct_terms(text: &'static str) -> BTreeSet<String> {
 
 /// A quad pattern in the spelling the columns store: each of subject,
 /// predicate, object and graph bound (`Some`) or free (`None`).
-type Pattern = (
+type RawPattern = (
     Option<&'static str>,
     Option<&'static str>,
     Option<&'static str>,
@@ -105,7 +104,7 @@ type Pattern = (
 /// predicate and object, by subject, by graph, and unconstrained. With an
 /// index built, the object, predicate and predicate-object ones are the ones
 /// it serves.
-const PATTERNS: &[Pattern] = &[
+const PATTERNS: &[RawPattern] = &[
     (None, None, None, None),
     (None, None, Some("\"x\""), None),
     (None, None, Some("\"y\"@en"), None),
@@ -126,7 +125,7 @@ const PATTERNS: &[Pattern] = &[
 ];
 
 /// Whether `quad` is an answer to a pattern, by plain string comparison.
-fn answers(quad: &Row, (s, p, o, g): &Pattern) -> bool {
+fn answers(quad: &Row, (s, p, o, g): &RawPattern) -> bool {
     let free_or_equal =
         |bound: &Option<&str>, field: &String| bound.is_none_or(|b| b == field.as_str());
     free_or_equal(s, &quad.0)
@@ -150,12 +149,8 @@ async fn assert_holds_each_quad_once(store: &VortexRdfStore, expected: &BTreeSet
     );
 
     for pattern in PATTERNS {
-        let (s, p, o, g) =
-            parse_pattern_checked(pattern.0, pattern.1, pattern.2, pattern.3).unwrap();
-        let view = store
-            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-            .await
-            .unwrap();
+        let probe = Probe::parse(pattern.0, pattern.1, pattern.2, pattern.3).unwrap();
+        let view = store.run_probe(&probe).await.unwrap();
         let want: BTreeSet<Row> = expected
             .iter()
             .filter(|q| answers(q, pattern))
@@ -235,28 +230,7 @@ where
         .await;
     }
 
-    #[cfg(feature = "file-io")]
     {
-        // The in-memory builder's chunk stream, written out the way the wasm
-        // bindings serialize it.
-        let built = crate::store::builders::sorted_in_memory::build_chunk_stream(
-            Box::new(raw_stream(DATASET)),
-            layout,
-            indexes.clone(),
-            3,
-        )
-        .await
-        .unwrap();
-        let mut bytes: Vec<u8> = Vec::new();
-        crate::io::ser::built_stream_to_vortex_writer(built, &mut bytes)
-            .await
-            .unwrap();
-        check(
-            tag("SortedInMemoryBuilder chunk stream, from bytes"),
-            VortexRdfStore::from_bytes(&bytes).await.unwrap(),
-        )
-        .await;
-
         let mut bytes: Vec<u8> = Vec::new();
         quads_stream_to_vortex_writer(raw_stream(DATASET), &mut bytes, layout, indexes.clone())
             .await
@@ -342,8 +316,9 @@ async fn test_index_served_matches_ignore_the_repeats() {
             .match_pattern(None, Some(&p), None, None)
             .await
             .unwrap();
-        assert!(
-            served.debug_has_serve_plan(),
+        assert_eq!(
+            served_component(&served),
+            Some("index:posg"),
             "{layout:?}: P is index-served"
         );
         assert_eq!(
@@ -401,20 +376,26 @@ fn child_row_ids(component: &crate::store::indexes::IndexComponent) -> Vec<crate
 fn assert_children_describe_exactly(built: &BuiltArray, rows: usize, who: &str) {
     for component in &built.components {
         let mut ids = child_row_ids(component);
-        assert_eq!(ids.len(), rows, "{who}: {} child rows", component.name);
+        assert_eq!(
+            ids.len(),
+            rows,
+            "{who}: {} child rows",
+            component.identity.name
+        );
         ids.sort_unstable();
         assert_eq!(
             ids,
             (0..rows as crate::store::RowId).collect::<Vec<_>>(),
             "{who}: {} child row ids are the deduplicated rows, once each",
-            component.name
+            component.identity.name
         );
     }
 }
 
 /// Copies of one quad that land in different spilled runs collapse in the
 /// K-way merge, and the index children — spilled and merged on their own —
-/// describe the deduplicated rows: one record per row, each row id once.
+/// describe the deduplicated rows: one record per row, each row id once, and
+/// each reference child's `(val, rid)` pairs strictly ascending.
 #[tokio::test]
 async fn test_spilled_runs_collapse_repeats_across_runs() {
     let (stream, expected) = spread_repeats().await;
@@ -433,6 +414,20 @@ async fn test_spilled_runs_collapse_repeats_across_runs() {
             assert_eq!(built.array.len(), expected.len(), "{who}: primary rows");
             assert_eq!(built.components.len(), 4, "{who}");
             assert_children_describe_exactly(&built, expected.len(), &who);
+            let references: Vec<_> = built
+                .components
+                .iter()
+                .filter(|c| c.identity.name.starts_with("index:ref-"))
+                .collect();
+            assert_eq!(references.len(), 2, "{who}: reference children");
+            for component in references {
+                let pairs = reference_pairs(component);
+                assert!(
+                    pairs.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{who}: {} rows are in strict (val, rid) order: {pairs:?}",
+                    component.identity.name
+                );
+            }
 
             let store = VortexRdfStore::from_built(built).unwrap();
             let rows = tuple_rows(&store.quads_vec().await.unwrap());
@@ -572,9 +567,7 @@ async fn test_probe_dictionary_holds_one_code_per_rdf_term() {
     }
     // The file-backed dictionary answers through its reader too; the
     // directory outlives the assertions below.
-    #[cfg(feature = "file-io")]
     let dir = tempfile::tempdir().unwrap();
-    #[cfg(feature = "file-io")]
     {
         let path = dir.path().join("probe.vortex");
         crate::io::quads_stream_to_vortex_file(raw_stream(PROBE), &path, layout, vec![])
@@ -690,7 +683,7 @@ async fn test_builders_intern_the_spelling_they_are_given() {
         );
         if layout == LayoutStrategy::Dictionary {
             // The subject, the predicate, "x" and the default graph.
-            assert_eq!(store.code_read_snapshot().unwrap().len(), 4);
+            assert_eq!(store.dict_reader().unwrap().len(), 4);
         }
     }
 }
@@ -732,14 +725,7 @@ async fn test_compaction_after_appends_holds_each_quad_once() {
     for layout in LAYOUTS {
         for indexes in index_sets() {
             let who = format!("{layout:?} / {indexes:?}");
-            let built = build_array::<SortedInMemoryBuilder>(
-                quad_stream(base.clone()),
-                layout,
-                indexes.clone(),
-            )
-            .await
-            .unwrap();
-            let store = VortexRdfStore::from_built(built).unwrap();
+            let store = built_store(base.clone(), layout, indexes.clone()).await;
             let tailed = store.add_quads(appended.clone()).await.unwrap();
             assert_eq!(
                 tailed.tail_len(),
@@ -751,17 +737,13 @@ async fn test_compaction_after_appends_holds_each_quad_once() {
             assert_holds_each_quad_once_in(&compacted, &expected, &who).await;
 
             // And its serialization.
-            #[cfg(feature = "file-io")]
-            {
-                let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
-                    .await
-                    .unwrap();
-                assert_holds_each_quad_once_in(&reread, &expected, &who).await;
-            }
+            let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
+                .await
+                .unwrap();
+            assert_holds_each_quad_once_in(&reread, &expected, &who).await;
         }
     }
 
-    #[cfg(feature = "file-io")]
     for layout in LAYOUTS {
         let who = format!("{layout:?} / file");
         let (_dir, path) = write_store_file(base.clone(), layout, ALL_INDEXES.to_vec()).await;
@@ -797,9 +779,11 @@ async fn assert_holds_each_quad_once_in(
 }
 
 /// A store whose base was assembled without a builder — rows from a foreign
-/// writer, repeats and all — comes out of compaction (which rebuilds through
+/// writer, repeats and all, in their own order or in `(s, p, o, g)` order
+/// under the sorted stamp — comes out of compaction (which rebuilds through
 /// the sorted builders) and out of a rebuilding serialization (a tail
-/// appended to it) with each quad once.
+/// appended to it) with each quad once: the unstamped rows are sorted whole,
+/// the stamped ones only have a tail merged in.
 #[tokio::test]
 async fn test_rebuilds_drop_repeats_a_base_carries() {
     let with_repeats: Vec<Quad> = vec![
@@ -812,33 +796,48 @@ async fn test_rebuilds_drop_repeats_a_base_carries() {
     ];
     let expected: BTreeSet<Row> = tuple_rows(&with_repeats).into_iter().collect();
     assert_eq!(expected.len(), 3);
-    let store = unstamped_store(&with_repeats);
-    assert_eq!(
-        store.size().await.unwrap(),
-        6,
-        "the base carries its repeats"
-    );
+    let mut sorted: Vec<RawQuad> = with_repeats.iter().map(RawQuad::from_quad).collect();
+    sorted.sort();
+    let stamped = VortexRdfStore::from_built(BuiltArray {
+        array: crate::store::builders::build_struct_array(&sorted, LayoutStrategy::Default, true)
+            .unwrap(),
+        components: vec![],
+        dict: None,
+    })
+    .unwrap();
+    for (base, store) in [
+        ("unstamped", unstamped_store(&with_repeats)),
+        ("stamped", stamped),
+    ] {
+        assert_eq!(
+            store.size().await.unwrap(),
+            6,
+            "{base}: the base carries its repeats"
+        );
+        assert_eq!(
+            store.view_statistics().unwrap().sort_order.is_some(),
+            base == "stamped",
+            "{base}: the base's sorted provenance"
+        );
 
-    for indexes in index_sets() {
-        let who = format!("in memory / {indexes:?}");
-        let compacted = store.compact_with_indexes(indexes.clone()).await.unwrap();
-        assert_holds_each_quad_once_in(&compacted, &expected, &who).await;
-        assert_eq!(compacted.indexes(), indexes.as_slice(), "{who}");
-    }
+        for indexes in index_sets() {
+            let who = format!("{base} in memory / {indexes:?}");
+            let compacted = store.compact_with_indexes(indexes.clone()).await.unwrap();
+            assert_holds_each_quad_once_in(&compacted, &expected, &who).await;
+            assert_eq!(compacted.indexes(), indexes.as_slice(), "{who}");
+        }
 
-    // A tail makes the serialization rebuild the rows: it drops them too.
-    #[cfg(feature = "file-io")]
-    {
+        // A tail makes the serialization rebuild the rows: it drops them too.
         let tailed = store.add_quads([quad_of("s4", "p", "z")]).await.unwrap();
         let mut expected_tailed = expected.clone();
         expected_tailed.extend(tuple_rows(&[quad_of("s4", "p", "z")]));
         let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
             .await
             .unwrap();
-        assert_holds_each_quad_once_in(&reread, &expected_tailed, "tailed serialization").await;
+        let who = format!("{base} tailed serialization");
+        assert_holds_each_quad_once_in(&reread, &expected_tailed, &who).await;
     }
 
-    #[cfg(feature = "file-io")]
     for indexes in index_sets() {
         let who = format!("file / {indexes:?}");
         let (_dir, path) = write_unsorted_store_file(&with_repeats, 0).await;

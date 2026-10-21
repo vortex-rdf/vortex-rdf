@@ -24,7 +24,7 @@ store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")            # [(s, p, o, g)
 
 ## Reading quads
 
-Every read takes a pattern as the keyword arguments `s`, `p`, `o`, `g`; an omitted position is a wildcard. Terms cross the boundary as N-Triples strings (`<iri>`, `_:b0`, `"lit"@en`, `"3"^^<http://www.w3.org/2001/XMLSchema#integer>`); the graph of a quad in the default graph is the empty string, which is also how a pattern selects it. A malformed term raises `ValueError`; a failing store operation raises `VortexRdfError`. That includes opening a store written by vortex-rdf 0.11 or earlier: its root layout is refused, and the error says to rebuild it from its RDF source with `serialize_rdf`.
+Every read takes a pattern as the keyword arguments `s`, `p`, `o`, `g`; an omitted position is a wildcard. Terms cross the boundary as N-Triples strings (`<iri>`, `_:b0`, `"lit"@en`, `"3"^^<http://www.w3.org/2001/XMLSchema#integer>`); the graph of a quad in the default graph is the empty string, which is also how a pattern selects it. A malformed term or an invalid argument (an unknown format, layout or index name, an unknown predicate kind, a bad option, candidate codes out of order) raises `ValueError`, and a malformed pattern term's message names the position that held it (`Invalid input: pattern subject: invalid IRI "…": …`); an I/O failure raises the `OSError` subclass its kind names; anything else raises `VortexRdfError`: a store that does not read, or an operation the store refuses, such as `keep` on a non-Dictionary store.
 
 ```python
 len(store)                                                   # number of quads
@@ -50,7 +50,7 @@ dictionary.decode_many(cols[0])                      # bulk-decode a whole colum
 dictionary.encode("<http://xmlns.com/foaf/0.1/name>")  # code for a term, or None
 ```
 
-`decode_many` decodes a batch in one GIL-released call. Buffer-protocol inputs — a column straight from `match_codes`, `memoryview(col).cast("Q")`, an `array("Q", ...)`, a `uint64` or non-negative `int64` NumPy array — are read in a single bulk copy with no per-element int conversion; a raw-byte buffer whose length is a multiple of 8 (`memoryview(col)` itself, before the `cast`) is read as native-endian `u64`s; a buffer of any other items (a `cast("I")` view, a `uint32` array) raises `ValueError` rather than being read element by element. Any sequence of ints works too. `encode` is the inverse of `decode` and tolerant of spelling: an IRI with or without angle brackets, a literal with an explicit `xsd:string` type or an upper-case language tag, and the default graph as `""`, `default` or `[]` all resolve to the stored form's code (a malformed term raises `ValueError`); `encode_many` does a batch. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout). A file store's dictionary is read from the mapped file on demand — `TermDict.file_backed` says so — with the same calls.
+`decode_many` decodes a batch in one GIL-released call. A column straight from `match_codes` is shared, not copied. Other buffer-protocol inputs — `memoryview(col).cast("Q")`, an `array("Q", ...)`, a `uint64` or non-negative `int64` NumPy array — are read in a single bulk copy with no per-element int conversion; a raw-byte buffer whose length is a multiple of 8 (`memoryview(col)` itself, before the `cast`) is read as native-endian `u64`s; a buffer of any other items (a `cast("I")` view, a `uint32` array) raises `ValueError` rather than being read element by element. Any sequence of ints works too. `encode` is the inverse of `decode` and tolerant of spelling: an IRI with or without angle brackets, a literal with an explicit `xsd:string` type or an upper-case language tag, and the default graph as `""`, `default` or `[]` all resolve to the stored form's code (a malformed term raises `ValueError`); `encode_many` does a batch. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout). A file store's dictionary is read from the mapped file on demand — `TermDict.file_backed` says so — with the same calls.
 
 Consumers can join, count, and de-duplicate entirely in code space and decode each distinct term once, never materializing a term string for a row they discard. The handle and the columns carry the pieces a query layer pushes below a pattern:
 
@@ -72,20 +72,41 @@ cols = store.match_codes(p=NAME, keep={"o": range(lo, hi)})
 cols = store.match_codes(p=NAME, keep={"o": passed, "g": [0]}, limit=100, offset=20)
 n = store.count_quads(p=NAME, keep={"o": passed}, limit=1)   # an existence test
 
-# Many probes in one GIL-released call, answered in input order.
-views = store.match_codes_many([(None, NAME, None, None), {"s": "<http://ex.org/bob>", "limit": 5}])
+# Many probes, answered in input order: at most `lookahead` in flight, `lookahead` answers waiting.
+for answer in store.match_codes_many([(None, NAME, None, None), {"s": "<http://ex.org/bob>", "limit": 5}]):
+    ...                                     # one probe's (s, p, o, g), or None
 counts = store.count_quads_many([{"p": NAME, "keep": {"o": literals}}])
+
+# A match of any size in chunks of at most batch_rows rows: in memory each is sliced or
+# gathered when it is pulled, and a file scan reads a bounded window of splits ahead.
+for subjects, objects in store.match_code_chunks(p=NAME, columns=("s", "o"), batch_rows=65536):
+    ...
+
+# One token per query stops its long calls from any thread.
+from vortex_rdf import CancelToken
+token = CancelToken()
+chunks = store.match_code_chunks(p=NAME, cancel=token)
+n = store.count_quads(p=NAME, cancel=token)
+token.cancel()                              # the next pull with it raises Cancelled
 
 # Column kernels, order-preserving: first-seen distinct values, nested-loop joins.
 s, p, o, g = cols
 s.distinct(); o.value_counts()
 left_idx, right_idx = o.join_indices(s)     # rows where o == s, as index pairs
 o.take(left_idx)                            # gather a joined column
+o.join_count(s)                             # the number of pairs, none built
+o.join_indices(s, max_pairs=1_000_000)      # JoinTooLarge (.pairs is the count) rather than more pairs
+groups = s.groups()                         # the join's right side, built once
+x, z = groups.gather(o, [s], [o])           # rows where o == s: the left s, the right o, no index pairs
+for start in range(0, len(o), 65536):       # a large join, one zero-copy left slice at a time
+    left_idx, right_idx = groups.join(o.slice(start, min(start + 65536, len(o))))
 ```
 
 `filter_codes(kind, arg, codes, *, flags="", case=None, as_str=False)` evaluates a FILTER predicate over the candidate `codes` (sorted and unique, else `ValueError`) and answers `(passed, undecided)`, both subsets of `codes`; a candidate in neither fails, and the undecided ones are left to the caller's own evaluator. No verdict is memoized. Kinds: `is_literal`, `is_iri`, `is_blank`; `datatype <iri>`, `lang <tag>`, `lang_matches <range>`; `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne <number>` (value comparison for well-formed numeric literals; `xsd:long`/`xsd:unsignedLong` beyond 64 bits undecided; different XSD datatypes order by their IRIs; a non-literal fails the orderings and `=`, passes `!=`); and the string kinds `str_prefix <p>`, `contains`/`strstarts`/`strends <constant's N-Triples spelling>`, `regex <pattern>` with `flags`. String kinds follow rdflib 7.6: the text is a string literal's lexical form (with `as_str=True`, SPARQL `STR()`: an IRI's string or a literal's lexical form; a blank node, or a literal whose datatype rdflib normalizes, is undecided), `case="lower"|"upper"` wraps that text (Python's `str.lower()`/`str.upper()`, decided on ASCII text only), a language-tagged constant needs the same tag on the text, and `regex` decides only patterns from an allow-listed subset that agrees with Python's `re`; the stub's docstring has the exact rules.
 
-`keep` takes a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0–3) to a code set or a code range. A set is a `U64Column`, a u64 buffer or a list of ints. A range is a `range` with step 1 (a stepped `range` raises `ValueError`) or a 2-tuple `(lo, hi)`, the half-open codes `lo <= code < hi`. A 2-tuple is always a range, so a set of codes is passed as a list or a `U64Column`, never as `tuple(codes)`. `limit`/`offset` window the rows in base order, and a filtered file scan stops at the first block that fills the window. A probe of the `*_many` calls is an `(s, p, o, g)` tuple or a dict with keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset`; every probe is parsed before any is evaluated.
+`keep` takes a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0–3) to a code set or a code range. A set is a `U64Column`, a u64 buffer or a list of ints. A range is a `range` with step 1 (a stepped `range` raises `ValueError`) or a 2-tuple `(lo, hi)`, the half-open codes `lo <= code < hi`. A 2-tuple is always a range, so a set of codes is passed as a list or a `U64Column`, never as `tuple(codes)`. `limit`/`offset` window the rows in base order (`count_quads` counts the same window), and a filtered file scan stops at the first block that fills the window. A probe of the `*_many` calls is an `(s, p, o, g)` tuple or a dict with keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset`; every probe is parsed before any is evaluated.
+
+`match_codes_many` returns an iterator whose probes start with the call and keep running between pulls, at most `lookahead` of them in flight (by default twice the CPU count, and at least 64; pass a smaller one for heavy scan probes) and at most `lookahead` answers waiting to be pulled; dropping it aborts the probes still running. `match_code_chunks` takes the narrowing of `match_codes`, plus `columns` (any of `"s"`, `"p"`, `"o"`, `"g"`, in the order the chunks hold them) and `batch_rows` (65,536 by default): in memory each chunk is sliced or gathered when it is pulled, and on file a scan reads a bounded window of splits ahead of the pulls ([docs/interfaces.md §3](https://github.com/vortex-rdf/vortex-rdf/blob/main/docs/interfaces.md#3-rows-as-columns-without-arrow)). A `CancelToken` passed as `cancel=` to `match_codes`, `count_quads`, the `*_many` calls or `match_code_chunks` stops them from any thread: a call or pull waiting when it is cancelled stops at its next wait for data (on file, the next split boundary) and raises `Cancelled`, a `VortexRdfError`, as does every later call or pull given the token, while a result already complete is returned; without a token the calls run unraced on the calling thread. `join_count` counts a join's pairs without building them, and `join_indices(other, max_pairs=n)` raises `JoinTooLarge` (`.pairs` is the pair count) before building more than `n`. `groups()` builds a column's side of a join once; `CodeGroups.join` of consecutive `slice`s of the other column, each offset by its start, concatenates to the one-shot `join_indices`, and `CodeGroups.gather` returns the joined columns themselves, filled as the pairs are found, with no index pairs written in between.
 
 ## Build options
 
@@ -133,33 +154,7 @@ Rust source changes are picked up by `uv sync` automatically (see `[tool.uv] cac
 
 Building from source (the sdist or a development build) additionally requires **libclang**: a transitive build dependency of the Vortex file engine (`custom-labels`, via `vortex-io`) generates C bindings with `bindgen` at compile time. It is preinstalled on most dev setups (Xcode, LLVM on Windows); on Linux install e.g. `clang-devel` (dnf) or `libclang-dev` (apt). Installing a published wheel needs none of this.
 
-### Benchmarks
-
-`bench/run.py` measures these bindings against [pyoxigraph](https://pypi.org/project/pyoxigraph/), [pycottas](https://pypi.org/project/pycottas/), [rdflib](https://pypi.org/project/rdflib/) and [lightrdf](https://pypi.org/project/lightrdf/) on a file → store → query workload and writes `bench/results.json` for [the dashboard's Python tab](https://vortex-rdf.github.io/vortex-rdf/#py); `bench/test_codspeed.py` is the instrumented suite CodSpeed runs.
-
-```bash
-python3 python/bench/run.py                 # full run
-BENCH_DIM=32 python3 python/bench/run.py    # quick pilot
-uv run pytest bench/test_codspeed.py --codspeed
-```
-
-Harness design (per-library virtualenvs, dataset parity with `js/bench/datasets.ts`, `unsupported` cells where a library lacks the operation, matched-row counts cross-checked and any disagreement recorded in `config.countWarnings`) is documented in `bench/run.py`, `bench/worker.py` and `bench/adapters.py`. Configuration variables:
-
-| Var | Default | Meaning |
-| --- | --- | --- |
-| `BENCH_SIZE` | 1,048,576 | rows (value shared with the Rust and JS suites) |
-| `BENCH_DIM` | unset | optional cube shorthand, `D³` rows; ignored if `BENCH_SIZE` is set |
-| `BENCH_GRAPHS_QUADS` | 8 | named graphs the comparative bench asks for |
-| `MUT_BATCH` | 10000 | quads per add/delete batch |
-| `BENCH_PYTHON` | 3.13 | Python version the per-library virtualenvs are provisioned with |
-| `BENCH_SUBJ_RATIO` / `BENCH_OBJ_RATIO` | 0.1 / 0.5 | distinct subjects / objects per row |
-| `BENCH_PREDICATES` | 32 | distinct predicates |
-| `BENCH_GRAPHS` | 1 | distinct named graphs in the generator; 1 means default graph only |
-| `BENCH_LITERAL_FRAC` | 0.4 | fraction of objects that are literals |
-| `BENCH_SLOW_PHASE_MS` | 30000 | a phase slower than this runs once, without warmup |
-| `PY_BENCH_QUERY_ITERS` / `PY_BENCH_QUERY_WARMUP` | 10 / 5 | measured / warmup iterations per query |
-| `PY_BENCH_HEAVY_ITERS` / `PY_BENCH_FULL_SCAN_ITERS` | 3 / 3 | iterations for the heavy and full-scan phases |
-| `CODSPEED_BENCH_DIM` / `CODSPEED_BENCH_DIM_QUADS` | 32 / 13 | CodSpeed suite: `D³` triples / `D⁴` quads |
+Benchmarks live in [bench/](https://github.com/vortex-rdf/vortex-rdf/blob/main/python/bench/README.md).
 
 ## License
 

@@ -25,7 +25,10 @@ export type LayoutStrategy = 'default' | 'typed-object' | 'dictionary';
  */
 export type IndexType = 'secondary-by-reference' | 'secondary-by-copy';
 
-/** RDF syntaxes accepted for parsing and emitted for serialization. */
+/**
+ * RDF syntaxes accepted for parsing and emitted for serialization. Any other
+ * name rejects with `Invalid input: unknown RDF format …`, which lists these.
+ */
 export type RdfFormatName =
     | 'nt' | 'ntriples'
     | 'nq' | 'nquads'
@@ -54,17 +57,108 @@ export interface BuildOptions {
 }
 
 /**
+ * The term codes a code read keeps, per position, applied inside the store
+ * before any row is gathered: a code set (a `Float64Array`, or an array of
+ * codes of any length but two; what a `matchCodes` column holds) or a code
+ * range (a two-element array `[lo, hi]`, the half-open codes
+ * `lo <= code < hi`). A two-element array is always a range; a two-code set
+ * is a `Float64Array`. A code is an integer from 0 to
+ * `Number.MAX_SAFE_INTEGER`. A keep needs code-addressable rows: on a store
+ * without them, a count with a keep throws.
+ */
+export type CodeKeep = {
+    s?: Float64Array | number[] | [number, number];
+    p?: Float64Array | number[] | [number, number];
+    o?: Float64Array | number[] | [number, number];
+    g?: Float64Array | number[] | [number, number];
+};
+
+/**
+ * How `matchCodes`, `countQuads` and `matchCodeChunks` narrow a pattern's
+ * match: `keep` first, then a window of the kept rows in base row order.
+ * A value of the wrong type or an unknown key throws a `TypeError`, a number
+ * outside its range a `RangeError`.
+ */
+export interface ReadOptions {
+    /** The codes to keep per position. */
+    keep?: CodeKeep;
+    /** The most rows to read; a count stops once this many are known to exist. */
+    limit?: number;
+    /** The rows to skip first. @default 0 */
+    offset?: number;
+}
+
+/** `ReadOptions` plus the shape of `matchCodeChunks`'s chunks. */
+export interface ChunkOptions extends ReadOptions {
+    /** The columns each chunk holds, by name; at least one. @default ['s', 'p', 'o', 'g'] */
+    columns?: ('s' | 'p' | 'o' | 'g')[];
+    /** The most rows a chunk holds; at least 1. @default 8192 */
+    batchRows?: number;
+    /** Ends the iteration at the next `next()` once aborted; aborted before the call, the call returns a finished iterable and resolves nothing. */
+    signal?: AbortSignal;
+}
+
+/** A match's term codes: one `Float64Array` of exact integer codes per position, each `length` long. */
+export interface CodeColumns {
+    s: Float64Array;
+    p: Float64Array;
+    o: Float64Array;
+    g: Float64Array;
+    length: number;
+}
+
+/** One chunk of `matchCodeChunks`: a `Float64Array` copy of each requested column, each `length` long; the others are not set. */
+export interface CodeChunk {
+    s?: Float64Array;
+    p?: Float64Array;
+    o?: Float64Array;
+    g?: Float64Array;
+    length: number;
+}
+
+/**
+ * One probe of `matchCodesMany` or `countQuadsMany`: a pattern as an array
+ * `[s, p, o, g]`, or an object whose `s`, `p`, `o`, `g` are its pattern
+ * terms (absent ones wildcards) and whose `keep`, `limit` and `offset`
+ * narrow it as `ReadOptions` do. Any other key throws.
+ */
+export type Probe =
+    | [Term | string | null, Term | string | null, Term | string | null, Term | string | null]
+    | {
+        s?: Term | string | null;
+        p?: Term | string | null;
+        o?: Term | string | null;
+        g?: Term | string | null;
+        keep?: CodeKeep;
+        limit?: number;
+        offset?: number;
+    };
+
+/**
  * A wasm-side store handle. Every method that fails rejects (or, for the
- * synchronous read family, throws) with an `Error`.
+ * synchronous read family, throws) with an `Error`. An argument the Rust
+ * core refuses (a format, layout or index name) rejects with
+ * `Invalid input: …`.
  *
- * Only the pattern-read family — `match`, `getQuads`, `countQuads`,
- * `matchCodes` — is synchronous; `size` and `has` return promises like the
- * builders and mutations.
+ * The read family — `match`, `getQuads`, `countQuads`, `countQuadsMany`,
+ * `matchCodes`, `matchCodeChunks`, `matchCodesMany`, `size` and `has` — is
+ * synchronous: no read path performs I/O, so there is nothing to await. The
+ * builders, mutations and serializers return promises.
  *
  * A pattern position is a wildcard when it is `null`/`undefined` or an RDF/JS
  * `Variable` term; a bare string is read as a NamedNode IRI; any other value
  * that is not a valid term of that position's kind throws `Invalid <position>
  * term`.
+ *
+ * A quad given to `has`, `addQuad`, `addQuads`, `deleteQuad` or `fromQuads`
+ * holds RDF/JS term objects only: a bare string is a NamedNode in a pattern,
+ * never in a quad. All five validate a quad's terms by one rule, and a quad is
+ * malformed (`Invalid quad object`) when a term is not of its position's kind
+ * or its IRI, blank-node label, language tag or datatype IRI is invalid. A
+ * literal is language-tagged when its `language` is non-empty, else typed when
+ * its `datatype.value` is, else simple. A literal's `datatype`, when present,
+ * is a NamedNode object: a non-object such as a bare IRI string is malformed,
+ * in a quad and in a pattern alike. An absent graph is the default graph.
  */
 export class VortexRdfStore {
     static empty(): VortexRdfStore;
@@ -86,9 +180,10 @@ export class VortexRdfStore {
     layout(): LayoutStrategy;
     /** The secondary indexes this store was built with (canonical kebab-case names). */
     indexes(): IndexType[];
-    size(): Promise<number>;
-    /** Rejects on a malformed quad object, like addQuad/deleteQuad. */
-    has(quad: Quad): Promise<boolean>;
+    /** Number of quads in the store. */
+    size(): number;
+    /** Whether the quad is in the store. Throws on a malformed quad object (addQuad/deleteQuad reject it). */
+    has(quad: Quad): boolean;
     /** Add one quad in place (a quad already present is ignored, per RDF/JS). */
     addQuad(quad: Quad): Promise<void>;
     /**
@@ -117,9 +212,18 @@ export class VortexRdfStore {
     getQuads(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): Quad[];
     /**
      * Number of quads matching a pattern — counted from the match's row
-     * selection alone, no term string materialized.
+     * selection alone, no term string materialized. `options` narrow the
+     * match as for `matchCodes`; with a `limit` the count stops once that
+     * many rows are known to exist (`limit: 1` is an existence test). A
+     * `keep` needs code-addressable rows and throws without them.
      */
-    countQuads(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): number;
+    countQuads(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ReadOptions): number;
+    /**
+     * `countQuads` for each probe, in input order, in one call. Every probe
+     * is parsed before any is counted, so a malformed one throws first; the
+     * first probe that fails throws. Counts on every layout.
+     */
+    countQuadsMany(probes: Probe[]): number[];
     /**
      * Low-level. Resolve a pattern to the matched rows' raw term codes —
      * `{ s, p, o, g }` as `Float64Array`s plus `length` — with no term strings
@@ -127,9 +231,44 @@ export class VortexRdfStore {
      * a code past `Number.MAX_SAFE_INTEGER` (2^53 - 1) throws rather than
      * rounding. `null` unless the store's rows are code-addressable
      * (Dictionary layout, no pending appends, resident dictionary); decode
-     * codes through `termDict()`.
+     * codes through `termDict()`. An invalid pattern term or option throws
+     * whether or not the rows are code-addressable.
+     *
+     * `options.keep` keeps the rows whose code in a position is in a code set
+     * or range (`CodeKeep`), inside the store, before any row is gathered;
+     * `options.offset` and `options.limit` then window the kept rows in base
+     * row order.
      */
-    matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): { s: Float64Array; p: Float64Array; o: Float64Array; g: Float64Array; length: number } | null;
+    matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ReadOptions): CodeColumns | null;
+    /**
+     * Low-level. `matchCodes` in chunks: an iterable whose items hold at most
+     * `options.batchRows` rows (8,192 by default) in base row order, each a
+     * `Float64Array` copy of the columns `options.columns` names (all four
+     * by default). `null` under the same conditions as `matchCodes`. The
+     * call resolves the narrowed match (`keep`, `limit`, `offset`); each
+     * `next()` reads or gathers one chunk's rows, so stopping the pulls stops
+     * the work. The iterable's `return()` (a `for…of` left early) and
+     * `[Symbol.dispose]` (`using`) free its wasm handle, as does its end; an
+     * aborted `options.signal` ends the iteration at the next `next()`, and
+     * a signal already aborted makes the call return a finished iterable
+     * without resolving the match. The iterable holds its store, which stays
+     * alive until the iterable is done; once the store is freed with
+     * `free()`, `next()` throws. `batchRows` below 1, an empty `columns` or
+     * an unknown column name throws.
+     */
+    matchCodeChunks(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ChunkOptions): (Iterable<CodeChunk> & Disposable) | null;
+    /**
+     * Low-level. `matchCodes` for each probe: an iterable answering one probe
+     * per `next()`, in input order — its `CodeColumns`, or `null` for every
+     * probe when the store's rows are not code-addressable, in which case no
+     * probe runs. Every probe is parsed before any runs, so a malformed one
+     * throws from this call; the first probe that fails throws from its
+     * `next()` and ends the iteration. The probes run one by one, on the
+     * calling thread; the batch saves the boundary crossings and the
+     * parsing. Disposal, `options.signal` (an already aborted one runs no
+     * probe) and the store's lifetime work as for `matchCodeChunks`.
+     */
+    matchCodesMany(probes: Probe[], options?: { signal?: AbortSignal }): Iterable<CodeColumns | null> & Disposable;
     /**
      * Low-level. An immutable handle on this store's term dictionary — the one
      * door to code↔term translation. `undefined` unless the store's rows are
@@ -160,12 +299,37 @@ export class TermDict {
      */
     decode(code: number): string | undefined;
     /**
-     * Encode an N-Triples term string to its code (inverse of `decode`), or
-     * `undefined` when the term is absent. Throws for a code past
-     * `Number.MAX_SAFE_INTEGER`, which no number holds exactly.
+     * Encode a term to its code (inverse of `decode`), or `undefined` when the
+     * term is absent. Tolerant of spelling: an IRI with or without angle
+     * brackets, a literal with escape variants, an `xsd:string` typing, an
+     * upper-case language tag, or `'default'` / `'[]'` for the default graph
+     * all find the stored form's code. Throws for a malformed term, and for a
+     * code past `Number.MAX_SAFE_INTEGER`, which no number holds exactly.
      */
     encode(term: string): number | undefined;
     /** Release the wasm-side handle (also invoked by `Symbol.dispose`). */
+    free(): void;
+    [Symbol.dispose](): void;
+}
+
+/**
+ * The wasm handle under `matchCodeChunks`'s iterable, which pulls it; not
+ * used directly. `next()` returns the next chunk, or `undefined` once the
+ * match is exhausted, and throws once its store is freed.
+ */
+export class CodeChunks {
+    next(): CodeChunk | undefined;
+    free(): void;
+    [Symbol.dispose](): void;
+}
+
+/**
+ * The wasm handle under `matchCodesMany`'s iterable, which pulls it; not
+ * used directly. `next()` returns the next probe's answer, or `undefined`
+ * once every probe has answered, and throws once its store is freed.
+ */
+export class ProbeAnswers {
+    next(): CodeColumns | null | undefined;
     free(): void;
     [Symbol.dispose](): void;
 }

@@ -81,41 +81,32 @@ mimalloc = ["dep:mimalloc"]
 # builds have no use for an argument parser.
 clap = ["dep:clap"]
 
+# Every public item has one public path: a `pub` item that is reachable from
+# the API but re-exported nowhere has none, and the gates run with `-D warnings`.
+[lints.rust]
+unnameable_types = "warn"
+
 [dev-dependencies]
 divan = { workspace = true }
-oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
-sophia = "0.10"
-hdt = { version = "0.7", features = ["nt"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 
 [[bench]]
 name = "benchmark"
 harness = false
-required-features = ["file-io"]
 
 [[bench]]
 name = "match_lazy"
 harness = false
-required-features = ["file-io"]
-
-[[bench]]
-name = "compare"
-harness = false
-required-features = ["file-io"]
 
 [[test]]
 name = "bench_dataset"
-required-features = ["file-io"]
 
 [[test]]
 name = "experimental_patched"
-required-features = ["file-io"]
 
 [[test]]
 name = "replace_mapped_store"
-required-features = ["file-io"]
 
 [[test]]
 name = "relative_path_compaction"
-required-features = ["file-io"]

@@ -1,41 +1,16 @@
-//! In-memory pattern matching: the per-layout probes, the prefix probe over
-//! the (s, p, o, g) order, and view derivation.
+//! In-memory pattern matching: every term kind under every layout, the
+//! prefix probe over the (s, p, o, g) order, and view derivation.
 
 use super::*;
 
 // ─── In-memory matching ────────────────────────────────────────────────
 
-#[tokio::test]
-async fn test_match_pattern_default_layout() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(two_quads()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .expect("build failed");
-    probe_default(VortexRdfStore::from_built(arr).unwrap()).await;
-}
-
-#[tokio::test]
-async fn test_match_typed_object_layout() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(two_quads()),
-        LayoutStrategy::TypedObject,
-        vec![],
-    )
-    .await
-    .expect("build failed");
-    let store = VortexRdfStore::from_built(arr).unwrap();
-    assert_eq!(store.layout(), LayoutStrategy::TypedObject);
-    probe_typed_object(store).await;
-}
-
 /// Every term kind in every role round-trips through each layout and binds
 /// exactly its rows: a blank-node subject, a blank-node graph, the default
 /// graph bound explicitly, and IRI / blank / plain / language-tagged / typed
 /// objects — with and without the copy index, whose sorted copies carry the
-/// same terms.
+/// same terms. An absent term matches nothing, and that empty result carries
+/// no index set.
 #[tokio::test]
 async fn test_term_kinds_match_under_every_layout() {
     let quads = term_kind_quads();
@@ -53,18 +28,10 @@ async fn test_term_kinds_match_under_every_layout() {
             _ => None,
         })
         .unwrap();
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
             let tag = format!("{layout:?} {indexes:?}");
-            let arr =
-                build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
-                    .await
-                    .unwrap();
-            let store = VortexRdfStore::from_built(arr).unwrap();
+            let store = built_store(quads.clone(), layout, indexes).await;
             assert_eq!(view_strings(&store).await, quad_strings(&quads), "{tag}");
 
             let by_blank_s = store
@@ -113,6 +80,15 @@ async fn test_term_kinds_match_under_every_layout() {
                     quad.object
                 );
             }
+            // An empty result carries no index set, so a match chained on it
+            // looks nothing up.
+            let absent = Term::NamedNode(NamedNode::new("http://example.org/absent").unwrap());
+            let none = store
+                .match_pattern(None, None, Some(&absent), None)
+                .await
+                .unwrap();
+            assert_eq!(none.size().await.unwrap(), 0, "{tag}: absent object");
+            assert!(none.indexes().is_empty(), "{tag}: empty result's indexes");
         }
     }
 }
@@ -173,7 +149,7 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
         .await
         .unwrap();
     assert_eq!(above.debug_selection_range(), None);
-    assert!(!above.debug_has_serve_plan());
+    assert_eq!(served_component(&above), None);
     assert_eq!(
         view_strings(&above).await,
         expected_strings(quads, |i| quads[i].subject == s0 && quads[i].object == o5)
@@ -184,25 +160,47 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
         .await
         .unwrap();
     assert_eq!(below.debug_selection_range(), None);
-    assert!(!below.debug_has_serve_plan());
+    assert_eq!(served_component(&below), None);
     assert_eq!(
         view_strings(&below).await,
         expected_strings(quads, |i| quads[i].subject == s1 && quads[i].object == o5)
     );
 }
 
+/// In memory the routing also shows in the row ids the index decodes: above
+/// the gate the copy index resolves the residual object and decodes its run
+/// (`o5` is on four rows), below it the object is filtered column-wise and
+/// no row id is decoded.
 #[tokio::test]
 async fn test_subject_range_then_index_routing_above_gate() {
+    use crate::store::test_hooks::decoded_rids;
+
     let quads = above_gate_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
     run_subject_range_then_index_routing_above_gate(&store, &quads).await;
+
+    let o5 = Term::Literal(Literal::new_simple_literal("o5"));
+    for (subject, rids) in [("s0", 4), ("s1", 0)] {
+        let s = NamedOrBlankNode::NamedNode(
+            NamedNode::new(format!("http://example.org/{subject}")).unwrap(),
+        );
+        let before = decoded_rids();
+        let matched = store
+            .match_pattern(Some(&s), None, Some(&o5), None)
+            .await
+            .unwrap();
+        assert_eq!(decoded_rids() - before, rids, "{subject}");
+        assert_eq!(
+            view_strings(&matched).await,
+            expected_strings(&quads, |i| quads[i].subject == s && quads[i].object == o5),
+            "{subject}"
+        );
+    }
 }
 
 // ─── Prefix probe: nested binary search over the (s, p, o, g) order ────
@@ -255,14 +253,7 @@ fn prefix_terms() -> (NamedOrBlankNode, NamedNode, Term, GraphName) {
 async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
     let (s, p, o, g) = prefix_terms();
     for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
-        let arr = build_array::<SortedInMemoryBuilder>(
-            quad_stream(prefix_quads()),
-            LayoutStrategy::Dictionary,
-            indexes.clone(),
-        )
-        .await
-        .unwrap();
-        let store = VortexRdfStore::from_built(arr).unwrap();
+        let store = built_store(prefix_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
 
         let label = format!("{indexes:?}");
         let label = &label;
@@ -322,31 +313,49 @@ async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
 
 /// The prefix ends at the first unbound role: a bound object or graph behind
 /// an unbound predicate is left to the residual scan, whose ids are exact but
-/// no longer a range.
+/// no longer a range. The subject's range and the residual compose the same
+/// way with a reference index: the residual keeps the subject's rows that
+/// hold the object, and a subject and an object that both exist but never
+/// meet match nothing.
 #[tokio::test]
 async fn test_prefix_probe_stops_at_the_first_unbound_role() {
     let (s, _, o, g) = prefix_terms();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(prefix_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    // `prefix_quads()` gives every subject both objects; `s04`'s one object,
+    // `o2`, no other subject holds, so `s04` never meets `o1`.
+    let mut quads = prefix_quads();
+    quads.push(make_quad(
+        "http://example.org/s04",
+        "http://example.org/p0",
+        "o2",
+        GraphName::DefaultGraph,
+    ));
+    let s04 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s04").unwrap());
+    for indexes in [vec![], vec![IndexType::SecondaryByReference]] {
+        let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
 
-    let by_so = store
-        .match_pattern(Some(&s), None, Some(&o), None)
-        .await
-        .unwrap();
-    assert_eq!(by_so.debug_selection_range(), None);
-    assert_eq!(by_so.size().await.unwrap(), 6); // 3 predicates × 2 graphs
-    let by_sg = store
-        .match_pattern(Some(&s), None, None, Some(&g))
-        .await
-        .unwrap();
-    assert_eq!(by_sg.debug_selection_range(), None);
-    assert_eq!(by_sg.size().await.unwrap(), 6); // 3 predicates × 2 objects
+        let by_so = store
+            .match_pattern(Some(&s), None, Some(&o), None)
+            .await
+            .unwrap();
+        assert_eq!(by_so.debug_selection_range(), None, "{indexes:?}");
+        assert_eq!(by_so.size().await.unwrap(), 6, "{indexes:?}"); // 3 predicates × 2 graphs
+        assert_eq!(
+            view_strings(&by_so).await,
+            expected_strings(&quads, |i| quads[i].subject == s && quads[i].object == o),
+            "{indexes:?}: the S+O hit decodes to exactly its rows"
+        );
+        assert_eq!(
+            matched_size(&store, Some(&s04), None, Some(&o), None).await,
+            0,
+            "{indexes:?}: s04 and o1 never meet"
+        );
+        let by_sg = store
+            .match_pattern(Some(&s), None, None, Some(&g))
+            .await
+            .unwrap();
+        assert_eq!(by_sg.debug_selection_range(), None, "{indexes:?}");
+        assert_eq!(by_sg.size().await.unwrap(), 6, "{indexes:?}"); // 3 predicates × 2 objects
+    }
 }
 
 /// Under a string layout only the subject has a searchable column: the
@@ -357,10 +366,7 @@ async fn test_prefix_probe_string_layout_narrows_by_subject_only() {
     let (s, p, o, _) = prefix_terms();
     let s99 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
-        let arr = build_array::<SortedInMemoryBuilder>(quad_stream(prefix_quads()), layout, vec![])
-            .await
-            .unwrap();
-        let store = VortexRdfStore::from_built(arr).unwrap();
+        let store = built_store(prefix_quads(), layout, vec![]).await;
         let by_s = store
             .match_pattern(Some(&s), None, None, None)
             .await
@@ -392,14 +398,7 @@ async fn test_prefix_probe_string_layout_narrows_by_subject_only() {
 #[tokio::test]
 async fn test_prefix_probe_chains_within_a_range() {
     let (s, p, o, _) = prefix_terms();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(prefix_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(prefix_quads(), LayoutStrategy::Dictionary, vec![]).await;
 
     let by_s = store
         .match_pattern(Some(&s), None, None, None)
@@ -434,7 +433,7 @@ async fn test_prefix_probe_declines_an_unstamped_base() {
     let mut quads = prefix_quads();
     quads.reverse();
     let store = unstamped_store(&quads);
-    assert!(!store.debug_base_subject_sorted());
+    assert_eq!(store.view_statistics().unwrap().sort_order, None);
 
     let by_s = store
         .match_pattern(Some(&s), None, None, None)
@@ -465,14 +464,7 @@ async fn test_derived_view_does_not_lose_base_rows() {
         })
         .collect();
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
     let object = Term::Literal(Literal::new_simple_literal("object 0"));
     let matched = store
@@ -491,8 +483,8 @@ async fn test_derived_view_does_not_lose_base_rows() {
 
 /// A residual over an in-memory base reads its probe-bound columns through
 /// the probes the store resolved for its base, so a match resolves none: a
-/// reference index answers `o` of `(?, p, o)` and `p` is read at its rows.
-#[cfg(feature = "file-io")]
+/// reference index answers `o` of `(?, p, o)` by searching its component's
+/// cached probe, and `p` is read at its rows through the base's.
 #[tokio::test]
 async fn test_in_memory_residual_reads_through_the_store_probes() {
     use crate::store::scan::typed_eq::probe_hooks;
@@ -516,8 +508,8 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
         assert_eq!(resolved_after, resolved, "no probe is resolved per match");
         assert_eq!(
             cached_after,
-            cached + 1,
-            "`p` reads through the store's probe"
+            cached + 2,
+            "`o`'s run is searched, and `p` read, through the store's probes"
         );
         assert_eq!(
             view_strings(&matched).await,
@@ -531,7 +523,6 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
 /// every bound prefix of the sort order is one exact row range and leaves no
 /// filter, with and without secondary indexes. The prefix ends at the first
 /// unbound role, whose bound successors stay a filter over the run.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
     let (s, p, o, g) = prefix_terms();
@@ -546,7 +537,12 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
         let label = format!("{indexes:?}");
         let expect = |view: &VortexRdfStore, range: std::ops::Range<u64>| {
             assert_eq!(view.debug_selection_range(), Some(range), "{label}");
-            assert_eq!(view.debug_file_filter_pending(), Some(false), "{label}");
+            let stats = view.view_statistics().unwrap();
+            assert_eq!(
+                (stats.file_backed, stats.pending_filter),
+                (true, false),
+                "{label}"
+            );
         };
 
         let by_sp = store
@@ -592,7 +588,12 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
             .await
             .unwrap();
         assert_eq!(by_so.debug_selection_range(), Some(12..24), "{label}");
-        assert_eq!(by_so.debug_file_filter_pending(), Some(true), "{label}");
+        let stats = by_so.view_statistics().unwrap();
+        assert_eq!(
+            (stats.file_backed, stats.pending_filter),
+            (true, true),
+            "{label}"
+        );
         assert_eq!(by_so.size().await.unwrap(), 6, "{label}");
     }
 }

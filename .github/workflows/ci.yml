@@ -4,9 +4,9 @@ on:
   push:
     branches:
       - main
-    # Doc-only changes can't break the build. Repeated per event because path
-    # filters are not inherited across triggers (and Actions does not support
-    # YAML anchors).
+    # Doc-only changes can't break the build (docs.yml checks their anchors).
+    # Repeated per event because path filters are not inherited across
+    # triggers.
     paths-ignore:
       - '**.md'
       - 'LICENSE'
@@ -23,6 +23,8 @@ on:
 permissions:
   contents: read
 
+# Each job sets up its tools and runs its commands through
+# scripts/ci-check.sh, the definition the pre-push hook runs too.
 jobs:
   lint:
     name: Lint (fmt + clippy)
@@ -30,51 +32,58 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
           # Shared with `rust-tests`: clippy compiles *dependencies* with plain
           # rustc (only workspace crates go through clippy-driver), so the two
-          # jobs' dev-profile dependency artifacts are the same build.
+          # jobs' native dev-profile dependency artifacts are the same build.
+          # The wasm32 clippy's artifacts are this job's alone: they are in the
+          # shared entry only when this job is the one that saves it.
           shared-key: dev
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Check doc anchors
-        run: scripts/check-doc-anchors.sh
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      # The no-default-features build has its own dead-code surface (items only
-      # reachable through the file-io feature), which the default clippy run
-      # cannot see.
-      - name: Run clippy (core, no default features)
-        run: cargo clippy -p vortex-rdf-core --no-default-features --all-targets -- -D warnings
+      - name: Run fmt and clippy
+        run: scripts/ci-check.sh lint
 
   rust-tests:
-    name: Rust Tests (${{ matrix.label }})
+    name: Rust Tests (workspace)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: workspace
-            command: cargo test --workspace
-          - label: core-no-default-features
-            command: cargo test -p vortex-rdf-core --no-default-features
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: dev
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Rust tests
-        run: ${{ matrix.command }}
+        run: scripts/ci-check.sh rust-tests
+
+  # The DataFusion conformance crate is a workspace of its own
+  # (interface-tests/Cargo.toml), so its dependency tree builds here only,
+  # `--locked` against the crate's own Cargo.lock.
+  interface-tests:
+    name: Interface Tests (DataFusion)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt, clippy
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: interface-tests
+          shared-key: interface-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run fmt, clippy and the interface tests
+        run: scripts/ci-check.sh interface-tests
 
   python-tests:
     name: Python Tests
@@ -86,10 +95,9 @@ jobs:
         with:
           enable-cache: true
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
-      # Both js and python are members of the root workspace, so maturin and
-      # wasm-pack write to <root>/target; the cache covers that default path and
-      # `key` keeps each job's entry separate.
+        uses: ./.github/actions/setup-rust
+      # The python crate is a member of the root workspace, so maturin writes
+      # to <root>/target, the path the cache covers.
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -97,18 +105,8 @@ jobs:
           # extension through maturin at the same profile.
           shared-key: py-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build bindings and install environment
-        working-directory: python
-        run: uv sync --locked
-      # `bench/test_codspeed.py` runs here too, without `--codspeed`: the plugin
-      # then calls each task once instead of instrumenting it, which is a ~1s
-      # smoke test of every benchmark against the current bindings. The
-      # CodSpeed workflow is otherwise the only thing that ever imports it, so
-      # a signature change lands as a red benchmark job on the PR that renames
-      # nothing rather than as a test failure on the PR that did.
-      - name: Run tests
-        working-directory: python
-        run: uv run pytest tests bench/test_codspeed.py -q
+      - name: Build the bindings and run the Python tests
+        run: scripts/ci-check.sh python-tests
 
   js-tests:
     name: JS Tests
@@ -122,28 +120,16 @@ jobs:
           cache: npm
           cache-dependency-path: js/package-lock.json
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-unknown-unknown
+      # The js crate is a member of the root workspace, so wasm-pack writes to
+      # <root>/target, the path the cache covers.
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
           # Shared with codspeed.yml's js-benchmarks: same wasm32 target.
           shared-key: wasm
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # wasm-pack is a pinned npm devDependency; `npm ci` installs it and npm
-      # run puts node_modules/.bin ahead of anything on PATH.
-      - name: Install dependencies
-        working-directory: js
-        run: npm ci
-      - name: Build WASM package
-        working-directory: js
-        run: npm run build
-      # Typechecks after the build: the tsconfigs resolve against the generated
-      # pkg/web/vortex_rdf.d.ts.
-      - name: Run typecheck
-        working-directory: js
-        run: npm run typecheck
-      - name: Run tests
-        working-directory: js
-        run: npm test
+      - name: Build the wasm package and run the JS tests
+        run: scripts/ci-check.sh js-tests

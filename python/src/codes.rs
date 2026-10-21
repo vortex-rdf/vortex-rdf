@@ -5,19 +5,20 @@
 
 use std::ops::Range;
 use std::os::raw::{c_int, c_void};
+use std::pin::pin;
 
 use pyo3::buffer::{ElementType, PyUntypedBuffer};
-use pyo3::exceptions::{PySystemError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PySystemError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::PyString;
-use vortex_buffer::Buffer;
+use pyo3::types::{PyString, PyTuple};
+use vortex_buffer::{Alignment, Buffer};
 use vortex_rdf_core::VortexRdfError as CoreError;
 use vortex_rdf_core::{CaseMap, DictReader, TermCode, TermPredicate, TextOptions, columns};
 
-use crate::{RUNTIME, parse_err, store_err};
+use crate::{JoinTooLarge, RUNTIME, detached, py_err};
 
-/// Buckets in the decode-sharing cache (see [`TermDict::decode_slice`]).
+/// Buckets in the decode-sharing cache (see [`decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
 /// entries keep the table at 4 KiB, small enough to stay cache-resident and to
 /// zero cheaply for a short column.
@@ -86,99 +87,89 @@ pub struct TermDict {
     pub(crate) reader: DictReader,
 }
 
-/// A malformed term or predicate argument is a `ValueError`; anything else
-/// (an I/O failure reading a file-backed dictionary) is a store error.
-fn term_err(e: CoreError) -> PyErr {
-    match e {
-        CoreError::Deserialization(_) | CoreError::InvalidOperation(_) => parse_err(e),
-        other => store_err(other),
-    }
-}
-
-impl TermDict {
-    /// Decodes `codes` GIL-released into Python strings, a repeated code
-    /// sharing its string while the cache below still holds it. Callers
-    /// must hand over codes copied out of any Python buffer: a borrowed
-    /// buffer view cannot cross the GIL release.
-    ///
-    /// A direct-mapped cache of `RECENT_BUCKETS` entries, indexed by the
-    /// code's low bits (`code & (RECENT_BUCKETS - 1)`), holds the
-    /// `(code, slot)` most recently decoded into each bucket; an occurrence
-    /// whose bucket holds its own code reuses that slot instead of
-    /// decompressing and allocating again. A hit
-    /// requires the stored code to match, so a collision — or a column holding
-    /// more live terms than there are buckets — costs only a re-decode and
-    /// never yields a wrong term.
-    ///
-    /// Runs in two phases, because Python objects cannot be built while
-    /// detached from the interpreter. The decode loop runs GIL-released and
-    /// produces the distinct terms, packed into one buffer ([`PackedTerms`],
-    /// with no `String` per term), plus a per-occurrence index into them; the
-    /// GIL is then retaken to build one `PyString` per distinct term from a
-    /// slice of that buffer and clone a reference per occurrence. When
-    /// nothing was shared those indices are the identity, and the strings are
-    /// built straight from the decode order.
-    pub(crate) fn decode_slice(
-        &self,
-        py: Python<'_>,
-        codes: &[TermCode],
-    ) -> PyResult<Vec<Option<Py<PyString>>>> {
-        // `slots[i]` indexes `decoded` for the i-th code, so the mapping from
-        // occurrence to decoded term survives the GIL boundary as plain data.
-        let (slots, decoded) = py
-            .detach(|| -> Result<_, CoreError> {
-                let mut slots: Vec<usize> = Vec::with_capacity(codes.len());
-                let mut distinct: Vec<TermCode> = Vec::new();
-                let mut recent = [(0 as TermCode, NO_SLOT); RECENT_BUCKETS];
-                for &code in codes {
-                    // The low bits pick the bucket: masked before the
-                    // narrowing, so they are the code's own.
-                    let bucket = (code & (RECENT_BUCKETS as TermCode - 1)) as usize;
-                    let (cached_code, cached_slot) = recent[bucket];
-                    let slot = if cached_slot != NO_SLOT && cached_code == code {
-                        cached_slot
-                    } else {
-                        let slot = distinct.len();
-                        distinct.push(code);
-                        // Overwrites whatever shared this bucket; a hit is
-                        // gated on the stored code, so a lost entry only
-                        // costs a re-decode.
-                        recent[bucket] = (code, slot);
-                        slot
-                    };
-                    slots.push(slot);
+/// Decodes `codes` through `reader` GIL-released into Python strings, a
+/// repeated code sharing its string while the cache below still holds it.
+/// `codes` is Rust-owned memory, never a view borrowed from a Python buffer,
+/// which cannot cross the GIL release: callers pass a column's buffer or the
+/// buffer [`extract_u64s`] returns.
+///
+/// A direct-mapped cache of `RECENT_BUCKETS` entries, indexed by the
+/// code's low bits (`code & (RECENT_BUCKETS - 1)`), holds the
+/// `(code, slot)` most recently decoded into each bucket; an occurrence
+/// whose bucket holds its own code reuses that slot instead of
+/// decompressing and allocating again. A hit
+/// requires the stored code to match, so a collision — or a column holding
+/// more live terms than there are buckets — costs only a re-decode and
+/// never yields a wrong term.
+///
+/// Runs in two phases, because Python objects cannot be built while
+/// detached from the interpreter. The decode loop runs GIL-released and
+/// produces the distinct terms, packed into one buffer ([`PackedTerms`],
+/// with no `String` per term), plus a per-occurrence index into them; the
+/// GIL is then retaken to build one `PyString` per distinct term from a
+/// slice of that buffer and clone a reference per occurrence. When
+/// nothing was shared those indices are the identity, and the strings are
+/// built straight from the decode order.
+pub(crate) fn decode_slice(
+    py: Python<'_>,
+    reader: &DictReader,
+    codes: &[TermCode],
+) -> PyResult<Vec<Option<Py<PyString>>>> {
+    // `slots[i]` indexes `decoded` for the i-th code, so the mapping from
+    // occurrence to decoded term survives the GIL boundary as plain data.
+    let (slots, decoded) = py
+        .detach(|| -> Result<_, CoreError> {
+            let mut slots: Vec<usize> = Vec::with_capacity(codes.len());
+            let mut distinct: Vec<TermCode> = Vec::new();
+            let mut recent = [(0 as TermCode, NO_SLOT); RECENT_BUCKETS];
+            for &code in codes {
+                // The low bits pick the bucket: masked before the
+                // narrowing, so they are the code's own.
+                let bucket = (code & (RECENT_BUCKETS as TermCode - 1)) as usize;
+                let (cached_code, cached_slot) = recent[bucket];
+                let slot = if cached_slot != NO_SLOT && cached_code == code {
+                    cached_slot
+                } else {
+                    let slot = distinct.len();
+                    distinct.push(code);
+                    // Overwrites whatever shared this bucket; a hit is
+                    // gated on the stored code, so a lost entry only
+                    // costs a re-decode.
+                    recent[bucket] = (code, slot);
+                    slot
+                };
+                slots.push(slot);
+            }
+            // One cursor over the resident terms, or one batched read of
+            // the file-backed child, its future pinned in place (see
+            // `detached`).
+            let mut decoded = PackedTerms::new(distinct.len());
+            match reader.snapshot() {
+                Some(snapshot) => {
+                    snapshot.decode_many_with(&distinct, |i, term| decoded.set(i, term));
                 }
-                // One cursor over the resident terms, or one batched read of
-                // the file-backed child.
-                let mut decoded = PackedTerms::new(distinct.len());
-                match self.reader.snapshot() {
-                    Some(snapshot) => {
-                        snapshot.decode_many_with(&distinct, |i, term| decoded.set(i, term));
-                    }
-                    None => RUNTIME.block_on(
-                        self.reader
-                            .decode_many_with(&distinct, |i, term| decoded.set(i, term)),
-                    )?,
-                }
-                Ok((slots, decoded))
-            })
-            .map_err(store_err)?;
+                None => RUNTIME.block_on(pin!(
+                    reader.decode_many_with(&distinct, |i, term| decoded.set(i, term))
+                ))?,
+            }
+            Ok((slots, decoded))
+        })
+        .map_err(py_err)?;
 
-        let build = |i: usize| decoded.get(i).map(|term| PyString::new(py, term).unbind());
+    let build = |i: usize| decoded.get(i).map(|term| PyString::new(py, term).unbind());
 
-        // Nothing was shared, so `slots` is the identity: every string is used
-        // exactly once and can be moved straight out, skipping the lookup table
-        // and the per-occurrence refcount bump.
-        if decoded.len() == slots.len() {
-            return Ok((0..slots.len()).map(build).collect());
-        }
-
-        let interned: Vec<Option<Py<PyString>>> = (0..decoded.len()).map(build).collect();
-        Ok(slots
-            .into_iter()
-            .map(|slot| interned[slot].as_ref().map(|s| s.clone_ref(py)))
-            .collect())
+    // Nothing was shared, so `slots` is the identity: every string is used
+    // exactly once and can be moved straight out, skipping the lookup table
+    // and the per-occurrence refcount bump.
+    if decoded.len() == slots.len() {
+        return Ok((0..slots.len()).map(build).collect());
     }
+
+    let interned: Vec<Option<Py<PyString>>> = (0..decoded.len()).map(build).collect();
+    Ok(slots
+        .into_iter()
+        .map(|slot| interned[slot].as_ref().map(|s| s.clone_ref(py)))
+        .collect())
 }
 
 #[pymethods]
@@ -190,8 +181,7 @@ impl TermDict {
         if let Some(snapshot) = self.reader.snapshot() {
             return Ok(snapshot.decode(code));
         }
-        py.detach(|| RUNTIME.block_on(self.reader.decode(code)))
-            .map_err(term_err)
+        detached(py, || self.reader.decode(code))
     }
 
     /// The code of the term `term`, or `None` when this dictionary does not
@@ -203,21 +193,19 @@ impl TermDict {
     /// `ValueError`.
     fn encode(&self, py: Python<'_>, term: &str) -> PyResult<Option<TermCode>> {
         if let Some(snapshot) = self.reader.snapshot() {
-            return snapshot.encode_tolerant(term).map_err(term_err);
+            return snapshot.encode(term).map_err(py_err);
         }
-        py.detach(|| RUNTIME.block_on(self.reader.encode(term)))
-            .map_err(term_err)
+        detached(py, || self.reader.encode(term))
     }
 
     /// [`encode`](Self::encode) over a sequence of terms, in order, in one
     /// GIL-released call. A malformed term raises `ValueError` before any
     /// lookup.
     fn encode_many(&self, py: Python<'_>, terms: Vec<String>) -> PyResult<Vec<Option<TermCode>>> {
-        py.detach(|| {
+        detached(py, || async {
             let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-            RUNTIME.block_on(self.reader.encode_many(&refs))
+            self.reader.encode_many(&refs).await
         })
-        .map_err(term_err)
     }
 
     /// `kind` over the candidate `codes`: `(passed, undecided)`, both
@@ -272,9 +260,9 @@ impl TermDict {
             case,
             as_str,
         };
-        let predicate = TermPredicate::parse_with(kind, arg, &options).map_err(term_err)?;
+        let predicate = TermPredicate::parse_with(kind, arg, &options).map_err(py_err)?;
         // Like a keep's code set: whatever is no u64 code list is a bad value.
-        let codes = code_buffer(codes).map_err(|e| {
+        let codes = extract_u64s(codes).map_err(|e| {
             PyValueError::new_err(format!(
                 "codes is a U64Column, a u64 buffer or a sequence of non-negative ints below \
                  2**64: {e}"
@@ -285,7 +273,7 @@ impl TermDict {
                 Some(snapshot) => snapshot.filter_codes(&predicate, codes.as_slice()),
                 None => RUNTIME.block_on(self.reader.filter_codes(&predicate, codes.as_slice())),
             })
-            .map_err(term_err)?;
+            .map_err(py_err)?;
         Ok((U64Column { codes: passed }, U64Column { codes: undecided }))
     }
 
@@ -294,16 +282,14 @@ impl TermDict {
     /// so a term kind (`"` for literals, `<` for IRIs, `_:` for blank nodes)
     /// and an IRI namespace (`<http://example.org/`) are each one range.
     fn prefix_range(&self, py: Python<'_>, prefix: &str) -> PyResult<(TermCode, TermCode)> {
-        py.detach(|| RUNTIME.block_on(self.reader.prefix_range(prefix)))
-            .map_err(term_err)
+        detached(py, || self.reader.prefix_range(prefix))
     }
 
     /// The code of the first term not below `term` in byte order — a
     /// present term's own code, where an absent one would sort, or the
     /// dictionary's size when every term is below it.
     fn lower_bound(&self, py: Python<'_>, term: &str) -> PyResult<TermCode> {
-        py.detach(|| RUNTIME.block_on(self.reader.lower_bound(term)))
-            .map_err(term_err)
+        detached(py, || self.reader.lower_bound(term))
     }
 
     /// Whether the terms are read from the store's file on demand (`True`)
@@ -317,23 +303,23 @@ impl TermDict {
     /// batch.
     ///
     /// `codes` is preferably a [`U64Column`] (a column from `match_codes`
-    /// passes directly) or a u64 buffer (`memoryview(col).cast("Q")`,
-    /// `array("Q", ...)`, a `uint64` NumPy array), read in one bulk copy
-    /// with no per-element Python-int conversion; a non-negative `int64`
-    /// buffer is read the same way, and a byte-typed buffer — the raw view a
-    /// `U64Column` exports — is reinterpreted as native-endian u64s. A buffer
-    /// of other items (a `cast("I")` view, a u32 array) raises `ValueError`.
-    /// Any other sequence of ints still works, at one `PyLong` extraction per
-    /// code.
+    /// passes directly, its buffer shared rather than copied) or a u64
+    /// buffer (`memoryview(col).cast("Q")`, `array("Q", ...)`, a `uint64`
+    /// NumPy array), read in one bulk copy with no per-element Python-int
+    /// conversion; a non-negative `int64` buffer is read the same way, and a
+    /// byte-typed buffer — the raw view a `U64Column` exports — is
+    /// reinterpreted as native-endian u64s. A buffer of other items (a
+    /// `cast("I")` view, a u32 array) raises `ValueError`. Any other sequence
+    /// of ints still works, at one `PyLong` extraction per code.
     ///
     /// A repeated code usually yields the same Python string object, as
-    /// [`decode_slice`](Self::decode_slice) describes.
+    /// [`decode_slice`] describes.
     fn decode_many(
         &self,
         py: Python<'_>,
         codes: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<Option<Py<PyString>>>> {
-        self.decode_slice(py, &extract_u64s(codes)?)
+        decode_slice(py, &self.reader, &extract_u64s(codes)?)
     }
 
     fn __len__(&self) -> usize {
@@ -353,9 +339,10 @@ impl TermDict {
     }
 }
 
-/// The u64 values of a Python object holding codes, indices or counts. A
-/// [`U64Column`] is copied whole. Any other object exporting a buffer is read
-/// as one, never element by element, and only when its items are u64 values:
+/// The u64 values of a Python object holding codes, indices or counts, as a
+/// Rust-owned buffer. A [`U64Column`] shares its own buffer, uncopied. Any
+/// other object exporting a buffer is read as one, in one copy, never
+/// element by element, and only when its items are u64 values:
 /// 8-byte unsigned integers (`memoryview(col).cast("Q")`, `array("Q", ...)`,
 /// a `uint64` NumPy array), 8-byte signed integers none of which is negative
 /// (an `int64` NumPy array), or raw bytes in multiples of 8 — the view a
@@ -365,9 +352,9 @@ impl TermDict {
 /// object without a buffer is a sequence of ints, at one `PyLong` extraction
 /// per element; an int that is negative or not below 2**64 raises
 /// `OverflowError`. Nothing is narrowed or wrapped.
-pub(crate) fn extract_u64s(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+pub(crate) fn extract_u64s(obj: &Bound<'_, PyAny>) -> PyResult<Buffer<u64>> {
     if let Ok(column) = obj.cast::<U64Column>() {
-        return Ok(column.get().codes.as_slice().to_vec());
+        return Ok(column.get().codes.clone());
     }
     // SAFETY: `obj` is a live object and the GIL is held.
     if unsafe { ffi::PyObject_CheckBuffer(obj.as_ptr()) } == 1 {
@@ -379,9 +366,9 @@ pub(crate) fn extract_u64s(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
                  {U64_FORMS}"
             ))
         })?;
-        return buffer_u64s(&buf);
+        return buffer_u64s(&buf).map(Buffer::from);
     }
-    obj.extract::<Vec<u64>>()
+    obj.extract::<Vec<u64>>().map(Buffer::from)
 }
 
 /// What a code argument may be, as the refusals of a buffer spell it.
@@ -495,15 +482,6 @@ fn copy_items(buf: &PyUntypedBuffer, out: &mut [u8]) {
     }
 }
 
-/// The u64 values of `obj` as a buffer: a `U64Column`'s own, shared
-/// zero-copy, or [`extract_u64s`]'s copy of anything else.
-fn code_buffer(obj: &Bound<'_, PyAny>) -> PyResult<Buffer<u64>> {
-    if let Ok(column) = obj.cast::<U64Column>() {
-        return Ok(column.get().codes.clone());
-    }
-    Ok(Buffer::from(extract_u64s(obj)?))
-}
-
 /// One matched term-code column — or a kernel's row indices or counts —
 /// exposed to Python zero-copy through the buffer protocol:
 /// `memoryview(col).cast("Q")` views the Rust memory directly, one native-
@@ -513,9 +491,10 @@ fn code_buffer(obj: &Bound<'_, PyAny>) -> PyResult<Buffer<u64>> {
 ///
 /// The column kernels ([`distinct`](Self::distinct),
 /// [`value_counts`](Self::value_counts), [`take`](Self::take),
-/// [`join_indices`](Self::join_indices)) run GIL-released and preserve the
-/// orders a query layer observes: first-seen order for distinct values,
-/// nested-loop order for a join's pairs.
+/// [`join_count`](Self::join_count), [`join_indices`](Self::join_indices),
+/// [`groups`](Self::groups)) run GIL-released and preserve the orders a
+/// query layer observes: first-seen order for distinct values, nested-loop
+/// order for a join's pairs.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct U64Column {
     pub(crate) codes: Buffer<u64>,
@@ -530,7 +509,7 @@ impl U64Column {
     #[new]
     fn new(values: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(U64Column {
-            codes: code_buffer(values)?,
+            codes: extract_u64s(values)?,
         })
     }
 
@@ -540,6 +519,29 @@ impl U64Column {
 
     fn __repr__(&self) -> String {
         format!("U64Column(len={})", self.codes.len())
+    }
+
+    /// The values from `start` up to, not including, `stop`, sharing this
+    /// column's buffer rather than copying it; `IndexError` when `start` is
+    /// past `stop` or `stop` past the end.
+    fn slice(&self, start: usize, stop: usize) -> PyResult<U64Column> {
+        let len = self.codes.len();
+        if start > stop {
+            return Err(PyIndexError::new_err(format!(
+                "slice start {start} is past its stop {stop}"
+            )));
+        }
+        if stop > len {
+            return Err(PyIndexError::new_err(format!(
+                "slice stop {stop} is out of range for a column of {len} values"
+            )));
+        }
+        // Cut at a u64's alignment, which every value's offset meets
+        // whatever alignment the shared buffer carries.
+        let codes = self
+            .codes
+            .slice_with_alignment(start..stop, Alignment::of::<u64>());
+        Ok(U64Column { codes })
     }
 
     /// The distinct values, each at its first occurrence, in that order.
@@ -563,7 +565,7 @@ impl U64Column {
         let codes = py
             .detach(|| columns::take(self.codes.as_slice(), &indices))
             .map_err(|position| {
-                pyo3::exceptions::PyIndexError::new_err(format!(
+                PyIndexError::new_err(format!(
                     "take index {} is out of range for a column of {} values",
                     indices[position],
                     self.codes.len()
@@ -572,24 +574,46 @@ impl U64Column {
         Ok(U64Column { codes })
     }
 
+    /// The number of row pairs [`join_indices`](Self::join_indices) makes
+    /// with `other` (a `U64Column`, u64 buffer or int sequence), counted
+    /// without building them.
+    fn join_count(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let right = extract_u64s(other)?;
+        Ok(py.detach(|| columns::join_count(self.codes.as_slice(), right.as_slice())))
+    }
+
     /// The row pairs `(left_indices, right_indices)` where this column's
     /// value equals `other`'s (a `U64Column`, u64 buffer or int sequence) —
     /// an equi-join on the two columns as keys, in
     /// nested-loop order: this column's rows in order, each with its
     /// matches in `other` in their original order. Gather the joined
-    /// columns with [`take`](Self::take).
+    /// columns with [`take`](Self::take). A join of more than `max_pairs`
+    /// pairs raises `JoinTooLarge` before any pair is built.
+    #[pyo3(signature = (other, *, max_pairs=None))]
     fn join_indices(
         &self,
         py: Python<'_>,
         other: &Bound<'_, PyAny>,
+        max_pairs: Option<usize>,
     ) -> PyResult<(U64Column, U64Column)> {
-        let right = U64Column::new(other)?.codes;
-        let (left_idx, right_idx) =
-            py.detach(|| columns::equi_join_indices(self.codes.as_slice(), right.as_slice()));
+        let right = extract_u64s(other)?;
+        let (left_idx, right_idx) = py
+            .detach(|| {
+                columns::equi_join_indices(self.codes.as_slice(), right.as_slice(), max_pairs)
+            })
+            .map_err(|pairs| join_too_large(pairs, max_pairs))?;
         Ok((
             U64Column { codes: left_idx },
             U64Column { codes: right_idx },
         ))
+    }
+
+    /// This column's rows grouped by value: the right side of
+    /// [`join_indices`](Self::join_indices), built once and joined with any
+    /// number of left columns (see [`CodeGroups`]).
+    fn groups(&self, py: Python<'_>) -> CodeGroups {
+        let groups = py.detach(|| columns::CodeGroups::build(self.codes.as_slice()));
+        CodeGroups { groups }
     }
 
     /// Fills `view` over the raw u64 data; the exported buffer holds a
@@ -615,5 +639,120 @@ impl U64Column {
                 .unwrap_or_else(|| PySystemError::new_err("PyBuffer_FillInfo failed")));
         }
         Ok(())
+    }
+}
+
+/// `JoinTooLarge` for a join of `pairs` pairs refused by its `max_pairs`
+/// cap: its `args` are the message, which names both, and `pairs`.
+fn join_too_large(pairs: usize, max_pairs: Option<usize>) -> PyErr {
+    let cap = max_pairs.unwrap_or_else(|| unreachable!("only a max_pairs cap refuses a join"));
+    JoinTooLarge::new_err((
+        format!("the join makes {pairs} pairs, more than its max_pairs of {cap}"),
+        pairs,
+    ))
+}
+
+/// A column's rows grouped by value ([`U64Column::groups`]): the right side
+/// of an equi-join, built once and joined with any number of left columns,
+/// so a join too large for one call runs as a loop over slices of its left
+/// column ([`U64Column::slice`]). It holds one u64 per grouped row, plus a
+/// slot per value of the column's span or per distinct value, until it is
+/// dropped.
+#[pyclass(frozen, module = "vortex_rdf._native")]
+pub struct CodeGroups {
+    groups: columns::CodeGroups,
+}
+
+#[pymethods]
+impl CodeGroups {
+    /// The number of grouped rows.
+    fn __len__(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// The number of row pairs [`join`](Self::join) makes with `column` (a
+    /// `U64Column`, u64 buffer or int sequence), counted without building
+    /// them.
+    fn count(&self, py: Python<'_>, column: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let left = extract_u64s(column)?;
+        Ok(py.detach(|| self.groups.count(left.as_slice())))
+    }
+
+    /// The row pairs `(left_indices, right_indices)` where `column`'s value
+    /// (a `U64Column`, u64 buffer or int sequence) equals a grouped row's,
+    /// in nested-loop order: `column`'s rows in order, each with its grouped
+    /// rows in their column's order. The left indices count from `column`'s
+    /// first row, so the joins of consecutive slices of a left column, each
+    /// offset by its slice's start, concatenate to
+    /// [`U64Column::join_indices`] of the whole column. A join of more than
+    /// `max_pairs` pairs raises `JoinTooLarge` before any pair is built.
+    #[pyo3(signature = (column, *, max_pairs=None))]
+    fn join(
+        &self,
+        py: Python<'_>,
+        column: &Bound<'_, PyAny>,
+        max_pairs: Option<usize>,
+    ) -> PyResult<(U64Column, U64Column)> {
+        let left = extract_u64s(column)?;
+        let (left_idx, right_idx) = py
+            .detach(|| self.groups.join(left.as_slice(), max_pairs))
+            .map_err(|pairs| join_too_large(pairs, max_pairs))?;
+        Ok((
+            U64Column { codes: left_idx },
+            U64Column { codes: right_idx },
+        ))
+    }
+
+    /// The columns the join of `column` with the grouped rows gathers,
+    /// filled while the pairs are found instead of through
+    /// [`join`](Self::join)'s indices: for each pair in nested-loop order,
+    /// each of `left_columns` (parallel to `column`) at the pair's left row,
+    /// then each of `right_columns` (parallel to the grouped column) at its
+    /// right row, one `U64Column` per column in that order. Each equals
+    /// [`U64Column::take`] of its column at the matching index column of
+    /// `join`. Every column is read as [`extract_u64s`] reads it; a column
+    /// of the wrong length raises `ValueError`, and a join of more than
+    /// `max_pairs` pairs raises `JoinTooLarge` before any output is built.
+    #[pyo3(signature = (column, left_columns, right_columns, *, max_pairs=None))]
+    fn gather<'py>(
+        &self,
+        py: Python<'py>,
+        column: &Bound<'py, PyAny>,
+        left_columns: Vec<Bound<'py, PyAny>>,
+        right_columns: Vec<Bound<'py, PyAny>>,
+        max_pairs: Option<usize>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let left = extract_u64s(column)?;
+        let lefts = left_columns
+            .iter()
+            .map(extract_u64s)
+            .collect::<PyResult<Vec<_>>>()?;
+        let rights = right_columns
+            .iter()
+            .map(extract_u64s)
+            .collect::<PyResult<Vec<_>>>()?;
+        if let Some(bad) = lefts.iter().position(|c| c.len() != left.len()) {
+            return Err(PyValueError::new_err(format!(
+                "left column {bad} holds {} values, not one per row of the {} joined",
+                lefts[bad].len(),
+                left.len()
+            )));
+        }
+        let grouped = self.groups.len();
+        if let Some(bad) = rights.iter().position(|c| c.len() != grouped) {
+            return Err(PyValueError::new_err(format!(
+                "right column {bad} holds {} values, not one per row of the {grouped} grouped",
+                rights[bad].len()
+            )));
+        }
+        let outputs = py
+            .detach(|| {
+                let lefts: Vec<&[u64]> = lefts.iter().map(Buffer::as_slice).collect();
+                let rights: Vec<&[u64]> = rights.iter().map(Buffer::as_slice).collect();
+                self.groups
+                    .gather(left.as_slice(), &lefts, &rights, max_pairs)
+            })
+            .map_err(|pairs| join_too_large(pairs, max_pairs))?;
+        PyTuple::new(py, outputs.into_iter().map(|codes| U64Column { codes }))
     }
 }

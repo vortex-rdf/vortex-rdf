@@ -1,7 +1,6 @@
 //! An owning probe: the array and its resolved [`SortedProbe`] in one value,
-//! so callers can resolve once and reuse the probe across calls (typically
-//! behind an `Arc` in a per-column cache) instead of re-walking the encoding
-//! tree on every search.
+//! resolved once and reused across calls (typically behind an `Arc` in a
+//! per-column cache).
 
 use vortex_array::ArrayRef;
 
@@ -17,9 +16,9 @@ self_cell::self_cell!(
 
 /// A [`SortedProbe`] that owns the array it probes.
 ///
-/// Same contract as [`SortedProbe`]: bounds queries require the array to be
-/// sorted ascending (caller contract); [`Self::value_at`] is exact regardless
-/// of sort order.
+/// Queries go through the borrowed probe, [`Self::probe`], under its
+/// contract: bounds queries require the array to be sorted ascending (caller
+/// contract); [`SortedProbe::value_at`] is exact regardless of sort order.
 pub struct OwnedSortedProbe {
     cell: ProbeCell,
 }
@@ -41,49 +40,6 @@ impl OwnedSortedProbe {
     /// The owned array the probe reads.
     pub fn array(&self) -> &ArrayRef {
         self.cell.borrow_owner()
-    }
-
-    /// Number of rows in the resolved array.
-    pub fn len(&self) -> usize {
-        self.probe().len()
-    }
-
-    /// Whether the resolved array is empty.
-    pub fn is_empty(&self) -> bool {
-        self.probe().is_empty()
-    }
-
-    /// Index of the first element `>= needle`.
-    pub fn lower_bound(&self, needle: u64) -> usize {
-        self.probe().lower_bound(needle)
-    }
-
-    /// Index of the first element `> needle`.
-    pub fn upper_bound(&self, needle: u64) -> usize {
-        self.probe().upper_bound(needle)
-    }
-
-    /// `(lower_bound, upper_bound)` — the half-open run of elements equal to
-    /// `needle`.
-    pub fn bounds(&self, needle: u64) -> (usize, usize) {
-        self.probe().bounds(needle)
-    }
-
-    /// [`SortedProbe::bounds_in`]: bounds restricted to a window that is
-    /// itself sorted, in absolute indices.
-    ///
-    /// # Panics
-    /// Panics if `range.end > self.len()`.
-    pub fn bounds_in(&self, range: std::ops::Range<usize>, needle: u64) -> (usize, usize) {
-        self.probe().bounds_in(range, needle)
-    }
-
-    /// Exact value at `index`, widened to `u64`.
-    ///
-    /// # Panics
-    /// Panics if `index >= self.len()`.
-    pub fn value_at(&self, index: usize) -> u64 {
-        self.probe().value_at(index)
     }
 }
 
@@ -109,11 +65,12 @@ mod tests {
             let arr = PrimitiveArray::from_iter([1u32, 3, 3, 7]).into_array();
             OwnedSortedProbe::resolve(arr).unwrap()
         };
-        assert_eq!(owned.len(), 4);
-        assert_eq!(owned.bounds(3), (1, 3));
-        assert_eq!(owned.bounds_in(1..4, 3), (1, 3));
-        assert_eq!((owned.lower_bound(7), owned.upper_bound(7)), (3, 4));
-        assert_eq!(owned.value_at(3), 7);
+        let probe = owned.probe();
+        assert_eq!(probe.len(), 4);
+        assert_eq!(probe.bounds(3), (1, 3));
+        assert_eq!(probe.bounds_in(1..4, 3), (1, 3));
+        assert_eq!((probe.lower_bound(7), probe.upper_bound(7)), (3, 4));
+        assert_eq!(probe.value_at(3), 7);
         assert_eq!(owned.array().len(), 4);
     }
 

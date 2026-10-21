@@ -1,9 +1,10 @@
-//! Temp-file spill machinery behind the out-of-core builder: quads (and, for
-//! globally sorted secondary indexes, `(value, row ID)` pairs) are serialized
-//! to disk with rkyv during ingestion/merge passes and read back during chunk
-//! emission, so peak memory stays bounded by the chunk size.
+//! Temp-file spill machinery behind the out-of-core builder: rkyv-serialized
+//! runs of quads and of the index families' `(value, row id)` entries, written
+//! during the ingest and merge passes and read back during chunk emission, so
+//! peak memory stays bounded by the chunk size.
 
 use std::collections::BinaryHeap;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::marker::PhantomData;
@@ -16,11 +17,11 @@ use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 use crate::error::{Result, VortexRdfError};
+use crate::store::RawQuad;
 
-/// Environment variable overriding where spill directories are created — the
-/// escape hatch for putting out-of-core runs on a specific volume. The OS
-/// temp dir is commonly a size-capped, RAM-backed tmpfs, exactly the wrong
-/// home for runs that exist because the data outgrew memory.
+/// Environment variable overriding where spill directories are created: a
+/// volume with room for runs that exist because the data outgrew memory (the
+/// OS temp dir is often a size-capped, RAM-backed tmpfs).
 const SPILL_DIR_ENV: &str = "VORTEX_RDF_SPILL_DIR";
 
 /// The rkyv bounds a record type needs to be spilled and read back.
@@ -47,26 +48,64 @@ fn resolve_spill_parent(env_override: Option<std::ffi::OsString>, base: Option<&
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// A unique temporary spill directory, deleted when dropped so spill files are
-/// cleaned up even if the chunk stream is abandoned before being fully
-/// consumed.
+/// A spill run's I/O failure: `what` failed in `dir` (shown as `.`, the
+/// working directory, when empty). The error keeps the I/O error's kind, and
+/// its message names the directory and the [`SPILL_DIR_ENV`] way out: a
+/// directory with more room when the volume or a quota is full, a writable
+/// one otherwise.
+pub(crate) fn spill_io_error(dir: &Path, what: &str, e: std::io::Error) -> VortexRdfError {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let dir = dir.display();
+    let hint = match e.kind() {
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "a directory with more room",
+        _ => "a writable directory",
+    };
+    VortexRdfError::Io(std::io::Error::new(
+        e.kind(),
+        format!("spill run {what} failed in {dir}: {e}; set {SPILL_DIR_ENV} to {hint}"),
+    ))
+}
+
+/// The longest file name, in bytes, the common filesystems take.
+const MAX_NAME_BYTES: usize = 255;
+
+/// A unique spill directory for one build's runs, deleted when dropped, so
+/// the runs go even when the chunk stream is abandoned unfinished.
 pub(crate) struct TempRunsGuard {
     dir: PathBuf,
 }
 
 impl TempRunsGuard {
-    /// Create `tmp_vortex_{prefix}_{uuid}` under the spill parent.
+    /// Create the run directory under the spill parent, named after the file
+    /// the build writes: `.<output>.spill-<uuid>`, by default a hidden sibling
+    /// of the output, or `.vortex-rdf.spill-<uuid>` when there is no output
+    /// name (a build into memory or into a caller's writer) or it would make
+    /// the directory's name longer than a file name may be.
     ///
-    /// The parent is resolved in precedence order: the `VORTEX_RDF_SPILL_DIR`
-    /// environment variable, then the caller-provided `base` (compaction
-    /// passes the directory its temp file is in, beside the file it replaces,
-    /// so spills share the output's volume), then [`std::env::temp_dir`]. The
-    /// library never writes into the caller's working directory: an embedding
-    /// server or binding can run with an arbitrary — even read-only — cwd.
-    pub(crate) fn create(prefix: &str, base: Option<&Path>) -> Result<Self> {
+    /// The parent is, in precedence order: the `VORTEX_RDF_SPILL_DIR`
+    /// environment variable, the caller's `base` (a build that writes a file
+    /// passes its temp file's directory, beside the file it writes or
+    /// replaces, so spills share the output's volume), then
+    /// [`std::env::temp_dir`]. Never the working directory: an embedding
+    /// server or binding can run with any cwd, even a read-only one.
+    pub(crate) fn create(output: Option<&OsStr>, base: Option<&Path>) -> Result<Self> {
         let parent = resolve_spill_parent(std::env::var_os(SPILL_DIR_ENV), base);
-        let dir = parent.join(format!("tmp_vortex_{}_{}", prefix, uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir)?;
+        let suffix = format!(".spill-{}", uuid::Uuid::new_v4());
+        let output = output
+            .filter(|output| 1 + output.len() + suffix.len() <= MAX_NAME_BYTES)
+            .unwrap_or(OsStr::new("vortex-rdf"));
+        let mut name = OsString::from(".");
+        name.push(output);
+        name.push(suffix);
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| spill_io_error(&parent, "directory creation", e))?;
+        #[cfg(test)]
+        spill_hooks::note(&dir);
         Ok(Self { dir })
     }
 
@@ -82,9 +121,36 @@ impl Drop for TempRunsGuard {
     }
 }
 
-/// Incremental rkyv writer for spilling items one at a time.
+/// Test hook: the run directory the last [`TempRunsGuard`] this thread
+/// created, which the tests read to pin where a build spilled and what the
+/// directory is called.
+#[cfg(test)]
+pub(crate) mod spill_hooks {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static LAST_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Record the run directory a guard created.
+    pub(super) fn note(dir: &Path) {
+        LAST_DIR.with(|last| *last.borrow_mut() = Some(dir.to_path_buf()));
+    }
+
+    /// The run directory the last guard created on this thread, if any.
+    pub(crate) fn last_dir() -> Option<PathBuf> {
+        LAST_DIR.with(|last| last.borrow().clone())
+    }
+}
+
+/// Incremental writer of one spill run: per record, a `u32` little-endian
+/// length and the rkyv bytes. Its I/O failures name the directory the run
+/// file is in ([`spill_io_error`]).
 pub(crate) struct RunWriter<T> {
     writer: BufWriter<File>,
+    /// The directory the run file is in, for error messages.
+    dir: PathBuf,
     /// Serialization buffer reused across pushes; `clear` keeps its capacity.
     buf: AlignedVec,
     _marker: PhantomData<T>,
@@ -92,17 +158,18 @@ pub(crate) struct RunWriter<T> {
 
 impl<T: Spillable> RunWriter<T> {
     pub(crate) fn create(path: &Path) -> Result<Self> {
-        let file = File::create(path)?;
+        let dir = path.parent().unwrap_or(path).to_path_buf();
+        let file = File::create(path).map_err(|e| spill_io_error(&dir, "file creation", e))?;
         Ok(Self {
             writer: BufWriter::new(file),
+            dir,
             buf: AlignedVec::new(),
             _marker: PhantomData,
         })
     }
 
     pub(crate) fn push(&mut self, item: &T) -> Result<()> {
-        // rkyv consumes and returns its writer by value, so the held buffer
-        // is taken and put back around each serialization.
+        // rkyv takes and returns the buffer by value.
         self.buf.clear();
         let bytes = to_bytes_in::<_, RkyvError>(item, std::mem::take(&mut self.buf))
             .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
@@ -113,14 +180,18 @@ impl<T: Spillable> RunWriter<T> {
             ))
         })?;
 
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(bytes.as_ref())?;
+        self.writer
+            .write_all(&len.to_le_bytes())
+            .and_then(|()| self.writer.write_all(bytes.as_ref()))
+            .map_err(|e| spill_io_error(&self.dir, "write", e))?;
         self.buf = bytes;
         Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<()> {
-        Ok(self.writer.flush()?)
+        self.writer
+            .flush()
+            .map_err(|e| spill_io_error(&self.dir, "write", e))
     }
 }
 
@@ -133,13 +204,9 @@ fn write_run<T: Spillable>(path: &Path, items: &[T]) -> Result<()> {
     writer.finish()
 }
 
-/// One sorted run of a merge, read sequentially — either still in memory or
-/// spilled to a temp file.
-///
-/// A dataset that fits in a single run never round-trips through rkyv and
-/// the filesystem: the ingest buffer *is* the run, already sorted and in
-/// memory. Only once a second run exists does spilling buy anything, so the
-/// builder spills lazily and keeps a lone run here.
+/// One sorted run of a merge, read sequentially: still in memory, or spilled
+/// to a temp file. A dataset that fits in one run never spills: the sorted
+/// ingest buffer is the run.
 pub(crate) struct Run<T>(RunInner<T>);
 
 enum RunInner<T> {
@@ -164,23 +231,6 @@ impl<T: Spillable> Run<T> {
             RunInner::File(reader) => reader.next(),
         }
     }
-
-    /// Pull up to `n` items off the run (fewer at the end of the data).
-    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        pull_batch(n, || self.next())
-    }
-}
-
-/// Pull up to `n` items off `next` (fewer once it yields `None`).
-fn pull_batch<T>(n: usize, mut next: impl FnMut() -> Result<Option<T>>) -> Result<Vec<T>> {
-    let mut batch = Vec::with_capacity(n.min(4096));
-    while batch.len() < n {
-        match next()? {
-            Some(item) => batch.push(item),
-            None => break,
-        }
-    }
-    Ok(batch)
 }
 
 /// Sequential rkyv reader over a spill file.
@@ -209,52 +259,47 @@ impl<T: Spillable> RunReader<T> {
             return Ok(None);
         }
 
-        // A truncated record is a corrupt spill file — a format-level
-        // `Deserialization` failure — while any other read error is plain
-        // filesystem I/O.
         let mut len_bytes = [0u8; 4];
         len_bytes[0] = first_len_byte[0];
-        self.reader.read_exact(&mut len_bytes[1..]).map_err(|e| {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                VortexRdfError::Deserialization(
-                    "Unexpected EOF while reading spill record length".to_string(),
-                )
-            } else {
-                VortexRdfError::Io(e)
-            }
-        })?;
+        read_exact_or_corrupt(&mut self.reader, &mut len_bytes[1..], "length")?;
 
         let len = u32::from_le_bytes(len_bytes) as usize;
         // Resize without clearing: `read_exact` overwrites all `len` bytes, so
         // the zero-fill only ever pays for the growth delta.
         self.payload.resize(len, 0);
-        self.reader.read_exact(&mut self.payload).map_err(|e| {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                VortexRdfError::Deserialization(
-                    "Unexpected EOF while reading spill record payload".to_string(),
-                )
-            } else {
-                VortexRdfError::Io(e)
-            }
-        })?;
+        read_exact_or_corrupt(&mut self.reader, &mut self.payload, "payload")?;
 
-        // SAFETY: spill files are produced by this process using the matching
-        // rkyv serializer and consumed immediately; we don't accept external
-        // untrusted data on this path.
+        // SAFETY: spill files are written by this process with the matching
+        // rkyv serializer and read back only by the build that wrote them; no
+        // external data takes this path.
         let item = unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&self.payload) }
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Some(item))
     }
 }
 
+/// `read_exact` of one spill record's `what` (its length or its payload)
+/// into `buf`. A truncated record is a corrupt spill file, a
+/// `Deserialization` failure; any other read error is filesystem I/O.
+fn read_exact_or_corrupt(reader: &mut impl Read, buf: &mut [u8], what: &str) -> Result<()> {
+    reader.read_exact(buf).map_err(|e| {
+        if e.kind() == ErrorKind::UnexpectedEof {
+            VortexRdfError::Deserialization(format!(
+                "Unexpected EOF while reading spill record {what}"
+            ))
+        } else {
+            VortexRdfError::Io(e)
+        }
+    })
+}
+
 /// External sort of `T`s: buffers items up to a capacity, spills each full
 /// buffer as a sorted run, and hands back a [`RunMerger`] that streams the
 /// items in global order.
 ///
-/// A spiller keeps every item pushed, repeats included — the index
-/// `(value, row id)` records are all different because their row ids are —
-/// unless it was made with [`distinct`](Self::distinct), which is what the
-/// quads themselves go through.
+/// A spiller keeps every item pushed, repeats included (the index
+/// `(value, row id)` records all differ, as their row ids do), unless it was
+/// made with [`distinct`](Self::distinct), as the quads' spiller is.
 pub(crate) struct RunSpiller<T> {
     dir: PathBuf,
     name: &'static str,
@@ -291,7 +336,7 @@ impl<T: Ord + Spillable> RunSpiller<T> {
     }
 
     /// Sort the buffer into a run, dropping its repeats when the spiller is
-    /// [`distinct`](Self::distinct) — equal items are adjacent once sorted.
+    /// [`distinct`](Self::distinct): equal items are adjacent once sorted.
     fn sort_buf(&mut self) {
         self.buf.sort_unstable();
         if self.distinct {
@@ -301,7 +346,7 @@ impl<T: Ord + Spillable> RunSpiller<T> {
 
     pub(crate) fn push(&mut self, item: T) -> Result<()> {
         // Spill only when the next item would not fit, so a dataset of exactly
-        // `capacity` items stays a single in-memory run (see [`Run`]).
+        // `capacity` items stays a single in-memory run.
         if self.buf.len() == self.capacity {
             self.flush_run()?;
         }
@@ -326,10 +371,8 @@ impl<T: Ord + Spillable> RunSpiller<T> {
         Ok(())
     }
 
-    /// Flush the tail run and set up the K-way merge over all runs.
-    ///
-    /// Nothing spilled means everything still sits in `buf`: sorting it in
-    /// place is the whole merge, so it becomes a single in-memory run.
+    /// Flush the last run and set up the K-way merge over all runs; when
+    /// nothing spilled, the sorted buffer is the single in-memory run.
     pub(crate) fn into_merger(mut self) -> Result<RunMerger<T>> {
         if self.run_paths.is_empty() {
             // The one run is deduplicated in place, so the merger reads it
@@ -371,8 +414,8 @@ impl<T: Ord + Spillable> RunMerger<T> {
     }
 
     /// Merge `runs`, each already sorted. With `distinct`, an item that
-    /// appears more than once — in several runs, or repeated inside one —
-    /// comes out once.
+    /// appears more than once (in several runs, or repeated inside one) comes
+    /// out once.
     pub(crate) fn merge(mut runs: Vec<Run<T>>, distinct: bool) -> Result<Self> {
         let mut heap = BinaryHeap::new();
         // A lone run reads straight through, unless its repeats must be
@@ -432,7 +475,61 @@ impl<T: Ord + Spillable> RunMerger<T> {
 
     /// Pull up to `n` items off the merge (fewer at the end of the data).
     pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        pull_batch(n, || self.next())
+        let mut batch = Vec::with_capacity(n.min(4096));
+        while batch.len() < n {
+            match self.next()? {
+                Some(item) => batch.push(item),
+                None => break,
+            }
+        }
+        Ok(batch)
+    }
+}
+
+/// Where [`merge_feeding_indexes`] puts the merged quads: straight into
+/// memory when the merge had a single input run, otherwise into a spill file.
+///
+/// [`merge_feeding_indexes`]: super::stream_indexes::merge_feeding_indexes
+pub(super) enum MergedSink {
+    Memory(Vec<RawQuad>),
+    File {
+        writer: RunWriter<RawQuad>,
+        path: PathBuf,
+    },
+}
+
+impl MergedSink {
+    /// An in-memory sink, or a writer to `merged.bin` under `dir`.
+    pub(super) fn create(dir: &Path, in_memory: bool) -> Result<Self> {
+        if in_memory {
+            return Ok(MergedSink::Memory(Vec::new()));
+        }
+        let path = dir.join("merged.bin");
+        Ok(MergedSink::File {
+            writer: RunWriter::create(&path)?,
+            path,
+        })
+    }
+
+    pub(super) fn push(&mut self, quad: RawQuad) -> Result<()> {
+        match self {
+            MergedSink::Memory(quads) => {
+                quads.push(quad);
+                Ok(())
+            }
+            MergedSink::File { writer, .. } => writer.push(&quad),
+        }
+    }
+
+    /// Close the sink and hand back the merged quads as a readable run.
+    pub(super) fn finish(self) -> Result<Run<RawQuad>> {
+        match self {
+            MergedSink::Memory(quads) => Ok(Run::memory(quads)),
+            MergedSink::File { writer, path } => {
+                writer.finish()?;
+                Run::file(&path)
+            }
+        }
     }
 }
 
@@ -467,22 +564,26 @@ impl<T: Ord> PartialOrd for MinHeapItem<T> {
 mod tests {
     use super::*;
 
+    /// The spill parent, by `(env override, base)`: the override wins over
+    /// `base`, `base` over the OS temp dir, and an empty override counts as
+    /// unset.
     #[test]
-    fn spill_parent_env_override_wins() {
-        let parent = resolve_spill_parent(Some("/custom/spill".into()), Some(Path::new("/base")));
-        assert_eq!(parent, PathBuf::from("/custom/spill"));
-    }
-
-    #[test]
-    fn spill_parent_prefers_base_over_os_temp() {
-        let parent = resolve_spill_parent(None, Some(Path::new("/base")));
-        assert_eq!(parent, PathBuf::from("/base"));
-    }
-
-    #[test]
-    fn spill_parent_treats_empty_env_as_unset() {
-        let parent = resolve_spill_parent(Some("".into()), None);
-        assert_eq!(parent, std::env::temp_dir());
+    fn spill_parent_resolves_env_then_base_then_os_temp() {
+        for (env, base, parent) in [
+            (
+                Some("/custom/spill"),
+                Some("/base"),
+                PathBuf::from("/custom/spill"),
+            ),
+            (None, Some("/base"), PathBuf::from("/base")),
+            (Some(""), None, std::env::temp_dir()),
+        ] {
+            assert_eq!(
+                resolve_spill_parent(env.map(std::ffi::OsString::from), base.map(Path::new)),
+                parent,
+                "env {env:?}, base {base:?}"
+            );
+        }
     }
 
     #[test]
@@ -495,13 +596,106 @@ mod tests {
         }
         let base = std::env::temp_dir().join(format!("vortex_spill_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
-        let guard = TempRunsGuard::create("unit", Some(&base)).unwrap();
+        let guard = TempRunsGuard::create(None, Some(&base)).unwrap();
         let dir = guard.path().to_path_buf();
         assert!(dir.starts_with(&base));
         assert!(dir.is_dir());
         drop(guard);
         assert!(!dir.exists());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn temp_runs_guard_names_the_directory_after_its_output() {
+        // As above: a preset override would (correctly) take the directory
+        // away from `base`, so only assert where it is absent.
+        if std::env::var_os(SPILL_DIR_ENV).is_some() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("vortex_spill_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        for (output, prefix) in [
+            (Some(OsStr::new("out.vortex")), ".out.vortex.spill-"),
+            (None, ".vortex-rdf.spill-"),
+        ] {
+            let guard = TempRunsGuard::create(output, Some(&base)).unwrap();
+            let dir = guard.path();
+            assert_eq!(dir.parent(), Some(base.as_path()), "{output:?}");
+            let name = dir.file_name().unwrap().to_str().unwrap();
+            let id = name
+                .strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("{output:?}: {name} does not start with {prefix}"));
+            assert!(uuid::Uuid::parse_str(id).is_ok(), "{output:?}: {name}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn temp_runs_guard_falls_back_when_the_output_name_is_too_long() {
+        // `.<output>.spill-<uuid>` is the output's length plus 44 bytes: a
+        // 211-byte output makes a name of 255 bytes, as long as a file name
+        // may be, and a longer one (212, and 250: 294 bytes) takes the name a
+        // build without an output has.
+        for (len, fits) in [(211, true), (212, false), (250, false)] {
+            let output = "x".repeat(len);
+            let guard = TempRunsGuard::create(Some(OsStr::new(&output)), None).unwrap();
+            let dir = guard.path();
+            assert!(dir.is_dir(), "{len}");
+            let name = dir.file_name().unwrap().to_str().unwrap();
+            let prefix = if fits {
+                format!(".{output}.spill-")
+            } else {
+                ".vortex-rdf.spill-".to_owned()
+            };
+            let id = name
+                .strip_prefix(prefix.as_str())
+                .unwrap_or_else(|| panic!("{len}: {name} does not start with {prefix}"));
+            assert!(uuid::Uuid::parse_str(id).is_ok(), "{len}: {name}");
+            if fits {
+                assert_eq!(name.len(), MAX_NAME_BYTES, "{len}");
+            }
+        }
+    }
+
+    #[test]
+    fn spill_io_error_suggests_room_for_a_full_volume() {
+        for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+            let error = spill_io_error(Path::new("/spill/runs"), "write", kind.into());
+            assert!(
+                matches!(&error, VortexRdfError::Io(e) if e.kind() == kind),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("spill run write failed in /spill/runs: "),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("; set VORTEX_RDF_SPILL_DIR to a directory with more room"),
+                "{message}"
+            );
+        }
+
+        // A real full volume: a run smaller than the writer's buffer reaches
+        // the device only at the final flush, which `finish` reports (the
+        // buffered writer's drop would swallow its error).
+        #[cfg(target_os = "linux")]
+        {
+            let error = write_run(Path::new("/dev/full"), &string_records()).unwrap_err();
+            assert!(
+                matches!(&error, VortexRdfError::Io(e) if e.kind() == ErrorKind::StorageFull),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("spill run write failed in /dev: "),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("; set VORTEX_RDF_SPILL_DIR to a directory with more room"),
+                "{message}"
+            );
+        }
     }
 
     fn string_records() -> Vec<(String, u32)> {
@@ -514,7 +708,7 @@ mod tests {
 
     #[test]
     fn run_roundtrip_through_reused_buffers() {
-        let guard = TempRunsGuard::create("unit_roundtrip", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let path = guard.path().join("run.bin");
         let records = string_records();
         write_run(&path, &records).unwrap();
@@ -527,7 +721,7 @@ mod tests {
 
     #[test]
     fn truncated_run_is_a_deserialization_error() {
-        let guard = TempRunsGuard::create("unit_truncated", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let path = guard.path().join("run.bin");
         let records = string_records();
         write_run(&path, &records).unwrap();
@@ -572,7 +766,7 @@ mod tests {
 
     #[test]
     fn distinct_spiller_collapses_repeats_inside_and_across_runs() {
-        let guard = TempRunsGuard::create("unit_distinct", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let items = repeated_items();
         let mut expected = items.clone();
         expected.sort_unstable();
@@ -601,7 +795,7 @@ mod tests {
     /// distinct by their row ids, never by being deduplicated.
     #[test]
     fn plain_spiller_keeps_repeats() {
-        let guard = TempRunsGuard::create("unit_plain", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let items = repeated_items();
         let mut expected = items.clone();
         expected.sort_unstable();
@@ -626,7 +820,7 @@ mod tests {
     /// yields each item once.
     #[test]
     fn distinct_merge_of_runs_with_repeats() {
-        let guard = TempRunsGuard::create("unit_distinct_runs", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let write = |name: &str, items: &[(u32, u32)]| {
             let path = guard.path().join(name);
             write_run(&path, items).unwrap();
@@ -655,7 +849,7 @@ mod tests {
 
     #[test]
     fn spiller_merges_runs_in_global_order() {
-        let guard = TempRunsGuard::create("unit_merge", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let mut spiller: RunSpiller<(u32, u32)> = RunSpiller::new(guard.path(), "pairs", 4);
         let items: Vec<(u32, u32)> = (0..23u32).rev().map(|i| (i % 5, i)).collect();
         for item in &items {

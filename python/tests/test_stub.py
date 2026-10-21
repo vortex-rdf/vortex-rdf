@@ -1,6 +1,7 @@
 """`_native.pyi` is checked against the extension module it describes: the
 same public names, and the same parameters and defaults on every function
-that carries a `__text_signature__`."""
+that carries a `__text_signature__`; and a repr the binding defines shows
+its class and state."""
 
 import ast
 import importlib.metadata
@@ -11,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import vortex_rdf
-from vortex_rdf import _native
+from vortex_rdf import U64Column, VortexRdfStore, _native
 
 STUB = Path(vortex_rdf.__file__).with_name("_native.pyi")
 
@@ -60,13 +61,28 @@ def test_version_matches_distribution():
 
 
 def _runtime_methods(cls):
-    names = _public(dir(cls)) | {"__len__", "__repr__"}
+    names = _public(dir(cls)) | {"__len__", "__iter__", "__next__"}
+    # Every object has a `__repr__`: the stub declares one only where the
+    # class defines its own.
+    if "__repr__" in vars(cls):
+        names.add("__repr__")
     if sys.version_info >= (3, 12):
         names |= {n for n in ("__buffer__",) if hasattr(cls, n)}
     return names
 
 
-@pytest.mark.parametrize("name", ["VortexRdfStore", "TermDict", "U64Column"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "VortexRdfStore",
+        "TermDict",
+        "U64Column",
+        "CodeGroups",
+        "ProbeAnswers",
+        "CodeChunks",
+        "CancelToken",
+    ],
+)
 def test_stub_class_methods_match_runtime(name):
     stub_methods = _stub_classes(_stub_tree())[name]
     cls = getattr(_native, name)
@@ -76,6 +92,18 @@ def test_stub_class_methods_match_runtime(name):
     if sys.version_info < (3, 12):
         stub_methods = stub_methods - {"__buffer__"}
     assert stub_methods == runtime
+
+
+def test_reprs_name_their_class_and_state(vortex_files):
+    """`U64Column`'s repr names the class and shows the column's length, as
+    `TermDict`'s does, for a column taken from a store and one built from
+    values; a store opened from a path shows the path and its layout."""
+    path = vortex_files["dictionary"]
+    store = VortexRdfStore(path)
+    assert repr(store) == f'VortexRdfStore(path="{path}", layout="dictionary")'
+    column = store.match_codes()[0]
+    assert repr(column) == "U64Column(len=5)"
+    assert repr(U64Column([])) == "U64Column(len=0)"
 
 
 _NO_DEFAULT = inspect.Parameter.empty

@@ -1,8 +1,6 @@
-//! Component sources: replayable producers of one independently typed
-//! component's chunks, plus the descriptor-source-strategy triple a write
-//! consumes. Always compiled — builders construct [`NativeComponentWrite`]s
-//! on every target, even when no serializer is compiled in; only the write
-//! strategy that consumes them (`write`) is gated.
+//! Component sources: producers of one component's chunks, the
+//! descriptor-source-strategy triple ([`NativeComponentWrite`]) a write
+//! consumes, and the per-child write strategies.
 
 use std::sync::Arc;
 
@@ -12,11 +10,11 @@ use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 
 use super::wire::StoreComponentDescriptor;
 
-/// Replayable producer for one independently typed component. Sources are
-/// buffered arrays ([`BufferedComponentSource`]) or spill-run mergers pulled
-/// chunk by chunk ([`PullComponentSource`]); both are lazy — nothing is
-/// produced until the write strategy polls, which is what lets it bound how
-/// many components compress concurrently.
+/// A producer of one component's chunks: buffered arrays
+/// ([`BufferedComponentSource`], replayable) or a spill-run merger pulled
+/// chunk by chunk ([`PullComponentSource`], single-shot). Nothing is produced
+/// until the write strategy polls, so it bounds how many components compress
+/// at once.
 pub(crate) trait NativeComponentSource: Send + Sync + 'static {
     fn dtype(&self) -> &DType;
     fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream>;
@@ -78,16 +76,17 @@ impl NativeComponentSource for BufferedComponentSource {
     }
 }
 
-/// A pull closure yielding one component chunk per call (`Ok(None)` = end).
-// Constructed only by the out-of-core builder, which is compiled out on
-// wasm32-unknown-unknown.
+/// A pull closure yielding one component chunk of at most the given rows per
+/// call, `Ok(None)` once exhausted; a zero-row pull yields the empty chunk of
+/// the component's dtype.
+// Made only by the out-of-core builder, absent on wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) type PullFn =
     Box<dyn FnMut(usize) -> VortexResult<Option<vortex_array::ArrayRef>> + Send>;
 
-/// A single-shot component source over a pull closure — how spill-run mergers
-/// stream a component's chunks without materializing them (each call reads
-/// the next window off the merger's run files).
+/// A single-shot component source over a pull closure: each call reads the
+/// next window off a spill-run merger's run files, so the component is never
+/// materialized.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) struct PullComponentSource {
     dtype: DType,
@@ -122,14 +121,28 @@ impl NativeComponentSource for PullComponentSource {
                 vortex_error::vortex_err!("a pull-backed component source replays only once")
             })?;
         let batch_rows = self.batch_rows;
-        let stream = futures::stream::unfold(Some(pull), move |state| async move {
-            let mut pull = state?;
-            match pull(batch_rows) {
-                Ok(Some(chunk)) => Some((Ok(chunk), Some(pull))),
-                Ok(None) => None,
-                Err(e) => Some((Err(e), None)),
-            }
-        });
+        // At least one chunk is emitted: the child strategy needs one,
+        // possibly empty, to write a schema-complete component, so an empty
+        // component contributes its zero-row pull.
+        let stream =
+            futures::stream::unfold((Some(pull), false), move |(state, emitted)| async move {
+                let mut pull = state?;
+                match pull(batch_rows) {
+                    Ok(Some(chunk)) => Some((Ok(chunk), (Some(pull), true))),
+                    Ok(None) if !emitted => {
+                        let empty = pull(0).and_then(|chunk| {
+                            chunk.ok_or_else(|| {
+                                vortex_error::vortex_err!(
+                                    "a zero-row pull must yield an empty chunk"
+                                )
+                            })
+                        });
+                        Some((empty, (None, true)))
+                    }
+                    Ok(None) => None,
+                    Err(e) => Some((Err(e), (None, true))),
+                }
+            });
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             self.dtype.clone(),
             stream,
@@ -137,6 +150,8 @@ impl NativeComponentSource for PullComponentSource {
     }
 }
 
+/// A component to write: its descriptor, chunk source and per-child write
+/// strategy.
 #[derive(Clone)]
 pub(crate) struct NativeComponentWrite {
     pub(crate) descriptor: StoreComponentDescriptor,
@@ -169,23 +184,19 @@ impl NativeComponentWrite {
 /// column the store writes outside [`id_column_strategy`].
 pub(crate) const ONE_MEG: u64 = 1 << 20;
 
-/// Rows per repartitioned block and per zone-map zone — the
+/// Rows per repartitioned block and per zone-map zone: the
 /// `WriteStrategyBuilder` default the store keeps.
 const ROW_BLOCK: usize = 8192;
 
 /// The compressor every store child is written with: the session's schemes,
 /// limited to the wire forms its write editions allow, minus FastLanes delta.
-///
-/// Delta wins on size for exactly the columns the store binary-searches in
-/// place — the sorted subject column and the index children's lead columns
-/// — but a delta value is a running sum, so a point read decodes its whole
-/// 1,024-value block; every cold probe and point read through the chunk
-/// leaves would pay that where a bit-packed or frame-of-reference column
-/// answers from one word. The store's own files stay on the encodings its
-/// probes read in place (the reader still probes delta, for files written
-/// elsewhere). The pinned core edition keeps frame-of-reference on a single
-/// reference and leaves delta out; the exclusion also keeps delta out of an
-/// edition that admits it.
+/// Delta is the smallest encoding for exactly the columns the store
+/// binary-searches in place (the sorted subject column, the index children's
+/// lead columns), but a delta value is a running sum, so a point read decodes
+/// its whole 1,024-value block where a bit-packed or frame-of-reference column
+/// answers from one word. The reader still probes delta, for files written
+/// elsewhere. The pinned core edition already leaves delta out; the exclusion
+/// keeps it out under one that admits it.
 fn store_compressor() -> vortex_btrblocks::BtrBlocksCompressorBuilder {
     use vortex_btrblocks::schemes::integer::DeltaScheme;
     use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt as _};
@@ -194,11 +205,10 @@ fn store_compressor() -> vortex_btrblocks::BtrBlocksCompressorBuilder {
         .exclude_schemes([DeltaScheme::new(1.25).id()])
 }
 
-/// The stock write strategy `write_options()` installs, with the
-/// [`store_compressor`] — what every store child's columns are written with
-/// except its id columns (see [`child_strategy`]); the dictionary child
-/// instead passes its pre-compressed chunks through
-/// `write::dict_child_strategy`.
+/// The stock write strategy (`write_options()`'s) with the
+/// [`store_compressor`]: what a store child's columns are written with, except
+/// its id columns ([`child_strategy`]) and the dictionary child's
+/// pre-compressed chunks (`dict_child_strategy`).
 pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
     vortex_file::WriteStrategyBuilder::from_session(&crate::session::VORTEX_SESSION)
         .with_btrblocks_builder(store_compressor())
@@ -210,21 +220,20 @@ pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy>
 /// ([`is_id_field`](crate::store::schema::is_id_field): a `u64` term-code
 /// `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid`) written by
 /// [`id_column_strategy`] instead, through the writer's per-field override
-/// (`WriteStrategyBuilder::with_field_writer`). Every other column — the
-/// Default and TypedObject layouts' strings — keeps the stock strategy; a
-/// child without id columns gets it unchanged.
+/// (`WriteStrategyBuilder::with_field_writer`). Every other column (the
+/// Default and TypedObject layouts' strings) keeps the stock strategy.
 ///
-/// The override cuts a plain id column into leaves of 262,144 rows (coalesced
-/// to 2 MiB uncompressed; Vortex's stock 1 MiB holds 131,072 `u64` values),
-/// and a dictionary-encoded column's codes into leaves of 1 MiB. A column in
-/// fewer leaves costs every probe that walks or rebuilds them less.
+/// The override cuts a plain id column into leaves of 262,144 rows (2 MiB
+/// uncompressed, where the stock 1 MiB holds 131,072 `u64` values) and a
+/// dictionary-encoded column's codes into leaves of 1 MiB: fewer leaves for
+/// every probe that walks or rebuilds them.
 pub(crate) fn child_strategy(dtype: &DType) -> Arc<dyn vortex_layout::LayoutStrategy> {
     child_strategy_with(dtype, ONE_MEG, 2 * ONE_MEG)
 }
 
 /// The fields of `dtype` that are id columns
 /// ([`is_id_field`](crate::store::schema::is_id_field): a non-nullable `u64`
-/// `s`, `p`, `o`, `g`, `val` or `rid`), in field order — the fields
+/// `s`, `p`, `o`, `g`, `val` or `rid`), in field order: the fields
 /// [`child_strategy`] overrides.
 pub(crate) fn id_fields(dtype: &DType) -> Vec<vortex_array::dtype::FieldName> {
     let DType::Struct(fields, _) = dtype else {
@@ -239,9 +248,9 @@ pub(crate) fn id_fields(dtype: &DType) -> Vec<vortex_array::dtype::FieldName> {
         .collect()
 }
 
-/// [`child_strategy`] with explicit [`id_column_strategy`] targets — the
-/// tests' handle on the override, which at 1 MiB and 1 MiB must write
-/// exactly what [`default_child_strategy`] writes.
+/// [`child_strategy`] with explicit [`id_column_strategy`] targets: the
+/// tests' handle on the override, which at 1 MiB and 1 MiB must write exactly
+/// what [`default_child_strategy`] writes.
 pub(crate) fn child_strategy_with(
     dtype: &DType,
     codes_target: u64,
@@ -265,19 +274,19 @@ pub(crate) fn child_strategy_with(
 
 /// An id column's leaf pipeline: the per-column pipeline
 /// `WriteStrategyBuilder::build` assembles (vortex-file 0.88, `strategy.rs`)
-/// step for step — repartition into 8 Ki-row blocks, zone statistics per
-/// block, dictionary encoding or its fallback, coalescing, compression,
-/// buffering, one flat leaf per chunk — with the coalescing target split in
-/// two: `codes_target` for the codes of a column that dictionary-encodes,
+/// step for step (repartition into 8 Ki-row blocks, zone statistics per block,
+/// dictionary encoding or its fallback, coalescing, compression, buffering,
+/// one flat leaf per chunk), with the coalescing target split in two:
+/// `codes_target` for the codes of a column that dictionary-encodes,
 /// `fallback_target` for a column that does not.
 ///
 /// [`child_strategy`] passes 1 MiB and 2 MiB. A dictionary's codes are as
-/// wide as its cardinality needs, whatever the width of the values, so they
-/// keep the stock 1 MiB; a plain `u64` column — a term-code column that does
-/// not dictionary-encode, or a row-id column, whose ids are unique — is
-/// coalesced to 2 MiB, which holds 262,144 rows per leaf. Passing 1 MiB twice
-/// gives the stock pipeline exactly, which a test pins by writing columns both
-/// ways: a Vortex upgrade that changes the stock pipeline fails that test.
+/// wide as its cardinality needs, so they keep the stock 1 MiB; a plain `u64`
+/// column (a term-code column that does not dictionary-encode, or a row-id
+/// column, whose ids are unique) takes 2 MiB, 262,144 rows per leaf. 1 MiB
+/// twice gives the stock pipeline exactly, which a test pins by writing
+/// columns both ways, so a Vortex upgrade that changes the stock pipeline
+/// fails it.
 fn id_column_strategy(
     codes_target: u64,
     fallback_target: u64,
@@ -345,5 +354,41 @@ fn id_column_strategy(
             block_size_target: None,
             canonicalize: false,
         },
+    ))
+}
+
+/// The dictionary child's strategy: every source chunk written verbatim as
+/// one flat leaf under a chunked node (no sampling, no re-encoding), so the
+/// leaves are the self-contained FSST windows (`TermDictionary::compress`)
+/// the file-backed dictionary reads. With `zone_rows` (the window length) the
+/// term column gets one zone per window, recording the window's exact first
+/// and last term (`vortex.min()`/`vortex.max()`); `None`, for chunks of uneven
+/// length, writes no zone map.
+pub(crate) fn dict_child_strategy(
+    zone_rows: Option<std::num::NonZeroUsize>,
+) -> Arc<dyn vortex_layout::LayoutStrategy> {
+    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+    use vortex_layout::layouts::struct_::StructStrategy;
+    use vortex_layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
+
+    let leaves = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
+    let terms: Arc<dyn vortex_layout::LayoutStrategy> = match zone_rows {
+        Some(block_size) => Arc::new(ZonedStrategy::new(
+            leaves,
+            FlatLayoutStrategy::default(),
+            ZonedLayoutOptions {
+                block_size,
+                aggregate_fns: Some(
+                    crate::store::layouts::dictionary::storage::window_bound_aggregates(),
+                ),
+                concurrency: std::num::NonZeroUsize::MIN,
+            },
+        )),
+        None => Arc::new(leaves),
+    };
+    Arc::new(StructStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        terms,
     ))
 }

@@ -1,0 +1,41 @@
+# A workspace of its own: the comparative harness (benches/compare.rs) is the
+# only code that needs oxigraph with its RocksDB backend, sophia and hdt, and
+# cargo builds a crate's dev-dependencies for every test, clippy, bench and
+# coverage build of that crate. Here their dependency trees stay out of the
+# main workspace's build and test surface, so `cargo test --workspace` never
+# compiles RocksDB's C++ sources. scripts/refresh.sh, the dashboard refresh, is
+# the only runner: it checks formatting, lints `--locked` against this crate's
+# own Cargo.lock, then benches. The crate declares no version, so cargo never
+# publishes it, and a release only refreshes that lock's entries for the main
+# workspace's crates (scripts/update-changelog.sh). A lock gone stale against
+# core's dependencies fails the lint job (scripts/ci-check.sh); refresh it with
+# `cargo update -w --manifest-path bench-compare/Cargo.toml`.
+[workspace]
+
+[package]
+name = "vortex-rdf-bench-compare"
+description = "The cross-library comparative benchmark behind the dashboard's Rust tab: Vortex-RDF stores against oxigraph, sophia and hdt"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[dependencies]
+# The mimalloc feature installs the global allocator in the bench binary, as the
+# CLI does for its own.
+vortex-rdf-core = { path = "../core", features = ["mimalloc"] }
+oxrdf = "0.3.3"
+oxrdfio = "0.2.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Every tokio feature, as cli/Cargo.toml enables them: the dashboard measures
+# under the runtime configuration the CLI binary has.
+tokio = { version = "1.53", features = ["full"] }
+# The libraries under comparison.
+oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
+sophia = "0.10"
+hdt = { version = "0.7", features = ["nt"] }
+
+[[bench]]
+name = "compare"
+harness = false

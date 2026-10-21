@@ -544,13 +544,17 @@ fn string_kind_options_are_validated() {
         ("contains", "\"x\"@", opts(None, false)),
     ] {
         assert!(
-            TermPredicate::parse_with(kind, arg, &options).is_err(),
+            matches!(
+                TermPredicate::parse_with(kind, arg, &options),
+                Err(crate::VortexRdfError::InvalidInput(_))
+            ),
             "{kind} {arg:?}"
         );
     }
 }
 
-/// Malformed predicates are refused at parse time, with the kind named.
+/// Malformed predicates are refused at parse time as invalid input, with
+/// the kind named.
 #[test]
 fn parse_rejects_malformed() {
     for (kind, arg) in [
@@ -562,7 +566,13 @@ fn parse_rejects_malformed() {
         ("num_eq", "1.5.2"),
         ("num_gt", "\"5\"^^<http://ex.org/dt>"),
     ] {
-        assert!(TermPredicate::parse(kind, arg).is_err(), "{kind} {arg:?}");
+        assert!(
+            matches!(
+                TermPredicate::parse(kind, arg),
+                Err(crate::VortexRdfError::InvalidInput(_))
+            ),
+            "{kind} {arg:?}"
+        );
     }
     // A numeric argument is a bare lexical form or a typed literal.
     assert!(TermPredicate::parse("num_lt", "5").is_ok());
@@ -596,7 +606,8 @@ async fn predicate_store() -> VortexRdfStore {
         "_:b0".to_string(),
         "_:ab".to_string(),
     ] {
-        let term = crate::common::terms::parse_term(&spelling).unwrap();
+        let term =
+            crate::common::terms::term(&spelling, crate::common::terms::Trust::Stored).unwrap();
         quads.push(Quad::new(
             s.clone(),
             p.clone(),
@@ -614,7 +625,7 @@ async fn predicate_store() -> VortexRdfStore {
 #[tokio::test]
 async fn filter_codes_matches_eval() {
     let store = predicate_store().await;
-    let dict = store.code_read_snapshot().unwrap();
+    let dict = store.dict_reader().unwrap().snapshot().unwrap();
     let terms: Vec<String> = (0..dict.len() as TermCode)
         .map(|c| dict.decode(c).unwrap())
         .collect();
@@ -754,9 +765,9 @@ fn malformed_spellings_are_never_true() {
 #[tokio::test]
 async fn filter_codes_leaves_wide_longs_undecided() {
     let store = predicate_store().await;
-    let dict = store.code_read_snapshot().unwrap();
+    let dict = store.dict_reader().unwrap().snapshot().unwrap();
     let all: Vec<TermCode> = (0..dict.len() as TermCode).collect();
-    let code = |spelling: String| dict.encode(&spelling).expect(&spelling);
+    let code = |spelling: String| dict.encode(&spelling).unwrap().expect(&spelling);
     let wide = [
         code(typed("99999999999999999999", "long")),
         code(typed("-1", "unsignedLong")),
@@ -782,18 +793,19 @@ async fn filter_codes_leaves_wide_longs_undecided() {
     }
 }
 
-/// Candidates must be ascending, unique and inside the dictionary.
+/// Candidates must be ascending, unique and inside the dictionary: any other
+/// list is invalid input.
 #[tokio::test]
 async fn filter_codes_rejects_bad_candidates() {
     let store = predicate_store().await;
-    let dict = store.code_read_snapshot().unwrap();
+    let dict = store.dict_reader().unwrap().snapshot().unwrap();
     let predicate = TermPredicate::parse("is_iri", "").unwrap();
     let len = dict.len() as TermCode;
     for codes in [vec![3u64, 1], vec![1, 1], vec![0, len]] {
         assert!(
             matches!(
                 dict.filter_codes(&predicate, &codes),
-                Err(crate::VortexRdfError::InvalidOperation(_))
+                Err(crate::VortexRdfError::InvalidInput(_))
             ),
             "{codes:?}"
         );

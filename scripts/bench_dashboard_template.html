@@ -1114,10 +1114,9 @@ function renderRust(){
 
   // Read-side headline KPIs, computed from the run itself. The Vortex lookup is
   // the fastest fully-selective probe in the whole match matrix; the full scan
-  // is `decode_all`, this suite's whole-store read.
-  // Null only if the render could not determine the size at all; showing that
-  // beats a stale literal, and beats a throw that would blank the whole tab.
-  const RUST_QUADS = RUST_CONFIG.benchSize ?? 0;
+  // is `decode_all`, this suite's whole-store read. The size is the run's own
+  // `#dataset` stamp, which the render requires.
+  const RUST_QUADS = RUST_CONFIG.benchSize;
   const vortexPoints = MATCH_INDEXES.flatMap(([ixLabel, ix]) =>
     MATCH_LAYOUTS.map(v => ({ id:`${v.group(ix, "warm")}::S`,
       desc:`${v.labels[0]} · ${v.labels[1]} · ${ixLabel.toLowerCase()}` })));
@@ -1154,7 +1153,7 @@ function renderRust(){
       sub:"Dictionary layout, index × residency" },
     { label:"Benchmarks", value:String(RUST_DATA.length + RC_DATA.length),
       sub:"leaf measurements" },
-    { label:"Quads", value:RUST_QUADS ? RUST_QUADS.toLocaleString() : "unknown",
+    { label:"Quads", value:RUST_QUADS.toLocaleString(),
       sub:RC_CONFIG.graphCount
         ? `one dataset, ${RC_CONFIG.graphCount} named graphs`
         : "generated quads" },
@@ -1174,25 +1173,24 @@ function renderRust(){
   // the suite no longer generates — which is exactly how the previous version
   // came to explain an i%100 predicate long after that generator was gone. The
   // bench targets print what they built; RUST_CONFIG.dataset carries it here.
-  const DS = RUST_CONFIG.dataset || null;
+  const DS = RUST_CONFIG.dataset;
   const setText = (id, text) => {
     const el = document.getElementById(id);
     if (el) el.textContent = text;
   };
-  const shape = DS
-    ? `${DS.subjects.toLocaleString()} subjects · ${DS.predicates} predicates · ` +
-      `${DS.objects.toLocaleString()} objects · ${DS.graphs} graphs · ` +
-      `${DS.terms.toLocaleString()} distinct terms`
-    : "dataset shape unavailable";
+  const shape =
+    `${DS.subjects.toLocaleString()} subjects · ${DS.predicates} predicates · ` +
+    `${DS.objects.toLocaleString()} objects · ${DS.graphs} graphs · ` +
+    `${DS.terms.toLocaleString()} distinct terms`;
   setText("ds-shape", shape);
   setText("ds-shape-internals", shape);
-  renderMatchedRows(DS ? DS.matched : null, "internals-matched-rows");
+  renderMatchedRows(DS.matched, "internals-matched-rows");
   makeTable(RUST_DATA, "#data-table", "#table-filter", "#table-count");
   document.getElementById("provenance").textContent = RUST_PROVENANCE;
   renderRustCompare();
 }
 
-// ---- Rust tab: cross-library comparison (core/benches/compare.rs) ----
+// ---- Rust tab: cross-library comparison (bench-compare/benches/compare.rs) ----
 // Deliberately the same panel shapes as the Python tab's comparison: the two
 // measure the same file at the same scale, so a reader moving between the tabs
 // should not also have to re-learn the layout.
@@ -1217,7 +1215,7 @@ function renderRustCompare(){
     // The comparative suite is a separate, slower target than the instrumented
     // one; a Rust tab rendered without it should say so rather than show a gap.
     host.innerHTML = '<p class="note">No cross-library results in this run — ' +
-      'produce them with <span class="mono">cargo bench --bench compare</span>.</p>';
+      'produce them with <span class="mono">cargo bench --manifest-path bench-compare/Cargo.toml</span>.</p>';
     return;
   }
   const rcById = new Map(RC_DATA.map(d => [byKey(d), d]));

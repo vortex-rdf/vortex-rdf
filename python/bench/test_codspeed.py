@@ -17,7 +17,8 @@ Where the two suites cannot correspond:
 
 * `mutate::*` has no Python counterpart — the bindings expose no add/delete.
 * `readback::toRdf_*` has none — there is no export API.
-* `readpath::match_stream` has none — there is no streaming read.
+* `readpath::match_stream` has none — the bindings stream code chunks
+  (`test_pushdown_chunks`), not quads.
 * Building takes a *file*, so every `build::*` task is parse-and-build. That
   makes it the analogue of the JS suite's `build::fromString_nquads` as much as
   of its `fromQuads` variants, and the two are not comparable in absolute
@@ -289,10 +290,10 @@ def test_readpath_full_decoded_literals(benchmark, stores):
 
 # ─── decode::<shape> (Python-only) ──────────────────────────────────────────
 #
-# No JavaScript counterpart: these guard `TermDict::decode_slice`'s sharing of
-# one Python string across repeats of a code. The three shapes are not
-# variations on one workload — each is a different way a column can repeat, and
-# the sharing covers them unequally:
+# No JavaScript counterpart: these guard `decode_slice`'s (python/src/codes.rs)
+# sharing of one Python string across repeats of a code. The three shapes are
+# not variations on one workload — each is a different way a column can repeat,
+# and the sharing covers them unequally:
 #
 #   constant  — a bound position, one code for every row.
 #   distinct  — no repetition at all, where sharing can only cost.
@@ -434,11 +435,47 @@ def test_pushdown_exists(benchmark, stores):
 
 @pytest.mark.benchmark
 def test_pushdown_many(benchmark, stores):
-    """64 subject probes in one `match_codes_many` — a nested-loop join's
-    probe batch, one GIL release for the lot."""
+    """64 subject probes through one `match_codes_many`, consumed whole — a
+    nested-loop join's probe batch, answered through the bounded window."""
     store = stores["triples::dict"]
     probes = [(nn(i * 7 % DIM), None, None, None) for i in range(64)]
-    benchmark(lambda: store.match_codes_many(probes))
+    benchmark(lambda: list(store.match_codes_many(probes)))
+
+
+@pytest.mark.benchmark
+def test_pushdown_many_scans(benchmark, stores):
+    """64 object probes through one `match_codes_many`, consumed whole: on
+    the store without indexes each probe is a scan of the whole store, so
+    this is the batch the bounded window keeps from running all at once."""
+    store = stores["triples::dict"]
+    probes = [(None, None, nn(i % DIM), None) for i in range(64)]
+    benchmark(lambda: list(store.match_codes_many(probes)))
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize(
+    "residency, batch_rows",
+    [("file", None), ("memory", None), ("file", 64), ("memory", 64)],
+    ids=["file", "memory", "file-64", "memory-64"],
+)
+def test_pushdown_chunks(benchmark, stores, store_paths, residency, batch_rows):
+    """A P match streamed whole through `match_code_chunks`, over the mapped
+    file and over the same store loaded whole. At the default chunk size the
+    match (DIM**2 rows) is one chunk, the chunked twin of
+    `readpath[match_codes]`; at 64 rows a chunk it is DIM**2 / 64 pulls (16
+    at the default DIM), so the per-chunk path is what is measured."""
+    if residency == "file":
+        store = stores["triples::dict"]
+    else:
+        store = VortexRdfStore(store_paths["triples::dict"], in_memory=True)
+    p = TRIPLE_PATTERNS[1]  # P
+    options = {} if batch_rows is None else {"batch_rows": batch_rows}
+
+    def stream():
+        for _ in store.match_code_chunks(p.s, p.p, p.o, p.g, **options):
+            pass
+
+    benchmark(stream)
 
 
 @pytest.mark.benchmark
@@ -458,15 +495,32 @@ def test_pushdown_filter_codes(benchmark, store_paths, kind):
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize("op", ["distinct", "value_counts", "join_indices"])
+@pytest.mark.parametrize(
+    "op",
+    ["distinct", "value_counts", "join_indices", "join_count", "groups_join", "groups_gather"],
+)
 def test_pushdown_kernels(benchmark, stores, op):
-    """The column kernels over a P match's subject column (`join_indices`
-    joins it with itself: the self-join shape of a star query)."""
+    """The column kernels over a P match's subject column (the joins join it
+    with itself: the self-join shape of a star query). `join_count` counts
+    that join's pairs without building them, and `groups_join` probes the
+    column's groups, built once outside the measurement, as a join over
+    slices of a large left column does for each slice; `groups_gather`
+    fills that join's subject and object columns of both sides instead of
+    its pair indices."""
     store = stores["triples::dict"]
     p = TRIPLE_PATTERNS[1]  # P
-    subjects = store.match_codes(p.s, p.p, p.o, p.g)[0]
+    subjects, _, objects, _ = store.match_codes(p.s, p.p, p.o, p.g)
     if op == "join_indices":
         benchmark(lambda: subjects.join_indices(subjects))
+    elif op == "join_count":
+        benchmark(lambda: subjects.join_count(subjects))
+    elif op == "groups_join":
+        groups = subjects.groups()
+        benchmark(lambda: groups.join(subjects))
+    elif op == "groups_gather":
+        groups = subjects.groups()
+        both = [subjects, objects]
+        benchmark(lambda: groups.gather(subjects, both, both))
     else:
         benchmark(getattr(subjects, op))
 

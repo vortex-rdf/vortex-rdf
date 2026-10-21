@@ -14,37 +14,11 @@ async fn row_set(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     rows
 }
 
-/// The row tuples of a view's gathered codes, in the order gathered.
-async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let cols = view
-        .code_columns_gathered()
-        .await
-        .unwrap()
-        .expect("a Dictionary-layout view without a tail gathers codes");
-    (0..cols[0].len())
-        .map(|i| [cols[0][i], cols[1][i], cols[2][i], cols[3][i]])
-        .collect()
-}
-
-/// The view's rows in base row order: a keep that admits every code drops
-/// the serve plan without dropping a row.
-async fn base_ordered(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let all = Keep::range(0..TermCode::MAX);
-    row_list(&view.keep(QuadColumn::S, &all).await.unwrap()).await
-}
-
 fn brute_keep(rows: &[[TermCode; 4]], column: QuadColumn, keep: &Keep) -> Vec<[TermCode; 4]> {
     rows.iter()
         .copied()
         .filter(|row| keep.admits(row[column.index()]))
         .collect()
-}
-
-fn fixture_quads() -> Vec<Quad> {
-    let g = |name: &str| {
-        GraphName::NamedNode(NamedNode::new(format!("http://example.org/{name}")).unwrap())
-    };
-    graph_modular_quads(3_000, 4, 5, 7, &[GraphName::DefaultGraph, g("g1"), g("g2")])
 }
 
 async fn memory_store(indexes: Indexes) -> VortexRdfStore {
@@ -236,7 +210,7 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
         ),
     ];
     for (view_tag, view) in &views {
-        let rows = base_ordered(view).await;
+        let rows = base_ordered_codes(view).await;
         let n = rows.len();
         for (offset, limit) in [
             (0, 0),
@@ -291,6 +265,60 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
     }
 }
 
+/// Inside a subject run of width 8, a range keep on `p` and a set of one code
+/// (one bounded search of ⌊log2 8⌋ + 1 = 4 steps, fewer than the run's rows;
+/// a code inside the run, and its last row, which ends the search) are
+/// answered by binary search inside the run; a set of two codes (8 steps)
+/// takes the pass over the run. Every keep equals brute force.
+async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
+    use crate::store::query::narrowing::narrow_hooks::sorted_run_keeps;
+    let quads: Vec<Quad> = (0..64)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{}", i / 8),
+                &format!("http://example.org/p{}", i % 8),
+                &format!("o{}", i % 3),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let store = VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, indexes)
+        .await
+        .unwrap();
+    let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s3").unwrap());
+    let run = store
+        .match_pattern(Some(&s3), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(run.debug_selection_range(), Some(24..32), "{tag}");
+    let rows = row_set(&run).await;
+    let dict = store.dict_reader().unwrap();
+    let mut p = Vec::new();
+    for i in 0..8 {
+        let term = format!("<http://example.org/p{i}>");
+        p.push(dict.encode(&term).await.unwrap().unwrap());
+    }
+    for (keep, searched) in [
+        (Keep::range(p[2]..p[5]), true),
+        (Keep::set([p[4]]), true),
+        (Keep::set([p[7]]), true),
+        (Keep::set([p[1], p[6]]), false),
+    ] {
+        let before = sorted_run_keeps();
+        let narrowed = run.keep(QuadColumn::P, &keep).await.unwrap();
+        assert_eq!(
+            sorted_run_keeps() - before,
+            usize::from(searched),
+            "{tag}: keep {keep:?}"
+        );
+        assert_eq!(
+            row_set(&narrowed).await,
+            brute_keep(&rows, QuadColumn::P, &keep),
+            "{tag}: keep {keep:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_keep_in_memory_matches_brute_force() {
     for (tag, indexes) in [
@@ -298,8 +326,36 @@ async fn test_keep_in_memory_matches_brute_force() {
         ("copy", vec![IndexType::SecondaryByCopy]),
         ("reference", vec![IndexType::SecondaryByReference]),
     ] {
-        let store = memory_store(indexes).await;
+        let store = memory_store(indexes.clone()).await;
         assert_keeps_match_brute_force(&store, tag).await;
+        assert_sorted_run_keeps_engage(indexes, tag).await;
+    }
+}
+
+/// A keep on a column with neither a canonical primitive nor a probe to read
+/// in place (the per-chunk references of [`unprobed_object_store`]'s `o`)
+/// decodes the column at the view's selected rows once and tests those:
+/// every keep on `o`, of the whole store and of a predicate-bound view,
+/// equals brute force.
+#[tokio::test]
+async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
+    let store = unprobed_object_store().await;
+    assert_eq!(store.debug_base_child_int_canonical("o"), Some(false));
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_p = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    for (tag, view) in [("whole", store.clone()), ("p-bound", by_p)] {
+        let rows = row_set(&view).await;
+        for keep in keeps_for(&store, QuadColumn::O).await {
+            let narrowed = view.keep(QuadColumn::O, &keep).await.unwrap();
+            assert_eq!(
+                row_set(&narrowed).await,
+                brute_keep(&rows, QuadColumn::O, &keep),
+                "{tag}: keep {keep:?}"
+            );
+        }
     }
 }
 
@@ -424,31 +480,9 @@ async fn test_narrowing_gates_and_tails() {
     );
 }
 
-#[cfg(feature = "file-io")]
 mod file {
     use super::*;
     use std::ops::Range;
-
-    /// Both open modes of a file store — loaded whole and mapped — with and
-    /// without indexes (the dir guards ride along, shared by both opens).
-    async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, VortexRdfStore)> {
-        let mut stores = Vec::new();
-        for (tag, indexes) in [
-            ("file/no-index", vec![]),
-            ("file/copy", vec![IndexType::SecondaryByCopy]),
-            ("file/reference", vec![IndexType::SecondaryByReference]),
-        ] {
-            let (dir, path) =
-                write_store_file(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
-            let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-            let mapped = VortexRdfStore::from_file(&path).await.unwrap();
-            assert!(mapped.debug_dict_file_backed());
-            let dir = std::sync::Arc::new(dir);
-            stores.push((format!("{tag}/loaded"), std::sync::Arc::clone(&dir), loaded));
-            stores.push((format!("{tag}/mapped"), dir, mapped));
-        }
-        stores
-    }
 
     #[tokio::test]
     async fn test_keep_on_file_matches_brute_force() {
@@ -459,8 +493,36 @@ mod file {
 
     #[tokio::test]
     async fn test_window_on_file_matches_slicing() {
+        let strings =
+            |quads: Vec<Quad>| -> Vec<String> { quads.iter().map(ToString::to_string).collect() };
         for (tag, _dir, store) in file_stores().await {
             assert_windows_match_slicing(&store, &tag).await;
+            if !tag.ends_with("/mapped") {
+                continue;
+            }
+            // With quads appended, a match on the unindexed graph keeps its
+            // filter pending: a window starting past the base's matches takes
+            // the tail's rows from the offset minus the base's match count.
+            let graph = GraphName::DefaultGraph;
+            let base_matches = matched_size(&store, None, None, None, Some(&graph)).await;
+            let tailed = store.add_quads(appended_quads(30)).await.unwrap();
+            let matched = tailed
+                .match_pattern(None, None, None, Some(&graph))
+                .await
+                .unwrap();
+            assert!(matched.view_statistics().unwrap().pending_filter, "{tag}");
+            let rows = strings(matched.quads_vec().await.unwrap());
+            assert_eq!(rows.len(), base_matches + 30, "{tag}");
+            for (past, limit) in [(1, 5), (10, 100), (29, 1), (30, 1)] {
+                let offset = base_matches + past;
+                let window = matched.window(offset, limit).await.unwrap();
+                let want: Vec<String> = rows.iter().skip(offset).take(limit).cloned().collect();
+                assert_eq!(
+                    strings(window.quads_vec().await.unwrap()),
+                    want,
+                    "{tag}: window({offset}, {limit})"
+                );
+            }
         }
     }
 
@@ -605,7 +667,7 @@ mod file {
     /// exact across the retirement, and the memo stays within its cap.
     #[tokio::test]
     async fn test_distinct_constants_retire_the_reader_tree() {
-        let distinct = crate::store::native_file::BIND_MEMO_MAX + 200;
+        let distinct = crate::store::persist::native_file::BIND_MEMO_MAX + 200;
         let quads: Vec<Quad> = (0..distinct)
             .map(|i| {
                 make_quad(
@@ -633,7 +695,7 @@ mod file {
         }
 
         assert!(
-            store.debug_bound_exprs().unwrap() <= crate::store::native_file::BIND_MEMO_MAX,
+            store.debug_bound_exprs().unwrap() <= crate::store::persist::native_file::BIND_MEMO_MAX,
             "the bound tree memo is capped"
         );
         assert!(
@@ -646,12 +708,7 @@ mod file {
     /// multi-split keep checks below.
     #[tokio::test]
     async fn test_keeps_on_a_multi_split_file() {
-        let (_dir, path) = write_store_file(
-            modular_quads(160_000, 3, 8),
-            LayoutStrategy::Dictionary,
-            vec![],
-        )
-        .await;
+        let (_dir, path) = multi_window_dictionary_file().await;
         let opened = crate::tests::open_mapped(&path).await;
         assert!(
             opened.splits().unwrap().len() > 1,

@@ -1,50 +1,53 @@
-//! Read-side access to native store files: opening them, requiring the
-//! native root, and materializing whole files or auxiliary children on any
-//! target. The opened-store runtime handle the store's file-backed query
-//! paths drive lives store-side, in
-//! [`store::native_file`](crate::store::native_file), beside the scan
-//! machinery that defines its memo semantics; the wire format itself (layout
-//! VTable, descriptors, write strategy) lives in
-//! [`container`](super::container).
+//! Read-side access to native store files: opening them (mapped or read), the
+//! open errors, and the scan drivers that run a scan's splits inline or
+//! spawned and materialize a whole reader, on any target.
 
 use std::future::Future;
 
 use futures::StreamExt as _;
 use vortex_array::ArrayRef;
 use vortex_error::VortexResult;
+use vortex_layout::scan::scan_builder::ScanBuilder;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::array::chunked_or_single;
 
-/// The host's available parallelism, read once; 1 on targets that cannot
-/// answer (wasm). Read by [`collect_chunks`] for its in-flight split count and
-/// exposed through [`available_parallelism`] to the store's scan and serve
-/// split loops.
+/// The host's available parallelism, read once; 1 where the target cannot
+/// answer (wasm). The in-flight split count of [`inline_splits`] and of the
+/// store's scan and serve split loops ([`available_parallelism`]).
 static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
 });
 
-/// The host's available parallelism — how many workers a scan's per-split
+/// The host's available parallelism: how many workers a scan's per-split
 /// tasks can spread over.
 #[cfg(feature = "file-io")]
 pub(crate) fn available_parallelism() -> usize {
     *AVAILABLE_PARALLELISM
 }
 
-/// Drive a scan's per-split futures inline and collect the chunks in split
-/// (row) order — the shared tail of [`scan_all`], [`scan_all_reader`] and
-/// [`scan_reader_chunks`].
-///
-/// The futures are polled through a `buffered` window — several in flight on
-/// this same task, still no runtime handle — so one split's I/O overlaps
-/// another's decode.
+/// A scan's per-split futures driven inline: polled on the calling task, a
+/// `buffered` window of the host's parallelism in flight (so one split's I/O
+/// overlaps another's decode, with no runtime handle), their results in split
+/// (row) order.
+pub(crate) fn inline_splits<F>(
+    tasks: Vec<F>,
+) -> impl futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>>,
+{
+    futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)
+}
+
+/// Drive a scan's per-split futures inline ([`inline_splits`]) and collect
+/// the chunks in split (row) order.
 async fn collect_chunks<F>(tasks: Vec<F>) -> Result<Vec<ArrayRef>>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
-    drain_chunks(futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)).await
+    drain_chunks(inline_splits(tasks)).await
 }
 
 /// The non-empty chunks of a stream of per-split results, in stream order.
@@ -54,16 +57,14 @@ where
 {
     let mut chunks = Vec::new();
     while let Some(chunk) = results.next().await {
-        if let Some(chunk) = chunk.map_err(VortexRdfError::Vortex)? {
+        if let Some(chunk) = chunk? {
             chunks.push(chunk);
         }
     }
     Ok(chunks)
 }
 
-/// [`collect_chunks`] assembled into one array of `dtype`: the tail of
-/// [`scan_all`], of `read_index_row_ids` and of `read_all_rows` for a scan
-/// within its inline limit.
+/// [`collect_chunks`] assembled into one array of `dtype`.
 pub(crate) async fn collect_scan<F>(
     dtype: vortex_array::dtype::DType,
     tasks: Vec<F>,
@@ -74,12 +75,44 @@ where
     chunked_or_single(collect_chunks(tasks).await?, dtype)
 }
 
-/// [`collect_scan`] with each split future spawned onto the session's runtime,
-/// `window` of them in flight. The chunks come back in split order, as the
-/// inline driver returns them.
+/// `scan` planned and run to completion inline ([`collect_scan`]) into one
+/// array.
+pub(crate) async fn collect_whole_scan(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
+    let dtype = scan.dtype()?;
+    collect_scan(dtype, scan.build()?).await
+}
+
+/// A scan's per-split futures each spawned onto the session's runtime as the
+/// stream is polled, `window` of them in flight, their results in split order
+/// as [`inline_splits`] yields them. Spawning needs a tokio runtime on the
+/// polling thread: [`ScanDriver::for_row_scan`] picks this driver only where
+/// there is one.
 ///
-/// With no tokio runtime on the calling thread there is nothing to spawn
-/// onto: the futures run inline and nothing is spawned.
+/// [`ScanDriver::for_row_scan`]: crate::store::scan::file_reads::ScanDriver::for_row_scan
+#[cfg(feature = "file-io")]
+pub(crate) fn spawned_splits<F>(
+    tasks: Vec<F>,
+    window: usize,
+) -> impl futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin + Send + 'static
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
+{
+    use vortex_io::session::RuntimeSessionExt as _;
+
+    let handle = crate::session::VORTEX_SESSION.handle();
+    futures::stream::iter(tasks)
+        .map(move |task| {
+            #[cfg(test)]
+            spawn_probe::note();
+            handle.spawn(task)
+        })
+        .buffered(window)
+}
+
+/// [`collect_scan`] with each split future spawned onto the session's runtime
+/// ([`spawned_splits`]), `window` of them in flight. The chunks come back in
+/// split order, as the inline driver returns them. Needs a tokio runtime on
+/// the polling thread, as [`spawned_splits`] does.
 #[cfg(feature = "file-io")]
 pub(crate) async fn collect_scan_spawned<F>(
     dtype: vortex_array::dtype::DType,
@@ -89,23 +122,12 @@ pub(crate) async fn collect_scan_spawned<F>(
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
 {
-    use vortex_io::session::RuntimeSessionExt as _;
-
-    if tokio::runtime::Handle::try_current().is_err() {
-        return collect_scan(dtype, tasks).await;
-    }
-    let handle = crate::session::VORTEX_SESSION.handle();
-    let spawned = futures::stream::iter(tasks).map(move |task| {
-        #[cfg(test)]
-        spawn_probe::note();
-        handle.spawn(task)
-    });
-    chunked_or_single(drain_chunks(spawned.buffered(window)).await?, dtype)
+    chunked_or_single(drain_chunks(spawned_splits(tasks, window)).await?, dtype)
 }
 
-/// Test hook: the number of split futures [`collect_scan_spawned`] has spawned
-/// on this thread. Zero means a scan ran inline.
-#[cfg(all(test, feature = "file-io"))]
+/// Test hook: the number of split futures [`spawned_splits`] has spawned on
+/// this thread. Zero means a scan ran inline.
+#[cfg(test)]
 pub(crate) mod spawn_probe {
     use std::cell::Cell;
 
@@ -124,25 +146,25 @@ pub(crate) mod spawn_probe {
     }
 }
 
-/// Materialize a whole file by driving its scan's per-split futures inline.
-///
-/// `ScanBuilder::into_array_stream` spawns onto the session's runtime handle;
-/// this drives `ScanBuilder::build`'s futures directly instead, so it needs no
-/// handle at all — which is what lets buffer-backed files (whose segment reads
-/// resolve synchronously) be read on wasm and in no-file-io builds.
-pub(crate) async fn scan_all(file: &vortex_file::VortexFile) -> Result<ArrayRef> {
-    let dtype = file.dtype().clone();
-    let scan = file.scan().map_err(VortexRdfError::Vortex)?;
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
-    collect_scan(dtype, tasks).await
+/// Materialize a whole layout reader (a file's root, or one of the store
+/// root's auxiliary children) by driving its scan's per-split futures inline.
+/// It needs no runtime handle, which is what lets a buffer-backed file (whose
+/// segment reads resolve synchronously) be read on wasm.
+pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
+    collect_whole_scan(reader_scan(reader)).await
 }
 
-/// [`scan_all`] over an arbitrary layout reader — how the native store root's
-/// auxiliary children (dictionary, index copies) are materialized from a
-/// buffer-backed file on every target, runtime handle included or not.
-pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
-    let dtype = reader.dtype().clone();
-    chunked_or_single(scan_reader_chunks(reader).await?, dtype)
+/// [`scan_all_reader`] completed on its first poll, for a reader that must sit
+/// over a buffer-backed segment source: its segment reads resolve
+/// synchronously, the invariant every handle-free `from_bytes` open relies on.
+pub(crate) fn scan_all_reader_sync(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
+    use futures::FutureExt as _;
+    scan_all_reader(reader).now_or_never().unwrap_or_else(|| {
+        unreachable!(
+            "a synchronous scan only ever reads a buffer-backed segment source, whose reads \
+             resolve without pending"
+        )
+    })
 }
 
 /// [`scan_all_reader`] before assembly: the reader's scan chunks in split
@@ -150,22 +172,17 @@ pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> R
 pub(crate) async fn scan_reader_chunks(
     reader: vortex_layout::LayoutReaderRef,
 ) -> Result<Vec<ArrayRef>> {
-    let scan = vortex_layout::scan::scan_builder::ScanBuilder::new(
-        crate::session::VORTEX_SESSION.clone(),
-        reader,
-    );
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
-    collect_chunks(tasks).await
+    collect_chunks(reader_scan(reader).build()?).await
 }
 
-/// The actionable error for a file whose root is not the native store layout:
-/// for the root of vortex-rdf 0.11 and earlier, what the file is and how to
-/// rebuild it ([`legacy_store_message`](super::container::legacy_store_message));
-/// for anything else, the layout it expected and the one it found.
+/// A scan of every row and column of `reader`, on the crate's session.
+fn reader_scan(reader: vortex_layout::LayoutReaderRef) -> ScanBuilder<ArrayRef> {
+    ScanBuilder::new(crate::session::VORTEX_SESSION.clone(), reader)
+}
+
+/// The error for a file whose root is not the native store layout: the layout
+/// it expected and the one it found.
 pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRdfError {
-    if super::container::is_legacy_file(file) {
-        return VortexRdfError::Deserialization(super::container::legacy_store_message());
-    }
     VortexRdfError::Deserialization(format!(
         "not a vortex-rdf store file: expected the {} root layout, found {}",
         super::container::STORE_LAYOUT_ID,
@@ -174,8 +191,8 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
 }
 
 /// The error for a file Vortex could not open: the one that says a newer
-/// vortex-rdf wrote it when `newer_root` names a store root this version does
-/// not know ([`newer_root_id`](super::container::newer_root_id)), Vortex's own
+/// vortex-rdf wrote it when `newer_root` names its root layout
+/// ([`newer_root_id`](super::container::newer_root_id)), Vortex's own
 /// otherwise.
 pub(crate) fn open_failure(
     error: vortex_error::VortexError,
@@ -231,14 +248,14 @@ pub(crate) enum FileAccess {
     /// cache, not a copy of the file on this process's heap.
     Mapped,
     /// Read through Vortex's file reader (`open_path`): every segment fetch
-    /// is a positioned read into a buffer the caller then owns — the path a
-    /// whole-store load takes, so the loaded store owns its memory.
+    /// is a positioned read into a buffer the caller then owns, so a
+    /// whole-store load owns its memory.
     Read,
 }
 
 /// A store file opened by [`open_vortex_file`], with how its bytes are
-/// reached. `mapped` and `identity` describe what the open did, not what was
-/// asked for.
+/// reached and where from. `mapped` and `identity` describe what the open
+/// did, not what was asked for.
 #[cfg(feature = "file-io")]
 pub(crate) struct OpenedFile {
     pub(crate) file: vortex_file::VortexFile,
@@ -246,9 +263,12 @@ pub(crate) struct OpenedFile {
     pub(crate) mapped: bool,
     /// The identity of the mapped file; none where the bytes are not a mapping.
     pub(crate) identity: Option<FileIdentity>,
+    /// The absolute path the file was opened from, so that a later change of
+    /// the working directory does not move it; none for a buffer.
+    pub(crate) path: Option<std::path::PathBuf>,
 }
 
-/// A file opened over a buffer: no mapping, no identity.
+/// A file opened over a buffer: no mapping, no identity, no path.
 #[cfg(feature = "file-io")]
 impl From<vortex_file::VortexFile> for OpenedFile {
     fn from(file: vortex_file::VortexFile) -> Self {
@@ -256,6 +276,7 @@ impl From<vortex_file::VortexFile> for OpenedFile {
             file,
             mapped: false,
             identity: None,
+            path: None,
         }
     }
 }
@@ -280,7 +301,7 @@ fn map_file(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
 }
 
 /// Test hook: the number of files [`map_file`] has mapped on this thread.
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) mod map_probe {
     use std::cell::Cell;
 
@@ -299,14 +320,16 @@ pub(crate) mod map_probe {
     }
 }
 
-/// Open a Vortex file lazily — no data is read until the returned
-/// `VortexFile` is scanned. The handle caches no reader: the
-/// [`NativeStoreFile`](crate::store::native_file::NativeStoreFile) around it
-/// owns the reader tree.
+/// Open a Vortex file lazily: its footer is read, its rows when the returned
+/// file is scanned. The handle caches no reader: the
+/// [`NativeStoreFile`](crate::store::persist::native_file::NativeStoreFile)
+/// around it owns the reader tree.
 ///
-/// Both modes reach the file through `File::open` first, so a path that
-/// cannot be opened is the same I/O error in either, with the path in its
-/// message.
+/// Both modes check the path, then reach the file through `File::open`, so a
+/// path that cannot be opened is the same I/O error in either, with the path
+/// in its message: a missing file is `NotFound`, a directory `IsADirectory`
+/// (checked first: Unix opens one read-only and fails only at the map or the
+/// read, Windows reports another kind).
 ///
 /// A mapped file must not be truncated or rewritten in place while open
 /// (its pages would fault); replacing it by rename is fine on Unix.
@@ -319,8 +342,16 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     use vortex_file::OpenOptionsSessionExt;
 
     let path = path.as_ref();
+    if path.is_dir() {
+        return Err(path_error(
+            "open",
+            path,
+            std::io::ErrorKind::IsADirectory.into(),
+        ));
+    }
     let options = crate::session::VORTEX_SESSION.open_options();
     let file = std::fs::File::open(path).map_err(|e| path_error("open", path, e))?;
+    let absolute = std::path::absolute(path).map_err(|e| path_error("resolve", path, e))?;
     match access {
         FileAccess::Mapped => {
             let identity = file.metadata().ok().as_ref().and_then(FileIdentity::of);
@@ -333,12 +364,16 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
                 file: opened,
                 mapped: true,
                 identity,
+                path: Some(absolute),
             })
         }
         FileAccess::Read => {
             drop(file);
             match options.open_path(path).await {
-                Ok(opened) => Ok(opened.into()),
+                Ok(opened) => Ok(OpenedFile {
+                    path: Some(absolute),
+                    ..opened.into()
+                }),
                 Err(error) => Err(open_failure(
                     error,
                     super::container::newer_root_id_at(path).await,
@@ -348,7 +383,7 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     }
 }
 
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use vortex_array::arrays::PrimitiveArray;

@@ -3,6 +3,7 @@ residencies, spelling-tolerant encoding, byte-order ranges and term
 predicates."""
 
 import re
+import time
 import warnings
 from array import array
 
@@ -10,8 +11,9 @@ import pytest
 
 from vortex_rdf import U64Column, VortexRdfStore, serialize_rdf
 
+from conftest import INDEXES, NAME, PATTERNS, u64_rows, u64s
+
 XSD = "http://www.w3.org/2001/XMLSchema#"
-RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 
 
 @pytest.fixture(params=["resident", "file-backed"])
@@ -27,22 +29,8 @@ def dictionary(request, vortex_files):
     return store, term_dict
 
 
-def _codes(col):
-    return memoryview(col).cast("Q").tolist()
-
-
 def _terms(term_dict):
     return term_dict.decode_many(list(range(len(term_dict))))
-
-
-def test_terms_sort_by_kind(dictionary):
-    _, term_dict = dictionary
-    terms = _terms(term_dict)
-    # "" (the default graph), then literals, IRIs, blank nodes, in byte order.
-    assert terms == sorted(terms, key=lambda t: t.encode())
-    assert terms[0] == ""
-    assert [t[0] for t in terms[1:]] == sorted(t[0] for t in terms[1:])
-    assert {t[0] for t in terms[1:]} == {'"', "<", "_"}
 
 
 def test_encode_is_spelling_tolerant(dictionary):
@@ -173,79 +161,36 @@ def test_decode_many_of_a_batch_longer_than_the_text_reservation(wide_dictionary
 
 
 def test_prefix_range_and_lower_bound(dictionary):
-    _, term_dict = dictionary
-    terms = _terms(term_dict)
-    n = len(terms)
-
-    def brute_lower(probe):
-        return sum(1 for t in terms if t.encode() < probe.encode())
-
-    def brute_prefix(probe):
-        lo = brute_lower(probe)
-        hi = lo + sum(1 for t in terms if t.startswith(probe))
-        return lo, hi
-
-    probes = ["", '"', "<", "_:", "<http://ex.org/", "<http://xmlns.com/", '"Bob', "~"] + terms
-    for probe in probes:
-        assert term_dict.lower_bound(probe) == brute_lower(probe), probe
-        assert term_dict.prefix_range(probe) == brute_prefix(probe), probe
-    assert term_dict.prefix_range("") == (0, n)
-    for term in terms:
-        lo, hi = term_dict.prefix_range(term)
-        assert lo <= term_dict.encode(term) < hi
-    # The kind ranges tile the codes after the default graph.
-    lit = term_dict.prefix_range('"')
-    iri = term_dict.prefix_range("<")
-    blank = term_dict.prefix_range("_:")
-    assert lit[0] == 1 and lit[1] == iri[0] and iri[1] == blank[0] and blank[1] == n
-
-
-def test_filter_codes_over_candidates(dictionary):
-    """`filter_codes(kind, arg, codes)` answers `(passed, undecided)`, both
-    subsets of the candidates; a candidate in neither fails."""
-    _, term_dict = dictionary
-    terms = _terms(term_dict)
-    every = U64Column(range(len(terms)))
-    code = {t: c for c, t in enumerate(terms)}
-    literal = [c for c, t in enumerate(terms) if t.startswith('"')]
-    iri = [c for c, t in enumerate(terms) if t.startswith("<")]
-    blank = [c for c, t in enumerate(terms) if t.startswith("_:")]
-
-    def run(kind, arg="", codes=every):
-        passed, undecided = term_dict.filter_codes(kind, arg, codes)
-        return _codes(passed), _codes(undecided)
-
-    # Kind tests: decided by the kind ranges; only "" (code 0) is no kind.
-    assert run("is_literal") == (literal, [0])
-    assert run("is_iri") == (iri, [0])
-    assert run("is_blank") == (blank, [0])
-    plain = [c for c in literal if terms[c].endswith('"')]
-    assert run("datatype", f"{XSD}string") == (plain, [0])
-    assert run("datatype", f"<{RDF}langString>")[0] == [code['"Bob"@en']]
-    assert run("datatype", f"{XSD}integer")[0] == [code[f'"42"^^<{XSD}integer>']]
-    assert run("lang", "en")[0] == [code['"Bob"@en']]
-    assert run("lang_matches", "EN")[0] == [code['"Bob"@en']]
-    # 42 by value; string literals order as xsd:string, above xsd:integer.
-    assert run("num_lt", "100") == ([code[f'"42"^^<{XSD}integer>']], [0])
-    assert run("num_gt", "100")[0] == sorted(code[t] for t in ('"Alice"', '"Anon"', '"Bob"@en'))
-    # `!=` holds for every IRI and blank node; a string literal is the engine's call.
-    passed, undecided = run("num_ne", "42")
-    assert passed == iri + blank
-    assert undecided == [0] + sorted(code[t] for t in ('"Alice"', '"Anon"', '"Bob"@en'))
-    # Any candidate subset, any int sequence or buffer.
-    sub = [code['"Alice"'], code['"Bob"@en'], iri[0]]
-    assert run("lang", "en", sub) == ([code['"Bob"@en']], [])
-    assert run("lang", "en", array("Q", sub)) == ([code['"Bob"@en']], [])
-    for kind, arg in [("no_such_kind", ""), ("datatype", ""), ("num_lt", "abc"), ("lang_matches", "")]:
-        with pytest.raises(ValueError):
-            term_dict.filter_codes(kind, arg, every)
-
-
-def test_filter_codes_validates_candidates(dictionary):
-    """Candidates must be sorted, unique and inside the dictionary, however
-    they are passed; none at all is two empty columns."""
+    """One call of each probe per residency: a present term, a probe past
+    every term and the empty prefix. The byte-order sweep against brute
+    force runs in core, on the same handle (`core/src/tests/dictionary_handle.rs`)."""
     _, term_dict = dictionary
     n = len(term_dict)
+    alice = term_dict.encode("<http://ex.org/alice>")
+    assert term_dict.lower_bound("<http://ex.org/alice>") == alice
+    assert term_dict.lower_bound("~") == n
+    assert term_dict.prefix_range("<http://ex.org/alice>") == (alice, alice + 1)
+    assert term_dict.prefix_range("") == (0, n)
+
+
+def test_filter_codes_validates_its_arguments(dictionary):
+    """An unknown kind, a malformed argument or an option the kind does not
+    take raises `ValueError`. Candidates must be sorted, unique and inside the
+    dictionary, however they are passed; none at all is two empty columns."""
+    _, term_dict = dictionary
+    n = len(term_dict)
+    every = U64Column(range(n))
+    for kind, arg, options in [
+        ("no_such_kind", "", {}),
+        ("datatype", "", {}),
+        ("num_lt", "abc", {}),
+        ("lang_matches", "", {}),
+        ("contains", "not a spelling", {}),
+        ("contains", '"a"', {"case": "title"}),
+        ("num_lt", "5", {"as_str": True}),
+    ]:
+        with pytest.raises(ValueError):
+            term_dict.filter_codes(kind, arg, every, **options)
 
     def forms(codes):
         """The same candidates as every input the call accepts."""
@@ -270,26 +215,33 @@ def test_filter_codes_validates_candidates(dictionary):
     for candidates in ([-1], [1 << 64], [0.5], b"\x01\x02\x03", "abc", None, 5):
         with pytest.raises(ValueError):
             term_dict.filter_codes("is_iri", "", candidates)
-    # A valid list answers alike in every form.
+    # A valid list answers alike in every form, as a pair of columns.
     iri = [c for c, t in enumerate(_terms(term_dict)) if t.startswith("<")]
     for candidates in forms(iri[:3] + [n - 1]):
         passed, undecided = term_dict.filter_codes("is_iri", "", candidates)
-        assert (_codes(passed), _codes(undecided)) == (iri[:3], [])
+        assert isinstance(passed, U64Column) and isinstance(undecided, U64Column)
+        assert (u64s(passed), u64s(undecided)) == (iri[:3], [])
 
 
-def test_file_backed_codes_decode_to_quads(vortex_files):
-    """A file-backed handle decodes what `match_codes` gathers to the quads
-    the string matchers return."""
-    store = VortexRdfStore(vortex_files["dictionary"])
-    term_dict = store.term_dict()
-    assert term_dict.file_backed
-    assert "file_backed=True" in repr(term_dict)
-    for pattern in ({}, {"p": "<http://xmlns.com/foaf/0.1/name>"}, {"o": '"Bob"@en'}):
+@pytest.mark.parametrize("api", ["decode", "decode_many"])
+def test_match_codes_decode_to_get_quads(dictionary, api):
+    """Decoding the code columns position by position reproduces `get_quads`,
+    under either residency and through either decode call.
+
+    `get_quads` assembles its rows from those same columns, so this pins the
+    decode-and-zip assembly: columns swapped or misaligned would still yield
+    plausible-looking rows of real terms.
+    """
+    store, term_dict = dictionary
+    assert repr(term_dict) == f"TermDict(len={len(term_dict)}, file_backed={term_dict.file_backed})"
+    for pattern in PATTERNS:
         cols = store.match_codes(**pattern)
         assert cols is not None
-        decoded = [term_dict.decode_many(col) for col in cols]
-        rows = sorted(zip(*decoded))
-        assert rows == sorted(store.get_quads(**pattern))
+        if api == "decode":
+            decoded = [[term_dict.decode(code) for code in u64s(col)] for col in cols]
+        else:
+            decoded = [term_dict.decode_many(col) for col in cols]
+        assert sorted(zip(*decoded)) == sorted(store.get_quads(**pattern)), pattern
 
 
 # ─── keeps, windows, batches ──────────────────────────────────────────────
@@ -303,19 +255,11 @@ def code_store(request, vortex_files):
     return store
 
 
-def _rows(cols):
-    return list(zip(*(memoryview(c).cast("Q").tolist() for c in cols)))
-
-
-def _sorted_rows(cols):
-    return sorted(_rows(cols))
-
-
 def test_keep_narrows_like_filtering(code_store):
     store = code_store
     term_dict = store.term_dict()
-    all_rows = _rows(store.match_codes())
-    name = term_dict.encode("<http://xmlns.com/foaf/0.1/name>")
+    all_rows = u64_rows(store.match_codes())
+    name = term_dict.encode(NAME)
     knows = term_dict.encode("<http://xmlns.com/foaf/0.1/knows>")
     alice = term_dict.encode("<http://ex.org/alice>")
     lit_lo, lit_hi = term_dict.prefix_range('"')
@@ -326,6 +270,7 @@ def test_keep_narrows_like_filtering(code_store):
 
     cases = [
         ({"p": [name, knows]}, 1, lambda c: c in (name, knows)),
+        ({"p": [knows, knows, name]}, 1, lambda c: c in (name, knows)),
         ({"p": range(name, name + 1)}, 1, lambda c: c == name),
         ({1: (knows, name + 1)}, 1, lambda c: knows <= c <= name),
         ({"o": range(lit_lo, lit_hi)}, 2, lambda c: lit_lo <= c < lit_hi),
@@ -338,16 +283,16 @@ def test_keep_narrows_like_filtering(code_store):
     ]
     for keep, position, admit in cases:
         want = expect(position, admit)
-        assert _sorted_rows(store.match_codes(keep=keep)) == want, keep
+        assert sorted(u64_rows(store.match_codes(keep=keep))) == want, keep
         assert store.count_quads(keep=keep) == len(want), keep
         assert store.count_quads(keep=keep, limit=1) == min(1, len(want)), keep
     # Keeps compose with a pattern and with each other.
     want = sorted(r for r in all_rows if r[1] == name and lit_lo <= r[2] < lit_hi)
-    got = store.match_codes(p="<http://xmlns.com/foaf/0.1/name>", keep={"o": range(lit_lo, lit_hi)})
-    assert _sorted_rows(got) == want
+    got = store.match_codes(p=NAME, keep={"o": range(lit_lo, lit_hi)})
+    assert sorted(u64_rows(got)) == want
     got = store.match_codes(keep={"o": (lit_lo, lit_hi), "p": [name]})
-    assert _sorted_rows(got) == want
-    assert store.count_quads(p="<http://xmlns.com/foaf/0.1/name>", keep={"o": [lit_lo]}) == len(
+    assert sorted(u64_rows(got)) == want
+    assert store.count_quads(p=NAME, keep={"o": [lit_lo]}) == len(
         [r for r in all_rows if r[1] == name and r[2] == lit_lo]
     )
 
@@ -390,31 +335,30 @@ def test_keep_needs_codes(vortex_files):
 
 def test_window_slices_base_order(code_store):
     store = code_store
-    rows = _rows(store.match_codes())
+    rows = u64_rows(store.match_codes())
     n = len(rows)
     for offset, limit in [(0, 2), (1, 3), (3, 10), (n, 1), (0, 0), (2, None)]:
         got = store.match_codes(limit=limit, offset=offset)
         want = rows[offset:] if limit is None else rows[offset : offset + limit]
-        assert _rows(got) == want, (offset, limit)
-    name = "<http://xmlns.com/foaf/0.1/name>"
-    named = _rows(store.match_codes(p=name))
-    assert _rows(store.match_codes(p=name, limit=2, offset=1)) == named[1:3]
-    assert store.count_quads(p=name, limit=2) == 2
-    assert store.count_quads(p=name, limit=10) == len(named)
+        assert u64_rows(got) == want, (offset, limit)
+        assert store.count_quads(limit=limit, offset=offset) == len(want), (offset, limit)
+    named = u64_rows(store.match_codes(p=NAME))
+    assert u64_rows(store.match_codes(p=NAME, limit=2, offset=1)) == named[1:3]
+    assert store.count_quads(p=NAME, limit=2) == 2
+    assert store.count_quads(p=NAME, limit=10) == len(named)
     assert store.count_quads(s="<http://ex.org/nobody>", limit=1) == 0
 
 
 def test_many_matches_singles(code_store, vortex_files):
     store = code_store
-    name = "<http://xmlns.com/foaf/0.1/name>"
     term_dict = store.term_dict()
     lit_lo, lit_hi = term_dict.prefix_range('"')
     probes = [
         (None, None, None, None),
-        (None, name, None, None),
+        (None, NAME, None, None),
         ["<http://ex.org/bob>", None, None, None],
         {"s": "<http://ex.org/nobody>"},
-        {"p": name, "keep": {"o": range(lit_lo, lit_hi)}, "limit": 2, "offset": 1},
+        {"p": NAME, "keep": {"o": range(lit_lo, lit_hi)}, "limit": 2, "offset": 1},
         {"keep": {"g": [0]}, "limit": 3},
         {},
     ]
@@ -424,17 +368,13 @@ def test_many_matches_singles(code_store, vortex_files):
     for probe, cols, count in zip(probes, many, counts):
         if isinstance(probe, dict):
             single = store.match_codes(**probe)
-            # The offset is consumed before the limit caps the count.
-            plain = {k: v for k, v in probe.items() if k not in ("offset", "limit")}
-            single_count = max(0, store.count_quads(**plain) - probe.get("offset", 0))
-            if "limit" in probe:
-                single_count = min(single_count, probe["limit"])
+            single_count = store.count_quads(**probe)
         else:
             single = store.match_codes(*probe)
             single_count = store.count_quads(*probe)
-        assert _rows(cols) == _rows(single), probe
-        assert count == single_count == len(_rows(cols)), probe
-    assert store.match_codes_many([]) == []
+        assert u64_rows(cols) == u64_rows(single), probe
+        assert count == single_count == len(u64_rows(cols)), probe
+    assert list(store.match_codes_many([])) == []
     assert store.count_quads_many([]) == []
     # Parse-all-first: a malformed probe raises before any evaluation.
     for bad in [[(None, None, None)], [{"bogus": 1}], ["<x>"], [(None, "not a term", None, None)]]:
@@ -442,36 +382,39 @@ def test_many_matches_singles(code_store, vortex_files):
             store.match_codes_many(bad)
         with pytest.raises(ValueError):
             store.count_quads_many(bad)
+    # A malformed term names its slot in a tuple probe as in a dict probe.
+    for bad in ([(None, "not a term", None, None)], [{"p": "not a term"}]):
+        with pytest.raises(ValueError, match=r"^Invalid input: pattern predicate: "):
+            store.match_codes_many(bad)
+        with pytest.raises(ValueError, match=r"^Invalid input: pattern predicate: "):
+            store.count_quads_many(bad)
     strings = VortexRdfStore(vortex_files["default"])
-    assert strings.match_codes_many(probes[:2]) == [None, None]
+    assert list(strings.match_codes_many(probes[:2])) == [None, None]
     assert strings.count_quads_many(probes[:2]) == [5, 3]
-
-
-def _values(col):
-    return memoryview(col).cast("Q").tolist()
 
 
 def test_column_kernels():
     from vortex_rdf import U64Column
 
     col = U64Column([3, 1, 3, 2, 1, 3])
-    assert len(col) == 6 and _values(col) == [3, 1, 3, 2, 1, 3]
-    assert _values(U64Column(col)) == _values(col)
-    assert _values(U64Column(memoryview(col))) == _values(col)
-    assert _values(U64Column(array("Q", [7, 8]))) == [7, 8]
-    assert _values(col.distinct()) == [3, 1, 2]
+    assert len(col) == 6 and u64s(col) == [3, 1, 3, 2, 1, 3]
+    assert u64s(U64Column(col)) == u64s(col)
+    assert u64s(U64Column(memoryview(col))) == u64s(col)
+    assert u64s(U64Column(array("Q", [7, 8]))) == [7, 8]
+    assert u64s(col.distinct()) == [3, 1, 2]
     values, counts = col.value_counts()
-    assert _values(values) == [3, 1, 2]
-    assert _values(counts) == [3, 2, 1]
-    assert _values(col.take([5, 0, 1])) == [3, 3, 1]
-    assert _values(col.take(col.distinct())) == [2, 1, 3]
-    assert _values(col.take([])) == []
+    assert u64s(values) == [3, 1, 2]
+    assert u64s(counts) == [3, 2, 1]
+    for indices in ([5, 0, 1], U64Column([5, 0, 1]), array("Q", [5, 0, 1])):
+        assert u64s(col.take(indices)) == [3, 3, 1]
+    assert u64s(col.take(col.distinct())) == [2, 1, 3]
+    assert u64s(col.take([])) == []
     with pytest.raises(IndexError):
         col.take([6])
     right = [1, 9, 3, 3]
     for other in (U64Column(right), right, array("Q", right)):
         left_idx, right_idx = col.join_indices(other)
-        pairs = list(zip(_values(left_idx), _values(right_idx)))
+        pairs = list(zip(u64s(left_idx), u64s(right_idx)))
         want = [(i, j) for i, l in enumerate([3, 1, 3, 2, 1, 3]) for j, r in enumerate(right) if l == r]
         assert pairs == want
     empty = U64Column([])
@@ -480,6 +423,113 @@ def test_column_kernels():
     assert len(col.join_indices(empty)[1]) == 0
     with pytest.raises((ValueError, OverflowError, TypeError)):
         U64Column([-1])
+
+
+def test_slice_is_a_window_of_the_column():
+    col = U64Column([3, 1, 3, 2, 1, 3])
+    assert u64s(col.slice(2, 5)) == u64s(col)[2:5] == [3, 2, 1]
+    assert u64s(col.slice(0, 6)) == u64s(col)
+    assert len(col.slice(3, 3)) == len(col.slice(6, 6)) == 0
+    with pytest.raises(IndexError):
+        col.slice(2, 7)
+    with pytest.raises(IndexError):
+        col.slice(4, 3)
+
+
+def test_slice_shares_the_column_instead_of_copying_it():
+    """1,000 slices of nearly all of a 10-million-row column: as copies they
+    would move 80 GB."""
+    rows = 10_000_000
+    col = U64Column(bytes(8 * rows))
+    started = time.process_time()
+    for start in range(1_000):
+        window = col.slice(start, rows - start)
+    spent = time.process_time() - started
+    assert len(window) == rows - 2 * 999
+    assert spent < 1.0, f"1,000 slices took {spent:.2f} s of CPU: a slice copies"
+
+
+def test_join_count_counts_the_pairs_join_indices_makes():
+    col = U64Column([3, 1, 3, 2, 1, 3])
+    right = [1, 9, 3, 3]
+    empty = U64Column([])
+    cases = [(col, U64Column(right)), (col, right), (col, array("Q", right)), (empty, right), (col, empty)]
+    for left, other in cases:
+        assert left.join_count(other) == len(left.join_indices(other)[0])
+    assert col.join_count(right) == 8
+
+
+def test_join_indices_refuses_more_pairs_than_max_pairs():
+    from vortex_rdf import JoinTooLarge, VortexRdfError
+
+    col = U64Column([3, 1, 3, 2, 1, 3])
+    right = [1, 9, 3, 3]
+    pairs = col.join_count(right)
+    with pytest.raises(JoinTooLarge) as refused:
+        col.join_indices(right, max_pairs=pairs - 1)
+    message, count = refused.value.args
+    assert count == pairs and str(pairs) in message
+    assert f"max_pairs of {pairs - 1}" in message, "the message names the cap"
+    assert isinstance(refused.value, VortexRdfError)
+    capped = col.join_indices(right, max_pairs=pairs)
+    assert [u64s(c) for c in capped] == [u64s(c) for c in col.join_indices(right)]
+
+
+def test_join_too_large_names_its_pair_count():
+    from vortex_rdf import JoinTooLarge
+
+    col = U64Column([3, 1, 3, 2, 1, 3])
+    right = [1, 9, 3, 3]
+    pairs = col.join_count(right)
+    with pytest.raises(JoinTooLarge) as refused:
+        col.join_indices(right, max_pairs=pairs - 1)
+    assert refused.value.pairs == refused.value.args[1] == pairs
+
+
+def test_groups_gather_is_the_join_indices_taken():
+    from vortex_rdf import JoinTooLarge
+
+    left = U64Column([3, 1, 3, 2, 1, 3])
+    right = U64Column([1, 9, 3, 3])
+    left_values = U64Column([10, 11, 12, 13, 14, 15])
+    right_values = U64Column([20, 21, 22, 23])
+    groups = right.groups()
+    left_idx, right_idx = left.join_indices(right)
+    gathered = groups.gather(left, [left, left_values], [right_values, right])
+    want = [left.take(left_idx), left_values.take(left_idx)]
+    want += [right_values.take(right_idx), right.take(right_idx)]
+    assert [u64s(c) for c in gathered] == [u64s(c) for c in want]
+    assert groups.gather(left, [], []) == ()
+    pairs = len(left_idx)
+    with pytest.raises(JoinTooLarge) as refused:
+        groups.gather(left, [left], [right], max_pairs=pairs - 1)
+    assert refused.value.args[1] == pairs
+    with pytest.raises(ValueError, match="left column 0"):
+        groups.gather(left, [left_values.slice(0, 5)], [])
+    with pytest.raises(ValueError, match="right column 1"):
+        groups.gather(left, [], [right, right_values.slice(0, 3)])
+
+
+def test_groups_join_slice_by_slice_like_join_indices():
+    from vortex_rdf import JoinTooLarge
+
+    left = U64Column([3, 1, 3, 2, 1, 3])
+    right = U64Column([1, 9, 3, 3])
+    groups = right.groups()
+    assert len(groups) == len(right)
+    assert groups.count(left) == left.join_count(right) == 8
+    want = [u64s(c) for c in left.join_indices(right)]
+    # Two-row slices make at most three pairs each.
+    for max_pairs in (None, 3):
+        got_left, got_right = [], []
+        for start in range(0, len(left), 2):
+            left_idx, right_idx = groups.join(left.slice(start, start + 2), max_pairs=max_pairs)
+            got_left += [start + i for i in u64s(left_idx)]
+            got_right += u64s(right_idx)
+        assert [got_left, got_right] == want, max_pairs
+    with pytest.raises(JoinTooLarge) as refused:
+        groups.join(left, max_pairs=7)
+    assert refused.value.args[1] == 8
 
 
 def test_kernels_round_trip_store_columns(code_store):
@@ -495,52 +545,16 @@ def test_kernels_round_trip_store_columns(code_store):
     # Join objects with subjects: every (object row, subject row) pair naming
     # the same term — alice knows bob, and bob is the subject of two rows.
     left_idx, right_idx = o.join_indices(s)
+    assert o.join_count(s) == len(left_idx)
     joined = sorted(
         (term_dict.decode(c), term_dict.decode(d))
-        for c, d in zip(_values(o.take(left_idx)), _values(s.take(right_idx)))
+        for c, d in zip(u64s(o.take(left_idx)), u64s(s.take(right_idx)))
     )
     objects, subjects = term_dict.decode_many(o), term_dict.decode_many(s)
     want = sorted((t, u) for t in objects for u in subjects if t == u)
     assert joined == want
     assert want == [("<http://ex.org/bob>", "<http://ex.org/bob>")] * 2
     assert isinstance(left_idx, U64Column)
-
-
-def test_filter_codes_string_kinds(dictionary):
-    _, term_dict = dictionary
-    terms = _terms(term_dict)
-    every = U64Column(range(len(terms)))
-    code = {t: c for c, t in enumerate(terms)}
-
-    def run(kind, arg, **options):
-        passed, undecided = term_dict.filter_codes(kind, arg, every, **options)
-        return _codes(passed), _codes(undecided)
-
-    alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
-    assert run("str_prefix", "A") == ([alice, anon], [0])
-    assert run("contains", '"o"') == ([anon, bob], [0])
-    assert run("contains", '"o"@en') == ([bob], [0])
-    assert run("contains", '"o"@EN') == ([], [0])
-    assert run("strstarts", f'"A"^^<{XSD}string>') == ([alice, anon], [0])
-    assert run("strends", '"e"') == ([alice], [0])
-    assert run("contains", '"O"', case="upper") == ([anon, bob], [0])
-    assert run("contains", '"al"', case="lower") == ([alice], [0])
-    age, alice_iri = code["<http://ex.org/age>"], code["<http://ex.org/alice>"]
-    forty_two = code[f'"42"^^<{XSD}integer>']
-    blank = code["_:b0"]
-    assert run("str_prefix", "http://ex.org/a", as_str=True) == ([age, alice_iri], [0, forty_two, blank])
-    assert run("str_prefix", "http") == ([], [0])
-    assert run("contains", f'"4"^^<{XSD}integer>') == ([], [0])
-    assert run("contains", "<http://ex.org/a>") == ([], [0])
-    for kind, arg, options in [
-        ("contains", '"a"', {"case": "title"}),
-        ("num_lt", "5", {"as_str": True}),
-        ("lang", "en", {"case": "lower"}),
-        ("contains", '"a"', {"flags": "i"}),
-        ("contains", "not a spelling", {}),
-    ]:
-        with pytest.raises(ValueError):
-            term_dict.filter_codes(kind, arg, every, **options)
 
 
 def test_filter_codes_regex(dictionary):
@@ -551,7 +565,7 @@ def test_filter_codes_regex(dictionary):
 
     def run(arg, **options):
         passed, undecided = term_dict.filter_codes("regex", arg, every, **options)
-        return _codes(passed), _codes(undecided)
+        return u64s(passed), u64s(undecided)
 
     alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
     assert run("^A") == ([alice, anon], [0])
@@ -575,7 +589,7 @@ def test_filter_codes_regex_options(dictionary):
 
     def run(arg, **options):
         passed, undecided = term_dict.filter_codes("regex", arg, every, **options)
-        return _codes(passed), _codes(undecided)
+        return u64s(passed), u64s(undecided)
 
     alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
     forty_two, blank = code[f'"42"^^<{XSD}integer>'], code["_:b0"]
@@ -642,28 +656,6 @@ def test_filter_codes_rejects_malformed_constants(dictionary):
     # A prefix and a pattern are raw text, not spellings.
     term_dict.filter_codes("str_prefix", '"a"^^xsd:string', every)
     term_dict.filter_codes("regex", '"a"^^xsd:string', every)
-
-
-def test_filter_codes_regex_compiled_size_is_bounded(dictionary):
-    """A pattern whose compiled program is large (counted repetitions
-    multiply) is undecided, like any pattern outside the subset, instead of
-    costing seconds per candidate; the shapes the subset is for stay decided."""
-    _, term_dict = dictionary
-    terms = _terms(term_dict)
-    every = U64Column(range(len(terms)))
-    code = {t: c for c, t in enumerate(terms)}
-    alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
-
-    def run(arg):
-        passed, undecided = term_dict.filter_codes("regex", arg, every)
-        return _codes(passed), _codes(undecided)
-
-    for pattern in ["(?:a{1000}){5}b", "(?:a{100}){100}b", r"(?:\w{1000}){5}b", "(?:a{1000}){1000}"]:
-        assert run(pattern) == ([], [0, alice, anon, bob]), pattern
-    for pattern in ["(?:a{50}){50}b", "[0-9A-Za-z_]{1000}x", r"\w{1000}x", "a" * 2000]:
-        assert run(pattern) == ([], [0]), pattern
-    assert run(r"^\w{3,10}$") == ([alice, anon, bob], [0])
-    assert run(r"^\W+$") == ([], [0])
 
 
 # Texts for the REGEX tests against Python's own `re`: the edges of the subset
@@ -775,7 +767,7 @@ def test_filter_codes_regex_agrees_with_python_re(regex_dictionary):
                 except (re.error, FutureWarning):
                     compiled = None
             passed, undecided = term_dict.filter_codes("regex", pattern, every, flags=flags)
-            passed, undecided = set(_codes(passed)), set(_codes(undecided))
+            passed, undecided = set(u64s(passed)), set(u64s(undecided))
             assert not passed & undecided
             for text, code in code_of.items():
                 if code in undecided:
@@ -788,7 +780,7 @@ def test_filter_codes_regex_agrees_with_python_re(regex_dictionary):
     # The rules that leave texts undecided do so, whatever the Python version.
     def undecided_of(pattern, flags=""):
         _, undecided = term_dict.filter_codes("regex", pattern, every, flags=flags)
-        return {t for t, c in code_of.items() if c in set(_codes(undecided))}
+        return {t for t, c in code_of.items() if c in set(u64s(undecided))}
 
     assert {t for t in REGEX_TEXTS if t.endswith("\n")} <= undecided_of("a$")
     assert "" in undecided_of(r"\B") and "ab" not in undecided_of(r"\B")
@@ -806,32 +798,30 @@ def test_located_reference_runs_agree_with_the_row_path(indexed_files, in_memory
     the file for, is not visible from Python; it is asserted where the read
     counter lives, in core/src/tests/indexes_file.rs."""
     store = VortexRdfStore(indexed_files[("dictionary", "secondary-by-reference")], in_memory=in_memory)
-    name = "<http://xmlns.com/foaf/0.1/name>"
-    rows = _rows(store.match_codes(p=name))
-    assert store.count_quads(p=name) == len(rows) == 3
-    assert store.count_quads(p=name, limit=2) == 2
-    assert store.count_quads_many([{"p": name, "limit": 1}, (None, name, None, None)]) == [1, 3]
+    rows = u64_rows(store.match_codes(p=NAME))
+    assert store.count_quads(p=NAME) == len(rows) == 3
+    assert store.count_quads(p=NAME, limit=2) == 2
+    assert store.count_quads_many([{"p": NAME, "limit": 1}, (None, NAME, None, None)]) == [1, 3]
     # Every window of the run, counted and read, against the same slice of its rows.
     for offset in range(5):
         for limit in (None, 0, 1, 2, 5):
             window = rows[offset:] if limit is None else rows[offset : offset + limit]
-            assert _rows(store.match_codes(p=name, offset=offset, limit=limit)) == window, (offset, limit)
-            probe = {"p": name, "offset": offset, "limit": limit}
+            assert u64_rows(store.match_codes(p=NAME, offset=offset, limit=limit)) == window, (offset, limit)
+            probe = {"p": NAME, "offset": offset, "limit": limit}
             assert store.count_quads_many([probe]) == [len(window)], (offset, limit)
     # An object-only run: the fixture's one IRI object.
     bob = "<http://ex.org/bob>"
-    assert store.count_quads(o=bob) == len(_rows(store.match_codes(o=bob))) == 1
+    assert store.count_quads(o=bob) == len(u64_rows(store.match_codes(o=bob))) == 1
     assert store.count_quads_many([{"o": bob, "offset": 1}]) == [0]
 
 
-@pytest.mark.parametrize("index", [None, "secondary-by-copy", "secondary-by-reference"])
+@pytest.mark.parametrize("index", [None, *INDEXES])
 @pytest.mark.parametrize("in_memory", [False, True])
 def test_an_empty_code_set_keep_matches_nothing(vortex_files, indexed_files, index, in_memory):
     # pinned contract: a keep with an empty code set is valid and matches nothing
     path = vortex_files["dictionary"] if index is None else indexed_files[("dictionary", index)]
     store = VortexRdfStore(path, in_memory=in_memory)
-    name = "<http://xmlns.com/foaf/0.1/name>"
     empty = {"o": U64Column([])}
-    assert store.count_quads(p=name, keep=empty) == 0
-    assert _rows(store.match_codes(p=name, keep=empty)) == []
-    assert store.count_quads_many([{"p": name, "keep": empty}]) == [0]
+    assert store.count_quads(p=NAME, keep=empty) == 0
+    assert u64_rows(store.match_codes(p=NAME, keep=empty)) == []
+    assert store.count_quads_many([{"p": NAME, "keep": empty}]) == [0]
