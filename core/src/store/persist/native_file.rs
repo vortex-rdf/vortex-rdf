@@ -68,6 +68,9 @@ pub(crate) struct NativeStoreFile {
     /// The index components' chunk-probe handles, by component name and
     /// column, held and bounded as the quad table's are.
     component_chunks: ChunkMemo<String>,
+    /// The located-run tables' four code-column handles, resolved once (see
+    /// `located_tables`).
+    located: OnceLock<LocatedTables>,
     /// One bound tree per (scope, filter shape): see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
     /// Whether the file is read through a memory mapping, as the open found
@@ -127,6 +130,10 @@ impl ReaderTree {
 }
 
 type ColumnHandle = Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>;
+
+/// Per located-run table (the quad table, `index:posg`, `index:ospg`), its
+/// `(s, p, o, g)` chunk-probe handles, `None` when one declines.
+pub(crate) type LocatedTables = [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3];
 
 /// Chunk-probe handles by table and column, each built on first use; `None`
 /// memoizes a decline. `T` names the table: `()` for the quad table, the
@@ -354,6 +361,7 @@ impl NativeStoreFile {
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
             quad_chunks: ChunkMemo::default(),
             component_chunks: ChunkMemo::default(),
+            located: OnceLock::new(),
             bound_exprs: Arc::new(BoundExprMemo::new()),
             mapped,
             identity,
@@ -466,6 +474,11 @@ impl NativeStoreFile {
             vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
                 .map(Arc::new)
         })
+    }
+
+    /// The located-run tables' handles, built by `build` on first use.
+    pub(crate) fn located_tables(&self, build: impl FnOnce() -> LocatedTables) -> &LocatedTables {
+        self.located.get_or_init(build)
     }
 
     /// The quad table's natural splits, memoized. Shadows the inner file's

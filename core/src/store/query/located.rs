@@ -125,24 +125,28 @@ impl VortexRdfStore {
             (Some("index:posg"), [1, 2, 0, 3]),
             (Some("index:ospg"), [2, 0, 1, 3]),
         ];
-        for (component, order) in TABLES {
+        let tables = file.located_tables(|| {
+            TABLES.map(|(component, _)| {
+                let handle = |column: &str| match component {
+                    None => file.column_chunks(column),
+                    Some(name) => file.component_column_chunks(name, column),
+                };
+                Some([
+                    handle(PRIMARY_COLUMNS[0])?,
+                    handle(PRIMARY_COLUMNS[1])?,
+                    handle(PRIMARY_COLUMNS[2])?,
+                    handle(PRIMARY_COLUMNS[3])?,
+                ])
+            })
+        });
+        for ((component, order), columns) in TABLES.iter().zip(tables) {
             let prefix = order.iter().take_while(|&&c| codes[c].is_some()).count();
             if prefix != bound || (component.is_none() && !file.quads_sorted()) {
                 continue;
             }
-            let handle = |column: &str| match component {
-                None => file.column_chunks(column),
-                Some(name) => file.component_column_chunks(name, column),
-            };
-            let (Some(s), Some(p), Some(o), Some(g)) = (
-                handle(PRIMARY_COLUMNS[0]),
-                handle(PRIMARY_COLUMNS[1]),
-                handle(PRIMARY_COLUMNS[2]),
-                handle(PRIMARY_COLUMNS[3]),
-            ) else {
+            let Some(columns) = columns else {
                 continue;
             };
-            let columns = [s, p, o, g];
             let lead = order[0];
             let Some(mut run) = columns[lead]
                 .bounds(codes[lead].expect("a bound lead key"), &source, session)
