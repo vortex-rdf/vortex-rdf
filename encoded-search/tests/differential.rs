@@ -35,6 +35,7 @@ const SUPPORTED_ENCODINGS: &[&str] = &[
     "vortex.chunked",
     "vortex.dict",
     "vortex.shared",
+    "vortex.sparse",
 ];
 
 /// Most generic-oracle calls a single fixture makes. Fixtures with fewer
@@ -620,12 +621,13 @@ fn declines_unsupported_dtypes() {
 }
 
 #[test]
-fn declines_per_chunk_for_references() {
+fn probes_per_chunk_for_references() {
     // One reference per 1,024-value chunk (the `fastlanes.for.v2` wire
-    // form): a needle maps to a different encoded value in every chunk.
+    // form): searches probe the composed values, since a needle maps to a
+    // different encoded value in every chunk.
     use vortex_fastlanes::{FoR, FoRArrayExt as _};
     let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i * 3).collect();
-    let arr = FoR::encode_chunked(PrimitiveArray::from_iter(data), &mut ctx())
+    let arr = FoR::encode_chunked(PrimitiveArray::from_iter(data.clone()), &mut ctx())
         .unwrap()
         .into_array();
     let view = arr.as_opt::<FoR>().unwrap();
@@ -633,7 +635,7 @@ fn declines_per_chunk_for_references() {
         view.constant_reference().is_none(),
         "fixture must carry per-chunk references"
     );
-    assert!(SortedProbe::resolve(&arr).is_none());
+    assert_probe_with_budget(&arr, &data, &[NodeKind::FoR], GENERIC_ORACLE_NEEDLES);
 }
 
 #[test]

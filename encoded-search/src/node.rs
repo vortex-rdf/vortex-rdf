@@ -7,6 +7,9 @@
 
 use std::sync::OnceLock;
 
+/// Values per FastLanes chunk: the stride of a chunked FoR's references.
+const FL_CHUNK: usize = vortex_fastlanes::FL_CHUNK_SIZE;
+
 /// Typed borrow of a canonical primitive buffer, one variant per unsigned width.
 pub(crate) enum Words<'a> {
     U8(&'a [u8]),
@@ -184,6 +187,16 @@ pub(crate) enum Node<'a> {
         reference: u64,
         child: Box<Node<'a>>,
     },
+    /// Frame of reference with one reference per 1024-value FastLanes chunk
+    /// (`fastlanes.for.v2`): `value_at(i) = child.value_at(i) +
+    /// references.value_at((offset + i) / 1024)`, wrapping. A needle maps to
+    /// a different encoded value in every chunk, so searches probe the
+    /// composed values.
+    ChunkedFoR {
+        references: Box<Node<'a>>,
+        offset: usize,
+        child: Box<Node<'a>>,
+    },
     BitPacked(PackedNode<'a>),
     Slice {
         child: Box<Node<'a>>,
@@ -204,6 +217,12 @@ pub(crate) enum Node<'a> {
     /// FastLanes delta encoding, decoded one 1024-value block at a time on
     /// first touch (see [`DeltaNode`]).
     Delta(DeltaNode<'a>),
+    /// `vortex.sparse`: `fill` everywhere except the patched positions.
+    Sparse {
+        fill: u64,
+        patches: PatchProbe<'a>,
+        len: usize,
+    },
 }
 
 /// The integer width a FastLanes delta block is decoded in: the wrapping
@@ -355,8 +374,9 @@ impl Node<'_> {
             | Node::Sequence { len, .. }
             | Node::RunEnd { len, .. }
             | Node::Slice { len, .. }
-            | Node::Chunked { len, .. } => *len,
-            Node::FoR { child, .. } => child.len(),
+            | Node::Chunked { len, .. }
+            | Node::Sparse { len, .. } => *len,
+            Node::FoR { child, .. } | Node::ChunkedFoR { child, .. } => child.len(),
             Node::BitPacked(p) => p.len,
             Node::Dict { codes, .. } => codes.len(),
             Node::Delta(d) => d.len(),
@@ -382,6 +402,13 @@ impl Node<'_> {
                 values.value_at(run)
             }
             Node::FoR { reference, child } => reference.saturating_add(child.value_at(i)),
+            Node::ChunkedFoR {
+                references,
+                offset,
+                child,
+            } => child
+                .value_at(i)
+                .wrapping_add(references.value_at((offset + i) / FL_CHUNK)),
             Node::BitPacked(p) => p.value_at(i),
             Node::Slice { child, start, .. } => child.value_at(start + i),
             Node::Chunked { chunks, .. } => {
@@ -392,6 +419,7 @@ impl Node<'_> {
             // so it fits a `usize`.
             Node::Dict { codes, values } => values.value_at(codes.value_at(i) as usize),
             Node::Delta(d) => d.value_at(i),
+            Node::Sparse { fill, patches, .. } => patches.lookup(i).unwrap_or(*fill),
         }
     }
 
@@ -457,6 +485,9 @@ impl Node<'_> {
             }),
             // A bisection touches O(log blocks) blocks, each decoded once.
             Node::Delta(d) => partition(d.len(), |i| d.value_at(i) < needle),
+            Node::ChunkedFoR { .. } | Node::Sparse { .. } => {
+                partition(self.len(), |i| self.value_at(i) < needle)
+            }
         }
     }
 
@@ -499,6 +530,18 @@ impl Node<'_> {
             Node::FoR { child, .. } => {
                 out.push(K::FoR);
                 child.collect_kinds(out);
+            }
+            Node::ChunkedFoR {
+                references, child, ..
+            } => {
+                out.push(K::FoR);
+                child.collect_kinds(out);
+                references.collect_kinds(out);
+            }
+            Node::Sparse { patches, .. } => {
+                out.push(K::Sparse);
+                patches.indices.collect_kinds(out);
+                patches.values.collect_kinds(out);
             }
             Node::BitPacked(p) => {
                 out.push(K::BitPacked);

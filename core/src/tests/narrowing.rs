@@ -333,7 +333,7 @@ async fn test_keep_in_memory_matches_brute_force() {
 }
 
 /// A keep on a column with neither a canonical primitive nor a probe to read
-/// in place (the per-chunk references of [`unprobed_object_store`]'s `o`)
+/// in place (the run-length encoded `o` of [`unprobed_object_store`])
 /// decodes the column at the view's selected rows once and tests those:
 /// every keep on `o`, of the whole store and of a predicate-bound view,
 /// equals brute force.

@@ -4000,6 +4000,7 @@ dependencies = [
  "vortex-runend",
  "vortex-sequence",
  "vortex-session",
+ "vortex-sparse",
 ]
 
 [[package]]

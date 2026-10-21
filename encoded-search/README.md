@@ -74,18 +74,22 @@ every query goes through.
 ## Supported encodings
 
 `Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR` (with one reference for
-the whole array), `BitPacked` (with one bit width, including its patches),
-`Delta` (FastLanes delta, decoded one 1,024-value block at a time on first
-touch), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the transparent
-`Shared` wrapper resolves to whatever it wraps. `NodeKind` reports the resolved
-tree's shape for tests and diagnostics. Frame-of-reference with a reference per
-1,024-value chunk (the `fastlanes.for.v2` wire form) and bit-packing with a
-width per block decline. When its builder allows `fastlanes.for.v2`, BtrBlocks'
-frame-of-reference scheme computes a reference per chunk, and an array whose
-chunk minima differ keeps them (one whose references come out constant is
-still single-reference `fastlanes.for`). `empty()` allows every wire form;
-`from_session` allows those both registered in the session and included in an
-edition it enables, and no Vortex core edition includes `fastlanes.for.v2`.
+the whole array, or one per 1,024-value chunk: the `fastlanes.for.v2` wire
+form), `BitPacked` (with one bit width, including its patches), `Delta`
+(FastLanes delta, decoded one 1,024-value block at a time on first touch),
+`Slice`, `Chunked`, `Dict` and `Sparse` (a fill value with patches), composed
+arbitrarily; the transparent `Shared` wrapper resolves to whatever it wraps.
+`NodeKind` reports the resolved tree's shape for tests and diagnostics.
+Bit-packing with a width per block declines. A frame of reference per chunk
+and a sparse array have no order-preserving map from a needle to their
+children, so their bounds searches probe the composed values. When its
+builder allows `fastlanes.for.v2`, BtrBlocks' frame-of-reference scheme
+computes a reference per chunk, and an array whose chunk minima differ keeps
+them (one whose references come out constant is still single-reference
+`fastlanes.for`). `empty()` allows every wire form; `from_session` allows those
+both registered in the session and included in an edition it enables, and no
+Vortex core edition includes `fastlanes.for.v2`: files written before the
+writer was limited to an edition can still hold it.
 
 ## The sortedness contract
 

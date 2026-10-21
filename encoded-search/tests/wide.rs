@@ -156,3 +156,87 @@ fn probes_default_cascade_codes_past_u32() {
         assert_probe(&arr, &data, &[]);
     }
 }
+
+#[test]
+fn probes_sparse_codes_past_u32() {
+    use vortex_array::dtype::Nullability::NonNullable;
+    use vortex_array::scalar::Scalar;
+    use vortex_sequence::Sequence;
+    use vortex_sparse::Sparse;
+
+    // Sorted: the fill below every patch, the patches ascending to the end.
+    let (len, first) = (5_000usize, 4_000usize);
+    let data: Vec<u64> = (0..len as u64)
+        .map(|i| {
+            if (i as usize) < first {
+                BASE
+            } else {
+                BASE + 1 + (i - first as u64) / 7
+            }
+        })
+        .collect();
+    let indices: Vec<u64> = (first as u64..len as u64).collect();
+    let values: Vec<u64> = indices.iter().map(|&i| data[i as usize]).collect();
+    let arr = Sparse::try_new(
+        PrimitiveArray::from_iter(indices).into_array(),
+        PrimitiveArray::from_iter(values).into_array(),
+        len,
+        Scalar::from(BASE),
+    )
+    .unwrap()
+    .into_array();
+    assert_eq!(arr.encoding_id().as_str(), "vortex.sparse");
+    assert_probe(&arr, &data, &[NodeKind::Sparse]);
+
+    // Patch positions and values both arithmetic sequences, the shape a
+    // sorted object column of an index child takes.
+    let data: Vec<u64> = (0..len as u64)
+        .map(|i| {
+            if (i as usize) < first {
+                BASE
+            } else {
+                BASE + 2 * (i - first as u64 + 1)
+            }
+        })
+        .collect();
+    let arr = Sparse::try_new(
+        Sequence::try_new_typed::<u64>(first as u64, 1, NonNullable, len - first)
+            .unwrap()
+            .into_array(),
+        Sequence::try_new_typed::<u64>(BASE + 2, 2, NonNullable, len - first)
+            .unwrap()
+            .into_array(),
+        len,
+        Scalar::from(BASE),
+    )
+    .unwrap()
+    .into_array();
+    assert_probe(&arr, &data, &[NodeKind::Sparse, NodeKind::Sequence]);
+}
+
+#[test]
+fn probes_chunked_frame_of_reference_past_u32() {
+    use vortex_fastlanes::FoR;
+
+    // One reference per 1024-value chunk, rising faster than the encoded
+    // values, so the composed values ascend; with and without an offset into
+    // the first chunk.
+    for (offset, len) in [(0u16, 3_500usize), (100, 3_000)] {
+        let chunks = (usize::from(offset) + len).div_ceil(1024);
+        let references: Vec<u64> = (0..chunks as u64).map(|k| BASE + k * 100_000).collect();
+        let encoded: Vec<u64> = (0..len)
+            .map(|i| ((usize::from(offset) + i) % 1024) as u64 / 3)
+            .collect();
+        let data: Vec<u64> = (0..len)
+            .map(|i| references[(usize::from(offset) + i) / 1024] + encoded[i])
+            .collect();
+        let arr = FoR::try_new_chunked(
+            PrimitiveArray::from_iter(encoded).into_array(),
+            PrimitiveArray::from_iter(references).into_array(),
+            offset,
+        )
+        .unwrap()
+        .into_array();
+        assert_probe(&arr, &data, &[NodeKind::FoR, NodeKind::Primitive]);
+    }
+}

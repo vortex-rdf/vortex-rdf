@@ -898,13 +898,13 @@ async fn multi_chunk_file() -> (tempfile::TempDir, VortexRdfStore) {
 }
 
 /// [`fixture_quads`] built under the Dictionary layout, with the base's
-/// `column` encoded with a reference per 1,024-value chunk
-/// (`fastlanes.for.v2`), its sorted stamp kept: an encoding no probe reads.
-/// `from_built` leaves such a column as it is, so it has neither a canonical
-/// primitive nor a probe; `from_parts` decodes it.
-async fn chunk_referenced_build(column: &str) -> BuiltArray {
+/// `column` FastLanes run-length encoded (`fastlanes.rle`), its sorted stamp
+/// kept: an encoding no probe reads. `from_built` leaves such a column as it
+/// is, so it has neither a canonical primitive nor a probe; `from_parts`
+/// decodes it.
+async fn rle_coded_build(column: &str) -> BuiltArray {
     use crate::store::array::{column_is_sorted, stamp_is_sorted};
-    use vortex::encodings::fastlanes::FoR;
+    use vortex::encodings::fastlanes::RLEData;
     use vortex_array::arrays::struct_::StructArrayExt as _;
     use vortex_array::arrays::{PrimitiveArray, StructArray};
     use vortex_array::{IntoArray as _, VortexSessionExecute as _};
@@ -932,10 +932,12 @@ async fn chunk_referenced_build(column: &str) -> BuiltArray {
             }
             let sorted = column_is_sorted(&child);
             let codes = child.execute::<PrimitiveArray>(&mut ctx).unwrap();
-            let encoded = FoR::encode_chunked(codes, &mut ctx).unwrap().into_array();
+            let encoded = RLEData::encode(codes.as_view(), &mut ctx)
+                .unwrap()
+                .into_array();
             assert!(
                 vortex_rdf_encoded_search::SortedProbe::resolve(&encoded).is_none(),
-                "no probe reads per-chunk references"
+                "no probe reads run-length encoding"
             );
             if sorted {
                 stamp_is_sorted(&encoded);
@@ -954,10 +956,10 @@ async fn chunk_referenced_build(column: &str) -> BuiltArray {
     built
 }
 
-/// [`chunk_referenced_build`] of the `o` column adopted by `from_built`: a
+/// [`rle_coded_build`] of the `o` column adopted by `from_built`: a
 /// store whose `o` has neither a canonical primitive nor a probe.
 async fn unprobed_object_store() -> VortexRdfStore {
-    VortexRdfStore::from_built(chunk_referenced_build("o").await).unwrap()
+    VortexRdfStore::from_built(rle_coded_build("o").await).unwrap()
 }
 
 /// The row tuples of a view's gathered codes, in the order gathered.

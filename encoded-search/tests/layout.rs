@@ -384,36 +384,28 @@ async fn column_chunks_empty_column() {
     );
 }
 
-/// A leaf whose wire encoding the probe does not support (sparse) declines
-/// with `Ok(None)` at query time, while the column itself still resolves.
+/// A leaf whose wire encoding the probe does not support (FastLanes RLE)
+/// declines with `Ok(None)` at query time, while the column itself still
+/// resolves.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_decline_unsupported_leaf() {
-    use vortex_array::scalar::Scalar;
-    use vortex_sparse::Sparse;
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_fastlanes::RLEData;
 
     let session = writer_session();
     let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
-    // A few explicit values over a constant fill: still non-decreasing, so
-    // only the encoding — not the data — is what the probe declines.
-    let indices: Vec<u64> = vec![4_093, 4_094, 4_095];
-    let values: Vec<u32> = indices.iter().map(|&i| data[i as usize]).collect();
-    let sparse = Sparse::try_new(
-        PrimitiveArray::from_iter(indices).into_array(),
-        PrimitiveArray::from_iter(values).into_array(),
-        data.len(),
-        Scalar::from(0u32),
+    // Non-decreasing data, so only the encoding — not the data — is what
+    // the probe declines.
+    let rle = RLEData::encode(
+        PrimitiveArray::from_iter(data.clone()).as_view(),
+        &mut session.create_execution_ctx(),
     )
     .unwrap()
     .into_array();
-    assert_eq!(sparse.encoding_id().as_str(), "vortex.sparse");
+    assert_eq!(rle.encoding_id().as_str(), "fastlanes.rle");
     // The flat strategy writes the chunk in the encoding it arrives in.
     let strategy = struct_strategy(FlatLayoutStrategy::default());
-    let file = write_file(
-        &session,
-        vec![struct_of(vec![("s", sparse)])],
-        Some(strategy),
-    )
-    .await;
+    let file = write_file(&session, vec![struct_of(vec![("s", rle)])], Some(strategy)).await;
     let root = file.footer().layout().clone();
 
     let column = ColumnChunks::from_struct_layout(&root, "s").expect("a flat leaf resolves");

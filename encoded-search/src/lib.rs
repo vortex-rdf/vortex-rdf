@@ -143,4 +143,6 @@ pub enum NodeKind {
     /// FastLanes delta: per 1024-value block, a lane of bases plus transposed
     /// deltas, decoded one block at a time on first touch.
     Delta,
+    /// Sparse: one fill value, with exception values at patched positions.
+    Sparse,
 }
