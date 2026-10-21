@@ -757,13 +757,9 @@ mod tests {
         check_offsets_stored_as::<i64>(original, &terms);
     }
 
-    /// A chunk whose code offsets a `u32` cannot hold is refused, never read
-    /// through wrapped or reinterpreted offsets: a 64-bit offset past
-    /// `u32::MAX` (a foreign writer's chunk of more than 4 GiB of codes), and
-    /// a negative `i32` one (a corrupt chunk), which would otherwise be
-    /// viewed in place as a huge `u32`. The offsets are a constant child,
-    /// which FSST checks against the code bytes only once decoded, so the
-    /// chunk holds no 4 GiB of codes.
+    /// An adoption that skips the offset scan, as a window's later rebuild
+    /// does, reads the offsets and terms the checked one reads; with the scan
+    /// on, a negative `i32` offset is still refused.
     #[test]
     fn fsst_offsets_unchecked_adoption_matches_the_checked_one() {
         use vortex_array::ArrayParts;
@@ -812,6 +808,13 @@ mod tests {
         assert!(FsstTerms::with_check(negative, true).is_err());
     }
 
+    /// A chunk whose code offsets a `u32` cannot hold is refused, never read
+    /// through wrapped or reinterpreted offsets: a 64-bit offset past
+    /// `u32::MAX` (a foreign writer's chunk of more than 4 GiB of codes), and
+    /// a negative `i32` one (a corrupt chunk), which would otherwise be
+    /// viewed in place as a huge `u32`. The offsets are a constant child,
+    /// which FSST checks against the code bytes only once decoded, so the
+    /// chunk holds no 4 GiB of codes.
     #[test]
     fn fsst_code_offsets_outside_u32_are_refused() {
         use vortex_array::ArrayParts;
