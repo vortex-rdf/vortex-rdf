@@ -527,15 +527,17 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
         oxrdf_reference(&stored, oxrdfio::RdfFormat::NTriples)
     );
 
-    // A named graph cannot be represented in N-Triples: refuse, as the
-    // structured path would.
+    // A named graph cannot be represented in a graph format: the fast path
+    // (N-Triples) and the structured serializer (Turtle) both refuse it as a
+    // Serialization error, not a writer failure.
     let store = built_store(quads, LayoutStrategy::Default, vec![]).await;
-    let mut exported = Vec::new();
-    assert!(
-        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
-            .await
-            .is_err()
-    );
+    for format in [oxrdfio::RdfFormat::NTriples, oxrdfio::RdfFormat::Turtle] {
+        let result = crate::export_rdf(store.clone(), Vec::new(), format).await;
+        assert!(
+            matches!(result, Err(VortexRdfError::Serialization(_))),
+            "{format:?}: {result:?}"
+        );
+    }
 }
 
 /// The fast path's file arm: the raw chunk stream over a scan must produce
@@ -631,46 +633,45 @@ impl std::io::Write for FailingWriter {
     }
 }
 
-/// The structured serializer reports a writer that fails: wherever the
-/// failure falls, from its first byte to the closing of the last graph,
-/// the export is an error carrying the writer's, with no panic and no
-/// partial success.
+/// Both export paths, the structured serializer (TriG) and the N-Quads fast
+/// path, report a writer that fails as the writer's own `Io` error, with its
+/// kind: wherever the failure falls, from the first byte to the closing of the
+/// last graph, with no panic and no partial success.
 #[tokio::test]
-async fn test_structured_export_reports_a_failing_writer() {
+async fn test_export_reports_a_failing_writer_as_its_io_error() {
     let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
     let quads = graph_modular_quads(4, 2, 2, 3, &[GraphName::DefaultGraph, g]);
     let store = built_store(quads, LayoutStrategy::Default, vec![]).await;
-    let mut whole = Vec::new();
-    crate::export_rdf(store.clone(), &mut whole, oxrdfio::RdfFormat::TriG)
+    for format in [oxrdfio::RdfFormat::TriG, oxrdfio::RdfFormat::NQuads] {
+        let mut whole = Vec::new();
+        crate::export_rdf(store.clone(), &mut whole, format)
+            .await
+            .unwrap();
+        if format == oxrdfio::RdfFormat::TriG {
+            assert!(
+                whole.ends_with(b"}\n"),
+                "the last graph is closed at the end"
+            );
+        }
+
+        for budget in 0..whole.len() {
+            let result = crate::export_rdf(store.clone(), FailingWriter { budget }, format).await;
+            assert!(
+                matches!(&result, Err(VortexRdfError::Io(e))
+                    if e.kind() == std::io::ErrorKind::StorageFull
+                        && e.to_string().contains(FailingWriter::MESSAGE)),
+                "{format:?}: a writer failing after {budget} of {} bytes: {result:?}",
+                whole.len()
+            );
+        }
+        crate::export_rdf(
+            store.clone(),
+            FailingWriter {
+                budget: whole.len(),
+            },
+            format,
+        )
         .await
         .unwrap();
-    assert!(
-        whole.ends_with(b"}\n"),
-        "the last graph is closed at the end"
-    );
-
-    for budget in 0..whole.len() {
-        let result = crate::export_rdf(
-            store.clone(),
-            FailingWriter { budget },
-            oxrdfio::RdfFormat::TriG,
-        )
-        .await;
-        assert!(
-            result
-                .as_ref()
-                .is_err_and(|e| e.to_string().contains(FailingWriter::MESSAGE)),
-            "a writer failing after {budget} of {} bytes: {result:?}",
-            whole.len()
-        );
     }
-    crate::export_rdf(
-        store,
-        FailingWriter {
-            budget: whole.len(),
-        },
-        oxrdfio::RdfFormat::TriG,
-    )
-    .await
-    .unwrap();
 }

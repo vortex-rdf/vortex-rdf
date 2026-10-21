@@ -20,6 +20,10 @@ use std::io::Write;
 /// [`BufWriter`](std::io::BufWriter), pass it by `&mut`, and flush it once the
 /// export returns: a `BufWriter` dropped unflushed discards the error of its
 /// last write.
+///
+/// A writer's failure is an [`Io`](VortexRdfError::Io) error carrying the
+/// writer's `io::Error`, in every format; a quad the format cannot represent
+/// (a named graph in N-Triples, say) is a `Serialization` error.
 pub async fn export_rdf<W: Write>(
     store: VortexRdfStore,
     writer: W,
@@ -89,12 +93,10 @@ async fn write_structured<W: Write>(
         let quad = quad_res?;
         rdf_serializer
             .serialize_quad(&quad)
-            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+            .map_err(serializer_error)?;
     }
 
-    rdf_serializer
-        .finish()
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    rdf_serializer.finish().map_err(serializer_error)?;
 
     log::debug!(
         "[export_rdf] Structured read and write loop took {:?}",
@@ -102,4 +104,16 @@ async fn write_structured<W: Write>(
     );
 
     Ok(())
+}
+
+/// An error from [`RdfSerializer`]: `InvalidInput` is its refusal of a quad the
+/// format cannot represent (a named graph in a graph format, an RDF/XML term),
+/// a `Serialization` error as on the N-Triples/N-Quads path; any other kind is
+/// the writer's own failure, an `Io` error that keeps its kind.
+fn serializer_error(e: std::io::Error) -> VortexRdfError {
+    if e.kind() == std::io::ErrorKind::InvalidInput {
+        VortexRdfError::Serialization(e.to_string())
+    } else {
+        VortexRdfError::Io(e)
+    }
 }

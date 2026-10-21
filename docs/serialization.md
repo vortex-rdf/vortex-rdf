@@ -555,7 +555,7 @@ in-memory store rebuilds and when `add_quads` compacts by itself are in
 
 ### 11.3 Back to RDF text
 
-The reverse direction is [`export_rdf`](../core/src/store/persist/export.rs#L23) (the
+The reverse direction is [`export_rdf`](../core/src/store/persist/export.rs#L27) (the
 CLI's `deserialize`, the bindings' `toRdf`): N-Triples and N-Quads are written
 straight from the raw term columns — the strings *are* the serialization — while
 every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
