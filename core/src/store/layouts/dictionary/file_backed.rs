@@ -49,18 +49,13 @@ type Bounds = (Box<[u8]>, Box<[u8]>);
 type Leaves = Vec<(FlatLayout, usize)>;
 
 /// One flat leaf of the term column (one FSST window as written): the rank of
-/// its first term, its row count (never 0), its first and last terms, and
-/// whether a rebuild has adopted it once, its code offsets checked.
+/// its first term, its row count (never 0), and its first and last terms.
 struct Window {
     layout: FlatLayout,
     start: usize,
     rows: usize,
     first: Box<[u8]>,
     last: Box<[u8]>,
-    /// Set by the first rebuild that adopted the leaf: the file does not
-    /// change under a reader, so a later rebuild of the window skips the scan
-    /// of its offsets ([`TermChunk::from_wire_checked`]).
-    adopted: std::sync::atomic::AtomicBool,
 }
 
 /// The charge one open file's window cache may hold: its windows' bytes
@@ -218,17 +213,8 @@ impl Windows {
         #[cfg(test)]
         self.rebuilt
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let window = &self.windows[w];
-        let leaf = fetch_flat(&window.layout, &self.source, &VORTEX_SESSION).await?;
-        let adopted = window.adopted.load(std::sync::atomic::Ordering::Acquire);
-        let chunk = TermChunk::from_wire_checked(
-            leaf,
-            &mut VORTEX_SESSION.create_execution_ctx(),
-            !adopted,
-        )?;
-        window
-            .adopted
-            .store(true, std::sync::atomic::Ordering::Release);
+        let leaf = fetch_flat(&self.windows[w].layout, &self.source, &VORTEX_SESSION).await?;
+        let chunk = TermChunk::from_wire(leaf, &mut VORTEX_SESSION.create_execution_ctx())?;
         Ok(self.cache().insert(w, Arc::new(chunk)))
     }
 }
@@ -291,7 +277,6 @@ impl FileBackedDict {
                 rows,
                 first,
                 last,
-                adopted: std::sync::atomic::AtomicBool::new(false),
             });
             start += rows;
         }
@@ -1109,39 +1094,6 @@ mod tests {
             assert!(fbd.debug_cached_windows().is_empty(), "budget {budget}");
             assert_eq!(fbd.debug_cached_bytes(), 0, "budget {budget}");
         }
-    }
-
-    /// A window's code offsets are checked by its first rebuild only: the
-    /// rebuild marks it adopted, and rebuilds after its eviction read the
-    /// same terms without the check.
-    #[tokio::test]
-    async fn a_window_is_checked_on_its_first_rebuild_only() {
-        let (native, _, terms) = windowed_native(600, 100).await;
-        let fbd = FileBackedDict::open_with_budget(&native, 0)
-            .await
-            .unwrap()
-            .unwrap();
-        let adopted = |fbd: &FileBackedDict| -> Vec<bool> {
-            fbd.0
-                .windows
-                .iter()
-                .map(|w| w.adopted.load(std::sync::atomic::Ordering::Acquire))
-                .collect()
-        };
-        assert!(adopted(&fbd).iter().all(|a| !a), "nothing rebuilt yet");
-        for round in 0..3 {
-            let got = fbd.decode_many(&[105, 250, 599]).await.unwrap();
-            assert_eq!(&*got[0], terms[105].as_str(), "round {round}");
-            assert_eq!(&*got[1], terms[250].as_str(), "round {round}");
-            assert_eq!(&*got[2], terms[599].as_str(), "round {round}");
-        }
-        let flags = adopted(&fbd);
-        assert_eq!(flags.iter().filter(|a| **a).count(), 3, "{flags:?}");
-        assert_eq!(
-            fbd.debug_windows_rebuilt(),
-            9,
-            "budget 0 keeps nothing: 3 rounds x 3 windows"
-        );
     }
 
     /// A window charged exactly the budget fits and is kept; the next one
