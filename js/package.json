@@ -1,6 +1,6 @@
 {
     "name": "@vortex-rdf/vortex-rdf-store",
-    "version": "0.12.1",
+    "version": "0.13.0",
     "description": "High-performance, zero-copy columnar RDF serialization format",
     "type": "module",
     "repository": {
