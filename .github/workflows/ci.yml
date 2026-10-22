@@ -133,3 +133,26 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build the wasm package and run the JS tests
         run: scripts/ci-check.sh js-tests
+
+  java-tests:
+    name: Java Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: java/pom.xml
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust
+      # The java crate is a member of the root workspace, so cargo writes to
+      # <root>/target, the path the cache covers.
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the JNI library and run the Java tests
+        run: scripts/ci-check.sh java-tests
