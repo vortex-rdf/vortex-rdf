@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.vortexrdf</groupId>
+  <artifactId>vortex-rdf</artifactId>
+  <!-- The workspace version (Cargo.toml): the jar and the native library it loads are released together. -->
+  <version>0.13.0</version>
+  <packaging>jar</packaging>
+
+  <name>Vortex-RDF</name>
+  <description>Java bindings for Vortex-RDF, a columnar RDF store format built on Vortex</description>
+  <url>https://github.com/vortex-rdf/vortex-rdf</url>
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+    </license>
+  </licenses>
+
+  <properties>
+    <maven.compiler.release>11</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <junit.version>5.11.3</junit.version>
+    <!-- The tests' inputs: the native library, and the stores and oracle that the `fixtures` example of the
+         vortex-rdf-java crate writes (scripts/ci-check.sh java-tests builds both). -->
+    <vortexrdf.library>${project.basedir}/../target/debug/libvortex_rdf_jni.so</vortexrdf.library>
+    <vortexrdf.fixtures>${project.basedir}/target/fixtures</vortexrdf.fixtures>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>-Xlint:all</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <systemPropertyVariables>
+            <vortexrdf.library>${vortexrdf.library}</vortexrdf.library>
+            <vortexrdf.fixtures>${vortexrdf.fixtures}</vortexrdf.fixtures>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

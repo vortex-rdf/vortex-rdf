@@ -1,0 +1,28 @@
+[package]
+name = "vortex-rdf-java"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Java bindings for Vortex-RDF: the JNI library behind the org.vortexrdf Java API"
+publish = false
+
+# The shared library the `org.vortexrdf` classes load (`libvortex_rdf_jni.so`,
+# `.dylib` or `vortex_rdf_jni.dll`). It declares the JNI types but links no JVM
+# library, so the crate builds and tests like any other member. The `rlib`
+# lets `tests/` drive the engine without a JVM.
+[lib]
+name = "vortex_rdf_jni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vortex-rdf-core = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+jni-sys = "0.4"
+
+[dev-dependencies]
+futures = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

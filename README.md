@@ -7,7 +7,7 @@
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/vortex-rdf/vortex-rdf?utm_source=badge)
 [![CI](https://github.com/vortex-rdf/vortex-rdf/actions/workflows/ci.yml/badge.svg)](https://github.com/vortex-rdf/vortex-rdf/actions/workflows/ci.yml)
 
-Vortex-RDF is a columnar RDF serialization and a queryable quad store built on the [Vortex](https://docs.vortex.dev) data format. It converts any RDF syntax [`oxrdfio`](https://docs.rs/oxrdfio/latest/oxrdfio/) reads into a compact, self-describing `.vortex` file (or the same bytes in memory) and queries it in place — zero-copy, without decompressing what a pattern does not touch — from Rust, a CLI, JavaScript/WebAssembly and Python.
+Vortex-RDF is a columnar RDF serialization and a queryable quad store built on the [Vortex](https://docs.vortex.dev) data format. It converts any RDF syntax [`oxrdfio`](https://docs.rs/oxrdfio/latest/oxrdfio/) reads into a compact, self-describing `.vortex` file (or the same bytes in memory) and queries it in place — zero-copy, without decompressing what a pattern does not touch — from Rust, a CLI, JavaScript/WebAssembly, Python and Java.
 
 ## Key features
 
@@ -16,7 +16,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 - 📦 **Adaptive compression**: Vortex picks per-column encodings (FSST, dictionary, run-length, bit-packing, …) and decompresses just in time.
 - ☄️ **Streaming, out-of-core ingestion**: datasets larger than RAM are globally sorted through an external merge sort with bounded memory.
 - 🍀 **RDF 1.1 quads**: named graphs `(s, p, o, g)`, blank nodes, language-tagged and typed literals.
-- 🌍 **Cross-platform**: one Rust core behind a CLI, WebAssembly bindings for Node.js and browsers, and Python bindings.
+- 🌍 **Cross-platform**: one Rust core behind a CLI, WebAssembly bindings for Node.js and browsers, and Python and Java bindings.
 
 ## Install
 
@@ -26,6 +26,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 | CLI | `cargo install vortex-rdf-cli` | |
 | JavaScript | `npm install @vortex-rdf/vortex-rdf-store` | [js/README.md](js/README.md) |
 | Python | `pip install vortex-rdf` | [python/README.md](python/README.md); [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) builds an rdflib integration on it |
+| Java | build from source (not published yet) | [java/README.md](java/README.md); a JNI library and the `org.vortexrdf` API, for any JVM program |
 
 ## Quick start
 
@@ -149,6 +150,7 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 | [docs/interfaces.md](docs/interfaces.md) | the contract an external query engine reads the store through: data sources, component tables, chunk streams, runtimes, view statistics, identities |
 | [js/README.md](js/README.md) | the JavaScript/WebAssembly bindings |
 | [python/README.md](python/README.md) | the Python bindings |
+| [java/README.md](java/README.md) | the Java bindings |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | git hooks, the local CI mirror, doc-anchor checks, changelog generation |
 | [CHANGELOG.md](CHANGELOG.md) | release history |
 
