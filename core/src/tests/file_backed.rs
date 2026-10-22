@@ -562,12 +562,29 @@ fn multiplicity_quads() -> Vec<Quad> {
     quads
 }
 
+/// [`multiplicity_quads`] and a hub subject with 60 quads, each object held
+/// by no other quad: under the reference index the hub's `s?o` checks the
+/// object's one-row reference run, every other subject's its own run, shorter
+/// than any object's.
+fn hub_quads() -> Vec<Quad> {
+    let mut quads = multiplicity_quads();
+    for k in 0..60 {
+        quads.push(make_quad(
+            "http://example.org/hub",
+            &format!("http://example.org/p{}", k % 5),
+            &format!("rare{k}"),
+            GraphName::DefaultGraph,
+        ));
+    }
+    quads
+}
+
 /// `locate_codes` answers exactly what the term path answers: for every bound
 /// subset of a store's own quads' codes, on every file open and index set
-/// (the suite's fixture, and [`multiplicity_quads`] mapped), the total is
-/// `size()` and the rows are the match's, in pages that cover them once. It
-/// declines (`None`) rather than answer a tombstoned or narrowed view or a
-/// non-prefix shape; a code no quad holds matches nothing.
+/// (the suite's fixture, and [`multiplicity_quads`] and [`hub_quads`]
+/// mapped), the total is `size()` and the rows are the match's, in pages that
+/// cover them once. It declines (`None`) rather than answer a tombstoned or
+/// narrowed view or a non-prefix shape; a code no quad holds matches nothing.
 #[tokio::test]
 async fn test_locate_codes_matches_the_term_path() {
     // The temp dirs stay alive until the stores are checked.
@@ -611,6 +628,30 @@ async fn test_locate_codes_matches_the_term_path() {
         "multiplicity/reference/seven-row-leaves/mapped".to_string(),
         VortexRdfStore::from_file(&path).await.unwrap(),
         multiplicity_quads(),
+        3,
+    ));
+    // A bound subject's rows are checked when its run is the shorter one, a
+    // reference run's otherwise: the hub holds both, in one leaf and in
+    // seven-row leaves, where a subject's run crosses them.
+    let (dir, path) = write_store_file(
+        hub_quads(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    guards.push(Box::new(dir));
+    stores.push((
+        "hub/reference/mapped".to_string(),
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        hub_quads(),
+        3,
+    ));
+    let (dir, path) = write_chunked_reference_store_file(&hub_quads(), 7).await;
+    guards.push(Box::new(dir));
+    stores.push((
+        "hub/reference/seven-row-leaves/mapped".to_string(),
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        hub_quads(),
         3,
     ));
     for (tag, store, quads, step) in stores {

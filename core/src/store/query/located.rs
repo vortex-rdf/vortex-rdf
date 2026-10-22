@@ -71,8 +71,9 @@ impl VortexRdfStore {
     /// that, a bound `p` or `o` is located in the reference index
     /// (`index:ref-p`, `index:ref-o`) and its rows read from the quad table in
     /// its order, the other bound slots checked at them when its run is short
-    /// enough. A code past the dictionary, or one in a position no quad holds,
-    /// matches nothing.
+    /// enough; a bound subject's run of a `quads_sorted` file is the rows
+    /// checked instead when no longer. A code past the dictionary, or one in
+    /// a position no quad holds, matches nothing.
     ///
     /// [`match_pattern`]: VortexRdfStore::match_pattern
     /// [`run_probe`]: VortexRdfStore::run_probe
@@ -217,7 +218,16 @@ impl VortexRdfStore {
         }
         // Boxed: its state would otherwise enlarge every lookup's future,
         // the sorted tables' too.
-        Box::pin(by_reference(codes, tables, offset, limit, &source, session)).await
+        Box::pin(by_reference(
+            codes,
+            tables,
+            file.quads_sorted(),
+            offset,
+            limit,
+            &source,
+            session,
+        ))
+        .await
     }
 }
 
@@ -227,10 +237,10 @@ impl VortexRdfStore {
 #[cfg(feature = "file-io")]
 const REFERENCES: [(&str, usize); 2] = [("index:ref-p", 1), ("index:ref-o", 2)];
 
-/// Rows of a reference run up to which the pattern's other bound slots are
-/// checked by reading them at the run's quad-table rows; a longer run
-/// declines, for the caller's generic path. Every window of such a pattern
-/// reads them again, so this bounds what a page costs.
+/// Rows of a reference or subject run up to which the pattern's other bound
+/// slots are checked at the run's quad-table rows; a longer run declines,
+/// for the caller's generic path. Every window of such a pattern reads them
+/// again, so this bounds what a page costs.
 #[cfg(feature = "file-io")]
 const CHECKED_ROWS: u64 = 16_384;
 
@@ -245,11 +255,14 @@ const SEARCHES_PER_LEAF: usize = 16;
 /// in order. With no other slot bound, its length is the total and only the
 /// window's rows are read; otherwise all its rows are checked against the
 /// other bound slots, within [`CHECKED_ROWS`]: against the other reference's
-/// run for `p` or `o`, by reading the quad table for `s` or `g`.
+/// run for `p` or `o`, by reading the quad table for `s` or `g`. A bound
+/// subject's run of a subject-sorted (`quads_sorted`) quad table is checked
+/// instead when it is no longer than the shortest reference run.
 #[cfg(feature = "file-io")]
 async fn by_reference(
     codes: [Option<TermCode>; 4],
     tables: &crate::store::persist::native_file::LocatedTables,
+    quads_sorted: bool,
     offset: usize,
     limit: Option<usize>,
     source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
@@ -280,7 +293,23 @@ async fn by_reference(
     let [_, rid] = tables.references[index]
         .as_ref()
         .expect("a reference that located a run");
-    let key = REFERENCES[index].1;
+    // A bound subject of a subject-sorted quad table is a run of it too,
+    // found by one search and its rows contiguous. It is the rows checked
+    // when no longer than the reference run: a subject's few quads, not the
+    // many of a common object (`s?o`), as the reference index's own probe
+    // leaves a bound subject to the subject column.
+    let subject = match codes[0] {
+        Some(code) if quads_sorted => quads[0]
+            .bounds(code, source, session)
+            .await
+            .map_err(VortexRdfError::Vortex)?
+            .filter(|subject| subject.end - subject.start <= run.end - run.start),
+        _ => None,
+    };
+    let key = match subject {
+        Some(_) => 0,
+        None => REFERENCES[index].1,
+    };
     let checked: Vec<usize> = (0..4)
         .filter(|&slot| slot != key && codes[slot].is_some())
         .collect();
@@ -297,13 +326,17 @@ async fn by_reference(
             None => return Ok(None),
         }
     } else {
-        if run.end - run.start > CHECKED_ROWS {
-            return Ok(None);
-        }
-        let Some(rows) = read_codes(rid, run, source, session).await? else {
-            return Ok(None);
+        let by_subject = subject.is_some();
+        let mut rows: Vec<u64> = match subject {
+            Some(subject) if subject.end - subject.start <= CHECKED_ROWS => subject.collect(),
+            None if run.end - run.start <= CHECKED_ROWS => {
+                match read_codes(rid, run, source, session).await? {
+                    Some(rows) => rows.to_vec(),
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
         };
-        let mut rows = rows.to_vec();
         for &slot in &checked {
             if rows.is_empty() {
                 break;
@@ -314,8 +347,9 @@ async fn by_reference(
             // Reading the quad table costs a leaf for each leaf the rows
             // reach, searching the other run a search per row: rows spread
             // one or two to a leaf (a large file) are searched, rows bunched
-            // in few leaves read.
-            if let Some(other) = REFERENCES.iter().position(|&(_, s)| s == slot)
+            // in few leaves read. A subject's rows are contiguous, so read.
+            if !by_subject
+                && let Some(other) = REFERENCES.iter().position(|&(_, s)| s == slot)
                 && let (Some(other_run), Some([_, other_rid])) =
                     (&runs[other], &tables.references[other])
                 && rows.len() < SEARCHES_PER_LEAF * leaves_holding(&quads[slot], &rows)

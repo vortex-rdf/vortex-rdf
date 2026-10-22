@@ -283,9 +283,11 @@ window's code columns from one located run, with no dictionary search, view
 or gather, in that table's order. With the reference index, a bound `p` or
 `o` is a run of `index:ref-p` or `index:ref-o` listing quad-table rows: the
 shorter one answers, in quad-table order, and any other bound slot is checked
-at its rows (for runs of at most 16,384 rows). It answers only a whole file-backed
-Dictionary store (no tail, tombstones or narrowing) and returns `None`
-otherwise, for the engine to `run_probe` instead.
+at its rows (for runs of at most 16,384 rows). A bound subject's run of a
+subject-sorted quad table is checked instead when it is no longer, so `s?o`
+reads the subject's few rows, not a common object's many. It answers only a
+whole file-backed Dictionary store (no tail, tombstones or narrowing) and
+returns `None` otherwise, for the engine to `run_probe` instead.
 
 ## 7. Snapshots and mutation
 
