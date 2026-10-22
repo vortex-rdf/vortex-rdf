@@ -280,7 +280,10 @@ first: when the bound codes are a prefix of a sorted table's key order (the
 quad table's `(s, p, o, g)`, the copy index's `index:posg` `(p, o, s, g)`
 or `index:ospg` `(o, s, p, g)`), it answers the match's size and the
 window's code columns from one located run, with no dictionary search, view
-or gather, in that table's order. It answers only a whole file-backed
+or gather, in that table's order. With the reference index, a bound `p` or
+`o` is a run of `index:ref-p` or `index:ref-o` listing quad-table rows: the
+shorter one answers, in quad-table order, and any other bound slot is checked
+at its rows (for runs of at most 16,384 rows). It answers only a whole file-backed
 Dictionary store (no tail, tombstones or narrowing) and returns `None`
 otherwise, for the engine to `run_probe` instead.
 

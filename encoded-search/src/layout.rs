@@ -362,6 +362,19 @@ impl ColumnChunks {
         }))
     }
 
+    /// The row past the end of the chunk leaf holding `row`, from the layout
+    /// alone: walking a run leaf by leaf, each piece is one [`Self::leaf_rows`].
+    ///
+    /// # Panics
+    /// Panics if `row >= self.row_count()`.
+    pub fn leaf_end(&self, row: u64) -> u64 {
+        assert!(row < self.row_count, "row {row} out of bounds");
+        let leaf = &self.chunks[self
+            .chunks
+            .partition_point(|c| c.row_offset + c.row_count <= row)];
+        leaf.row_offset + leaf.row_count
+    }
+
     /// The rows `rows` (absolute, non-empty) as a [`LeafRows`] of the one
     /// chunk leaf holding them all, whose probe is fetched once: searches and
     /// reads inside a located run then touch that leaf only, where each
