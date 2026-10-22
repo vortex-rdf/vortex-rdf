@@ -131,9 +131,15 @@ impl ReaderTree {
 
 type ColumnHandle = Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>;
 
-/// Per located-run table (the quad table, `index:posg`, `index:ospg`), its
-/// `(s, p, o, g)` chunk-probe handles, `None` when one declines.
-pub(crate) type LocatedTables = [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3];
+/// The chunk-probe handles of the tables a located run is found in, `None`
+/// where one declines or the file has no such table.
+pub(crate) struct LocatedTables {
+    /// Per sorted table (the quad table, `index:posg`, `index:ospg`), its
+    /// `(s, p, o, g)` columns.
+    pub(crate) sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
+    /// Per reference index (`index:ref-p`, `index:ref-o`), its `(val, rid)`.
+    pub(crate) references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
+}
 
 /// Chunk-probe handles by table and column, each built on first use; `None`
 /// memoizes a decline. `T` names the table: `()` for the quad table, the

@@ -85,7 +85,8 @@ encoding, layout, extension dtype and zone-map aggregate a store file may hold
 — and the store edition ([`STORE_EDITION`](../core/src/session.rs#L69)), whose
 one member is the root layout. A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
-per-chunk frame-of-reference (`fastlanes.for.v2`), is never written.
+per-chunk frame-of-reference (`fastlanes.for.v2`), is never written. Files
+from earlier writers can hold it; the chunk probes read it.
 
 ---
 

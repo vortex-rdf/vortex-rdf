@@ -35,6 +35,8 @@ const SUPPORTED_ENCODINGS: &[&str] = &[
     "vortex.chunked",
     "vortex.dict",
     "vortex.shared",
+    "vortex.sparse",
+    "fastlanes.rle",
 ];
 
 /// Most generic-oracle calls a single fixture makes. Fixtures with fewer
@@ -620,12 +622,13 @@ fn declines_unsupported_dtypes() {
 }
 
 #[test]
-fn declines_per_chunk_for_references() {
+fn probes_per_chunk_for_references() {
     // One reference per 1,024-value chunk (the `fastlanes.for.v2` wire
-    // form): a needle maps to a different encoded value in every chunk.
+    // form): searches probe the composed values, since a needle maps to a
+    // different encoded value in every chunk.
     use vortex_fastlanes::{FoR, FoRArrayExt as _};
     let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i * 3).collect();
-    let arr = FoR::encode_chunked(PrimitiveArray::from_iter(data), &mut ctx())
+    let arr = FoR::encode_chunked(PrimitiveArray::from_iter(data.clone()), &mut ctx())
         .unwrap()
         .into_array();
     let view = arr.as_opt::<FoR>().unwrap();
@@ -633,7 +636,52 @@ fn declines_per_chunk_for_references() {
         view.constant_reference().is_none(),
         "fixture must carry per-chunk references"
     );
-    assert!(SortedProbe::resolve(&arr).is_none());
+    assert_probe_with_budget(&arr, &data, &[NodeKind::FoR], GENERIC_ORACLE_NEEDLES);
+}
+
+#[test]
+fn probes_fastlanes_run_length() {
+    // Runs of 1 to 2,000 values, so runs cross 1,024-value chunk boundaries
+    // and a chunk may hold a single run; slices start mid-chunk, which the
+    // array keeps as an offset into its first chunk, and past the first, so
+    // value offsets count from a base above zero.
+    use vortex_array::arrays::slice::SliceKernel as _;
+    use vortex_fastlanes::{RLE, RLEData};
+    let mut rng = Lcg(7);
+    let mut data: Vec<u32> = Vec::with_capacity(10_000);
+    let mut value = 0u32;
+    while data.len() < 10_000 {
+        let run = [1, 3, 40, 2_000][rng.next() as usize % 4];
+        data.extend(std::iter::repeat_n(value, run));
+        value += 1 + (rng.next() % 5) as u32;
+    }
+    data.truncate(10_000);
+    let arr = RLEData::encode(
+        PrimitiveArray::from_iter(data.clone()).as_view(),
+        &mut ctx(),
+    )
+    .unwrap()
+    .into_array();
+    assert_eq!(arr.encoding_id().as_str(), "fastlanes.rle");
+    assert_probe(&arr, &data, &[NodeKind::Rle]);
+    for range in [
+        5..1000usize,
+        1030..2050,
+        1023..1025,
+        3..9_999,
+        4_096..10_000,
+        777..777,
+    ] {
+        // `ArrayRef::slice` wraps; RLE's slice kernel, run when that wrapper
+        // executes, pushes the window into the array.
+        let wrapped = arr.slice(range.clone()).unwrap();
+        assert_probe(&wrapped, &data[range.clone()], &[]);
+        let pushed = RLE::slice(arr.as_opt::<RLE>().unwrap(), range.clone(), &mut ctx())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pushed.encoding_id().as_str(), "fastlanes.rle");
+        assert_probe(&pushed, &data[range], &[NodeKind::Rle]);
+    }
 }
 
 #[test]

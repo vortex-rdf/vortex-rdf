@@ -32,7 +32,7 @@ use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
 use vortex_session::VortexSession;
 
-use crate::OwnedSortedProbe;
+use crate::{OwnedSortedProbe, SortedProbe};
 
 /// A dictionary layout's values leaf, shared by every codes leaf beneath it:
 /// fetched and reconstructed in its wire encoding on first use, then cached.
@@ -273,8 +273,11 @@ impl ColumnChunks {
     /// [`Self::bounds`] restricted to `range`, in absolute rows, under the
     /// window contract of [`SortedProbe::bounds_in`](crate::SortedProbe::bounds_in):
     /// only the window must be sorted ascending, and rows outside it are never
-    /// read. Fetches only the chunks the bisection touches (cached
-    /// thereafter). `Ok(None)` when a needed chunk's encoding declines.
+    /// read. A window inside one chunk leaf is searched through that leaf's
+    /// probe; a wider one picks the leaf holding each bound by the leaves'
+    /// last values (rows of the window for every leaf but its last), then
+    /// searches inside that leaf. Fetches only the chunks those searches touch
+    /// (cached thereafter). `Ok(None)` when a needed chunk's encoding declines.
     ///
     /// # Panics
     /// Panics if `range.end > self.row_count()`.
@@ -286,30 +289,126 @@ impl ColumnChunks {
         session: &VortexSession,
     ) -> VortexResult<Option<Range<u64>>> {
         assert!(range.end <= self.row_count, "window out of bounds");
-        // The first row of `lo..hi` whose value is `>= bound`, by a
-        // partition_point through async point reads.
-        let partition = async |mut lo: u64, mut hi: u64, bound: u64| -> VortexResult<Option<u64>> {
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let Some(v) = self.value_at(mid, source, session).await? else {
-                    return Ok(None);
-                };
-                if v < bound {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            Ok(Some(lo))
-        };
-        let Some(lo) = partition(range.start, range.end, needle).await? else {
+        if range.is_empty() {
+            return Ok(Some(range.start..range.start));
+        }
+        // The leaf holding the lower bound is searched for both bounds at
+        // once; only a run that reaches the end of that leaf's part of the
+        // window needs its upper bound searched past it.
+        let Some(leaf) = self
+            .window_leaf(range.clone(), needle, source, session)
+            .await?
+        else {
             return Ok(None);
         };
-        let hi = match needle.checked_add(1) {
-            Some(next) => partition(lo, range.end, next).await?,
-            None => Some(range.end.max(lo)),
+        let bounds = leaf.bounds(needle);
+        if bounds.end < leaf.rows().end || bounds.end == range.end {
+            return Ok(Some(bounds));
+        }
+        let upper = match needle.checked_add(1) {
+            Some(next) => match self
+                .window_leaf(bounds.end..range.end, next, source, session)
+                .await?
+            {
+                Some(leaf) => leaf.bounds(next).start,
+                None => return Ok(None),
+            },
+            None => range.end,
         };
-        Ok(hi.map(|hi| lo..hi))
+        Ok(Some(bounds.start..upper))
+    }
+
+    /// The part of the non-empty `window` in the leaf
+    /// holding its first row whose value is `>= needle`, under the window
+    /// contract: the first leaf whose last row in the window reaches the
+    /// needle, which for every leaf but the window's last is the leaf's own
+    /// last row. `Ok(None)` when a needed chunk's encoding declines.
+    async fn window_leaf(
+        &self,
+        window: Range<u64>,
+        needle: u64,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<LeafRows<'_>>> {
+        let first = self
+            .chunks
+            .partition_point(|c| c.row_offset + c.row_count <= window.start);
+        let last = self
+            .chunks
+            .partition_point(|c| c.row_offset + c.row_count < window.end)
+            .max(first);
+        let (mut lo, mut hi) = (first, last);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let Some(value) = self.chunk_last(mid, source, session).await? else {
+                return Ok(None);
+            };
+            if value < needle {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let leaf = &self.chunks[lo];
+        let Some(probe) = self.chunk_probe(lo, source, session).await? else {
+            return Ok(None);
+        };
+        let start = window.start.max(leaf.row_offset) - leaf.row_offset;
+        let end = window.end.min(leaf.row_offset + leaf.row_count) - leaf.row_offset;
+        Ok(Some(LeafRows {
+            probe: probe.probe(),
+            row_offset: leaf.row_offset,
+            window: start as usize..end as usize,
+        }))
+    }
+
+    /// The row past the end of the chunk leaf holding `row`, from the layout
+    /// alone: walking a run leaf by leaf, each piece is one [`Self::leaf_rows`].
+    ///
+    /// # Panics
+    /// Panics if `row >= self.row_count()`.
+    pub fn leaf_end(&self, row: u64) -> u64 {
+        assert!(row < self.row_count, "row {row} out of bounds");
+        let leaf = &self.chunks[self
+            .chunks
+            .partition_point(|c| c.row_offset + c.row_count <= row)];
+        leaf.row_offset + leaf.row_count
+    }
+
+    /// The rows `rows` (absolute, non-empty) as a [`LeafRows`] of the one
+    /// chunk leaf holding them all, whose probe is fetched once: searches and
+    /// reads inside a located run then touch that leaf only, where each
+    /// [`Self::bounds_in`] step or [`Self::value_at`] finds its chunk again.
+    /// `Ok(None)` when the rows span leaves or the leaf's encoding declines.
+    ///
+    /// # Panics
+    /// Panics if `rows` is empty or ends past `self.row_count()`.
+    pub async fn leaf_rows(
+        &self,
+        rows: Range<u64>,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<LeafRows<'_>>> {
+        assert!(
+            rows.start < rows.end && rows.end <= self.row_count,
+            "rows {rows:?} out of bounds"
+        );
+        let idx = self
+            .chunks
+            .partition_point(|c| c.row_offset + c.row_count <= rows.start);
+        let leaf = &self.chunks[idx];
+        if rows.end > leaf.row_offset + leaf.row_count {
+            return Ok(None);
+        }
+        let Some(probe) = self.chunk_probe(idx, source, session).await? else {
+            return Ok(None);
+        };
+        let local = |row: u64| (row - leaf.row_offset) as usize;
+        Ok(Some(LeafRows {
+            probe: probe.probe(),
+            row_offset: leaf.row_offset,
+            window: local(rows.start)..local(rows.end),
+        }))
     }
 
     /// Exact value at global `row`, fetching (and caching) only the chunk
@@ -406,6 +505,39 @@ impl ColumnChunks {
             .get()
             .vortex_expect("chunk cell was just populated")
             .as_ref())
+    }
+}
+
+/// A row window of a [`ColumnChunks`] column inside one chunk leaf, from
+/// [`ColumnChunks::leaf_rows`]: bounds searches within the window and point
+/// reads through the leaf's probe, in the column's absolute rows.
+pub struct LeafRows<'a> {
+    probe: &'a SortedProbe<'a>,
+    row_offset: u64,
+    window: Range<usize>,
+}
+
+impl LeafRows<'_> {
+    /// The window's rows, absolute.
+    pub fn rows(&self) -> Range<u64> {
+        self.row_offset + self.window.start as u64..self.row_offset + self.window.end as u64
+    }
+
+    /// The rows of the window equal to `needle`, absolute, under the window
+    /// contract of [`SortedProbe::bounds_in`]: only the window must be sorted
+    /// ascending.
+    pub fn bounds(&self, needle: u64) -> Range<u64> {
+        let (lo, hi) = self.probe.bounds_in(self.window.clone(), needle);
+        self.row_offset + lo as u64..self.row_offset + hi as u64
+    }
+
+    /// The value at absolute `row`.
+    ///
+    /// # Panics
+    /// Panics if `row` is outside the window.
+    pub fn value_at(&self, row: u64) -> u64 {
+        assert!(self.rows().contains(&row), "row {row} outside the window");
+        self.probe.value_at((row - self.row_offset) as usize)
     }
 }
 

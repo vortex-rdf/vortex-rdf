@@ -474,7 +474,8 @@ async fn test_file_subject_range_then_index_routing_above_gate() {
     )
     .await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    run_subject_range_then_index_routing_above_gate(&store, &quads).await;
+    // s1 is the last subject: its two rows follow s0's 5,000.
+    run_subject_range_then_index_routing_above_gate(&store, &quads, Some(5_000..5_002)).await;
 }
 
 /// A file carrying both index families opens with both, answers the shapes

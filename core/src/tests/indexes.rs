@@ -985,7 +985,7 @@ async fn test_built_store_compresses_resident_form() {
     assert_eq!(got, expected_rows(&quads, |i| i % 4 == 1));
 
     // What construction leaves alone comes back as it went in: a code column
-    // already in an encoding no probe reads (a reference per chunk) is
+    // already in an encoding no probe reads (pcodec) is
     // neither decoded nor re-encoded.
     let unprobed = unprobed_object_store().await;
     assert_eq!(unprobed.debug_base_child_int_canonical("o"), Some(false));
@@ -996,7 +996,7 @@ async fn test_built_store_compresses_resident_form() {
             .unwrap()
             .encoding_id()
             .as_str(),
-        "fastlanes.for.v2"
+        "vortex.pco"
     );
     // The resident helpers' declines: a nullable struct passes through as
     // it is, and the code accessors hand out no primitive for a column that

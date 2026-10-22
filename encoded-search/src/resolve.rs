@@ -13,10 +13,11 @@ use vortex_array::dtype::PType;
 use vortex_array::scalar::PValue;
 use vortex_fastlanes::{
     BitPacked, BitPackedArrayExt as _, BitPackedSlots, BitWidthsView, Delta, DeltaArrayExt as _,
-    DeltaSlots, FoR, FoRArrayExt as _, FoRSlots,
+    DeltaSlots, FoR, FoRArrayExt as _, FoRSlots, RLE, RLESlots,
 };
 use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
+use vortex_sparse::{Sparse, SparseSlots};
 
 use crate::node::{Chunk, DeltaNode, DeltaWidth, Node, PackedNode, PatchProbe, Words};
 
@@ -82,14 +83,55 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
     }
 
     if let Some(view) = arr.as_opt::<FoR>() {
-        // One reference for the whole array (the `fastlanes.for` wire form).
-        // Per-chunk references (`fastlanes.for.v2`) decline: a needle maps to
-        // a different encoded value in every chunk.
-        let reference = u64::try_from(&view.constant_reference()?).ok()?;
-        let child = resolve_node(slot(view.slots(), FoRSlots::ENCODED)?)?;
-        return Some(Node::FoR {
-            reference,
-            child: Box::new(child),
+        let child = Box::new(resolve_node(slot(view.slots(), FoRSlots::ENCODED)?)?);
+        // One reference for the whole array (the `fastlanes.for` wire form),
+        // or one per 1024-value chunk (`fastlanes.for.v2`).
+        return Some(match view.constant_reference() {
+            Some(reference) => Node::FoR {
+                reference: u64::try_from(&reference).ok()?,
+                child,
+            },
+            None => Node::ChunkedFoR {
+                references: Box::new(resolve_node(slot(view.slots(), FoRSlots::REFERENCES)?)?),
+                offset: usize::from(view.offset()),
+                child,
+            },
+        });
+    }
+
+    if let Some(view) = arr.as_opt::<Sparse>() {
+        // The fill value everywhere but at the patched positions; the
+        // chunk-offsets slot only accelerates a lookup and needs no handling.
+        let data = view.data();
+        let slots = view.slots();
+        return Some(Node::Sparse {
+            fill: u64::try_from(data.fill_scalar()).ok()?,
+            patches: PatchProbe {
+                indices: Box::new(resolve_node(slot(slots, SparseSlots::PATCH_INDICES)?)?),
+                values: Box::new(resolve_node(slot(slots, SparseSlots::PATCH_VALUES)?)?),
+                offset: data.offset(),
+            },
+            len: arr.len(),
+        });
+    }
+
+    if let Some(view) = arr.as_opt::<RLE>() {
+        // Value offsets are absolute; a slice keeps the ones of its chunks,
+        // so the first is the base its value indices count from.
+        let slots = view.slots();
+        let value_offsets = resolve_node(slot(slots, RLESlots::VALUES_IDX_OFFSETS)?)?;
+        let base = if value_offsets.len() == 0 {
+            0
+        } else {
+            value_offsets.value_at(0)
+        };
+        return Some(Node::Rle {
+            values: Box::new(resolve_node(slot(slots, RLESlots::VALUES)?)?),
+            indices: Box::new(resolve_node(slot(slots, RLESlots::INDICES)?)?),
+            value_offsets: Box::new(value_offsets),
+            base,
+            offset: view.data().offset(),
+            len: arr.len(),
         });
     }
 

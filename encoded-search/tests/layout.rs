@@ -220,6 +220,67 @@ async fn column_chunks_match_canonical() {
             );
         }
     }
+    // Windows crossing the flat leaves' own boundaries, with needles whose
+    // run crosses them: the lower bound lies in one leaf and the run goes on
+    // into the next. A window inside one leaf reads through `leaf_rows`; one
+    // across a boundary has no single leaf.
+    let starts: Vec<u64> = flat_leaves(&node)
+        .expect("the column's leaves")
+        .iter()
+        .map(|leaf| leaf.row_offset)
+        .filter(|&start| start > 0)
+        .collect();
+    assert!(!starts.is_empty(), "fixture must have a leaf boundary");
+    let len = data.len() as u64;
+    for &b in &starts {
+        let around: Vec<u64> = (b - 2..b + 2)
+            .map(|r| u64::from(data[r as usize]))
+            .collect();
+        for window in [b - 30..b + 30, b - 1..b + 1, 0..len, b - 11..len, 0..b + 11] {
+            let wdata = &data[window.start as usize..window.end as usize];
+            for needle in around.iter().copied().chain([0, max, u64::MAX]) {
+                let got = column
+                    .bounds_in(window.clone(), needle, &source, &session)
+                    .await
+                    .unwrap()
+                    .expect("all chunks are probeable");
+                let want = canonical_bounds(wdata, needle);
+                assert_eq!(
+                    got,
+                    window.start + want.start..window.start + want.end,
+                    "boundary {b} window {window:?} needle {needle}"
+                );
+            }
+        }
+        let inside = column
+            .leaf_rows(b - 20..b, &source, &session)
+            .await
+            .unwrap()
+            .expect("a window inside one leaf");
+        assert_eq!(inside.rows(), b - 20..b);
+        for row in b - 20..b {
+            assert_eq!(
+                inside.value_at(row),
+                u64::from(data[row as usize]),
+                "row {row}"
+            );
+        }
+        let needle = u64::from(data[(b - 5) as usize]);
+        let want = canonical_bounds(&data[(b - 20) as usize..b as usize], needle);
+        assert_eq!(
+            inside.bounds(needle),
+            b - 20 + want.start..b - 20 + want.end
+        );
+        assert!(
+            column
+                .leaf_rows(b - 1..b + 1, &source, &session)
+                .await
+                .unwrap()
+                .is_none(),
+            "a window across leaf boundary {b}"
+        );
+    }
+
     // A reversed window holds no row: at `u64::MAX` too, its bounds are
     // empty at its start.
     #[allow(clippy::reversed_empty_ranges)]
@@ -384,36 +445,29 @@ async fn column_chunks_empty_column() {
     );
 }
 
-/// A leaf whose wire encoding the probe does not support (sparse) declines
+/// A leaf whose wire encoding the probe does not support (pcodec) declines
 /// with `Ok(None)` at query time, while the column itself still resolves.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_decline_unsupported_leaf() {
-    use vortex_array::scalar::Scalar;
-    use vortex_sparse::Sparse;
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_pco::Pco;
 
     let session = writer_session();
     let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
-    // A few explicit values over a constant fill: still non-decreasing, so
-    // only the encoding — not the data — is what the probe declines.
-    let indices: Vec<u64> = vec![4_093, 4_094, 4_095];
-    let values: Vec<u32> = indices.iter().map(|&i| data[i as usize]).collect();
-    let sparse = Sparse::try_new(
-        PrimitiveArray::from_iter(indices).into_array(),
-        PrimitiveArray::from_iter(values).into_array(),
-        data.len(),
-        Scalar::from(0u32),
+    // Non-decreasing data, so only the encoding — not the data — is what
+    // the probe declines.
+    let pco = Pco::from_primitive(
+        PrimitiveArray::from_iter(data.clone()).as_view(),
+        3,
+        0,
+        &mut session.create_execution_ctx(),
     )
     .unwrap()
     .into_array();
-    assert_eq!(sparse.encoding_id().as_str(), "vortex.sparse");
+    assert_eq!(pco.encoding_id().as_str(), "vortex.pco");
     // The flat strategy writes the chunk in the encoding it arrives in.
     let strategy = struct_strategy(FlatLayoutStrategy::default());
-    let file = write_file(
-        &session,
-        vec![struct_of(vec![("s", sparse)])],
-        Some(strategy),
-    )
-    .await;
+    let file = write_file(&session, vec![struct_of(vec![("s", pco)])], Some(strategy)).await;
     let root = file.footer().layout().clone();
 
     let column = ColumnChunks::from_struct_layout(&root, "s").expect("a flat leaf resolves");
@@ -430,6 +484,51 @@ async fn column_chunks_decline_unsupported_leaf() {
     );
     // A leaf whose encoding declined was fetched all the same.
     assert_eq!((column.chunk_count(), column.fetched_chunks()), (1, 1));
+}
+
+/// A FastLanes run-length leaf, a wire form of the store's writer edition,
+/// read back from a file answers every probe as the canonical data does.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_probe_run_length_leaf() {
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_fastlanes::RLEData;
+
+    let session = writer_session();
+    let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
+    let rle = RLEData::encode(
+        PrimitiveArray::from_iter(data.clone()).as_view(),
+        &mut session.create_execution_ctx(),
+    )
+    .unwrap()
+    .into_array();
+    let strategy = struct_strategy(FlatLayoutStrategy::default());
+    let file = write_file(&session, vec![struct_of(vec![("s", rle)])], Some(strategy)).await;
+    let root = file.footer().layout().clone();
+
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("a flat leaf resolves");
+    let source = file.segment_source();
+    for needle in [0u64, 7, 400, 818, 819, 820, 5_000] {
+        let want = canonical_bounds(&data[1_000..3_000], needle);
+        assert_eq!(
+            column.bounds(needle, &source, &session).await.unwrap(),
+            Some(canonical_bounds(&data, needle)),
+            "bounds({needle})"
+        );
+        assert_eq!(
+            column
+                .bounds_in(1_000..3_000, needle, &source, &session)
+                .await
+                .unwrap(),
+            Some(1_000 + want.start..1_000 + want.end),
+            "bounds_in({needle})"
+        );
+    }
+    for row in [0u64, 1_023, 1_024, 4_095] {
+        assert_eq!(
+            column.value_at(row, &source, &session).await.unwrap(),
+            Some(u64::from(data[row as usize]))
+        );
+    }
 }
 
 /// Dictionary layouts whose shape the probe does not support decline at

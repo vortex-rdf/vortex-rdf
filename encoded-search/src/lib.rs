@@ -10,7 +10,7 @@ pub use owned::OwnedSortedProbe;
 #[cfg(feature = "layout")]
 mod layout;
 #[cfg(feature = "layout")]
-pub use layout::{ColumnChunks, FlatLeaf, fetch_flat, flat_leaves};
+pub use layout::{ColumnChunks, FlatLeaf, LeafRows, fetch_flat, flat_leaves};
 
 use vortex_array::ArrayRef;
 
@@ -74,11 +74,11 @@ impl<'a> SortedProbe<'a> {
     pub fn bounds_in(&self, range: std::ops::Range<usize>, needle: u64) -> (usize, usize) {
         assert!(range.end <= self.len(), "window out of bounds");
         let width = range.end.saturating_sub(range.start);
-        let lo = node::partition(width, |i| self.value_at(range.start + i) < needle);
-        let hi = lo
-            + node::partition(width - lo, |i| {
-                self.value_at(range.start + lo + i) <= needle
-            });
+        let value = |i: usize| self.value_at(range.start + i);
+        // The lower bound's probes cap the needle's rows: the first row past
+        // them lies between the bound and the nearest probe above the needle.
+        let (lo, past) = node::search_ascending_capped(width, value, needle);
+        let hi = lo + node::partition(past - lo, |i| value(lo + i) <= needle);
         (range.start + lo, range.start + hi)
     }
 
@@ -143,4 +143,9 @@ pub enum NodeKind {
     /// FastLanes delta: per 1024-value block, a lane of bases plus transposed
     /// deltas, decoded one block at a time on first touch.
     Delta,
+    /// Sparse: one fill value, with exception values at patched positions.
+    Sparse,
+    /// FastLanes run-length: per 1024-value chunk, run values and an index
+    /// per position into them.
+    Rle,
 }

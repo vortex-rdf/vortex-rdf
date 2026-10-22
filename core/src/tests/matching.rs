@@ -128,10 +128,13 @@ pub(super) fn above_gate_quads() -> Vec<Quad> {
 /// index whenever the range is at or above the routing gate — the result is
 /// the intersection (exact ids, no longer a range, and never served, since
 /// the subject already restricts the view). Below the gate the residual is
-/// filtered column-wise to the same answer.
+/// filtered column-wise to the same answer, over `below_range`: on file the
+/// subject's range stays the selection with the object filter pending over
+/// it; in memory none is left.
 pub(super) async fn run_subject_range_then_index_routing_above_gate(
     store: &VortexRdfStore,
     quads: &[Quad],
+    below_range: Option<std::ops::Range<u64>>,
 ) {
     let s0 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s0").unwrap());
     let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
@@ -159,7 +162,7 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
         .match_pattern(Some(&s1), None, Some(&o5), None)
         .await
         .unwrap();
-    assert_eq!(below.debug_selection_range(), None);
+    assert_eq!(below.debug_selection_range(), below_range);
     assert_eq!(served_component(&below), None);
     assert_eq!(
         view_strings(&below).await,
@@ -182,7 +185,7 @@ async fn test_subject_range_then_index_routing_above_gate() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    run_subject_range_then_index_routing_above_gate(&store, &quads).await;
+    run_subject_range_then_index_routing_above_gate(&store, &quads, None).await;
 
     let o5 = Term::Literal(Literal::new_simple_literal("o5"));
     for (subject, rids) in [("s0", 4), ("s1", 0)] {

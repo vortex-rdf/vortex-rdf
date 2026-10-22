@@ -457,11 +457,11 @@ async fn test_from_parts_adopts_searchable_children() {
         1
     );
 
-    // A sorted column in an encoding no probe reads (a reference per chunk):
+    // A sorted column in an encoding no probe reads (pcodec):
     // adoption decodes it and keeps its stamp, so a bound subject is still
     // one searched row range, answering as the built store does.
     let decoded = VortexRdfStore::from_parts(crate::store::StoreParts {
-        built: chunk_referenced_build("s").await,
+        built: pco_coded_build("s").await,
     })
     .unwrap();
     assert!(decoded.debug_base_probe_resolvable());
@@ -487,7 +487,7 @@ async fn test_from_parts_adopts_searchable_children() {
     // An unsorted column in such an encoding is decoded too: `from_parts`
     // leaves no integer column without a probe or a primitive.
     let decoded = VortexRdfStore::from_parts(crate::store::StoreParts {
-        built: chunk_referenced_build("o").await,
+        built: pco_coded_build("o").await,
     })
     .unwrap();
     assert_eq!(decoded.debug_base_child_int_canonical("o"), Some(true));
@@ -1549,7 +1549,8 @@ async fn test_written_code_columns_avoid_delta() {
 
 /// The store's own files keep frame-of-reference on one reference per
 /// array: the pinned core edition the store writes with leaves out the
-/// per-chunk wire form (`fastlanes.for.v2`), which the chunk probes decline.
+/// per-chunk wire form (`fastlanes.for.v2`), whose bounds searches the chunk
+/// probes can only answer through the composed values.
 /// The guard bites: with that form admitted, some of the fixture's
 /// frame-of-reference arrays take a reference per 1,024 rows.
 #[tokio::test]

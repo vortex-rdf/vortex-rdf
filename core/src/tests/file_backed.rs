@@ -562,12 +562,29 @@ fn multiplicity_quads() -> Vec<Quad> {
     quads
 }
 
+/// [`multiplicity_quads`] and a hub subject with 60 quads, each object held
+/// by no other quad: under the reference index the hub's `s?o` checks the
+/// object's one-row reference run, every other subject's its own run, shorter
+/// than any object's.
+fn hub_quads() -> Vec<Quad> {
+    let mut quads = multiplicity_quads();
+    for k in 0..60 {
+        quads.push(make_quad(
+            "http://example.org/hub",
+            &format!("http://example.org/p{}", k % 5),
+            &format!("rare{k}"),
+            GraphName::DefaultGraph,
+        ));
+    }
+    quads
+}
+
 /// `locate_codes` answers exactly what the term path answers: for every bound
 /// subset of a store's own quads' codes, on every file open and index set
-/// (the suite's fixture, and [`multiplicity_quads`] mapped), the total is
-/// `size()` and the rows are the match's, in pages that cover them once. It
-/// declines (`None`) rather than answer a tombstoned or narrowed view or a
-/// non-prefix shape; a code no quad holds matches nothing.
+/// (the suite's fixture, and [`multiplicity_quads`] and [`hub_quads`]
+/// mapped), the total is `size()` and the rows are the match's, in pages that
+/// cover them once. It declines (`None`) rather than answer a tombstoned or
+/// narrowed view or a non-prefix shape; a code no quad holds matches nothing.
 #[tokio::test]
 async fn test_locate_codes_matches_the_term_path() {
     // The temp dirs stay alive until the stores are checked.
@@ -593,6 +610,50 @@ async fn test_locate_codes_matches_the_term_path() {
             3,
         ));
     }
+    // Seven-row flat leaves: most subject runs cross a leaf boundary, so the
+    // narrowing and the reads go across leaves as well as inside one.
+    let (dir, path) = write_chunked_store_file(&multiplicity_quads(), 7).await;
+    guards.push(Box::new(dir));
+    stores.push((
+        "multiplicity/seven-row-leaves/mapped".to_string(),
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        multiplicity_quads(),
+        1,
+    ));
+    // The reference index in seven-row leaves: a run of `index:ref-p` or
+    // `index:ref-o` spans leaves, so the other run is walked leaf by leaf.
+    let (dir, path) = write_chunked_reference_store_file(&multiplicity_quads(), 7).await;
+    guards.push(Box::new(dir));
+    stores.push((
+        "multiplicity/reference/seven-row-leaves/mapped".to_string(),
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        multiplicity_quads(),
+        3,
+    ));
+    // A bound subject's rows are checked when its run is the shorter one, a
+    // reference run's otherwise: the hub holds both, in one leaf and in
+    // seven-row leaves, where a subject's run crosses them.
+    let (dir, path) = write_store_file(
+        hub_quads(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    guards.push(Box::new(dir));
+    stores.push((
+        "hub/reference/mapped".to_string(),
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        hub_quads(),
+        3,
+    ));
+    let (dir, path) = write_chunked_reference_store_file(&hub_quads(), 7).await;
+    guards.push(Box::new(dir));
+    stores.push((
+        "hub/reference/seven-row-leaves/mapped".to_string(),
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        hub_quads(),
+        3,
+    ));
     for (tag, store, quads, step) in stores {
         check_locate_codes(&tag, &store, &quads, step).await;
     }
@@ -680,8 +741,9 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
     }
     // Masks over (s, p, o, g) = bits 0..4. A mapped sorted file answers the
     // subject prefixes; the copy index also the posg and ospg ones (`s?o`
-    // among them); the no-index file none of the index-only shapes, and
-    // nothing answers `s??g`.
+    // among them); the reference index every shape with `p` or `o` bound, the
+    // other bound slots checked at its rows; the no-index file none of the
+    // index-only shapes, and nothing answers `s??g`.
     if tag.ends_with("/mapped") {
         for mask in [0b0001, 0b0011, 0b0111, 0b1111] {
             assert!(
@@ -692,6 +754,14 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
     }
     if tag.contains("/copy/") && tag.ends_with("/mapped") {
         for mask in [0b0010, 0b0110, 0b0100, 0b0101] {
+            assert!(
+                answered.contains(&mask),
+                "{tag}: mask {mask:04b} not answered"
+            );
+        }
+    }
+    if tag.contains("/reference/") && tag.ends_with("/mapped") {
+        for mask in [0b0010, 0b0110, 0b0100, 0b0101, 0b1010, 0b1100, 0b1110] {
             assert!(
                 answered.contains(&mask),
                 "{tag}: mask {mask:04b} not answered"

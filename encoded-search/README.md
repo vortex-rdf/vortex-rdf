@@ -74,18 +74,24 @@ every query goes through.
 ## Supported encodings
 
 `Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR` (with one reference for
-the whole array), `BitPacked` (with one bit width, including its patches),
-`Delta` (FastLanes delta, decoded one 1,024-value block at a time on first
-touch), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the transparent
-`Shared` wrapper resolves to whatever it wraps. `NodeKind` reports the resolved
-tree's shape for tests and diagnostics. Frame-of-reference with a reference per
-1,024-value chunk (the `fastlanes.for.v2` wire form) and bit-packing with a
-width per block decline. When its builder allows `fastlanes.for.v2`, BtrBlocks'
-frame-of-reference scheme computes a reference per chunk, and an array whose
-chunk minima differ keeps them (one whose references come out constant is
-still single-reference `fastlanes.for`). `empty()` allows every wire form;
-`from_session` allows those both registered in the session and included in an
-edition it enables, and no Vortex core edition includes `fastlanes.for.v2`.
+the whole array, or one per 1,024-value chunk: the `fastlanes.for.v2` wire
+form), `BitPacked` (with one bit width, including its patches), `Delta`
+(FastLanes delta, decoded one 1,024-value block at a time on first touch),
+`Slice`, `Chunked`, `Dict`, `Sparse` (a fill value with patches) and FastLanes
+run-length (`fastlanes.rle`: per 1,024-value chunk, run values and an index
+per position into them), composed arbitrarily; the transparent `Shared`
+wrapper resolves to whatever it wraps. `NodeKind` reports the resolved tree's
+shape for tests and diagnostics. Bit-packing with a width per block declines.
+A frame of reference per chunk, a sparse array and a run-length array have no
+order-preserving map from a needle to their children, so their bounds searches
+probe the composed values. When its
+builder allows `fastlanes.for.v2`, BtrBlocks' frame-of-reference scheme
+computes a reference per chunk, and an array whose chunk minima differ keeps
+them (one whose references come out constant is still single-reference
+`fastlanes.for`). `empty()` allows every wire form; `from_session` allows those
+both registered in the session and included in an edition it enables, and no
+Vortex core edition includes `fastlanes.for.v2`: files written before the
+writer was limited to an edition can still hold it.
 
 ## The sortedness contract
 
@@ -96,6 +102,16 @@ panicking, never unsound — answer. `bounds_in` requires only its window to be
 sorted, and never reads a row outside it. `value_at` is exact regardless of
 order.
 
+Searches over ascending codes in a run-end node's values, and a `bounds_in`
+window's lower bound, interpolate: once a probe has landed on each side of the
+needle, a few splits go where an even spread between the two values puts it,
+and the rest of the window is bisected. The answer is the bisection's; codes
+spread about evenly cost a few reads instead of one per halving, while
+plateaus and windows of 16 values or fewer cost what bisection does. A
+`bounds_in` window's upper bound is then bisected for between its lower bound
+and the nearest row the lower search found past the needle: a few rows when
+the needle's rows are few.
+
 ## The `layout` feature
 
 Off by default. With it, `ColumnChunks` extends the same treatment to a column
@@ -103,7 +119,10 @@ inside a written Vortex file: it locates one field's flat chunk leaves in a
 layout tree, then answers global lower bounds, bounds queries, point reads and
 takes at ascending rows by fetching only the chunks a binary search over the
 chunks' last values, or the rows, actually touch; a take has each leaf take its
-rows from its array. Each fetched chunk is reconstructed in its wire encoding
+rows from its array. A `bounds_in` window is searched inside the leaf holding
+its lower bound, which the leaves' last values pick, and `leaf_rows` hands
+back a window inside one leaf as a `LeafRows`, whose bounds searches and point
+reads go through that leaf's probe without finding the leaf again. Each fetched chunk is reconstructed in its wire encoding
 (`SerializedArray::decode` rebuilds metadata over the segment buffers — it does
 not decompress), resolved into a probe once, and cached, so repeated queries
 against a hot file do no further I/O.
