@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-core"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -4291,7 +4291,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-encoded-search"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "fastlanes 0.7.2",
  "self_cell",
