@@ -781,7 +781,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L1226) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L536)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L1227) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L536)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -933,7 +933,7 @@ The match's decisions show up here
 | `raw_quad_chunks()` | plan deliberately ignored (it reorders rows): the pending ids materialize and the rows are read as without one | as `quads()`, in base row order: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
 
 An exact file selection is read the cheapest way
-([`ExactRead`](../core/src/store/scan/file_reads.rs#L851)): point by point
+([`ExactRead`](../core/src/store/scan/file_reads.rs#L853)): point by point
 through the chunk probes when it is point-sized, or ids at most 16 per split
 they touch (`POINT_IDS_PER_SPLIT`), and every column has chunk probes;
 taken at its ids when they number at most one per 16 rows of their splits

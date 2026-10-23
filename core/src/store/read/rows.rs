@@ -510,7 +510,7 @@ impl VortexRdfStore {
     ) -> Result<[Buffer<TermCode>; 4]> {
         let read = MaskedRead::of(file, masks)?;
         if read != MaskedRead::Project {
-            let ids = Buffer::from(file_filter::first_ids(masks, usize::MAX));
+            let ids = file_filter::first_ids(masks, usize::MAX);
             if read == MaskedRead::Points
                 && let Some(codes) =
                     file_reads::file_point_codes(file, columns, None, ids.clone()).await?

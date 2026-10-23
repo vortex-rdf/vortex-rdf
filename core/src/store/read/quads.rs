@@ -45,8 +45,6 @@ use futures::future::BoxFuture;
 #[cfg(feature = "file-io")]
 use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
-use vortex_buffer::Buffer;
-#[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
 #[cfg(feature = "file-io")]
 use vortex_mask::Mask;
@@ -306,7 +304,7 @@ impl VortexRdfStore {
         let primary = self.layout.strategy().primary_column_names();
         let read = MaskedRead::of(file, masks)?;
         if read == MaskedRead::Points {
-            let ids = Buffer::from(file_filter::first_ids(masks, usize::MAX));
+            let ids = file_filter::first_ids(masks, usize::MAX);
             if let Some(rows) = file_reads::file_point_rows(file, primary, None, ids).await? {
                 let chunk = T::decode_async(&self.layout, &rows).await;
                 return Ok(with_tail(stream::iter([chunk]), tail));

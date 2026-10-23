@@ -534,7 +534,7 @@ pub(crate) async fn file_point_rows(
     file: &NativeStoreFile,
     columns: &[&str],
     filter: Option<&Expression>,
-    rows: Buffer<u64>,
+    rows: Vec<u64>,
 ) -> Result<Option<ArrayRef>> {
     let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
@@ -553,7 +553,7 @@ pub(crate) async fn file_point_codes(
     file: &NativeStoreFile,
     columns: &[&str],
     filter: Option<&Expression>,
-    rows: Buffer<u64>,
+    rows: Vec<u64>,
 ) -> Result<Option<Vec<Buffer<TermCode>>>> {
     let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
@@ -566,7 +566,7 @@ pub(crate) async fn file_point_codes(
             Some(code) => BufferMut::full(code, points.live.len()).freeze(),
             None => {
                 let mut codes = BufferMut::with_capacity(points.live.len());
-                for &row in points.live.iter() {
+                for &row in &points.live {
                     match handle.value_at(row, &source, session).await? {
                         Some(code) => codes.push(code),
                         None => return Ok(None),
@@ -586,7 +586,7 @@ pub(crate) async fn file_point_codes(
 struct PointRows {
     handles: Vec<Arc<vortex_rdf_encoded_search::ColumnChunks>>,
     eqs: Vec<(String, u64)>,
-    live: Buffer<u64>,
+    live: Vec<u64>,
 }
 
 impl PointRows {
@@ -597,7 +597,7 @@ impl PointRows {
         file: &NativeStoreFile,
         columns: &[&str],
         filter: Option<&Expression>,
-        rows: Buffer<u64>,
+        rows: Vec<u64>,
     ) -> Result<Option<Self>> {
         let eqs = match filter {
             None => Vec::new(),
@@ -647,8 +647,8 @@ type CodeCheck = (Arc<vortex_rdf_encoded_search::ColumnChunks>, u64);
 async fn rows_reading(
     file: &NativeStoreFile,
     checks: &[CodeCheck],
-    rows: Buffer<u64>,
-) -> Result<Option<Buffer<u64>>> {
+    rows: Vec<u64>,
+) -> Result<Option<Vec<u64>>> {
     let source = file.segment_source();
     let session = file.session();
     let mut live = rows;
@@ -656,15 +656,15 @@ async fn rows_reading(
         if live.is_empty() {
             break;
         }
-        let mut kept = BufferMut::with_capacity(live.len());
-        for &row in live.iter() {
+        let mut kept = Vec::with_capacity(live.len());
+        for &row in &live {
             match handle.value_at(row, &source, session).await? {
                 Some(v) if v == *code => kept.push(row),
                 Some(_) => {}
                 None => return Ok(None),
             }
         }
-        live = kept.freeze();
+        live = kept;
     }
     Ok(Some(live))
 }
@@ -723,7 +723,9 @@ pub(crate) async fn point_filter_ids(
     else {
         return Ok(None);
     };
-    rows_reading(file, &checks, ids.clone()).await
+    Ok(rows_reading(file, &checks, ids.to_vec())
+        .await?
+        .map(Buffer::from))
 }
 
 /// A take costs about as much per id as the scan's row mask spends on this
@@ -850,7 +852,7 @@ const POINT_IDS_PER_SPLIT: u64 = 16;
 /// How the rows of an exact file selection are read, cheapest first.
 pub(crate) enum ExactRead {
     /// Point by point through the chunk probes, at these live rows.
-    Points(Buffer<RowId>),
+    Points(Vec<RowId>),
     /// Taken at these live ids.
     Take(Buffer<RowId>),
     /// By the pending filter's masks first, then the rows they keep
@@ -895,15 +897,14 @@ impl ExactRead {
         #[cfg(test)]
         exact_read_hooks::note();
         let row_count = file.row_count() as usize;
-        let live = || match (selection, deleted) {
-            (RowSelection::Ids(ids), None) => ids.clone(),
-            _ => Buffer::from(
-                selection.filter_rows(row_count, move |id| deleted.is_none_or(|d| !d.value(id))),
-            ),
-        };
+        let live =
+            || selection.filter_rows(row_count, move |id| deleted.is_none_or(|d| !d.value(id)));
         Ok(match ReadKind::of(file, columns, filter, selection)? {
             ReadKind::Points => ExactRead::Points(live()),
-            ReadKind::Take => ExactRead::Take(live()),
+            ReadKind::Take => ExactRead::Take(match (selection, deleted) {
+                (RowSelection::Ids(ids), None) => ids.clone(),
+                _ => Buffer::from(live()),
+            }),
             ReadKind::Masks => ExactRead::Masks,
             ReadKind::Scan => ExactRead::Scan,
         })
