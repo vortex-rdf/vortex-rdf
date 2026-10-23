@@ -1549,10 +1549,11 @@ async fn test_kept_masks_never_outlive_a_derivation() {
         let rows = row_list(&twin).await;
         assert_eq!(row_list(&view).await, rows, "{shape}: the twin's rows");
         // A subject set of one code per sixteen of the view's rows is
-        // located; one with a code for every other subject of the store, more
-        // than one per sixteen rows of the view, is streamed.
+        // located; one with the codes of two in every three of the store's
+        // subjects, odd and even rows' alike, more than one per sixteen rows
+        // of the view, is streamed.
         let located = Keep::set(rows.iter().step_by(16).map(|row| row[0]));
-        let streamed = Keep::set((s_lo..s_hi).step_by(2));
+        let streamed = Keep::set((s_lo..s_hi).filter(|code| (code - s_lo) % 3 != 0));
         let objects = Keep::set([o0, o5]);
         let streams = || view.debug_column_streams().unwrap();
         let before = streams();
