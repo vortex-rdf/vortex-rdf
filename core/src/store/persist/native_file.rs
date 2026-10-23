@@ -61,16 +61,19 @@ pub(crate) struct NativeStoreFile {
     /// allocation. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
     /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]),
-    /// but for the code columns', which [`code_chunks`](Self::code_chunks)
-    /// holds. Each handle keeps the probes of the leaves it fetched, so a
-    /// repeated subject or index-run location skips the layout walk and the
-    /// leaf rebuilds. Bounded by the file's layout: one handle per column,
-    /// and per fetched leaf a probe over mapped bytes.
+    /// but for the code columns', which
+    /// [`code_column_chunks`](Self::code_column_chunks) holds. Each handle
+    /// keeps the probes of the leaves it fetched, so a repeated subject or
+    /// index-run location skips the layout walk and the leaf rebuilds.
+    /// Bounded by the file's layout: one handle per column, and per fetched
+    /// leaf a probe over mapped bytes.
     quad_chunks: ChunkMemo<()>,
     /// The `s`, `p`, `o` and `g` columns' handles, one slot each, held as
     /// [`quad_chunks`](Self::quad_chunks) holds the others': the lookups
-    /// every read by id makes take no lock.
-    code_chunks: [OnceLock<ColumnHandle>; 4],
+    /// every read by id makes take no lock. Racing first lookups of a slot
+    /// wait for its one build (`OnceLock`), where the memo builds outside its
+    /// lock and keeps the first insert.
+    code_column_chunks: [OnceLock<ColumnHandle>; 4],
     /// The index components' chunk-probe handles, by component name and
     /// column, held and bounded as the quad table's are.
     component_chunks: ChunkMemo<String>,
@@ -372,7 +375,7 @@ impl NativeStoreFile {
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
             quad_chunks: ChunkMemo::default(),
-            code_chunks: Default::default(),
+            code_column_chunks: Default::default(),
             component_chunks: ChunkMemo::default(),
             located: OnceLock::new(),
             bound_exprs: Arc::new(BoundExprMemo::new()),
@@ -481,7 +484,7 @@ impl NativeStoreFile {
             schema::COL_G => 3,
             _ => return self.quad_chunks.get_or_build(&(), column, build),
         };
-        self.code_chunks[slot].get_or_init(build).clone()
+        self.code_column_chunks[slot].get_or_init(build).clone()
     }
 
     /// An index component column's chunk-probe handle, the auxiliary-child

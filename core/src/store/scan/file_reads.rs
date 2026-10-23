@@ -885,8 +885,8 @@ impl ExactRead {
     /// has chunk probes and the filter is none or code equalities (checked per
     /// row); a take serves ids at most one per [`TAKE_ROWS`] rows of their
     /// splits under no filter. The rest is the filter's masks first under such
-    /// a filter of code equalities, and the scan otherwise. An id list read by
-    /// id with nothing tombstoned is read at its own buffer.
+    /// a filter of code equalities, and the scan otherwise. An id list taken
+    /// with nothing tombstoned is taken at its own buffer.
     pub(crate) fn of(
         file: &NativeStoreFile,
         columns: &[&str],
@@ -918,8 +918,8 @@ impl ExactRead {
     /// Whether [`of`](Self::of) reads `columns` at `selection` with `filter`
     /// pending by the filter's masks first: the same choice, made without
     /// building an id list (tombstones never change it). A selection with no
-    /// filter, or a point-sized one, never does: it reads point by point or
-    /// by the scan.
+    /// filter, or a point-sized one, never does: it reads by id or by the
+    /// scan.
     pub(crate) fn reads_masks(
         file: &NativeStoreFile,
         columns: &[&str],
