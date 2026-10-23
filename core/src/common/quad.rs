@@ -43,8 +43,7 @@ impl From<RawQuad> for SharedQuad {
     }
 }
 
-/// A quad holding its terms as owned N-Triples strings: the builders' input
-/// and the spill-file record.
+/// A quad holding its terms as owned N-Triples strings: the builders' input.
 ///
 /// The strings are the canonical spelling of their terms, as
 /// [`from_quad`](Self::from_quad), the parsers

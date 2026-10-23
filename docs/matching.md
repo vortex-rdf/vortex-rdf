@@ -199,8 +199,8 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` matches on the
-[`Backend`](../core/src/store/view/mod.rs#L57) of the store's
-[`QuadsSource`](../core/src/store/view/mod.rs#L41) and hands that backend's
+[`Backend`](../core/src/store/view/mod.rs#L59) of the store's
+[`QuadsSource`](../core/src/store/view/mod.rs#L43) and hands that backend's
 base and the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
@@ -532,11 +532,11 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:503-508`](../core/src/store/query/matching.rs#L503-L508 "FileBase") | — |
-| 1 · subject chunk probe and prefix | [`matching.rs:509-516`](../core/src/store/query/matching.rs#L509-L516 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L688), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L359), [`narrow_subject_run`](../core/src/store/scan/file_reads.rs#L388) | [§7.1](#71-subject-chunk-probe) |
+| 1 · subject chunk probe and prefix | [`matching.rs:509-516`](../core/src/store/query/matching.rs#L509-L516 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L688), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L362), [`narrow_subject_run`](../core/src/store/scan/file_reads.rs#L391) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`matching.rs:517-530`](../core/src/store/query/matching.rs#L517-L530 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L691) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:543-613`](../core/src/store/query/matching.rs#L543-L613 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L330) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:536-537`](../core/src/store/query/matching.rs#L536-L537 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L795) and [`matching.rs:621-635`](../core/src/store/query/matching.rs#L621-L635 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L717), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L342) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
-| 5 · filter at sparse ids | [`matching.rs:637-652`](../core/src/store/query/matching.rs#L637-L652 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L704) | [§7.3](#73-what-ends-up-on-the-view) |
+| 3 · pushed-down filter | [`matching.rs:543-613`](../core/src/store/query/matching.rs#L543-L613 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L333) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:536-537`](../core/src/store/query/matching.rs#L536-L537 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L795) and [`matching.rs:621-635`](../core/src/store/query/matching.rs#L621-L635 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L717), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L413) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 5 · filter at sparse ids | [`matching.rs:637-652`](../core/src/store/query/matching.rs#L637-L652 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L707) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -549,7 +549,7 @@ each split they touch.
 ### 7.1 Subject chunk probe
 
 The file mirror of the in-memory subject binary search
-([`locate_subject_run`](../core/src/store/scan/file_reads.rs#L359)): it
+([`locate_subject_run`](../core/src/store/scan/file_reads.rs#L362)): it
 binary-searches the subject column's **encoded chunks** through cached chunk
 probes, reading only the chunks the bisection touches. It requires `u64::try_from(&probe)` to succeed, so
 it engages **only under the Dictionary layout** — a string-subject file falls
@@ -562,7 +562,7 @@ declines bound-subject patterns, so this fast path takes an uncontested route.
 
 Then, as the in-memory prefix probe does, it narrows the run by the roles
 behind the subject in sort order
-([`narrow_subject_run`](../core/src/store/scan/file_reads.rs#L388)): each bound
+([`narrow_subject_run`](../core/src/store/scan/file_reads.rs#L391)): each bound
 role whose term has a code is binary-searched inside the run through its
 column's chunk probes (`ColumnChunks::bounds_in`) and leaves the pattern. The
 first role that is unbound, has no code or whose chunks decline ends the
@@ -584,7 +584,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L342) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L413) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -616,7 +616,7 @@ read touches one zone rather than the file.
   When the selection is exact row ids at most one per `POINT_READ_ROWS` (256)
   rows of the splits holding them, stage 5 reads the filter's columns at those
   ids through the chunk probes, keeps the ids that pass and leaves no filter
-  ([`point_filter_ids`](../core/src/store/scan/file_reads.rs#L704)) — the
+  ([`point_filter_ids`](../core/src/store/scan/file_reads.rs#L707)) — the
   in-memory residual step ([§6.3](#63-residual-column-filtering)) on file. A
   denser selection, or a filter that is not code equalities, keeps the filter.
 - **Selection** — the first of these that applies: an index's row ids folded
@@ -751,7 +751,7 @@ probe-incompatible.
 **On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L40)
 binary-searches the value column's chunk probes (sorted child + integer probe
 required). A located run's ids are `Lazy`
-([`read_located_rids`](../core/src/store/indexes/file.rs#L137)): a count
+([`read_located_rids`](../core/src/store/indexes/file.rs#L160)): a count
 takes the run's width, a window reads only its own rows, and materialized, a
 run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/file.rs#L71)
 and a wider one a rid-only scan restricted to the range — neither pays filter
@@ -781,7 +781,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L1011) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L513)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L1236) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L536)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -929,11 +929,11 @@ The match's decisions show up here
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else a range scan of the located run (`located_run_scan`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries; on file, read it by id or scan it as `ExactRead` chooses (below) |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — one `Arc<str>` per distinct term of a chunk, handed to every row repeating it | the same gather or restricted scan, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located run's width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns: in memory a run of at most 256 rows through its probes, on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L538)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
+| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns: in memory a run of at most 256 rows through its probes, on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L561)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
 | `raw_quad_chunks()` | plan deliberately ignored (it reorders rows): the pending ids materialize and the rows are read as without one | as `quads()`, in base row order: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
 
 An exact file selection is read the cheapest way
-([`ExactRead`](../core/src/store/scan/file_reads.rs#L850)): point by point
+([`ExactRead`](../core/src/store/scan/file_reads.rs#L853)): point by point
 through the chunk probes when it is point-sized, or ids at most 16 per split
 they touch (`POINT_IDS_PER_SPLIT`), and every column has chunk probes;
 taken at its ids when they number at most one per 16 rows of their splits
@@ -941,6 +941,20 @@ taken at its ids when they number at most one per 16 rows of their splits
 leaves, else split by split; scanned otherwise. A take runs the in-memory
 gather's kernels over the wire-encoded leaves, where the scan's row mask would
 filter a run-end column run by run over every split it touches.
+
+A one-shot read (`code_columns_gathered`, `quads_vec`, `shared_quads_vec`) of a
+view whose pending filter is code equalities over columns with chunk probes,
+at a selection those reads decline, reads the filter's masks first
+(`ExactRead::Masks`): the per-split filter loop a window runs
+([§16.2](#162-window-size_capped-exists)), every split evaluated, in file order.
+The rows the masks keep are then read the same way, by their density over the
+splits holding them (`MaskedRead`): point by point, by one take, or, denser
+than a take, each split projected at its own mask, the filter not evaluated
+again. `quads_vec` and `shared_quads_vec` read and decode a take or a
+projection split by split, spawning the split reads when there is more than
+one and a tokio runtime is current. The streams (`quads()`, `row_chunks`,
+`code_chunks`, the data source) keep the restricted scan, which reads the file
+split by split as they are pulled.
 
 `LazyRowIds` caches into a shared `OnceLock`, so the first consumer that needs
 the ids pays for them once and every clone of the view reads them back for free.
@@ -1140,10 +1154,41 @@ so a chained `match_pattern` narrows it exactly as
 ### 16.2 `window`, `size_capped`, `exists`
 
 `window(offset, limit)` is the view's rows after skipping `offset` and
-taking `limit`, in read order — base rows in base row order, then the
-tail's (available on every layout). In memory and on an unfiltered file view
-it is a position range over the selection, no I/O (`RowSelection::window`
-steps over tombstones). On a view whose selection is a located reference run
+taking `limit` (available on every layout). A window that cannot cut a row
+is the view as it is: serve plan, pending filter and row order included, so
+it reads its rows in the order the view itself reads them. It cannot cut
+one when `offset` is 0 and `limit` is at least the view's row count, or a
+bound on it, known without reading: the `rows.upper_bound` of
+`view_statistics`
+([interfaces §5](interfaces.md#5-what-a-view-promises-before-it-is-read)),
+the base's selected rows (a pending run's width; under a pending file
+filter, the rows it has yet to test), their live rows under tombstones when
+those take no read, plus the tail's live rows. The selected rows are tested
+first, which decodes nothing; the live rows are counted only under
+tombstones, when the selected rows do not fit (an in-memory run's ids are
+decoded to count them). A served file run whose width is unknown until its
+ids are read (an index child the resolver could not locate: under the
+Default and TypedObject layouts, or a Dictionary leaf without a chunk
+probe) reads them first when there is no offset, into the cell the view
+shares, and is the view as it is when they fit the limit; a window that
+cuts takes them from that cell. A view built only to be counted or
+windowed, an index run pending without a plan (`IdsNeed::CountOrWindow`),
+is windowed as below whatever the limit: the window's rows are the plain
+match's rows in base order, and where `QuadsSource::located_window` answers
+(no tombstones, an in-memory run whose rids ascend, a file run with no
+filter) the window reads them without the run's other ids. So is a file
+view whose reads take its pending filter by the masks first
+(`ExactRead::Masks`: no serve plan, a filter of code equalities over
+columns with chunk probes, at an exact selection the reads by id decline):
+those reads would evaluate the filter anyway, so with no offset its window
+evaluates the filter's split masks, as below, and finds whether it cuts,
+the view's statistics exact from then on.
+
+Any other window is a position range over base order, in read order — base
+rows in base row order, then the tail's — and drops the serve plan. In
+memory and on an unfiltered file view it is a position range over the
+selection, no I/O (`RowSelection::window` steps over tombstones). On a view
+whose selection is a located reference run
 held pending (`IdsNeed::CountOrWindow`), it reads only the run's rows the
 window takes (`QuadsSource::located_window`): the run is in `(val, rid)` order,
 so those rows hold the window's ids — in memory cut out of the run's rid column
@@ -1153,7 +1198,29 @@ pending filter it is
 [§7](#7-the-file-path), run *in file order* with a few splits in flight, and
 stopped at the first split that fills `offset + limit` rows — so `LIMIT`
 over a filtered scan costs the matching prefix of the file, not all of it.
-The window's view carries exact ids and no filter.
+The loop's splits run inline up to 42 splits and are spawned above, as a row
+scan's are. The window's view carries exact ids and no filter.
+
+With no offset over such a view, an exact selection and no serve plan, the
+loop is the filter's split masks (`split_masks_until`), and the window looks
+at what it found. Enough matches are the window's first `limit` ids. Fewer
+mean it cuts no base row, which no bound could tell before reading: the view
+keeps its rows, its tail windowed to what the base left of the limit, and
+keeps the evaluation. Its filter's masks are kept when the filter is code
+equalities over columns with chunk probes, the filter `ExactRead::Masks`
+reads, and the masks take less memory than the matches' ids (a bit a row of
+each split a mask keeps some rows of, against 64 a match); otherwise those
+ids are kept, with the filter dropped. Either way `view_statistics` reports
+the rows exactly and no filter pending, and no read or count runs the filter
+again. With the masks kept, the one-shot reads take the rows from them as
+they read any filter's masks
+([§12](#12-what-the-derived-view-costs-at-read-time)) and the streams read
+the ids the masks keep; with the ids kept, every read reads those. Ids are
+read as `ExactRead` reads exact ids: a point-sized set, or one of at most 16
+ids a split, at once; a set at a take's density by takes, one window of ids
+per pull for `code_chunks`, `row_chunks` and the data source, the whole set
+as one chunk for `quads()` and `shared_quad_chunks`; anything denser by a
+scan of those ids.
 
 `size_capped(limit)` is `min(size, limit)` by the same loop
 (`count_matching_rows_capped`), and `exists()` is `size_capped(1) > 0` —

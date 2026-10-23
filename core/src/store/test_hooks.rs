@@ -42,6 +42,11 @@ thread_local! {
     /// first term (see [`CodeBase`]); 0 outside a guard.
     static CODE_BASE: std::cell::Cell<TermCode> = const { std::cell::Cell::new(0) };
 
+    /// The most distinct terms an out-of-core build on this thread may hold
+    /// (see [`TermCap`]); the dictionary's `i32::MAX` outside a guard.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static TERM_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(i32::MAX as usize) };
+
     /// The row id the indexed builds on this thread give their first row
     /// (see [`RowIdBase`]); 0 outside a guard.
     static ROW_ID_BASE: std::cell::Cell<RowId> = const { std::cell::Cell::new(0) };
@@ -114,6 +119,37 @@ impl Drop for CodeBase {
     }
 }
 
+/// The most distinct terms an out-of-core build on this thread may hold:
+/// `i32::MAX`, unless a [`TermCap`] guard is live. Read by the build's term
+/// interner at every new term.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn term_cap() -> usize {
+    TERM_CAP.with(std::cell::Cell::get)
+}
+
+/// While alive, every out-of-core build on this thread refuses its term past
+/// `cap` instead of past `i32::MAX`, so a few terms reach the refusal a
+/// dictionary of two billion terms would. Dropping the guard restores the cap
+/// it replaced. Thread-local like `GATHERS`, for the same reason.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) struct TermCap(usize);
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl TermCap {
+    /// Cap this thread's builds at `cap` distinct terms until the guard
+    /// drops.
+    pub(crate) fn set(cap: usize) -> Self {
+        TermCap(TERM_CAP.with(|cell| cell.replace(cap)))
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Drop for TermCap {
+    fn drop(&mut self) {
+        TERM_CAP.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Record `rows` row ids decoded from a component's `rid` column (called by
 /// `sorted_row_ids`).
 pub(crate) fn note_decoded_rids(rows: usize) {
@@ -168,6 +204,17 @@ impl VortexRdfStore {
         match &self.quads.selection {
             ViewSelection::Exact(RowSelection::Range(range)) => Some(range.clone()),
             _ => None,
+        }
+    }
+
+    /// The pending selection's id count as far as it is known without
+    /// reading (an in-memory run's or a located file run's width, or ids
+    /// already read): `Some(None)` for a file run whose ids are unread and
+    /// whose width is unknown, `None` for an exact selection.
+    pub(crate) fn debug_pending_len(&self) -> Option<Option<usize>> {
+        match &self.quads.selection {
+            ViewSelection::Pending(lazy) => Some(lazy.len_if_known()),
+            ViewSelection::Exact(_) => None,
         }
     }
 
@@ -273,6 +320,30 @@ impl VortexRdfStore {
     /// in, and none a caller gets back is.
     pub(crate) fn debug_pending_without_plan(&self) -> bool {
         self.quads.is_pending_without_plan()
+    }
+
+    /// The live base rows the filter masks a window kept on this view hold
+    /// (see `FileBase::masks`); `None` on a view without them.
+    pub(crate) fn debug_evaluated_len(&self) -> Option<usize> {
+        self.quads.evaluated_len()
+    }
+
+    /// Whether this view's one-shot reads take its pending filter by the
+    /// masks first, which makes its window evaluate the filter whatever the
+    /// bound (see `reads_masks_first`).
+    pub(crate) fn debug_reads_masks_first(&self) -> bool {
+        self.reads_masks_first()
+            .expect("the read choice needs only the file's splits")
+    }
+
+    /// A primary column's chunk-probe handle as `(row count, flat leaves)` —
+    /// `None` off-file or when the column's shape declines the handle.
+    pub(crate) fn debug_quad_column_chunks(&self, column: &str) -> Option<(u64, usize)> {
+        self.quads
+            .file()?
+            .file
+            .column_chunks(column)
+            .map(|chunks| (chunks.row_count(), chunks.chunk_count()))
     }
 
     /// An index component column's chunk-probe handle as `(row count, flat

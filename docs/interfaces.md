@@ -18,10 +18,10 @@ is the path such an engine takes.
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L103) on any view, registered with vortex's `VortexTable` |
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L152), [`index_components`](../core/src/store/read/metadata.rs#L226), [`partitions`](../core/src/store/read/metadata.rs#L261) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L156), [`index_components`](../core/src/store/read/metadata.rs#L235), [`partitions`](../core/src/store/read/metadata.rs#L270) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L243) (from [`dict_reader`](../core/src/store/mod.rs#L203)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L141), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L267) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L142), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L267) |
 | The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L82), with [`vortex_scan`](../core/src/lib.rs#L76) re-exported |
 
 ---
@@ -151,7 +151,11 @@ order, never the index's.
 `code_columns_gathered` is the one-shot form, for a match the caller has
 counted and will consume whole: one call answers all four columns,
 zero-copy over the base's canonical code columns for a contiguous selection
-without tombstones. The chunk stream is the form for a match consumed
+without tombstones. On a file view whose pending filter no read by id
+serves, it evaluates the filter's masks split by split first and then reads
+only the rows they keep, point by point, by one take, or by projecting each
+split at its mask, where the streams scan the file. The chunk stream is the
+form for a match consumed
 incrementally or of unknown size, and the bindings reach it through
 `match_code_chunks` (Python) and `matchCodeChunks` (JS). A Python
 `match_codes` call given a cancel token returns its result when its gather
@@ -201,13 +205,17 @@ Every read is lazy, and a stream's first poll decides how it runs:
   the call's error.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
-  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L64)), and a
+  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L67)), and a
   scan first polled where no tokio runtime is current run inline on the
   polling task. Any other scan spawns its splits
-  ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L41)) onto the tokio
+  ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L44)) onto the tokio
   runtime it is polled in, and vortex looks that runtime up
   (`Handle::current()`) at every spawn, so every later poll of the stream
-  must run inside a tokio runtime too.
+  must run inside a tokio runtime too. A filtered file view's capped count,
+  window and one-shot reads evaluate the filter split by split under the
+  same rule, and `quads_vec` and `shared_quads_vec` spawn their split reads
+  whenever there is more than one and a runtime is current: each such call,
+  once it has spawned, must be polled to completion inside that runtime.
 - A file-backed store's component tables are vortex's own
   `LayoutReaderDataSource`, whose scan always spawns: read them inside a
   tokio runtime.
@@ -227,12 +235,12 @@ is the one way it fails.
 
 | Field | Meaning |
 |---|---|
-| `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
+| `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones; a filter a window has evaluated, finding it cuts no row, counts as none. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
 | `sort_order` | `Some(Spog)` when the base is globally sorted (every base this crate writes) and the view reads no tail row — the order `row_chunks`, `code_chunks` and the data source produce, whatever answered the match. A view that reads tail rows has none: they follow the base in append order. |
-| `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a pending file filter binds by equality. |
+| `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a file view's pushed-down filter binds by equality, while the view still carries the filter (pending, or evaluated by a window that kept its masks). |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |
 | `served_component` | The index child that answered the match, if any (`index:posg`, …; `quads()` on such a view decodes in that child's order). |
-| `pending_filter` | Whether every read runs a pushed-down file filter. |
+| `pending_filter` | Whether every read runs a pushed-down file filter. A filter a window has evaluated over every row, finding it cuts none, is not pending: its matches are counted exactly and read without running it again, and the view's selection reads as `Ids`. |
 | `tombstones`, `tail_rows` | Rows tombstoned in the base (never counted) and live rows in the append tail (counted, read last). |
 | `file_backed`, `generation` | Where the base lives, and the data's identity ([§7](#7-snapshots-and-mutation)). |
 

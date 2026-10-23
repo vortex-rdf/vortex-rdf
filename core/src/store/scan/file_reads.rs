@@ -7,15 +7,17 @@ use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use futures::{StreamExt, future, stream};
+use futures::{FutureExt as _, StreamExt, future, stream};
 use oxrdf::NamedOrBlankNode;
+use vortex_array::dtype::DType;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root, select};
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::{Buffer, BufferMut};
-use vortex_error::VortexExpect as _;
+use vortex_error::{VortexExpect as _, VortexResult};
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_mask::{AllOr, Mask};
 use vortex_scan::selection::Selection;
@@ -28,9 +30,10 @@ use crate::io::read::{
 };
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::persist::native_file::NativeStoreFile;
+use crate::store::scan::file_filter;
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::schema::{self, RowId, TermCode};
-use crate::store::view::selection::RowSelection;
+use crate::store::view::selection::{RowSelection, point_sized};
 
 /// The bind-memo scope tag for expressions over the quad table's schema
 /// (the transparent root the file scan reads).
@@ -639,8 +642,8 @@ impl PointRows {
 type CodeCheck = (Arc<vortex_rdf_encoded_search::ColumnChunks>, u64);
 
 /// The rows of `rows` at which every check's column reads its code, read
-/// point by point through the chunk probes. `None` when a chunk the reads
-/// reach has no probe.
+/// point by point through the chunk probes; `rows` itself when there is no
+/// check. `None` when a chunk the reads reach has no probe.
 async fn rows_reading(
     file: &NativeStoreFile,
     checks: &[CodeCheck],
@@ -849,11 +852,30 @@ const POINT_IDS_PER_SPLIT: u64 = 16;
 /// How the rows of an exact file selection are read, cheapest first.
 pub(crate) enum ExactRead {
     /// Point by point through the chunk probes, at these live rows.
-    Points(Vec<u64>),
+    Points(Vec<RowId>),
     /// Taken at these live ids.
-    Take(Vec<RowId>),
+    Take(Buffer<RowId>),
+    /// By the pending filter's masks first, then the rows they keep
+    /// ([`MaskedRead`]): a filter of code equalities over columns that all
+    /// have chunk probes, at a selection the reads by id decline. A streaming
+    /// reader reads it as [`Scan`](Self::Scan).
+    Masks,
     /// By the restricted scan.
     Scan,
+}
+
+/// Whether reads by id can check `filter` while reading `columns` of `file`
+/// point by point: the filter is none or code equalities (checked per row),
+/// and every column has chunk probes. [`ExactRead`]'s condition for its
+/// point reads, and, with a filter pending, for reading the filter's masks
+/// first.
+pub(crate) fn point_readable(
+    file: &NativeStoreFile,
+    columns: &[&str],
+    filter: Option<&Expression>,
+) -> bool {
+    filter.is_none_or(|f| eq_code_pairs(f).is_some())
+        && columns.iter().all(|c| file.column_chunks(c).is_some())
 }
 
 impl ExactRead {
@@ -862,7 +884,9 @@ impl ExactRead {
     /// at most [`POINT_IDS_PER_SPLIT`] per split they touch, when every column
     /// has chunk probes and the filter is none or code equalities (checked per
     /// row); a take serves ids at most one per [`TAKE_ROWS`] rows of their
-    /// splits under no filter; the scan serves the rest.
+    /// splits under no filter. The rest is the filter's masks first under such
+    /// a filter of code equalities, and the scan otherwise. An id list taken
+    /// with nothing tombstoned is taken at its own buffer.
     pub(crate) fn of(
         file: &NativeStoreFile,
         columns: &[&str],
@@ -873,25 +897,80 @@ impl ExactRead {
         #[cfg(test)]
         exact_read_hooks::note();
         let row_count = file.row_count() as usize;
-        let pointable = filter.is_none_or(|f| eq_code_pairs(f).is_some())
-            && columns.iter().all(|c| file.column_chunks(c).is_some());
+        let pointable = point_readable(file, columns, filter);
         if pointable && let Some(rows) = selection.point_sized_live_rows(deleted, row_count) {
             return Ok(ExactRead::Points(rows));
         }
+        let live =
+            || selection.filter_rows(row_count, move |id| deleted.is_none_or(|d| !d.value(id)));
+        let read = match ReadKind::past_point_sized(file, filter, selection, pointable)? {
+            ReadKind::Points => ExactRead::Points(live()),
+            ReadKind::Take => ExactRead::Take(match (selection, deleted) {
+                (RowSelection::Ids(ids), None) => ids.clone(),
+                _ => Buffer::from(live()),
+            }),
+            ReadKind::Masks => ExactRead::Masks,
+            ReadKind::Scan => ExactRead::Scan,
+        };
+        Ok(read)
+    }
+
+    /// Whether [`of`](Self::of) reads `columns` at `selection` with `filter`
+    /// pending by the filter's masks first: the same choice, made without
+    /// building an id list (tombstones never change it). A selection with no
+    /// filter, or a point-sized one, never does: it reads by id or by the
+    /// scan.
+    pub(crate) fn reads_masks(
+        file: &NativeStoreFile,
+        columns: &[&str],
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+    ) -> Result<bool> {
+        if filter.is_none() || selection.is_point_sized() {
+            return Ok(false);
+        }
+        let pointable = point_readable(file, columns, filter);
+        Ok(ReadKind::past_point_sized(file, filter, selection, pointable)? == ReadKind::Masks)
+    }
+}
+
+/// Which read [`ExactRead::of`] makes, before it builds any id list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadKind {
+    Points,
+    Take,
+    Masks,
+    Scan,
+}
+
+impl ReadKind {
+    /// [`ExactRead::of`]'s choice for `selection` with `filter` pending, once
+    /// a point-sized selection the reads by id can check is ruled out (it
+    /// reads point by point): `pointable` is whether they can check the
+    /// filter on the columns read ([`point_readable`]).
+    fn past_point_sized(
+        file: &NativeStoreFile,
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+        pointable: bool,
+    ) -> Result<Self> {
+        let unread = if pointable && filter.is_some() {
+            ReadKind::Masks
+        } else {
+            ReadKind::Scan
+        };
         let RowSelection::Ids(ids) = selection else {
-            return Ok(ExactRead::Scan);
+            return Ok(unread);
         };
         let splits = file.splits()?;
         let footprint = Footprint::of(ids, &splits);
-        let live =
-            || selection.filter_rows(row_count, move |id| deleted.is_none_or(|d| !d.value(id)));
         if pointable && footprint.few_per_split(POINT_IDS_PER_SPLIT) {
-            return Ok(ExactRead::Points(live()));
+            return Ok(ReadKind::Points);
         }
         if filter.is_none() && footprint.sparse(TAKE_ROWS) {
-            return Ok(ExactRead::Take(live()));
+            return Ok(ReadKind::Take);
         }
-        Ok(ExactRead::Scan)
+        Ok(unread)
     }
 }
 
@@ -912,6 +991,152 @@ pub(crate) mod exact_read_hooks {
     /// The reads chosen on this thread so far.
     pub(crate) fn chosen() -> usize {
         CHOSEN.with(Cell::get)
+    }
+}
+
+/// How the rows a pending filter's split masks keep are read, cheapest first,
+/// once the masks have applied the filter: point by point while the kept ids
+/// are point-sized or at most [`POINT_IDS_PER_SPLIT`] per split they touch,
+/// taken at their ids while at most one per [`TAKE_ROWS`] rows of those
+/// splits (the reads [`ExactRead`] makes of exact ids under no filter), and
+/// past that density each split projected at its own mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaskedRead {
+    /// Point by point through the chunk probes.
+    Points,
+    /// Taken at the kept ids.
+    Take,
+    /// Each split with a match projected at its mask.
+    Project,
+}
+
+impl MaskedRead {
+    /// The read of the rows `masks` keep: each evaluated split's surviving
+    /// mask beside its range, clamped to the view's selection, in file order.
+    /// The kept ids are weighed, as [`ExactRead`] weighs exact ids, against
+    /// the natural splits holding them.
+    pub(crate) fn of(file: &NativeStoreFile, masks: &[(Mask, Range<u64>)]) -> Result<Self> {
+        let splits = file.splits()?;
+        let (mut ids, mut touched, mut rows) = (0u64, 0u64, 0u64);
+        for (mask, range) in masks {
+            let kept = mask.true_count() as u64;
+            if kept == 0 {
+                continue;
+            }
+            ids += kept;
+            touched += 1;
+            let split = splits.partition_point(|s| s.end <= range.start);
+            rows += splits
+                .get(split)
+                .map_or(range.end - range.start, |s| s.end - s.start);
+        }
+        let footprint = Footprint {
+            ids,
+            splits: touched,
+            rows,
+        };
+        let read = if point_sized(ids) || footprint.few_per_split(POINT_IDS_PER_SPLIT) {
+            MaskedRead::Points
+        } else if footprint.sparse(TAKE_ROWS) {
+            MaskedRead::Take
+        } else {
+            MaskedRead::Project
+        };
+        #[cfg(test)]
+        masked_read_hooks::note(read);
+        Ok(read)
+    }
+}
+
+/// One split's read of the rows its mask keeps.
+pub(crate) type SplitRead = BoxFuture<'static, VortexResult<Option<ArrayRef>>>;
+
+/// The reads of the rows `masks` keep, one per split with a match in split
+/// order, beside their struct dtype: `columns` taken at the split's kept ids
+/// (`take`), or projected at its mask. A projection is handed a mask of its
+/// own over the kept mask's bits, so nothing the projection caches on its
+/// mask stays on `masks`.
+pub(crate) fn masked_split_tasks(
+    file: &Arc<NativeStoreFile>,
+    columns: &[&'static str],
+    masks: &[(Mask, Range<u64>)],
+    take: bool,
+) -> Result<(DType, Vec<SplitRead>)> {
+    let reader = file.layout_reader()?;
+    let projection =
+        file.bound_exprs()
+            .bind(QUAD_SCOPE, &select(columns, root()), reader.dtype())?;
+    let dtype = projection.dtype().clone();
+    let columns: Arc<[&'static str]> = Arc::from(columns);
+    let mut tasks: Vec<SplitRead> = Vec::new();
+    for (mask, range) in masks {
+        if mask.all_false() {
+            continue;
+        }
+        if take {
+            let mut ids = Vec::new();
+            file_filter::push_kept_ids(&mut ids, mask, range);
+            let (file, columns) = (Arc::clone(file), Arc::clone(&columns));
+            tasks.push(
+                async move {
+                    Ok::<_, vortex_error::VortexError>(take_file_rows(&file, &columns, &ids).await?)
+                }
+                .boxed(),
+            );
+            continue;
+        }
+        let split_mask = match mask.bit_buffer() {
+            AllOr::Some(bits) => Mask::from_buffer(bits.clone()),
+            _ => Mask::new_true(mask.len()),
+        };
+        let projected =
+            reader.projection_evaluation(range, &projection, MaskFuture::ready(split_mask))?;
+        tasks.push(async move { projected.await.map(Some) }.boxed());
+    }
+    Ok((dtype, tasks))
+}
+
+/// The rows of `columns` that `masks` keep, each split with a match projected
+/// at its mask ([`masked_split_tasks`]), in one array in split order, the
+/// splits driven as [`read_all_rows`] drives a scan's: inline up to
+/// [`MAX_INLINE_SPLITS`], spawned above.
+pub(crate) async fn masked_projection(
+    file: &Arc<NativeStoreFile>,
+    columns: &[&'static str],
+    masks: &[(Mask, Range<u64>)],
+) -> Result<ArrayRef> {
+    let (dtype, tasks) = masked_split_tasks(file, columns, masks, false)?;
+    match ScanDriver::for_row_scan(tasks.len()) {
+        ScanDriver::Inline => collect_scan(dtype, tasks).await,
+        ScanDriver::Spawned => {
+            collect_scan_spawned(dtype, tasks, 4 * available_parallelism()).await
+        }
+    }
+}
+
+/// Test hook: how many reads of a filter's kept rows this thread chose
+/// ([`MaskedRead`]), by kind.
+#[cfg(test)]
+pub(crate) mod masked_read_hooks {
+    use std::cell::Cell;
+
+    use super::MaskedRead;
+
+    thread_local! {
+        static READS: Cell<[usize; 3]> = const { Cell::new([0; 3]) };
+    }
+
+    /// Record one masked read of kind `read`.
+    pub(super) fn note(read: MaskedRead) {
+        let mut reads = READS.get();
+        reads[read as usize] += 1;
+        READS.set(reads);
+    }
+
+    /// The masked reads chosen on this thread so far: `[points, takes,
+    /// projections]`.
+    pub(crate) fn reads() -> [usize; 3] {
+        READS.get()
     }
 }
 

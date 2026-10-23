@@ -165,13 +165,14 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
     }
 }
 
-/// Windows and capped counts of every view agree with slicing its
-/// base-ordered rows.
-async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
+/// The views [`assert_windows_match_slicing`] windows, each beside its tag:
+/// the whole store, a bound predicate, object, subject and predicate-object
+/// pair, and an object keep.
+async fn slicing_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let o3 = Term::Literal(Literal::new_simple_literal("o3"));
     let s42 = subject_node(42, 4);
-    let views: Vec<(&str, VortexRdfStore)> = vec![
+    vec![
         ("whole", store.clone()),
         (
             "p-bound",
@@ -208,10 +209,28 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
                 .await
                 .unwrap(),
         ),
-    ];
-    for (view_tag, view) in &views {
+    ]
+}
+
+/// Windows and capped counts of every view agree with slicing its
+/// base-ordered rows. A window that keeps a serve plan is one that cuts no
+/// row, and reads the rows of the same match built anew, read plain, in its
+/// order: its codes, and its quads in the index's order, which on a store
+/// with the copy index is not always base order.
+async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
+    let views = slicing_views(store).await;
+    let plain_views = slicing_views(store).await;
+    let mut index_ordered = 0;
+    for ((view_tag, view), (_, plain)) in views.iter().zip(&plain_views) {
         let rows = base_ordered_codes(view).await;
         let n = rows.len();
+        let base_quads = view
+            .keep(QuadColumn::S, &Keep::range(0..TermCode::MAX))
+            .await
+            .unwrap()
+            .quads_vec()
+            .await
+            .unwrap();
         for (offset, limit) in [
             (0, 0),
             (0, 1),
@@ -226,9 +245,25 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
         ] {
             let windowed = view.window(offset, limit).await.unwrap();
             let want: Vec<[TermCode; 4]> = rows.iter().copied().skip(offset).take(limit).collect();
+            let read = if served_component(&windowed).is_some() {
+                assert!(
+                    offset == 0 && limit >= n,
+                    "{tag}/{view_tag}: window({offset}, {limit}) cuts rows and keeps the plan"
+                );
+                let quads = plain.quads_vec().await.unwrap();
+                assert_eq!(
+                    windowed.quads_vec().await.unwrap(),
+                    quads,
+                    "{tag}/{view_tag}: window({offset}, {limit}): the plain quads, in order"
+                );
+                index_ordered += usize::from(quads != base_quads);
+                row_list(plain).await
+            } else {
+                want.clone()
+            };
             assert_eq!(
                 row_list(&windowed).await,
-                want,
+                read,
                 "{tag}/{view_tag}: window({offset}, {limit})"
             );
             assert_eq!(
@@ -262,6 +297,12 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
             "{tag}/{view_tag}"
         );
         assert_eq!(view.size_capped(0).await.unwrap(), 0, "{tag}/{view_tag}");
+    }
+    if store.indexes().contains(&IndexType::SecondaryByCopy) {
+        assert!(
+            index_ordered > 0,
+            "{tag}: a served window whose plain order is not base order"
+        );
     }
 }
 
@@ -478,6 +519,590 @@ async fn test_narrowing_gates_and_tails() {
             .await
             .is_ok()
     );
+}
+
+// ─── Windows that cannot cut a row ────────────────────────────────────────
+
+/// The stores the window rules are checked over, each beside its tag: every
+/// open of the fixture's files ([`file_stores`]), and the fixture built in
+/// memory with no index, the copy index and the reference index. The dir
+/// guards keep the files alive for the stores' lifetime.
+async fn window_stores() -> (
+    Vec<std::sync::Arc<tempfile::TempDir>>,
+    Vec<(String, VortexRdfStore)>,
+) {
+    let mut dirs = Vec::new();
+    let mut stores = Vec::new();
+    for (tag, dir, store) in file_stores().await {
+        dirs.push(dir);
+        stores.push((tag, store));
+    }
+    for (tag, indexes) in [
+        ("memory/no-index", vec![]),
+        ("memory/copy", vec![IndexType::SecondaryByCopy]),
+        ("memory/reference", vec![IndexType::SecondaryByReference]),
+    ] {
+        stores.push((tag.to_string(), memory_store(indexes).await));
+    }
+    (dirs, stores)
+}
+
+/// The probes the window rules are checked with, each beside its shape: `P`,
+/// `PO` and `O`, which the copy index serves and the reference index
+/// resolves to a run; the located subject runs `S` and `SP`; and `SPG`, a
+/// located `(s, p)` run whose graph is left to a filter, pending on file.
+fn window_probes() -> Vec<(&'static str, Probe)> {
+    // The fixture's row 42: `s0042 p2 "o0"` in the default graph.
+    let s = subject_node(42, 4);
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p2 = NamedNode::new("http://example.org/p2").unwrap();
+    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    vec![
+        ("P", Probe::new(None, Some(p1.clone()), None, None)),
+        ("PO", Probe::new(None, Some(p1), Some(o3.clone()), None)),
+        ("O", Probe::new(None, None, Some(o3), None)),
+        ("S", Probe::new(Some(s.clone()), None, None, None)),
+        (
+            "SP",
+            Probe::new(Some(s.clone()), Some(p2.clone()), None, None),
+        ),
+        (
+            "SPG",
+            Probe::new(Some(s), Some(p2), None, Some(GraphName::DefaultGraph)),
+        ),
+    ]
+}
+
+/// A window with no offset whose limit is at least the match's rows (the row
+/// count, one more, or every row) is the plain match: the same rows in the
+/// same order, the same serve plan, all the same statistics under an
+/// unbounded limit, and never a view pending without a plan, on every open
+/// and index set, in memory and on file. The exception is a filtered file
+/// match whose reads take its filter by the masks first: its window
+/// evaluates the filter whatever the limit, so the plain rows, in order, come
+/// with exact statistics.
+#[tokio::test]
+async fn test_window_that_cannot_cut_is_the_plain_view() {
+    let (_dirs, stores) = window_stores().await;
+    for (tag, store) in &stores {
+        for (shape, probe) in window_probes() {
+            let label = format!("{tag} {shape}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            let n = plain.size().await.unwrap();
+            assert!(n > 0, "{label}: the fixture matches");
+            let rows = row_list(&plain).await;
+            assert_eq!(rows.len(), n, "{label}");
+            let stats = plain.view_statistics().unwrap();
+            // Each shape is what it is named for: the copy index serves the
+            // index-eligible ones, and on file the graph's filter is left
+            // pending beside the located run. A mapped file reads a pending
+            // filter of code equalities by its masks first: the no-index
+            // file's index-eligible ones, and the predicate the reference
+            // index leaves beside the object's run.
+            assert_eq!(
+                stats.served_component.is_some(),
+                tag.contains("copy") && matches!(shape, "P" | "PO" | "O"),
+                "{label}: served"
+            );
+            if shape == "SPG" && stats.file_backed {
+                assert!(stats.pending_filter, "{label}: the graph's filter");
+            }
+            let masks_first = plain.debug_reads_masks_first();
+            let expected = match tag.as_str() {
+                "file/no-index/mapped" => matches!(shape, "P" | "PO" | "O"),
+                "file/reference/mapped" => shape == "PO",
+                _ => false,
+            };
+            assert_eq!(
+                masks_first, expected,
+                "{label}: read by the filter's masks first"
+            );
+            for limit in [n, n + 1, usize::MAX] {
+                let windowed = store
+                    .run_probe(&probe.clone().window(0, Some(limit)))
+                    .await
+                    .unwrap();
+                assert!(
+                    !windowed.debug_pending_without_plan(),
+                    "{label} limit {limit}: readable"
+                );
+                let got = windowed.view_statistics().unwrap();
+                assert_eq!(
+                    got.served_component, stats.served_component,
+                    "{label} limit {limit}: the plan"
+                );
+                if masks_first {
+                    assert!(!got.pending_filter, "{label} limit {limit}: evaluated");
+                    assert_eq!(
+                        got.rows,
+                        RowCountHint::exact(n),
+                        "{label} limit {limit}: exact rows"
+                    );
+                } else if limit == usize::MAX {
+                    assert_eq!(got, stats, "{label}: the plain view's statistics");
+                }
+                assert_eq!(
+                    row_list(&windowed).await,
+                    rows,
+                    "{label} limit {limit}: the plain rows, in order"
+                );
+            }
+        }
+    }
+}
+
+/// A window that cuts rows (one row short of the match, or past its first
+/// row) is a position range over base order: the plain match's rows in base
+/// row order, sliced, with no serve plan, on every store and every shape
+/// with two rows to cut between.
+#[tokio::test]
+async fn test_window_that_cuts_keeps_base_order() {
+    let (_dirs, stores) = window_stores().await;
+    let mut served = 0;
+    for (tag, store) in &stores {
+        for (shape, probe) in window_probes() {
+            let label = format!("{tag} {shape}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            let n = plain.size().await.unwrap();
+            if n < 2 {
+                continue;
+            }
+            served += usize::from(served_component(&plain).is_some());
+            let rows = base_ordered_codes(&plain).await;
+            for (offset, limit) in [(0, n - 1), (1, n)] {
+                let windowed = store
+                    .run_probe(&probe.clone().window(offset, Some(limit)))
+                    .await
+                    .unwrap();
+                assert!(
+                    !windowed.debug_pending_without_plan(),
+                    "{label} ({offset}, {limit}): readable"
+                );
+                assert_eq!(
+                    served_component(&windowed),
+                    None,
+                    "{label} ({offset}, {limit}): the plan is dropped"
+                );
+                let want: Vec<[TermCode; 4]> =
+                    rows.iter().copied().skip(offset).take(limit).collect();
+                assert_eq!(
+                    row_list(&windowed).await,
+                    want,
+                    "{label} ({offset}, {limit}): base order"
+                );
+            }
+        }
+    }
+    assert!(served > 0, "a served match is among those cut");
+}
+
+/// Under tombstones and an appended tail, a window that cannot cut a row is
+/// still the plain match, rows and order, the tail's rows after the base's,
+/// and the copy index still serves its shapes. Its bound is the one the
+/// view's statistics report for a fresh match: the base's live rows, exact
+/// wherever they are known without reading (in memory always), plus the
+/// tail's rows, so a limit of exactly that cuts nothing, while the live base
+/// rows alone cut the tail. On file, a served run whose ids are unread is
+/// bounded by its width, tombstones included, and once they are read by its
+/// live rows.
+#[tokio::test]
+async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
+    let quads = fixture_quads();
+    // Every 11th row up to row 649: rows of `p1`, of `"o3"` and of both are
+    // among them, and row 42, which `S`, `SP` and `SPG` match, is not.
+    let doomed: Vec<Quad> = quads.iter().step_by(11).take(60).cloned().collect();
+    assert!(!doomed.contains(&quads[42]));
+    // Twenty rows that `P`, `PO` and `O` match, and three that `S`, `SP` and
+    // `SPG` match.
+    let appended: Vec<Quad> = (0..20)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/tail{i:02}"),
+                "http://example.org/p1",
+                "o3",
+                GraphName::DefaultGraph,
+            )
+        })
+        .chain((0..3).map(|i| {
+            make_quad(
+                "http://example.org/s0042",
+                "http://example.org/p2",
+                &format!("late{i}"),
+                GraphName::DefaultGraph,
+            )
+        }))
+        .collect();
+    let (_dirs, stores) = window_stores().await;
+    for (tag, mut store) in stores {
+        for quad in &doomed {
+            store = store.delete_quad(quad).await.unwrap();
+        }
+        let store = store.add_quads(appended.clone()).await.unwrap();
+        for (shape, probe) in window_probes() {
+            let label = format!("{tag} {shape}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            // Taken before any read, as a fresh match knows itself.
+            let stats = plain.view_statistics().unwrap();
+            let rows = plain.quads_vec().await.unwrap();
+            let n = rows.len();
+            assert_eq!(plain.size().await.unwrap(), n, "{label}");
+            assert!(stats.tombstones > 0, "{label}");
+            let tail_rows = if matches!(shape, "P" | "PO" | "O") {
+                20
+            } else {
+                3
+            };
+            assert_eq!(stats.tail_rows, tail_rows, "{label}");
+            assert_eq!(
+                stats.served_component.is_some(),
+                tag.contains("copy") && matches!(shape, "P" | "PO" | "O"),
+                "{label}: served"
+            );
+            let bound = stats.rows.upper_bound;
+            assert!(bound >= n, "{label}: a bound");
+            if !stats.file_backed {
+                assert_eq!(stats.rows.exact, Some(n), "{label}: the live rows");
+            }
+            if tag == "file/copy/mapped" && matches!(shape, "P" | "O") {
+                assert_eq!(stats.rows.exact, None, "{label}: the run's ids unread");
+                assert!(bound > n, "{label}: the run's width");
+                // The size above read the run's ids into the view: its live
+                // rows now bound it, so a window of exactly its rows is the
+                // served view as it is.
+                assert_eq!(
+                    plain.view_statistics().unwrap().rows,
+                    RowCountHint::exact(n),
+                    "{label}: the ids read"
+                );
+                let windowed = plain.window(0, n).await.unwrap();
+                assert_eq!(
+                    served_component(&windowed),
+                    stats.served_component,
+                    "{label}: the ids read, the plan"
+                );
+                assert_eq!(
+                    windowed.quads_vec().await.unwrap(),
+                    rows,
+                    "{label}: the ids read, the plain rows, in order"
+                );
+            }
+            for limit in [bound, bound + 1, usize::MAX] {
+                let windowed = store
+                    .run_probe(&probe.clone().window(0, Some(limit)))
+                    .await
+                    .unwrap();
+                assert!(
+                    !windowed.debug_pending_without_plan(),
+                    "{label} limit {limit}: readable"
+                );
+                assert_eq!(
+                    served_component(&windowed),
+                    stats.served_component,
+                    "{label} limit {limit}: the plan"
+                );
+                assert_eq!(
+                    windowed.quads_vec().await.unwrap(),
+                    rows,
+                    "{label} limit {limit}: the plain rows, in order"
+                );
+            }
+            // The live base rows alone cut the tail's.
+            let base_rows = n - tail_rows;
+            let cut = store
+                .run_probe(&probe.clone().window(0, Some(base_rows)))
+                .await
+                .unwrap();
+            assert_eq!(cut.size().await.unwrap(), base_rows, "{label}: no tail");
+            assert_eq!(
+                view_strings(&cut).await,
+                quad_strings(&rows[..base_rows]),
+                "{label}: the base's rows"
+            );
+        }
+    }
+}
+
+/// On file, a subject and predicate located to a run whose graph is left to
+/// a pending filter are bounded by the run's width: a limit of the filter's
+/// matches, or anything else short of the width, takes the window route,
+/// which evaluates the filter, while a limit of the width or more keeps the
+/// filter pending. Either way the rows are the plain match's, in order. In
+/// memory the graph is tested at match time, so none of these limits cuts.
+#[tokio::test]
+async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
+    let graph = |k: usize| match k {
+        0 => GraphName::DefaultGraph,
+        k => GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{k}")).unwrap()),
+    };
+    // Subjects `s00` to `s31`, each with six objects under `p0`, then six
+    // under `p1`, cycling through the default graph, `g1` and `g2`.
+    let quads: Vec<Quad> = (0..384)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:02}", i / 12),
+                &format!("http://example.org/p{}", i / 6 % 2),
+                &format!("o{i:03}"),
+                graph(i % 3),
+            )
+        })
+        .collect();
+    let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
+    // `s05 p0` is a run of six rows, two of them in the default graph.
+    let probe = Probe::new(
+        Some(subject_node(5, 2)),
+        Some(NamedNode::new("http://example.org/p0").unwrap()),
+        None,
+        Some(GraphName::DefaultGraph),
+    );
+    for store in [
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+    ] {
+        let plain = store.run_probe(&probe).await.unwrap();
+        let rows = row_list(&plain).await;
+        assert_eq!(rows.len(), 2);
+        let stats = plain.view_statistics().unwrap();
+        let on_file = stats.file_backed;
+        if on_file {
+            assert!(stats.pending_filter);
+            assert_eq!(stats.rows, RowCountHint::at_most(6), "the run's width");
+        } else {
+            assert_eq!(stats.rows, RowCountHint::exact(2));
+        }
+        for (limit, short_of_width) in [
+            (2, true),
+            (5, true),
+            (6, false),
+            (7, false),
+            (usize::MAX, false),
+        ] {
+            let windowed = store
+                .run_probe(&probe.clone().window(0, Some(limit)))
+                .await
+                .unwrap();
+            assert_eq!(row_list(&windowed).await, rows, "limit {limit}");
+            let got = windowed.view_statistics().unwrap();
+            if on_file && short_of_width {
+                assert!(!got.pending_filter, "limit {limit}: the filter evaluated");
+                assert_eq!(got.rows, RowCountHint::exact(2), "limit {limit}");
+            } else {
+                assert_eq!(got, stats, "limit {limit}: the plain view");
+            }
+        }
+    }
+}
+
+/// `run_probe` hands back the matched view itself when the probe's window
+/// cannot cut a row (no offset, a limit at least the view's bound): no window
+/// is built, and the view reads the plain probe's codes in its order, with
+/// its statistics, readable. Over every store but the reference ones, whose
+/// windowed match holds its run pending for the window: copy-index served
+/// matches, located runs with a pending filter and in-memory views. A
+/// filtered file view read by its filter's masks first (the no-index file's
+/// index-eligible shapes) builds its window, which evaluates the filter: the
+/// plain rows, in order, known exactly.
+#[tokio::test]
+async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
+    use crate::store::query::narrowing::narrow_hooks;
+
+    let (_dirs, stores) = window_stores().await;
+    for (tag, store) in stores.iter().filter(|(tag, _)| !tag.contains("reference")) {
+        for (shape, probe) in window_probes() {
+            let label = format!("{tag} {shape}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            let stats = plain.view_statistics().unwrap();
+            let rows = row_list(&plain).await;
+            let bound = stats.rows.upper_bound;
+            let masks_first = plain.debug_reads_masks_first();
+            assert_eq!(
+                masks_first,
+                tag == "file/no-index/mapped" && matches!(shape, "P" | "PO" | "O"),
+                "{label}: read by the filter's masks first"
+            );
+            for limit in [bound, bound + 1, usize::MAX] {
+                let windows = narrow_hooks::windows();
+                let windowed = store
+                    .run_probe(&probe.clone().window(0, Some(limit)))
+                    .await
+                    .unwrap();
+                assert!(
+                    !windowed.debug_pending_without_plan(),
+                    "{label} limit {limit}: readable"
+                );
+                let got = windowed.view_statistics().unwrap();
+                if masks_first {
+                    assert_eq!(
+                        narrow_hooks::windows(),
+                        windows + 1,
+                        "{label} limit {limit}: the filter's window"
+                    );
+                    assert!(!got.pending_filter, "{label} limit {limit}: evaluated");
+                    assert_eq!(
+                        got.rows,
+                        RowCountHint::exact(rows.len()),
+                        "{label} limit {limit}: exact rows"
+                    );
+                } else {
+                    assert_eq!(
+                        narrow_hooks::windows(),
+                        windows,
+                        "{label} limit {limit}: no window built"
+                    );
+                    assert_eq!(
+                        got, stats,
+                        "{label} limit {limit}: the plain view's statistics"
+                    );
+                }
+                assert_eq!(
+                    row_list(&windowed).await,
+                    rows,
+                    "{label} limit {limit}: the plain rows, in order"
+                );
+            }
+        }
+    }
+}
+
+/// On file, a copy index's run under a string layout is unlocated: its width
+/// is unknown until its ids are read. A window with no offset reads them once,
+/// into the view's shared cell: under a limit they fit (the match's rows, or
+/// one more, short of the base's) it is the served view as it is, the plain
+/// match's rows in the index's order, while one row short it cuts in base
+/// order, taking the ids from the cell. Under tombstones the ids read are the
+/// run's width, and its live rows are what fits the limit. `run_probe` takes
+/// the same routes.
+#[tokio::test]
+async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
+    use crate::store::IdsNeed;
+    use crate::store::indexes::file::rid_scan_hooks;
+
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let probe = Probe::new(None, Some(p1.clone()), None, None);
+    let matching: Vec<Quad> = fixture_quads()
+        .into_iter()
+        .filter(|quad| quad.predicate == p1)
+        .collect();
+    // Five of the run's rows, spread over it.
+    let doomed: Vec<Quad> = matching.iter().step_by(120).cloned().collect();
+    assert_eq!(doomed.len(), 5);
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let (_dir, path) =
+            write_store_file(fixture_quads(), layout, vec![IndexType::SecondaryByCopy]).await;
+        let mut tombstoned = VortexRdfStore::from_file(&path).await.unwrap();
+        for quad in &doomed {
+            tombstoned = tombstoned.delete_quad(quad).await.unwrap();
+        }
+        let written = VortexRdfStore::from_file(&path).await.unwrap();
+        for (variant, store) in [("as written", written), ("tombstoned", tombstoned)] {
+            let label = format!("{layout:?} {variant}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            assert_eq!(served_component(&plain), Some("index:posg"), "{label}");
+            assert_eq!(plain.debug_serve_row_range(), None, "{label}: unlocated");
+            assert_eq!(plain.debug_pending_len(), Some(None), "{label}: unread");
+            let rows = plain.quads_vec().await.unwrap();
+            let n = rows.len();
+            let deleted = if variant == "tombstoned" {
+                doomed.len()
+            } else {
+                0
+            };
+            assert_eq!(n, matching.len() - deleted, "{label}: the live rows");
+            assert!(
+                n + 1 < store.size().await.unwrap(),
+                "{label}: a base to cut"
+            );
+            // The plain match's rows in base order: the store's own, in its
+            // order.
+            let matched: std::collections::HashSet<&Quad> = rows.iter().collect();
+            let base: Vec<Quad> = store
+                .quads_vec()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|quad| matched.contains(quad))
+                .collect();
+            assert_ne!(base, rows, "{label}: the index's order is not base order");
+            for (limit, cuts) in [(n - 1, true), (n, false), (n + 1, false)] {
+                let label = format!("{label} limit {limit}");
+                let view = store
+                    .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+                    .await
+                    .unwrap();
+                assert_eq!(view.debug_pending_len(), Some(None), "{label}: unread");
+                let scans = rid_scan_hooks::scans();
+                let windowed = view.window(0, limit).await.unwrap();
+                assert_eq!(rid_scan_hooks::scans() - scans, 1, "{label}: one id read");
+                assert_eq!(
+                    view.debug_pending_len(),
+                    Some(Some(matching.len())),
+                    "{label}: the run's ids in the shared cell"
+                );
+                let (plan, want) = if cuts {
+                    (None, &base[..limit])
+                } else {
+                    (Some("index:posg"), &rows[..])
+                };
+                assert_eq!(served_component(&windowed), plan, "{label}: the plan");
+                assert_eq!(
+                    windowed.quads_vec().await.unwrap(),
+                    want,
+                    "{label}: the rows"
+                );
+                let probed = store
+                    .run_probe(&probe.clone().window(0, Some(limit)))
+                    .await
+                    .unwrap();
+                assert_eq!(served_component(&probed), plan, "{label}: run_probe's plan");
+                assert_eq!(
+                    probed.quads_vec().await.unwrap(),
+                    want,
+                    "{label}: run_probe's rows"
+                );
+            }
+        }
+    }
+}
+
+/// Under tombstones, a window over a file view whose reads take its pending
+/// filter by the masks first counts none of the view's live rows: its window
+/// evaluates the filter whatever the bound, so a count for the bound would
+/// go unused. The window still reads the plain rows, known exactly.
+#[tokio::test]
+async fn test_masks_first_window_under_tombstones_counts_no_live_rows() {
+    use crate::store::view::selection::live_count_hooks;
+
+    let quads = fixture_quads();
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let mut store = VortexRdfStore::from_file(&path).await.unwrap();
+    for quad in quads.iter().step_by(11).take(40) {
+        store = store.delete_quad(quad).await.unwrap();
+    }
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let probe = Probe::new(None, Some(p1), None, None);
+    let plain = store.run_probe(&probe).await.unwrap();
+    assert!(
+        plain.debug_reads_masks_first(),
+        "read by the filter's masks first"
+    );
+    let rows = row_list(&plain).await;
+    let n = rows.len();
+    // A limit short of the selected rows: the bound would count the live
+    // rows.
+    assert!(
+        n + 1 < quads.len(),
+        "{n} rows under a base of {}",
+        quads.len()
+    );
+    let counts = live_count_hooks::counts();
+    let windowed = store
+        .run_probe(&probe.window(0, Some(n + 1)))
+        .await
+        .unwrap();
+    assert_eq!(live_count_hooks::counts(), counts, "no live rows counted");
+    let stats = windowed.view_statistics().unwrap();
+    assert!(!stats.pending_filter, "the filter evaluated");
+    assert_eq!(stats.rows, RowCountHint::exact(n), "exact rows");
+    assert_eq!(row_list(&windowed).await, rows, "the plain rows");
 }
 
 mod file {

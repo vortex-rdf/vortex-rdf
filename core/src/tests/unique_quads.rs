@@ -13,7 +13,7 @@
 use super::*;
 use crate::common::terms::{canonical_spelling, parse_quads_from_reader};
 use crate::store::RawQuad;
-use crate::store::builders::{BuiltArray, sorted_stream};
+use crate::store::builders::{BuildSizes, BuiltArray, sorted_stream};
 use oxrdfio::RdfFormat;
 use std::collections::BTreeSet;
 use std::io::Cursor;
@@ -203,10 +203,14 @@ where
 
     // A run capacity of 3 spills the 14 lines into five runs, so the repeats
     // sit in different runs.
-    let built =
-        sorted_stream::build_array(Box::new(raw_stream(DATASET)), layout, indexes.clone(), 3)
-            .await
-            .unwrap();
+    let built = sorted_stream::build_array(
+        Box::new(raw_stream(DATASET)),
+        layout,
+        indexes.clone(),
+        BuildSizes::uniform(3),
+    )
+    .await
+    .unwrap();
     check(
         tag("SortedStreamBuilder, spilled"),
         VortexRdfStore::from_built(built).unwrap(),
@@ -407,7 +411,7 @@ async fn test_spilled_runs_collapse_repeats_across_runs() {
                 Box::new(raw_vec_stream(stream.clone())),
                 layout,
                 ALL_INDEXES.to_vec(),
-                run_capacity,
+                BuildSizes::uniform(run_capacity),
             )
             .await
             .unwrap();
@@ -450,7 +454,7 @@ async fn test_spilled_chunk_stream_is_cut_from_deduplicated_rows() {
                 Box::new(raw_vec_stream(stream.clone())),
                 layout,
                 indexes,
-                4,
+                BuildSizes::uniform(4),
                 None,
             )
             .await
@@ -555,7 +559,7 @@ async fn test_probe_dictionary_holds_one_code_per_rdf_term() {
                         Box::new(raw_stream(PROBE)),
                         layout,
                         indexes.clone(),
-                        2,
+                        BuildSizes::uniform(2),
                     )
                     .await
                     .unwrap(),

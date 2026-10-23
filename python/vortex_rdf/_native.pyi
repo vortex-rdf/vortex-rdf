@@ -365,9 +365,18 @@ class VortexRdfStore:
         there, a code set (`U64Column`, a u64 buffer or a list of ints) or a
         code range (a ``range`` with step 1, or a 2-tuple ``(lo, hi)``, the
         half-open codes ``lo <= code < hi``; a 2-tuple is never a set).
-        `offset` and `limit` window the rows in base order; a filtered file
-        scan stops at the first block that fills the window. With a
-        `cancel` token the match races it (`CancelToken`)."""
+        `offset` and `limit` window the rows: a window that cuts rows takes
+        them in base order, and a filtered file scan stops at the first block
+        that fills it, while a `limit` that cannot cut a row (no `offset`, and
+        at least the match's row count, or a bound on it, known without
+        reading its rows: an index-served file match of unknown width reads
+        its row ids for the count) returns the match as it is, in the order
+        the call without a limit returns. With no `offset`, a `limit` that a
+        filtered file match's rows turn out to fall short of returns the match
+        as it is too, read from the window's evaluation of the filter, which a
+        match whose reads evaluate the filter before reading a row makes even
+        when its bound fits the limit. With a `cancel` token the match races
+        it (`CancelToken`)."""
         ...
     def match_code_chunks(
         self,
@@ -455,10 +464,10 @@ class VortexRdfStore:
         """Number of quads matching the pattern, counted from the row
         selection; no term is materialized. `keep` narrows as for
         `match_codes` (Dictionary layout only). `offset` and `limit` window
-        the rows in base order as `match_codes` does: `offset` skips that
-        many matched rows, and `limit` caps the count and stops the read
-        once that many rows are known to exist. With a `cancel` token the
-        count races it (`CancelToken`)."""
+        the rows as `match_codes` does: `offset` skips that many matched
+        rows, and `limit` caps the count and stops the read once that many
+        rows are known to exist. With a `cancel` token the count races it
+        (`CancelToken`)."""
         ...
     def match_columns(
         self,

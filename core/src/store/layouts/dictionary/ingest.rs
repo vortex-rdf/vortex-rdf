@@ -24,12 +24,6 @@ use crate::store::schema::TermCode;
 use super::codec::{QuadCodes, build_array};
 use super::term_dict::{CodeSpace, TermDictionary};
 
-/// Term → code lookup keyed by owned terms, for the sorted-stream builder,
-/// whose quads are moved or re-read from a spill file; dropped once every
-/// quad is encoded.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) type TermCodeMap = HashMap<String, TermCode>;
-
 /// Term → code lookup borrowing its keys from the quads being encoded.
 pub(crate) type BorrowedTermCodeMap<'a> = HashMap<&'a str, TermCode>;
 
@@ -82,45 +76,6 @@ impl TermDictionary {
         log::debug!(
             "[Dictionary] Built dictionary + borrowed code map from {} quads ({} unique terms) in {:?}",
             quads.len(),
-            dict.len(),
-            debug::elapsed(start)
-        );
-        Ok((dict, code_map))
-    }
-}
-
-/// Collects the unique term strings of a dataset during a build's ingestion
-/// pass.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) struct TermDictionaryBuilder {
-    set: HashSet<String>,
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-impl TermDictionaryBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            set: HashSet::new(),
-        }
-    }
-
-    pub(crate) fn insert_quad(&mut self, q: &RawQuad) {
-        for term in [&q.s, &q.p, &q.o, &q.g] {
-            if !self.set.contains(term.as_str()) {
-                self.set.insert(term.clone());
-            }
-        }
-    }
-
-    /// The sorted terms frozen into the dictionary ([`freeze`]), beside the
-    /// term → code map keyed by them.
-    pub(crate) fn finish(self) -> Result<(TermDictionary, TermCodeMap)> {
-        let start = debug::timer();
-        let mut terms: Vec<String> = self.set.into_iter().collect();
-        terms.sort_unstable();
-        let (dict, code_map) = freeze(terms)?;
-        log::debug!(
-            "[Dictionary] Finished incremental dictionary ({} unique terms) in {:?}",
             dict.len(),
             debug::elapsed(start)
         );

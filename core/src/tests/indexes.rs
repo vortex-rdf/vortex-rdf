@@ -873,20 +873,40 @@ async fn test_in_memory_copy_index_serving() {
     .await;
 
     // A served view's N-Quads export lists its quads in base (s, p, o, g)
-    // order, as its window (which drops the plan) does; `quads()` reads them
-    // in the index's (p, o, s, g) order.
+    // order; `quads()` reads them in the index's (p, o, s, g) order. A window
+    // that cannot cut a row is the served view as it is, plan and order
+    // included, while one that cuts a row drops the plan and reads base
+    // order.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let by_p = store
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
     assert_eq!(served_component(&by_p), Some("index:posg"));
-    let windowed = by_p.window(0, by_p.size().await.unwrap()).await.unwrap();
-    assert_eq!(served_component(&windowed), None);
+    let size = by_p.size().await.unwrap();
+    let whole = by_p.window(0, size).await.unwrap();
+    assert_eq!(served_component(&whole), Some("index:posg"));
+    let cut = by_p.window(0, size - 1).await.unwrap();
+    assert_eq!(served_component(&cut), None);
     let exported = nquads(by_p.clone()).await;
-    assert_eq!(exported, nquads(windowed).await);
+    assert_eq!(exported, nquads(whole.clone()).await);
     let lines: Vec<&str> = exported.lines().collect();
     assert!(lines.is_sorted(), "base (s, p, o, g) order: {lines:#?}");
+    assert_eq!(
+        nquads(cut.clone()).await.lines().collect::<Vec<_>>(),
+        lines[..size - 1]
+    );
+    let cut_lines: Vec<String> = cut
+        .quads()
+        .map_ok(|q| format!("{q} ."))
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        cut_lines,
+        lines[..size - 1],
+        "a cut window reads base order"
+    );
     let served: Vec<Quad> = by_p.quads().try_collect().await.unwrap();
     assert_eq!(
         quad_strings(&served),
@@ -901,6 +921,11 @@ async fn test_in_memory_copy_index_serving() {
     );
     let served_lines: Vec<String> = served.iter().map(|q| format!("{q} .")).collect();
     assert_ne!(served_lines, lines, "the two orders differ on this run");
+    let whole_served: Vec<Quad> = whole.quads().try_collect().await.unwrap();
+    assert_eq!(
+        whole_served, served,
+        "a window that cannot cut keeps the index's order"
+    );
 
     // Over code columns a served run within the point-read cap is read point
     // by point through the component's probes, and a wider one is sliced;
@@ -1062,7 +1087,9 @@ async fn test_code_columns_serves_from_the_answering_index() {
 /// offset at or past the run's end — and never more than the run. The window
 /// holds the same rows as the slice of the whole run, and the pending view it
 /// is taken beside keeps its ids undecoded. A copy index's run is in key
-/// order, so it is decoded whole (and shared with the pending view).
+/// order, so a window that can cut it decodes it whole (and shares it with
+/// the pending view), while one that cannot cut a row is the served match as
+/// it is and decodes nothing.
 #[tokio::test]
 async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
     use crate::store::{IdsNeed, Probe};
@@ -1118,7 +1145,14 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
 
         for (offset, limit) in windows {
             let (from, to) = span(offset, limit);
-            let expected = if decoded_whole { width } else { to - from };
+            let served = decoded_whole && offset == 0 && limit >= width;
+            let expected = if served {
+                0
+            } else if decoded_whole {
+                width
+            } else {
+                to - from
+            };
             let before = crate::store::test_hooks::decoded_rids();
             let window = store
                 .run_probe(&probe.clone().window(offset, Some(limit)))
@@ -1126,6 +1160,11 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
                 .unwrap();
             let decoded = crate::store::test_hooks::decoded_rids() - before;
             assert_eq!(decoded, expected, "{index:?} ({offset}, {limit}) decodes");
+            assert_eq!(
+                served_component(&window).is_some(),
+                served,
+                "{index:?} ({offset}, {limit}) keeps the plan"
+            );
 
             let beside = pending.window(offset, limit).await.unwrap();
             if !decoded_whole {

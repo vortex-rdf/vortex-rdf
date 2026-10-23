@@ -882,3 +882,308 @@ async fn test_chunks_gates() {
         "a tailed Dictionary view has no source"
     );
 }
+
+/// `stream` pulled once and then drained: the splits its first pull spawned,
+/// and the rows its items hold (`rows_of`). `before_first_poll` runs once the
+/// stream is built and before it is first polled.
+async fn pull_and_drain<S: futures::Stream + Unpin>(
+    mut stream: S,
+    before_first_poll: impl FnOnce(),
+    rows_of: impl Fn(S::Item) -> usize,
+) -> (usize, usize) {
+    use crate::store::scan::file_reads::driver_hooks;
+    before_first_poll();
+    driver_hooks::take_spawned();
+    let first = stream.next().await.expect("a first item");
+    let spawned = driver_hooks::take_spawned();
+    let mut rows = rows_of(first);
+    while let Some(item) = stream.next().await {
+        rows += rows_of(item);
+    }
+    (spawned, rows)
+}
+
+/// The chunk streams over a filtered no-index file view (`code_chunks`,
+/// `row_chunks`, `quads()` and the data source's scan) stay lazy and scan:
+/// nothing is evaluated or scanned before the first poll, each drained stream
+/// runs one row scan and never reads the filter's masks first, and with the
+/// split limit forced to zero a first pull has at most a scan's window of
+/// splits spawned, four per unit of available parallelism, on a file of more
+/// splits than that. The row-chunk streams spawn through the crate's driver,
+/// which counts each spawn; `quads()` reads through vortex's own scan stream,
+/// whose window the count does not see.
+#[tokio::test]
+async fn test_chunk_stream_over_filtered_file_stays_lazy() {
+    use crate::io::read::available_parallelism;
+    use crate::store::scan::file_filter::split_hooks;
+    use crate::store::scan::file_reads::{driver_hooks, masked_read_hooks, scan_hooks};
+
+    let (_dir, path) = many_splits_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let view = store
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert!(view.view_statistics().unwrap().pending_filter);
+    let n = view.size().await.unwrap();
+    let window = 4 * available_parallelism();
+    let _limit = driver_hooks::ForcedLimit::set(0);
+    for read in ["code_chunks", "row_chunks", "quads", "data_source"] {
+        let (scans, evaluated) = (scan_hooks::scans(), split_hooks::evaluated());
+        let masked = masked_read_hooks::reads();
+        let lazy = || {
+            assert_eq!(
+                scan_hooks::scans(),
+                scans,
+                "{read}: no scan before the first poll"
+            );
+            assert_eq!(
+                split_hooks::evaluated(),
+                evaluated,
+                "{read}: no split evaluated before the first poll"
+            );
+        };
+        let (spawned, rows) = match read {
+            "code_chunks" => {
+                let chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap()[0].len()).await
+            }
+            "row_chunks" => {
+                let chunks = view.row_chunks(256).unwrap();
+                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap().len()).await
+            }
+            "quads" => {
+                pull_and_drain(view.quads(), lazy, |quad| {
+                    quad.unwrap();
+                    1
+                })
+                .await
+            }
+            _ => {
+                let source = view.data_source().unwrap();
+                let scan = source.scan(ScanRequest::default()).await.unwrap();
+                let mut partitions = scan.partitions();
+                let partition = partitions.next().await.unwrap().unwrap();
+                assert!(partitions.next().await.is_none(), "one partition");
+                let chunks = partition.execute().unwrap();
+                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap().len()).await
+            }
+        };
+        assert_eq!(rows, n, "{read}: every row");
+        assert!(
+            spawned <= window,
+            "{read}: {spawned} splits spawned by a first pull"
+        );
+        if read != "quads" {
+            assert_eq!(spawned, window.min(MANY_SPLITS), "{read}: a scan's window");
+        }
+        assert_eq!(scan_hooks::scans() - scans, 1, "{read}: one row scan");
+        assert_eq!(
+            split_hooks::evaluated(),
+            evaluated,
+            "{read}: no masks evaluated"
+        );
+        assert_eq!(masked_read_hooks::reads(), masked, "{read}: no masked read");
+    }
+}
+
+/// The read hooks' counters on this thread: split masks evaluated, masked
+/// reads by kind, restricted scans built with a filter, row scans, and takes
+/// through the chunk probes.
+#[derive(Clone, Copy)]
+struct ReadCounters {
+    evaluated: usize,
+    masked: [usize; 3],
+    filtered_scans: usize,
+    scans: usize,
+    takes: usize,
+}
+
+impl ReadCounters {
+    fn now() -> Self {
+        use crate::store::read::rows::restricted_scan_hooks;
+        use crate::store::scan::file_filter::split_hooks;
+        use crate::store::scan::file_reads::{masked_read_hooks, scan_hooks, take_hooks};
+        Self {
+            evaluated: split_hooks::evaluated(),
+            masked: masked_read_hooks::reads(),
+            filtered_scans: restricted_scan_hooks::filtered(),
+            scans: scan_hooks::scans(),
+            takes: take_hooks::takes().0,
+        }
+    }
+}
+
+/// The streams over a view whose window kept its filter's masks (`code_chunks`,
+/// `row_chunks`, `quads()` and the data source's scan) read the masks' ids as
+/// exact ids with no filter: the plain view's rows, each reader evaluating no
+/// split of the filter, making no masked read and building no scan with the
+/// filter, for a take's density (the ids taken, no row scan) and a
+/// projection's.
+#[tokio::test]
+async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
+    use crate::store::scan::file_reads::MaskedRead;
+
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let dense = masks_probes()
+        .into_iter()
+        .filter(|(shape, ..)| matches!(*shape, "P" | "G"));
+    for (shape, probe, read) in dense {
+        let plain = store.run_probe(&probe).await.unwrap();
+        let (codes, _) = collect_code_chunks(&plain, &QuadColumn::ALL, 4_096).await;
+        let quads: Vec<Quad> = plain.quads().try_collect().await.unwrap();
+        let n = codes.len();
+        let kept = store
+            .run_probe(&probe.clone().window(0, Some(n + 1)))
+            .await
+            .unwrap();
+        assert_eq!(kept.debug_evaluated_len(), Some(n), "{shape}: kept masks");
+        // What a reader did since `before`.
+        let check = |reader: &str, before: ReadCounters| {
+            let label = format!("{shape} {reader}");
+            let after = ReadCounters::now();
+            assert_eq!(
+                after.evaluated, before.evaluated,
+                "{label}: no split evaluated"
+            );
+            assert_eq!(after.masked, before.masked, "{label}: no masked read");
+            assert_eq!(
+                after.filtered_scans, before.filtered_scans,
+                "{label}: no scan with the filter"
+            );
+            if read == MaskedRead::Take {
+                assert_eq!(after.scans, before.scans, "{label}: no row scan");
+                assert!(after.takes > before.takes, "{label}: the ids taken");
+            }
+        };
+        let before = ReadCounters::now();
+        let (kept_codes, _) = collect_code_chunks(&kept, &QuadColumn::ALL, 4_096).await;
+        assert_eq!(kept_codes, codes, "{shape}: code_chunks");
+        check("code_chunks", before);
+        let before = ReadCounters::now();
+        assert_eq!(
+            struct_chunk_codes(&collect_row_chunks(&kept, 4_096).await),
+            codes,
+            "{shape}: row_chunks"
+        );
+        check("row_chunks", before);
+        let before = ReadCounters::now();
+        let kept_quads: Vec<Quad> = kept.quads().try_collect().await.unwrap();
+        assert_eq!(kept_quads, quads, "{shape}: quads()");
+        check("quads()", before);
+        let before = ReadCounters::now();
+        let source = kept.data_source().unwrap();
+        assert_eq!(
+            scan_codes(&source, ScanRequest::default()).await,
+            codes,
+            "{shape}: the data source's scan"
+        );
+        check("data_source", before);
+    }
+}
+
+/// A window whose limit fits the bound of a filtered no-index file view
+/// whose reads take the filter by its masks first (no offset, a limit of the
+/// bound or more) evaluates the filter: for `O`, `PO` and `P`, its one-shot
+/// reads return the plain view's rows, evaluating no split again and
+/// building no scan with the filter, its statistics are exact with no filter
+/// pending, and each stream (`code_chunks`, `row_chunks`, `quads()` and the
+/// data source's scan) reads the matches' ids, where the plain view's streams
+/// scan with the filter.
+#[tokio::test]
+async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let shapes = masks_probes()
+        .into_iter()
+        .filter(|(shape, ..)| matches!(*shape, "O" | "PO" | "P"));
+    for (shape, probe, _) in shapes {
+        let plain = store.run_probe(&probe).await.unwrap();
+        assert!(plain.debug_reads_masks_first(), "{shape}: masks first");
+        let stats = plain.view_statistics().unwrap();
+        assert!(stats.pending_filter, "{shape}: the plain view's filter");
+        let codes = row_list(&plain).await;
+        let quads = plain.quads_vec().await.unwrap();
+        let n = codes.len();
+        let bound = stats.rows.upper_bound;
+        assert!(n < bound, "{shape}: {n} rows under a bound of {bound}");
+        // Each view beside its label and whether its streams scan with the
+        // filter.
+        let mut views = vec![(format!("{shape} plain"), plain, true)];
+        for limit in [bound, usize::MAX] {
+            let label = format!("{shape} limit {limit}");
+            let windowed = store
+                .run_probe(&probe.clone().window(0, Some(limit)))
+                .await
+                .unwrap();
+            let got = windowed.view_statistics().unwrap();
+            assert!(!got.pending_filter, "{label}: evaluated");
+            assert_eq!(got.rows, RowCountHint::exact(n), "{label}: exact rows");
+            let before = ReadCounters::now();
+            assert_eq!(row_list(&windowed).await, codes, "{label}: the plain rows");
+            assert_eq!(
+                windowed.quads_vec().await.unwrap(),
+                quads,
+                "{label}: the plain quads"
+            );
+            let after = ReadCounters::now();
+            assert_eq!(
+                after.evaluated, before.evaluated,
+                "{label}: one-shot reads evaluate no split"
+            );
+            assert_eq!(
+                after.filtered_scans, before.filtered_scans,
+                "{label}: one-shot reads build no scan with the filter"
+            );
+            views.push((label, windowed, false));
+        }
+        for (label, view, scans_filter) in &views {
+            // What a reader did since `before`.
+            let check = |reader: &str, before: ReadCounters| {
+                let label = format!("{label} {reader}");
+                let after = ReadCounters::now();
+                if *scans_filter {
+                    assert!(
+                        after.filtered_scans > before.filtered_scans,
+                        "{label}: a scan with the filter"
+                    );
+                    return;
+                }
+                assert_eq!(
+                    after.filtered_scans, before.filtered_scans,
+                    "{label}: no scan with the filter"
+                );
+                assert_eq!(
+                    after.evaluated, before.evaluated,
+                    "{label}: no split evaluated"
+                );
+                assert_eq!(after.masked, before.masked, "{label}: no masked read");
+            };
+            let before = ReadCounters::now();
+            let (streamed, _) = collect_code_chunks(view, &QuadColumn::ALL, 4_096).await;
+            assert_eq!(streamed, codes, "{label}: code_chunks");
+            check("code_chunks", before);
+            let before = ReadCounters::now();
+            assert_eq!(
+                struct_chunk_codes(&collect_row_chunks(view, 4_096).await),
+                codes,
+                "{label}: row_chunks"
+            );
+            check("row_chunks", before);
+            let before = ReadCounters::now();
+            let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
+            assert_eq!(streamed, quads, "{label}: quads()");
+            check("quads()", before);
+            let before = ReadCounters::now();
+            let source = view.data_source().unwrap();
+            assert_eq!(
+                scan_codes(&source, ScanRequest::default()).await,
+                codes,
+                "{label}: the data source's scan"
+            );
+            check("data_source", before);
+        }
+    }
+}

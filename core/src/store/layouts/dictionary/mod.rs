@@ -20,9 +20,6 @@ pub(crate) mod storage;
 pub(crate) mod term_dict;
 
 pub(super) use self::codec::decode_code_column;
-// Built from raw quads only by the sorted-stream builder, which wasm lacks.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) use self::codec::build_chunk;
 pub(crate) use self::codec::{
     QuadCodes, build_code_chunk, decode_chunk, decode_chunk_shared, empty_struct, encode_quads,
 };
@@ -39,9 +36,3 @@ pub use self::predicates::{
     CaseMap, KindRanges, NumOp, Number, TermPredicate, TextOptions, TextPredicate, Verdict,
 };
 pub(crate) use self::term_dict::TermDictionary;
-
-// Read only by the sorted-stream builder, which wasm lacks.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) use self::codec::code_of;
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) use self::ingest::{TermCodeMap, TermDictionaryBuilder};
