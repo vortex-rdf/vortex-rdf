@@ -12,11 +12,18 @@ use crate::store::layouts::ChunkDecode;
 use crate::store::{Backend, MemoryBase, RawQuad, SharedQuad, Tail, VortexRdfStore};
 
 #[cfg(feature = "file-io")]
+use std::ops::Range;
+#[cfg(feature = "file-io")]
+use std::sync::Arc;
+
+#[cfg(feature = "file-io")]
 use super::deferred;
 #[cfg(feature = "file-io")]
 use super::rows::BaseRead;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
+#[cfg(feature = "file-io")]
+use crate::io::read::{available_parallelism, inline_splits, spawned_splits};
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
 #[cfg(feature = "file-io")]
@@ -24,7 +31,11 @@ use crate::store::indexes::FileServePlan;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_reads;
+use crate::store::persist::native_file::NativeStoreFile;
+#[cfg(feature = "file-io")]
+use crate::store::scan::file_filter;
+#[cfg(feature = "file-io")]
+use crate::store::scan::file_reads::{self, MaskedRead};
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::point_sized;
 #[cfg(feature = "file-io")]
@@ -33,6 +44,8 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 #[cfg(feature = "file-io")]
 use vortex_array::ArrayRef;
+#[cfg(feature = "file-io")]
+use vortex_buffer::Buffer;
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
 #[cfg(feature = "file-io")]
@@ -50,7 +63,10 @@ impl VortexRdfStore {
     /// then the tail's live rows. Nothing is read until the first poll, and a
     /// failure to set the read up arrives as the stream's first item.
     pub fn quads(&self) -> Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_> {
-        Box::new(self.chunk_stream::<Quad>(true).flat_map(stream::iter))
+        Box::new(
+            self.chunk_stream::<Quad>(true, false)
+                .flat_map(stream::iter),
+        )
     }
 
     /// Every quad this view covers, in [`quads`](Self::quads)' order, in one
@@ -78,7 +94,7 @@ impl VortexRdfStore {
     pub fn shared_quad_chunks(
         &self,
     ) -> Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_> {
-        Box::new(self.chunk_stream::<SharedQuad>(true))
+        Box::new(self.chunk_stream::<SharedQuad>(true, false))
     }
 
     /// The raw-text counterpart of
@@ -91,12 +107,13 @@ impl VortexRdfStore {
     /// index, is not consulted, so a served view's pending selection
     /// materializes and its rows are read as an unserved view's are.
     pub(in crate::store) fn raw_quad_chunks(&self) -> BoxStream<'_, Vec<Result<RawQuad>>> {
-        self.chunk_stream::<RawQuad>(false)
+        self.chunk_stream::<RawQuad>(false, false)
     }
 
     /// Collect every decoded chunk, then flatten into one exactly-sized `Vec`.
     /// An in-memory view is one chunk ([`in_memory_chunk`](Self::in_memory_chunk)),
-    /// taken as it decodes, with no chunk stream around it.
+    /// taken as it decodes, with no chunk stream around it; a file view's
+    /// chunks are read as a one-shot read reads them (see `file_chunks`).
     async fn decoded_vec<T: ChunkDecode>(&self) -> Result<Vec<T>> {
         match &self.quads.backend {
             Backend::InMemory(memory) => {
@@ -105,7 +122,8 @@ impl VortexRdfStore {
             }
             #[cfg(feature = "file-io")]
             Backend::File(_) => {
-                let chunks: Vec<Vec<Result<T>>> = self.chunk_stream::<T>(true).collect().await;
+                let chunks: Vec<Vec<Result<T>>> =
+                    self.chunk_stream::<T>(true, true).collect().await;
                 flattened(chunks.iter().map(Vec::len).sum(), chunks)
             }
         }
@@ -116,8 +134,13 @@ impl VortexRdfStore {
     /// ([`in_memory_chunk`](Self::in_memory_chunk)), decoded without
     /// suspending; on file the chunks of `file_chunks`.
     /// `serve` says whether a serve plan, when the view carries one, answers
-    /// the read.
-    fn chunk_stream<T: ChunkDecode>(&self, serve: bool) -> BoxStream<'_, Vec<Result<T>>> {
+    /// the read, and `one_shot` whether the chunks are collected whole.
+    #[cfg_attr(not(feature = "file-io"), allow(unused_variables))]
+    fn chunk_stream<T: ChunkDecode>(
+        &self,
+        serve: bool,
+        one_shot: bool,
+    ) -> BoxStream<'_, Vec<Result<T>>> {
         #[cfg(test)]
         chunk_stream_hooks::note();
         match &self.quads.backend {
@@ -127,7 +150,9 @@ impl VortexRdfStore {
             .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(e)]))
             .boxed(),
             #[cfg(feature = "file-io")]
-            Backend::File(base) => deferred(self.file_chunks::<T>(base, serve), |e| vec![Err(e)]),
+            Backend::File(base) => deferred(self.file_chunks::<T>(base, serve, one_shot), |e| {
+                vec![Err(e)]
+            }),
         }
     }
 
@@ -167,9 +192,16 @@ impl VortexRdfStore {
     /// rows in base row order, over the exact selection
     /// ([`base_read`](Self::base_read)): rows read by id
     /// ([`ExactRead`](file_reads::ExactRead)) are one chunk, and the
-    /// restricted scan streams split by split.
+    /// restricted scan streams split by split. A `one_shot` read of a pending
+    /// filter the reads by id leave to the scan reads the filter's masks
+    /// first, then the rows they keep ([`masked_chunks`](Self::masked_chunks)).
     #[cfg(feature = "file-io")]
-    async fn file_chunks<T: ChunkDecode>(&self, base: &FileBase, serve: bool) -> Result<Chunks<T>> {
+    async fn file_chunks<T: ChunkDecode>(
+        &self,
+        base: &FileBase,
+        serve: bool,
+        one_shot: bool,
+    ) -> Result<Chunks<T>> {
         let FileBase {
             file, serve: plan, ..
         } = base;
@@ -219,9 +251,26 @@ impl VortexRdfStore {
             };
             return self.scan_chunks(scan, decoder, tail);
         }
-        match self
-            .base_read(self.layout.strategy().primary_column_names())
-            .await?
+        let primary = self.layout.strategy().primary_column_names();
+        let (selection, by_id) = self.file_read_scope(base, primary).await?;
+        let filter = base.filter.as_ref();
+        let read = Self::exact_read(file, by_id, filter, &selection, deleted.as_ref())?;
+        if one_shot
+            && let Some(masks) =
+                Self::masks_first(file, filter, &selection, deleted.as_ref(), &read).await?
+        {
+            return self.masked_chunks(file, &masks, tail).await;
+        }
+        match Self::file_base_read(
+            file,
+            primary,
+            by_id,
+            filter,
+            &selection,
+            deleted.as_ref(),
+            read,
+        )
+        .await?
         {
             // Rows read by id decode as one chunk, with no scan machinery.
             BaseRead::Rows(rows) => Ok(with_tail(
@@ -230,6 +279,76 @@ impl VortexRdfStore {
             )),
             BaseRead::Scan(scan) => self.scan_chunks(*scan, self.layout.clone(), tail),
         }
+    }
+
+    /// A one-shot read's chunks of the rows `masks` keep (a pending filter's
+    /// split masks), then the tail's chunk, read as [`MaskedRead`] chooses:
+    /// point by point as one chunk, read inline, or else one chunk per split
+    /// with a match, taken at its ids or projected at its mask. Those split
+    /// reads are spawned onto the tokio runtime whenever there is more than
+    /// one and a runtime is current, whatever the row-scan driver's split
+    /// limit: the read is collected whole, so many splits' reads overlap
+    /// their decodes, where a single split, read inline, spares a spawn's
+    /// latency. Each chunk decodes
+    /// inside its split's task under a resident dictionary and on the stream
+    /// under a file-backed one, as [`scan_chunks`](Self::scan_chunks)
+    /// decodes. A point read a chunk declines is taken.
+    #[cfg(feature = "file-io")]
+    async fn masked_chunks<T: ChunkDecode>(
+        &self,
+        file: &Arc<NativeStoreFile>,
+        masks: &[(Mask, Range<u64>)],
+        tail: Vec<Result<T>>,
+    ) -> Result<Chunks<T>> {
+        let primary = self.layout.strategy().primary_column_names();
+        let read = MaskedRead::of(file, masks)?;
+        if read == MaskedRead::Points {
+            let ids = Buffer::from(file_filter::first_ids(masks, usize::MAX));
+            if let Some(rows) = file_reads::file_point_rows(file, primary, None, ids).await? {
+                let chunk = T::decode_async(&self.layout, &rows).await;
+                return Ok(with_tail(stream::iter([chunk]), tail));
+            }
+        }
+        let take = read != MaskedRead::Project;
+        let (_, tasks) = file_reads::masked_split_tasks(file, primary, masks, take)?;
+        let spawn = tasks.len() > 1 && tokio::runtime::Handle::try_current().is_ok();
+        let window = 4 * available_parallelism();
+        let layout = self.layout.clone();
+        let file_backed_dictionary =
+            matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
+        let chunks: Chunks<T> = if file_backed_dictionary {
+            let rows = if spawn {
+                spawned_splits(tasks, window).left_stream()
+            } else {
+                inline_splits(tasks).right_stream()
+            };
+            rows.filter_map(|split| future::ready(split.transpose()))
+                .then(move |chunk| match chunk {
+                    Ok(chunk) => ChunkDecoder::<T>::decode_async(&layout, chunk),
+                    Err(e) => future::ready(vec![Err(VortexRdfError::Vortex(e))]).boxed(),
+                })
+                .boxed()
+        } else {
+            let decoding: Vec<_> = tasks
+                .into_iter()
+                .map(|task| {
+                    let layout = layout.clone();
+                    async move {
+                        task.await
+                            .map(|rows| rows.map(|rows| T::decode(&layout, &rows)))
+                    }
+                })
+                .collect();
+            let rows = if spawn {
+                spawned_splits(decoding, window).left_stream()
+            } else {
+                inline_splits(decoding).right_stream()
+            };
+            rows.filter_map(|split| future::ready(split.transpose()))
+                .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(VortexRdfError::Vortex(e))]))
+                .boxed()
+        };
+        Ok(with_tail(chunks, tail))
     }
 
     /// `scan`'s chunks decoded through `decoder`, then the tail's chunk; a

@@ -812,6 +812,55 @@ async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
     }
 }
 
+/// `run_probe` hands back the matched view itself when the probe's window
+/// cannot cut a row (no offset, a limit at least the view's bound): no window
+/// is built, and the view reads the plain probe's codes in its order, with
+/// its statistics, readable. Over every store but the reference ones, whose
+/// windowed match holds its run pending for the window: copy-index served
+/// matches, located runs with a pending filter, filtered no-index file views
+/// and in-memory views.
+#[tokio::test]
+async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
+    use crate::store::query::narrowing::narrow_hooks;
+
+    let (_dirs, stores) = window_stores().await;
+    for (tag, store) in stores.iter().filter(|(tag, _)| !tag.contains("reference")) {
+        for (shape, probe) in window_probes() {
+            let label = format!("{tag} {shape}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            let stats = plain.view_statistics().unwrap();
+            let rows = row_list(&plain).await;
+            let bound = stats.rows.upper_bound;
+            for limit in [bound, bound + 1, usize::MAX] {
+                let windows = narrow_hooks::windows();
+                let windowed = store
+                    .run_probe(&probe.clone().window(0, Some(limit)))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    narrow_hooks::windows(),
+                    windows,
+                    "{label} limit {limit}: no window built"
+                );
+                assert!(
+                    !windowed.debug_pending_without_plan(),
+                    "{label} limit {limit}: readable"
+                );
+                assert_eq!(
+                    windowed.view_statistics().unwrap(),
+                    stats,
+                    "{label} limit {limit}: the plain view's statistics"
+                );
+                assert_eq!(
+                    row_list(&windowed).await,
+                    rows,
+                    "{label} limit {limit}: the plain rows, in order"
+                );
+            }
+        }
+    }
+}
+
 mod file {
     use super::*;
     use std::ops::Range;

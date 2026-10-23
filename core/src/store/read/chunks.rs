@@ -262,29 +262,27 @@ impl VortexRdfStore {
         };
         let file = Arc::clone(&base.file);
         let columns: Arc<[&'static str]> = Arc::from(by_id_columns);
-        Ok(
-            stream::iter(id_windows(Buffer::from(ids), batch_rows).enumerate())
-                .then(move |(k, window)| {
-                    let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
-                    async move {
-                        // A take declines only an empty id list, and no
-                        // window is empty: a decline is a broken invariant.
-                        take_file_rows(&file, &columns, &window)
-                            .await
-                            .and_then(|rows| {
-                                rows.ok_or_else(|| {
-                                    VortexRdfError::Vortex(vortex_error::vortex_err!(
-                                        "the take of id window {k} ({} ids from base row {}) \
+        Ok(stream::iter(id_windows(ids, batch_rows).enumerate())
+            .then(move |(k, window)| {
+                let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
+                async move {
+                    // A take declines only an empty id list, and no
+                    // window is empty: a decline is a broken invariant.
+                    take_file_rows(&file, &columns, &window)
+                        .await
+                        .and_then(|rows| {
+                            rows.ok_or_else(|| {
+                                VortexRdfError::Vortex(vortex_error::vortex_err!(
+                                    "the take of id window {k} ({} ids from base row {}) \
                                          declined",
-                                        window.len(),
-                                        window.first().copied().unwrap_or_default()
-                                    ))
-                                })
+                                    window.len(),
+                                    window.first().copied().unwrap_or_default()
+                                ))
                             })
-                    }
-                })
-                .boxed(),
-        )
+                        })
+                }
+            })
+            .boxed())
     }
 
     /// The tail's live rows cut to `batch_rows`, each slice cut when it is

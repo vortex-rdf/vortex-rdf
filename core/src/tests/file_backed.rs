@@ -795,3 +795,388 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
         "{tag}: tombstones"
     );
 }
+
+// ─── Filtered one-shot reads: the filter's masks first ───────────────────
+
+/// A view's rows in read order, as the bindings' one-shot reads return them:
+/// its code columns, or the quads of a view with a tail, whose rows have no
+/// codes.
+#[derive(Debug, PartialEq)]
+enum ReadRows {
+    Codes(Vec<[TermCode; 4]>),
+    Quads(Vec<Quad>),
+}
+
+async fn read_rows(view: &VortexRdfStore) -> ReadRows {
+    match view.code_columns_gathered().await.unwrap() {
+        Some(c) => ReadRows::Codes(
+            (0..c[0].len())
+                .map(|i| [c[0][i], c[1][i], c[2][i], c[3][i]])
+                .collect(),
+        ),
+        None => ReadRows::Quads(view.quads_vec().await.unwrap()),
+    }
+}
+
+/// The masked reads chosen on this thread since `before`, by kind.
+fn masked_reads_since(before: [usize; 3]) -> [usize; 3] {
+    let now = crate::store::scan::file_reads::masked_read_hooks::reads();
+    std::array::from_fn(|kind| now[kind] - before[kind])
+}
+
+/// One masked read of kind `read`, as [`masked_reads_since`] counts them.
+fn one_masked_read(read: crate::store::scan::file_reads::MaskedRead) -> [usize; 3] {
+    let mut reads = [0; 3];
+    reads[read as usize] = 1;
+    reads
+}
+
+/// Each of [`masks_probes`] on `file` against `memory`: a view with a pending
+/// filter whose one-shot code read chooses the probe's masked read once and
+/// answers the rows, in order, of the view's scan (`row_chunks`) and of
+/// `memory`'s view.
+async fn assert_masks_first_reads(file: &VortexRdfStore, memory: &VortexRdfStore, tag: &str) {
+    use crate::store::scan::file_reads::masked_read_hooks;
+    for (shape, probe, read) in masks_probes() {
+        let label = format!("{tag} {shape}");
+        let view = file.run_probe(&probe).await.unwrap();
+        assert!(
+            view.view_statistics().unwrap().pending_filter,
+            "{label}: a pending filter"
+        );
+        let before = masked_read_hooks::reads();
+        let rows = row_list(&view).await;
+        assert_eq!(
+            masked_reads_since(before),
+            one_masked_read(read),
+            "{label}: read as {read:?}"
+        );
+        assert!(!rows.is_empty(), "{label}: the pattern matches");
+        assert_eq!(
+            struct_chunk_codes(&collect_row_chunks(&view, 4_096).await),
+            rows,
+            "{label}: the scan's rows, in order"
+        );
+        assert_eq!(
+            row_list(&memory.run_probe(&probe).await.unwrap()).await,
+            rows,
+            "{label}: the in-memory store's rows"
+        );
+    }
+}
+
+/// A filtered no-index file view's one-shot code read evaluates the filter's
+/// masks first and reads the rows they keep as `MaskedRead` chooses: point by
+/// point, by one take, or each split projected at its mask. Over sixteen
+/// splits, one of them empty among the matched, the rows and their order are
+/// the scan's and the in-memory store's.
+#[tokio::test]
+async fn test_masks_first_reads_each_kind() {
+    let (_dir, path) = masks_file().await;
+    assert_eq!(
+        open_mapped(&path).await.splits().unwrap().len(),
+        MASKS_SPLITS
+    );
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    assert_masks_first_reads(&file, &memory, "file").await;
+}
+
+/// The masks first skip tombstoned rows: with some of every pattern's rows
+/// deleted from the file store and the in-memory store alike, each pattern
+/// still reads as its kind and answers the in-memory store's live rows.
+#[tokio::test]
+async fn test_masks_first_skips_tombstones() {
+    let (_dir, path) = masks_file().await;
+    let file = masks_deleted(&VortexRdfStore::from_file(&path).await.unwrap()).await;
+    let memory = masks_deleted(&VortexRdfStore::from_file_in_memory(&path).await.unwrap()).await;
+    assert!(file.view_statistics().unwrap().tombstones > 0);
+    assert_masks_first_reads(&file, &memory, "tombstoned").await;
+}
+
+/// A filtered no-index file view's `quads_vec` and `shared_quads_vec` read
+/// the filter's masks first: the quads, in order, are the `quads()` stream's,
+/// the tail's after the base's, for each read kind, under a file-backed and
+/// a resident dictionary, with the masks evaluated inline and, the split
+/// limit forced to zero, spawned. Rows read point by point are read inline;
+/// a take or a projection reads each split with a match in a task of its
+/// own, spawned since there is more than one.
+#[tokio::test]
+async fn test_quads_vec_over_a_filtered_file_matches_quads() {
+    use crate::store::scan::file_reads::{MaskedRead, driver_hooks, masked_read_hooks};
+
+    let (_file_backed_dir, file_backed) = masks_file().await;
+    let (_resident_dir, resident) = masks_file_resident_dictionary().await;
+    for (dictionary, path, file_backed) in [
+        ("file-backed", &file_backed, true),
+        ("resident", &resident, false),
+    ] {
+        let store = VortexRdfStore::from_file(path).await.unwrap();
+        assert_eq!(
+            store.dict_reader().unwrap().is_file_backed(),
+            file_backed,
+            "{dictionary}"
+        );
+        let tailed = store.add_quads(masks_tail()).await.unwrap();
+        for forced in [None, Some(0)] {
+            let _limit = forced.map(driver_hooks::ForcedLimit::set);
+            for (shape, probe, read) in masks_probes() {
+                let label = format!("{dictionary} {shape} limit {forced:?}");
+                let view = tailed.run_probe(&probe).await.unwrap();
+                let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
+                let tail_rows = if matches!(shape, "P" | "G") { 12 } else { 6 };
+                assert!(
+                    streamed[streamed.len() - tail_rows..].iter().all(|q| q
+                        .subject
+                        .to_string()
+                        .starts_with("<http://example.org/tail")),
+                    "{label}: the tail's rows last"
+                );
+                let before = masked_read_hooks::reads();
+                driver_hooks::take_spawned();
+                let quads = view.quads_vec().await.unwrap();
+                let spawned = driver_hooks::take_spawned();
+                assert_eq!(
+                    masked_reads_since(before),
+                    one_masked_read(read),
+                    "{label}: read as {read:?}"
+                );
+                assert_eq!(quads, streamed, "{label}: the stream's quads, in order");
+                // The masks spawn every split under the forced limit; a take
+                // or a projection spawns each split with a match.
+                let masks = if forced.is_some() { MASKS_SPLITS } else { 0 };
+                let reads = match read {
+                    MaskedRead::Points => 0,
+                    MaskedRead::Take | MaskedRead::Project => MASKS_SPLITS - 1,
+                };
+                assert_eq!(spawned, masks + reads, "{label}: spawned splits");
+                let shared = view.shared_quads_vec().await.unwrap();
+                assert_eq!(
+                    shared_tuple_rows(&shared),
+                    tuple_rows(&streamed),
+                    "{label}: shared_quads_vec"
+                );
+            }
+        }
+    }
+}
+
+/// On no-index file stores, opened mapped and loaded whole, as written, with
+/// tombstones and with a tail, each of `O`, `PO`, `P` and `G` reads the same
+/// rows in base order plain and windowed to a limit that cannot bind: limits
+/// between the match's rows and their bound (the window route) and at or
+/// past the bound (the plain view). They are the rows the loaded open, an
+/// in-memory store, reads plain.
+#[tokio::test]
+async fn test_plain_and_unbound_limit_reads_return_the_same_rows() {
+    let (_dir, path) = masks_file().await;
+    let mapped = VortexRdfStore::from_file(&path).await.unwrap();
+    let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let variants = [
+        ("as written", mapped.clone(), loaded.clone()),
+        (
+            "tombstoned",
+            masks_deleted(&mapped).await,
+            masks_deleted(&loaded).await,
+        ),
+        (
+            "tailed",
+            mapped.add_quads(masks_tail()).await.unwrap(),
+            loaded.add_quads(masks_tail()).await.unwrap(),
+        ),
+    ];
+    for (variant, mapped, loaded) in &variants {
+        for (shape, probe, _) in masks_probes() {
+            let want = read_rows(&loaded.run_probe(&probe).await.unwrap()).await;
+            for (open, store) in [("mapped", mapped), ("loaded", loaded)] {
+                let label = format!("{variant} {open} {shape}");
+                let plain = store.run_probe(&probe).await.unwrap();
+                let n = plain.size().await.unwrap();
+                let bound = plain.view_statistics().unwrap().rows.upper_bound;
+                assert_eq!(read_rows(&plain).await, want, "{label}: plain");
+                let mut limits = vec![bound, bound + 1, usize::MAX];
+                if open == "mapped" {
+                    assert!(n + 1 < bound, "{label}: {n} rows under a bound of {bound}");
+                    limits.extend([n + 1, n + (bound - n) / 2, bound - 1]);
+                }
+                for limit in limits {
+                    let windowed = store
+                        .run_probe(&probe.clone().window(0, Some(limit)))
+                        .await
+                        .unwrap();
+                    assert_eq!(read_rows(&windowed).await, want, "{label} limit {limit}");
+                }
+            }
+        }
+    }
+}
+
+/// A window that cuts a filtered file view, a limit below its rows, is the
+/// first `limit` matches in base order, read as exact ids with the filter
+/// evaluated.
+#[tokio::test]
+async fn test_window_that_cuts_a_filter_keeps_base_order() {
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    for (shape, probe, _) in masks_probes() {
+        let rows = row_list(&store.run_probe(&probe).await.unwrap()).await;
+        let n = rows.len();
+        for limit in [1, n / 2, n - 1] {
+            let label = format!("{shape}: limit {limit} of {n} rows");
+            let windowed = store
+                .run_probe(&probe.clone().window(0, Some(limit)))
+                .await
+                .unwrap();
+            let stats = windowed.view_statistics().unwrap();
+            assert!(!stats.pending_filter, "{label}: the filter evaluated");
+            assert_eq!(stats.selection, SelectionKind::Ids, "{label}: exact ids");
+            assert_eq!(stats.rows, RowCountHint::exact(limit), "{label}");
+            assert_eq!(
+                row_list(&windowed).await,
+                rows[..limit],
+                "{label}: the first matches"
+            );
+        }
+    }
+}
+
+/// A window that cuts a filtered file view evaluates its splits in file order
+/// and stops at the first that fills it. On a file of more splits than the
+/// fold's lookahead it consumes exactly the splits up to that one, and starts
+/// at most a lookahead's worth of splits past them: inline (the split limit
+/// forced to the file's splits), evaluated as the fold polls them; spawned
+/// (the limit forced to zero), counted as they are spawned, since a spawned
+/// split may or may not run before its abort. The window's rows are the
+/// first matches.
+#[tokio::test]
+async fn test_cutting_window_over_a_filter_stops_early() {
+    use crate::io::read::available_parallelism;
+    use crate::store::scan::file_filter::split_hooks;
+    use crate::store::scan::file_reads::driver_hooks;
+
+    let (_dir, path) = many_splits_file().await;
+    assert_eq!(
+        open_mapped(&path).await.splits().unwrap().len(),
+        MANY_SPLITS
+    );
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let view = store
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    let rows = row_list(&view).await;
+    let limit = 64;
+    // `p0` is on every third row: the splits whose matches reach the limit.
+    let filled = (1..=MANY_SPLITS)
+        .find(|&splits| (0..splits * MANY_SPLIT_ROWS).filter(|i| i % 3 == 0).count() >= limit)
+        .unwrap();
+    let reach = (filled + available_parallelism().max(2) - 1).min(MANY_SPLITS);
+    for (forced, inline) in [(MANY_SPLITS, true), (0, false)] {
+        let _limit = driver_hooks::ForcedLimit::set(forced);
+        let (evaluated, consumed) = (split_hooks::evaluated(), split_hooks::consumed());
+        driver_hooks::take_spawned();
+        let windowed = view.window(0, limit).await.unwrap();
+        let spawned = driver_hooks::take_spawned();
+        let evaluated = split_hooks::evaluated() - evaluated;
+        assert_eq!(
+            split_hooks::consumed() - consumed,
+            filled,
+            "limit {forced}: the splits up to the one that fills the window"
+        );
+        if inline {
+            assert_eq!(spawned, 0, "inline: nothing spawned");
+            assert!(
+                (filled..=reach).contains(&evaluated),
+                "inline: {evaluated} splits evaluated, {filled} to {reach} expected"
+            );
+        } else {
+            assert_eq!(spawned, reach, "spawned: a lookahead past the consumed");
+        }
+        assert!(filled < MANY_SPLITS, "the window stops early");
+        assert_eq!(
+            row_list(&windowed).await,
+            rows[..limit],
+            "limit {forced}: the first matches"
+        );
+    }
+}
+
+/// The masks of a one-shot read, and a capped count, evaluate their splits
+/// under the row-scan driver: with the split limit forced below the file's
+/// sixteen splits every split is spawned, at sixteen none, and the rows and
+/// counts agree. A projection's own split reads follow the same rule over the
+/// fifteen splits with a match, which neither limit exceeds.
+#[tokio::test]
+async fn test_masks_driver_follows_the_row_scan_rule() {
+    use crate::store::scan::file_reads::driver_hooks;
+
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    for (shape, probe, _) in masks_probes() {
+        let view = store.run_probe(&probe).await.unwrap();
+        let mut answers = Vec::new();
+        for (limit, spawned) in [(MASKS_SPLITS - 1, MASKS_SPLITS), (MASKS_SPLITS, 0)] {
+            let label = format!("{shape} limit {limit}");
+            let _limit = driver_hooks::ForcedLimit::set(limit);
+            driver_hooks::take_spawned();
+            let rows = row_list(&view).await;
+            assert_eq!(
+                driver_hooks::take_spawned(),
+                spawned,
+                "{label}: the read's masks"
+            );
+            let count = view.size_capped(usize::MAX).await.unwrap();
+            assert_eq!(
+                driver_hooks::take_spawned(),
+                spawned,
+                "{label}: the capped count's masks"
+            );
+            answers.push((rows, count));
+        }
+        assert_eq!(answers[0], answers[1], "{shape}: either driver");
+        assert_eq!(answers[0].0.len(), answers[0].1, "{shape}: the count");
+    }
+}
+
+/// Dropping a capped count whose masks are spawned (the split limit forced to
+/// zero) aborts the split evaluations in flight: its first poll spawns a
+/// lookahead of splits, which on this single-threaded runtime have not run
+/// yet, and once the count is dropped they never run.
+#[tokio::test]
+async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
+    use crate::io::read::available_parallelism;
+    use crate::store::scan::file_filter::split_hooks;
+    use crate::store::scan::file_reads::driver_hooks;
+
+    let (_dir, path) = many_splits_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let view = store
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    let _limit = driver_hooks::ForcedLimit::set(0);
+    driver_hooks::take_spawned();
+    let evaluated = split_hooks::evaluated();
+    {
+        let mut count = std::pin::pin!(view.size_capped(usize::MAX));
+        assert!(
+            futures::poll!(count.as_mut()).is_pending(),
+            "the spawned splits have not run"
+        );
+        assert_eq!(
+            driver_hooks::take_spawned(),
+            available_parallelism().clamp(2, MANY_SPLITS),
+            "a lookahead of splits spawned"
+        );
+    }
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        split_hooks::evaluated(),
+        evaluated,
+        "the dropped count's splits never ran"
+    );
+}

@@ -151,7 +151,11 @@ order, never the index's.
 `code_columns_gathered` is the one-shot form, for a match the caller has
 counted and will consume whole: one call answers all four columns,
 zero-copy over the base's canonical code columns for a contiguous selection
-without tombstones. The chunk stream is the form for a match consumed
+without tombstones. On a file view whose pending filter no read by id
+serves, it evaluates the filter's masks split by split first and then reads
+only the rows they keep, point by point, by one take, or by projecting each
+split at its mask, where the streams scan the file. The chunk stream is the
+form for a match consumed
 incrementally or of unknown size, and the bindings reach it through
 `match_code_chunks` (Python) and `matchCodeChunks` (JS). A Python
 `match_codes` call given a cancel token returns its result when its gather
@@ -201,13 +205,17 @@ Every read is lazy, and a stream's first poll decides how it runs:
   the call's error.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
-  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L64)), and a
+  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L67)), and a
   scan first polled where no tokio runtime is current run inline on the
   polling task. Any other scan spawns its splits
-  ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L41)) onto the tokio
+  ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L44)) onto the tokio
   runtime it is polled in, and vortex looks that runtime up
   (`Handle::current()`) at every spawn, so every later poll of the stream
-  must run inside a tokio runtime too.
+  must run inside a tokio runtime too. A filtered file view's capped count,
+  window and one-shot reads evaluate the filter split by split under the
+  same rule, and `quads_vec` spawns its split reads whenever there is more
+  than one and a runtime is current: each such call, once it has spawned,
+  must be polled to completion inside that runtime.
 - A file-backed store's component tables are vortex's own
   `LayoutReaderDataSource`, whose scan always spawns: read them inside a
   tokio runtime.

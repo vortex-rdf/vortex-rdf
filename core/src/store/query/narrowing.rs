@@ -226,6 +226,8 @@ impl VortexRdfStore {
     /// the window), so `LIMIT` over a filtered scan costs the matching prefix
     /// of the file.
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
+        #[cfg(test)]
+        narrow_hooks::note_window();
         let t = debug::timer();
         if self.window_cannot_cut(offset, limit)? {
             debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
@@ -275,7 +277,7 @@ impl VortexRdfStore {
     /// serve plan never qualifies: its window reads exactly the rows it takes
     /// into exact ids, the rows and order of the plain match, and leaves the
     /// ids it shares with other views unread.
-    fn window_cannot_cut(&self, offset: usize, limit: usize) -> Result<bool> {
+    pub(in crate::store) fn window_cannot_cut(&self, offset: usize, limit: usize) -> Result<bool> {
         if offset != 0 || self.quads.is_pending_without_plan() {
             return Ok(false);
         }
@@ -610,13 +612,14 @@ fn set_is_located(codes: usize, rows: usize) -> bool {
 
 /// Test hook: how many of this thread's in-memory keeps were answered by
 /// binary search inside a sorted run (`keep_sorted_run`), not by a pass
-/// over the selected rows.
+/// over the selected rows; and how many windows this thread built.
 #[cfg(test)]
 pub(crate) mod narrow_hooks {
     use std::cell::Cell;
 
     thread_local! {
         static SORTED_RUN_KEEPS: Cell<usize> = const { Cell::new(0) };
+        static WINDOWS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Record one keep answered inside a sorted run.
@@ -627,6 +630,16 @@ pub(crate) mod narrow_hooks {
     /// The keeps answered inside a sorted run on this thread so far.
     pub(crate) fn sorted_run_keeps() -> usize {
         SORTED_RUN_KEEPS.with(Cell::get)
+    }
+
+    /// Record one call of [`window`](crate::store::VortexRdfStore::window).
+    pub(super) fn note_window() {
+        WINDOWS.set(WINDOWS.get() + 1);
+    }
+
+    /// The windows built on this thread so far.
+    pub(crate) fn windows() -> usize {
+        WINDOWS.get()
     }
 }
 

@@ -142,9 +142,10 @@ impl VortexRdfStore {
             IdsNeed::Rows
         };
         let view = self.run_pattern_and_keeps(probe, need).await?;
-        let view = if windowed {
-            view.window(probe.offset, probe.limit.unwrap_or(usize::MAX))
-                .await?
+        // A window that cannot cut a row is the matched view itself.
+        let limit = probe.limit.unwrap_or(usize::MAX);
+        let view = if windowed && !view.window_cannot_cut(probe.offset, limit)? {
+            view.window(probe.offset, limit).await?
         } else {
             view
         };

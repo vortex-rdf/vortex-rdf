@@ -28,15 +28,13 @@ pub(crate) fn available_parallelism() -> usize {
     *AVAILABLE_PARALLELISM
 }
 
-/// A scan's per-split futures driven inline: polled on the calling task, a
-/// `buffered` window of the host's parallelism in flight (so one split's I/O
-/// overlaps another's decode, with no runtime handle), their results in split
-/// (row) order.
-pub(crate) fn inline_splits<F>(
-    tasks: Vec<F>,
-) -> impl futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin
+/// Per-split futures (a scan's, or any other split loop's) driven inline:
+/// polled on the calling task, a `buffered` window of the host's parallelism
+/// in flight (so one split's I/O overlaps another's decode, with no runtime
+/// handle), their results in split (row) order.
+pub(crate) fn inline_splits<F, T>(tasks: Vec<F>) -> impl futures::Stream<Item = T> + Unpin
 where
-    F: Future<Output = VortexResult<Option<ArrayRef>>>,
+    F: Future<Output = T>,
 {
     futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)
 }
@@ -82,20 +80,22 @@ pub(crate) async fn collect_whole_scan(scan: ScanBuilder<ArrayRef>) -> Result<Ar
     collect_scan(dtype, scan.build()?).await
 }
 
-/// A scan's per-split futures each spawned onto the session's runtime as the
-/// stream is polled, `window` of them in flight, their results in split order
-/// as [`inline_splits`] yields them. Spawning needs a tokio runtime on the
-/// polling thread: [`ScanDriver::for_row_scan`] picks this driver only where
-/// there is one.
+/// Per-split futures (a scan's, or any other split loop's) each spawned onto
+/// the session's runtime as the stream is polled, `window` of them in flight,
+/// their results in split order as [`inline_splits`] yields them. Dropping
+/// the stream aborts the spawned splits it still holds. Spawning needs a
+/// tokio runtime on the polling thread: [`ScanDriver::for_row_scan`] picks
+/// this driver only where there is one.
 ///
 /// [`ScanDriver::for_row_scan`]: crate::store::scan::file_reads::ScanDriver::for_row_scan
 #[cfg(feature = "file-io")]
-pub(crate) fn spawned_splits<F>(
+pub(crate) fn spawned_splits<F, T>(
     tasks: Vec<F>,
     window: usize,
-) -> impl futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin + Send + 'static
+) -> impl futures::Stream<Item = T> + Unpin + Send + 'static
 where
-    F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
 {
     use vortex_io::session::RuntimeSessionExt as _;
 

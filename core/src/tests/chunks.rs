@@ -882,3 +882,108 @@ async fn test_chunks_gates() {
         "a tailed Dictionary view has no source"
     );
 }
+
+/// `stream` pulled once and then drained: the splits its first pull spawned,
+/// and the rows its items hold (`rows_of`). `before_first_poll` runs once the
+/// stream is built and before it is first polled.
+async fn pull_and_drain<S: futures::Stream + Unpin>(
+    mut stream: S,
+    before_first_poll: impl FnOnce(),
+    rows_of: impl Fn(S::Item) -> usize,
+) -> (usize, usize) {
+    use crate::store::scan::file_reads::driver_hooks;
+    before_first_poll();
+    driver_hooks::take_spawned();
+    let first = stream.next().await.expect("a first item");
+    let spawned = driver_hooks::take_spawned();
+    let mut rows = rows_of(first);
+    while let Some(item) = stream.next().await {
+        rows += rows_of(item);
+    }
+    (spawned, rows)
+}
+
+/// The chunk streams over a filtered no-index file view (`code_chunks`,
+/// `row_chunks`, `quads()` and the data source's scan) stay lazy and scan:
+/// nothing is evaluated or scanned before the first poll, each drained stream
+/// runs one row scan and never reads the filter's masks first, and with the
+/// split limit forced to zero a first pull has at most a scan's window of
+/// splits spawned, four per unit of available parallelism, on a file of more
+/// splits than that. The row-chunk streams spawn through the crate's driver,
+/// which counts each spawn; `quads()` reads through vortex's own scan stream,
+/// whose window the count does not see.
+#[tokio::test]
+async fn test_chunk_stream_over_filtered_file_stays_lazy() {
+    use crate::io::read::available_parallelism;
+    use crate::store::scan::file_filter::split_hooks;
+    use crate::store::scan::file_reads::{driver_hooks, masked_read_hooks, scan_hooks};
+
+    let (_dir, path) = many_splits_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let view = store
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert!(view.view_statistics().unwrap().pending_filter);
+    let n = view.size().await.unwrap();
+    let window = 4 * available_parallelism();
+    let _limit = driver_hooks::ForcedLimit::set(0);
+    for read in ["code_chunks", "row_chunks", "quads", "data_source"] {
+        let (scans, evaluated) = (scan_hooks::scans(), split_hooks::evaluated());
+        let masked = masked_read_hooks::reads();
+        let lazy = || {
+            assert_eq!(
+                scan_hooks::scans(),
+                scans,
+                "{read}: no scan before the first poll"
+            );
+            assert_eq!(
+                split_hooks::evaluated(),
+                evaluated,
+                "{read}: no split evaluated before the first poll"
+            );
+        };
+        let (spawned, rows) = match read {
+            "code_chunks" => {
+                let chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap()[0].len()).await
+            }
+            "row_chunks" => {
+                let chunks = view.row_chunks(256).unwrap();
+                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap().len()).await
+            }
+            "quads" => {
+                pull_and_drain(view.quads(), lazy, |quad| {
+                    quad.unwrap();
+                    1
+                })
+                .await
+            }
+            _ => {
+                let source = view.data_source().unwrap();
+                let scan = source.scan(ScanRequest::default()).await.unwrap();
+                let mut partitions = scan.partitions();
+                let partition = partitions.next().await.unwrap().unwrap();
+                assert!(partitions.next().await.is_none(), "one partition");
+                let chunks = partition.execute().unwrap();
+                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap().len()).await
+            }
+        };
+        assert_eq!(rows, n, "{read}: every row");
+        assert!(
+            spawned <= window,
+            "{read}: {spawned} splits spawned by a first pull"
+        );
+        if read != "quads" {
+            assert_eq!(spawned, window.min(MANY_SPLITS), "{read}: a scan's window");
+        }
+        assert_eq!(scan_hooks::scans() - scans, 1, "{read}: one row scan");
+        assert_eq!(
+            split_hooks::evaluated(),
+            evaluated,
+            "{read}: no masks evaluated"
+        );
+        assert_eq!(masked_read_hooks::reads(), masked, "{read}: no masked read");
+    }
+}

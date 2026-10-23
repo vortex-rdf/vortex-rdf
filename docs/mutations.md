@@ -153,9 +153,9 @@ flowchart TD
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L221) (through
-  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L307)), and on
+  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L378)), and on
   every later read the mask is applied **inside the scan**
-  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L234)) — as an
+  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L237)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`
   selection, or subtracted up front from an id list — so it composes with a
   pushed-down filter, whose output carries no row ids to re-align against.
@@ -173,7 +173,7 @@ flowchart TD
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/read/rows.rs#L478): base rows first (in view
+[`live_raw_quads`](../core/src/store/read/rows.rs#L550): base rows first (in view
 order), then tail rows, tombstones already excluded. Both put them in order the
 same way ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L87)):
 the tail is sorted alone and merged into the sorted base in one linear pass (a
