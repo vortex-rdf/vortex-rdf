@@ -24,6 +24,7 @@ use vortex_layout::{Layout, LayoutReaderRef, LayoutRef};
 use crate::io::container::{self, RdfStoreLayoutVTable};
 use crate::io::read::{FileIdentity, OpenedFile};
 use crate::store::persist::open::{ComponentRoster, IndexChild};
+use crate::store::schema;
 
 /// An opened native store file: the [`vortex_file::VortexFile`] plus its
 /// classified component roster and reader tree.
@@ -59,12 +60,17 @@ pub(crate) struct NativeStoreFile {
     /// same few filters; keyed this way a hit costs a tree walk but no
     /// allocation. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
-    /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]).
-    /// Each handle keeps the probes of the leaves it fetched, so a repeated
-    /// subject or index-run location skips the layout walk and the leaf
-    /// rebuilds. Bounded by the file's layout: one handle per column, and per
-    /// fetched leaf a probe over mapped bytes.
+    /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]),
+    /// but for the code columns', which [`code_chunks`](Self::code_chunks)
+    /// holds. Each handle keeps the probes of the leaves it fetched, so a
+    /// repeated subject or index-run location skips the layout walk and the
+    /// leaf rebuilds. Bounded by the file's layout: one handle per column,
+    /// and per fetched leaf a probe over mapped bytes.
     quad_chunks: ChunkMemo<()>,
+    /// The `s`, `p`, `o` and `g` columns' handles, one slot each, held as
+    /// [`quad_chunks`](Self::quad_chunks) holds the others': the lookups
+    /// every read by id makes take no lock.
+    code_chunks: [OnceLock<ColumnHandle>; 4],
     /// The index components' chunk-probe handles, by component name and
     /// column, held and bounded as the quad table's are.
     component_chunks: ChunkMemo<String>,
@@ -366,6 +372,7 @@ impl NativeStoreFile {
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
             quad_chunks: ChunkMemo::default(),
+            code_chunks: Default::default(),
             component_chunks: ChunkMemo::default(),
             located: OnceLock::new(),
             bound_exprs: Arc::new(BoundExprMemo::new()),
@@ -462,11 +469,19 @@ impl NativeStoreFile {
     /// quad child's layout shape or that column's dtype declines (memoized
     /// too); callers keep the scan.
     pub(crate) fn column_chunks(&self, column: &str) -> ColumnHandle {
-        self.quad_chunks.get_or_build(&(), column, || {
+        let build = || {
             let quads = container::quad_source(self.root()).ok()?;
             vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
                 .map(Arc::new)
-        })
+        };
+        let slot = match column {
+            schema::COL_S => 0,
+            schema::COL_P => 1,
+            schema::COL_O => 2,
+            schema::COL_G => 3,
+            _ => return self.quad_chunks.get_or_build(&(), column, build),
+        };
+        self.code_chunks[slot].get_or_init(build).clone()
     }
 
     /// An index component column's chunk-probe handle, the auxiliary-child

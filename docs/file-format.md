@@ -471,7 +471,7 @@ a call is working on and the bounded structures below. Residency is the
 kernel's decision; no segment cache sits in between.
 
 What a file store keeps for its lifetime, and what bounds it. The opened handle
-([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L39)) and the file-backed
+([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L40)) and the file-backed
 dictionary handle
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L228))
 keep:
