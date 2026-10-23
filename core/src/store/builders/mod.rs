@@ -2,14 +2,15 @@
 //! ([`BuiltArray`], and the crate-private `BuiltStream` the file writer
 //! consumes), the primary chunk build ([`build_struct_array`]) and the
 //! globally sorted index emission ([`build_components`]). `sorted_in_memory`
-//! and `sorted_stream` are the two pipelines; `spill` (the sort runs) and
+//! and `sorted_stream` are the two pipelines; `interner` (the term ids),
+//! `runs` (the sort runs and their merge), `spill` (the run directory) and
 //! `stream_indexes` (the index children) back the out-of-core one.
 //!
 //! Which pipeline runs is a property of the target, never a caller's choice:
-//! the out-of-core global sort (`SortedStreamBuilder`), whose peak memory does
-//! not scale with the dataset, wherever a filesystem exists; the in-memory
-//! one ([`SortedInMemoryBuilder`]) on `wasm32-unknown-unknown`, the only one
-//! compiled there.
+//! the out-of-core global sort (`SortedStreamBuilder`), whose peak memory
+//! scales with the dataset's distinct terms, not its quads, wherever a
+//! filesystem exists; the in-memory one ([`SortedInMemoryBuilder`]) on
+//! `wasm32-unknown-unknown`, the only one compiled there.
 //!
 //! A builder emits primary-only quad rows plus one *component* per requested
 //! index's persisted child, the one form index data takes: the in-memory sort
@@ -45,6 +46,42 @@ use vortex_array::{ArrayRef, IntoArray};
 
 /// Number of quads per StructArray chunk in streaming/chunked builders.
 pub(crate) const DEFAULT_CHUNK_ROWS: usize = 100_000;
+
+/// Entries per spill run of the out-of-core build: quads per quad run, and
+/// entries per run of each index family. A run's records are term ids and
+/// ranks (16 bytes a quad, 8 or 20 an index entry), so a run of ten chunks'
+/// worth is buffered in a few megabytes and a build opens a tenth as many
+/// run files as runs of a chunk would.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) const DEFAULT_RUN_ROWS: usize = 1 << 20;
+
+/// The out-of-core build's sizes: rows per emitted chunk (quad chunks and
+/// index-child chunks alike) and entries per spill run.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BuildSizes {
+    pub(crate) chunk_rows: usize,
+    pub(crate) run_rows: usize,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl BuildSizes {
+    /// [`DEFAULT_CHUNK_ROWS`] and [`DEFAULT_RUN_ROWS`]: every build's.
+    pub(crate) const DEFAULT: Self = Self {
+        chunk_rows: DEFAULT_CHUNK_ROWS,
+        run_rows: DEFAULT_RUN_ROWS,
+    };
+
+    /// One size for both, so a test of a few quads cuts several runs and
+    /// several chunks.
+    #[cfg(test)]
+    pub(crate) const fn uniform(rows: usize) -> Self {
+        Self {
+            chunk_rows: rows,
+            run_rows: rows,
+        }
+    }
+}
 
 /// A stream of StructArray chunks for the Vortex file writer. Items are
 /// `VortexResult` because the writer polls the stream directly; builder
@@ -87,9 +124,13 @@ pub(crate) struct BuiltStream {
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod interner;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod runs;
 pub(crate) mod sorted_in_memory;
 // No filesystem to spill to on wasm32-unknown-unknown; compiling the external
-// sort out also keeps rkyv and uuid out of the wasm artifact.
+// sort out also keeps uuid out of the wasm artifact.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -124,7 +165,7 @@ pub trait VortexArrayBuilder {
 /// built beside it as components ([`build_components`]). An empty `quads`
 /// builds every layout's empty chunk, the Dictionary layout's being
 /// [`dictionary::empty_struct`] (unstamped: nothing to sort); a non-empty
-/// Dictionary chunk needs the dictionary's codes ([`dictionary::build_chunk`]).
+/// Dictionary chunk needs the dictionary's codes ([`dictionary::build_code_chunk`]).
 ///
 /// `s_sorted` stamps `IsSorted` on the `s` column, which `match_pattern`
 /// trusts as global `(s, p, o, g)` order: it must be `true` only when `quads`

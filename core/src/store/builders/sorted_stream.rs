@@ -1,31 +1,41 @@
-//! The [`SortedStreamBuilder`] strategy: spill sorted runs to temporary
-//! files, then K-way merge them back into one global (s, p, o, g) order. It
-//! gives the in-memory builder's guarantee (globally sorted `s` and index
-//! children) without holding the dataset, at the cost of temp-file I/O; the
-//! requested indexes merge from their own spilled `(value, row id)` runs and
-//! stream out as components, never materialized whole
+//! The [`SortedStreamBuilder`] strategy: an external merge sort over term
+//! ids. Every term is interned as it arrives ([`TermInterner`]), each quad
+//! kept as four `u32` ids; full buffers are sorted in their terms' order and
+//! spilled as fixed-width runs ([`runs`](super::runs)), then K-way merged back
+//! into one global (s, p, o, g) order through the terms' ranks. It gives the
+//! in-memory builder's guarantee (globally sorted `s` and index children)
+//! with the dataset on disk as 16 bytes a quad; the requested indexes merge
+//! from their own spilled `(ranks, row id)` runs and stream out as
+//! components, never materialized whole
 //! ([`stream_indexes`](super::stream_indexes)).
 //!
-//! Quads are unique and terms canonical in what this builder emits. The quad
-//! runs are spilled *distinct*: a quad that arrives more than once, in one run
-//! or in several, is merged out once, and the dictionary collects the terms of
-//! the canonical quads as a set. Row ids are assigned by that merge, after the
-//! repeats are gone, so every index family's `(value, row id)` records
+//! Quads are unique and terms canonical in what this builder emits. A term is
+//! interned by its canonical spelling, so equal ids are equal terms, and the
+//! quad runs are spilled *distinct*: a quad that arrives more than once, in
+//! one run or in several, is merged out once. Row ids are assigned by that
+//! merge, after the repeats are gone, so every index family's records
 //! describe the deduplicated rows and are unique, each carrying a row id of
 //! its own; the families are spilled and merged as they are.
+//!
+//! The distinct terms are what this builder holds for the dataset, under
+//! every layout: the interner during ingest, then the Dictionary layout's
+//! term dictionary or, under the string layouts, the sorted terms the ranks
+//! are spelled back from.
 
-use super::spill::{RunSpiller, TempRunsGuard};
+use super::interner::TermInterner;
+use super::runs::QuadSpiller;
+use super::spill::TempRunsGuard;
 use super::stream_indexes::merge_feeding_indexes;
 use super::{
-    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder,
-    build_struct_array,
+    BuildSizes, BuiltArray, BuiltStream, ChunkStream, VortexArrayBuilder, build_struct_array,
 };
-use crate::error::Result;
+use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, with_subject_stamp};
 use crate::store::indexes::{IndexComponent, Indexes};
-use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
+use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
 use crate::store::layouts::{LayoutStrategy, dictionary};
+use crate::store::schema::TermCode;
 
 use crate::debug;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -34,18 +44,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 use vortex_array::ArrayRef;
+use vortex_array::arrays::VarBinViewArray;
 use vortex_array::dtype::DType;
 
 /// The out-of-core, globally sorted builder: an external merge sort, so a
-/// dataset larger than memory builds. Sorted runs are spilled to disk
-/// (`build_vortex_array` spills under `VORTEX_RDF_SPILL_DIR`, else the OS
-/// temp dir), then K-way merged into fixed-size chunks.
+/// dataset larger than memory builds. Sorted runs of term ids are spilled to
+/// disk (`build_vortex_array` spills under `VORTEX_RDF_SPILL_DIR`, else the
+/// OS temp dir), then K-way merged into fixed-size chunks.
 ///
-/// With any secondary index requested, the quad merge runs eagerly to a spill
-/// (it assigns the row ids) while each index family's `(value, row id)`
-/// entries are spilled as sorted runs; each family then streams its child off
-/// its own merger beside the lazily re-read quad chunks. Without indexes one
-/// lazy merge pass emits chunks as the consumer polls.
+/// With any secondary index requested, a first merge assigns the row ids
+/// while each index family's `(ranks, row id)` entries are spilled as sorted
+/// runs; the quad chunks then come off a second merge over the same runs,
+/// beside each family's child streaming off its own merger. Without indexes
+/// one lazy merge pass emits chunks as the consumer polls.
 pub struct SortedStreamBuilder;
 
 impl VortexArrayBuilder for SortedStreamBuilder {
@@ -54,7 +65,7 @@ impl VortexArrayBuilder for SortedStreamBuilder {
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<BuiltArray> {
-        build_array(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS).await
+        build_array(quad_stream, layout, indexes, BuildSizes::DEFAULT).await
     }
 }
 
@@ -69,7 +80,7 @@ impl SortedStreamBuilder {
         indexes: Indexes,
         spill: Option<(&OsStr, &Path)>,
     ) -> Result<BuiltStream> {
-        build_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS, spill).await
+        build_chunk_stream(quad_stream, layout, indexes, BuildSizes::DEFAULT, spill).await
     }
 }
 
@@ -82,7 +93,7 @@ pub(crate) async fn build_array(
     quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
-    chunk_size: usize,
+    sizes: BuildSizes,
 ) -> Result<BuiltArray> {
     let start = debug::timer();
     let BuiltStream {
@@ -91,7 +102,7 @@ pub(crate) async fn build_array(
         components: writes,
         dict,
         ..
-    } = build_chunk_stream(quad_stream, layout, indexes, chunk_size, None).await?;
+    } = build_chunk_stream(quad_stream, layout, indexes, sizes, None).await?;
     let chunks: Vec<ArrayRef> = chunks.try_collect().await?;
     let mut components = Vec::with_capacity(writes.len());
     for write in &writes {
@@ -110,50 +121,123 @@ pub(crate) async fn build_array(
     })
 }
 
-/// How merged quads become primary chunks: a string layout's columns, or
-/// codes against the dictionary collected during ingest.
+/// How merged rank quads become primary chunks: codes into the term
+/// dictionary built from the ranked terms, or the string layout's columns
+/// with each rank spelled back.
 enum Encoding {
-    Strings(LayoutStrategy),
     Codes {
         dict: Arc<TermDictionary>,
-        code_map: TermCodeMap,
+    },
+    Strings {
+        layout: LayoutStrategy,
+        terms: Arc<[Box<str>]>,
     },
 }
 
 impl Encoding {
+    /// `layout`'s encoding of the build's terms, `sorted` in rank order:
+    /// moved into the Dictionary layout's term dictionary, or kept to spell
+    /// the ranks back.
+    fn new(layout: LayoutStrategy, sorted: Vec<Box<str>>) -> Result<Self> {
+        Ok(match layout {
+            LayoutStrategy::Dictionary => Encoding::Codes {
+                dict: Arc::new(TermDictionary::from_sorted_column(
+                    VarBinViewArray::from_iter_str(sorted),
+                )?),
+            },
+            layout => Encoding::Strings {
+                layout,
+                terms: Arc::from(sorted),
+            },
+        })
+    }
+
     fn strategy(&self) -> LayoutStrategy {
         match self {
-            Encoding::Strings(layout) => *layout,
+            Encoding::Strings { layout, .. } => *layout,
             Encoding::Codes { .. } => LayoutStrategy::Dictionary,
         }
     }
 
-    /// `quads`, a non-empty window of the global merge, as one chunk with
+    /// `ranks`, a non-empty window of the global merge, as one chunk with
     /// `s` stamped sorted.
-    fn chunk(&self, quads: &[RawQuad]) -> Result<ArrayRef> {
+    fn chunk(&self, ranks: &[[u32; 4]]) -> Result<ArrayRef> {
         match self {
-            Encoding::Strings(layout) => build_struct_array(quads, *layout, true),
-            Encoding::Codes { code_map, .. } => dictionary::build_chunk(quads, code_map, true),
+            Encoding::Codes { dict } => {
+                let n = ranks.len();
+                let mut codes = QuadCodes {
+                    s: Vec::with_capacity(n),
+                    p: Vec::with_capacity(n),
+                    o: Vec::with_capacity(n),
+                    g: Vec::with_capacity(n),
+                };
+                for &[s, p, o, g] in ranks {
+                    codes.s.push(code_of_rank(dict, s)?);
+                    codes.p.push(code_of_rank(dict, p)?);
+                    codes.o.push(code_of_rank(dict, o)?);
+                    codes.g.push(code_of_rank(dict, g)?);
+                }
+                dictionary::build_code_chunk(&codes, 0..n, true)
+            }
+            Encoding::Strings { layout, terms } => {
+                let quads = ranks
+                    .iter()
+                    .map(|&[s, p, o, g]| {
+                        Ok(RawQuad {
+                            s: term_of_rank(terms, s)?,
+                            p: term_of_rank(terms, p)?,
+                            o: term_of_rank(terms, o)?,
+                            g: term_of_rank(terms, g)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                build_struct_array(&quads, *layout, true)
+            }
         }
     }
 
     /// The dictionary that rides beside the chunks for the serializer.
     fn dict(&self) -> Option<Arc<TermDictionary>> {
         match self {
-            Encoding::Strings(_) => None,
-            Encoding::Codes { dict, .. } => Some(Arc::clone(dict)),
+            Encoding::Strings { .. } => None,
+            Encoding::Codes { dict } => Some(Arc::clone(dict)),
         }
     }
+}
+
+/// A term rank past the build's terms: only a corrupt spill record names one.
+fn rank_error(rank: u32, terms: usize) -> VortexRdfError {
+    VortexRdfError::Deserialization(format!(
+        "spill record names term rank {rank}, past the {terms} terms"
+    ))
+}
+
+/// The dictionary code of the term of `rank`.
+fn code_of_rank(dict: &TermDictionary, rank: u32) -> Result<TermCode> {
+    let at = rank as usize;
+    if at < dict.len() {
+        Ok(dict.code_at(at))
+    } else {
+        Err(rank_error(rank, dict.len()))
+    }
+}
+
+/// The spelling of the term of `rank`.
+fn term_of_rank(terms: &[Box<str>], rank: u32) -> Result<String> {
+    terms
+        .get(rank as usize)
+        .map(|term| term.to_string())
+        .ok_or_else(|| rank_error(rank, terms.len()))
 }
 
 /// External merge sort into a lazily evaluated stream of sorted chunks, each
 /// distinct quad once. Ingest into sorted runs completes before this returns:
 /// no sorted output exists before all input is seen. Without secondary
-/// indexes the K-way merge then builds chunks only as the consumer polls, at a
-/// peak memory of the heap plus one chunk (plus the distinct terms under the
-/// Dictionary layout); with them the merge runs eagerly (it assigns the row
-/// ids the index runs carry) and only chunk emission stays lazy. The run
-/// files are removed when the stream is dropped.
+/// indexes the K-way merge then builds chunks only as the consumer polls, at
+/// a peak memory of the distinct terms plus a run buffer and a chunk; with
+/// them a first merge runs to the end (it assigns the row ids the index runs
+/// carry) and the chunks come lazily off a second. The run files are removed
+/// when the stream is dropped.
 ///
 /// `spill` is the output file's name and the directory to spill beside: a
 /// build that writes a file passes its temp file's directory, beside the file
@@ -164,73 +248,69 @@ pub(crate) async fn build_chunk_stream(
     mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
-    chunk_size: usize,
+    sizes: BuildSizes,
     spill: Option<(&OsStr, &Path)>,
 ) -> Result<BuiltStream> {
     let start = debug::timer();
     let (output, base) = spill.unzip();
     let guard = Arc::new(TempRunsGuard::create(output, base)?);
 
-    // For the Dictionary layout, the global term dictionary is built
-    // incrementally during this same ingestion pass.
-    let mut dict_builder = (layout == LayoutStrategy::Dictionary).then(TermDictionaryBuilder::new);
-
-    // Distinct: a repeated quad must be one row, and one row id.
-    let mut spiller = RunSpiller::<RawQuad>::distinct(guard.path(), "quads", chunk_size);
+    let mut terms = TermInterner::new();
+    let mut spiller = QuadSpiller::new(guard.path(), sizes.run_rows);
     let mut ingested = 0usize;
     while let Some(res) = quads_in.next().await {
-        let raw = res?;
-        if let Some(b) = dict_builder.as_mut() {
-            b.insert_quad(&raw);
-        }
-        spiller.push(raw)?;
+        let ids = terms.intern_quad(res?)?;
+        spiller.push(ids, &terms)?;
         ingested += 1;
     }
-    let merger = spiller.into_merger()?;
+    let runs = spiller.finish(&terms)?;
     log::debug!(
-        "[SortedStreamBuilder] Ingested {} quads into {} runs in {:?} (dictionary={})",
+        "[SortedStreamBuilder] Ingested {} quads ({} distinct terms) into {} runs in {:?}",
         ingested,
-        merger.run_count(),
-        debug::elapsed(start),
-        dict_builder.is_some()
+        terms.len(),
+        runs.run_count(),
+        debug::elapsed(start)
     );
-    let encoding = match dict_builder {
-        Some(builder) => {
-            let (dict, code_map) = builder.finish()?;
-            Encoding::Codes {
-                dict: Arc::new(dict),
-                code_map,
-            }
-        }
-        None => Encoding::Strings(layout),
-    };
+
+    let freeze = debug::timer();
+    let frozen = terms.finish();
+    let rank_of = Arc::new(frozen.rank_of);
+    let encoding = Encoding::new(layout, frozen.sorted)?;
+    log::debug!(
+        "[SortedStreamBuilder] Ranked {} terms in {:?}",
+        rank_of.len(),
+        debug::elapsed(freeze)
+    );
 
     // Any requested index means a first pass over the merge: the index
     // children are globally sorted, which needs the row ids the merge
     // assigns before their entries can be sorted. Only the families the
     // requested types need are spilled, each once however often requested.
-    let (merger, components) = if indexes.is_empty() {
-        (merger, Vec::new())
+    let components = if indexes.is_empty() {
+        Vec::new()
     } else {
         match &encoding {
-            Encoding::Codes { code_map, .. } => {
-                merge_feeding_indexes(merger, &guard, chunk_size, &indexes, |term| {
-                    dictionary::code_of(code_map, term)
+            Encoding::Codes { dict } => {
+                let dict = Arc::clone(dict);
+                merge_feeding_indexes(&runs, &rank_of, &guard, sizes, &indexes, move |rank| {
+                    code_of_rank(&dict, rank)
                 })?
             }
-            Encoding::Strings(_) => {
-                merge_feeding_indexes(merger, &guard, chunk_size, &indexes, |term| {
-                    Ok(term.to_string())
+            Encoding::Strings { terms, .. } => {
+                let terms = Arc::clone(terms);
+                merge_feeding_indexes(&runs, &rank_of, &guard, sizes, &indexes, move |rank| {
+                    term_of_rank(&terms, rank)
                 })?
             }
         }
     };
 
+    let merger = runs.merger(&rank_of)?;
     let dict = encoding.dict();
     let strategy = encoding.strategy();
     let (dtype, chunks) = chunk_stream(
         (merger, guard),
-        chunk_size,
+        sizes.chunk_rows,
         move |(merger, _guard), n| {
             let batch = merger.next_batch(n)?;
             if batch.is_empty() {

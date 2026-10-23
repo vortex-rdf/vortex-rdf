@@ -1023,14 +1023,13 @@ mod links_and_permissions {
     /// run file in a directory that takes no new files.
     #[test]
     fn test_spill_write_error_names_the_directory_and_the_hint() {
-        use crate::store::RawQuad;
-        use crate::store::builders::spill::RunWriter;
+        use crate::store::builders::runs::RecordWriter;
         let dir = tempfile::tempdir().unwrap();
         let Some(_read_only) = read_only_dir(dir.path()) else {
             return;
         };
 
-        let error = RunWriter::<RawQuad>::create(&dir.path().join("quads_run_0.bin"))
+        let error = RecordWriter::create(&dir.path().join("quads_run_0.bin"))
             .err()
             .expect("a directory that takes no new files takes no spill run");
 

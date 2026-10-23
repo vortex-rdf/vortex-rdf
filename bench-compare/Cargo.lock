@@ -3974,6 +3974,7 @@ version = "0.13.1"
 dependencies = [
  "async-trait",
  "futures",
+ "hashbrown 0.17.1",
  "log",
  "memmap2",
  "mimalloc",

@@ -225,7 +225,7 @@ flowchart TD
   `<store>.write-<uuid>.tmp` exists before the work starts (a process killed
   meanwhile leaves it behind, and nothing removes it later). The sorted rows
   are then streamed through the out-of-core builder
-  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L163))
+  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L247))
   into it
   ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L77)), which is
   then renamed over the original path, and the store is reopened
@@ -241,14 +241,14 @@ flowchart TD
   there a file-backed store cannot compact over its own path: the compaction
   fails with the I/O error and the file stays as it was. The builder's spill
   runs are placed in the temp file's directory
-  ([`spill_site`](../core/src/io/write.rs#L413), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L95)):
+  ([`spill_site`](../core/src/io/write.rs#L413), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default), in a
   run directory named after that file.
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L190) and adopts
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L231) and adopts
   the result through [`from_built`](../core/src/store/construct.rs#L108), in the
   same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).

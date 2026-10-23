@@ -283,24 +283,16 @@ pub(crate) mod out_of_core {
     }
 
     /// A quad's terms rearranged into one family's sort-key order, so deriving
-    /// `Ord` (and the spill machinery's pair sort) compares by exactly that
-    /// family's comparator. `V` is the term encoding: `String`, or
-    /// [`TermCode`](crate::store::TermCode)s under the Dictionary layout.
+    /// `Ord` compares by exactly that family's comparator. `V` is the term
+    /// encoding: `String`, [`TermCode`](crate::store::TermCode)s under the
+    /// Dictionary layout, or the out-of-core build's `u32` term ranks, whose
+    /// order is the terms' (its spilled copy entries carry their ranks in
+    /// this order).
     ///
     /// Built via [`Self::new`] from an `[s, p, o, g]` tuple;
     /// [`CopyFamily::key_positions`](super::CopyFamily::key_positions) maps the
     /// components back out when the sorted keys are turned into columns.
-    #[derive(
-        Clone,
-        Debug,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        rkyv::Archive,
-        rkyv::Serialize,
-        rkyv::Deserialize,
-    )]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(crate) struct CopyKey<V>(pub(crate) [V; 4]);
 
     impl<V: Default> CopyKey<V> {

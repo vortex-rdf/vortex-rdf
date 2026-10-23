@@ -3544,6 +3544,7 @@ dependencies = [
  "clap",
  "codspeed-divan-compat",
  "futures",
+ "hashbrown 0.17.1",
  "log",
  "memmap2",
  "mimalloc",

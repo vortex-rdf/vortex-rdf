@@ -100,21 +100,6 @@ where
     Ok(codes)
 }
 
-/// A Dictionary-layout chunk of `quads`: four code columns encoded through
-/// `code_map`, `s_sorted` as for [`build_code_chunk`].
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn build_chunk<K>(
-    quads: &[RawQuad],
-    code_map: &HashMap<K, TermCode>,
-    s_sorted: bool,
-) -> Result<ArrayRef>
-where
-    K: Borrow<str> + Eq + Hash,
-{
-    let codes = encode_quads(quads, code_map)?;
-    build_code_chunk(&codes, 0..quads.len(), s_sorted)
-}
-
 /// The whole dataset as one chunk. `codes` must be in global (s, p, o, g)
 /// order: the `s` column is stamped sorted.
 pub(crate) fn build_array(codes: &QuadCodes) -> Result<ArrayRef> {

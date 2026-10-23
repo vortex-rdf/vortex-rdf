@@ -132,7 +132,7 @@ impl VortexRdfStore {
             Box::new(stream),
             self.layout.strategy(),
             indexes,
-            DEFAULT_CHUNK_ROWS,
+            crate::store::builders::BuildSizes::DEFAULT,
             pending.spill_site(),
         )
         .await?;
