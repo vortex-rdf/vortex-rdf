@@ -838,7 +838,9 @@ mod tests {
     }
 
     /// A panic while a memo's lock is held leaves the memo usable: its
-    /// entries are whole, so the next lookup takes the poisoned lock over.
+    /// entries are whole, so the next lookup takes the poisoned lock over,
+    /// and a column it remembers is not built again. The code columns'
+    /// handles, in their own slots, take no lock at all.
     #[tokio::test]
     async fn a_poisoned_chunk_handle_lock_is_recovered() {
         let (_dir, native) = crate::tests::mapped_file(50, vec![]).await;
@@ -846,6 +848,9 @@ mod tests {
         let before = native
             .column_chunks("s")
             .expect("the subject column resolves");
+        // A column outside the code columns' slots: the memo remembers its
+        // decline.
+        assert!(native.column_chunks("no-such-column").is_none());
 
         let poisoner = Arc::clone(&native);
         let result = std::thread::spawn(move || {
@@ -857,6 +862,13 @@ mod tests {
         assert!(result.is_err());
         assert!(native.quad_chunks.0.is_poisoned() && native.component_chunks.0.is_poisoned());
 
+        assert!(
+            native
+                .quad_chunks
+                .get_or_build(&(), "no-such-column", || panic!("a hit does not rebuild"))
+                .is_none()
+        );
+        assert!(native.column_chunks("no-such-column").is_none());
         let after = native
             .column_chunks("s")
             .expect("the subject column still resolves");
