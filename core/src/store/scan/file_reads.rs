@@ -897,9 +897,13 @@ impl ExactRead {
         #[cfg(test)]
         exact_read_hooks::note();
         let row_count = file.row_count() as usize;
+        let pointable = point_readable(file, columns, filter);
+        if pointable && let Some(rows) = selection.point_sized_live_rows(deleted, row_count) {
+            return Ok(ExactRead::Points(rows));
+        }
         let live =
             || selection.filter_rows(row_count, move |id| deleted.is_none_or(|d| !d.value(id)));
-        Ok(match ReadKind::of(file, columns, filter, selection)? {
+        let read = match ReadKind::past_point_sized(file, filter, selection, pointable)? {
             ReadKind::Points => ExactRead::Points(live()),
             ReadKind::Take => ExactRead::Take(match (selection, deleted) {
                 (RowSelection::Ids(ids), None) => ids.clone(),
@@ -907,19 +911,26 @@ impl ExactRead {
             }),
             ReadKind::Masks => ExactRead::Masks,
             ReadKind::Scan => ExactRead::Scan,
-        })
+        };
+        Ok(read)
     }
 
     /// Whether [`of`](Self::of) reads `columns` at `selection` with `filter`
     /// pending by the filter's masks first: the same choice, made without
-    /// building an id list (tombstones never change it).
+    /// building an id list (tombstones never change it). A selection with no
+    /// filter, or a point-sized one, never does: it reads point by point or
+    /// by the scan.
     pub(crate) fn reads_masks(
         file: &NativeStoreFile,
         columns: &[&str],
         filter: Option<&Expression>,
         selection: &RowSelection,
     ) -> Result<bool> {
-        Ok(ReadKind::of(file, columns, filter, selection)? == ReadKind::Masks)
+        if filter.is_none() || selection.is_point_sized() {
+            return Ok(false);
+        }
+        let pointable = point_readable(file, columns, filter);
+        Ok(ReadKind::past_point_sized(file, filter, selection, pointable)? == ReadKind::Masks)
     }
 }
 
@@ -933,18 +944,16 @@ enum ReadKind {
 }
 
 impl ReadKind {
-    /// [`ExactRead::of`]'s choice for `columns` at `selection` with `filter`
-    /// pending.
-    fn of(
+    /// [`ExactRead::of`]'s choice for `selection` with `filter` pending, once
+    /// a point-sized selection the reads by id can check is ruled out (it
+    /// reads point by point): `pointable` is whether they can check the
+    /// filter on the columns read ([`point_readable`]).
+    fn past_point_sized(
         file: &NativeStoreFile,
-        columns: &[&str],
         filter: Option<&Expression>,
         selection: &RowSelection,
+        pointable: bool,
     ) -> Result<Self> {
-        let pointable = point_readable(file, columns, filter);
-        if pointable && selection.is_point_sized() {
-            return Ok(ReadKind::Points);
-        }
         let unread = if pointable && filter.is_some() {
             ReadKind::Masks
         } else {

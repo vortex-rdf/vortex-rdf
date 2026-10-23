@@ -334,34 +334,34 @@ impl VortexRdfStore {
     /// [`QuadsSource::located_window`](crate::store::QuadsSource::located_window)
     /// answers (no tombstones, an in-memory run whose rids ascend, a file run
     /// with no filter) it reads them without the run's other ids. So does a
-    /// file view whose reads take its pending filter by the masks first
-    /// ([`reads_masks_first`](Self::reads_masks_first)): its window evaluates
-    /// the filter, which its reads would evaluate anyway, so its one-shot
-    /// reads take the rows from that evaluation, its streams read the
-    /// matches' ids, and its statistics are exact.
+    /// file view whose bound fits but whose reads take its pending filter by
+    /// the masks first ([`reads_masks_first`](Self::reads_masks_first)),
+    /// tested after the bound: its window evaluates the filter, which its
+    /// reads would evaluate anyway, so its one-shot reads take the rows from
+    /// that evaluation, its streams read the matches' ids, and its statistics
+    /// are exact.
     pub(in crate::store) fn window_check(
         &self,
         offset: usize,
         limit: usize,
     ) -> Result<WindowCheck> {
-        let may_cut = WindowCheck::MayCut { base_live: None };
         if offset != 0 || self.quads.is_pending_without_plan() {
+            return Ok(WindowCheck::MayCut { base_live: None });
+        }
+        let tail = self.tail_size();
+        let fits = |base: usize| base.saturating_add(tail) <= limit;
+        let base = self.quads.base_rows(|selected| !fits(selected))?;
+        let may_cut = WindowCheck::MayCut {
+            base_live: base.live,
+        };
+        if !fits(base.upper_bound()) {
             return Ok(may_cut);
         }
         #[cfg(feature = "file-io")]
         if self.reads_masks_first()? {
             return Ok(may_cut);
         }
-        let tail = self.tail_size();
-        let fits = |base: usize| base.saturating_add(tail) <= limit;
-        let base = self.quads.base_rows(|selected| !fits(selected))?;
-        Ok(if fits(base.upper_bound()) {
-            WindowCheck::CannotCut
-        } else {
-            WindowCheck::MayCut {
-                base_live: base.live,
-            }
-        })
+        Ok(WindowCheck::CannotCut)
     }
 
     /// Whether this view's one-shot reads take its pending filter by the
