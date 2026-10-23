@@ -10,9 +10,10 @@
 //! apply after the pattern and never as scan expressions: in memory as a
 //! binary search inside a sorted run or a pass over the column's selected
 //! rows, on file as the located runs of a sorted subject column or else a
-//! pass over the column streamed for the view's rows. A window over a file
-//! view with a pending filter evaluates its splits in file order and stops
-//! at the first split that fills it.
+//! pass over the column streamed for the view's rows. A window that cannot
+//! cut a row is the view as it is; any other over a file view with a pending
+//! filter evaluates its splits in file order and stops at the first split
+//! that fills it.
 
 use std::ops::Range;
 
@@ -208,18 +209,28 @@ impl VortexRdfStore {
         Ok(view)
     }
 
-    /// The view's rows after skipping `offset` and taking at most `limit`, in
-    /// the order the view reads them: base rows in base row order, then the
-    /// tail's. A pending file filter is resolved only as far as the window
-    /// reaches (its splits evaluated in file order, stopping at the first
-    /// that fills the window), so `LIMIT` over a filtered scan costs the
-    /// matching prefix of the file. Available on every layout.
+    /// The view's rows after skipping `offset` and taking at most `limit`.
+    /// Available on every layout.
     ///
-    /// The serve plan is dropped, so a served view's rows come back in base
-    /// order: a window is a position range over base order, which the
-    /// index's order does not share.
+    /// A window that cannot cut a row is the view as it is, its serve plan,
+    /// pending filter and row order included: one with no `offset` whose
+    /// `limit` is at least the view's row count, or a bound on it, known
+    /// without reading (the `rows.upper_bound` of
+    /// [`view_statistics`](Self::view_statistics)).
+    ///
+    /// Any other window is a position range over base order: base rows in
+    /// base row order, then the tail's. Its serve plan is dropped, so a
+    /// served view's rows come back in base order, not the index's. A
+    /// pending file filter is resolved only as far as the window reaches
+    /// (its splits evaluated in file order, stopping at the first that fills
+    /// the window), so `LIMIT` over a filtered scan costs the matching prefix
+    /// of the file.
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
         let t = debug::timer();
+        if self.window_cannot_cut(offset, limit)? {
+            debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
+            return Ok(self.clone());
+        }
         // A located run held pending for this window reads only the window's
         // own rows, and its width is the base's live size; any other view
         // windows its materialized selection.
@@ -251,6 +262,35 @@ impl VortexRdfStore {
             "[window] offset {offset} limit {limit}: {base_taken} base rows"
         );
         Ok(self.derived(quads, tail))
+    }
+
+    /// Whether a window of `limit` rows after `offset` keeps every row of
+    /// this view, known without reading one: no offset, and a limit at least
+    /// the `rows.upper_bound` of [`view_statistics`](Self::view_statistics),
+    /// the base's rows plus the tail's live rows. For the base it tests the
+    /// selected rows first (a pending run's width, or every base row while
+    /// that is unknown), which decodes nothing, then, only under tombstones
+    /// and when those do not fit, their live rows where known without I/O,
+    /// which in memory decodes a pending run's ids. A view pending without a
+    /// serve plan never qualifies: its window reads exactly the rows it takes
+    /// into exact ids, the rows and order of the plain match, and leaves the
+    /// ids it shares with other views unread.
+    fn window_cannot_cut(&self, offset: usize, limit: usize) -> Result<bool> {
+        if offset != 0 || self.quads.is_pending_without_plan() {
+            return Ok(false);
+        }
+        let tail = self.tail_size();
+        let fits = |base: usize| base.saturating_add(tail) <= limit;
+        let base_len = self.quads.base_len();
+        let selected = self
+            .quads
+            .selection
+            .len_if_known(None, base_len)?
+            .unwrap_or(base_len);
+        if fits(selected) {
+            return Ok(true);
+        }
+        Ok(self.quads.deleted.is_some() && self.quads.live_len_if_known()?.is_some_and(fits))
     }
 
     /// The base's window over its exact `selection`, and the base's live row

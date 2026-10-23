@@ -389,12 +389,12 @@ impl VortexRdfStore {
     ///
     /// `keep` narrows the match to rows whose code in a position is in a
     /// set or range (see [`Self::match_codes`]; Dictionary layout only).
-    /// `offset` and `limit` window the rows in base order as
-    /// [`Self::match_codes`] does: `offset` skips that many matched rows,
-    /// and `limit` caps the count, stopping the read as soon as that many
-    /// rows are known to exist (`count_quads(..., limit=1)` is an existence
-    /// test). With a `cancel` token the count runs as a task raced with
-    /// it ([`CancelToken`]); without one it runs on the calling thread.
+    /// `offset` and `limit` window the rows as [`Self::match_codes`] does:
+    /// `offset` skips that many matched rows, and `limit` caps the count,
+    /// stopping the read as soon as that many rows are known to exist
+    /// (`count_quads(..., limit=1)` is an existence test). With a `cancel`
+    /// token the count runs as a task raced with it ([`CancelToken`]);
+    /// without one it runs on the calling thread.
     // The parameters are the Python signature: a pattern and its narrowing.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -498,10 +498,14 @@ impl VortexRdfStore {
     /// yield) or a code range (a `range` with step 1, or a 2-tuple
     /// `(lo, hi)`, the half-open codes `lo <= code < hi`; what
     /// `TermDict.prefix_range` yields). A 2-tuple is never a set. `offset`
-    /// and `limit` window the rows in base order; a filtered file scan stops
-    /// at the first block that fills the window. With a `cancel` token the
-    /// match runs as a task raced with it ([`CancelToken`]); without one it
-    /// runs on the calling thread.
+    /// and `limit` window the rows: a window that cuts rows takes them in
+    /// base order, and a filtered file scan stops at the first block that
+    /// fills it, while a `limit` that cannot cut a row (no `offset`, and at
+    /// least the match's row count, or a bound on it, known without reading)
+    /// returns the match as it is, in its own order (an index-served
+    /// match's rows in its index's). With a `cancel` token the match runs as
+    /// a task raced with it ([`CancelToken`]); without one it runs on the
+    /// calling thread.
     // The parameters are the Python signature: a pattern and its narrowing.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (

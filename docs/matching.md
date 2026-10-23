@@ -1140,10 +1140,27 @@ so a chained `match_pattern` narrows it exactly as
 ### 16.2 `window`, `size_capped`, `exists`
 
 `window(offset, limit)` is the view's rows after skipping `offset` and
-taking `limit`, in read order — base rows in base row order, then the
-tail's (available on every layout). In memory and on an unfiltered file view
-it is a position range over the selection, no I/O (`RowSelection::window`
-steps over tombstones). On a view whose selection is a located reference run
+taking `limit` (available on every layout). A window that cannot cut a row
+is the view as it is: serve plan, pending filter and row order included, so
+a served view still reads in its index's order. It cannot cut one when
+`offset` is 0 and `limit` is at least the view's row count, or a bound on
+it, known without reading: the `rows.upper_bound` of `view_statistics`
+([interfaces §5](interfaces.md#5-what-a-view-promises-before-it-is-read)),
+the base's selected rows (a pending run's width; under a pending file
+filter, the rows it has yet to test), their live rows under tombstones when
+those take no read, plus the tail's live rows. The selected rows are tested
+first, which decodes nothing; the live rows are counted only under
+tombstones, when the selected rows do not fit (an in-memory run's ids are
+decoded to count them). A view built only to be counted or windowed, an
+index run pending without a plan (`IdsNeed::CountOrWindow`), is windowed as
+below whatever the limit: the window reads exactly its rows, which are the
+plain match's rows in base order, and leaves the run's own ids unread.
+
+Any other window is a position range over base order, in read order — base
+rows in base row order, then the tail's — and drops the serve plan. In
+memory and on an unfiltered file view it is a position range over the
+selection, no I/O (`RowSelection::window` steps over tombstones). On a view
+whose selection is a located reference run
 held pending (`IdsNeed::CountOrWindow`), it reads only the run's rows the
 window takes (`QuadsSource::located_window`): the run is in `(val, rid)` order,
 so those rows hold the window's ids — in memory cut out of the run's rid column

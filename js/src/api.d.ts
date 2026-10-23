@@ -75,7 +75,12 @@ export type CodeKeep = {
 
 /**
  * How `matchCodes`, `countQuads` and `matchCodeChunks` narrow a pattern's
- * match: `keep` first, then a window of the kept rows in base row order.
+ * match: `keep` first, then a window of the kept rows. A window that cuts
+ * rows takes them in base row order. A `limit` that cannot cut a row (no
+ * `offset`, and at least the match's row count, or a bound on it, known
+ * without reading) leaves the match as it is, which `matchCodes` reads in
+ * its own order (an index-served match's rows in its index's) and
+ * `matchCodeChunks` in base row order.
  * A value of the wrong type or an unknown key throws a `TypeError`, a number
  * outside its range a `RangeError`.
  */
@@ -236,8 +241,11 @@ export class VortexRdfStore {
      *
      * `options.keep` keeps the rows whose code in a position is in a code set
      * or range (`CodeKeep`), inside the store, before any row is gathered;
-     * `options.offset` and `options.limit` then window the kept rows in base
-     * row order.
+     * `options.offset` and `options.limit` then window the kept rows: a
+     * window that cuts rows takes them in base row order, while a limit that
+     * cannot cut a row (no offset, and at least the match's row count, or a
+     * bound on it, known without reading) returns the match as it is, in its
+     * own order (an index-served match's rows in its index's).
      */
     matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ReadOptions): CodeColumns | null;
     /**
