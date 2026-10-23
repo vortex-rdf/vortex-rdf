@@ -401,8 +401,8 @@ impl VortexRdfStore {
     /// `options.limit` then window the kept rows: a window that cuts rows
     /// takes them in base row order, while a limit that cannot cut a row (no
     /// offset, and at least the match's row count, or a bound on it, known
-    /// without reading) returns the match as it is, in its own order (an
-    /// index-served match's rows in its index's).
+    /// without reading) returns the match as it is, in the order the call
+    /// without a limit returns.
     #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
     pub fn match_codes(
         &self,

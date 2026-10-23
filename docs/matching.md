@@ -950,8 +950,9 @@ at a selection those reads decline, reads the filter's masks first
 The rows the masks keep are then read the same way, by their density over the
 splits holding them (`MaskedRead`): point by point, by one take, or, denser
 than a take, each split projected at its own mask, the filter not evaluated
-again. `quads_vec` reads and decodes split by split, spawning the split reads
-when there is more than one. The streams (`quads()`, `row_chunks`,
+again. `quads_vec` and `shared_quads_vec` read and decode a take or a
+projection split by split, spawning the split reads when there is more than
+one and a tokio runtime is current. The streams (`quads()`, `row_chunks`,
 `code_chunks`, the data source) keep the restricted scan, which reads the file
 split by split as they are pulled.
 
@@ -1155,7 +1156,7 @@ so a chained `match_pattern` narrows it exactly as
 `window(offset, limit)` is the view's rows after skipping `offset` and
 taking `limit` (available on every layout). A window that cannot cut a row
 is the view as it is: serve plan, pending filter and row order included, so
-a served view still reads in its index's order. It cannot cut one when
+it reads its rows in the order the view itself reads them. It cannot cut one when
 `offset` is 0 and `limit` is at least the view's row count, or a bound on
 it, known without reading: the `rows.upper_bound` of `view_statistics`
 ([interfaces §5](interfaces.md#5-what-a-view-promises-before-it-is-read)),
@@ -1166,8 +1167,10 @@ first, which decodes nothing; the live rows are counted only under
 tombstones, when the selected rows do not fit (an in-memory run's ids are
 decoded to count them). A view built only to be counted or windowed, an
 index run pending without a plan (`IdsNeed::CountOrWindow`), is windowed as
-below whatever the limit: the window reads exactly its rows, which are the
-plain match's rows in base order, and leaves the run's own ids unread.
+below whatever the limit: the window's rows are the plain match's rows in
+base order, and where `QuadsSource::located_window` answers (no tombstones,
+an in-memory run whose rids ascend, a file run with no filter) the window
+reads them without the run's other ids.
 
 Any other window is a position range over base order, in read order — base
 rows in base row order, then the tail's — and drops the serve plan. In
@@ -1199,7 +1202,10 @@ ids are kept, with the filter dropped. Either way
 `view_statistics` reports the rows exactly and no filter pending, and no read
 or count runs the filter again: the one-shot reads take the rows from the
 kept masks as they read any filter's masks ([§12](#12-what-the-derived-view-costs-at-read-time)),
-and the streams read the ids the masks keep, one window of ids per pull.
+and the streams read the ids the masks keep as `ExactRead` reads exact ids:
+a point-sized set, or one of at most 16 ids a split, at once; a set at a
+take's density one window of ids per pull; anything denser by a scan of
+those ids.
 
 `size_capped(limit)` is `min(size, limit)` by the same loop
 (`count_matching_rows_capped`), and `exists()` is `size_capped(1) > 0` —

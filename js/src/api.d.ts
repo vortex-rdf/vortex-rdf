@@ -79,8 +79,8 @@ export type CodeKeep = {
  * rows takes them in base row order. A `limit` that cannot cut a row (no
  * `offset`, and at least the match's row count, or a bound on it, known
  * without reading) leaves the match as it is, which `matchCodes` reads in
- * its own order (an index-served match's rows in its index's) and
- * `matchCodeChunks` in base row order.
+ * the order it reads the match without a limit and `matchCodeChunks` in base
+ * row order.
  * A value of the wrong type or an unknown key throws a `TypeError`, a number
  * outside its range a `RangeError`.
  */
@@ -244,8 +244,8 @@ export class VortexRdfStore {
      * `options.offset` and `options.limit` then window the kept rows: a
      * window that cuts rows takes them in base row order, while a limit that
      * cannot cut a row (no offset, and at least the match's row count, or a
-     * bound on it, known without reading) returns the match as it is, in its
-     * own order (an index-served match's rows in its index's).
+     * bound on it, known without reading) returns the match as it is, in the
+     * order the call without a limit returns.
      */
     matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ReadOptions): CodeColumns | null;
     /**

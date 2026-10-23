@@ -213,9 +213,9 @@ Every read is lazy, and a stream's first poll decides how it runs:
   (`Handle::current()`) at every spawn, so every later poll of the stream
   must run inside a tokio runtime too. A filtered file view's capped count,
   window and one-shot reads evaluate the filter split by split under the
-  same rule, and `quads_vec` spawns its split reads whenever there is more
-  than one and a runtime is current: each such call, once it has spawned,
-  must be polled to completion inside that runtime.
+  same rule, and `quads_vec` and `shared_quads_vec` spawn their split reads
+  whenever there is more than one and a runtime is current: each such call,
+  once it has spawned, must be polled to completion inside that runtime.
 - A file-backed store's component tables are vortex's own
   `LayoutReaderDataSource`, whose scan always spawns: read them inside a
   tokio runtime.
@@ -237,7 +237,7 @@ is the one way it fails.
 |---|---|
 | `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones; a filter a window has evaluated, finding it cuts no row, counts as none. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
 | `sort_order` | `Some(Spog)` when the base is globally sorted (every base this crate writes) and the view reads no tail row — the order `row_chunks`, `code_chunks` and the data source produce, whatever answered the match. A view that reads tail rows has none: they follow the base in append order. |
-| `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a pending file filter binds by equality. |
+| `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a file view's pushed-down filter binds by equality, whether the filter is pending or a window has evaluated it. |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |
 | `served_component` | The index child that answered the match, if any (`index:posg`, …; `quads()` on such a view decodes in that child's order). |
 | `pending_filter` | Whether every read runs a pushed-down file filter. A filter a window has evaluated over every row, finding it cuts none, is not pending: its matches are counted exactly and read without running it again, and the view's selection reads as `Ids`. |

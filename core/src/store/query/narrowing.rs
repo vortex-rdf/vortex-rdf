@@ -289,9 +289,11 @@ impl VortexRdfStore {
     /// and when those do not fit, their live rows where known without I/O,
     /// which in memory decodes a pending run's ids. A view whose window kept
     /// its filter's masks knows the base's live rows exactly from them. A
-    /// view pending without a serve plan never qualifies: its window reads
-    /// exactly the rows it takes into exact ids, the rows and order of the
-    /// plain match, and leaves the ids it shares with other views unread.
+    /// view pending without a serve plan never qualifies: its window takes
+    /// its rows into exact ids, the rows and order of the plain match, and
+    /// where [`QuadsSource::located_window`](crate::store::QuadsSource::located_window)
+    /// answers (no tombstones, an in-memory run whose rids ascend, a file run
+    /// with no filter) it reads them without the run's other ids.
     pub(in crate::store) fn window_cannot_cut(&self, offset: usize, limit: usize) -> Result<bool> {
         if offset != 0 || self.quads.is_pending_without_plan() {
             return Ok(false);
