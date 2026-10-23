@@ -219,7 +219,10 @@ impl VortexRdfStore {
     /// pending filter and row order included: one with no `offset` whose
     /// `limit` is at least the view's row count, or a bound on it, known
     /// without reading (the `rows.upper_bound` of
-    /// [`view_statistics`](Self::view_statistics)).
+    /// [`view_statistics`](Self::view_statistics)). A file view whose reads
+    /// take a pending filter of code equalities by its masks first is never
+    /// the view as it is: its window evaluates the filter whatever the bound,
+    /// as below, and so finds whether it cuts.
     ///
     /// Any other window is a position range over base order: base rows in
     /// base row order, then the tail's. Its serve plan is dropped, so a
@@ -293,7 +296,12 @@ impl VortexRdfStore {
     /// its rows into exact ids, the rows and order of the plain match, and
     /// where [`QuadsSource::located_window`](crate::store::QuadsSource::located_window)
     /// answers (no tombstones, an in-memory run whose rids ascend, a file run
-    /// with no filter) it reads them without the run's other ids.
+    /// with no filter) it reads them without the run's other ids. Nor does a
+    /// file view whose reads take its pending filter by the masks first
+    /// ([`reads_masks_first`](Self::reads_masks_first)): its window evaluates
+    /// the filter, which its reads would evaluate anyway, so its one-shot
+    /// reads take the rows from that evaluation, its streams read the
+    /// matches' ids, and its statistics are exact.
     pub(in crate::store) fn window_cannot_cut(&self, offset: usize, limit: usize) -> Result<bool> {
         if offset != 0 || self.quads.is_pending_without_plan() {
             return Ok(false);
@@ -302,6 +310,10 @@ impl VortexRdfStore {
         let fits = |base: usize| base.saturating_add(tail) <= limit;
         if let Some(live) = self.quads.evaluated_len() {
             return Ok(fits(live));
+        }
+        #[cfg(feature = "file-io")]
+        if self.reads_masks_first()? {
+            return Ok(false);
         }
         let base_len = self.quads.base_len();
         let selected = self
@@ -313,6 +325,30 @@ impl VortexRdfStore {
             return Ok(true);
         }
         Ok(self.quads.deleted.is_some() && self.quads.live_len_if_known()?.is_some_and(fits))
+    }
+
+    /// Whether this view's one-shot reads take its pending filter by the
+    /// filter's masks first ([`ExactRead::Masks`](file_reads::ExactRead::Masks)):
+    /// a file view with no serve plan and no masks a window kept, an exact
+    /// selection, and a filter of code equalities over columns with chunk
+    /// probes, at a selection the reads by id decline. The choice those
+    /// reads make, made here without reading.
+    #[cfg(feature = "file-io")]
+    pub(in crate::store) fn reads_masks_first(&self) -> Result<bool> {
+        let (
+            Some(FileBase {
+                file,
+                filter: Some(filter),
+                serve: None,
+                masks: None,
+            }),
+            ViewSelection::Exact(selection),
+        ) = (self.quads.file(), &self.quads.selection)
+        else {
+            return Ok(false);
+        };
+        let primary = self.layout.strategy().primary_column_names();
+        file_reads::ExactRead::reads_masks(file, primary, Some(filter), selection)
     }
 
     /// `window(0, limit)` of a file view with a pending filter, an exact

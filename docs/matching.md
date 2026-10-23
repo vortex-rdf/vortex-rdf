@@ -781,7 +781,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L1187) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L513)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L1226) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L513)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -1156,9 +1156,10 @@ so a chained `match_pattern` narrows it exactly as
 `window(offset, limit)` is the view's rows after skipping `offset` and
 taking `limit` (available on every layout). A window that cannot cut a row
 is the view as it is: serve plan, pending filter and row order included, so
-it reads its rows in the order the view itself reads them. It cannot cut one when
-`offset` is 0 and `limit` is at least the view's row count, or a bound on
-it, known without reading: the `rows.upper_bound` of `view_statistics`
+it reads its rows in the order the view itself reads them. It cannot cut
+one when `offset` is 0 and `limit` is at least the view's row count, or a
+bound on it, known without reading: the `rows.upper_bound` of
+`view_statistics`
 ([interfaces §5](interfaces.md#5-what-a-view-promises-before-it-is-read)),
 the base's selected rows (a pending run's width; under a pending file
 filter, the rows it has yet to test), their live rows under tombstones when
@@ -1170,7 +1171,12 @@ index run pending without a plan (`IdsNeed::CountOrWindow`), is windowed as
 below whatever the limit: the window's rows are the plain match's rows in
 base order, and where `QuadsSource::located_window` answers (no tombstones,
 an in-memory run whose rids ascend, a file run with no filter) the window
-reads them without the run's other ids.
+reads them without the run's other ids. So is a file view whose reads take
+its pending filter by the masks first (`ExactRead::Masks`: no serve plan, a
+filter of code equalities over columns with chunk probes, at an exact
+selection the reads by id decline): those reads would evaluate the filter
+anyway, so with no offset its window evaluates the filter's split masks, as
+below, and finds whether it cuts, the view's statistics exact from then on.
 
 Any other window is a position range over base order, in read order — base
 rows in base row order, then the tail's — and drops the serve plan. In

@@ -1138,8 +1138,9 @@ async fn test_quads_vec_over_a_filtered_file_matches_quads() {
 /// tombstones and with a tail, each of `O`, `PO`, `P` and `G` reads the same
 /// rows in base order plain and windowed to a limit that cannot bind: limits
 /// between the match's rows and their bound (the window route) and at or
-/// past the bound (the plain view). They are the rows the loaded open, an
-/// in-memory store, reads plain.
+/// past the bound (the plain view loaded; mapped, whose reads take these
+/// filters by their masks first, the window route too). They are the rows
+/// the loaded open, an in-memory store, reads plain.
 #[tokio::test]
 async fn test_plain_and_unbound_limit_reads_return_the_same_rows() {
     let (_dir, path) = masks_file().await;

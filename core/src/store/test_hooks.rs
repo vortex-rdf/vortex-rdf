@@ -281,6 +281,14 @@ impl VortexRdfStore {
         self.quads.evaluated_len()
     }
 
+    /// Whether this view's one-shot reads take its pending filter by the
+    /// masks first, which makes its window evaluate the filter whatever the
+    /// bound (see `reads_masks_first`).
+    pub(crate) fn debug_reads_masks_first(&self) -> bool {
+        self.reads_masks_first()
+            .expect("the read choice needs only the file's splits")
+    }
+
     /// An index component column's chunk-probe handle as `(row count, flat
     /// leaves)` — `None` off-file or when the column's shape declines the
     /// handle.

@@ -895,20 +895,59 @@ impl ExactRead {
         #[cfg(test)]
         exact_read_hooks::note();
         let row_count = file.row_count() as usize;
-        let pointable = point_readable(file, columns, filter);
         let live = || match (selection, deleted) {
             (RowSelection::Ids(ids), None) => ids.clone(),
             _ => Buffer::from(
                 selection.filter_rows(row_count, move |id| deleted.is_none_or(|d| !d.value(id))),
             ),
         };
+        Ok(match ReadKind::of(file, columns, filter, selection)? {
+            ReadKind::Points => ExactRead::Points(live()),
+            ReadKind::Take => ExactRead::Take(live()),
+            ReadKind::Masks => ExactRead::Masks,
+            ReadKind::Scan => ExactRead::Scan,
+        })
+    }
+
+    /// Whether [`of`](Self::of) reads `columns` at `selection` with `filter`
+    /// pending by the filter's masks first: the same choice, made without
+    /// building an id list (tombstones never change it).
+    pub(crate) fn reads_masks(
+        file: &NativeStoreFile,
+        columns: &[&str],
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+    ) -> Result<bool> {
+        Ok(ReadKind::of(file, columns, filter, selection)? == ReadKind::Masks)
+    }
+}
+
+/// Which read [`ExactRead::of`] makes, before it builds any id list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadKind {
+    Points,
+    Take,
+    Masks,
+    Scan,
+}
+
+impl ReadKind {
+    /// [`ExactRead::of`]'s choice for `columns` at `selection` with `filter`
+    /// pending.
+    fn of(
+        file: &NativeStoreFile,
+        columns: &[&str],
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+    ) -> Result<Self> {
+        let pointable = point_readable(file, columns, filter);
         if pointable && selection.is_point_sized() {
-            return Ok(ExactRead::Points(live()));
+            return Ok(ReadKind::Points);
         }
         let unread = if pointable && filter.is_some() {
-            ExactRead::Masks
+            ReadKind::Masks
         } else {
-            ExactRead::Scan
+            ReadKind::Scan
         };
         let RowSelection::Ids(ids) = selection else {
             return Ok(unread);
@@ -916,10 +955,10 @@ impl ExactRead {
         let splits = file.splits()?;
         let footprint = Footprint::of(ids, &splits);
         if pointable && footprint.few_per_split(POINT_IDS_PER_SPLIT) {
-            return Ok(ExactRead::Points(live()));
+            return Ok(ReadKind::Points);
         }
         if filter.is_none() && footprint.sparse(TAKE_ROWS) {
-            return Ok(ExactRead::Take(live()));
+            return Ok(ReadKind::Take);
         }
         Ok(unread)
     }

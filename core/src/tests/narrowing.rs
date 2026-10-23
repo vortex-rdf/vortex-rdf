@@ -544,9 +544,12 @@ fn window_probes() -> Vec<(&'static str, Probe)> {
 
 /// A window with no offset whose limit is at least the match's rows (the row
 /// count, one more, or every row) is the plain match: the same rows in the
-/// same order (a served match's in its index's), the same serve plan, all
-/// the same statistics under an unbounded limit, and never a view pending
-/// without a plan, on every open and index set, in memory and on file.
+/// same order, the same serve plan, all the same statistics under an
+/// unbounded limit, and never a view pending without a plan, on every open
+/// and index set, in memory and on file. The exception is a filtered file
+/// match whose reads take its filter by the masks first: its window
+/// evaluates the filter whatever the limit, so the plain rows, in order, come
+/// with exact statistics.
 #[tokio::test]
 async fn test_window_that_cannot_cut_is_the_plain_view() {
     let (_dirs, stores) = window_stores().await;
@@ -561,7 +564,10 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
             let stats = plain.view_statistics().unwrap();
             // Each shape is what it is named for: the copy index serves the
             // index-eligible ones, and on file the graph's filter is left
-            // pending beside the located run.
+            // pending beside the located run. A mapped file reads a pending
+            // filter of code equalities by its masks first: the no-index
+            // file's index-eligible ones, and the predicate the reference
+            // index leaves beside the object's run.
             assert_eq!(
                 stats.served_component.is_some(),
                 tag.contains("copy") && matches!(shape, "P" | "PO" | "O"),
@@ -570,6 +576,16 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
             if shape == "SPG" && stats.file_backed {
                 assert!(stats.pending_filter, "{label}: the graph's filter");
             }
+            let masks_first = plain.debug_reads_masks_first();
+            let expected = match tag.as_str() {
+                "file/no-index/mapped" => matches!(shape, "P" | "PO" | "O"),
+                "file/reference/mapped" => shape == "PO",
+                _ => false,
+            };
+            assert_eq!(
+                masks_first, expected,
+                "{label}: read by the filter's masks first"
+            );
             for limit in [n, n + 1, usize::MAX] {
                 let windowed = store
                     .run_probe(&probe.clone().window(0, Some(limit)))
@@ -584,7 +600,14 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
                     got.served_component, stats.served_component,
                     "{label} limit {limit}: the plan"
                 );
-                if limit == usize::MAX {
+                if masks_first {
+                    assert!(!got.pending_filter, "{label} limit {limit}: evaluated");
+                    assert_eq!(
+                        got.rows,
+                        RowCountHint::exact(n),
+                        "{label} limit {limit}: exact rows"
+                    );
+                } else if limit == usize::MAX {
                     assert_eq!(got, stats, "{label}: the plain view's statistics");
                 }
                 assert_eq!(
@@ -817,8 +840,10 @@ async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
 /// is built, and the view reads the plain probe's codes in its order, with
 /// its statistics, readable. Over every store but the reference ones, whose
 /// windowed match holds its run pending for the window: copy-index served
-/// matches, located runs with a pending filter, filtered no-index file views
-/// and in-memory views.
+/// matches, located runs with a pending filter and in-memory views. A
+/// filtered file view read by its filter's masks first (the no-index file's
+/// index-eligible shapes) builds its window, which evaluates the filter: the
+/// plain rows, in order, known exactly.
 #[tokio::test]
 async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
     use crate::store::query::narrowing::narrow_hooks;
@@ -831,26 +856,46 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
             let stats = plain.view_statistics().unwrap();
             let rows = row_list(&plain).await;
             let bound = stats.rows.upper_bound;
+            let masks_first = plain.debug_reads_masks_first();
+            assert_eq!(
+                masks_first,
+                tag == "file/no-index/mapped" && matches!(shape, "P" | "PO" | "O"),
+                "{label}: read by the filter's masks first"
+            );
             for limit in [bound, bound + 1, usize::MAX] {
                 let windows = narrow_hooks::windows();
                 let windowed = store
                     .run_probe(&probe.clone().window(0, Some(limit)))
                     .await
                     .unwrap();
-                assert_eq!(
-                    narrow_hooks::windows(),
-                    windows,
-                    "{label} limit {limit}: no window built"
-                );
                 assert!(
                     !windowed.debug_pending_without_plan(),
                     "{label} limit {limit}: readable"
                 );
-                assert_eq!(
-                    windowed.view_statistics().unwrap(),
-                    stats,
-                    "{label} limit {limit}: the plain view's statistics"
-                );
+                let got = windowed.view_statistics().unwrap();
+                if masks_first {
+                    assert_eq!(
+                        narrow_hooks::windows(),
+                        windows + 1,
+                        "{label} limit {limit}: the filter's window"
+                    );
+                    assert!(!got.pending_filter, "{label} limit {limit}: evaluated");
+                    assert_eq!(
+                        got.rows,
+                        RowCountHint::exact(rows.len()),
+                        "{label} limit {limit}: exact rows"
+                    );
+                } else {
+                    assert_eq!(
+                        narrow_hooks::windows(),
+                        windows,
+                        "{label} limit {limit}: no window built"
+                    );
+                    assert_eq!(
+                        got, stats,
+                        "{label} limit {limit}: the plain view's statistics"
+                    );
+                }
                 assert_eq!(
                     row_list(&windowed).await,
                     rows,
