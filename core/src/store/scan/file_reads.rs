@@ -862,6 +862,20 @@ pub(crate) enum ExactRead {
     Scan,
 }
 
+/// Whether reads by id can check `filter` while reading `columns` of `file`
+/// point by point: the filter is none or code equalities (checked per row),
+/// and every column has chunk probes. [`ExactRead`]'s condition for its
+/// point reads, and, with a filter pending, for reading the filter's masks
+/// first.
+pub(crate) fn point_readable(
+    file: &NativeStoreFile,
+    columns: &[&str],
+    filter: Option<&Expression>,
+) -> bool {
+    filter.is_none_or(|f| eq_code_pairs(f).is_some())
+        && columns.iter().all(|c| file.column_chunks(c).is_some())
+}
+
 impl ExactRead {
     /// The read of `columns` at `selection`, exact, with `filter` pending and
     /// `deleted` tombstoned. Point reads serve a point-sized selection, or ids
@@ -881,8 +895,7 @@ impl ExactRead {
         #[cfg(test)]
         exact_read_hooks::note();
         let row_count = file.row_count() as usize;
-        let pointable = filter.is_none_or(|f| eq_code_pairs(f).is_some())
-            && columns.iter().all(|c| file.column_chunks(c).is_some());
+        let pointable = point_readable(file, columns, filter);
         let live = || match (selection, deleted) {
             (RowSelection::Ids(ids), None) => ids.clone(),
             _ => Buffer::from(

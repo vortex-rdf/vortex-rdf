@@ -1188,7 +1188,8 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
 /// statistics exactly, no filter left pending, without evaluating a split
 /// again. Under tombstones its counts are the live rows'; under a tail longer
 /// than the rest of the limit it reads the base's rows, then the tail's first
-/// rows up to the limit.
+/// rows up to the limit. Under a string layout, whose filter compares strings
+/// that no read by id checks, the window keeps the matches' ids, not masks.
 #[tokio::test]
 async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
     use crate::store::scan::file_filter::split_hooks;
@@ -1262,6 +1263,34 @@ async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
             windowed.quads_vec().await.unwrap(),
             quads[..limit],
             "{label}: the base's rows, then the tail's first"
+        );
+    }
+    // The fixture's graph `g1`, on every third row: dense enough for masks.
+    let g1 = GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap());
+    let probe = Probe::new(None, None, None, Some(g1));
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let label = format!("{layout:?} G");
+        let (_dir, path) = write_store_file(fixture_quads(), layout, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let plain = store.run_probe(&probe).await.unwrap();
+        let quads = plain.quads_vec().await.unwrap();
+        let n = quads.len();
+        let stats = plain.view_statistics().unwrap();
+        assert!(stats.pending_filter, "{label}: a pending filter");
+        let bound = stats.rows.upper_bound;
+        assert!(n + 1 < bound, "{label}: {n} rows under a bound of {bound}");
+        let windowed = store
+            .run_probe(&probe.clone().window(0, Some(n + 1)))
+            .await
+            .unwrap();
+        assert_eq!(windowed.debug_evaluated_len(), None, "{label}: no masks");
+        let stats = windowed.view_statistics().unwrap();
+        assert!(!stats.pending_filter, "{label}: the filter evaluated");
+        assert_eq!(stats.rows, RowCountHint::exact(n), "{label}: exact rows");
+        assert_eq!(
+            windowed.quads_vec().await.unwrap(),
+            quads,
+            "{label}: the plain rows"
         );
     }
 }

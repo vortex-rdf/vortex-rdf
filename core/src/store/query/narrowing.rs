@@ -320,10 +320,11 @@ impl VortexRdfStore {
     ///
     /// With `limit` matches the window is their ids, in base order, with no
     /// filter and the tail cut off. With fewer it cuts no base row: the view
-    /// keeps its filter with the masks kept for its reads where they are
-    /// smaller than the matches' ids ([`masks_smaller_than_ids`]), else holds
-    /// those ids with no filter, and its tail is windowed to the rest of the
-    /// limit.
+    /// keeps its filter with the masks kept for its reads where the filter is
+    /// one the reads by id check ([`file_reads::point_readable`]) and the
+    /// masks are smaller than the matches' ids ([`masks_smaller_than_ids`]),
+    /// else holds those ids with no filter, and its tail is windowed to the
+    /// rest of the limit.
     #[cfg(feature = "file-io")]
     async fn filter_window(&self, limit: usize) -> Result<Option<Self>> {
         let (
@@ -341,7 +342,11 @@ impl VortexRdfStore {
         let deleted = self.quads.deleted.as_ref();
         let masks = file_filter::split_masks_until(file, filter, selection, deleted, limit).await?;
         let found: usize = masks.iter().map(|(mask, _)| mask.true_count()).sum();
-        let (quads, tail_limit) = if found < limit && masks_smaller_than_ids(&masks, found) {
+        let primary = self.layout.strategy().primary_column_names();
+        let keep_masks = found < limit
+            && file_reads::point_readable(file, primary, Some(filter))
+            && masks_smaller_than_ids(&masks, found);
+        let (quads, tail_limit) = if keep_masks {
             (
                 self.quads.with_evaluated_masks(Arc::new(masks)),
                 limit - found,

@@ -110,10 +110,11 @@ pub(crate) struct FileBase {
     /// split in file order, once a window has evaluated them all and found it
     /// cuts no row: the view's one-shot reads take its rows from them, its
     /// other reads their ids, and its counts their bits, so the filter is
-    /// never evaluated again. They are kept only while smaller than the ids
-    /// of the rows they keep, and they are read off their bits, so nothing
-    /// caches beside them. Every view derived from this one starts without
-    /// them.
+    /// never evaluated again. They are kept only for a filter of code
+    /// equalities over columns with chunk probes, the one the reads by id
+    /// check, and only while smaller than the ids of the rows they keep; they
+    /// are read off their bits, so nothing caches beside them. Every view
+    /// derived from this one starts without them.
     pub(crate) masks: Option<Arc<SplitMasks>>,
 }
 

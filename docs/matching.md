@@ -781,7 +781,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L1174) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L513)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L1187) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L513)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -1191,9 +1191,11 @@ loop is the filter's split masks (`split_masks_until`), and the window looks
 at what it found. Enough matches are the window's first `limit` ids. Fewer
 mean it cuts no base row, which no bound could tell before reading: the view
 keeps its rows, its tail windowed to what the base left of the limit, and
-keeps the evaluation. Its filter's masks are kept when they take less memory
-than the matches' ids (a bit a row of each split a mask keeps some rows of,
-against 64 a match), else those ids with the filter dropped. Either way
+keeps the evaluation. Its filter's masks are kept when the filter is code
+equalities over columns with chunk probes, the filter `ExactRead::Masks`
+reads, and the masks take less memory than the matches' ids (a bit a row of
+each split a mask keeps some rows of, against 64 a match); otherwise those
+ids are kept, with the filter dropped. Either way
 `view_statistics` reports the rows exactly and no filter pending, and no read
 or count runs the filter again: the one-shot reads take the rows from the
 kept masks as they read any filter's masks ([§12](#12-what-the-derived-view-costs-at-read-time)),
