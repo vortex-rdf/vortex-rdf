@@ -12,6 +12,7 @@ use crate::error::Result;
 use crate::store::FileBase;
 use crate::store::indexes::copy::CopyFamily;
 use crate::store::indexes::{ComponentIdentity, IndexType};
+use crate::store::read::count::BaseRows;
 use crate::store::schema::{QuadColumn, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{Backend, LayoutStrategy, MemoryBase, VortexRdfStore};
@@ -158,17 +159,13 @@ impl VortexRdfStore {
         // the base's live rows, an explicit set of them.
         let evaluated = self.quads.evaluated_len();
         let filtered = self.quads.has_filter() && evaluated.is_none();
-        let (selection, base_len) = (&self.quads.selection, self.quads.base_len());
+        let selection = &self.quads.selection;
         // The base's live rows when known without I/O; else at most the
         // selection's rows before tombstones (a pending run's width), or the
         // base's.
-        let live = match evaluated {
-            Some(live) => Some(live),
-            None => self.quads.live_len_if_known()?,
-        };
-        let bound = selection.len_if_known(None, base_len)?.unwrap_or(base_len);
+        let base = self.quads.base_rows(|_| true)?;
         Ok(ViewStatistics {
-            rows: row_count_hint(live, filtered, bound, tail_rows),
+            rows: row_count_hint(base, filtered, tail_rows),
             sort_order: (self.quads.subject_sorted() && tail_rows == 0).then_some(SortOrder::Spog),
             code_bounds: self.code_bounds(),
             selection: match evaluated {
@@ -301,19 +298,15 @@ impl VortexRdfStore {
     }
 }
 
-/// The count of a view whose base selection covers `live` rows, when that
-/// is known, and at most `bound`, with a filter still to test them when
-/// `filtered`, and `tail_rows` tail rows after them.
-fn row_count_hint(
-    live: Option<usize>,
-    filtered: bool,
-    bound: usize,
-    tail_rows: usize,
-) -> RowCountHint {
-    match (live, filtered) {
-        (Some(live), false) => RowCountHint::exact(live + tail_rows),
-        (Some(live), true) => RowCountHint::at_most(live + tail_rows),
-        (None, _) => RowCountHint::at_most(bound + tail_rows),
+/// The count of a view whose base holds `base` rows, with a filter still to
+/// test them when `filtered`, and `tail_rows` tail rows after them: exact
+/// when the live base rows are counted and no filter is pending, else at
+/// most their [`upper_bound`](BaseRows::upper_bound) plus the tail's.
+fn row_count_hint(base: BaseRows, filtered: bool, tail_rows: usize) -> RowCountHint {
+    let upper_bound = base.upper_bound() + tail_rows;
+    match (base.live, filtered) {
+        (Some(_), false) => RowCountHint::exact(upper_bound),
+        _ => RowCountHint::at_most(upper_bound),
     }
 }
 

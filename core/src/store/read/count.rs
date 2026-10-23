@@ -1,7 +1,7 @@
 //! Counting a view's rows: the exact size and its base and tail halves, the
 //! capped count behind `exists`, and the base count known without reading
-//! ([`QuadsSource::live_len_if_known`]) that the counts and the planner
-//! metadata start from.
+//! ([`QuadsSource::live_len_if_known`], [`QuadsSource::base_rows`]) that the
+//! counts, the planner metadata and the window start from.
 
 use crate::error::Result;
 #[cfg(feature = "file-io")]
@@ -109,5 +109,47 @@ impl QuadsSource {
     pub(crate) fn live_len_if_known(&self) -> Result<Option<usize>> {
         self.selection
             .len_if_known(self.deleted.as_ref(), self.base_len())
+    }
+
+    /// The base's rows as far as they are known without I/O ([`BaseRows`]):
+    /// the bound `view_statistics` reports and a window tests. Under
+    /// tombstones the live rows are counted only when `count_live` asks for
+    /// them, given the selected rows ([`live_len_if_known`](Self::live_len_if_known)
+    /// walks the tombstones, and decodes an in-memory pending run's ids);
+    /// without tombstones they are the selected rows wherever those are
+    /// known.
+    pub(crate) fn base_rows(&self, count_live: impl FnOnce(usize) -> bool) -> Result<BaseRows> {
+        let base_len = self.base_len();
+        let known = self.selection.len_if_known(None, base_len)?;
+        let selected = known.unwrap_or(base_len);
+        let live = match self.evaluated_len() {
+            Some(live) => Some(live),
+            None if self.deleted.is_none() => known,
+            None if count_live(selected) => self.live_len_if_known()?,
+            None => None,
+        };
+        Ok(BaseRows { live, selected })
+    }
+}
+
+/// What a view's base rows number, as far as that is known without I/O
+/// ([`QuadsSource::base_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BaseRows {
+    /// The live base rows: the matches a window's kept masks hold, or the
+    /// selection's rows less its tombstones. `None` when they take I/O or
+    /// were not counted. A pending filter is not applied: with one they bound
+    /// the view's base rows.
+    pub(crate) live: Option<usize>,
+    /// The selection's rows before tombstones: a pending run's width, or
+    /// every base row while that is unknown.
+    pub(crate) selected: usize,
+}
+
+impl BaseRows {
+    /// The most rows the base holds: its live rows where counted, else the
+    /// selected rows.
+    pub(crate) fn upper_bound(&self) -> usize {
+        self.live.unwrap_or(self.selected)
     }
 }

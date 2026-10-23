@@ -239,28 +239,44 @@ impl VortexRdfStore {
     /// filter's evaluation, which is never run again, and its tail is
     /// windowed to the rest of the limit.
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
-        #[cfg(test)]
-        narrow_hooks::note_window();
         let t = debug::timer();
-        if self.window_cannot_cut(offset, limit)? {
+        let WindowCheck::MayCut { base_live } = self.window_check(offset, limit)? else {
             debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
             return Ok(self.clone());
-        }
+        };
+        self.window_cut(offset, limit, base_live).await
+    }
+
+    /// [`window`](Self::window) past its check ([`window_check`](Self::window_check)),
+    /// which found the window may cut a row; `base_live` is the base's live
+    /// row count when the check counted it.
+    pub(in crate::store) async fn window_cut(
+        &self,
+        offset: usize,
+        limit: usize,
+        base_live: Option<usize>,
+    ) -> Result<Self> {
+        let t = debug::timer();
         // A served file run whose width is unknown until its ids are read
         // reads them into the view's shared cell, where any window below
         // takes them from, and is the view as it is when they fit.
         #[cfg(feature = "file-io")]
-        if offset == 0
+        let base_live = if offset == 0
             && let Some(FileBase { serve: Some(_), .. }) = self.quads.file()
             && let ViewSelection::Pending(lazy) = &self.quads.selection
             && lazy.len_if_known().is_none()
         {
             lazy.materialized_async().await?;
-            if self.window_cannot_cut(offset, limit)? {
+            let WindowCheck::MayCut { base_live } = self.window_check(offset, limit)? else {
                 debug::step!(t, "[window] limit {limit} cuts no row of the served run");
                 return Ok(self.clone());
-            }
-        }
+            };
+            base_live
+        } else {
+            base_live
+        };
+        #[cfg(test)]
+        narrow_hooks::note_window();
         #[cfg(feature = "file-io")]
         if offset == 0
             && let Some(windowed) = self.filter_window(limit).await?
@@ -275,7 +291,8 @@ impl VortexRdfStore {
             Some(located) => located,
             None => {
                 let selection = self.quads.materialized_selection().await?;
-                self.base_window(&selection, offset, limit).await?
+                self.base_window(&selection, offset, limit, base_live)
+                    .await?
             }
         };
         let base_taken = windowed.len(self.quads.base_len());
@@ -301,48 +318,50 @@ impl VortexRdfStore {
         Ok(self.derived(quads, tail))
     }
 
-    /// Whether a window of `limit` rows after `offset` keeps every row of
-    /// this view, known without reading one: no offset, and a limit at least
-    /// the `rows.upper_bound` of [`view_statistics`](Self::view_statistics),
-    /// the base's rows plus the tail's live rows. For the base it tests the
-    /// selected rows first (a pending run's width, or every base row while
-    /// that is unknown), which decodes nothing, then, only under tombstones
-    /// and when those do not fit, their live rows where known without I/O,
-    /// which in memory decodes a pending run's ids. A view whose window kept
-    /// its filter's masks knows the base's live rows exactly from them. A
-    /// view pending without a serve plan never qualifies: its window takes
-    /// its rows into exact ids, the rows and order of the plain match, and
-    /// where [`QuadsSource::located_window`](crate::store::QuadsSource::located_window)
+    /// Whether a window of `limit` rows after `offset` can cut a row of this
+    /// view, known without reading one. It cannot with no offset and a limit
+    /// at least the `rows.upper_bound` of
+    /// [`view_statistics`](Self::view_statistics), the base's rows plus the
+    /// tail's live rows, both from [`QuadsSource::base_rows`](crate::store::QuadsSource::base_rows):
+    /// the selected rows (a pending run's width, or every base row while that
+    /// is unknown), tested first, which decodes nothing, then, only under
+    /// tombstones and when those do not fit, their live rows where known
+    /// without I/O, which in memory decodes a pending run's ids, counted once
+    /// for the window to take. A view whose window kept its filter's masks
+    /// knows the base's live rows exactly from them. A view pending without
+    /// a serve plan always may cut: its window takes its rows into exact
+    /// ids, the rows and order of the plain match, and where
+    /// [`QuadsSource::located_window`](crate::store::QuadsSource::located_window)
     /// answers (no tombstones, an in-memory run whose rids ascend, a file run
-    /// with no filter) it reads them without the run's other ids. Nor does a
+    /// with no filter) it reads them without the run's other ids. So does a
     /// file view whose reads take its pending filter by the masks first
     /// ([`reads_masks_first`](Self::reads_masks_first)): its window evaluates
     /// the filter, which its reads would evaluate anyway, so its one-shot
     /// reads take the rows from that evaluation, its streams read the
     /// matches' ids, and its statistics are exact.
-    pub(in crate::store) fn window_cannot_cut(&self, offset: usize, limit: usize) -> Result<bool> {
+    pub(in crate::store) fn window_check(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<WindowCheck> {
+        let may_cut = WindowCheck::MayCut { base_live: None };
         if offset != 0 || self.quads.is_pending_without_plan() {
-            return Ok(false);
-        }
-        let tail = self.tail_size();
-        let fits = |base: usize| base.saturating_add(tail) <= limit;
-        if let Some(live) = self.quads.evaluated_len() {
-            return Ok(fits(live));
+            return Ok(may_cut);
         }
         #[cfg(feature = "file-io")]
         if self.reads_masks_first()? {
-            return Ok(false);
+            return Ok(may_cut);
         }
-        let base_len = self.quads.base_len();
-        let selected = self
-            .quads
-            .selection
-            .len_if_known(None, base_len)?
-            .unwrap_or(base_len);
-        if fits(selected) {
-            return Ok(true);
-        }
-        Ok(self.quads.deleted.is_some() && self.quads.live_len_if_known()?.is_some_and(fits))
+        let tail = self.tail_size();
+        let fits = |base: usize| base.saturating_add(tail) <= limit;
+        let base = self.quads.base_rows(|selected| !fits(selected))?;
+        Ok(if fits(base.upper_bound()) {
+            WindowCheck::CannotCut
+        } else {
+            WindowCheck::MayCut {
+                base_live: base.live,
+            }
+        })
     }
 
     /// Whether this view's one-shot reads take its pending filter by the
@@ -423,14 +442,16 @@ impl VortexRdfStore {
     /// The base's window over its exact `selection`, and the base's live row
     /// count as far as the window needs it: a position range over the
     /// selection, stepping over tombstones, with the selection's live row
-    /// count; or, under a pending file filter, the window of the first
-    /// matches, evaluated only as far as the window reaches, with their count
-    /// (at most `offset + limit`).
+    /// count (`live`, when the window's check counted it); or, under a
+    /// pending file filter, the window of the first matches, evaluated only
+    /// as far as the window reaches, with their count (at most
+    /// `offset + limit`).
     async fn base_window(
         &self,
         selection: &RowSelection,
         offset: usize,
         limit: usize,
+        live: Option<usize>,
     ) -> Result<(RowSelection, usize)> {
         let base_len = self.quads.base_len();
         let deleted = self.quads.deleted.as_ref();
@@ -452,7 +473,7 @@ impl VortexRdfStore {
                 live,
             ));
         }
-        let live = selection.live_len(deleted, base_len);
+        let live = live.unwrap_or_else(|| selection.live_len(deleted, base_len));
         Ok((selection.window(offset, limit, deleted, base_len), live))
     }
 
@@ -749,6 +770,17 @@ fn set_is_located(codes: usize, rows: usize) -> bool {
     codes <= rows.div_ceil(LOCATED_SET_ROWS_PER_CODE)
 }
 
+/// What a window's check ([`window_check`](VortexRdfStore::window_check))
+/// found.
+pub(in crate::store) enum WindowCheck {
+    /// The window cannot cut a row: it is the view as it is.
+    CannotCut,
+    /// The window may cut a row. `base_live` is the base's live row count
+    /// when the check counted it, which the window takes instead of
+    /// counting again.
+    MayCut { base_live: Option<usize> },
+}
+
 /// Test hook: how many of this thread's in-memory keeps were answered by
 /// binary search inside a sorted run (`keep_sorted_run`), not by a pass
 /// over the selected rows; and how many windows this thread built.
@@ -771,7 +803,9 @@ pub(crate) mod narrow_hooks {
         SORTED_RUN_KEEPS.with(Cell::get)
     }
 
-    /// Record one call of [`window`](crate::store::VortexRdfStore::window).
+    /// Record one window built: a call of
+    /// [`window`](crate::store::VortexRdfStore::window) past the checks that
+    /// find it is the view as it is.
     pub(super) fn note_window() {
         WINDOWS.set(WINDOWS.get() + 1);
     }
