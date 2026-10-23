@@ -36,8 +36,8 @@ flowchart LR
 | Term dictionary | a `TermDictionary` inside the resolved layout | the required `dictionary` child |
 
 A builder hands these back in one of two shapes
-([`BuiltArray`](../core/src/store/builders/mod.rs#L61) and the crate-private
-[`BuiltStream`](../core/src/store/builders/mod.rs#L75)):
+([`BuiltArray`](../core/src/store/builders/mod.rs#L97) and the crate-private
+[`BuiltStream`](../core/src/store/builders/mod.rs#L111)):
 
 - **`BuiltArray`** — everything materialized: the quad array, the components,
   the dictionary. What `VortexRdfStore::from_built` adopts.
@@ -72,7 +72,7 @@ the same kebab-case names, which `LayoutStrategy`/`IndexType` parse and print.
 ## 3. The ingest currency: `RawQuad`
 
 Every builder consumes one thing: a stream of
-[`RawQuad`](../core/src/common/quad.rs#L66)s, four owned strings in the exact
+[`RawQuad`](../core/src/common/quad.rs#L65)s, four owned strings in the exact
 form the columns store.
 
 | Field | Spelling | Example |
@@ -114,7 +114,7 @@ deduplicated dataset (an RDF dataset is a set: a quad is in it or is not).
 The rebuilds of [§11](#11-rebuilds-mutated-stores-compaction-export) do the
 same. Builders do not parse a term again, so a build's input must come from
 one of the canonical sources: `RawQuad::from_quad` (an `oxrdf` quad), the
-parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L91), which
+parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L90), which
 turns four strings into a `RawQuad` and rejects what is no quad (a literal
 subject, a malformed IRI). A `RawQuad` written by hand in some other spelling
 of the same terms is a different quad.
@@ -129,7 +129,7 @@ is a property of the target
 
 | Target | Builder | Holds |
 |---|---|---|
-| Anywhere with a filesystem (Rust, CLI, Python) | `SortedStreamBuilder` — external merge sort | one chunk of quads, plus spill runs on disk |
+| Anywhere with a filesystem (Rust, CLI, Python) | `SortedStreamBuilder` — external merge sort | the distinct terms and one chunk of quads, plus spill runs of term ids on disk |
 | `wasm32-unknown-unknown` (JavaScript) | `SortedInMemoryBuilder` — one in-memory sort; the only builder compiled there | the whole dataset |
 
 The order is what the read side is written against: the `s` column carries the
@@ -174,11 +174,11 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, stripped
 of its adjacent repeats, and built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L132); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L172); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
-([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L189)):
+([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L144)):
 each distinct term is held once (a `Box<str>` keyed map), and each quad is kept
 as four provisional `u64` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
@@ -187,7 +187,7 @@ lexicographic ranks, sorting `[u64; 4]` rows is the same order as sorting the
 term strings, so the sort moves 32-byte rows instead of four-string structs;
 equal rows are then adjacent and the repeats are dropped, since equal codes are
 equal terms.
-[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L153) is
+[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L108) is
 the push-based form of the same ingest, for callers that produce quads one at a
 time (the wasm array path).
 
@@ -195,74 +195,104 @@ time (the wasm array path).
 
 ## 6. Pipeline B — sorted out of core
 
-[`SortedStreamBuilder`](../core/src/store/builders/sorted_stream.rs#L49) is an
-external merge sort: peak memory is bounded by the chunk size (plus the
-distinct terms, under the Dictionary layout), not by the dataset.
+[`SortedStreamBuilder`](../core/src/store/builders/sorted_stream.rs#L60) is an
+external merge sort over term ids: peak memory is bounded by the dataset's
+distinct terms plus a run buffer and a chunk, not by the dataset, and the
+spill holds each quad once, as 16 bytes.
 
 ```mermaid
 flowchart TD
-    subgraph P1 ["Phase 1 — ingest into sorted runs"]
-        I1["buffer up to 100,000 RawQuads"] --> I2{"buffer full?"}
-        I2 -- "yes" --> I3["sort the buffer,<br/>spill it as run_N.bin (rkyv records)"]
+    subgraph P1 ["Phase 1 — ingest into sorted runs of term ids"]
+        I0["intern each term: a u32 id, the term held once"] --> I1["buffer up to 1,048,576 quads as four ids"]
+        I1 --> I2{"buffer full?"}
+        I2 -- "yes" --> I3["sort it in the terms' order, drop repeats,<br/>spill it as quads_run_N.bin (16 bytes a quad)"]
         I3 --> I1
-        I2 -- "no" --> I1
-        I1 -. "Dictionary layout: every term<br/>also enters TermDictionaryBuilder" .-> I4["distinct terms"]
+        I2 -- "no" --> I0
     end
-    P1 --> P2["Phase 2 — K-way merge<br/>a min-heap over every run's head"]
-    P2 --> Q{"indexes requested?"}
-    Q -- "no" --> E1["lazy emission: each poll pulls<br/>≤ 100,000 quads off the heap and builds one chunk"]
-    Q -- "yes" --> E2["merge_feeding_indexes: run the merge to the end,<br/>assign row ids, spill (key, rid) runs per family,<br/>write the merged quads to merged.bin"]
-    E2 --> E3["primary chunks re-read from merged.bin<br/>while each family's merger streams its child"]
-    I4 -. "finish: sorted terms → TermDictionary + term→code map,<br/>before any chunk is emitted" .-> E1
-    I4 -.-> E2
+    P1 --> F["freeze: rank the terms in byte order (id → rank);<br/>Dictionary layout: the ranked terms become the TermDictionary"]
+    F --> Q{"indexes requested?"}
+    Q -- "no" --> E1["lazy emission: a K-way merge of the runs, ids read as ranks;<br/>each poll pulls ≤ 100,000 quads and builds one chunk"]
+    Q -- "yes" --> E2["merge_feeding_indexes: a first merge to the end,<br/>assign row ids, spill (ranks, row offset) runs per family"]
+    E2 --> E3["primary chunks off a second merge of the same runs<br/>while each family's merger streams its child"]
 ```
 
-**Phase 1 — runs.** Quads are buffered up to `DEFAULT_CHUNK_ROWS`; a buffer
-that would overflow is sorted and spilled as one run file. A dataset that fits
+**Phase 1 — runs.** Every term is interned as it arrives, under every layout
+([`TermInterner`](../core/src/store/builders/interner.rs#L36)): each distinct
+term is held once under a provisional `u32` id, in arrival order, and a quad is
+kept as its four ids. The buffer holds up to
+[`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L55) (1,048,576) quads,
+16 bytes each; a buffer that would overflow is sorted in its terms' order (an
+equal id is an equal term, never read), deduplicated and spilled as one run
+([`QuadSpiller`](../core/src/store/builders/runs.rs#L250)). A dataset that fits
 in a single buffer never touches the filesystem — the sorted buffer *is* the
-run. Under the Dictionary layout every term is also inserted into a
-[`TermDictionaryBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L95)
-during this same pass, so the global dictionary is complete before any chunk
-flows; the whole distinct-term set is the one thing this pipeline holds for the
-dataset's lifetime.
+run. The distinct terms are the one thing this pipeline holds for the
+dataset's lifetime: in the interner during ingest, then as the Dictionary
+layout's term dictionary or, under the string layouts, as the sorted terms the
+ranks are spelled back from. A build of more than `i32::MAX` distinct terms is
+refused at the term past it.
 
-**Phase 2 — merge.** A binary heap holds the head of every run; popping it
-yields the globally next quad in `(s, p, o, g)` order. The quad runs are
-*distinct*: a run drops its repeats as it is sorted, and after each pop the
-merge pops every other copy of that quad off the heap (equal quads are
-adjacent in the merged order, so they are the heads of their runs), so a quad
-that arrives more than once, in one run or in several, is emitted once. Row
-ids are assigned after this, so the index families' `(key, rid)` records —
-spilled and merged as they are, never deduplicated — are unique because their
-row ids are.
+**Freeze.** The interner's
+[`finish`](../core/src/store/builders/interner.rs#L115) sorts the terms once, in
+byte order, and maps each id to its term's rank. A rank keeps its term's order
+— the order of dictionary codes and of `RawQuad`'s derived `Ord` — so a run
+sorted by its terms is sorted by rank tuple once its ids are read as ranks: no
+run is sorted again. Under the Dictionary layout the ranked terms become the
+term dictionary (a rank's code is its position), each term moved into the
+column and freed as it is copied.
+
+**Phase 2 — merge.** A binary heap holds the head of every run, its ids read
+as ranks; popping it yields the globally next quad in `(s, p, o, g)` order. The
+quad runs are *distinct*: a run drops its repeats as it is sorted, and after
+each pop the merge pops every other copy of that quad off the heap (equal quads
+are adjacent in the merged order, so they are the heads of their runs), so a
+quad that arrives more than once, in one run or in several, is emitted once.
+Row ids are assigned after this, so the index families' records — spilled and
+merged as they are, never deduplicated — are unique because their row ids are.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
-([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L163)):
-every poll of the chunk stream pulls up to a chunk's worth of quads off the
-heap and builds one struct
-([`build_struct_array`](../core/src/store/builders/mod.rs#L132), or
-[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L106)
-encoding each term through the term→code map). With indexes the merge runs to
-completion first ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L127)):
+([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L247)):
+every poll pulls up to a chunk's worth of quads off the heap and builds one
+struct, their ranks spelled as dictionary codes
+([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L118)) or,
+under the string layouts, as their terms again
+([`build_struct_array`](../core/src/store/builders/mod.rs#L172)). With indexes a
+first merge runs to completion
+([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L114)):
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
-Each merged quad's terms (strings, or codes under Dictionary) are pushed into
-one spiller per requested family, each spilling its own sorted runs:
+Each merged quad's ranks are pushed into one spiller per requested family
+([`EntrySpiller`](../core/src/store/builders/runs.rs#L482)), each spilling its
+own sorted runs:
 
 | Family | Spilled entry | Run files |
 |---|---|---|
-| `index:ref-o` / `index:ref-p` | `(value, rid)` | `idx_o_run_N.bin`, `idx_p_run_N.bin` |
-| `index:posg` / `index:ospg` | `(CopyKey[4 terms in the family's key order], rid)` | `idx_posg_run_N.bin`, `idx_ospg_run_N.bin` |
+| `index:ref-o` / `index:ref-p` | `(rank, row id)` | `idx_o_run_N.bin`, `idx_p_run_N.bin` |
+| `index:posg` / `index:ospg` | `(four ranks in the family's key order, row id)` | `idx_posg_run_N.bin`, `idx_ospg_run_N.bin` |
 
-The merged quads go to `merged.bin` (or stay in memory when the merge had a
-single input run). Then each family's merger streams its child's chunks in
-global order through a pull-based component source, while the primary chunks
-are re-read from `merged.bin` a chunk at a time — no index is ever materialized
-whole.
+The primary chunks then come off a second merge of the same quad runs, while
+each family's merger streams its child's chunks in global order through a
+pull-based component source, the ranks spelled as the layout's terms as each
+chunk is built — no index is ever materialized whole, and the quads are never
+written a second time.
 
-**Spill files** are length-prefixed `rkyv` records (a little-endian `u32`
-length, then the archived value) in a per-build run directory, removed when
-the stream is dropped. A build that writes a file names the directory after
+**Spill files** are fixed-width little-endian records
+([`runs.rs`](../core/src/store/builders/runs.rs)) in a per-build run
+directory, removed when the stream is dropped:
+
+| Run | Header | Record |
+|---|---|---|
+| `quads_run_N.bin` | none | four `u32` term ids: 16 bytes |
+| `idx_o_…`, `idx_p_…` | the run's first row id, `u64` | rank `u32`, row offset `u32`: 8 bytes |
+| `idx_posg_…`, `idx_ospg_…` | the run's first row id, `u64` | four ranks `u32`, row offset `u32`: 20 bytes |
+
+A run holds at most `DEFAULT_RUN_ROWS` entries numbered consecutively (one per
+quad, in row order), so a row offset from the run's first row id fits a `u32`.
+The spill peaks at the end of the first merge, when the quad runs and every
+index run exist at once: 16 bytes a quad, plus 16 for the reference index and
+40 for the copy index (plus 8 bytes a run). A record cut off partway, or an id
+or rank past its table, is a `Deserialization` error.
+
+A build that writes a file names the directory after
 that file (where the links at its path end), `.<file name>.spill-<uuid>`
 (`.out.vortex.spill-<uuid>` for `out.vortex`), by default a hidden sibling of
 the store, so a directory a crash left behind says which output it belonged
@@ -270,7 +300,7 @@ to; a build with no output path (an in-memory store, or
 [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L46) into a caller's
 writer), or one whose file name would make the directory's name longer than
 255 bytes, uses `.vortex-rdf.spill-<uuid>`. The parent directory is resolved in
-this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L95)):
+this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L71)):
 the `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (a
 serialization to a file,
 [`quads_stream_to_vortex_file`](../core/src/io/write.rs#L136) and so the CLI
@@ -284,8 +314,8 @@ full) or to a writable directory (any other failure).
 
 | Build | Peak memory |
 |---|---|
-| no indexes | heap heads + one chunk (+ the distinct terms under Dictionary) |
-| with indexes | as above, plus each spiller's buffer of up to 100,000 entries, plus the components' compressed segments the writer holds until the quad table finishes ([`write_stream`](../core/src/io/container/write.rs#L94)) |
+| no indexes | the distinct terms (the interner during ingest, then the term dictionary, or the sorted terms under the string layouts) + a run buffer of up to 1,048,576 quads (16 MB) + heap heads + one chunk |
+| with indexes | as above, plus each family spiller's buffer of up to 1,048,576 entries (16 MB a reference spiller, 24 MB a copy spiller), plus the components' compressed segments the writer holds until the quad table finishes ([`write_stream`](../core/src/io/container/write.rs#L94)) |
 
 ---
 
@@ -321,13 +351,12 @@ independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
-Which pipeline built the dictionary decides how its term→code map is held during
-encoding: borrowed from the live quads in memory
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L77)),
-owned when the quads were spilled and cannot be borrowed from
-([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L117)).
-Either way the map exists only for the build; stores keep the columnar
-dictionary alone.
+Which pipeline built the dictionary decides how a term reaches its code during
+encoding: a rebuild looks it up in a term→code map borrowed from the live quads
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L71)),
+while the interning builds never look a term up again: their quads hold term
+ids, remapped to ranks, and a rank's code is its position. Either way the
+mapping exists only for the build; stores keep the columnar dictionary alone.
 
 ---
 
@@ -363,7 +392,7 @@ Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
 ([file-format.md §6](file-format.md#6-the-index-children)).
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L166)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L206)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
 family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L138),
 or the code tuple under Dictionary), then gather the columns through that
