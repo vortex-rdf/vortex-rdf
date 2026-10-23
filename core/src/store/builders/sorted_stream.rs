@@ -274,7 +274,7 @@ pub(crate) async fn build_chunk_stream(
 
     let freeze = debug::timer();
     let frozen = terms.finish();
-    let rank_of: Arc<[u32]> = Arc::from(frozen.rank_of);
+    let rank_of = Arc::new(frozen.rank_of);
     let encoding = Encoding::new(layout, frozen.sorted)?;
     log::debug!(
         "[SortedStreamBuilder] Ranked {} terms in {:?}",

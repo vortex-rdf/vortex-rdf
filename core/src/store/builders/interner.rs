@@ -74,10 +74,12 @@ impl TermInterner {
         }
         // Below the cap, at most `i32::MAX`: the id fits a `u32`.
         let id = self.terms.len() as u32;
+        // The term goes in first, so the table's rehash, which hashes the
+        // terms behind the ids it holds, can read every id, the new one too.
+        self.terms.push(term.into_boxed_str());
         let (terms, hasher) = (&self.terms, &self.hasher);
         self.index
             .insert_unique(hash, id, |&id| hasher.hash_one(&*terms[id as usize]));
-        self.terms.push(term.into_boxed_str());
         Ok(id)
     }
 

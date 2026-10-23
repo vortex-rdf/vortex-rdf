@@ -2,14 +2,15 @@
 //! ([`BuiltArray`], and the crate-private `BuiltStream` the file writer
 //! consumes), the primary chunk build ([`build_struct_array`]) and the
 //! globally sorted index emission ([`build_components`]). `sorted_in_memory`
-//! and `sorted_stream` are the two pipelines; `spill` (the sort runs) and
+//! and `sorted_stream` are the two pipelines; `interner` (the term ids),
+//! `runs` (the sort runs and their merge), `spill` (the run directory) and
 //! `stream_indexes` (the index children) back the out-of-core one.
 //!
 //! Which pipeline runs is a property of the target, never a caller's choice:
-//! the out-of-core global sort (`SortedStreamBuilder`), whose peak memory does
-//! not scale with the dataset, wherever a filesystem exists; the in-memory
-//! one ([`SortedInMemoryBuilder`]) on `wasm32-unknown-unknown`, the only one
-//! compiled there.
+//! the out-of-core global sort (`SortedStreamBuilder`), whose peak memory
+//! scales with the dataset's distinct terms, not its quads, wherever a
+//! filesystem exists; the in-memory one ([`SortedInMemoryBuilder`]) on
+//! `wasm32-unknown-unknown`, the only one compiled there.
 //!
 //! A builder emits primary-only quad rows plus one *component* per requested
 //! index's persisted child, the one form index data takes: the in-memory sort
@@ -129,7 +130,7 @@ pub(crate) mod interner;
 pub(crate) mod runs;
 pub(crate) mod sorted_in_memory;
 // No filesystem to spill to on wasm32-unknown-unknown; compiling the external
-// sort out also keeps rkyv and uuid out of the wasm artifact.
+// sort out also keeps uuid out of the wasm artifact.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

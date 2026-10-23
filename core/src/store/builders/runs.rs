@@ -41,6 +41,12 @@ pub(crate) const COPY_RECORD_BYTES: usize = 20;
 /// Bytes of a row offset inside an index record.
 const ROW_OFFSET_BYTES: usize = 4;
 
+/// A build's id → rank table ([`FrozenTerms::rank_of`]), shared by every
+/// reader of its quad runs, the table moved in rather than copied.
+///
+/// [`FrozenTerms::rank_of`]: super::interner::FrozenTerms::rank_of
+pub(crate) type RankTable = Arc<Vec<u32>>;
+
 /// The little-endian `u32` at the start of `bytes`.
 fn le_u32(bytes: &[u8]) -> u32 {
     let mut word = [0u8; 4];
@@ -346,7 +352,7 @@ impl QuadRuns {
 
     /// A merge of the runs yielding each distinct quad once, in global order,
     /// as the ranks `rank_of` maps its ids to.
-    pub(crate) fn merger(&self, rank_of: &Arc<[u32]>) -> Result<RunMerger<QuadRunReader>> {
+    pub(crate) fn merger(&self, rank_of: &RankTable) -> Result<RunMerger<QuadRunReader>> {
         let runs = match &self.memory {
             Some(ids) => vec![QuadRunReader {
                 source: QuadSource::Memory {
@@ -373,7 +379,7 @@ impl QuadRuns {
 /// One quad run read back, each id mapped to its rank.
 pub(crate) struct QuadRunReader {
     source: QuadSource,
-    rank_of: Arc<[u32]>,
+    rank_of: RankTable,
 }
 
 enum QuadSource {
@@ -720,7 +726,7 @@ mod tests {
         let guard = TempRunsGuard::create(None, None).unwrap();
         let (runs, frozen) = spill(guard.path(), &pushes(), 3);
         assert!(runs.run_count() > 1, "{} runs", runs.run_count());
-        let rank_of: Arc<[u32]> = frozen.rank_of.clone().into();
+        let rank_of = Arc::new(frozen.rank_of.clone());
         let merged = runs
             .merger(&rank_of)
             .unwrap()
@@ -733,7 +739,7 @@ mod tests {
     fn quad_runs_open_twice_yield_the_same_sequence() {
         let guard = TempRunsGuard::create(None, None).unwrap();
         let (runs, frozen) = spill(guard.path(), &pushes(), 3);
-        let rank_of: Arc<[u32]> = frozen.rank_of.into();
+        let rank_of = Arc::new(frozen.rank_of);
         let first = runs
             .merger(&rank_of)
             .unwrap()
@@ -755,7 +761,7 @@ mod tests {
         let (runs, frozen) = spill(guard.path(), quads, 100);
         assert_eq!(runs.run_count(), 1);
         assert_eq!(std::fs::read_dir(guard.path()).unwrap().count(), 0);
-        let rank_of: Arc<[u32]> = frozen.rank_of.clone().into();
+        let rank_of = Arc::new(frozen.rank_of.clone());
         let merged = runs
             .merger(&rank_of)
             .unwrap()
@@ -779,7 +785,7 @@ mod tests {
     fn quad_run_id_past_the_table_is_a_deserialization_error() {
         let guard = TempRunsGuard::create(None, None).unwrap();
         let (runs, frozen) = spill(guard.path(), &distinct_quads(), 3);
-        let short: Arc<[u32]> = frozen.rank_of[..2].to_vec().into();
+        let short = Arc::new(frozen.rank_of[..2].to_vec());
         let read = runs
             .merger(&short)
             .and_then(|mut merger| merger.next_batch(usize::MAX));
@@ -879,7 +885,7 @@ mod tests {
             .unwrap();
         run.set_len(10).unwrap();
         let runs = spiller.finish(&terms).unwrap();
-        let rank_of: Arc<[u32]> = terms.finish().rank_of.into();
+        let rank_of = Arc::new(terms.finish().rank_of);
         let read = runs
             .merger(&rank_of)
             .and_then(|mut merger| merger.next_batch(usize::MAX));

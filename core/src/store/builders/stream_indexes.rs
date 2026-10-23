@@ -6,7 +6,7 @@
 
 use super::BuildSizes;
 use super::runs::{
-    CopyEntry, EntryRunReader, EntrySpiller, IndexEntry, QuadRuns, RefEntry, RunMerger,
+    CopyEntry, EntryRunReader, EntrySpiller, IndexEntry, QuadRuns, RankTable, RefEntry, RunMerger,
 };
 use super::spill::TempRunsGuard;
 use crate::error::Result;
@@ -113,7 +113,7 @@ fn finish_pair<E: IndexEntry>(pair: Pair<EntrySpiller<E>>) -> Result<Pair<EntryM
 /// size; `runs` stays readable for the quad chunks' own merge.
 pub(super) fn merge_feeding_indexes<V>(
     runs: &QuadRuns,
-    rank_of: &Arc<[u32]>,
+    rank_of: &RankTable,
     guard: &Arc<TempRunsGuard>,
     sizes: BuildSizes,
     indexes: &[IndexType],
