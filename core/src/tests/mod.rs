@@ -153,7 +153,7 @@ async fn write_chunked_store_file(
     quads: &[Quad],
     chunk_rows: usize,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
-    write_chunked_store(quads, chunk_rows, false, false).await
+    write_chunked_store(quads, chunk_rows, false, false, None).await
 }
 
 /// [`write_chunked_store_file`] with the reference index built as well and
@@ -164,18 +164,22 @@ async fn write_chunked_reference_store_file(
     quads: &[Quad],
     chunk_rows: usize,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
-    write_chunked_store(quads, chunk_rows, true, false).await
+    write_chunked_store(quads, chunk_rows, true, false, None).await
 }
 
 /// The file behind [`write_chunked_store_file`] and
 /// [`write_chunked_reference_store_file`]; with `flat_dictionary` its
 /// dictionary child is one flat struct leaf, a shape the file-backed
-/// dictionary declines, so a mapped open holds the dictionary resident.
+/// dictionary declines, so a mapped open holds the dictionary resident. With
+/// `unprobed`, that primary column is written as a dictionary whose codes are
+/// a dictionary again, a shape the chunk probes decline, so the column has
+/// none.
 async fn write_chunked_store(
     quads: &[Quad],
     chunk_rows: usize,
     reference_index: bool,
     flat_dictionary: bool,
+    unprobed: Option<&str>,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
     use crate::io::container::BufferedComponentSource;
     use crate::store::indexes::IndexInput;
@@ -229,6 +233,44 @@ async fn write_chunked_store(
             components.push(write);
         }
     }
+    let primary: std::sync::Arc<dyn vortex_layout::LayoutStrategy> = match unprobed {
+        None => std::sync::Arc::new(StructStrategy::new(
+            std::sync::Arc::new(FlatLayoutStrategy::default()),
+            std::sync::Arc::new(leaves),
+        )),
+        Some(column) => {
+            use vortex_layout::layouts::dict::writer::DictStrategy;
+            use vortex_layout::layouts::table::TableStrategy;
+            // Every chunk dictionary-encodes, so each level is a dictionary.
+            let always = |chunk: &vortex_array::ArrayRef, ctx: &mut vortex_array::ExecutionCtx| {
+                vortex_array::builders::dict::dict_encode(chunk, ctx).map(|dict| dict.into_array())
+            };
+            let inner = DictStrategy::new(
+                leaves.clone(),
+                FlatLayoutStrategy::default(),
+                leaves.clone(),
+                Default::default(),
+                std::sync::Arc::new(always),
+            );
+            let dict = DictStrategy::new(
+                inner,
+                FlatLayoutStrategy::default(),
+                leaves.clone(),
+                Default::default(),
+                std::sync::Arc::new(always),
+            );
+            std::sync::Arc::new(
+                TableStrategy::new(
+                    std::sync::Arc::new(FlatLayoutStrategy::default()),
+                    std::sync::Arc::new(leaves),
+                )
+                .with_field_writer(
+                    vortex_array::dtype::FieldPath::from_name(column),
+                    std::sync::Arc::new(dict),
+                ),
+            )
+        }
+    };
     let mut bytes: Vec<u8> = Vec::new();
     crate::io::container::write_store(
         &crate::session::VORTEX_SESSION,
@@ -237,10 +279,7 @@ async fn write_chunked_store(
             dtype,
             Box::pin(stream::iter(chunks.into_iter().map(Ok))),
         ),
-        std::sync::Arc::new(StructStrategy::new(
-            std::sync::Arc::new(FlatLayoutStrategy::default()),
-            std::sync::Arc::new(leaves),
-        )),
+        primary,
         true,
         components,
     )
@@ -405,8 +444,14 @@ async fn masks_file_resident_dictionary() -> (tempfile::TempDir, std::path::Path
 async fn masks_file_with(flat_dictionary: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     static BYTES: [OnceLock<Vec<u8>>; 2] = [const { OnceLock::new() }; 2];
     let bytes = cached_store_bytes(&BYTES[usize::from(flat_dictionary)], || async move {
-        let (_dir, path) =
-            write_chunked_store(&masks_quads(), MASKS_SPLIT_ROWS, false, flat_dictionary).await;
+        let (_dir, path) = write_chunked_store(
+            &masks_quads(),
+            MASKS_SPLIT_ROWS,
+            false,
+            flat_dictionary,
+            None,
+        )
+        .await;
         std::fs::read(&path).unwrap()
     })
     .await;

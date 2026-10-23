@@ -1482,6 +1482,47 @@ async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
     }
 }
 
+/// On a Dictionary file one of whose primary columns has no chunk probes (the
+/// object column written dictionary-encoded with its values under a chunked
+/// node, a shape the probes decline), the reads by id cannot check a filter
+/// of code equalities, so a filtered view's reads scan, and a window that
+/// finds fewer matches than its limit keeps the matches' ids, not the
+/// filter's masks: the rows an in-memory open reads, known exactly, no filter
+/// pending.
+#[tokio::test]
+async fn test_window_over_a_column_without_chunk_probes_keeps_ids() {
+    let (_dir, path) =
+        write_chunked_store(&masks_quads(), MASKS_SPLIT_ROWS, false, false, Some("o")).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let twin = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    assert_eq!(store.debug_quad_column_chunks("o"), None, "o: no probes");
+    assert!(store.debug_quad_column_chunks("p").is_some(), "p: probes");
+    let dense = masks_probes()
+        .into_iter()
+        .filter(|(shape, ..)| matches!(*shape, "P" | "G"));
+    for (shape, probe, _) in dense {
+        let plain = store.run_probe(&probe).await.unwrap();
+        assert!(
+            plain.view_statistics().unwrap().pending_filter,
+            "{shape}: a pending filter"
+        );
+        assert!(!plain.debug_reads_masks_first(), "{shape}: no masks first");
+        let rows = row_list(&twin.run_probe(&probe).await.unwrap()).await;
+        assert_eq!(row_list(&plain).await, rows, "{shape}: the twin's rows");
+        let n = rows.len();
+        let windowed = store
+            .run_probe(&probe.clone().window(0, Some(n + 1)))
+            .await
+            .unwrap();
+        assert_eq!(windowed.debug_evaluated_len(), None, "{shape}: no masks");
+        let stats = windowed.view_statistics().unwrap();
+        assert!(!stats.pending_filter, "{shape}: the filter evaluated");
+        assert_eq!(stats.selection, SelectionKind::Ids, "{shape}: the ids");
+        assert_eq!(stats.rows, RowCountHint::exact(n), "{shape}: exact rows");
+        assert_eq!(row_list(&windowed).await, rows, "{shape}: the plain rows");
+    }
+}
+
 /// A window that cuts no row of a filtered file view keeps the filter's masks
 /// for its reads where they are smaller than the matches' ids (a bit a row of
 /// each split a mask keeps some rows of, against 64 a match), and the ids
@@ -1550,9 +1591,10 @@ async fn test_kept_masks_never_outlive_a_derivation() {
         let rows = row_list(&twin).await;
         assert_eq!(row_list(&view).await, rows, "{shape}: the twin's rows");
         // A subject set of one code per sixteen of the view's rows is
-        // located; one with the codes of two in every three of the store's
-        // subjects, odd and even rows' alike, more than one per sixteen rows
-        // of the view, is streamed.
+        // located: the rule counts a set's codes against the selection's
+        // rows, here every row of the file. One with the codes of two in
+        // every three of the store's subjects, odd and even rows' alike, more
+        // than one per sixteen of those rows, is streamed.
         let located = Keep::set(rows.iter().step_by(16).map(|row| row[0]));
         let streamed = Keep::set((s_lo..s_hi).filter(|code| (code - s_lo) % 3 != 0));
         let objects = Keep::set([o0, o5]);

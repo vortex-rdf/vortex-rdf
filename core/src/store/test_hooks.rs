@@ -300,6 +300,16 @@ impl VortexRdfStore {
             .expect("the read choice needs only the file's splits")
     }
 
+    /// A primary column's chunk-probe handle as `(row count, flat leaves)` —
+    /// `None` off-file or when the column's shape declines the handle.
+    pub(crate) fn debug_quad_column_chunks(&self, column: &str) -> Option<(u64, usize)> {
+        self.quads
+            .file()?
+            .file
+            .column_chunks(column)
+            .map(|chunks| (chunks.row_count(), chunks.chunk_count()))
+    }
+
     /// An index component column's chunk-probe handle as `(row count, flat
     /// leaves)` — `None` off-file or when the column's shape declines the
     /// handle.

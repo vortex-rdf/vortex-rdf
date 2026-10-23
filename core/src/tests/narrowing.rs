@@ -165,14 +165,14 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
     }
 }
 
-/// Windows and capped counts of every view agree with slicing its
-/// base-ordered rows. A window that keeps a serve plan is one that cuts no
-/// row, and reads the view's own rows in the view's order.
-async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
+/// The views [`assert_windows_match_slicing`] windows, each beside its tag:
+/// the whole store, a bound predicate, object, subject and predicate-object
+/// pair, and an object keep.
+async fn slicing_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let o3 = Term::Literal(Literal::new_simple_literal("o3"));
     let s42 = subject_node(42, 4);
-    let views: Vec<(&str, VortexRdfStore)> = vec![
+    vec![
         ("whole", store.clone()),
         (
             "p-bound",
@@ -209,10 +209,28 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
                 .await
                 .unwrap(),
         ),
-    ];
-    for (view_tag, view) in &views {
+    ]
+}
+
+/// Windows and capped counts of every view agree with slicing its
+/// base-ordered rows. A window that keeps a serve plan is one that cuts no
+/// row, and reads the rows of the same match built anew, read plain, in its
+/// order: its codes, and its quads in the index's order, which on a store
+/// with the copy index is not always base order.
+async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
+    let views = slicing_views(store).await;
+    let plain_views = slicing_views(store).await;
+    let mut index_ordered = 0;
+    for ((view_tag, view), (_, plain)) in views.iter().zip(&plain_views) {
         let rows = base_ordered_codes(view).await;
         let n = rows.len();
+        let base_quads = view
+            .keep(QuadColumn::S, &Keep::range(0..TermCode::MAX))
+            .await
+            .unwrap()
+            .quads_vec()
+            .await
+            .unwrap();
         for (offset, limit) in [
             (0, 0),
             (0, 1),
@@ -232,7 +250,14 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
                     offset == 0 && limit >= n,
                     "{tag}/{view_tag}: window({offset}, {limit}) cuts rows and keeps the plan"
                 );
-                row_list(view).await
+                let quads = plain.quads_vec().await.unwrap();
+                assert_eq!(
+                    windowed.quads_vec().await.unwrap(),
+                    quads,
+                    "{tag}/{view_tag}: window({offset}, {limit}): the plain quads, in order"
+                );
+                index_ordered += usize::from(quads != base_quads);
+                row_list(plain).await
             } else {
                 want.clone()
             };
@@ -272,6 +297,12 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
             "{tag}/{view_tag}"
         );
         assert_eq!(view.size_capped(0).await.unwrap(), 0, "{tag}/{view_tag}");
+    }
+    if store.indexes().contains(&IndexType::SecondaryByCopy) {
+        assert!(
+            index_ordered > 0,
+            "{tag}: a served window whose plain order is not base order"
+        );
     }
 }
 
@@ -666,12 +697,14 @@ async fn test_window_that_cuts_keeps_base_order() {
 }
 
 /// Under tombstones and an appended tail, a window that cannot cut a row is
-/// still the plain match, rows and order, the tail's rows after the base's.
-/// Its bound is the one the view's statistics report for a fresh match: the
-/// base's live rows, exact wherever they are known without reading (in
-/// memory always), plus the tail's rows, so a limit of exactly that cuts
-/// nothing, while the live base rows alone cut the tail. On file, a served
-/// run whose ids are unread is bounded by its width, tombstones included.
+/// still the plain match, rows and order, the tail's rows after the base's,
+/// and the copy index still serves its shapes. Its bound is the one the
+/// view's statistics report for a fresh match: the base's live rows, exact
+/// wherever they are known without reading (in memory always), plus the
+/// tail's rows, so a limit of exactly that cuts nothing, while the live base
+/// rows alone cut the tail. On file, a served run whose ids are unread is
+/// bounded by its width, tombstones included, and once they are read by its
+/// live rows.
 #[tokio::test]
 async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
     let quads = fixture_quads();
@@ -720,6 +753,11 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
                 3
             };
             assert_eq!(stats.tail_rows, tail_rows, "{label}");
+            assert_eq!(
+                stats.served_component.is_some(),
+                tag.contains("copy") && matches!(shape, "P" | "PO" | "O"),
+                "{label}: served"
+            );
             let bound = stats.rows.upper_bound;
             assert!(bound >= n, "{label}: a bound");
             if !stats.file_backed {
@@ -728,6 +766,25 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
             if tag == "file/copy/mapped" && matches!(shape, "P" | "O") {
                 assert_eq!(stats.rows.exact, None, "{label}: the run's ids unread");
                 assert!(bound > n, "{label}: the run's width");
+                // The size above read the run's ids into the view: its live
+                // rows now bound it, so a window of exactly its rows is the
+                // served view as it is.
+                assert_eq!(
+                    plain.view_statistics().unwrap().rows,
+                    RowCountHint::exact(n),
+                    "{label}: the ids read"
+                );
+                let windowed = plain.window(0, n).await.unwrap();
+                assert_eq!(
+                    served_component(&windowed),
+                    stats.served_component,
+                    "{label}: the ids read, the plan"
+                );
+                assert_eq!(
+                    windowed.quads_vec().await.unwrap(),
+                    rows,
+                    "{label}: the ids read, the plain rows, in order"
+                );
             }
             for limit in [bound, bound + 1, usize::MAX] {
                 let windowed = store
