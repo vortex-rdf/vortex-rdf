@@ -36,8 +36,8 @@ flowchart LR
 | Term dictionary | a `TermDictionary` inside the resolved layout | the required `dictionary` child |
 
 A builder hands these back in one of two shapes
-([`BuiltArray`](../core/src/store/builders/mod.rs#L97) and the crate-private
-[`BuiltStream`](../core/src/store/builders/mod.rs#L111)):
+([`BuiltArray`](../core/src/store/builders/mod.rs#L98) and the crate-private
+[`BuiltStream`](../core/src/store/builders/mod.rs#L112)):
 
 - **`BuiltArray`** — everything materialized: the quad array, the components,
   the dictionary. What `VortexRdfStore::from_built` adopts.
@@ -125,7 +125,7 @@ of the same terms is a different quad.
 
 Both pipelines put the rows in global `(s, p, o, g)` order. Which pipeline runs
 is a property of the target
-([`builders/mod.rs`](../core/src/store/builders/mod.rs#L8 "Which pipeline runs")):
+([`builders/mod.rs`](../core/src/store/builders/mod.rs#L9 "Which pipeline runs")):
 
 | Target | Builder | Holds |
 |---|---|---|
@@ -174,7 +174,7 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, stripped
 of its adjacent repeats, and built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L172); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L173); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
@@ -220,10 +220,10 @@ flowchart TD
 ([`TermInterner`](../core/src/store/builders/interner.rs#L36)): each distinct
 term is held once under a provisional `u32` id, in arrival order, and a quad is
 kept as its four ids. The buffer holds up to
-[`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L55) (1,048,576) quads,
+[`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L56) (1,048,576) quads,
 16 bytes each; a buffer that would overflow is sorted in its terms' order (an
 equal id is an equal term, never read), deduplicated and spilled as one run
-([`QuadSpiller`](../core/src/store/builders/runs.rs#L250)). A dataset that fits
+([`QuadSpiller`](../core/src/store/builders/runs.rs#L261)). A dataset that fits
 in a single buffer never touches the filesystem — the sorted buffer *is* the
 run. The distinct terms are the one thing this pipeline holds for the
 dataset's lifetime: in the interner during ingest, then as the Dictionary
@@ -232,7 +232,7 @@ ranks are spelled back from. A build of more than `i32::MAX` distinct terms is
 refused at the term past it.
 
 **Freeze.** The interner's
-[`finish`](../core/src/store/builders/interner.rs#L115) sorts the terms once, in
+[`finish`](../core/src/store/builders/interner.rs#L117) sorts the terms once, in
 byte order, and maps each id to its term's rank. A rank keeps its term's order
 — the order of dictionary codes and of `RawQuad`'s derived `Ord` — so a run
 sorted by its terms is sorted by rank tuple once its ids are read as ranks: no
@@ -255,13 +255,13 @@ every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
 ([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L118)) or,
 under the string layouts, as their terms again
-([`build_struct_array`](../core/src/store/builders/mod.rs#L172)). With indexes a
+([`build_struct_array`](../core/src/store/builders/mod.rs#L173)). With indexes a
 first merge runs to completion
 ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L114)):
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's ranks are pushed into one spiller per requested family
-([`EntrySpiller`](../core/src/store/builders/runs.rs#L482)), each spilling its
+([`EntrySpiller`](../core/src/store/builders/runs.rs#L493)), each spilling its
 own sorted runs:
 
 | Family | Spilled entry | Run files |
@@ -300,7 +300,7 @@ to; a build with no output path (an in-memory store, or
 [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L46) into a caller's
 writer), or one whose file name would make the directory's name longer than
 255 bytes, uses `.vortex-rdf.spill-<uuid>`. The parent directory is resolved in
-this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L71)):
+this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
 the `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (a
 serialization to a file,
 [`quads_stream_to_vortex_file`](../core/src/io/write.rs#L136) and so the CLI
@@ -392,7 +392,7 @@ Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
 ([file-format.md §6](file-format.md#6-the-index-children)).
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L206)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L207)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
 family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L138),
 or the code tuple under Dictionary), then gather the columns through that

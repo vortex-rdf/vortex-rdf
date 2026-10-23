@@ -608,8 +608,8 @@ open rather than being read around.
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L848) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L733) |
 | `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L67) |
-| `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: an emitted chunk's size, an index child chunk's size and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L47) |
-| `DEFAULT_RUN_ROWS` | 1,048,576 entries per out-of-core spill run: quads per quad run, entries per index-family run (whose `u32` row offsets this bounds) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L55) |
+| `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: an emitted chunk's size, an index child chunk's size and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L48) |
+| `DEFAULT_RUN_ROWS` | 1,048,576 entries per out-of-core spill run: quads per quad run, entries per index-family run (whose `u32` row offsets this bounds) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L56) |
 
 ---
 

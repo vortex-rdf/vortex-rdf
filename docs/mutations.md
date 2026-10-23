@@ -241,14 +241,14 @@ flowchart TD
   there a file-backed store cannot compact over its own path: the compaction
   fails with the I/O error and the file stays as it was. The builder's spill
   runs are placed in the temp file's directory
-  ([`spill_site`](../core/src/io/write.rs#L413), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L71)):
+  ([`spill_site`](../core/src/io/write.rs#L413), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default), in a
   run directory named after that file.
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L230) and adopts
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L231) and adopts
   the result through [`from_built`](../core/src/store/construct.rs#L108), in the
   same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
