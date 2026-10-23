@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::interner::TermInterner;
-use super::spill::spill_io_error;
+use super::spill::{spill_io_error, spill_open_error};
 use crate::error::{Result, VortexRdfError};
 use crate::store::schema::RowId;
 
@@ -111,9 +111,13 @@ pub(crate) struct RecordReader {
 }
 
 impl RecordReader {
+    /// The run at `path`; a run that cannot be opened names its directory
+    /// ([`spill_open_error`]).
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        let file =
+            File::open(path).map_err(|e| spill_open_error(path.parent().unwrap_or(path), e))?;
         Ok(Self {
-            reader: BufReader::new(File::open(path)?),
+            reader: BufReader::new(file),
         })
     }
 
@@ -902,6 +906,26 @@ mod tests {
         assert!(
             matches!(made, Err(VortexRdfError::InvalidInput(_))),
             "a run of more entries than a u32 offset reaches is refused"
+        );
+    }
+
+    /// A run the merge cannot open fails with an error that names the
+    /// directory the run was to be read from and keeps the I/O error's kind.
+    #[test]
+    fn a_run_that_cannot_be_opened_names_its_directory() {
+        let guard = TempRunsGuard::create(None, None).unwrap();
+        let dir = guard.path().join("gone");
+        let error = RecordReader::open(&dir.join("quads_run_0.bin"))
+            .err()
+            .expect("a run in a missing directory does not open");
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("spill run open failed in {}: ", dir.display())),
+            "{message}"
         );
     }
 

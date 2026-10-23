@@ -30,12 +30,7 @@ fn resolve_spill_parent(env_override: Option<std::ffi::OsString>, base: Option<&
 /// directory with more room when the volume or a quota is full, a writable
 /// one otherwise.
 pub(crate) fn spill_io_error(dir: &Path, what: &str, e: std::io::Error) -> VortexRdfError {
-    let dir = if dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        dir
-    };
-    let dir = dir.display();
+    let dir = shown_dir(dir).display();
     let hint = match e.kind() {
         ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "a directory with more room",
         _ => "a writable directory",
@@ -44,6 +39,39 @@ pub(crate) fn spill_io_error(dir: &Path, what: &str, e: std::io::Error) -> Vorte
         e.kind(),
         format!("spill run {what} failed in {dir}: {e}; set {SPILL_DIR_ENV} to {hint}"),
     ))
+}
+
+/// A spill run that cannot be opened for its merge: the error keeps the I/O
+/// error's kind and names the directory the run is in (shown as `.` when
+/// empty). A merge opens every run at once, so when the process is out of
+/// file descriptors the message says to raise the open-file limit;
+/// `VORTEX_RDF_SPILL_DIR` would not help there, and is not suggested.
+pub(crate) fn spill_open_error(dir: &Path, e: std::io::Error) -> VortexRdfError {
+    let dir = shown_dir(dir).display();
+    let hint = if out_of_descriptors(&e) {
+        "; a build opens every spill run at once: raise the open-file limit (ulimit -n)"
+    } else {
+        ""
+    };
+    VortexRdfError::Io(std::io::Error::new(
+        e.kind(),
+        format!("spill run open failed in {dir}: {e}{hint}"),
+    ))
+}
+
+/// `dir` as a message shows it: `.`, the working directory, when empty.
+fn shown_dir(dir: &Path) -> &Path {
+    if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    }
+}
+
+/// Whether `e` is the process's or the system's open-file limit (`EMFILE`,
+/// `ENFILE`: 24 and 23 on Linux and macOS).
+fn out_of_descriptors(e: &std::io::Error) -> bool {
+    cfg!(unix) && matches!(e.raw_os_error(), Some(23 | 24))
 }
 
 /// The longest file name, in bytes, the common filesystems take.
@@ -215,6 +243,38 @@ mod tests {
                 assert_eq!(name.len(), MAX_NAME_BYTES, "{len}");
             }
         }
+    }
+
+    /// A run that cannot be opened because the process is out of file
+    /// descriptors (a merge opens every run at once) says to raise the
+    /// open-file limit; any other open failure names the directory only.
+    #[cfg(unix)]
+    #[test]
+    fn spill_open_error_suggests_the_open_file_limit_when_out_of_descriptors() {
+        // EMFILE and ENFILE on Linux and macOS.
+        for errno in [24, 23] {
+            let error = spill_open_error(
+                Path::new("/spill/runs"),
+                std::io::Error::from_raw_os_error(errno),
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("spill run open failed in /spill/runs: "),
+                "{message}"
+            );
+            assert!(
+                message.ends_with(
+                    "; a build opens every spill run at once: raise the open-file limit (ulimit -n)"
+                ),
+                "{message}"
+            );
+        }
+        let error = spill_open_error(Path::new("/spill/runs"), ErrorKind::NotFound.into());
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == ErrorKind::NotFound),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("ulimit"), "{error}");
     }
 
     #[test]
