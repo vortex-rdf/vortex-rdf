@@ -219,10 +219,13 @@ impl VortexRdfStore {
     /// pending filter and row order included: one with no `offset` whose
     /// `limit` is at least the view's row count, or a bound on it, known
     /// without reading (the `rows.upper_bound` of
-    /// [`view_statistics`](Self::view_statistics)). A file view whose reads
-    /// take a pending filter of code equalities by its masks first is never
-    /// the view as it is: its window evaluates the filter whatever the bound,
-    /// as below, and so finds whether it cuts.
+    /// [`view_statistics`](Self::view_statistics)). With no `offset`, a
+    /// served file view whose run's width is unknown reads the run's ids
+    /// first, kept on the view for the window below, and is the view as it
+    /// is when they fit. A file view whose reads take a pending filter of
+    /// code equalities by its masks first is never the view as it is: its
+    /// window evaluates the filter whatever the bound, as below, and so finds
+    /// whether it cuts.
     ///
     /// Any other window is a position range over base order: base rows in
     /// base row order, then the tail's. Its serve plan is dropped, so a
@@ -242,6 +245,21 @@ impl VortexRdfStore {
         if self.window_cannot_cut(offset, limit)? {
             debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
             return Ok(self.clone());
+        }
+        // A served file run whose width is unknown until its ids are read
+        // reads them into the view's shared cell, where any window below
+        // takes them from, and is the view as it is when they fit.
+        #[cfg(feature = "file-io")]
+        if offset == 0
+            && let Some(FileBase { serve: Some(_), .. }) = self.quads.file()
+            && let ViewSelection::Pending(lazy) = &self.quads.selection
+            && lazy.len_if_known().is_none()
+        {
+            lazy.materialized_async().await?;
+            if self.window_cannot_cut(offset, limit)? {
+                debug::step!(t, "[window] limit {limit} cuts no row of the served run");
+                return Ok(self.clone());
+            }
         }
         #[cfg(feature = "file-io")]
         if offset == 0

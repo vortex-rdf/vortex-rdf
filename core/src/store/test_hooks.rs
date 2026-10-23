@@ -171,6 +171,17 @@ impl VortexRdfStore {
         }
     }
 
+    /// The pending selection's id count as far as it is known without
+    /// reading (an in-memory run's or a located file run's width, or ids
+    /// already read): `Some(None)` for a file run whose ids are unread and
+    /// whose width is unknown, `None` for an exact selection.
+    pub(crate) fn debug_pending_len(&self) -> Option<Option<usize>> {
+        match &self.quads.selection {
+            ViewSelection::Pending(lazy) => Some(lazy.len_if_known()),
+            ViewSelection::Exact(_) => None,
+        }
+    }
+
     /// The append tail's physical rows, `None` when nothing has been
     /// appended.
     pub(crate) fn debug_tail_rows(&self) -> Option<&ArrayRef> {

@@ -112,7 +112,30 @@ pub(crate) async fn scan_index_row_ids(
     };
     let filter = child.bind(&filter)?;
 
+    #[cfg(test)]
+    rid_scan_hooks::note();
     read_scanned_row_ids(child.scan(&[COL_RID])?.with_filter(filter)).await
+}
+
+/// Test hook: how many rid-only scans of an index child under its
+/// equalities ([`scan_index_row_ids`]) this thread ran.
+#[cfg(test)]
+pub(crate) mod rid_scan_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SCANS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one rid-only child scan.
+    pub(super) fn note() {
+        SCANS.set(SCANS.get() + 1);
+    }
+
+    /// The rid-only child scans run on this thread so far.
+    pub(crate) fn scans() -> usize {
+        SCANS.get()
+    }
 }
 
 /// The row ids of a *located* index-child run (the rows a resolver bounded
