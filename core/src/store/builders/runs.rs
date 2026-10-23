@@ -50,8 +50,9 @@ fn le_u32(bytes: &[u8]) -> u32 {
 
 /// Four `u32`s, little-endian, into the first 16 bytes of `out`.
 fn write_u32s(values: &[u32; 4], out: &mut [u8]) {
-    for (value, slot) in values.iter().zip(out.chunks_exact_mut(4)) {
-        slot.copy_from_slice(&value.to_le_bytes());
+    let (slots, _) = out.as_chunks_mut::<4>();
+    for (value, slot) in values.iter().zip(slots) {
+        *slot = value.to_le_bytes();
     }
 }
 
