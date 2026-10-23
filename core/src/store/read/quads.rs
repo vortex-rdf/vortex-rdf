@@ -194,7 +194,8 @@ impl VortexRdfStore {
     /// ([`ExactRead`](file_reads::ExactRead)) are one chunk, and the
     /// restricted scan streams split by split. A `one_shot` read of a pending
     /// filter the reads by id leave to the scan reads the filter's masks
-    /// first, then the rows they keep ([`masked_chunks`](Self::masked_chunks)).
+    /// first, then the rows they keep ([`masked_chunks`](Self::masked_chunks)),
+    /// and reads a window's kept masks the same way.
     #[cfg(feature = "file-io")]
     async fn file_chunks<T: ChunkDecode>(
         &self,
@@ -251,9 +252,11 @@ impl VortexRdfStore {
             };
             return self.scan_chunks(scan, decoder, tail);
         }
+        if one_shot && let Some(masks) = &base.masks {
+            return self.masked_chunks(file, masks, tail).await;
+        }
         let primary = self.layout.strategy().primary_column_names();
-        let (selection, by_id) = self.file_read_scope(base, primary).await?;
-        let filter = base.filter.as_ref();
+        let (selection, by_id, filter) = self.file_read_scope(base, primary).await?;
         let read = Self::exact_read(file, by_id, filter, &selection, deleted.as_ref())?;
         if one_shot
             && let Some(masks) =

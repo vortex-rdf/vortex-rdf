@@ -31,6 +31,8 @@ use crate::store::indexes::FileServePlan;
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
+use crate::store::scan::file_filter::SplitMasks;
+#[cfg(feature = "file-io")]
 use vortex_array::expr::Expression;
 
 /// A view's base rows: the base the store was constructed from, never
@@ -104,6 +106,15 @@ pub(crate) struct FileBase {
     /// exactly the plan's run: any narrowing drops it, materializing a
     /// pending selection first (see [`ViewSelection`]).
     pub(crate) serve: Option<FileServePlan>,
+    /// The pending filter's masks over the selection, one per evaluated
+    /// split in file order, once a window has evaluated them all and found it
+    /// cuts no row: the view's one-shot reads take its rows from them, its
+    /// other reads their ids, and its counts their bits, so the filter is
+    /// never evaluated again. They are kept only while smaller than the ids
+    /// of the rows they keep, and they are read off their bits, so nothing
+    /// caches beside them. Every view derived from this one starts without
+    /// them.
+    pub(crate) masks: Option<Arc<SplitMasks>>,
 }
 
 impl QuadsSource {
@@ -197,6 +208,40 @@ impl QuadsSource {
             #[cfg(feature = "file-io")]
             Backend::File(FileBase { file, .. }) => file.quads_sorted(),
         }
+    }
+
+    /// The live base rows a window's kept filter masks hold
+    /// ([`FileBase::masks`]), counted off the masks; `None` without them, and
+    /// in memory.
+    pub(crate) fn evaluated_len(&self) -> Option<usize> {
+        #[cfg(feature = "file-io")]
+        if let Backend::File(FileBase {
+            masks: Some(masks), ..
+        }) = &self.backend
+        {
+            return Some(masks.iter().map(|(mask, _)| mask.true_count()).sum());
+        }
+        None
+    }
+
+    /// This file source with `masks`, its pending filter evaluated over its
+    /// exact selection, kept for its reads ([`FileBase::masks`]).
+    #[cfg(feature = "file-io")]
+    pub(crate) fn with_evaluated_masks(&self, masks: Arc<SplitMasks>) -> Self {
+        debug_assert!(self.has_filter(), "masks are a pending filter's");
+        debug_assert!(
+            self.served_component().is_none(),
+            "a served view reads through its plan"
+        );
+        debug_assert!(
+            matches!(self.selection, ViewSelection::Exact(_)),
+            "masks cover an exact selection"
+        );
+        let mut source = self.clone();
+        if let Backend::File(base) = &mut source.backend {
+            base.masks = Some(masks);
+        }
+        source
     }
 
     /// Whether a pushed-down file filter is still to be evaluated; never for
@@ -309,6 +354,7 @@ impl QuadsSource {
                 file: Arc::clone(&base.file),
                 filter,
                 serve,
+                masks: None,
             }),
         }
     }
@@ -326,12 +372,16 @@ impl QuadsSource {
         }
     }
 
-    /// This source with its pushed-down filter dropped (a no-op in memory).
+    /// This source with its pushed-down filter dropped, and the filter's
+    /// masks with it (a no-op in memory).
     pub(crate) fn without_filter(mut self) -> Self {
         match &mut self.backend {
             Backend::InMemory(_) => {}
             #[cfg(feature = "file-io")]
-            Backend::File(base) => base.filter = None,
+            Backend::File(base) => {
+                base.filter = None;
+                base.masks = None;
+            }
         }
         self
     }

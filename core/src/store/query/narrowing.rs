@@ -13,9 +13,12 @@
 //! pass over the column streamed for the view's rows. A window that cannot
 //! cut a row is the view as it is; any other over a file view with a pending
 //! filter evaluates its splits in file order and stops at the first split
-//! that fills it.
+//! that fills it, and one that finds it cuts no row keeps the view, the
+//! filter's evaluation with it.
 
 use std::ops::Range;
+#[cfg(feature = "file-io")]
+use std::sync::Arc;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -224,7 +227,11 @@ impl VortexRdfStore {
     /// pending file filter is resolved only as far as the window reaches
     /// (its splits evaluated in file order, stopping at the first that fills
     /// the window), so `LIMIT` over a filtered scan costs the matching prefix
-    /// of the file.
+    /// of the file. A window with no `offset` whose filter matches fewer rows
+    /// than its limit finds that it cuts no base row: the view keeps its rows,
+    /// known exactly from then on, its reads and counts taking them from the
+    /// filter's evaluation, which is never run again, and its tail is
+    /// windowed to the rest of the limit.
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
         #[cfg(test)]
         narrow_hooks::note_window();
@@ -232,6 +239,13 @@ impl VortexRdfStore {
         if self.window_cannot_cut(offset, limit)? {
             debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
             return Ok(self.clone());
+        }
+        #[cfg(feature = "file-io")]
+        if offset == 0
+            && let Some(windowed) = self.filter_window(limit).await?
+        {
+            debug::step!(t, "[window] limit {limit} over the filter's masks");
+            return Ok(windowed);
         }
         // A located run held pending for this window reads only the window's
         // own rows, and its width is the base's live size; any other view
@@ -273,16 +287,20 @@ impl VortexRdfStore {
     /// selected rows first (a pending run's width, or every base row while
     /// that is unknown), which decodes nothing, then, only under tombstones
     /// and when those do not fit, their live rows where known without I/O,
-    /// which in memory decodes a pending run's ids. A view pending without a
-    /// serve plan never qualifies: its window reads exactly the rows it takes
-    /// into exact ids, the rows and order of the plain match, and leaves the
-    /// ids it shares with other views unread.
+    /// which in memory decodes a pending run's ids. A view whose window kept
+    /// its filter's masks knows the base's live rows exactly from them. A
+    /// view pending without a serve plan never qualifies: its window reads
+    /// exactly the rows it takes into exact ids, the rows and order of the
+    /// plain match, and leaves the ids it shares with other views unread.
     pub(in crate::store) fn window_cannot_cut(&self, offset: usize, limit: usize) -> Result<bool> {
         if offset != 0 || self.quads.is_pending_without_plan() {
             return Ok(false);
         }
         let tail = self.tail_size();
         let fits = |base: usize| base.saturating_add(tail) <= limit;
+        if let Some(live) = self.quads.evaluated_len() {
+            return Ok(fits(live));
+        }
         let base_len = self.quads.base_len();
         let selected = self
             .quads
@@ -293,6 +311,52 @@ impl VortexRdfStore {
             return Ok(true);
         }
         Ok(self.quads.deleted.is_some() && self.quads.live_len_if_known()?.is_some_and(fits))
+    }
+
+    /// `window(0, limit)` of a file view with a pending filter, an exact
+    /// selection and no serve plan: the filter's masks evaluated in file
+    /// order up to the split that brings the matches to `limit`
+    /// ([`file_filter::split_masks_until`]). `None` for any other view.
+    ///
+    /// With `limit` matches the window is their ids, in base order, with no
+    /// filter and the tail cut off. With fewer it cuts no base row: the view
+    /// keeps its filter with the masks kept for its reads where they are
+    /// smaller than the matches' ids ([`masks_smaller_than_ids`]), else holds
+    /// those ids with no filter, and its tail is windowed to the rest of the
+    /// limit.
+    #[cfg(feature = "file-io")]
+    async fn filter_window(&self, limit: usize) -> Result<Option<Self>> {
+        let (
+            Some(FileBase { serve: None, .. }),
+            ViewSelection::Exact(selection),
+            Some((file, filter)),
+        ) = (
+            self.quads.file(),
+            &self.quads.selection,
+            self.quads.pending_filter(),
+        )
+        else {
+            return Ok(None);
+        };
+        let deleted = self.quads.deleted.as_ref();
+        let masks = file_filter::split_masks_until(file, filter, selection, deleted, limit).await?;
+        let found: usize = masks.iter().map(|(mask, _)| mask.true_count()).sum();
+        let (quads, tail_limit) = if found < limit && masks_smaller_than_ids(&masks, found) {
+            (
+                self.quads.with_evaluated_masks(Arc::new(masks)),
+                limit - found,
+            )
+        } else {
+            let taken = found.min(limit);
+            let ids = Buffer::from(file_filter::first_ids(&masks, taken));
+            let quads = self
+                .quads
+                .with_selection(ViewSelection::Exact(RowSelection::from_ids(ids)))
+                .without_filter();
+            (quads, limit - taken)
+        };
+        let tail = self.tail.as_ref().map(|tail| tail.window(0, tail_limit));
+        Ok(Some(self.derived(quads, tail)))
     }
 
     /// The base's window over its exact `selection`, and the base's live row
@@ -583,6 +647,20 @@ impl VortexRdfStore {
             Keep::Set(_) => None,
         })
     }
+}
+
+/// Whether split masks that keep `found` rows take less memory than those
+/// rows' ids: a mask keeping some but not all of its range's rows holds a bit
+/// a row of that range, a mask keeping all or none of them holds nothing,
+/// and an id is 64 bits.
+#[cfg(feature = "file-io")]
+fn masks_smaller_than_ids(masks: &[(vortex_mask::Mask, Range<u64>)], found: usize) -> bool {
+    let bits: u64 = masks
+        .iter()
+        .filter(|(mask, _)| mask.values().is_some())
+        .map(|(_, range)| range.end - range.start)
+        .sum();
+    (found as u64).saturating_mul(64) >= bits
 }
 
 /// The positions of `codes` the keep admits, as a mask over them.

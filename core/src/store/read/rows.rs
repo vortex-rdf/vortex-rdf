@@ -235,11 +235,17 @@ impl VortexRdfStore {
         // point-sized read by id fills the code buffers straight from the
         // chunk probes, with the same rows and filter checks, and a pending
         // filter the reads by id leave to the scan is evaluated to its masks
-        // first, the rows they keep read after.
+        // first, the rows they keep read after. A window's kept masks are
+        // read the same way, the filter not run again.
         #[cfg(feature = "file-io")]
         if let Backend::File(base) = &self.quads.backend {
-            let (selection, columns) = self.file_read_scope(base, &schema::PRIMARY_COLUMNS).await?;
-            let (file, filter) = (&base.file, base.filter.as_ref());
+            let file = &base.file;
+            if let Some(masks) = &base.masks {
+                let primary = self.layout.strategy().primary_column_names();
+                return Self::masked_codes(file, primary, masks).await.map(Some);
+            }
+            let (selection, columns, filter) =
+                self.file_read_scope(base, &schema::PRIMARY_COLUMNS).await?;
             let deleted = self.quads.deleted.as_ref();
             let read = Self::exact_read(file, columns, filter, &selection, deleted)?;
             if let Some(masks) = Self::masks_first(file, filter, &selection, deleted, &read).await?
@@ -319,8 +325,9 @@ impl VortexRdfStore {
             Backend::InMemory(memory) => Ok(BaseRead::Rows(self.in_memory_base_rows(memory)?)),
             #[cfg(feature = "file-io")]
             Backend::File(base) => {
-                let (selection, by_id_columns) = self.file_read_scope(base, columns).await?;
-                let (file, filter) = (&base.file, base.filter.as_ref());
+                let (selection, by_id_columns, filter) =
+                    self.file_read_scope(base, columns).await?;
+                let file = &base.file;
                 let deleted = self.quads.deleted.as_ref();
                 let read = Self::exact_read(file, by_id_columns, filter, &selection, deleted)?;
                 Self::file_base_read(
@@ -363,25 +370,37 @@ impl VortexRdfStore {
 
     /// What a read of this file view's `base` rows covers: its exact
     /// selection, a served view's pending one materialized here (the plan
-    /// orders the rows by the index, and the read needs base order), and the
+    /// orders the rows by the index, and the read needs base order); the
     /// columns a read by id reads, every primary column while a filter is
-    /// pending (the read checks it on the columns it reads), else `columns`.
+    /// pending (the read checks it on the columns it reads), else `columns`;
+    /// and the filter still to run. A view whose window kept its filter's
+    /// masks ([`FileBase::masks`]) covers the ids the masks keep, with no
+    /// filter to run.
     #[cfg(feature = "file-io")]
     pub(in crate::store) async fn file_read_scope<'a>(
         &'a self,
-        base: &FileBase,
+        base: &'a FileBase,
         columns: &'a [&'static str],
-    ) -> Result<(Cow<'a, RowSelection>, &'a [&'static str])> {
+    ) -> Result<(
+        Cow<'a, RowSelection>,
+        &'a [&'static str],
+        Option<&'a Expression>,
+    )> {
+        if let Some(masks) = &base.masks {
+            let ids = Buffer::from(file_filter::first_ids(masks, usize::MAX));
+            return Ok((Cow::Owned(RowSelection::from_ids(ids)), columns, None));
+        }
         let selection = match base.serve {
             // Runs the deferred index-child read once, cached on the view.
             Some(_) => Cow::Owned(self.quads.selection.materialized_async().await?),
             None => Cow::Borrowed(self.quads.selection.expect_exact()),
         };
-        let by_id_columns = match base.filter {
+        let filter = base.filter.as_ref();
+        let by_id_columns = match filter {
             Some(_) => self.layout.strategy().primary_column_names(),
             None => columns,
         };
-        Ok((selection, by_id_columns))
+        Ok((selection, by_id_columns, filter))
     }
 
     /// An in-memory view's live base rows in base row order, every primary

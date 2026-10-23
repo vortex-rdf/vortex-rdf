@@ -241,8 +241,8 @@ impl VortexRdfStore {
         columns: &[&'static str],
         batch_rows: usize,
     ) -> Result<RowChunkStream> {
-        let (selection, by_id_columns) = self.file_read_scope(base, columns).await?;
-        let (file, filter) = (&base.file, base.filter.as_ref());
+        let (selection, by_id_columns, filter) = self.file_read_scope(base, columns).await?;
+        let file = &base.file;
         let deleted = self.quads.deleted.as_ref();
         let ids = match Self::exact_read(file, by_id_columns, filter, &selection, deleted)? {
             ExactRead::Take(ids) => ids,

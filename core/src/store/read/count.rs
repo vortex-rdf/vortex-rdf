@@ -17,12 +17,16 @@ impl VortexRdfStore {
     }
 
     /// [`size`](Self::size) of the base alone: the live rows the selection
-    /// and a pending file filter cover. With no filter pending, a count known
+    /// and a pending file filter cover. The masks a window kept of its filter
+    /// answer when the view holds them; with no filter pending, a count known
     /// without reading ([`live_len_if_known`](QuadsSource::live_len_if_known))
-    /// answers. Otherwise the selection materializes (a deferred resolution's
+    /// does. Otherwise the selection materializes (a deferred resolution's
     /// ids, computed once and cached on the view) and a pending filter is
     /// evaluated over its live rows.
     pub(crate) async fn base_size(&self) -> Result<usize> {
+        if let Some(live) = self.quads.evaluated_len() {
+            return Ok(live);
+        }
         if !self.quads.has_filter()
             && let Some(live) = self.quads.live_len_if_known()?
         {
@@ -63,8 +67,11 @@ impl VortexRdfStore {
     }
 
     /// [`base_size`](Self::base_size), a pending file filter stopping at
-    /// `limit` matches.
+    /// `limit` matches; a window's kept masks answer first.
     async fn base_size_capped(&self, limit: usize) -> Result<usize> {
+        if let Some(live) = self.quads.evaluated_len() {
+            return Ok(live.min(limit));
+        }
         #[cfg(feature = "file-io")]
         if let Some((file, filter)) = self.quads.pending_filter() {
             // The selection resolves first (a served view's ids come from its

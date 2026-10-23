@@ -987,3 +987,56 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
         assert_eq!(masked_read_hooks::reads(), masked, "{read}: no masked read");
     }
 }
+
+/// The streams over a view whose window kept its filter's masks (`code_chunks`,
+/// `row_chunks`, `quads()` and the data source's scan) read the masks' ids:
+/// the plain view's rows, with no split of the filter evaluated after the
+/// window and no masked read, for a take's density and a projection's.
+#[tokio::test]
+async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
+    use crate::store::scan::file_filter::split_hooks;
+    use crate::store::scan::file_reads::masked_read_hooks;
+
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let dense = masks_probes()
+        .into_iter()
+        .filter(|(shape, ..)| matches!(*shape, "P" | "G"));
+    for (shape, probe, _) in dense {
+        let plain = store.run_probe(&probe).await.unwrap();
+        let (codes, _) = collect_code_chunks(&plain, &QuadColumn::ALL, 4_096).await;
+        let quads: Vec<Quad> = plain.quads().try_collect().await.unwrap();
+        let n = codes.len();
+        let kept = store
+            .run_probe(&probe.clone().window(0, Some(n + 1)))
+            .await
+            .unwrap();
+        assert_eq!(kept.debug_evaluated_len(), Some(n), "{shape}: kept masks");
+        let (evaluated, masked) = (split_hooks::evaluated(), masked_read_hooks::reads());
+        let (kept_codes, _) = collect_code_chunks(&kept, &QuadColumn::ALL, 4_096).await;
+        assert_eq!(kept_codes, codes, "{shape}: code_chunks");
+        assert_eq!(
+            struct_chunk_codes(&collect_row_chunks(&kept, 4_096).await),
+            codes,
+            "{shape}: row_chunks"
+        );
+        let kept_quads: Vec<Quad> = kept.quads().try_collect().await.unwrap();
+        assert_eq!(kept_quads, quads, "{shape}: quads()");
+        let source = kept.data_source().unwrap();
+        assert_eq!(
+            scan_codes(&source, ScanRequest::default()).await,
+            codes,
+            "{shape}: the data source's scan"
+        );
+        assert_eq!(
+            split_hooks::evaluated(),
+            evaluated,
+            "{shape}: no split evaluated"
+        );
+        assert_eq!(
+            masked_read_hooks::reads(),
+            masked,
+            "{shape}: no masked read"
+        );
+    }
+}

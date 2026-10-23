@@ -98,7 +98,10 @@ pub struct ViewStatistics {
     /// [`quads`](VortexRdfStore::quads) in its own order, if any.
     pub served_component: Option<&'static str>,
     /// Whether a pushed-down file filter is still to be evaluated: then the
-    /// row count is a bound, and every read runs the filter.
+    /// row count is a bound, and every read runs the filter. A filter a
+    /// window has evaluated over every row, finding it cuts none, is not
+    /// pending: its matches are counted exactly and read without running it
+    /// again.
     pub pending_filter: bool,
     /// Rows tombstoned in the base (never counted).
     pub tombstones: usize,
@@ -151,18 +154,27 @@ impl VortexRdfStore {
     /// one way it fails.
     pub fn view_statistics(&self) -> Result<ViewStatistics> {
         let tail_rows = self.tail_size();
-        let filtered = self.quads.has_filter();
+        // A filter whose masks a window kept is evaluated: the masks count
+        // the base's live rows, an explicit set of them.
+        let evaluated = self.quads.evaluated_len();
+        let filtered = self.quads.has_filter() && evaluated.is_none();
         let (selection, base_len) = (&self.quads.selection, self.quads.base_len());
         // The base's live rows when known without I/O; else at most the
         // selection's rows before tombstones (a pending run's width), or the
         // base's.
-        let live = self.quads.live_len_if_known()?;
+        let live = match evaluated {
+            Some(live) => Some(live),
+            None => self.quads.live_len_if_known()?,
+        };
         let bound = selection.len_if_known(None, base_len)?.unwrap_or(base_len);
         Ok(ViewStatistics {
             rows: row_count_hint(live, filtered, bound, tail_rows),
             sort_order: (self.quads.subject_sorted() && tail_rows == 0).then_some(SortOrder::Spog),
             code_bounds: self.code_bounds(),
-            selection: selection_kind(selection),
+            selection: match evaluated {
+                Some(_) => SelectionKind::Ids,
+                None => selection_kind(selection),
+            },
             served_component: self.quads.served_component(),
             pending_filter: filtered,
             tombstones: self.quads.deleted.as_ref().map_or(0, Mask::true_count),

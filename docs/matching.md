@@ -199,8 +199,8 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` matches on the
-[`Backend`](../core/src/store/view/mod.rs#L57) of the store's
-[`QuadsSource`](../core/src/store/view/mod.rs#L41) and hands that backend's
+[`Backend`](../core/src/store/view/mod.rs#L59) of the store's
+[`QuadsSource`](../core/src/store/view/mod.rs#L43) and hands that backend's
 base and the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
@@ -1185,6 +1185,19 @@ stopped at the first split that fills `offset + limit` rows — so `LIMIT`
 over a filtered scan costs the matching prefix of the file, not all of it.
 The loop's splits run inline up to 42 splits and are spawned above, as a row
 scan's are. The window's view carries exact ids and no filter.
+
+With no offset over such a view, an exact selection and no serve plan, the
+loop is the filter's split masks (`split_masks_until`), and the window looks
+at what it found. Enough matches are the window's first `limit` ids. Fewer
+mean it cuts no base row, which no bound could tell before reading: the view
+keeps its rows, its tail windowed to what the base left of the limit, and
+keeps the evaluation. Its filter's masks are kept when they take less memory
+than the matches' ids (a bit a row of each split a mask keeps some rows of,
+against 64 a match), else those ids with the filter dropped. Either way
+`view_statistics` reports the rows exactly and no filter pending, and no read
+or count runs the filter again: the one-shot reads take the rows from the
+kept masks as they read any filter's masks ([§12](#12-what-the-derived-view-costs-at-read-time)),
+and the streams read the ids the masks keep, one window of ids per pull.
 
 `size_capped(limit)` is `min(size, limit)` by the same loop
 (`count_matching_rows_capped`), and `exists()` is `size_capped(1) > 0` —

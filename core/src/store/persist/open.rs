@@ -310,6 +310,7 @@ impl VortexRdfStore {
                 file,
                 filter: None,
                 serve: None,
+                masks: None,
             })),
             tail: None,
         })

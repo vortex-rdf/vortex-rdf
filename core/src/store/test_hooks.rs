@@ -275,6 +275,12 @@ impl VortexRdfStore {
         self.quads.is_pending_without_plan()
     }
 
+    /// The live base rows the filter masks a window kept on this view hold
+    /// (see `FileBase::masks`); `None` on a view without them.
+    pub(crate) fn debug_evaluated_len(&self) -> Option<usize> {
+        self.quads.evaluated_len()
+    }
+
     /// An index component column's chunk-probe handle as `(row count, flat
     /// leaves)` — `None` off-file or when the column's shape declines the
     /// handle.

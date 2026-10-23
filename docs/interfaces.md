@@ -18,7 +18,7 @@ is the path such an engine takes.
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L103) on any view, registered with vortex's `VortexTable` |
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L152), [`index_components`](../core/src/store/read/metadata.rs#L226), [`partitions`](../core/src/store/read/metadata.rs#L261) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L155), [`index_components`](../core/src/store/read/metadata.rs#L238), [`partitions`](../core/src/store/read/metadata.rs#L273) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L243) (from [`dict_reader`](../core/src/store/mod.rs#L203)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L141), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L267) |
@@ -235,12 +235,12 @@ is the one way it fails.
 
 | Field | Meaning |
 |---|---|
-| `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
+| `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones; a filter a window has evaluated, finding it cuts no row, counts as none. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
 | `sort_order` | `Some(Spog)` when the base is globally sorted (every base this crate writes) and the view reads no tail row — the order `row_chunks`, `code_chunks` and the data source produce, whatever answered the match. A view that reads tail rows has none: they follow the base in append order. |
 | `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a pending file filter binds by equality. |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |
 | `served_component` | The index child that answered the match, if any (`index:posg`, …; `quads()` on such a view decodes in that child's order). |
-| `pending_filter` | Whether every read runs a pushed-down file filter. |
+| `pending_filter` | Whether every read runs a pushed-down file filter. A filter a window has evaluated over every row, finding it cuts none, is not pending: its matches are counted exactly and read without running it again, and the view's selection reads as `Ids`. |
 | `tombstones`, `tail_rows` | Rows tombstoned in the base (never counted) and live rows in the append tail (counted, read last). |
 | `file_backed`, `generation` | Where the base lives, and the data's identity ([§7](#7-snapshots-and-mutation)). |
 

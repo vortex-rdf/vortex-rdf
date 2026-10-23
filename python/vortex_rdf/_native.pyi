@@ -370,8 +370,10 @@ class VortexRdfStore:
         that fills it, while a `limit` that cannot cut a row (no `offset`, and
         at least the match's row count, or a bound on it, known without
         reading) returns the match as it is, in its own order (an
-        index-served match's rows in its index's). With a `cancel` token the
-        match races it (`CancelToken`)."""
+        index-served match's rows in its index's). A `limit` that a filtered
+        file match's rows turn out to fall short of returns the match as it
+        is too, read from the window's evaluation of the filter. With a
+        `cancel` token the match races it (`CancelToken`)."""
         ...
     def match_code_chunks(
         self,

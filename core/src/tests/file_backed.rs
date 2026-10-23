@@ -1180,3 +1180,225 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
         "the dropped count's splits never ran"
     );
 }
+
+// ─── A window that cuts no row keeps the filter's evaluation ─────────────
+
+/// A window over a filtered file view that finds fewer matches than its limit
+/// cuts no base row: it reads the plain rows and knows its size and
+/// statistics exactly, no filter left pending, without evaluating a split
+/// again. Under tombstones its counts are the live rows'; under a tail longer
+/// than the rest of the limit it reads the base's rows, then the tail's first
+/// rows up to the limit.
+#[tokio::test]
+async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
+    use crate::store::scan::file_filter::split_hooks;
+
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let tombstoned = masks_deleted(&store).await;
+    for (variant, store) in [("as written", &store), ("tombstoned", &tombstoned)] {
+        for (shape, probe, _) in masks_probes() {
+            let label = format!("{variant} {shape}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            let rows = row_list(&plain).await;
+            let n = rows.len();
+            let bound = plain.view_statistics().unwrap().rows.upper_bound;
+            assert!(n + 1 < bound, "{label}: {n} rows under a bound of {bound}");
+            let windowed = store
+                .run_probe(&probe.clone().window(0, Some(n + 1)))
+                .await
+                .unwrap();
+            let evaluated = split_hooks::evaluated();
+            let stats = windowed.view_statistics().unwrap();
+            assert!(!stats.pending_filter, "{label}: no filter pending");
+            assert_eq!(stats.rows, RowCountHint::exact(n), "{label}: exact rows");
+            assert_eq!(windowed.size().await.unwrap(), n, "{label}: size");
+            assert_eq!(
+                windowed.size_capped(n + 1).await.unwrap(),
+                n,
+                "{label}: capped"
+            );
+            assert_eq!(row_list(&windowed).await, rows, "{label}: the plain rows");
+            assert_eq!(
+                split_hooks::evaluated(),
+                evaluated,
+                "{label}: no split evaluated again"
+            );
+        }
+    }
+    let tailed = store.add_quads(masks_tail()).await.unwrap();
+    for (shape, probe, _) in masks_probes() {
+        let label = format!("tailed {shape}");
+        let quads = tailed
+            .run_probe(&probe)
+            .await
+            .unwrap()
+            .quads_vec()
+            .await
+            .unwrap();
+        let base = quads
+            .iter()
+            .take_while(|q| {
+                !q.subject
+                    .to_string()
+                    .starts_with("<http://example.org/tail")
+            })
+            .count();
+        assert!(quads.len() - base > 2, "{label}: a tail past the limit");
+        let limit = base + 2;
+        let windowed = tailed
+            .run_probe(&probe.clone().window(0, Some(limit)))
+            .await
+            .unwrap();
+        let stats = windowed.view_statistics().unwrap();
+        assert!(!stats.pending_filter, "{label}: no filter pending");
+        assert_eq!(
+            stats.rows,
+            RowCountHint::exact(limit),
+            "{label}: exact rows"
+        );
+        assert_eq!(windowed.size().await.unwrap(), limit, "{label}: size");
+        assert_eq!(
+            windowed.quads_vec().await.unwrap(),
+            quads[..limit],
+            "{label}: the base's rows, then the tail's first"
+        );
+    }
+}
+
+/// A window that cuts no row of a filtered file view keeps the filter's masks
+/// for its reads where they are smaller than the matches' ids (a bit a row of
+/// each split a mask keeps some rows of, against 64 a match), and the ids
+/// otherwise: the dense predicate and graph keep their masks, while the sparse
+/// object and predicate-object pair, spread over the splits, keep their ids
+/// and drop the filter. Either way the view knows its rows exactly and reads
+/// the plain read's rows in base order, with and without a tail.
+#[tokio::test]
+async fn test_window_keeps_masks_only_when_smaller_than_ids() {
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let tailed = store.add_quads(masks_tail()).await.unwrap();
+    for (variant, store) in [("plain", &store), ("tailed", &tailed)] {
+        for (shape, probe, _) in masks_probes() {
+            let label = format!("{variant} {shape}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            let want = read_rows(&plain).await;
+            let n = plain.size().await.unwrap();
+            let tail = plain.view_statistics().unwrap().tail_rows;
+            let windowed = store
+                .run_probe(&probe.clone().window(0, Some(n + 1)))
+                .await
+                .unwrap();
+            let dense = matches!(shape, "P" | "G");
+            assert_eq!(
+                windowed.debug_evaluated_len(),
+                dense.then_some(n - tail),
+                "{label}: masks kept only where smaller than the ids"
+            );
+            let stats = windowed.view_statistics().unwrap();
+            assert!(!stats.pending_filter, "{label}: no filter pending");
+            assert_eq!(stats.rows, RowCountHint::exact(n), "{label}: exact rows");
+            assert_eq!(read_rows(&windowed).await, want, "{label}: the plain rows");
+        }
+    }
+}
+
+/// The masks a window keeps belong to its view alone: every view derived from
+/// it (a located subject keep, an object keep, a chained match, windows that
+/// cut or skip, pieces, an owned copy) starts without them and answers what
+/// brute force over the view's rows answers. An owner's later delete leaves
+/// the view's own rows as they were, and the probe run again sees it.
+#[tokio::test]
+async fn test_kept_masks_never_outlive_a_derivation() {
+    use crate::store::Keep;
+    use std::num::NonZeroUsize;
+
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let dict = store.dict_reader().unwrap();
+    let o0 = dict.encode("\"o0\"").await.unwrap().unwrap();
+    let o5 = dict.encode("\"o5\"").await.unwrap().unwrap();
+    let o0_term = Term::Literal(Literal::new_simple_literal("o0"));
+    let dense = masks_probes()
+        .into_iter()
+        .filter(|(shape, ..)| matches!(*shape, "P" | "G"));
+    for (shape, probe, _) in dense {
+        let n = store.run_probe(&probe).await.unwrap().size().await.unwrap();
+        let windowed = probe.clone().window(0, Some(n + 1));
+        let view = store.run_probe(&windowed).await.unwrap();
+        assert_eq!(view.debug_evaluated_len(), Some(n), "{shape}: kept masks");
+        let rows = row_list(&view).await;
+        let quads = view.quads_vec().await.unwrap();
+        let brute = |admit: &dyn Fn(&[TermCode; 4]) -> bool| -> Vec<[TermCode; 4]> {
+            rows.iter().copied().filter(|row| admit(row)).collect()
+        };
+        let subjects = Keep::set(rows.iter().step_by(7).map(|row| row[0]));
+        let objects = Keep::set([o0, o5]);
+        let derived = [
+            (
+                "located subject keep",
+                view.keep(QuadColumn::S, &subjects).await.unwrap(),
+                brute(&|row| subjects.admits(row[0])),
+            ),
+            (
+                "object keep",
+                view.keep(QuadColumn::O, &objects).await.unwrap(),
+                brute(&|row| objects.admits(row[2])),
+            ),
+            (
+                "chained match",
+                view.match_pattern(None, None, Some(&o0_term), None)
+                    .await
+                    .unwrap(),
+                brute(&|row| row[2] == o0),
+            ),
+            (
+                "cutting window",
+                view.window(0, n / 2).await.unwrap(),
+                rows[..n / 2].to_vec(),
+            ),
+            (
+                "skipping window",
+                view.window(1, usize::MAX).await.unwrap(),
+                rows[1..].to_vec(),
+            ),
+        ];
+        for (tag, derived, want) in &derived {
+            let label = format!("{shape} {tag}");
+            assert!(!want.is_empty(), "{label}: rows to check");
+            assert_eq!(derived.debug_evaluated_len(), None, "{label}: no masks");
+            assert_eq!(row_list(derived).await, *want, "{label}: brute force");
+            assert_eq!(derived.size().await.unwrap(), want.len(), "{label}: size");
+        }
+        let pieces = view
+            .partitions(NonZeroUsize::new(3).unwrap())
+            .await
+            .unwrap();
+        assert!(pieces.len() > 1, "{shape}: pieces");
+        let mut pieced = Vec::new();
+        for piece in &pieces {
+            assert_eq!(piece.debug_evaluated_len(), None, "{shape}: a piece");
+            pieced.extend(row_list(piece).await);
+        }
+        assert_eq!(pieced, rows, "{shape}: the pieces' rows");
+        let owned = view.owned().await.unwrap();
+        assert_eq!(owned.debug_evaluated_len(), None, "{shape}: the owned copy");
+        assert_eq!(
+            owned.quads_vec().await.unwrap(),
+            quads,
+            "{shape}: owned quads"
+        );
+        // The store, the view's owner, deletes three of the view's rows.
+        let mut owner = store.clone();
+        for quad in &quads[..3] {
+            owner = owner.delete_quad(quad).await.unwrap();
+        }
+        assert_eq!(row_list(&view).await, rows, "{shape}: the view's own rows");
+        let again = owner.run_probe(&windowed).await.unwrap();
+        assert_eq!(
+            again.quads_vec().await.unwrap(),
+            quads[3..],
+            "{shape}: the probe after the delete"
+        );
+    }
+}
