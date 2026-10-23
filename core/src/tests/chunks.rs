@@ -988,21 +988,49 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
     }
 }
 
+/// The read hooks' counters on this thread: split masks evaluated, masked
+/// reads by kind, restricted scans built with a filter, row scans, and takes
+/// through the chunk probes.
+#[derive(Clone, Copy)]
+struct ReadCounters {
+    evaluated: usize,
+    masked: [usize; 3],
+    filtered_scans: usize,
+    scans: usize,
+    takes: usize,
+}
+
+impl ReadCounters {
+    fn now() -> Self {
+        use crate::store::read::rows::restricted_scan_hooks;
+        use crate::store::scan::file_filter::split_hooks;
+        use crate::store::scan::file_reads::{masked_read_hooks, scan_hooks, take_hooks};
+        Self {
+            evaluated: split_hooks::evaluated(),
+            masked: masked_read_hooks::reads(),
+            filtered_scans: restricted_scan_hooks::filtered(),
+            scans: scan_hooks::scans(),
+            takes: take_hooks::takes().0,
+        }
+    }
+}
+
 /// The streams over a view whose window kept its filter's masks (`code_chunks`,
-/// `row_chunks`, `quads()` and the data source's scan) read the masks' ids:
-/// the plain view's rows, with no split of the filter evaluated after the
-/// window and no masked read, for a take's density and a projection's.
+/// `row_chunks`, `quads()` and the data source's scan) read the masks' ids as
+/// exact ids with no filter: the plain view's rows, each reader evaluating no
+/// split of the filter, making no masked read and building no scan with the
+/// filter, for a take's density (the ids taken, no row scan) and a
+/// projection's.
 #[tokio::test]
 async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
-    use crate::store::scan::file_filter::split_hooks;
-    use crate::store::scan::file_reads::masked_read_hooks;
+    use crate::store::scan::file_reads::MaskedRead;
 
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let dense = masks_probes()
         .into_iter()
         .filter(|(shape, ..)| matches!(*shape, "P" | "G"));
-    for (shape, probe, _) in dense {
+    for (shape, probe, read) in dense {
         let plain = store.run_probe(&probe).await.unwrap();
         let (codes, _) = collect_code_chunks(&plain, &QuadColumn::ALL, 4_096).await;
         let quads: Vec<Quad> = plain.quads().try_collect().await.unwrap();
@@ -1012,31 +1040,46 @@ async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
             .await
             .unwrap();
         assert_eq!(kept.debug_evaluated_len(), Some(n), "{shape}: kept masks");
-        let (evaluated, masked) = (split_hooks::evaluated(), masked_read_hooks::reads());
+        // What a reader did since `before`.
+        let check = |reader: &str, before: ReadCounters| {
+            let label = format!("{shape} {reader}");
+            let after = ReadCounters::now();
+            assert_eq!(
+                after.evaluated, before.evaluated,
+                "{label}: no split evaluated"
+            );
+            assert_eq!(after.masked, before.masked, "{label}: no masked read");
+            assert_eq!(
+                after.filtered_scans, before.filtered_scans,
+                "{label}: no scan with the filter"
+            );
+            if read == MaskedRead::Take {
+                assert_eq!(after.scans, before.scans, "{label}: no row scan");
+                assert!(after.takes > before.takes, "{label}: the ids taken");
+            }
+        };
+        let before = ReadCounters::now();
         let (kept_codes, _) = collect_code_chunks(&kept, &QuadColumn::ALL, 4_096).await;
         assert_eq!(kept_codes, codes, "{shape}: code_chunks");
+        check("code_chunks", before);
+        let before = ReadCounters::now();
         assert_eq!(
             struct_chunk_codes(&collect_row_chunks(&kept, 4_096).await),
             codes,
             "{shape}: row_chunks"
         );
+        check("row_chunks", before);
+        let before = ReadCounters::now();
         let kept_quads: Vec<Quad> = kept.quads().try_collect().await.unwrap();
         assert_eq!(kept_quads, quads, "{shape}: quads()");
+        check("quads()", before);
+        let before = ReadCounters::now();
         let source = kept.data_source().unwrap();
         assert_eq!(
             scan_codes(&source, ScanRequest::default()).await,
             codes,
             "{shape}: the data source's scan"
         );
-        assert_eq!(
-            split_hooks::evaluated(),
-            evaluated,
-            "{shape}: no split evaluated"
-        );
-        assert_eq!(
-            masked_read_hooks::reads(),
-            masked,
-            "{shape}: no masked read"
-        );
+        check("data_source", before);
     }
 }

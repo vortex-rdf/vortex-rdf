@@ -557,6 +557,8 @@ impl VortexRdfStore {
             &scope,
         )?);
         if let Some(f) = filter {
+            #[cfg(test)]
+            restricted_scan_hooks::note_filtered();
             scan = scan.with_filter(memo.bind(file_reads::QUAD_SCOPE, f, &scope)?);
         }
         Ok(selection.restrict_scan(scan, deleted))
@@ -619,5 +621,27 @@ pub(crate) mod column_hooks {
     /// The gathers on this thread so far: `(of all four columns, of one)`.
     pub(crate) fn gathers() -> (usize, usize) {
         (FOUR.with(Cell::get), ONE.with(Cell::get))
+    }
+}
+
+/// Test hook: how many restricted file scans this thread built with a filter
+/// pushed down (`restricted_file_scan`), each evaluating that filter split by
+/// split as it is read.
+#[cfg(all(test, feature = "file-io"))]
+pub(crate) mod restricted_scan_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FILTERED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one restricted scan built with a filter.
+    pub(super) fn note_filtered() {
+        FILTERED.set(FILTERED.get() + 1);
+    }
+
+    /// The restricted scans built with a filter on this thread so far.
+    pub(crate) fn filtered() -> usize {
+        FILTERED.get()
     }
 }
