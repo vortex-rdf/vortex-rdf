@@ -1210,14 +1210,17 @@ keeps the evaluation. Its filter's masks are kept when the filter is code
 equalities over columns with chunk probes, the filter `ExactRead::Masks`
 reads, and the masks take less memory than the matches' ids (a bit a row of
 each split a mask keeps some rows of, against 64 a match); otherwise those
-ids are kept, with the filter dropped. Either way
-`view_statistics` reports the rows exactly and no filter pending, and no read
-or count runs the filter again: the one-shot reads take the rows from the
-kept masks as they read any filter's masks ([§12](#12-what-the-derived-view-costs-at-read-time)),
-and the streams read the ids the masks keep as `ExactRead` reads exact ids:
-a point-sized set, or one of at most 16 ids a split, at once; a set at a
-take's density one window of ids per pull; anything denser by a scan of
-those ids.
+ids are kept, with the filter dropped. Either way `view_statistics` reports
+the rows exactly and no filter pending, and no read or count runs the filter
+again. With the masks kept, the one-shot reads take the rows from them as
+they read any filter's masks
+([§12](#12-what-the-derived-view-costs-at-read-time)) and the streams read
+the ids the masks keep; with the ids kept, every read reads those. Ids are
+read as `ExactRead` reads exact ids: a point-sized set, or one of at most 16
+ids a split, at once; a set at a take's density by takes, one window of ids
+per pull for `code_chunks`, `row_chunks` and the data source, the whole set
+as one chunk for `quads()` and `shared_quad_chunks`; anything denser by a
+scan of those ids.
 
 `size_capped(limit)` is `min(size, limit)` by the same loop
 (`count_matching_rows_capped`), and `exists()` is `size_capped(1) > 0` —

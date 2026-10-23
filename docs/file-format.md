@@ -497,14 +497,20 @@ is first offered to the reads by id: point reads through the chunk probes, or
 takes from their leaves for sparse ids
 ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
 A row scan — the reads that
-materialize a view's rows: `code_columns_gathered`, serialization and the
-`from_file_in_memory` load, a compaction's gather — filters and decodes per
-split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L67)
+materialize a view's rows: serialization and the `from_file_in_memory` load, a
+compaction's gather, and the one-shot reads (`code_columns_gathered`,
+`quads_vec`, `shared_quads_vec`) the reads by id decline — filters and decodes
+per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L67)
 (42) splits runs inline, a larger one is spawned across the runtime's workers.
-Without a Tokio runtime these scans run inline. Streaming reads (`quads()` and
-its twins) decode inside the per-split tasks Vortex's scan stream spawns; under
-a file-backed dictionary the decode awaits the dictionary's own reads, so it
-runs at the stream's consumer instead.
+Without a Tokio runtime these scans run inline. A one-shot read under a
+pending filter of code equalities over columns with chunk probes evaluates
+the filter's masks first instead, split by split under the same rule, then
+reads the rows they keep point by point, by a take, or by projecting each
+split at its mask
+([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
+Streaming reads (`quads()` and its twins) decode inside the per-split tasks
+Vortex's scan stream spawns; under a file-backed dictionary the decode awaits
+the dictionary's own reads, so it runs at the stream's consumer instead.
 
 **Platforms and limits.** Mapping works on Linux, macOS and Windows. A store
 file is read in place while open: truncating or rewriting it in place is
