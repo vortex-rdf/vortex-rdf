@@ -968,7 +968,9 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
 /// into the view's shared cell: under a limit they fit (the match's rows, or
 /// one more, short of the base's) it is the served view as it is, the plain
 /// match's rows in the index's order, while one row short it cuts in base
-/// order, taking the ids from the cell. `run_probe` takes the same routes.
+/// order, taking the ids from the cell. Under tombstones the ids read are the
+/// run's width, and its live rows are what fits the limit. `run_probe` takes
+/// the same routes.
 #[tokio::test]
 async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
     use crate::store::IdsNeed;
@@ -976,69 +978,87 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let probe = Probe::new(None, Some(p1.clone()), None, None);
+    let matching: Vec<Quad> = fixture_quads()
+        .into_iter()
+        .filter(|quad| quad.predicate == p1)
+        .collect();
+    // Five of the run's rows, spread over it.
+    let doomed: Vec<Quad> = matching.iter().step_by(120).cloned().collect();
+    assert_eq!(doomed.len(), 5);
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let (_dir, path) =
             write_store_file(fixture_quads(), layout, vec![IndexType::SecondaryByCopy]).await;
-        let store = VortexRdfStore::from_file(&path).await.unwrap();
-        let plain = store.run_probe(&probe).await.unwrap();
-        assert_eq!(served_component(&plain), Some("index:posg"), "{layout:?}");
-        assert_eq!(plain.debug_serve_row_range(), None, "{layout:?}: unlocated");
-        assert_eq!(plain.debug_pending_len(), Some(None), "{layout:?}: unread");
-        let rows = plain.quads_vec().await.unwrap();
-        let n = rows.len();
-        assert!(
-            n + 1 < store.size().await.unwrap(),
-            "{layout:?}: a base to cut"
-        );
-        // The plain match's rows in base order: the store's own, in its order.
-        let matched: std::collections::HashSet<&Quad> = rows.iter().collect();
-        let base: Vec<Quad> = store
-            .quads_vec()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|quad| matched.contains(quad))
-            .collect();
-        assert_ne!(
-            base, rows,
-            "{layout:?}: the index's order is not base order"
-        );
-        for (limit, cuts) in [(n - 1, true), (n, false), (n + 1, false)] {
-            let label = format!("{layout:?} limit {limit}");
-            let view = store
-                .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
-                .await
-                .unwrap();
-            assert_eq!(view.debug_pending_len(), Some(None), "{label}: unread");
-            let scans = rid_scan_hooks::scans();
-            let windowed = view.window(0, limit).await.unwrap();
-            assert_eq!(rid_scan_hooks::scans() - scans, 1, "{label}: one id read");
-            assert_eq!(
-                view.debug_pending_len(),
-                Some(Some(n)),
-                "{label}: the ids in the shared cell"
-            );
-            let (plan, want) = if cuts {
-                (None, &base[..limit])
+        let mut tombstoned = VortexRdfStore::from_file(&path).await.unwrap();
+        for quad in &doomed {
+            tombstoned = tombstoned.delete_quad(quad).await.unwrap();
+        }
+        let written = VortexRdfStore::from_file(&path).await.unwrap();
+        for (variant, store) in [("as written", written), ("tombstoned", tombstoned)] {
+            let label = format!("{layout:?} {variant}");
+            let plain = store.run_probe(&probe).await.unwrap();
+            assert_eq!(served_component(&plain), Some("index:posg"), "{label}");
+            assert_eq!(plain.debug_serve_row_range(), None, "{label}: unlocated");
+            assert_eq!(plain.debug_pending_len(), Some(None), "{label}: unread");
+            let rows = plain.quads_vec().await.unwrap();
+            let n = rows.len();
+            let deleted = if variant == "tombstoned" {
+                doomed.len()
             } else {
-                (Some("index:posg"), &rows[..])
+                0
             };
-            assert_eq!(served_component(&windowed), plan, "{label}: the plan");
-            assert_eq!(
-                windowed.quads_vec().await.unwrap(),
-                want,
-                "{label}: the rows"
+            assert_eq!(n, matching.len() - deleted, "{label}: the live rows");
+            assert!(
+                n + 1 < store.size().await.unwrap(),
+                "{label}: a base to cut"
             );
-            let probed = store
-                .run_probe(&probe.clone().window(0, Some(limit)))
+            // The plain match's rows in base order: the store's own, in its
+            // order.
+            let matched: std::collections::HashSet<&Quad> = rows.iter().collect();
+            let base: Vec<Quad> = store
+                .quads_vec()
                 .await
-                .unwrap();
-            assert_eq!(served_component(&probed), plan, "{label}: run_probe's plan");
-            assert_eq!(
-                probed.quads_vec().await.unwrap(),
-                want,
-                "{label}: run_probe's rows"
-            );
+                .unwrap()
+                .into_iter()
+                .filter(|quad| matched.contains(quad))
+                .collect();
+            assert_ne!(base, rows, "{label}: the index's order is not base order");
+            for (limit, cuts) in [(n - 1, true), (n, false), (n + 1, false)] {
+                let label = format!("{label} limit {limit}");
+                let view = store
+                    .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+                    .await
+                    .unwrap();
+                assert_eq!(view.debug_pending_len(), Some(None), "{label}: unread");
+                let scans = rid_scan_hooks::scans();
+                let windowed = view.window(0, limit).await.unwrap();
+                assert_eq!(rid_scan_hooks::scans() - scans, 1, "{label}: one id read");
+                assert_eq!(
+                    view.debug_pending_len(),
+                    Some(Some(matching.len())),
+                    "{label}: the run's ids in the shared cell"
+                );
+                let (plan, want) = if cuts {
+                    (None, &base[..limit])
+                } else {
+                    (Some("index:posg"), &rows[..])
+                };
+                assert_eq!(served_component(&windowed), plan, "{label}: the plan");
+                assert_eq!(
+                    windowed.quads_vec().await.unwrap(),
+                    want,
+                    "{label}: the rows"
+                );
+                let probed = store
+                    .run_probe(&probe.clone().window(0, Some(limit)))
+                    .await
+                    .unwrap();
+                assert_eq!(served_component(&probed), plan, "{label}: run_probe's plan");
+                assert_eq!(
+                    probed.quads_vec().await.unwrap(),
+                    want,
+                    "{label}: run_probe's rows"
+                );
+            }
         }
     }
 }
