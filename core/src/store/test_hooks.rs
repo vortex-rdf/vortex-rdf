@@ -42,6 +42,11 @@ thread_local! {
     /// first term (see [`CodeBase`]); 0 outside a guard.
     static CODE_BASE: std::cell::Cell<TermCode> = const { std::cell::Cell::new(0) };
 
+    /// The most distinct terms an out-of-core build on this thread may hold
+    /// (see [`TermCap`]); the dictionary's `i32::MAX` outside a guard.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static TERM_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(i32::MAX as usize) };
+
     /// The row id the indexed builds on this thread give their first row
     /// (see [`RowIdBase`]); 0 outside a guard.
     static ROW_ID_BASE: std::cell::Cell<RowId> = const { std::cell::Cell::new(0) };
@@ -111,6 +116,37 @@ impl CodeBase {
 impl Drop for CodeBase {
     fn drop(&mut self) {
         CODE_BASE.with(|cell| cell.set(self.0));
+    }
+}
+
+/// The most distinct terms an out-of-core build on this thread may hold:
+/// `i32::MAX`, unless a [`TermCap`] guard is live. Read by the build's term
+/// interner at every new term.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn term_cap() -> usize {
+    TERM_CAP.with(std::cell::Cell::get)
+}
+
+/// While alive, every out-of-core build on this thread refuses its term past
+/// `cap` instead of past `i32::MAX`, so a few terms reach the refusal a
+/// dictionary of two billion terms would. Dropping the guard restores the cap
+/// it replaced. Thread-local like `GATHERS`, for the same reason.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) struct TermCap(usize);
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl TermCap {
+    /// Cap this thread's builds at `cap` distinct terms until the guard
+    /// drops.
+    pub(crate) fn set(cap: usize) -> Self {
+        TermCap(TERM_CAP.with(|cell| cell.replace(cap)))
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Drop for TermCap {
+    fn drop(&mut self) {
+        TERM_CAP.with(|cell| cell.set(self.0));
     }
 }
 

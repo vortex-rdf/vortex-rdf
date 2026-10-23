@@ -87,6 +87,8 @@ pub(crate) struct BuiltStream {
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod interner;
 pub(crate) mod sorted_in_memory;
 // No filesystem to spill to on wasm32-unknown-unknown; compiling the external
 // sort out also keeps rkyv and uuid out of the wasm artifact.
