@@ -341,10 +341,15 @@ fn child_table(component: &crate::store::indexes::IndexComponent) -> Vec<(String
 /// The out-of-core build, its runs spilled, emits the very children and rows
 /// the in-memory build does, under every layout and index set: the same
 /// children in the same order, every field equal row by row, and the same
-/// quads in the same order.
+/// quads in the same order. The quads cycle through the default graph and two
+/// named ones, so every key position of a copy child is exercised.
 #[tokio::test]
 async fn test_spilled_children_equal_in_memory_children() {
-    let mut quads = modular_quads(24, 3, 4);
+    let graph = |name: &str| {
+        GraphName::NamedNode(NamedNode::new(format!("http://example.org/{name}")).unwrap())
+    };
+    let graphs = [GraphName::DefaultGraph, graph("g1"), graph("g2")];
+    let mut quads = graph_modular_quads(24, 2, 3, 4, &graphs);
     quads.reverse();
     quads.extend(quads[..6].to_vec());
     for layout in LAYOUTS {
@@ -385,14 +390,15 @@ async fn test_spilled_children_equal_in_memory_children() {
     }
 }
 
-/// A string layout's spilled build gives back every spelling it was given:
-/// escapes, a language tag, a datatype, blank nodes, a named graph and the
-/// default graph.
+/// A string layout's spilled build stores every spelling it was given, byte
+/// for byte: escapes, a language tag, a datatype, blank nodes, a named graph
+/// and the default graph. The rows are read as the stored strings, with no
+/// parse that could hide another spelling of the same term, and in order.
 #[tokio::test]
 async fn test_spilled_string_layouts_decode_terms_verbatim() {
     use crate::common::terms::parse_quads_from_reader;
+    use crate::store::layouts::ResolvedLayout;
     use oxrdfio::RdfFormat;
-    use std::collections::BTreeSet;
 
     let text = concat!(
         "<http://e.org/s> <http://e.org/p> \"a\\\"b\\\\c\" .\n",
@@ -409,8 +415,13 @@ async fn test_spilled_string_layouts_decode_terms_verbatim() {
             .unwrap();
     assert_eq!(raws.len(), 6);
     let row = |q: &crate::store::RawQuad| (q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone());
-    let expected: BTreeSet<_> = raws.iter().map(row).collect();
-    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+    let mut sorted = raws.clone();
+    sorted.sort();
+    let expected: Vec<_> = sorted.iter().map(row).collect();
+    for (layout, resolved) in [
+        (LayoutStrategy::Default, ResolvedLayout::Default),
+        (LayoutStrategy::TypedObject, ResolvedLayout::TypedObject),
+    ] {
         let built = sorted_stream::build_array(
             Box::new(stream::iter(raws.clone().into_iter().map(Ok))),
             layout,
@@ -419,13 +430,11 @@ async fn test_spilled_string_layouts_decode_terms_verbatim() {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::from_built(built).unwrap();
-        let got: BTreeSet<_> = store
-            .quads_vec()
-            .await
+        let got: Vec<_> = resolved
+            .raw_quads(&built.array)
             .unwrap()
             .iter()
-            .map(|q| row(&crate::store::RawQuad::from_quad(q)))
+            .map(row)
             .collect();
         assert_eq!(got, expected, "{layout:?}");
     }
