@@ -240,21 +240,28 @@ impl VortexRdfStore {
     /// windowed to the rest of the limit.
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
         let t = debug::timer();
-        let WindowCheck::MayCut { base_live } = self.window_check(offset, limit)? else {
+        let WindowCheck::MayCut {
+            base_live,
+            masks_first,
+        } = self.window_check(offset, limit)?
+        else {
             debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
             return Ok(self.clone());
         };
-        self.window_cut(offset, limit, base_live).await
+        self.window_cut(offset, limit, base_live, masks_first).await
     }
 
     /// [`window`](Self::window) past its check ([`window_check`](Self::window_check)),
     /// which found the window may cut a row; `base_live` is the base's live
-    /// row count when the check counted it.
+    /// row count when the check counted it, and `masks_first` whether it
+    /// found the view's reads take a pending filter by the masks first.
+    #[cfg_attr(not(feature = "file-io"), allow(unused_variables))]
     pub(in crate::store) async fn window_cut(
         &self,
         offset: usize,
         limit: usize,
         base_live: Option<usize>,
+        masks_first: bool,
     ) -> Result<Self> {
         let t = debug::timer();
         // A served file run whose width is unknown until its ids are read
@@ -267,7 +274,7 @@ impl VortexRdfStore {
             && lazy.len_if_known().is_none()
         {
             lazy.materialized_async().await?;
-            let WindowCheck::MayCut { base_live } = self.window_check(offset, limit)? else {
+            let WindowCheck::MayCut { base_live, .. } = self.window_check(offset, limit)? else {
                 debug::step!(t, "[window] limit {limit} cuts no row of the served run");
                 return Ok(self.clone());
             };
@@ -279,7 +286,7 @@ impl VortexRdfStore {
         narrow_hooks::note_window();
         #[cfg(feature = "file-io")]
         if offset == 0
-            && let Some(windowed) = self.filter_window(limit).await?
+            && let Some(windowed) = self.filter_window(limit, masks_first).await?
         {
             debug::step!(t, "[window] limit {limit} over the filter's masks");
             return Ok(windowed);
@@ -347,26 +354,35 @@ impl VortexRdfStore {
         limit: usize,
     ) -> Result<WindowCheck> {
         if offset != 0 || self.quads.is_pending_without_plan() {
-            return Ok(WindowCheck::MayCut { base_live: None });
+            return Ok(WindowCheck::MayCut {
+                base_live: None,
+                masks_first: false,
+            });
         }
         #[cfg(feature = "file-io")]
         let tombstoned = self.quads.deleted.is_some();
         #[cfg(feature = "file-io")]
         if tombstoned && self.reads_masks_first()? {
-            return Ok(WindowCheck::MayCut { base_live: None });
+            return Ok(WindowCheck::MayCut {
+                base_live: None,
+                masks_first: true,
+            });
         }
         let tail = self.tail_size();
         let fits = |base: usize| base.saturating_add(tail) <= limit;
         let base = self.quads.base_rows(|selected| !fits(selected))?;
-        let may_cut = WindowCheck::MayCut {
-            base_live: base.live,
-        };
         if !fits(base.upper_bound()) {
-            return Ok(may_cut);
+            return Ok(WindowCheck::MayCut {
+                base_live: base.live,
+                masks_first: false,
+            });
         }
         #[cfg(feature = "file-io")]
         if !tombstoned && self.reads_masks_first()? {
-            return Ok(may_cut);
+            return Ok(WindowCheck::MayCut {
+                base_live: base.live,
+                masks_first: true,
+            });
         }
         Ok(WindowCheck::CannotCut)
     }
@@ -402,32 +418,31 @@ impl VortexRdfStore {
     ///
     /// With `limit` matches the window is their ids, in base order, with no
     /// filter and the tail cut off. With fewer it cuts no base row: the view
-    /// keeps its filter with the masks kept for its reads where the filter is
-    /// one the reads by id check ([`file_reads::point_readable`]) and the
-    /// masks are smaller than the matches' ids ([`masks_smaller_than_ids`]),
-    /// else holds those ids with no filter, and its tail is windowed to the
-    /// rest of the limit.
+    /// keeps its filter with the masks kept for its reads where the masks are
+    /// smaller than the matches' ids ([`masks_smaller_than_ids`]) and the
+    /// filter is one the reads by id check ([`file_reads::point_readable`],
+    /// known with `masks_first`: the window's check found the view's reads
+    /// take the filter by its masks first), else holds those ids with no
+    /// filter, and its tail is windowed to the rest of the limit.
     #[cfg(feature = "file-io")]
-    async fn filter_window(&self, limit: usize) -> Result<Option<Self>> {
-        let (
-            Some(FileBase { serve: None, .. }),
-            ViewSelection::Exact(selection),
-            Some((file, filter)),
-        ) = (
+    async fn filter_window(&self, limit: usize, masks_first: bool) -> Result<Option<Self>> {
+        let (Some(base), ViewSelection::Exact(selection), Some((file, filter))) = (
             self.quads.file(),
             &self.quads.selection,
             self.quads.pending_filter(),
-        )
-        else {
+        ) else {
             return Ok(None);
         };
+        if base.serve.is_some() {
+            return Ok(None);
+        }
         let deleted = self.quads.deleted.as_ref();
         let masks = file_filter::split_masks_until(file, filter, selection, deleted, limit).await?;
         let found: usize = masks.iter().map(|(mask, _)| mask.true_count()).sum();
         let primary = self.layout.strategy().primary_column_names();
         let keep_masks = found < limit
-            && file_reads::point_readable(file, primary, Some(filter))
-            && masks_smaller_than_ids(&masks, found);
+            && masks_smaller_than_ids(&masks, found)
+            && (masks_first || file_reads::point_readable(file, primary, Some(filter)));
         let (quads, tail_limit) = if keep_masks {
             (
                 self.quads.with_evaluated_masks(Arc::new(masks)),
@@ -436,11 +451,11 @@ impl VortexRdfStore {
         } else {
             let taken = found.min(limit);
             let ids = Buffer::from(file_filter::first_ids(&masks, taken));
-            let quads = self
-                .quads
-                .with_selection(ViewSelection::Exact(RowSelection::from_ids(ids)))
-                .without_filter();
-            (quads, limit - taken)
+            let selection = ViewSelection::Exact(RowSelection::from_ids(ids));
+            (
+                self.quads.file_with(base, None, selection, None),
+                limit - taken,
+            )
         };
         let tail = self.tail.as_ref().map(|tail| tail.window(0, tail_limit));
         Ok(Some(self.derived(quads, tail)))
@@ -784,8 +799,13 @@ pub(in crate::store) enum WindowCheck {
     CannotCut,
     /// The window may cut a row. `base_live` is the base's live row count
     /// when the check counted it, which the window takes instead of
-    /// counting again.
-    MayCut { base_live: Option<usize> },
+    /// counting again; `masks_first` is whether the check found the view's
+    /// reads take its pending filter by the masks first, which tells the
+    /// window the reads by id can check that filter.
+    MayCut {
+        base_live: Option<usize>,
+        masks_first: bool,
+    },
 }
 
 /// Test hook: how many of this thread's in-memory keeps were answered by

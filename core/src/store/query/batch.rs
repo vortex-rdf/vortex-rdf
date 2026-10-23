@@ -147,8 +147,12 @@ impl VortexRdfStore {
         let view = if windowed {
             match view.window_check(probe.offset, limit)? {
                 WindowCheck::CannotCut => view,
-                WindowCheck::MayCut { base_live } => {
-                    view.window_cut(probe.offset, limit, base_live).await?
+                WindowCheck::MayCut {
+                    base_live,
+                    masks_first,
+                } => {
+                    view.window_cut(probe.offset, limit, base_live, masks_first)
+                        .await?
                 }
             }
         } else {
