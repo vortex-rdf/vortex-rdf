@@ -202,8 +202,8 @@ impl LayoutStrategy {
     /// empty columns of the right dtypes.
     ///
     /// A `Serialization` error for `Dictionary`, whose encoding needs the
-    /// global [`TermDictionary`]: its chunks are built by
-    /// [`dictionary::build_chunk`] instead.
+    /// global [`TermDictionary`]: its chunks are built from codes by
+    /// [`dictionary::build_code_chunk`] instead.
     ///
     /// [`TermDictionary`]: dictionary::TermDictionary
     pub(crate) fn build_columns(self, quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {

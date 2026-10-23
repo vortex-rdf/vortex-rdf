@@ -17,8 +17,6 @@
 //! key, then row id; its row ids are offsets from the run's first, which a
 //! `u32` holds because a run holds at most `u32::MAX` entries numbered
 //! consecutively (one per quad, in row order).
-// Wired into the builder by the out-of-core build's ingest; removed then.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BinaryHeap;
 use std::fs::File;

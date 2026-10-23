@@ -8,8 +8,6 @@
 //! Terms are interned by the exact spelling given, so the input must be
 //! canonical (as a builder's is): equal ids are equal terms, and a quad's
 //! four ids name it.
-// Wired into the builder by the out-of-core build's ingest; removed then.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::cmp::Ordering;
 use std::hash::BuildHasher;

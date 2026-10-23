@@ -3,7 +3,7 @@
 //! and the sorted stamp a build leaves on its subject column.
 
 use super::*;
-use crate::store::builders::sorted_stream;
+use crate::store::builders::{BuildSizes, sorted_stream};
 
 /// The chunk-boundary harness: chunk_size 3 over the 10 given quads must
 /// split as [3, 3, 3, 1], whatever the `layout`. Hands back the collected
@@ -24,7 +24,7 @@ async fn run_chunk_boundary_builders(
             Box::new(quad_stream(quads.to_vec())),
             layout,
             vec![],
-            3,
+            BuildSizes::uniform(3),
             None,
         )
         .await,
@@ -133,7 +133,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
             Box::new(quad_stream(quads.clone())),
             layout,
             indexes.clone(),
-            3,
+            BuildSizes::uniform(3),
             None,
         )
         .await
@@ -162,7 +162,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
             Box::new(quad_stream(quads.clone())),
             layout,
             indexes.clone(),
-            3,
+            BuildSizes::uniform(3),
         )
         .await
         .expect("spilled array build");
@@ -207,7 +207,7 @@ async fn test_sorted_stream_empty_dataset() {
                 Box::new(quad_stream(vec![])),
                 layout,
                 indexes.clone(),
-                3,
+                BuildSizes::uniform(3),
             )
             .await
             .unwrap_or_else(|e| panic!("{layout:?}/{indexes:?}: {e}"));
@@ -298,7 +298,7 @@ async fn test_sorted_builders_stamp_is_sorted() {
         Box::new(quad_stream(quads)),
         LayoutStrategy::Default,
         vec![],
-        3,
+        BuildSizes::uniform(3),
     )
     .await
     .unwrap();
@@ -306,4 +306,246 @@ async fn test_sorted_builders_stamp_is_sorted() {
         crate::store::array::subject_sorted(&streamed.array),
         "sorted_stream: no IsSorted stamp on s"
     );
+}
+
+/// Every field of an index child as strings, by field name: terms as their
+/// N-Triples spelling, codes and row ids as numbers.
+fn child_table(component: &crate::store::indexes::IndexComponent) -> Vec<(String, Vec<String>)> {
+    use crate::store::array::{StrColReader, field_as};
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_array::arrays::struct_::StructArrayExt as _;
+    use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+
+    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+    let rows = component.rows().unwrap();
+    rows.names()
+        .iter()
+        .map(|name| {
+            let field = rows.unmasked_field_by_name(name.as_ref()).unwrap();
+            let values: Vec<String> =
+                if matches!(field.dtype(), vortex_array::dtype::DType::Utf8(_)) {
+                    let col: VarBinViewArray = field_as(rows, name.as_ref(), &mut ctx).unwrap();
+                    let reader = StrColReader::new(&col);
+                    (0..col.len())
+                        .map(|i| reader.str_at(i).unwrap().to_owned())
+                        .collect()
+                } else {
+                    let col: PrimitiveArray = field_as(rows, name.as_ref(), &mut ctx).unwrap();
+                    col.as_slice::<u64>().iter().map(u64::to_string).collect()
+                };
+            (name.to_string(), values)
+        })
+        .collect()
+}
+
+/// The out-of-core build, its runs spilled, emits the very children and rows
+/// the in-memory build does, under every layout and index set: the same
+/// children in the same order, every field equal row by row, and the same
+/// quads in the same order.
+#[tokio::test]
+async fn test_spilled_children_equal_in_memory_children() {
+    let mut quads = modular_quads(24, 3, 4);
+    quads.reverse();
+    quads.extend(quads[..6].to_vec());
+    for layout in LAYOUTS {
+        for indexes in index_sets() {
+            let who = format!("{layout:?} / {indexes:?}");
+            let spilled = sorted_stream::build_array(
+                Box::new(quad_stream(quads.clone())),
+                layout,
+                indexes.clone(),
+                BuildSizes::uniform(3),
+            )
+            .await
+            .unwrap();
+            let in_memory = build_array::<SortedInMemoryBuilder>(
+                quad_stream(quads.clone()),
+                layout,
+                indexes.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                component_names(&spilled),
+                component_names(&in_memory),
+                "{who}"
+            );
+            for (a, b) in spilled.components.iter().zip(&in_memory.components) {
+                assert_eq!(child_table(a), child_table(b), "{who}: {}", a.identity.name);
+            }
+            let rows = |built: BuiltArray| async move {
+                let store = VortexRdfStore::from_built(built).unwrap();
+                let quads = store.quads_vec().await.unwrap();
+                quads.iter().map(ToString::to_string).collect::<Vec<_>>()
+            };
+            let (spilled_rows, in_memory_rows) = (rows(spilled).await, rows(in_memory).await);
+            assert_eq!(spilled_rows.len(), 24, "{who}: the repeats are gone");
+            assert_eq!(spilled_rows, in_memory_rows, "{who}");
+        }
+    }
+}
+
+/// A string layout's spilled build gives back every spelling it was given:
+/// escapes, a language tag, a datatype, blank nodes, a named graph and the
+/// default graph.
+#[tokio::test]
+async fn test_spilled_string_layouts_decode_terms_verbatim() {
+    use crate::common::terms::parse_quads_from_reader;
+    use oxrdfio::RdfFormat;
+    use std::collections::BTreeSet;
+
+    let text = concat!(
+        "<http://e.org/s> <http://e.org/p> \"a\\\"b\\\\c\" .\n",
+        "<http://e.org/s> <http://e.org/p> \"hello\"@en <http://e.org/g> .\n",
+        "_:b1 <http://e.org/p> \"5\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<http://e.org/s> <http://e.org/q> _:b2 <http://e.org/g> .\n",
+        "_:b1 <http://e.org/q> <http://e.org/o> .\n",
+        "<http://e.org/t> <http://e.org/p> \"x\\u00e9\\n\" .\n",
+    );
+    let raws: Vec<crate::store::RawQuad> =
+        parse_quads_from_reader(std::io::Cursor::new(text.as_bytes()), RdfFormat::NQuads)
+            .try_collect()
+            .await
+            .unwrap();
+    assert_eq!(raws.len(), 6);
+    let row = |q: &crate::store::RawQuad| (q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone());
+    let expected: BTreeSet<_> = raws.iter().map(row).collect();
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let built = sorted_stream::build_array(
+            Box::new(stream::iter(raws.clone().into_iter().map(Ok))),
+            layout,
+            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            BuildSizes::uniform(2),
+        )
+        .await
+        .unwrap();
+        let store = VortexRdfStore::from_built(built).unwrap();
+        let got: BTreeSet<_> = store
+            .quads_vec()
+            .await
+            .unwrap()
+            .iter()
+            .map(|q| row(&crate::store::RawQuad::from_quad(q)))
+            .collect();
+        assert_eq!(got, expected, "{layout:?}");
+    }
+}
+
+/// A run spills only past its capacity: exactly that many quads stay one
+/// in-memory run and write nothing, one more writes two quad runs; both
+/// builds emit every quad.
+#[tokio::test]
+async fn test_run_capacity_boundary_spills_only_past_it() {
+    use crate::store::builders::spill::spill_hooks;
+
+    for layout in LAYOUTS {
+        for (n, files) in [(4usize, 0usize), (5, 2)] {
+            let quads = modular_quads(n, 3, 4);
+            let built = sorted_stream::build_chunk_stream(
+                Box::new(quad_stream(quads)),
+                layout,
+                vec![],
+                BuildSizes::uniform(4),
+                None,
+            )
+            .await
+            .unwrap();
+            let dir = spill_hooks::last_dir().expect("the build made a run directory");
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names.len(), files, "{layout:?}, {n} quads: {names:?}");
+            assert!(
+                names.iter().all(|name| name.starts_with("quads_run_")),
+                "{layout:?}, {n} quads: {names:?}"
+            );
+            let chunks: Vec<_> = built.chunks.try_collect().await.unwrap();
+            assert_eq!(
+                chunks.iter().map(|c| c.len()).sum::<usize>(),
+                n,
+                "{layout:?}"
+            );
+        }
+    }
+}
+
+/// An input that fails after runs were spilled fails the build with its
+/// error, and the run directory is gone.
+#[tokio::test]
+async fn test_input_error_after_spilling_removes_the_runs() {
+    use crate::store::builders::spill::spill_hooks;
+
+    for layout in LAYOUTS {
+        let raws: Vec<_> = modular_quads(10, 3, 4)
+            .iter()
+            .map(crate::store::RawQuad::from_quad)
+            .map(Ok)
+            .chain(std::iter::once(Err(VortexRdfError::InvalidInput(
+                "boom".to_owned(),
+            ))))
+            .collect();
+        let result = sorted_stream::build_chunk_stream(
+            Box::new(stream::iter(raws)),
+            layout,
+            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            BuildSizes::uniform(3),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(VortexRdfError::InvalidInput(m)) if m == "boom"),
+            "{layout:?}"
+        );
+        let dir = spill_hooks::last_dir().expect("the build made a run directory");
+        assert!(!dir.exists(), "{layout:?}: {} is left", dir.display());
+    }
+}
+
+/// The peak spill of an out-of-core build — its run directory once the merge
+/// that numbers the rows has run, before any chunk is pulled — is the quads as
+/// term ids, 16 bytes each, and the requested families' compact entries (an
+/// 8-byte header per run, 8 bytes per reference entry, 20 per copy entry),
+/// with no merged copy of the quads, under every layout.
+#[tokio::test]
+async fn test_peak_spill_is_term_ids_and_compact_entries() {
+    use crate::store::builders::spill::spill_hooks;
+
+    for layout in LAYOUTS {
+        for indexes in index_sets() {
+            let who = format!("{layout:?} / {indexes:?}");
+            // 10 distinct quads in runs of 3: 4 runs of each kind (3, 3, 3, 1).
+            let built = sorted_stream::build_chunk_stream(
+                Box::new(quad_stream(modular_quads(10, 3, 4))),
+                layout,
+                indexes.clone(),
+                BuildSizes::uniform(3),
+                None,
+            )
+            .await
+            .unwrap();
+            let dir = spill_hooks::last_dir().expect("the build made a run directory");
+            let files: Vec<(String, u64)> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    (name, e.metadata().unwrap().len())
+                })
+                .collect();
+            assert!(
+                !files.iter().any(|(name, _)| name == "merged.bin"),
+                "{who}: {files:?}"
+            );
+            let families = |index| if indexes.contains(&index) { 2 } else { 0 };
+            let want = 16 * 10
+                + families(IndexType::SecondaryByReference) * (4 * 8 + 10 * 8)
+                + families(IndexType::SecondaryByCopy) * (4 * 8 + 10 * 20);
+            let total: u64 = files.iter().map(|(_, len)| len).sum();
+            assert_eq!(total, want, "{who}: {files:?}");
+            let chunks: Vec<_> = built.chunks.try_collect().await.unwrap();
+            assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 10, "{who}");
+        }
+    }
 }

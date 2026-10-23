@@ -16,7 +16,7 @@ use std::num::NonZeroUsize;
 
 use super::*;
 use crate::store::array::field_as;
-use crate::store::builders::sorted_stream;
+use crate::store::builders::{BuildSizes, sorted_stream};
 use crate::store::test_hooks::RowIdBase;
 use crate::store::{Probe, RowId, StoreParts};
 use vortex_array::VortexSessionExecute as _;
@@ -285,7 +285,7 @@ async fn spilled_store_bytes(
         Box::new(quad_stream(quads)),
         layout,
         indexes,
-        RUN_ROWS,
+        BuildSizes::uniform(RUN_ROWS),
         None,
     )
     .await
@@ -354,7 +354,7 @@ async fn row_ids_past_u32_round_trip_through_spilled_runs() {
                 Box::new(quad_stream(quads.clone())),
                 layout,
                 indexes,
-                RUN_ROWS,
+                BuildSizes::uniform(RUN_ROWS),
             )
             .await
             .unwrap();
@@ -465,7 +465,7 @@ async fn reference_children_keep_val_rid_order_across_u32_max() {
                 Box::new(quad_stream(quads.clone())),
                 layout,
                 vec![IndexType::SecondaryByReference],
-                RUN_ROWS,
+                BuildSizes::uniform(RUN_ROWS),
             )
             .await
             .unwrap();

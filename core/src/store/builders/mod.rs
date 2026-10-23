@@ -46,6 +46,42 @@ use vortex_array::{ArrayRef, IntoArray};
 /// Number of quads per StructArray chunk in streaming/chunked builders.
 pub(crate) const DEFAULT_CHUNK_ROWS: usize = 100_000;
 
+/// Entries per spill run of the out-of-core build: quads per quad run, and
+/// entries per run of each index family. A run's records are term ids and
+/// ranks (16 bytes a quad, 8 or 20 an index entry), so a run of ten chunks'
+/// worth is buffered in a few megabytes and a build opens a tenth as many
+/// run files as runs of a chunk would.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) const DEFAULT_RUN_ROWS: usize = 1 << 20;
+
+/// The out-of-core build's sizes: rows per emitted chunk (quad chunks and
+/// index-child chunks alike) and entries per spill run.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BuildSizes {
+    pub(crate) chunk_rows: usize,
+    pub(crate) run_rows: usize,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl BuildSizes {
+    /// [`DEFAULT_CHUNK_ROWS`] and [`DEFAULT_RUN_ROWS`]: every build's.
+    pub(crate) const DEFAULT: Self = Self {
+        chunk_rows: DEFAULT_CHUNK_ROWS,
+        run_rows: DEFAULT_RUN_ROWS,
+    };
+
+    /// One size for both, so a test of a few quads cuts several runs and
+    /// several chunks.
+    #[cfg(test)]
+    pub(crate) const fn uniform(rows: usize) -> Self {
+        Self {
+            chunk_rows: rows,
+            run_rows: rows,
+        }
+    }
+}
+
 /// A stream of StructArray chunks for the Vortex file writer. Items are
 /// `VortexResult` because the writer polls the stream directly; builder
 /// errors convert through `From<VortexRdfError> for VortexError`.
@@ -128,7 +164,7 @@ pub trait VortexArrayBuilder {
 /// built beside it as components ([`build_components`]). An empty `quads`
 /// builds every layout's empty chunk, the Dictionary layout's being
 /// [`dictionary::empty_struct`] (unstamped: nothing to sort); a non-empty
-/// Dictionary chunk needs the dictionary's codes ([`dictionary::build_chunk`]).
+/// Dictionary chunk needs the dictionary's codes ([`dictionary::build_code_chunk`]).
 ///
 /// `s_sorted` stamps `IsSorted` on the `s` column, which `match_pattern`
 /// trusts as global `(s, p, o, g)` order: it must be `true` only when `quads`

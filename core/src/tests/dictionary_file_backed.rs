@@ -768,23 +768,22 @@ async fn test_dictionary_empty_store_roundtrip() {
 #[tokio::test]
 async fn test_large_dictionary_child_lift_keeps_fsst() {
     use crate::store::RawQuad;
-    use crate::store::layouts::dictionary::{TermDictionary, TermDictionaryBuilder};
+    use crate::store::layouts::dictionary::TermDictionary;
     use vortex_buffer::ByteBuffer;
     use vortex_file::OpenOptionsSessionExt as _;
 
     // ~200k unique terms → several independent FSST windows, so the child is
     // written (verbatim, through the pass-through strategy) as several flat
     // leaves and splits back into several chunks.
-    let mut builder = TermDictionaryBuilder::new();
-    for i in 0..50_000u64 {
-        builder.insert_quad(&RawQuad {
+    let quads: Vec<RawQuad> = (0..50_000u64)
+        .map(|i| RawQuad {
             s: format!("<http://example.org/subject/{i:07}>"),
             p: format!("<http://example.org/predicate/{i:07}>"),
             o: format!("\"object value number {i:07}\""),
             g: format!("<http://example.org/graph/{i:07}>"),
-        });
-    }
-    let (dict, _code_map) = builder.finish().unwrap();
+        })
+        .collect();
+    let (dict, _code_map) = TermDictionary::from_quads_with_map(&quads).unwrap();
     let len = dict.len() as u64;
 
     let bytes = write_dict_only_store(&dict).await;
