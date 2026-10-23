@@ -681,19 +681,21 @@ fn narrow_match_many(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Group 4c — LIMIT PAIRS (the one-shot code read, plain and windowed)
+// Group 4c — LIMIT PAIRS (the code reads, plain and windowed)
 //
-// The read behind the bindings' `match_codes` / `matchCodes` (`run_probe`, then
-// `code_columns_gathered`), timed twice per shape on one warm Dictionary store:
-// `match_codes_plain_*` as it is, `match_codes_limit_*` windowed to a `limit`
-// above the shape's own rows, so the window cannot cut one. Both cells of a pair
-// return the same rows; the gap between them is what the window route costs, or
-// saves, for that shape.
+// The reads behind the bindings' `match_codes` / `matchCodes` (`run_probe`, then
+// `code_columns_gathered`) and Python's `match_code_chunks` (`run_probe`, then
+// every chunk of `code_chunks`), timed twice per shape on one warm Dictionary
+// store: `*_plain_*` as it is, `*_limit_*` windowed to a `limit` above the
+// shape's own rows, so the window cannot cut one. Both cells of a pair return
+// the same rows; the gap between them is what the window route costs, or saves,
+// for that shape and read.
 // ══════════════════════════════════════════════════════════════════════════
 
 /// A shape of the limit pairs: a pattern's bound roles (Subject, Predicate,
-/// Object, Graph), each at term index 0. `SPG` leaves the object free, which no
-/// [`Pattern`] does.
+/// Object, Graph), each at term index 0. `SPG` leaves the object free, and `PG`
+/// binds the predicate and the graph alone, which no [`Pattern`] does: two
+/// equalities whose matches spread over every split of the file.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug)]
 enum LimitShape {
@@ -704,6 +706,8 @@ enum LimitShape {
     P,
     PO,
     O,
+    G,
+    PG,
 }
 
 impl LimitShape {
@@ -720,27 +724,44 @@ impl LimitShape {
             Self::P => terms_for(Pattern::P),
             Self::PO => terms_for(Pattern::PO),
             Self::O => terms_for(Pattern::O),
+            Self::G => terms_for(Pattern::G),
+            Self::PG => {
+                let (_, p, _, g) = terms_for(Pattern::SPOG);
+                (None, p, None, g)
+            }
         };
         Probe::new(s, p, o, g)
     }
+}
+
+/// How a limit-pair cell reads its view once `run_probe` has matched it.
+#[derive(Copy, Clone)]
+enum PairRead {
+    /// `code_columns_gathered`, the one-shot read: the bindings'
+    /// `match_codes`.
+    Gathered,
+    /// Every chunk of `code_chunks` over the four columns, 65,536 rows a
+    /// chunk: Python's `match_code_chunks` at its default batch.
+    Chunks,
 }
 
 /// The limit vortex-rdflib's `triples()` probes a pattern's size with.
 const PROBING_LIMIT: usize = 65_537;
 
 /// One cell of a limit pair: `shape` matched on a Dictionary store of the given
-/// `source` and `index` (opened once, before timing) and read as the bindings'
-/// `match_codes` reads it, `run_probe` then `code_columns_gathered`. A plain
-/// cell times the probe as it is; a `limited` one times it windowed to a limit
-/// that cannot cut a row: one above the shape's rows, and at least
-/// [`PROBING_LIMIT`], so that on a store of more rows than that the limit is
-/// also below the store's own size. The setup reads both ways once and panics,
-/// naming `cell` and the shape, unless their row counts agree.
+/// `source` and `index` (opened once, before timing) and read as the bindings
+/// read it, `run_probe` then `how`. A plain cell times the probe as it is; a
+/// `limited` one times it windowed to a limit that cannot cut a row: one above
+/// the shape's rows, and at least [`PROBING_LIMIT`], so that on a store of more
+/// rows than that the limit is also below the store's own size. The setup reads
+/// both ways once and panics, naming `cell` and the shape, unless their row
+/// counts agree.
 fn run_limit_pair(
     bencher: divan::Bencher,
     cell: &str,
     source: Source,
     index: Index,
+    how: PairRead,
     shape: LimitShape,
     limited: bool,
 ) {
@@ -748,8 +769,22 @@ fn run_limit_pair(
     let read = |probe: &Probe| {
         rt().block_on(async {
             let view = store.run_probe(probe).await.expect("run_probe");
-            let columns = view.code_columns_gathered().await.expect("gather");
-            columns.expect("a Dictionary view has code columns")[0].len()
+            match how {
+                PairRead::Gathered => {
+                    let columns = view.code_columns_gathered().await.expect("gather");
+                    columns.expect("a Dictionary view has code columns")[0].len()
+                }
+                PairRead::Chunks => {
+                    let mut chunks = view
+                        .code_chunks(&QuadColumn::ALL, 65_536)
+                        .expect("code_chunks");
+                    let mut rows = 0;
+                    while let Some(chunk) = chunks.next().await {
+                        rows += chunk.expect("code chunk")[0].len();
+                    }
+                    rows
+                }
+            }
         })
     };
     let plain = shape.probe();
@@ -766,33 +801,37 @@ fn run_limit_pair(
     bencher.bench(|| black_box(read(&probe)));
 }
 
-/// The limit-pair cells: one `(index, source, [shapes]) => plain / limit` row
-/// per config, naming the config's two benchmark functions, each swept over the
-/// row's shapes.
+/// The limit-pair cells: one `read (index, source, [shapes]) => plain / limit`
+/// row per config, `read` a [`PairRead`], naming the config's two benchmark
+/// functions, each swept over the row's shapes.
 macro_rules! limit_pairs {
-    ($(($index:expr, $source:expr, [$($shape:ident),+]) => $plain:ident / $limit:ident,)*) => {
+    ($($read:ident ($index:expr, $source:expr, [$($shape:ident),+]) => $plain:ident / $limit:ident,)*) => {
         $(
             #[divan::bench(args = [$(LimitShape::$shape),+], sample_count = QUERY_SAMPLES)]
             fn $plain(bencher: divan::Bencher, shape: &LimitShape) {
-                run_limit_pair(bencher, stringify!($plain), $source, $index, *shape, false);
+                let read = PairRead::$read;
+                run_limit_pair(bencher, stringify!($plain), $source, $index, read, *shape, false);
             }
 
             #[divan::bench(args = [$(LimitShape::$shape),+], sample_count = QUERY_SAMPLES)]
             fn $limit(bencher: divan::Bencher, shape: &LimitShape) {
-                run_limit_pair(bencher, stringify!($limit), $source, $index, *shape, true);
+                let read = PairRead::$read;
+                run_limit_pair(bencher, stringify!($limit), $source, $index, read, *shape, true);
             }
         )*
     };
 }
 
 limit_pairs!(
-    // File stores.
-    (Index::None, Source::File, [S, SP, SPO, SPG, P, PO, O]) => match_codes_plain_dict_noindex_file / match_codes_limit_dict_noindex_file,
-    (Index::ByCopy, Source::File, [P, PO, O]) => match_codes_plain_dict_bycopy_file / match_codes_limit_dict_bycopy_file,
-    (Index::ByReference, Source::File, [P, PO]) => match_codes_plain_dict_byref_file / match_codes_limit_dict_byref_file,
-    // In-memory stores.
-    (Index::None, Source::InMemory, [SPG, P, PO]) => match_codes_plain_dict_noindex_mem / match_codes_limit_dict_noindex_mem,
-    (Index::ByCopy, Source::InMemory, [P, PO]) => match_codes_plain_dict_bycopy_mem / match_codes_limit_dict_bycopy_mem,
+    // The one-shot read, file stores.
+    Gathered (Index::None, Source::File, [S, SP, SPO, SPG, P, PO, O, G, PG]) => match_codes_plain_dict_noindex_file / match_codes_limit_dict_noindex_file,
+    Gathered (Index::ByCopy, Source::File, [P, PO, O]) => match_codes_plain_dict_bycopy_file / match_codes_limit_dict_bycopy_file,
+    Gathered (Index::ByReference, Source::File, [P, PO]) => match_codes_plain_dict_byref_file / match_codes_limit_dict_byref_file,
+    // The one-shot read, in-memory stores.
+    Gathered (Index::None, Source::InMemory, [SPG, P, PO]) => match_codes_plain_dict_noindex_mem / match_codes_limit_dict_noindex_mem,
+    Gathered (Index::ByCopy, Source::InMemory, [P, PO]) => match_codes_plain_dict_bycopy_mem / match_codes_limit_dict_bycopy_mem,
+    // The chunk stream, the no-index file store.
+    Chunks (Index::None, Source::File, [P, G]) => chunks_codes_plain_dict_noindex_file / chunks_codes_limit_dict_noindex_file,
 );
 
 // ══════════════════════════════════════════════════════════════════════════
