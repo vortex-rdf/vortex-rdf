@@ -149,7 +149,11 @@ impl RowSelection {
     pub(crate) fn live_len(&self, deleted: Option<&Mask>, base_len: usize) -> usize {
         match deleted {
             None => self.len(base_len),
-            Some(deleted) => self.live_mask(deleted, base_len).true_count(),
+            Some(deleted) => {
+                #[cfg(test)]
+                live_count_hooks::note();
+                self.live_mask(deleted, base_len).true_count()
+            }
         }
     }
 
@@ -521,6 +525,28 @@ pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;
 /// [`POINT_GATHER_MAX_ROWS`]).
 pub(crate) fn point_sized(rows: u64) -> bool {
     rows <= POINT_GATHER_MAX_ROWS as u64
+}
+
+/// Test hook: how many live counts under tombstones this thread made
+/// ([`live_len`](crate::store::view::selection::RowSelection::live_len),
+/// which builds the selection's live mask to count it).
+#[cfg(test)]
+pub(crate) mod live_count_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one live count under tombstones.
+    pub(super) fn note() {
+        COUNTS.set(COUNTS.get() + 1);
+    }
+
+    /// The live counts under tombstones this thread made so far.
+    pub(crate) fn counts() -> usize {
+        COUNTS.get()
+    }
 }
 
 #[cfg(test)]

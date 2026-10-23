@@ -1063,6 +1063,48 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
     }
 }
 
+/// Under tombstones, a window over a file view whose reads take its pending
+/// filter by the masks first counts none of the view's live rows: its window
+/// evaluates the filter whatever the bound, so a count for the bound would
+/// go unused. The window still reads the plain rows, known exactly.
+#[tokio::test]
+async fn test_masks_first_window_under_tombstones_counts_no_live_rows() {
+    use crate::store::view::selection::live_count_hooks;
+
+    let quads = fixture_quads();
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let mut store = VortexRdfStore::from_file(&path).await.unwrap();
+    for quad in quads.iter().step_by(11).take(40) {
+        store = store.delete_quad(quad).await.unwrap();
+    }
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let probe = Probe::new(None, Some(p1), None, None);
+    let plain = store.run_probe(&probe).await.unwrap();
+    assert!(
+        plain.debug_reads_masks_first(),
+        "read by the filter's masks first"
+    );
+    let rows = row_list(&plain).await;
+    let n = rows.len();
+    // A limit short of the selected rows: the bound would count the live
+    // rows.
+    assert!(
+        n + 1 < quads.len(),
+        "{n} rows under a base of {}",
+        quads.len()
+    );
+    let counts = live_count_hooks::counts();
+    let windowed = store
+        .run_probe(&probe.window(0, Some(n + 1)))
+        .await
+        .unwrap();
+    assert_eq!(live_count_hooks::counts(), counts, "no live rows counted");
+    let stats = windowed.view_statistics().unwrap();
+    assert!(!stats.pending_filter, "the filter evaluated");
+    assert_eq!(stats.rows, RowCountHint::exact(n), "exact rows");
+    assert_eq!(row_list(&windowed).await, rows, "the plain rows");
+}
+
 mod file {
     use super::*;
     use std::ops::Range;

@@ -334,18 +334,25 @@ impl VortexRdfStore {
     /// [`QuadsSource::located_window`](crate::store::QuadsSource::located_window)
     /// answers (no tombstones, an in-memory run whose rids ascend, a file run
     /// with no filter) it reads them without the run's other ids. So does a
-    /// file view whose bound fits but whose reads take its pending filter by
-    /// the masks first ([`reads_masks_first`](Self::reads_masks_first)),
-    /// tested after the bound: its window evaluates the filter, which its
-    /// reads would evaluate anyway, so its one-shot reads take the rows from
-    /// that evaluation, its streams read the matches' ids, and its statistics
-    /// are exact.
+    /// file view whose reads take its pending filter by the masks first
+    /// ([`reads_masks_first`](Self::reads_masks_first)), whatever its bound:
+    /// its window evaluates the filter, which its reads would evaluate
+    /// anyway, so its one-shot reads take the rows from that evaluation, its
+    /// streams read the matches' ids, and its statistics are exact. That test
+    /// runs after the bound's, which costs less, but under tombstones before
+    /// it, as the bound may count live rows such a window never takes.
     pub(in crate::store) fn window_check(
         &self,
         offset: usize,
         limit: usize,
     ) -> Result<WindowCheck> {
         if offset != 0 || self.quads.is_pending_without_plan() {
+            return Ok(WindowCheck::MayCut { base_live: None });
+        }
+        #[cfg(feature = "file-io")]
+        let tombstoned = self.quads.deleted.is_some();
+        #[cfg(feature = "file-io")]
+        if tombstoned && self.reads_masks_first()? {
             return Ok(WindowCheck::MayCut { base_live: None });
         }
         let tail = self.tail_size();
@@ -358,7 +365,7 @@ impl VortexRdfStore {
             return Ok(may_cut);
         }
         #[cfg(feature = "file-io")]
-        if self.reads_masks_first()? {
+        if !tombstoned && self.reads_masks_first()? {
             return Ok(may_cut);
         }
         Ok(WindowCheck::CannotCut)
