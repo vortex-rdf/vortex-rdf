@@ -1141,13 +1141,14 @@ applies:
 
 | Backend | Shape | How |
 |---|---|---|
-| memory | the selection is a run of the sorted base that `column` orders — every earlier column of the `(s, p, o, g)` order is constant over it, as a subject-bound match leaves | binary search inside the run through the base's cached probe: two lower bounds for a range, one bounded sub-run per code for a small set |
-| memory | anything else | one pass over the selected rows of the column, read in place (its canonical primitive, else the cached probe); a set tests a bitmap over its span when dense, a binary search when sparse |
+| memory | the selection is a run of the sorted base that `column` orders — every earlier column of the `(s, p, o, g)` order is constant over it, as a subject-bound match leaves; every row of a base sorted by subject is one such run for a keep on `s` | binary search inside the run through the base's cached probe: two lower bounds for a range, one bounded sub-run per code for a small set |
+| memory | anything else | one pass over the selected rows of the column: read in place from its canonical primitive when one is materialized; else a piece at a time (at most 65,536 rows of one chunk, a shared wrapper's source decoded, never its cache filled), a piece with more than 16 selected rows, at least one per 16 rows from its first to its last, decoded and compared, any other read row by row through the cached probe, as is a point-sized selection (at most 256 rows) whole; a set tests a bitmap over its span when dense, a binary search when sparse |
 | file | `s` of a file sorted by it: a range, or a set of at most one code per 16 selected rows | located: the admitted rows are runs of the sorted column, found by binary search through its chunk probes and intersected with the selection — no column is read, and a pending filter stays pending |
 | file | any other keep | the view's rows are resolved (a pending filter evaluated), the column is streamed for them through the mapping, and the keep is tested in memory — never pushed to the scan as an expression, so Vortex's identity-keyed caches never see a per-query code list |
 
 A pending view (a served match, or a run held for a count) materializes its
-ids first. The result is an exact `Ids` (or `Range`) selection in base order,
+ids first. The result is an exact selection in base order (`Ids`, a `Range`,
+or in memory the selection itself when the keep admits every selected row),
 so a chained `match_pattern` narrows it exactly as
 [§11](#11-chained-matches) describes.
 
