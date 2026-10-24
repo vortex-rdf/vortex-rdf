@@ -400,6 +400,128 @@ async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
     }
 }
 
+/// Over every row of a store sorted by subject, a keep on `s` is a binary
+/// search, the whole base being one run of the subject column: ranges and
+/// small sets equal brute force over the store's rows in base order; a set
+/// of more codes than its searches would beat takes the pass.
+#[tokio::test]
+async fn test_subject_keep_over_every_row_searches_the_sorted_column() {
+    use crate::store::query::narrowing::narrow_hooks::sorted_run_keeps;
+    let store = memory_store(vec![]).await;
+    let rows = row_list(&store).await;
+    let (lo, hi) = store
+        .dict_reader()
+        .unwrap()
+        .prefix_range("<http://example.org/s")
+        .await
+        .unwrap();
+    let mid = lo + (hi - lo) / 2;
+    for (keep, searched) in [
+        (Keep::range(lo..hi), true),
+        (Keep::range(lo + 7..mid), true),
+        (Keep::range(mid..mid + 1), true),
+        (Keep::set([lo, lo + 41, mid, hi - 1]), true),
+        (Keep::set(lo..hi), false),
+    ] {
+        let before = sorted_run_keeps();
+        let narrowed = store.keep(QuadColumn::S, &keep).await.unwrap();
+        assert_eq!(
+            sorted_run_keeps() - before,
+            usize::from(searched),
+            "keep {keep:?}"
+        );
+        assert_eq!(
+            row_list(&narrowed).await,
+            brute_keep(&rows, QuadColumn::S, &keep),
+            "keep {keep:?}"
+        );
+    }
+}
+
+/// A store loaded whole from a file of 500-row leaves holds its code columns
+/// chunked, so a keep's pass reads them through their probes a piece at a
+/// time. Over every row and over a predicate-bound view, ranges on `g` and
+/// sets on `p` decode the pieces they select densely, read no row through
+/// the probe and equal brute force over the view's rows in base order; a
+/// point-sized view reads each of its rows through the probe and decodes
+/// nothing.
+#[tokio::test]
+async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
+    use crate::store::query::narrowing::narrow_hooks::{decoded_pieces, probed_rows};
+    let (_dir, path) = write_chunked_store_file(&fixture_quads(), 500).await;
+    let store = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    for column in ["p", "g"] {
+        assert_eq!(
+            store.debug_base_child_int_canonical(column),
+            Some(false),
+            "{column}: chunked"
+        );
+    }
+    let dict = store.dict_reader().unwrap();
+    let (g_lo, g_hi) = dict.prefix_range("<http://example.org/g").await.unwrap();
+    let (p_lo, p_hi) = dict.prefix_range("<http://example.org/p").await.unwrap();
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_p = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    let keeps = [
+        (QuadColumn::G, Keep::range(g_lo..g_hi)),
+        (QuadColumn::G, Keep::range(g_lo..g_lo + 1)),
+        (QuadColumn::P, Keep::set([p_lo, p_hi - 1])),
+        (QuadColumn::P, Keep::set(p_lo..p_hi)),
+    ];
+    for (tag, view) in [("whole", store.clone()), ("p-bound", by_p)] {
+        let rows = row_list(&view).await;
+        for (column, keep) in &keeps {
+            let (pieces, probed) = (decoded_pieces(), probed_rows());
+            let narrowed = view.keep(*column, keep).await.unwrap();
+            assert!(
+                decoded_pieces() > pieces,
+                "{tag}: {column:?} {keep:?} decodes"
+            );
+            assert_eq!(
+                probed_rows(),
+                probed,
+                "{tag}: {column:?} {keep:?} probes no row"
+            );
+            assert_eq!(
+                row_list(&narrowed).await,
+                brute_keep(&rows, *column, keep),
+                "{tag}: {column:?} {keep:?}"
+            );
+        }
+    }
+    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let point = store
+        .match_pattern(None, Some(&p1), Some(&o3), None)
+        .await
+        .unwrap();
+    let rows = row_list(&point).await;
+    assert!(
+        !rows.is_empty() && rows.len() <= 256,
+        "a point-sized view: {} rows",
+        rows.len()
+    );
+    let keep = Keep::range(g_lo..g_hi);
+    let (pieces, probed) = (decoded_pieces(), probed_rows());
+    let narrowed = point.keep(QuadColumn::G, &keep).await.unwrap();
+    assert_eq!(
+        decoded_pieces(),
+        pieces,
+        "a point-sized view decodes nothing"
+    );
+    assert_eq!(
+        probed_rows() - probed,
+        rows.len(),
+        "each of its rows probed"
+    );
+    assert_eq!(
+        row_list(&narrowed).await,
+        brute_keep(&rows, QuadColumn::G, &keep)
+    );
+}
+
 #[tokio::test]
 async fn test_window_in_memory_matches_slicing() {
     for (tag, indexes) in [
