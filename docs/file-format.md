@@ -504,9 +504,11 @@ per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_read
 (42) splits runs inline, a larger one is spawned across the runtime's workers.
 Without a Tokio runtime these scans run inline. A one-shot read under a
 pending filter of code equalities over columns with chunk probes evaluates
-the filter's masks first instead, split by split under the same rule, then
-reads the rows they keep point by point, by a take, or by projecting each
-split at its mask
+the filter's masks first instead, split by split under the same rule, each
+split testing the equalities in the order of their observed selectivity (a
+prior of `s`, `o`, `p`, `g` until every one has been tested), then reads the
+rows they keep point by point, by a take, or by projecting each split at its
+mask
 ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
 Streaming reads (`quads()` and its twins) decode inside the per-split tasks
 Vortex's scan stream spawns; under a file-backed dictionary the decode awaits

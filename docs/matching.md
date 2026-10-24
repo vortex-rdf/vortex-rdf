@@ -535,7 +535,7 @@ Each stage in the code, and where the details are below:
 | 1 · subject chunk probe and prefix | [`matching.rs:509-516`](../core/src/store/query/matching.rs#L509-L516 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L688), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L362), [`narrow_subject_run`](../core/src/store/scan/file_reads.rs#L391) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`matching.rs:517-530`](../core/src/store/query/matching.rs#L517-L530 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L691) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:543-613`](../core/src/store/query/matching.rs#L543-L613 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L333) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:536-537`](../core/src/store/query/matching.rs#L536-L537 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L795) and [`matching.rs:621-635`](../core/src/store/query/matching.rs#L621-L635 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L717), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L413) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:536-537`](../core/src/store/query/matching.rs#L536-L537 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L795) and [`matching.rs:621-635`](../core/src/store/query/matching.rs#L621-L635 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L717), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L495) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`matching.rs:637-652`](../core/src/store/query/matching.rs#L637-L652 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L707) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -584,7 +584,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L413) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L495) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
