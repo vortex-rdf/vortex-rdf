@@ -28,3 +28,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 futures = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
 vortex-buffer.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"

@@ -148,6 +148,7 @@ impl CancelToken {
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    keep_freed_heap();
     m.add_class::<store::VortexRdfStore>()?;
     m.add_class::<store::ProbeAnswers>()?;
     m.add_class::<chunks::CodeChunks>()?;
@@ -162,3 +163,32 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
+
+/// Keep the memory a large read frees for the next one instead of returning
+/// it to the kernel: raise glibc's trim threshold, top pad and mmap
+/// threshold, so the result buffers of consecutive queries reuse the same
+/// pages rather than faulting fresh ones in. Linux/glibc only; a no-op on
+/// other platforms and when the environment carries glibc's own tunables
+/// (`GLIBC_TUNABLES` or a `MALLOC_*_` variable), which then stand.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn keep_freed_heap() {
+    let tuned = [
+        "GLIBC_TUNABLES",
+        "MALLOC_TRIM_THRESHOLD_",
+        "MALLOC_TOP_PAD_",
+        "MALLOC_MMAP_THRESHOLD_",
+    ];
+    if tuned.iter().any(|name| std::env::var_os(name).is_some()) {
+        return;
+    }
+    // SAFETY: mallopt only sets allocator parameters; the values are in the
+    // documented range of each option.
+    unsafe {
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 64 << 20);
+        libc::mallopt(libc::M_TOP_PAD, 16 << 20);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn keep_freed_heap() {}
