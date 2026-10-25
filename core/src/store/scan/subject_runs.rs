@@ -20,7 +20,7 @@ use crate::store::schema::{self, TermCode};
 /// keeps the scan path.
 pub(crate) async fn locate_subject_run(
     file: &NativeStoreFile,
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
     subject: &NamedOrBlankNode,
 ) -> Result<Option<Range<u64>>> {
     if !file.quads_sorted() {
@@ -46,7 +46,7 @@ pub(crate) async fn locate_subject_run(
 /// the prefix, as does an empty run. Answers how many roles it cleared.
 pub(crate) async fn narrow_subject_run(
     file: &NativeStoreFile,
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
     pattern: &mut QuadPattern<'_>,
     run: &mut Range<u64>,
 ) -> Result<usize> {

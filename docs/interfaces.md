@@ -19,9 +19,9 @@ is the path such an engine takes.
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L156), [`index_components`](../core/src/store/read/metadata.rs#L235), [`partitions`](../core/src/store/read/metadata.rs#L270) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L243) (from [`dict_reader`](../core/src/store/mod.rs#L203)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) (from [`dict_reader`](../core/src/store/mod.rs#L203)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L142), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L267) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L142), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L266) |
 | The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L82), with [`vortex_scan`](../core/src/lib.rs#L76) re-exported |
 
 ---

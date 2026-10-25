@@ -238,7 +238,7 @@ async fn resolve_eager_from_scan(
 pub(super) async fn resolve_file(
     probe: IndexProbe<'_>,
     file: &Arc<NativeStoreFile>,
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
     let (child, keys, located) = match locate(file, &probe, codes).await? {
         Located::Declined => return Ok(IndexResolution::Declined),
@@ -340,7 +340,7 @@ enum Located {
 async fn locate(
     file: &NativeStoreFile,
     probe: &IndexProbe<'_>,
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<Located> {
     let Some(child) = file.child_reader(probe.identity.name)? else {
         return Ok(Located::Declined);
@@ -374,7 +374,7 @@ pub(crate) async fn debug_located_run(
     file: &NativeStoreFile,
     layout: &ResolvedLayout,
     pattern: crate::store::layouts::QuadPattern<'_>,
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<Option<Range<u64>>> {
     let Some(probe) = index.choose(pattern, layout) else {
         return Ok(None);

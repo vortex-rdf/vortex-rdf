@@ -18,7 +18,7 @@ pub(crate) const QUAD_SCOPE: &str = "quads";
 /// pattern, `None` when nothing is bound.
 pub(crate) fn build_file_filter(
     pattern: QuadPattern<'_>,
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<Option<Expression>> {
     Ok(match codes.constraints(pattern)? {
         Constraints::AlwaysFalse => Some(lit(false)),

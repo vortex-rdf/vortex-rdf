@@ -67,7 +67,7 @@ pub(super) struct IndexProbe<'a> {
 pub(super) fn resolve_in_memory(
     probe: IndexProbe<'_>,
     components: &[IndexComponent],
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     // Route through the index only when the probed component exists and its
     // sort keys are globally sorted: the writer's provenance, not a stamp

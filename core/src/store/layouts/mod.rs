@@ -354,29 +354,26 @@ impl TermRef<'_> {
 /// layout (it stores terms as strings so a term the base's dictionary has
 /// never seen can still match), so a code cached here would be meaningless
 /// there, and the tail's match prepares its own witness.
-pub(crate) struct PatternCodes<'a> {
+pub(crate) struct PatternCodes {
     /// Per role: `None` = not resolved yet, `Some(None)` = resolved and absent
     /// from the dictionary (so the pattern cannot match).
     roles: [Option<Option<TermCode>>; 4],
     /// Reused render target for the bound terms; see the type docs.
     scratch: String,
     /// The layout the prelude prepared the pattern under, which fixes how a
-    /// probe the role cache does not already hold is answered, so a probe can
-    /// never be dispatched against the wrong access mode: the string layouts
-    /// probe with the rendered term itself (`TypedObject`'s constraints
-    /// decomposing the object into its typed sub-columns); a resident
-    /// dictionary resolves on demand by in-memory binary search (memoized per
-    /// role here); for a file-backed one the prelude pre-resolved every bound
-    /// role, so the role cache is the complete answer, with no synchronous
-    /// resolver to fall back to.
-    layout: &'a ResolvedLayout,
+    /// probe is answered: the string layouts probe with the rendered term
+    /// itself (`TypedObject`'s constraints decomposing the object into its
+    /// typed sub-columns), the Dictionary layout with the code the prelude
+    /// resolved for the term's role under either residency, so the role
+    /// cache is the complete answer and no probe reaches the dictionary.
+    layout: LayoutStrategy,
 }
 
-impl<'a> PatternCodes<'a> {
+impl PatternCodes {
     /// A fresh witness prepared under `layout`, reachable only from the async
     /// prelude ([`prepare_pattern`](ResolvedLayout::prepare_pattern)), which
     /// is what makes holding a `PatternCodes` proof that the prelude ran.
-    fn new(layout: &'a ResolvedLayout) -> Self {
+    fn new(layout: LayoutStrategy) -> Self {
         Self {
             roles: [None; 4],
             scratch: String::new(),
@@ -402,6 +399,13 @@ impl<'a> PatternCodes<'a> {
         resolved
     }
 
+    /// Seed `term`'s role with `code`, resolved without the rendered term (a
+    /// file-backed dictionary's window search), unless the role is cached
+    /// already.
+    pub(in crate::store::layouts) fn seed(&mut self, term: TermRef<'_>, code: Option<TermCode>) {
+        self.roles[term.role().index()].get_or_insert(code);
+    }
+
     /// `term`'s N-Triples form in the shared scratch buffer, for the layouts
     /// that probe with the string itself (no dictionary code to cache).
     fn render(&mut self, term: TermRef<'_>) -> &str {
@@ -412,32 +416,24 @@ impl<'a> PatternCodes<'a> {
     /// Whether this witness probes with the rendered term itself rather than
     /// a dictionary code: the `Default` and `TypedObject` layouts.
     fn probes_by_string(&self) -> bool {
-        !matches!(self.layout, ResolvedLayout::Dictionary(_))
+        self.layout != LayoutStrategy::Dictionary
     }
 
-    /// The dictionary code for `term`'s role: the role cache first (the
-    /// prelude seeded every bound role), then a resident dictionary's binary
-    /// search for a witness that can run one synchronously.
+    /// The dictionary code for `term`'s role, from the role cache the prelude
+    /// seeded with every bound role.
     ///
     /// The error arm is the residual contract a witness cannot encode in its
-    /// type: a probe for a role the prepared pattern never bound, on a
-    /// witness with no synchronous resolver. `None` is reserved for
-    /// "resolved and absent from the dictionary", so an unresolvable probe
-    /// must be an error: answering `None` would fabricate an empty match
-    /// result.
-    fn code(&mut self, term: TermRef<'_>) -> Result<Option<TermCode>> {
-        if let Some(cached) = self.roles[term.role().index()] {
-            return Ok(cached);
-        }
-        let layout = self.layout;
-        let ResolvedLayout::Dictionary(DictAccess::Resident(dict)) = layout else {
-            return Err(VortexRdfError::Deserialization(format!(
-                "no synchronous code resolution for {term}: the async prelude resolves every \
-                 bound role of the prepared pattern, and a file-backed dictionary cannot be \
-                 probed outside it"
-            )));
-        };
-        Ok(self.resolve(term, |s| dict.encode_exact(s)))
+    /// type: a probe for a role the prepared pattern never bound, which no
+    /// synchronous resolver answers. `None` is reserved for "resolved and
+    /// absent from the dictionary", so an unresolvable probe must be an
+    /// error: answering `None` would fabricate an empty match result.
+    fn code(&self, term: TermRef<'_>) -> Result<Option<TermCode>> {
+        self.roles[term.role().index()].ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "no code resolution for {term}: the async prelude resolves every bound role \
+                 of the prepared pattern, and no probe reaches the dictionary outside it"
+            ))
+        })
     }
 
     /// The scalar a term column is probed with (the primary `s` column, a
@@ -485,7 +481,7 @@ impl<'a> PatternCodes<'a> {
     /// term's code; a term absent from the dictionary compiles to
     /// [`Constraints::AlwaysFalse`].
     pub(crate) fn constraints(&mut self, pattern: QuadPattern<'_>) -> Result<Constraints> {
-        let typed_object = matches!(self.layout, ResolvedLayout::TypedObject);
+        let typed_object = self.layout == LayoutStrategy::TypedObject;
         let mut eqs: Vec<(&'static str, Scalar)> = Vec::new();
         for term in pattern.bound_roles() {
             if typed_object && let TermRef::Object(object) = term {
@@ -587,11 +583,8 @@ impl ResolvedLayout {
     /// which is why this prelude is the witness's only constructor. The
     /// string layouts have nothing to resolve, so their preparation never
     /// suspends.
-    pub(crate) async fn prepare_pattern(
-        &self,
-        pattern: QuadPattern<'_>,
-    ) -> Result<PatternCodes<'_>> {
-        let mut codes = PatternCodes::new(self);
+    pub(crate) async fn prepare_pattern(&self, pattern: QuadPattern<'_>) -> Result<PatternCodes> {
+        let mut codes = PatternCodes::new(self.strategy());
         if let ResolvedLayout::Dictionary(access) = self {
             access.resolve_pattern(pattern, &mut codes).await?;
         }
@@ -769,20 +762,14 @@ fn read_code_column(struct_arr: &StructArray, name: &str) -> Result<Vec<TermCode
 mod tests {
     use super::*;
 
-    /// A pre-resolved witness — one prepared under a file-backed dictionary
-    /// — answers a probe for a role the prelude never seeded with an error,
-    /// and from the role cache once it is seeded.
-    #[tokio::test]
-    async fn preresolved_witness_declines_unseeded_role() {
-        let (_dir, native) = crate::tests::mapped_file(1, Vec::new()).await;
-        let fb = FileBackedDict::open(&native)
-            .await
-            .unwrap()
-            .expect("the written dictionary child must be window-searchable");
-        let layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(fb));
+    /// A witness prepared under the Dictionary layout answers a probe for a
+    /// role the prelude never seeded with an error, and from the role cache
+    /// once it is seeded.
+    #[test]
+    fn preresolved_witness_declines_unseeded_role() {
         let subject = NamedOrBlankNode::from(NamedNode::new("http://example.org/s").unwrap());
         let pattern = QuadPattern::new(Some(&subject), None, None, None);
-        let mut codes = PatternCodes::new(&layout);
+        let mut codes = PatternCodes::new(LayoutStrategy::Dictionary);
         assert!(matches!(
             codes.constraints(pattern),
             Err(VortexRdfError::Deserialization(_))
