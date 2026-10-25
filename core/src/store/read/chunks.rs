@@ -233,7 +233,8 @@ impl VortexRdfStore {
     /// A file view's base chunks, its [`ExactRead`] chosen once: a selection
     /// taken by id is cut into windows of at most `batch_rows` live ids, each
     /// taken ([`take_file_rows`]) when its chunk is pulled; a point or scan
-    /// read is [`file_base_read`](Self::file_base_read)'s, cut to the cap.
+    /// read is [`FileReadScope::rows`](crate::store::read::rows::FileReadScope::rows)'s,
+    /// cut to the cap.
     #[cfg(feature = "file-io")]
     async fn file_base_chunks(
         &self,
@@ -241,27 +242,13 @@ impl VortexRdfStore {
         columns: &[&'static str],
         batch_rows: usize,
     ) -> Result<RowChunkStream> {
-        let (selection, by_id_columns, filter) = self.file_read_scope(base, columns).await?;
-        let file = &base.file;
-        let deleted = self.quads.deleted.as_ref();
-        let ids = match Self::exact_read(file, by_id_columns, filter, &selection, deleted)? {
+        let (scope, read) = self.file_read(base, columns).await?;
+        let ids = match read {
             ExactRead::Take(ids) => ids,
-            read => {
-                return Self::file_base_read(
-                    file,
-                    columns,
-                    by_id_columns,
-                    filter,
-                    &selection,
-                    deleted,
-                    read,
-                )
-                .await?
-                .chunks(batch_rows);
-            }
+            read => return scope.rows(read).await?.chunks(batch_rows),
         };
         let file = Arc::clone(&base.file);
-        let columns: Arc<[&'static str]> = Arc::from(by_id_columns);
+        let columns: Arc<[&'static str]> = Arc::from(scope.by_id_columns);
         Ok(stream::iter(id_windows(ids, batch_rows).enumerate())
             .then(move |(k, window)| {
                 let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));

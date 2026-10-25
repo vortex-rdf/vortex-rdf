@@ -256,25 +256,11 @@ impl VortexRdfStore {
             return self.masked_chunks(file, masks, tail).await;
         }
         let primary = self.layout.strategy().primary_column_names();
-        let (selection, by_id, filter) = self.file_read_scope(base, primary).await?;
-        let read = Self::exact_read(file, by_id, filter, &selection, deleted.as_ref())?;
-        if one_shot
-            && let Some(masks) =
-                Self::masks_first(file, filter, &selection, deleted.as_ref(), &read).await?
-        {
+        let (scope, read) = self.file_read(base, primary).await?;
+        if one_shot && let Some(masks) = scope.masks_first(&read).await? {
             return self.masked_chunks(file, &masks, tail).await;
         }
-        match Self::file_base_read(
-            file,
-            primary,
-            by_id,
-            filter,
-            &selection,
-            deleted.as_ref(),
-            read,
-        )
-        .await?
-        {
+        match scope.rows(read).await? {
             // Rows read by id decode as one chunk, with no scan machinery.
             BaseRead::Rows(rows) => Ok(with_tail(
                 stream::iter([T::decode_async(&self.layout, &rows).await]),
