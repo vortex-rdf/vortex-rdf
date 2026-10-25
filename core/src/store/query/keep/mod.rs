@@ -101,6 +101,18 @@ impl Keep {
     }
 }
 
+impl From<Buffer<TermCode>> for Keep {
+    /// The keep admitting exactly `codes`: a buffer that is already ascending
+    /// and unique becomes the set as it stands, shared rather than copied;
+    /// any other goes through [`Keep::set`].
+    fn from(codes: Buffer<TermCode>) -> Self {
+        if codes.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Keep::Set(codes);
+        }
+        Keep::set(codes.iter().copied())
+    }
+}
+
 /// A [`Keep`] as a per-row test: a range compare, a bitmap over a dense set's
 /// span, or a binary search of a sparse one.
 enum KeepTest<'a> {
@@ -198,6 +210,24 @@ mod tests {
         let (lo, hi) = (9, 4);
         assert!(Keep::range(lo..hi).is_empty());
         assert!(Keep::range(2..5).admits(4) && !Keep::range(2..5).admits(5));
+    }
+
+    #[test]
+    fn keep_from_a_buffer_shares_a_sorted_one_and_sorts_any_other() {
+        let sorted = Buffer::from(vec![1u64, 3, 5]);
+        let Keep::Set(shared) = Keep::from(sorted.clone()) else {
+            panic!("a code buffer is a set keep");
+        };
+        assert_eq!(
+            shared.as_ptr(),
+            sorted.as_ptr(),
+            "the sorted buffer was copied"
+        );
+        // Out of order, or ascending with a repeat: sorted and folded.
+        for codes in [vec![5u64, 1, 3, 3, 1], vec![1, 3, 3, 5]] {
+            assert_eq!(Keep::from(Buffer::from(codes)), Keep::Set(sorted.clone()));
+        }
+        assert!(Keep::from(Buffer::<TermCode>::empty()).is_empty());
     }
 
     #[test]
