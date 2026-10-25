@@ -22,8 +22,6 @@ use crate::store::{
     persist::native_file::NativeStoreFile,
 };
 
-use vortex_file::OpenOptionsSessionExt as _;
-
 use std::sync::Arc;
 
 use vortex_array::arrays::StructArray;
@@ -341,11 +339,7 @@ impl VortexRdfStore {
     /// whenever the caller already owns the bytes; `from_bytes` copies a
     /// borrowed slice into one.
     pub async fn from_bytes_owned(bytes: impl Into<vortex_buffer::ByteBuffer>) -> Result<Self> {
-        let bytes: vortex_buffer::ByteBuffer = bytes.into();
-        let file = VORTEX_SESSION
-            .open_options()
-            .open_buffer(bytes.clone())
-            .map_err(|error| read::open_failure(error, container::newer_root_id(&bytes)))?;
+        let file = read::open_store_buffer(bytes.into())?;
         // Refused before a row is read, for a fault of the roster too.
         let roster = ComponentRoster::of(&file)?;
         // The root scan is the transparent quad child.
@@ -359,14 +353,7 @@ impl VortexRdfStore {
         let quads = crate::store::array::with_subject_stamp(quads, typed.data().quads_sorted)?;
 
         // A reader of the roster's component in `slot`, over the buffer.
-        let reader = |slot: usize| -> vortex_error::VortexResult<vortex_layout::LayoutReaderRef> {
-            container::component_child(typed, slot)?.new_reader(
-                typed.data().components[slot].name.as_str().into(),
-                file.segment_source(),
-                file.session(),
-                &Default::default(),
-            )
-        };
+        let reader = |slot: usize| container::component_reader(&file, slot);
         let dict = match roster.dict {
             Some(slot) => Some(DictAccess::Resident(Arc::new(
                 TermDictionary::from_child_reader(reader(slot)?).await?,

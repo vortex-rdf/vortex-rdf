@@ -3,7 +3,7 @@
 //! a path named when it was opened ([`FileIdentity`]).
 
 use crate::error::Result;
-use crate::io::read::open_failure;
+use crate::io::read::{open_failure, open_store_buffer};
 
 /// Which file a path named when it was opened: the device and inode on Unix.
 /// A store keeps it to tell, before it rewrites its source file, whether the
@@ -119,17 +119,13 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
             std::io::ErrorKind::IsADirectory.into(),
         ));
     }
-    let options = crate::session::VORTEX_SESSION.open_options();
     let file = std::fs::File::open(path).map_err(|e| path_error("open", path, e))?;
     let absolute = std::path::absolute(path).map_err(|e| path_error("resolve", path, e))?;
     match access {
         FileAccess::Mapped => {
             let identity = file.metadata().ok().as_ref().and_then(FileIdentity::of);
             let mmap = map_file(&file).map_err(|e| path_error("map", path, e))?;
-            let bytes = vortex_buffer::ByteBuffer::from(mmap);
-            let opened = options
-                .open_buffer(bytes.clone())
-                .map_err(|e| open_failure(e, super::container::newer_root_id(&bytes)))?;
+            let opened = open_store_buffer(vortex_buffer::ByteBuffer::from(mmap))?;
             Ok(OpenedFile {
                 file: opened,
                 mapped: true,
@@ -139,7 +135,11 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
         }
         FileAccess::Read => {
             drop(file);
-            match options.open_path(path).await {
+            match crate::session::VORTEX_SESSION
+                .open_options()
+                .open_path(path)
+                .await
+            {
                 Ok(opened) => Ok(OpenedFile {
                     path: Some(absolute),
                     ..opened.into()

@@ -191,6 +191,20 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
     ))
 }
 
+/// `bytes` opened as a Vortex file, a failure naming a newer vortex-rdf when
+/// one wrote them ([`open_failure`]): how a store's bytes are opened, whether
+/// handed over or mapped from a file.
+pub(crate) fn open_store_buffer(
+    bytes: vortex_buffer::ByteBuffer,
+) -> Result<vortex_file::VortexFile> {
+    use vortex_file::OpenOptionsSessionExt as _;
+
+    crate::session::VORTEX_SESSION
+        .open_options()
+        .open_buffer(bytes.clone())
+        .map_err(|error| open_failure(error, super::container::newer_root_id(&bytes)))
+}
+
 /// The error for a file Vortex could not open: the one that says a newer
 /// vortex-rdf wrote it when `newer_root` names its root layout
 /// ([`newer_root_id`](super::container::newer_root_id)), Vortex's own

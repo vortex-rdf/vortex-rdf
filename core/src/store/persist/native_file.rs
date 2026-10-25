@@ -620,12 +620,7 @@ impl NativeStoreFile {
         if let Some(reader) = cell.get() {
             return Ok(reader.clone());
         }
-        let reader = self.slot_layout(slot)?.new_reader(
-            self.root().data().components[slot].name.as_str().into(),
-            self.file.segment_source(),
-            self.file.session(),
-            &Default::default(),
-        )?;
+        let reader = container::component_reader(&self.file, slot)?;
         Ok(cell.get_or_init(|| reader).clone())
     }
 

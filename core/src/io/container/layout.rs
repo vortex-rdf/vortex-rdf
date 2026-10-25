@@ -201,6 +201,24 @@ pub(crate) fn component_child(root: &RdfStoreLayout, slot: usize) -> VortexResul
         .ok_or_else(|| vortex_error::vortex_err!("store root has no component child {slot}"))
 }
 
+/// A reader of the component in `slot` of a native store file's inventory
+/// ([`component_child`]), named as its descriptor names it and reading the
+/// file's own segments: the one construction of a component reader, which
+/// the native handle caches and the in-memory open adopts. `file` must be
+/// a native store file (its roster read, `ComponentRoster::of`).
+pub(crate) fn component_reader(
+    file: &vortex_file::VortexFile,
+    slot: usize,
+) -> VortexResult<LayoutReaderRef> {
+    let root = file.footer().layout().as_::<RdfStoreLayoutVTable>();
+    component_child(root, slot)?.new_reader(
+        root.data().components[slot].name.as_str().into(),
+        file.segment_source(),
+        file.session(),
+        &Default::default(),
+    )
+}
+
 /// Test-only: the decoded root metadata of serialized store bytes, the
 /// `quads_sorted` bit and the component inventory.
 #[cfg(test)]
