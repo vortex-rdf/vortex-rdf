@@ -748,9 +748,9 @@ fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let col = field_as::<VarBinViewArray>(struct_arr, name, &mut ctx)?;
     let reader = StrColReader::new(&col);
-    (0..col.len())
-        .map(|i| reader.str_at(i).map(str::to_string))
-        .collect()
+    Ok((0..col.len())
+        .map(|i| reader.str_at(i).to_string())
+        .collect())
 }
 
 fn read_code_column(struct_arr: &StructArray, name: &str) -> Result<Vec<TermCode>> {

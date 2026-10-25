@@ -645,7 +645,7 @@ fn reference_pairs(
         let col: VarBinViewArray = field_as(rows, "val", &mut ctx).unwrap();
         let reader = StrColReader::new(&col);
         (0..col.len())
-            .map(|i| Val::Term(reader.str_at(i).unwrap().to_owned()))
+            .map(|i| Val::Term(reader.str_at(i).to_owned()))
             .collect()
     } else {
         let col: PrimitiveArray = field_as(rows, "val", &mut ctx).unwrap();
@@ -1320,7 +1320,7 @@ fn chunk_strings(chunks: &[vortex_array::ArrayRef], name: &str) -> Vec<String> {
         let col = field_as::<VarBinViewArray>(&s, name, &mut ctx).unwrap();
         let reader = StrColReader::new(&col);
         for i in 0..col.len() {
-            out.push(reader.str_at(i).unwrap().to_string());
+            out.push(reader.str_at(i).to_string());
         }
     }
     out

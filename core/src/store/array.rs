@@ -46,8 +46,8 @@ impl<'a> StrColReader<'a> {
     /// ([`trusted_str`]); a decoder's oxrdf constructors make the single owned
     /// copy.
     #[inline]
-    pub(crate) fn str_at(&self, i: usize) -> Result<&'a str> {
-        buf_as_str(self.bytes_at(i))
+    pub(crate) fn str_at(&self, i: usize) -> &'a str {
+        trusted_str(self.bytes_at(i))
     }
 }
 
@@ -223,13 +223,6 @@ pub(crate) fn trusted_str(buf: &[u8]) -> &str {
     // SAFETY: the caller's precondition above: `buf` is a value of a `Utf8`
     // column of a store this crate wrote or the caller trusts.
     unsafe { std::str::from_utf8_unchecked(buf) }
-}
-
-/// [`trusted_str`] as a `Result`, so decode call sites that `?` their
-/// fallible neighbours stay uniform.
-#[inline]
-pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
-    Ok(trusted_str(buf))
 }
 
 /// Test hook: how many slices this thread's [`rechunk`] iterators cut, and a

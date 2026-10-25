@@ -327,7 +327,7 @@ fn child_table(component: &crate::store::indexes::IndexComponent) -> Vec<(String
                     let col: VarBinViewArray = field_as(rows, name.as_ref(), &mut ctx).unwrap();
                     let reader = StrColReader::new(&col);
                     (0..col.len())
-                        .map(|i| reader.str_at(i).unwrap().to_owned())
+                        .map(|i| reader.str_at(i).to_owned())
                         .collect()
                 } else {
                     let col: PrimitiveArray = field_as(rows, name.as_ref(), &mut ctx).unwrap();

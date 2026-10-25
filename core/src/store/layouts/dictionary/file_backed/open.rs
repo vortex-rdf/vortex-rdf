@@ -384,11 +384,8 @@ mod tests {
             .execute::<VarBinViewArray>(&mut ctx)
             .unwrap();
         for w in 0..6 {
-            assert_eq!(StrColReader::new(&mins).str_at(w).unwrap(), terms[w * 100]);
-            assert_eq!(
-                StrColReader::new(&maxes).str_at(w).unwrap(),
-                terms[w * 100 + 99]
-            );
+            assert_eq!(StrColReader::new(&mins).str_at(w), terms[w * 100]);
+            assert_eq!(StrColReader::new(&maxes).str_at(w), terms[w * 100 + 99]);
         }
     }
 
@@ -501,7 +498,7 @@ mod tests {
         let column = StrColReader::new(&plain);
         // The edge terms are answered from the bounds read at open.
         for code in (0..6).flat_map(|w| [w * 100, w * 100 + 99]) {
-            let term = column.str_at(code).unwrap();
+            let term = column.str_at(code);
             assert_eq!(
                 fbd.encode_exact(term).await.unwrap(),
                 Some(code as TermCode)
@@ -509,7 +506,7 @@ mod tests {
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 0);
         for code in 0..600 {
-            let term = column.str_at(code).unwrap();
+            let term = column.str_at(code);
             assert_eq!(
                 fbd.encode_exact(term).await.unwrap(),
                 Some(code as TermCode),
@@ -521,7 +518,7 @@ mod tests {
         let codes: Vec<TermCode> = (0..600).collect();
         let decoded = fbd.decode_many(&codes).await.unwrap();
         for (code, term) in decoded.iter().enumerate() {
-            assert_eq!(&**term, column.str_at(code).unwrap(), "code {code}");
+            assert_eq!(&**term, column.str_at(code), "code {code}");
         }
         assert_eq!(fbd.encode_exact("<http://zzz>").await.unwrap(), None);
         assert_eq!(

@@ -162,23 +162,17 @@ impl ObjectReader<'_> {
     fn term_at(&self, i: usize) -> Result<Term> {
         compose_object(
             self.kinds[i],
-            self.values.str_at(i)?,
-            nullable_str_at(self.datatypes.as_ref(), i)?,
-            nullable_str_at(self.langs.as_ref(), i)?,
+            self.values.str_at(i),
+            nullable_str_at(self.datatypes.as_ref(), i),
+            nullable_str_at(self.langs.as_ref(), i),
         )
     }
 }
 
 /// Row `i` of a nullable string column: `None` for a missing column or an
 /// empty value.
-fn nullable_str_at<'a>(col: Option<&StrColReader<'a>>, i: usize) -> Result<Option<&'a str>> {
-    match col {
-        Some(c) => {
-            let s = c.str_at(i)?;
-            Ok(if s.is_empty() { None } else { Some(s) })
-        }
-        None => Ok(None),
-    }
+fn nullable_str_at<'a>(col: Option<&StrColReader<'a>>, i: usize) -> Option<&'a str> {
+    col.map(|c| c.str_at(i)).filter(|s| !s.is_empty())
 }
 
 /// The object terms of every row in N-Triples form, recomposed from
@@ -227,10 +221,10 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
     (0..n)
         .map(|i| {
             Ok(Quad::new(
-                subject(subjects.str_at(i)?, Trust::Stored)?,
-                named_node(predicates.str_at(i)?, Trust::Stored)?,
+                subject(subjects.str_at(i), Trust::Stored)?,
+                named_node(predicates.str_at(i), Trust::Stored)?,
                 objects.term_at(i)?,
-                graph_name(graphs.str_at(i)?, Trust::Stored)?,
+                graph_name(graphs.str_at(i), Trust::Stored)?,
             ))
         })
         .collect()

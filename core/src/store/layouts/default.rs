@@ -60,6 +60,6 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
     let g = StrColReader::new(&g_col);
 
     (0..n)
-        .map(|i| quad_from_terms(s.str_at(i)?, p.str_at(i)?, o.str_at(i)?, g.str_at(i)?))
+        .map(|i| quad_from_terms(s.str_at(i), p.str_at(i), o.str_at(i), g.str_at(i)))
         .collect()
 }

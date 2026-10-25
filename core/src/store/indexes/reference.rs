@@ -295,7 +295,7 @@ mod tests {
             assert_eq!(rids.len(), quads.len());
             let mut repeats = 0;
             for row in 1..rids.len() {
-                let (before, at) = (vals.str_at(row - 1).unwrap(), vals.str_at(row).unwrap());
+                let (before, at) = (vals.str_at(row - 1), vals.str_at(row));
                 assert!(before <= at, "{name}: values ascend at row {row}");
                 if before == at {
                     repeats += 1;
