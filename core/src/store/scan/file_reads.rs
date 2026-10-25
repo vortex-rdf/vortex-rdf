@@ -23,7 +23,7 @@ use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
 use crate::store::scan::file_filter::{self, SplitMasks};
 use crate::store::scan::file_scans::collect_row_splits;
 use crate::store::scan::gather::primitive_from_u64_reads;
-use crate::store::scan::read_plan::{Footprint, POINT_READ_ROWS};
+use crate::store::scan::read_plan::{Footprint, POINT_READ_ROWS, ids_by_split};
 use crate::store::schema::{RowId, TermCode};
 
 /// The rows of `columns` at `rows`, the live rows
@@ -235,26 +235,16 @@ pub(crate) async fn take_file_rows(
     let splits = file.splits()?;
     // The ids grouped by split: the rows from the group's first to past its
     // last id, and each id's offset in them.
-    let mut groups: Vec<(Range<u64>, Vec<u64>)> = Vec::new();
-    let mut rest = ids;
-    let mut idx = 0;
-    while let Some(&first) = rest.first() {
-        idx += splits[idx..].partition_point(|s| s.end <= first);
-        let end = splits.get(idx).map_or(u64::MAX, |s| s.end);
-        let inside = rest.partition_point(|&id| id < end);
-        let last = rest[inside - 1];
-        groups.push((
-            first..last + 1,
-            rest[..inside].iter().map(|&id| id - first).collect(),
-        ));
-        rest = &rest[inside..];
-        idx += 1;
-    }
+    let groups = ids_by_split(ids, &splits).map(|(_, group)| {
+        let (first, last) = (group[0], group[group.len() - 1]);
+        let offsets: Vec<u64> = group.iter().map(|&id| id - first).collect();
+        (first..last + 1, offsets)
+    });
     let reader = file.layout_reader()?;
     let projection =
         file.bound_exprs()
             .bind(QUAD_SCOPE, &select(columns, root()), reader.dtype())?;
-    let mut tasks = Vec::with_capacity(groups.len());
+    let mut tasks = Vec::new();
     for (rows, offsets) in groups {
         let len = (rows.end - rows.start) as usize;
         let projected =

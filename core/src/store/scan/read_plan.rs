@@ -65,13 +65,9 @@ pub(crate) fn point_readable(
 
 impl ExactRead {
     /// The read of `columns` at `selection`, exact, with `filter` pending and
-    /// `deleted` tombstoned. Point reads serve a point-sized selection, or ids
-    /// at most [`POINT_IDS_PER_SPLIT`] per split they touch, when every column
-    /// has chunk probes and the filter is none or code equalities (checked per
-    /// row); a take serves ids at most one per [`TAKE_ROWS`] rows of their
-    /// splits under no filter. The rest is the filter's masks first under such
-    /// a filter of code equalities, and the scan otherwise. An id list taken
-    /// with nothing tombstoned is taken at its own buffer.
+    /// `deleted` tombstoned, as [`ReadKind::of`] chooses it, with the live
+    /// rows a read by id needs. An id list taken with nothing tombstoned is
+    /// taken at its own buffer.
     pub(crate) fn of(
         file: &NativeStoreFile,
         columns: &[&str],
@@ -81,14 +77,12 @@ impl ExactRead {
     ) -> Result<Self> {
         #[cfg(test)]
         exact_read_hooks::note();
-        let row_count = file.row_count() as usize;
-        let pointable = point_readable(file, columns, filter);
-        if pointable && let Some(rows) = selection.point_sized_live_rows(deleted, row_count) {
-            return Ok(ExactRead::Points(rows));
-        }
-        let live =
-            || selection.filter_rows(row_count, move |id| deleted.is_none_or(|d| !d.value(id)));
-        let read = match ReadKind::past_point_sized(file, filter, selection, pointable)? {
+        let live = || {
+            selection.filter_rows(file.row_count() as usize, move |id| {
+                deleted.is_none_or(|d| !d.value(id))
+            })
+        };
+        Ok(match ReadKind::of(file, columns, filter, selection)? {
             ReadKind::Points => ExactRead::Points(live()),
             ReadKind::Take => ExactRead::Take(match (selection, deleted) {
                 (RowSelection::Ids(ids), None) => ids.clone(),
@@ -96,8 +90,7 @@ impl ExactRead {
             }),
             ReadKind::Masks => ExactRead::Masks,
             ReadKind::Scan => ExactRead::Scan,
-        };
-        Ok(read)
+        })
     }
 
     /// Whether [`of`](Self::of) reads `columns` at `selection` with `filter`
@@ -114,8 +107,7 @@ impl ExactRead {
         if filter.is_none() || selection.is_point_sized() {
             return Ok(false);
         }
-        let pointable = point_readable(file, columns, filter);
-        Ok(ReadKind::past_point_sized(file, filter, selection, pointable)? == ReadKind::Masks)
+        Ok(ReadKind::of(file, columns, filter, selection)? == ReadKind::Masks)
     }
 }
 
@@ -129,33 +121,37 @@ enum ReadKind {
 }
 
 impl ReadKind {
-    /// [`ExactRead::of`]'s choice for `selection` with `filter` pending, once
-    /// a point-sized selection the reads by id can check is ruled out (it
-    /// reads point by point): `pointable` is whether they can check the
-    /// filter on the columns read ([`point_readable`]).
-    fn past_point_sized(
+    /// The read of `columns` at `selection` with `filter` pending, cheapest
+    /// first: point reads for a point-sized selection or ids that fit them
+    /// ([`Footprint::points_fit`]), when they can check the filter on the
+    /// columns read ([`point_readable`]); a take for ids that fit one
+    /// ([`Footprint::take_fits`]) under no filter; past those, the filter's
+    /// masks first for a filter the point reads can check, and the scan
+    /// otherwise. Only an id list reads the file's splits.
+    fn of(
         file: &NativeStoreFile,
+        columns: &[&str],
         filter: Option<&Expression>,
         selection: &RowSelection,
-        pointable: bool,
     ) -> Result<Self> {
-        let unread = if pointable && filter.is_some() {
+        let pointable = point_readable(file, columns, filter);
+        if pointable && selection.is_point_sized() {
+            return Ok(ReadKind::Points);
+        }
+        if let RowSelection::Ids(ids) = selection {
+            let footprint = Footprint::of(ids, &file.splits()?);
+            if pointable && footprint.points_fit() {
+                return Ok(ReadKind::Points);
+            }
+            if filter.is_none() && footprint.take_fits() {
+                return Ok(ReadKind::Take);
+            }
+        }
+        Ok(if pointable && filter.is_some() {
             ReadKind::Masks
         } else {
             ReadKind::Scan
-        };
-        let RowSelection::Ids(ids) = selection else {
-            return Ok(unread);
-        };
-        let splits = file.splits()?;
-        let footprint = Footprint::of(ids, &splits);
-        if pointable && footprint.few_per_split(POINT_IDS_PER_SPLIT) {
-            return Ok(ReadKind::Points);
-        }
-        if filter.is_none() && footprint.sparse(TAKE_ROWS) {
-            return Ok(ReadKind::Take);
-        }
-        Ok(unread)
+        })
     }
 }
 
@@ -181,9 +177,8 @@ pub(crate) mod exact_read_hooks {
 
 /// How the rows a pending filter's split masks keep are read, cheapest first,
 /// once the masks have applied the filter: point by point while the kept ids
-/// are point-sized or at most [`POINT_IDS_PER_SPLIT`] per split they touch,
-/// taken at their ids while at most one per [`TAKE_ROWS`] rows of those
-/// splits (the reads [`ExactRead`] makes of exact ids under no filter), and
+/// fit point reads, taken at their ids while they fit a take (the reads
+/// [`ExactRead`] makes of exact ids under no filter; see [`Footprint`]), and
 /// past that density each split projected at its own mask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaskedRead {
@@ -201,28 +196,10 @@ impl MaskedRead {
     /// The kept ids are weighed, as [`ExactRead`] weighs exact ids, against
     /// the natural splits holding them.
     pub(crate) fn of(file: &NativeStoreFile, masks: &SplitMasks) -> Result<Self> {
-        let splits = file.splits()?;
-        let (mut ids, mut touched, mut rows) = (0u64, 0u64, 0u64);
-        for (mask, range) in masks.iter() {
-            let kept = mask.true_count() as u64;
-            if kept == 0 {
-                continue;
-            }
-            ids += kept;
-            touched += 1;
-            let split = splits.partition_point(|s| s.end <= range.start);
-            rows += splits
-                .get(split)
-                .map_or(range.end - range.start, |s| s.end - s.start);
-        }
-        let footprint = Footprint {
-            ids,
-            splits: touched,
-            rows,
-        };
-        let read = if point_sized(ids) || footprint.few_per_split(POINT_IDS_PER_SPLIT) {
+        let footprint = Footprint::of_masks(masks, &file.splits()?);
+        let read = if footprint.points_fit() {
             MaskedRead::Points
-        } else if footprint.sparse(TAKE_ROWS) {
+        } else if footprint.take_fits() {
             MaskedRead::Take
         } else {
             MaskedRead::Project
@@ -259,8 +236,30 @@ pub(crate) mod masked_read_hooks {
     }
 }
 
-/// Where exact ids (ascending) sit among a file's splits: how many ids, how
-/// many splits hold them, and how many rows those splits have.
+/// `ids` (ascending) grouped by the split of `splits` (ascending, disjoint)
+/// holding them, in order: each split holding any of the ids, beside the ids
+/// it holds. The ids past the last split come last, as one group with no
+/// split.
+pub(super) fn ids_by_split<'a>(
+    ids: &'a [RowId],
+    splits: &'a [Range<u64>],
+) -> impl Iterator<Item = (Option<&'a Range<u64>>, &'a [RowId])> {
+    let (mut rest, mut idx) = (ids, 0);
+    std::iter::from_fn(move || {
+        let &first = rest.first()?;
+        idx += splits[idx..].partition_point(|s| s.end <= first);
+        let split = splits.get(idx);
+        let held = split.map_or(rest.len(), |s| rest.partition_point(|&id| id < s.end));
+        let (group, after) = rest.split_at(held);
+        rest = after;
+        idx += 1;
+        Some((split, group))
+    })
+}
+
+/// Where ids sit among a file's splits: how many ids, how many splits hold
+/// them, and how many rows those splits have. The reads by id weigh it
+/// against what scanning those splits costs.
 pub(super) struct Footprint {
     ids: u64,
     splits: u64,
@@ -268,25 +267,53 @@ pub(super) struct Footprint {
 }
 
 impl Footprint {
+    /// The footprint of exact `ids` (ascending) among `splits`; ids past the
+    /// last split hold no split and count only as ids.
     pub(super) fn of(ids: &[RowId], splits: &[Range<u64>]) -> Self {
-        let (mut touched, mut rows) = (0, 0);
-        let mut rest = ids;
-        let mut idx = 0;
-        while let Some(&first) = rest.first() {
-            idx += splits[idx..].partition_point(|s| s.end <= first);
-            let Some(split) = splits.get(idx) else {
-                break;
-            };
-            touched += 1;
-            rows += split.end - split.start;
-            rest = &rest[rest.partition_point(|&id| id < split.end)..];
-            idx += 1;
-        }
+        let held = ids_by_split(ids, splits).map_while(|(split, _)| split);
+        let (touched, rows) = held.fold((0, 0), |(n, rows), s| (n + 1, rows + (s.end - s.start)));
         Footprint {
             ids: ids.len() as u64,
             splits: touched,
             rows,
         }
+    }
+
+    /// The footprint of the ids a filter's split `masks` keep among the
+    /// file's natural `splits`: each mask with a match counts once, with the
+    /// rows of the natural split its range starts in (its own rows past the
+    /// last one).
+    fn of_masks(masks: &SplitMasks, splits: &[Range<u64>]) -> Self {
+        let mut footprint = Footprint {
+            ids: 0,
+            splits: 0,
+            rows: 0,
+        };
+        for (mask, range) in masks.iter() {
+            let kept = mask.true_count() as u64;
+            if kept == 0 {
+                continue;
+            }
+            footprint.ids += kept;
+            footprint.splits += 1;
+            let split = splits.partition_point(|s| s.end <= range.start);
+            footprint.rows += splits
+                .get(split)
+                .map_or(range.end - range.start, |s| s.end - s.start);
+        }
+        footprint
+    }
+
+    /// Whether the ids fit point reads: point-sized, or at most
+    /// [`POINT_IDS_PER_SPLIT`] per split holding them.
+    fn points_fit(&self) -> bool {
+        point_sized(self.ids) || self.few_per_split(POINT_IDS_PER_SPLIT)
+    }
+
+    /// Whether the ids fit a take: at most one per [`TAKE_ROWS`] rows of the
+    /// splits holding them.
+    fn take_fits(&self) -> bool {
+        self.sparse(TAKE_ROWS)
     }
 
     /// Whether the ids number at most one per `rows_per_id` rows of the splits
