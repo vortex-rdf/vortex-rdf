@@ -56,17 +56,8 @@ pub fn format_from_name(name: &str) -> Result<RdfFormat> {
 
 /// Every name [`format_from_name`] accepts, long spelling before its aliases:
 /// the list its error quotes.
-pub(crate) fn supported_format_names() -> &'static [&'static str] {
-    const NAMES: [&str; FORMAT_NAMES.len()] = {
-        let mut names = [""; FORMAT_NAMES.len()];
-        let mut i = 0;
-        while i < names.len() {
-            names[i] = FORMAT_NAMES[i].0;
-            i += 1;
-        }
-        names
-    };
-    &NAMES
+pub(crate) fn supported_format_names() -> [&'static str; FORMAT_NAMES.len()] {
+    FORMAT_NAMES.map(|(name, _)| name)
 }
 
 #[cfg(test)]
