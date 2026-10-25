@@ -1121,8 +1121,10 @@ A pattern binds whole terms. A query engine also pushes restrictions a
 pattern cannot express — a `VALUES` block, a `FILTER` on a term predicate,
 `LIMIT`/`OFFSET`, `ASK` — and the store applies those as derived views too,
 so they compose with `match_pattern` in either order and read through the
-same paths (`size`, `code_columns_gathered`, `quads`). `keep` and `window` live
-in [`core/src/store/query/narrowing.rs`](../core/src/store/query/narrowing.rs),
+same paths (`size`, `code_columns_gathered`, `quads`). `keep` lives in
+[`core/src/store/query/keep/`](../core/src/store/query/keep/mod.rs) (its
+in-memory and file backends in `memory.rs` and `file.rs`), `window` in
+[`core/src/store/query/window.rs`](../core/src/store/query/window.rs),
 `size_capped` and `exists` with the other counts in
 [`core/src/store/read/count.rs`](../core/src/store/read/count.rs); the
 batch form in [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs).
@@ -1298,7 +1300,9 @@ checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 | Pushed-down filters, `eq_conjunction`, point reads | [`core/src/store/scan/file_reads.rs`](../core/src/store/scan/file_reads.rs) |
 | Split evaluation, pruning | [`core/src/store/scan/file_filter.rs`](../core/src/store/scan/file_filter.rs) |
 | Typed residual/tail equality loops | [`core/src/store/scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs) |
-| `Keep`, `keep`, `window`, `empty_view` | [`core/src/store/query/narrowing.rs`](../core/src/store/query/narrowing.rs) |
+| `Keep`, `keep` | [`core/src/store/query/keep/mod.rs`](../core/src/store/query/keep/mod.rs), [`memory.rs`](../core/src/store/query/keep/memory.rs), [`file.rs`](../core/src/store/query/keep/file.rs) |
+| `window` | [`core/src/store/query/window.rs`](../core/src/store/query/window.rs) |
+| `empty_view` | [`core/src/store/mod.rs`](../core/src/store/mod.rs) |
 | `size`, `size_capped`, `exists`, `live_len_if_known` | [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
 | `Probe` (with `Probe::parse`), `match_many`, `count_many`, `run_probe`, `count_probe` | [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs) |
 | `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |

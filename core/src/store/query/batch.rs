@@ -7,7 +7,8 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
 use crate::common::terms::{self, Trust, at};
 use crate::error::Result;
-use crate::store::query::narrowing::{Keep, WindowCheck};
+use crate::store::query::keep::Keep;
+use crate::store::query::window::WindowCheck;
 use crate::store::schema::QuadColumn;
 
 use crate::store::IdsNeed;

@@ -312,7 +312,7 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
 /// answered by binary search inside the run; a set of two codes (8 steps)
 /// takes the pass over the run. Every keep equals brute force.
 async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
-    use crate::store::query::narrowing::narrow_hooks::sorted_run_keeps;
+    use crate::store::query::keep::keep_hooks::sorted_run_keeps;
     let quads: Vec<Quad> = (0..64)
         .map(|i| {
             make_quad(
@@ -406,7 +406,7 @@ async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
 /// of more codes than its searches would beat takes the pass.
 #[tokio::test]
 async fn test_subject_keep_over_every_row_searches_the_sorted_column() {
-    use crate::store::query::narrowing::narrow_hooks::sorted_run_keeps;
+    use crate::store::query::keep::keep_hooks::sorted_run_keeps;
     let store = memory_store(vec![]).await;
     let rows = row_list(&store).await;
     let (lo, hi) = store
@@ -447,7 +447,7 @@ async fn test_subject_keep_over_every_row_searches_the_sorted_column() {
 /// nothing.
 #[tokio::test]
 async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
-    use crate::store::query::narrowing::narrow_hooks::{decoded_pieces, probed_rows};
+    use crate::store::query::keep::keep_hooks::{decoded_pieces, probed_rows};
     let (_dir, path) = write_chunked_store_file(&fixture_quads(), 500).await;
     let store = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     for column in ["p", "g"] {
@@ -1025,7 +1025,7 @@ async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
 /// plain rows, in order, known exactly.
 #[tokio::test]
 async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
-    use crate::store::query::narrowing::narrow_hooks;
+    use crate::store::query::window::window_hooks;
 
     let (_dirs, stores) = window_stores().await;
     for (tag, store) in stores.iter().filter(|(tag, _)| !tag.contains("reference")) {
@@ -1042,7 +1042,7 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
                 "{label}: read by the filter's masks first"
             );
             for limit in [bound, bound + 1, usize::MAX] {
-                let windows = narrow_hooks::windows();
+                let windows = window_hooks::windows();
                 let windowed = store
                     .run_probe(&probe.clone().window(0, Some(limit)))
                     .await
@@ -1054,7 +1054,7 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
                 let got = windowed.view_statistics().unwrap();
                 if masks_first {
                     assert_eq!(
-                        narrow_hooks::windows(),
+                        window_hooks::windows(),
                         windows + 1,
                         "{label} limit {limit}: the filter's window"
                     );
@@ -1066,7 +1066,7 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
                     );
                 } else {
                     assert_eq!(
-                        narrow_hooks::windows(),
+                        window_hooks::windows(),
                         windows,
                         "{label} limit {limit}: no window built"
                     );

@@ -31,9 +31,9 @@ pub use layouts::dictionary::{
 };
 pub use persist::export::export_rdf;
 pub use query::batch::Probe;
+pub use query::keep::Keep;
 pub use query::located::{CodePattern, LocatedCodes};
 pub(crate) use query::matching::IdsNeed;
-pub use query::narrowing::Keep;
 pub use read::chunks::{CodeChunkStream, RowChunkStream};
 pub use read::metadata::{
     IndexComponentInfo, RowCountHint, SelectionKind, SortOrder, ViewStatistics,
@@ -204,6 +204,21 @@ impl VortexRdfStore {
         match &self.layout {
             ResolvedLayout::Dictionary(access) if self.is_code_view() => Some(access.reader()),
             _ => None,
+        }
+    }
+
+    /// An empty view of this store: the same base and tail, selecting no row
+    /// of either, so scans plan no work and `size()` answers 0 without
+    /// touching the data. Indexes and components are dropped, so chained
+    /// matches run no lookups, and no serve plan carries over.
+    pub(crate) fn empty_view(&self) -> Self {
+        let tail = self
+            .tail
+            .as_ref()
+            .map(|tail| tail.with_selection(view::selection::RowSelection::empty()));
+        Self {
+            indexes: vec![],
+            ..self.derived(self.quads.emptied(), tail)
         }
     }
 }

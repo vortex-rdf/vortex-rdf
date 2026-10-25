@@ -2,6 +2,7 @@
 //! batched probes.
 
 pub(crate) mod batch;
+pub(crate) mod keep;
 pub(crate) mod located;
 pub(crate) mod matching;
-pub(crate) mod narrowing;
+pub(crate) mod window;
