@@ -210,10 +210,7 @@ async fn test_view_statistics_in_memory() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let mut deleted = store.clone();
-    for quad in quads.iter().step_by(50).take(20) {
-        deleted = deleted.delete_quad(quad).await.unwrap();
-    }
+    let deleted = delete_all(&store, quads.iter().step_by(50).take(20)).await;
     for (base, tombstones) in [(&store, 0), (&deleted, 20)] {
         for (name, view) in views_of(base).await {
             let tag = format!("{tombstones} tombstones, {name}");
@@ -310,10 +307,7 @@ async fn test_view_statistics_file_backed() {
     let stores = file_stores().await;
     for (tag, _dir, store) in &stores {
         let mapped = tag.ends_with("/mapped");
-        let mut deleted = store.clone();
-        for quad in quads.iter().step_by(100).take(10) {
-            deleted = deleted.delete_quad(quad).await.unwrap();
-        }
+        let deleted = delete_all(store, quads.iter().step_by(100).take(10)).await;
         for (base, tombstones) in [(store, 0), (&deleted, 10)] {
             for (name, view) in views_of(base).await {
                 let tag = format!("{tag} {tombstones} tombstones, {name}");
@@ -609,10 +603,7 @@ async fn test_partitions_in_memory() {
         vec![IndexType::SecondaryByReference],
     ] {
         let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
-        let mut deleted = store.clone();
-        for quad in quads.iter().step_by(9).take(40) {
-            deleted = deleted.delete_quad(quad).await.unwrap();
-        }
+        let deleted = delete_all(&store, quads.iter().step_by(9).take(40)).await;
         for (base, tombstones) in [(&store, 0), (&deleted, 40)] {
             for (name, view) in views_of(base).await {
                 assert_partitions_tile(&view, &format!("{indexes:?} {tombstones} {name}")).await;
@@ -669,10 +660,7 @@ async fn test_partitions_in_memory() {
 async fn test_partitions_file_backed() {
     let quads = fixture_quads();
     for (tag, _dir, store) in file_stores().await {
-        let mut deleted = store.clone();
-        for quad in quads.iter().step_by(13).take(30) {
-            deleted = deleted.delete_quad(quad).await.unwrap();
-        }
+        let deleted = delete_all(&store, quads.iter().step_by(13).take(30)).await;
         for (base, tombstones) in [(&store, 0), (&deleted, 30)] {
             for (name, view) in views_of(base).await {
                 assert_partitions_tile(&view, &format!("{tag} {tombstones} {name}")).await;

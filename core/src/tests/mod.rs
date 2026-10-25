@@ -509,7 +509,7 @@ fn masks_tail() -> Vec<Quad> {
 /// three of the rows of `pm` with `"o0"`.
 async fn masks_deleted(store: &VortexRdfStore) -> VortexRdfStore {
     let gd = iri_graph("gd");
-    let mut store = store
+    let store = store
         .delete_matching(None, Some(&iri("pm")), Some(&plain_literal("o3")), None)
         .await
         .unwrap()
@@ -519,13 +519,12 @@ async fn masks_deleted(store: &VortexRdfStore) -> VortexRdfStore {
         .delete_matching(None, Some(&iri("p1")), Some(&plain_literal("sparse")), None)
         .await
         .unwrap();
-    let po = masks_quads()
+    let po: Vec<Quad> = masks_quads()
         .into_iter()
-        .filter(|q| q.predicate == iri("pm") && q.object == plain_literal("o0"));
-    for quad in po.take(3) {
-        store = store.delete_quad(&quad).await.unwrap();
-    }
-    store
+        .filter(|q| q.predicate == iri("pm") && q.object == plain_literal("o0"))
+        .take(3)
+        .collect();
+    delete_all(&store, &po).await
 }
 
 /// The rows of one leaf, and so of one split, of [`many_splits_file`].
@@ -613,6 +612,19 @@ async fn matched_size(
     g: Option<&GraphName>,
 ) -> usize {
     matched_view(store, s, p, o, g).await.size().await.unwrap()
+}
+
+/// `store` with each quad of `doomed` deleted, in turn: a
+/// [`delete_quad`](VortexRdfStore::delete_quad) each, unwrapped.
+async fn delete_all<'a>(
+    store: &VortexRdfStore,
+    doomed: impl IntoIterator<Item = &'a Quad>,
+) -> VortexRdfStore {
+    let mut store = store.clone();
+    for quad in doomed {
+        store = store.delete_quad(quad).await.unwrap();
+    }
+    store
 }
 
 /// The index child that answers `view`'s reads from its own columns, if any:

@@ -114,10 +114,11 @@ async fn test_file_narrowing_skips_tombstones() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let mut store = VortexRdfStore::from_file(&path).await.unwrap();
-    for quad in quads.iter().step_by(11).take(40) {
-        store = store.delete_quad(quad).await.unwrap();
-    }
+    let store = delete_all(
+        &VortexRdfStore::from_file(&path).await.unwrap(),
+        quads.iter().step_by(11).take(40),
+    )
+    .await;
     assert_eq!(store.size().await.unwrap(), quads.len() - 40);
     assert_keeps_match_brute_force(&store, "file/tombstoned").await;
     assert_windows_match_slicing(&store, "file/tombstoned").await;

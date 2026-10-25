@@ -487,10 +487,7 @@ async fn test_window_in_memory_matches_slicing() {
 async fn test_narrowing_skips_tombstones() {
     let quads = fixture_quads();
     let store = memory_store(vec![IndexType::SecondaryByCopy]).await;
-    let mut deleted = store.clone();
-    for quad in quads.iter().step_by(7).take(50) {
-        deleted = deleted.delete_quad(quad).await.unwrap();
-    }
+    let deleted = delete_all(&store, quads.iter().step_by(7).take(50)).await;
     assert_eq!(deleted.size().await.unwrap(), quads.len() - 50);
     assert_keeps_match_brute_force(&deleted, "tombstoned").await;
     assert_windows_match_slicing(&deleted, "tombstoned").await;
@@ -804,11 +801,12 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
         }))
         .collect();
     let (_dirs, stores) = window_stores().await;
-    for (tag, mut store) in stores {
-        for quad in &doomed {
-            store = store.delete_quad(quad).await.unwrap();
-        }
-        let store = store.add_quads(appended.clone()).await.unwrap();
+    for (tag, store) in stores {
+        let store = delete_all(&store, &doomed)
+            .await
+            .add_quads(appended.clone())
+            .await
+            .unwrap();
         for (shape, probe) in window_probes() {
             let label = format!("{tag} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
@@ -1055,10 +1053,8 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let (_dir, path) =
             write_store_file(fixture_quads(), layout, vec![IndexType::SecondaryByCopy]).await;
-        let mut tombstoned = VortexRdfStore::from_file(&path).await.unwrap();
-        for quad in &doomed {
-            tombstoned = tombstoned.delete_quad(quad).await.unwrap();
-        }
+        let tombstoned =
+            delete_all(&VortexRdfStore::from_file(&path).await.unwrap(), &doomed).await;
         let written = VortexRdfStore::from_file(&path).await.unwrap();
         for (variant, store) in [("as written", written), ("tombstoned", tombstoned)] {
             let label = format!("{layout:?} {variant}");
@@ -1140,10 +1136,11 @@ async fn test_masks_first_window_under_tombstones_counts_no_live_rows() {
 
     let quads = fixture_quads();
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let mut store = VortexRdfStore::from_file(&path).await.unwrap();
-    for quad in quads.iter().step_by(11).take(40) {
-        store = store.delete_quad(quad).await.unwrap();
-    }
+    let store = delete_all(
+        &VortexRdfStore::from_file(&path).await.unwrap(),
+        quads.iter().step_by(11).take(40),
+    )
+    .await;
     let p1 = iri("p1");
     let probe = Probe::new(None, Some(p1), None, None);
     let plain = store.run_probe(&probe).await.unwrap();

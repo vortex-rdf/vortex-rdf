@@ -451,14 +451,13 @@ async fn test_file_code_columns_match_memory() {
     }
     // Tombstones: the same deletions on a file store and in memory.
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let (mut file, mut mem) = (
-        VortexRdfStore::from_file(&path).await.unwrap(),
-        memory.clone(),
-    );
-    for quad in quads.iter().step_by(7).take(60) {
-        file = file.delete_quad(quad).await.unwrap();
-        mem = mem.delete_quad(quad).await.unwrap();
-    }
+    let doomed = quads.iter().step_by(7).take(60);
+    let file = delete_all(
+        &VortexRdfStore::from_file(&path).await.unwrap(),
+        doomed.clone(),
+    )
+    .await;
+    let mem = delete_all(&memory, doomed).await;
     check("file/tombstoned", &file, &mem).await;
 }
 
@@ -1571,11 +1570,8 @@ async fn test_kept_masks_never_outlive_a_derivation() {
         );
         // The store, the view's owner, deletes three of the view's rows, and
         // so does the twin's.
-        let (mut owner, mut twin_owner) = (store.clone(), memory.clone());
-        for quad in &quads[..3] {
-            owner = owner.delete_quad(quad).await.unwrap();
-            twin_owner = twin_owner.delete_quad(quad).await.unwrap();
-        }
+        let owner = delete_all(&store, &quads[..3]).await;
+        let twin_owner = delete_all(&memory, &quads[..3]).await;
         assert_eq!(row_list(&view).await, rows, "{shape}: the view's own rows");
         let again = owner.run_probe(&windowed).await.unwrap();
         let twin_again = twin_owner.run_probe(&windowed).await.unwrap();

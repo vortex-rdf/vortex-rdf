@@ -512,10 +512,7 @@ async fn test_chunks_skip_tombstones() {
         vec![IndexType::SecondaryByReference],
     ] {
         let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
-        let mut deleted = store.clone();
-        for quad in quads.iter().step_by(7).take(50) {
-            deleted = deleted.delete_quad(quad).await.unwrap();
-        }
+        let deleted = delete_all(&store, quads.iter().step_by(7).take(50)).await;
         assert_eq!(deleted.size().await.unwrap(), quads.len() - 50);
         for (name, view) in views_of(&deleted).await {
             let tag = format!("tombstoned {indexes:?} {name}");
