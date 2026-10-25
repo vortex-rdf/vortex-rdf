@@ -223,7 +223,7 @@ kept as its four ids. The buffer holds up to
 [`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L54) (1,048,576) quads,
 16 bytes each; a buffer that would overflow is sorted in its terms' order (an
 equal id is an equal term, never read), deduplicated and spilled as one run
-([`QuadSpiller`](../core/src/store/builders/runs.rs#L261)). A dataset that fits
+([`QuadSpiller`](../core/src/store/builders/runs.rs#L262)). A dataset that fits
 in a single buffer never touches the filesystem — the sorted buffer *is* the
 run. The distinct terms are the one thing this pipeline holds for the
 dataset's lifetime: in the interner during ingest, then as the Dictionary
@@ -241,13 +241,14 @@ term dictionary (a rank's code is its position), each term moved into the
 column and freed as it is copied.
 
 **Phase 2 — merge.** A binary heap holds the head of every run, its ids read
-as ranks; popping it yields the globally next quad in `(s, p, o, g)` order. The
-quad runs are *distinct*: a run drops its repeats as it is sorted, and after
-each pop the merge pops every other copy of that quad off the heap (equal quads
-are adjacent in the merged order, so they are the heads of their runs), so a
-quad that arrives more than once, in one run or in several, is emitted once.
-Row ids are assigned after this, so the index families' records — spilled and
-merged as they are, never deduplicated — are unique because their row ids are.
+as ranks (a lone run is read straight through); popping it yields the globally
+next quad in `(s, p, o, g)` order. The quads come out *distinct*: a run drops
+its repeats as it is sorted, and equal quads are adjacent in the merged order,
+so the merge skips any quad equal to the one it emitted last, and a quad that
+arrives more than once, in one run or in several, is emitted once. Row ids are
+assigned after this, so the index families' records, spilled and merged the
+same way, are unique because their row ids are: none equals the one before
+it.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229)):
@@ -261,7 +262,7 @@ first merge runs to completion
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's ranks are pushed into one spiller per requested family
-([`EntrySpiller`](../core/src/store/builders/runs.rs#L493)), each spilling its
+([`EntrySpiller`](../core/src/store/builders/runs.rs#L494)), each spilling its
 own sorted runs:
 
 | Family | Spilled entry | Run files |
