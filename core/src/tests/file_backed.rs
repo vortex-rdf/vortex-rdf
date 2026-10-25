@@ -415,13 +415,6 @@ async fn test_match_file_dictionary() {
 async fn test_file_code_columns_match_memory() {
     let quads = fixture_quads();
     let memory = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let rows = |c: [vortex_buffer::Buffer<TermCode>; 4]| -> Vec<[TermCode; 4]> {
-        let mut rows: Vec<[TermCode; 4]> = (0..c[0].len())
-            .map(|i| [c[0][i], c[1][i], c[2][i], c[3][i]])
-            .collect();
-        rows.sort_unstable();
-        rows
-    };
     // Patterns from the fixture's own quads, every 97th, in the four
     // subject-bound shapes, each also windowed past its first row.
     let patterns: Vec<(Option<NamedOrBlankNode>, Option<NamedNode>, Option<Term>)> = quads
@@ -447,23 +440,9 @@ async fn test_file_code_columns_match_memory() {
                         None => v,
                     }
                 };
-                let got = view(store)
-                    .await
-                    .code_columns_gathered()
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let want = view(memory)
-                    .await
-                    .code_columns_gathered()
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    rows(got),
-                    rows(want),
-                    "{tag}: {s:?} {p:?} {o:?} window {window:?}"
-                );
+                let got = sorted_rows(&view(store).await).await;
+                let want = sorted_rows(&view(memory).await).await;
+                assert_eq!(got, want, "{tag}: {s:?} {p:?} {o:?} window {window:?}");
             }
         }
     };
@@ -606,18 +585,10 @@ async fn test_locate_codes_matches_the_term_path() {
 
 async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], step: usize) {
     use crate::{CodePattern, Probe};
-    let sorted = |c: &[vortex_buffer::Buffer<TermCode>; 4]| -> Vec<[TermCode; 4]> {
-        let mut rows: Vec<[TermCode; 4]> = (0..c[0].len())
-            .map(|i| [c[0][i], c[1][i], c[2][i], c[3][i]])
-            .collect();
-        rows.sort_unstable();
-        rows
-    };
     let dict = store.dict_reader().unwrap();
-    let all = store.code_columns_gathered().await.unwrap().unwrap();
+    let all = row_list(store).await;
     let mut answered = std::collections::BTreeSet::new();
-    for row in (0..all[0].len()).step_by(step) {
-        let quad = [all[0][row], all[1][row], all[2][row], all[3][row]];
+    for quad in all.iter().step_by(step) {
         for mask in 1..16u8 {
             let slot = |i: usize| (mask & (1 << i) != 0).then_some(quad[i]);
             let pattern = CodePattern::new(slot(0), slot(1), slot(2), slot(3));
@@ -640,7 +611,7 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
             )
             .unwrap();
             let view = store.run_probe(&probe).await.unwrap();
-            let want = view.code_columns_gathered().await.unwrap().unwrap();
+            let want = sorted_rows(&view).await;
             let tag = format!("{tag} {pattern:?}");
             assert_eq!(
                 full.total,
@@ -652,7 +623,9 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
                 full.columns[0].len() as u64,
                 "{tag}: unwindowed rows"
             );
-            assert_eq!(sorted(&full.columns), sorted(&want), "{tag}: rows");
+            let mut located: Vec<[TermCode; 4]> = code_rows(&full.columns);
+            located.sort_unstable();
+            assert_eq!(located, want, "{tag}: rows");
             for page in [1usize, 3, 64] {
                 let mut seen = Vec::new();
                 let mut offset = 0;
@@ -669,18 +642,11 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
                         page.min(full.total as usize - offset),
                         "{tag}: page {page} at {offset}"
                     );
-                    seen.extend((0..n).map(|i| {
-                        [
-                            got.columns[0][i],
-                            got.columns[1][i],
-                            got.columns[2][i],
-                            got.columns[3][i],
-                        ]
-                    }));
+                    seen.extend(code_rows::<4>(&got.columns));
                     offset += page;
                 }
                 seen.sort_unstable();
-                assert_eq!(seen, sorted(&want), "{tag}: pages of {page}");
+                assert_eq!(seen, want, "{tag}: pages of {page}");
             }
         }
     }
@@ -754,11 +720,7 @@ enum ReadRows {
 
 async fn read_rows(view: &VortexRdfStore) -> ReadRows {
     match view.code_columns_gathered().await.unwrap() {
-        Some(c) => ReadRows::Codes(
-            (0..c[0].len())
-                .map(|i| [c[0][i], c[1][i], c[2][i], c[3][i]])
-                .collect(),
-        ),
+        Some(c) => ReadRows::Codes(code_rows(&c)),
         None => ReadRows::Quads(view.quads_vec().await.unwrap()),
     }
 }

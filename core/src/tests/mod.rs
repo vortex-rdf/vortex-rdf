@@ -1209,6 +1209,14 @@ async fn unprobed_object_store() -> VortexRdfStore {
     VortexRdfStore::from_built(pco_coded_build("o").await).unwrap()
 }
 
+/// The rows of `N` code columns, in order: row `i` holds code `i` of each
+/// column, in the columns' order.
+fn code_rows<const N: usize>(columns: &[vortex_buffer::Buffer<TermCode>]) -> Vec<[TermCode; N]> {
+    (0..columns[0].len())
+        .map(|i| std::array::from_fn(|c| columns[c][i]))
+        .collect()
+}
+
 /// The row tuples of a view's gathered codes, in the order gathered.
 async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     let cols = view
@@ -1216,9 +1224,16 @@ async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
         .await
         .unwrap()
         .expect("a Dictionary-layout view without a tail gathers codes");
-    (0..cols[0].len())
-        .map(|i| [cols[0][i], cols[1][i], cols[2][i], cols[3][i]])
-        .collect()
+    code_rows(&cols)
+}
+
+/// The row tuples of a view's gathered codes, sorted — order-free, since a
+/// served view gathers in its index's order and a narrowed one in base
+/// order.
+async fn sorted_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    let mut rows = row_list(view).await;
+    rows.sort_unstable();
+    rows
 }
 
 /// The view's rows in base row order: a keep that admits every code drops
@@ -1229,8 +1244,8 @@ async fn base_ordered_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
 }
 
 /// The rows of one [`code_chunks`](VortexRdfStore::code_chunks) chunk over
-/// `N` columns, in the chunk's column order. Asserts one buffer per column,
-/// all of one length.
+/// `N` columns, in the chunk's column order ([`code_rows`]). Asserts one
+/// buffer per column, all of one length.
 fn code_chunk_rows<const N: usize>(
     chunk: &[vortex_buffer::Buffer<TermCode>],
 ) -> Vec<[TermCode; N]> {
@@ -1240,9 +1255,7 @@ fn code_chunk_rows<const N: usize>(
         chunk.iter().all(|b| b.len() == n),
         "column buffers agree in length"
     );
-    (0..n)
-        .map(|i| std::array::from_fn(|c| chunk[c][i]))
-        .collect()
+    code_rows(chunk)
 }
 
 /// The rows of every `code_chunks` chunk a drained stream held, in order:

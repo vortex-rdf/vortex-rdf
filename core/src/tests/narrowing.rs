@@ -5,15 +5,6 @@
 use super::*;
 use crate::store::{Keep, QuadColumn, TermCode};
 
-/// The row tuples of a view's gathered codes, sorted — order-free, since a
-/// served view gathers in its index's order and a narrowed one in base
-/// order.
-async fn row_set(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let mut rows = row_list(view).await;
-    rows.sort_unstable();
-    rows
-}
-
 fn brute_keep(rows: &[[TermCode; 4]], column: QuadColumn, keep: &Keep) -> Vec<[TermCode; 4]> {
     rows.iter()
         .copied()
@@ -87,12 +78,12 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
         ),
     ];
     for (view_tag, view) in &views {
-        let rows = row_set(view).await;
+        let rows = sorted_rows(view).await;
         for column in QuadColumn::ALL {
             for keep in keeps_for(store, column).await {
                 let narrowed = view.keep(column, &keep).await.unwrap();
                 let want = brute_keep(&rows, column, &keep);
-                let got = row_set(&narrowed).await;
+                let got = sorted_rows(&narrowed).await;
                 assert_eq!(got, want, "{tag}/{view_tag}: keep {column:?} {keep:?}");
                 assert_eq!(
                     narrowed.size().await.unwrap(),
@@ -116,7 +107,7 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
                 let want_chained: Vec<[TermCode; 4]> =
                     want.iter().copied().filter(|r| r[1] == p1_code).collect();
                 assert_eq!(
-                    row_set(&chained).await,
+                    sorted_rows(&chained).await,
                     want_chained,
                     "{tag}/{view_tag}: chained match"
                 );
@@ -140,7 +131,7 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
             &keeps[1].1,
         );
         assert_eq!(
-            row_set(&narrowed).await,
+            sorted_rows(&narrowed).await,
             want,
             "{tag}/{view_tag}: keep_many"
         );
@@ -299,7 +290,7 @@ async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
     let s3 = iri_subject("s3");
     let run = matched_view(&store, Some(&s3), None, None, None).await;
     assert_eq!(run.debug_selection_range(), Some(24..32), "{tag}");
-    let rows = row_set(&run).await;
+    let rows = sorted_rows(&run).await;
     let dict = store.dict_reader().unwrap();
     let mut p = Vec::new();
     for i in 0..8 {
@@ -320,7 +311,7 @@ async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
             "{tag}: keep {keep:?}"
         );
         assert_eq!(
-            row_set(&narrowed).await,
+            sorted_rows(&narrowed).await,
             brute_keep(&rows, QuadColumn::P, &keep),
             "{tag}: keep {keep:?}"
         );
@@ -352,11 +343,11 @@ async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
     let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     for (tag, view) in [("whole", store.clone()), ("p-bound", by_p)] {
-        let rows = row_set(&view).await;
+        let rows = sorted_rows(&view).await;
         for keep in keeps_for(&store, QuadColumn::O).await {
             let narrowed = view.keep(QuadColumn::O, &keep).await.unwrap();
             assert_eq!(
-                row_set(&narrowed).await,
+                sorted_rows(&narrowed).await,
                 brute_keep(&rows, QuadColumn::O, &keep),
                 "{tag}: keep {keep:?}"
             );

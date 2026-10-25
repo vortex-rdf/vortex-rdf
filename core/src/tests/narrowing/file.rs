@@ -59,10 +59,10 @@ async fn test_keep_wide_set_on_file() {
             matched_view(&store, None, Some(&p1), None, None).await,
         ),
     ] {
-        let rows = row_set(&view).await;
+        let rows = sorted_rows(&view).await;
         let narrowed = view.keep(QuadColumn::S, &wide).await.unwrap();
         assert_eq!(
-            row_set(&narrowed).await,
+            sorted_rows(&narrowed).await,
             brute_keep(&rows, QuadColumn::S, &wide),
             "{tag}"
         );
@@ -239,18 +239,22 @@ async fn keep_spans_scan_splits(path: &std::path::Path) {
         ("window", store.window(10_000, 140_000).await.unwrap()),
     ];
     for (tag, view) in views {
-        let rows = row_set(&view).await;
+        let rows = sorted_rows(&view).await;
         let narrowed = view.keep(QuadColumn::O, &objects).await.unwrap();
         let expected = brute_keep(&rows, QuadColumn::O, &objects);
         assert!(!expected.is_empty() && expected.len() < rows.len(), "{tag}");
-        assert_eq!(row_set(&narrowed).await, expected, "{tag}");
+        assert_eq!(sorted_rows(&narrowed).await, expected, "{tag}");
         let chained = narrowed.keep(QuadColumn::S, &subjects).await.unwrap();
         let chained_expected = brute_keep(&expected, QuadColumn::S, &subjects);
         assert!(
             !chained_expected.is_empty() && chained_expected.len() < expected.len(),
             "{tag} chained"
         );
-        assert_eq!(row_set(&chained).await, chained_expected, "{tag} chained");
+        assert_eq!(
+            sorted_rows(&chained).await,
+            chained_expected,
+            "{tag} chained"
+        );
     }
 }
 
@@ -815,7 +819,7 @@ async fn s_keeps_match_brute_force(path: &std::path::Path) {
         ("20,000", Keep::set((lo..hi).step_by(8)), false),
     ];
     for (tag, view) in &views {
-        let rows = row_set(view).await;
+        let rows = sorted_rows(view).await;
         for (name, keep, located) in &keeps {
             let before = store.debug_column_streams().unwrap();
             let narrowed = view.keep(QuadColumn::S, keep).await.unwrap();
@@ -829,7 +833,7 @@ async fn s_keeps_match_brute_force(path: &std::path::Path) {
                 // Every subject has one row, so every keep admits some.
                 assert!(!want.is_empty(), "{name}");
             }
-            assert_eq!(row_set(&narrowed).await, want, "{tag}: {name}");
+            assert_eq!(sorted_rows(&narrowed).await, want, "{tag}: {name}");
             assert_eq!(narrowed.size().await.unwrap(), want.len(), "{tag}: {name}");
         }
     }

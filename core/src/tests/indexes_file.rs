@@ -319,13 +319,6 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
     );
 }
 
-/// The code columns of `view` as sorted `(s, p, o, g)` rows.
-async fn sorted_code_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let mut rows = row_list(view).await;
-    rows.sort_unstable();
-    rows
-}
-
 /// A served file view whose row ids are still deferred — a located run past
 /// the point-read cap — answers its code columns from the copy family's run,
 /// by a scan of exactly the run: the ids stay unread and no primary row is
@@ -388,7 +381,7 @@ async fn test_copy_index_file_serves_code_columns_from_the_run() {
                     "{rows} {p:?} {o:?}"
                 );
                 let reads = file.debug_located_rid_reads().unwrap();
-                let codes = sorted_code_rows(&served).await;
+                let codes = sorted_rows(&served).await;
                 assert_eq!(
                     file.debug_located_rid_reads().unwrap(),
                     reads,
@@ -397,7 +390,7 @@ async fn test_copy_index_file_serves_code_columns_from_the_run() {
                 if pending {
                     assert_eq!(served.debug_row_ids_materialized(), Some(false));
                 }
-                let want = sorted_code_rows(&matched_view(in_memory, None, p, o, None).await).await;
+                let want = sorted_rows(&matched_view(in_memory, None, p, o, None).await).await;
                 assert_eq!(codes, want, "{rows} {p:?} {o:?}");
                 assert_eq!(codes.len(), served.size().await.unwrap());
             }
@@ -1489,9 +1482,9 @@ async fn test_reference_index_file_takes_sparse_ids() {
             }
             assert_eq!(view_strings(&in_memory_matched).await, want, "{label}");
             if through_chunks {
-                let codes = sorted_code_rows(&matched).await;
+                let codes = sorted_rows(&matched).await;
                 assert_eq!(codes.len(), rows, "{label}");
-                assert_eq!(codes, sorted_code_rows(&in_memory_matched).await, "{label}");
+                assert_eq!(codes, sorted_rows(&in_memory_matched).await, "{label}");
             }
         }
     }
