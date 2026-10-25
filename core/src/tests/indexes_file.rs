@@ -436,7 +436,7 @@ async fn test_file_subject_range_then_index_routing_above_gate() {
 #[tokio::test]
 async fn test_file_with_both_index_kinds() {
     let quads = modular_quads(24, 3, 4);
-    let both = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let both = ALL_INDEX_TYPES.to_vec();
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, both.clone()).await;
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(file.indexes(), both.as_slice());

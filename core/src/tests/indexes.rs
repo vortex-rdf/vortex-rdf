@@ -555,10 +555,7 @@ async fn run_index_matrix_test<B: VortexArrayBuilder + 'static>(builder_name: &'
             vec![IndexType::SecondaryByReference],
         ),
         ("secondary-by-copy", vec![IndexType::SecondaryByCopy]),
-        (
-            "both",
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-        ),
+        ("both", ALL_INDEX_TYPES.to_vec()),
     ];
 
     let mut cells = Vec::new();

@@ -58,7 +58,7 @@ async fn test_tombstoned_store_serialization_keeps_indexes_and_sortedness() {
 /// index set it was built with.
 #[tokio::test]
 async fn test_serialize_to_empty_keeps_indexes() {
-    let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let indexes = ALL_INDEX_TYPES.to_vec();
     for layout in [LayoutStrategy::Dictionary, LayoutStrategy::Default] {
         let store = built_store(modular_quads(6, 3, 4), layout, indexes.clone()).await;
         assert_eq!(store.indexes(), indexes.as_slice());
@@ -108,7 +108,7 @@ async fn test_narrowed_view_serializes_rows_only() {
     let store = built_store(
         quads.clone(),
         LayoutStrategy::Default,
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        ALL_INDEX_TYPES.to_vec(),
     )
     .await;
     let p1 = iri("p1");
@@ -353,7 +353,7 @@ async fn test_from_bytes_defers_index_child_materialization() {
     let bytes = built_store(
         modular_quads(12, 3, 4),
         LayoutStrategy::Default,
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        ALL_INDEX_TYPES.to_vec(),
     )
     .await
     .to_bytes()
@@ -601,12 +601,7 @@ async fn test_from_bytes_and_from_parts_answer_every_pattern_like_from_built() {
             )
         })
         .collect();
-    let canonical = built_store(
-        quads,
-        LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-    )
-    .await;
+    let canonical = built_store(quads, LayoutStrategy::Dictionary, ALL_INDEX_TYPES.to_vec()).await;
     let bytes = canonical.to_bytes().await.unwrap();
     let lean = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     let resident = VortexRdfStore::from_parts(lean.to_serializable_parts().await.unwrap()).unwrap();
@@ -724,7 +719,7 @@ async fn test_every_writer_stamps_index_children_with_the_index_version() {
             .map(|component| (component.name, component.version))
             .collect()
     };
-    let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let indexes = ALL_INDEX_TYPES.to_vec();
     for layout in LAYOUTS {
         let label = format!("{layout:?}");
         let quads = modular_quads(12, 3, 4);

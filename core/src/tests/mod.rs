@@ -4,6 +4,7 @@
 use super::*;
 use crate::io::quads_stream_to_vortex_writer;
 use crate::store::VortexArrayBuilder;
+use crate::store::indexes::ALL_INDEX_TYPES;
 use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::OnceLock;
@@ -46,14 +47,49 @@ const LAYOUTS: [LayoutStrategy; 3] = [
     LayoutStrategy::Dictionary,
 ];
 
+/// A store's index configuration in the suites' fixture matrix: no index,
+/// or one family alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexConfig {
+    NoIndex,
+    Copy,
+    Reference,
+}
+
+impl IndexConfig {
+    /// Every configuration, in the order the suites check them.
+    const ALL: [IndexConfig; 3] = [
+        IndexConfig::NoIndex,
+        IndexConfig::Copy,
+        IndexConfig::Reference,
+    ];
+
+    /// The index set a store of this configuration is built with.
+    fn types(self) -> Indexes {
+        match self {
+            IndexConfig::NoIndex => vec![],
+            IndexConfig::Copy => vec![IndexType::SecondaryByCopy],
+            IndexConfig::Reference => vec![IndexType::SecondaryByReference],
+        }
+    }
+
+    /// The configuration as a fixture's tag names it.
+    fn name(self) -> &'static str {
+        match self {
+            IndexConfig::NoIndex => "no-index",
+            IndexConfig::Copy => "copy",
+            IndexConfig::Reference => "reference",
+        }
+    }
+}
+
 /// Every index set worth building: none, each family alone, both.
 fn index_sets() -> Vec<Indexes> {
-    vec![
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-    ]
+    IndexConfig::ALL
+        .into_iter()
+        .map(IndexConfig::types)
+        .chain([ALL_INDEX_TYPES.to_vec()])
+        .collect()
 }
 
 /// The IRI `<http://example.org/{name}>`: the namespace of the suites'

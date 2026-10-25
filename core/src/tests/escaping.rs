@@ -96,7 +96,7 @@ async fn escaped_literals_roundtrip_with_secondary_indexes() {
         for indexes in [
             vec![IndexType::SecondaryByReference],
             vec![IndexType::SecondaryByCopy],
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            ALL_INDEX_TYPES.to_vec(),
         ] {
             run_escaped_literal_roundtrip(layout, indexes).await;
         }

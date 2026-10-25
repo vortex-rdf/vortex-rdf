@@ -119,7 +119,7 @@ async fn test_fixtures_match_regenerated_stores() {
             DICTIONARY_FIXTURE,
             "store-dictionary-both-indexes.vortex",
             LayoutStrategy::Dictionary,
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            ALL_INDEX_TYPES.to_vec(),
         ),
     ] {
         let regenerated = built_store(quads.clone(), layout, indexes).await;

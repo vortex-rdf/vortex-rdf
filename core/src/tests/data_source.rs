@@ -634,7 +634,7 @@ async fn test_component_data_sources() {
     let store = built_store(
         fixture_quads(),
         LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        ALL_INDEX_TYPES.to_vec(),
     )
     .await;
     assert_eq!(assert_component_tables(&store, "memory").await, 4);

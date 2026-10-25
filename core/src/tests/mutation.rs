@@ -756,7 +756,7 @@ async fn test_chained_compactions_of_a_mapped_store() {
     let (_dir, path) = write_store_file(
         expected.clone(),
         LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        ALL_INDEX_TYPES.to_vec(),
     )
     .await;
     let mut store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -808,7 +808,7 @@ async fn test_chained_compactions_of_a_mapped_store() {
 /// was loaded from is never touched.
 #[tokio::test]
 async fn test_chained_compactions_of_an_in_memory_store() {
-    let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let indexes = ALL_INDEX_TYPES.to_vec();
     let initial = compaction_batch(0, 12);
     let (_dir, path) =
         write_store_file(initial.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;

@@ -281,11 +281,7 @@ async fn test_chunks_in_memory_match_gathered() {
         matches!(count, Precision::Exact(_)),
         "multi-chunk: exact in memory"
     );
-    for indexes in [
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-    ] {
+    for indexes in IndexConfig::ALL.map(IndexConfig::types) {
         let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
         for (name, view) in views_of(&store).await {
             let tag = format!("memory {indexes:?} {name}");
@@ -507,11 +503,7 @@ async fn test_chunks_surface_a_failed_cut() {
 #[tokio::test]
 async fn test_chunks_skip_tombstones() {
     let quads = fixture_quads();
-    for indexes in [
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-    ] {
+    for indexes in IndexConfig::ALL.map(IndexConfig::types) {
         let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
         let deleted = delete_all(&store, quads.iter().step_by(7).take(50)).await;
         assert_eq!(deleted.size().await.unwrap(), quads.len() - 50);

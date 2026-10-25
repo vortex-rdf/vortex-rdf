@@ -258,7 +258,7 @@ async fn every_store_write_path_takes_the_id_column_override() {
             )
         })
         .collect();
-    let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let indexes = ALL_INDEX_TYPES.to_vec();
     let leaves_of = |leaves: &[(String, Vec<u64>)], key: &str| {
         leaves
             .iter()

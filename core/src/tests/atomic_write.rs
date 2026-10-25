@@ -53,15 +53,13 @@ where
         .await
 }
 
-const BOTH_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
-
 /// A build whose input fails mid-stream — after valid quads — writes nothing
 /// at a fresh path, under every layout, with and without indexes: no store
 /// file and no temp file.
 #[tokio::test]
 async fn test_failed_build_leaves_nothing_at_a_fresh_path() {
     for layout in LAYOUTS {
-        for indexes in [vec![], BOTH_INDEXES.to_vec()] {
+        for indexes in [vec![], ALL_INDEX_TYPES.to_vec()] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("store.vortex");
             let error = crate::io::quads_stream_to_vortex_file(
@@ -92,7 +90,7 @@ async fn test_failed_build_keeps_the_existing_store_byte_identical() {
     let (dir, path) = write_store_file(
         modular_quads(12, 3, 4),
         LayoutStrategy::Dictionary,
-        BOTH_INDEXES.to_vec(),
+        ALL_INDEX_TYPES.to_vec(),
     )
     .await;
     let before = std::fs::read(&path).unwrap();

@@ -479,7 +479,7 @@ async fn row_ids_past_u32_survive_compaction() {
     let extra = quads.pop().unwrap();
     for layout in LAYOUTS {
         let label = format!("{layout:?}");
-        let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+        let indexes = ALL_INDEX_TYPES.to_vec();
         let store = streamed_store(quads.clone(), layout, indexes.clone()).await;
         let grown = store.add_quad(extra.clone()).await.unwrap();
         let mut all = quads.clone();

@@ -300,11 +300,8 @@ async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
 
 #[tokio::test]
 async fn test_keep_in_memory_matches_brute_force() {
-    for (tag, indexes) in [
-        ("no-index", vec![]),
-        ("copy", vec![IndexType::SecondaryByCopy]),
-        ("reference", vec![IndexType::SecondaryByReference]),
-    ] {
+    for index in IndexConfig::ALL {
+        let (tag, indexes) = (index.name(), index.types());
         let store =
             streamed_store(fixture_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
         assert_keeps_match_brute_force(&store, tag).await;
@@ -454,12 +451,10 @@ async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
 
 #[tokio::test]
 async fn test_window_in_memory_matches_slicing() {
-    for (tag, indexes) in [
-        ("no-index", vec![]),
-        ("copy", vec![IndexType::SecondaryByCopy]),
-    ] {
-        let store = streamed_store(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
-        assert_windows_match_slicing(&store, tag).await;
+    for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
+        let store =
+            streamed_store(fixture_quads(), LayoutStrategy::Dictionary, index.types()).await;
+        assert_windows_match_slicing(&store, index.name()).await;
     }
 }
 

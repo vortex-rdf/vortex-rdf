@@ -454,11 +454,7 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
 #[tokio::test]
 async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
     let (s, p, o, _) = prefix_terms();
-    for indexes in [
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-    ] {
+    for indexes in IndexConfig::ALL.map(IndexConfig::types) {
         let (_dir, path) =
             write_store_file(prefix_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();

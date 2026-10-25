@@ -597,11 +597,7 @@ async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
 #[tokio::test]
 async fn test_partitions_in_memory() {
     let quads = fixture_quads();
-    for indexes in [
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-    ] {
+    for indexes in IndexConfig::ALL.map(IndexConfig::types) {
         let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
         let deleted = delete_all(&store, quads.iter().step_by(9).take(40)).await;
         for (base, tombstones) in [(&store, 0), (&deleted, 40)] {

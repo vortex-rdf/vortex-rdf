@@ -113,7 +113,7 @@ async fn test_dictionary_streaming_chunk_boundaries() {
 /// against the merged dictionary) alike.
 #[tokio::test]
 async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
-    let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let indexes = ALL_INDEX_TYPES.to_vec();
     // Fed in reverse so nothing is accidentally in order, and wide enough
     // (24 quads over a chunk size of 3) to force 8 runs.
     let mut quads = modular_quads(24, 3, 4);
@@ -193,10 +193,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 #[tokio::test]
 async fn test_sorted_stream_empty_dataset() {
     for layout in LAYOUTS {
-        for indexes in [
-            vec![],
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-        ] {
+        for indexes in [vec![], ALL_INDEX_TYPES.to_vec()] {
             let built = sorted_stream::build_array(
                 Box::new(quad_stream(vec![])),
                 layout,
@@ -416,7 +413,7 @@ async fn test_spilled_string_layouts_decode_terms_verbatim() {
         let built = sorted_stream::build_array(
             Box::new(stream::iter(raws.clone().into_iter().map(Ok))),
             layout,
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            ALL_INDEX_TYPES.to_vec(),
             BuildSizes::uniform(2),
         )
         .await
@@ -489,7 +486,7 @@ async fn test_input_error_after_spilling_removes_the_runs() {
         let result = sorted_stream::build_chunk_stream(
             Box::new(stream::iter(raws)),
             layout,
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            ALL_INDEX_TYPES.to_vec(),
             BuildSizes::uniform(3),
             None,
         )

@@ -56,8 +56,6 @@ const DATASET: &str = r#"<http://ex.org/s> <http://ex.org/p> "x" .
 const DATASET_LINES: usize = 14;
 const DATASET_DISTINCT: usize = 7;
 
-const ALL_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
-
 fn row(q: &RawQuad) -> Row {
     (q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone())
 }
@@ -407,7 +405,7 @@ async fn test_spilled_runs_collapse_repeats_across_runs() {
             let built = sorted_stream::build_array(
                 Box::new(raw_vec_stream(stream.clone())),
                 layout,
-                ALL_INDEXES.to_vec(),
+                ALL_INDEX_TYPES.to_vec(),
                 BuildSizes::uniform(run_capacity),
             )
             .await
@@ -445,7 +443,7 @@ async fn test_spilled_runs_collapse_repeats_across_runs() {
 async fn test_spilled_chunk_stream_is_cut_from_deduplicated_rows() {
     let (stream, expected) = spread_repeats().await;
     for layout in LAYOUTS {
-        for indexes in [vec![], ALL_INDEXES.to_vec()] {
+        for indexes in [vec![], ALL_INDEX_TYPES.to_vec()] {
             let who = format!("{layout:?} / {indexes:?}");
             let built = sorted_stream::build_chunk_stream(
                 Box::new(raw_vec_stream(stream.clone())),
@@ -484,7 +482,7 @@ async fn test_in_memory_sort_children_describe_deduplicated_rows() {
         let built = build_array::<SortedInMemoryBuilder>(
             raw_vec_stream(stream.clone()),
             layout,
-            ALL_INDEXES.to_vec(),
+            ALL_INDEX_TYPES.to_vec(),
         )
         .await
         .unwrap();
@@ -747,7 +745,7 @@ async fn test_compaction_after_appends_holds_each_quad_once() {
 
     for layout in LAYOUTS {
         let who = format!("{layout:?} / file");
-        let (_dir, path) = write_store_file(base.clone(), layout, ALL_INDEXES.to_vec()).await;
+        let (_dir, path) = write_store_file(base.clone(), layout, ALL_INDEX_TYPES.to_vec()).await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let compacted = store
             .add_quads(appended.clone())
