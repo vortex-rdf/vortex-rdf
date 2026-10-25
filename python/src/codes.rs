@@ -5,7 +5,6 @@
 
 use std::ops::Range;
 use std::os::raw::{c_int, c_void};
-use std::pin::pin;
 
 use pyo3::buffer::{ElementType, PyUntypedBuffer};
 use pyo3::exceptions::{PyIndexError, PySystemError, PyValueError};
@@ -16,7 +15,7 @@ use vortex_buffer::{Alignment, Buffer};
 use vortex_rdf_core::VortexRdfError as CoreError;
 use vortex_rdf_core::{CaseMap, DictReader, TermCode, TermPredicate, TextOptions, columns};
 
-use crate::{JoinTooLarge, RUNTIME, detached, py_err};
+use crate::{JoinTooLarge, detached, py_err};
 
 /// Buckets in the decode-sharing cache (see [`decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
@@ -117,44 +116,38 @@ pub(crate) fn decode_slice(
 ) -> PyResult<Vec<Option<Py<PyString>>>> {
     // `slots[i]` indexes `decoded` for the i-th code, so the mapping from
     // occurrence to decoded term survives the GIL boundary as plain data.
-    let (slots, decoded) = py
-        .detach(|| -> Result<_, CoreError> {
-            let mut slots: Vec<usize> = Vec::with_capacity(codes.len());
-            let mut distinct: Vec<TermCode> = Vec::new();
-            let mut recent = [(0 as TermCode, NO_SLOT); RECENT_BUCKETS];
-            for &code in codes {
-                // The low bits pick the bucket: masked before the
-                // narrowing, so they are the code's own.
-                let bucket = (code & (RECENT_BUCKETS as TermCode - 1)) as usize;
-                let (cached_code, cached_slot) = recent[bucket];
-                let slot = if cached_slot != NO_SLOT && cached_code == code {
-                    cached_slot
-                } else {
-                    let slot = distinct.len();
-                    distinct.push(code);
-                    // Overwrites whatever shared this bucket; a hit is
-                    // gated on the stored code, so a lost entry only
-                    // costs a re-decode.
-                    recent[bucket] = (code, slot);
-                    slot
-                };
-                slots.push(slot);
-            }
-            // One cursor over the resident terms, or one batched read of
-            // the file-backed child, its future pinned in place (see
-            // `detached`).
+    let (slots, decoded) = detached(py, || {
+        let mut slots: Vec<usize> = Vec::with_capacity(codes.len());
+        let mut distinct: Vec<TermCode> = Vec::new();
+        let mut recent = [(0 as TermCode, NO_SLOT); RECENT_BUCKETS];
+        for &code in codes {
+            // The low bits pick the bucket: masked before the
+            // narrowing, so they are the code's own.
+            let bucket = (code & (RECENT_BUCKETS as TermCode - 1)) as usize;
+            let (cached_code, cached_slot) = recent[bucket];
+            let slot = if cached_slot != NO_SLOT && cached_code == code {
+                cached_slot
+            } else {
+                let slot = distinct.len();
+                distinct.push(code);
+                // Overwrites whatever shared this bucket; a hit is
+                // gated on the stored code, so a lost entry only
+                // costs a re-decode.
+                recent[bucket] = (code, slot);
+                slot
+            };
+            slots.push(slot);
+        }
+        // One read of the distinct codes: a cursor over the resident terms,
+        // or one batched read of the file-backed child.
+        async move {
             let mut decoded = PackedTerms::new(distinct.len());
-            match reader.snapshot() {
-                Some(snapshot) => {
-                    snapshot.decode_many_with(&distinct, |i, term| decoded.set(i, term));
-                }
-                None => RUNTIME.block_on(pin!(
-                    reader.decode_many_with(&distinct, |i, term| decoded.set(i, term))
-                ))?,
-            }
-            Ok((slots, decoded))
-        })
-        .map_err(py_err)?;
+            reader
+                .decode_many_with(&distinct, |i, term| decoded.set(i, term))
+                .await?;
+            Ok::<_, CoreError>((slots, decoded))
+        }
+    })?;
 
     let build = |i: usize| decoded.get(i).map(|term| PyString::new(py, term).unbind());
 
@@ -178,6 +171,9 @@ impl TermDict {
     /// this dictionary's range. A code is an int from 0 to 2**64 - 1: a
     /// negative one, or one of 2**64 or more, raises `OverflowError`.
     fn decode(&self, py: Python<'_>, code: TermCode) -> PyResult<Option<String>> {
+        // A resident dictionary answers in place, the GIL held: for one code
+        // (or `encode`'s one term) that is cheaper than a detached call's GIL
+        // release and `block_on`.
         if let Some(snapshot) = self.reader.snapshot() {
             return Ok(snapshot.decode(code));
         }
@@ -268,12 +264,9 @@ impl TermDict {
                  2**64: {e}"
             ))
         })?;
-        let (passed, undecided) = py
-            .detach(|| match self.reader.snapshot() {
-                Some(snapshot) => snapshot.filter_codes(&predicate, codes.as_slice()),
-                None => RUNTIME.block_on(self.reader.filter_codes(&predicate, codes.as_slice())),
-            })
-            .map_err(py_err)?;
+        let (passed, undecided) = detached(py, || {
+            self.reader.filter_codes(&predicate, codes.as_slice())
+        })?;
         Ok((U64Column { codes: passed }, U64Column { codes: undecided }))
     }
 
