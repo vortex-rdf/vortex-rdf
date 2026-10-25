@@ -182,7 +182,7 @@ async fn test_file_keeps_bind_no_expressions() {
 /// exact across the retirement, and the memo stays within its cap.
 #[tokio::test]
 async fn test_distinct_constants_retire_the_reader_tree() {
-    let distinct = crate::store::persist::native_file::BIND_MEMO_MAX + 200;
+    let distinct = crate::store::persist::memo::BIND_MEMO_MAX + 200;
     let quads: Vec<Quad> = (0..distinct)
         .map(|i| {
             make_quad(
@@ -210,7 +210,7 @@ async fn test_distinct_constants_retire_the_reader_tree() {
     }
 
     assert!(
-        store.debug_bound_exprs().unwrap() <= crate::store::persist::native_file::BIND_MEMO_MAX,
+        store.debug_bound_exprs().unwrap() <= crate::store::persist::memo::BIND_MEMO_MAX,
         "the bound tree memo is capped"
     );
     assert!(
