@@ -1,6 +1,7 @@
 //! The builders: chunk-boundary behaviour of the streaming builder, the
 //! spill-and-merge path of the streaming one, the file writer's ordering,
-//! and the sorted stamp a build leaves on its subject column.
+//! the sorted stamp a build leaves on its subject column, and the
+//! push-based sink's wire form, the in-memory builder's.
 
 use super::*;
 use crate::store::builders::{BuildSizes, sorted_stream};
@@ -547,4 +548,28 @@ async fn test_peak_spill_is_term_ids_and_compact_entries() {
             assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 10, "{who}");
         }
     }
+}
+
+/// The push-based sink and the sorted in-memory builder serialize the same
+/// quads to the same bytes: the sink's single-chunk array, dictionary and
+/// components are the builder's.
+#[tokio::test]
+async fn test_dictionary_quad_sink_serializes_like_the_builder() {
+    let quads = dictionary_test_quads();
+    let mut sink = DictionaryQuadSink::new(vec![IndexType::SecondaryByCopy]);
+    for quad in &quads {
+        sink.push(crate::store::RawQuad::from_quad(quad));
+    }
+    let sunk = VortexRdfStore::from_built(sink.finish().unwrap()).unwrap();
+    let built = built_store(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    assert_eq!(
+        sunk.to_bytes().await.unwrap(),
+        built.to_bytes().await.unwrap(),
+        "the sink's wire form must be the builder's"
+    );
 }

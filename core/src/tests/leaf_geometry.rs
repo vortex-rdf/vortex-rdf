@@ -3,7 +3,9 @@
 //! per leaf, which holds 131,072 `u64` values; `child_strategy` writes the id
 //! columns (term codes and row ids) at 2 MiB, 262,144 rows per leaf for a
 //! plain column, keeps a dictionary's codes at the stock 1 MiB, and leaves
-//! every other column on the stock strategy.
+//! every other column on the stock strategy. The code columns' encodings are
+//! ones the probes read in place: no FastLanes delta, and one
+//! frame-of-reference reference an array.
 
 use std::sync::Arc;
 
@@ -290,4 +292,107 @@ async fn every_store_write_path_takes_the_id_column_override() {
             assert_eq!(leaves_of(leaves, key), [rows as u64], "{label}: {key}");
         }
     }
+}
+
+/// The store's own files keep their code columns on the encodings the
+/// probes read in place: no FastLanes delta in the quad child or the index
+/// children, however well it would compress a sorted column. The adoption
+/// keeps wire encodings the probes bind (delta included), so the trees seen
+/// here are the writer's.
+#[tokio::test]
+async fn test_written_code_columns_avoid_delta() {
+    let graphs: Vec<GraphName> = (0..4).map(|i| iri_graph(&format!("g{i}"))).collect();
+    let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
+    let store = streamed_store(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let bytes = store.to_bytes().await.unwrap();
+    let adopted = VortexRdfStore::from_bytes_owned(bytes).await.unwrap();
+    let parts = adopted.to_serializable_parts().await.unwrap();
+    let mut trees = vec![(
+        "quads".to_string(),
+        format!("{}", parts.array.display_tree_encodings_only()),
+    )];
+    for component in &parts.components {
+        use vortex_array::IntoArray as _;
+        let rows = component.rows().unwrap().clone().into_array();
+        trees.push((
+            component.identity.name.to_string(),
+            format!("{}", rows.display_tree_encodings_only()),
+        ));
+    }
+    for (name, tree) in &trees {
+        assert!(
+            !tree.contains("fastlanes.delta"),
+            "{name} carries a delta-encoded column:\n{tree}"
+        );
+    }
+    // A 32 Ki-row sorted subject column is what the stock cascade would
+    // delta-encode; the pinned edition leaves delta out, so it stays on a
+    // word-addressable encoding.
+    let quads_tree = &trees[0].1;
+    assert!(
+        [
+            "fastlanes.bitpacked",
+            "fastlanes.for",
+            "vortex.runend",
+            "vortex.sequence"
+        ]
+        .iter()
+        .any(|id| quads_tree.contains(id)),
+        "quads tree:\n{quads_tree}"
+    );
+}
+
+/// The store's own files keep frame-of-reference on one reference per
+/// array: the pinned core edition the store writes with leaves out the
+/// per-chunk wire form (`fastlanes.for.v2`), whose bounds searches the chunk
+/// probes can only answer through the composed values.
+/// The guard bites: with that form admitted, some of the fixture's
+/// frame-of-reference arrays take a reference per 1,024 rows.
+#[tokio::test]
+async fn test_written_frame_of_reference_keeps_one_reference() {
+    use vortex::encodings::fastlanes::{FoR, FoRArrayExt as _};
+    use vortex_array::{ArrayRef, IntoArray as _};
+
+    /// `(single, per_chunk)`: the frame-of-reference nodes in `array`'s
+    /// tree with one reference, and with a reference per chunk.
+    fn for_nodes(array: &ArrayRef, counts: &mut (usize, usize)) {
+        if let Some(view) = array.as_opt::<FoR>() {
+            if view.constant_reference().is_some() {
+                counts.0 += 1;
+            } else {
+                counts.1 += 1;
+            }
+        }
+        for child in array.children() {
+            for_nodes(&child, counts);
+        }
+    }
+
+    let graphs: Vec<GraphName> = (0..4).map(|i| iri_graph(&format!("g{i}"))).collect();
+    let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
+    let store = streamed_store(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let bytes = store.to_bytes().await.unwrap();
+    let adopted = VortexRdfStore::from_bytes_owned(bytes).await.unwrap();
+    let parts = adopted.to_serializable_parts().await.unwrap();
+    let mut counts = (0, 0);
+    for_nodes(&parts.array, &mut counts);
+    for component in &parts.components {
+        for_nodes(&component.rows().unwrap().clone().into_array(), &mut counts);
+    }
+    let (single, per_chunk) = counts;
+    assert_eq!(
+        per_chunk, 0,
+        "{per_chunk} frame-of-reference nodes carry per-chunk references"
+    );
+    assert!(single > 0, "the fixture wrote no frame-of-reference column");
 }
