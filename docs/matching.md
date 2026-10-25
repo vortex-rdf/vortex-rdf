@@ -1312,10 +1312,10 @@ checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 | `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
 | `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules, the regex subset | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs), [`numeric.rs`](../core/src/store/layouts/dictionary/predicates/numeric.rs), [`literal.rs`](../core/src/store/layouts/dictionary/predicates/literal.rs), [`text.rs`](../core/src/store/layouts/dictionary/predicates/text.rs), [`regex_filter.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter.rs) |
 | The RDF/XSD datatype IRIs the predicates and the TypedObject layout share | [`core/src/common/vocab.rs`](../core/src/common/vocab.rs) |
-| Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/columns.rs`](../core/src/columns.rs) |
-| `join_count`: a join's pair count, from the counting pass alone, no pair allocated | [`core/src/columns.rs`](../core/src/columns.rs) |
-| The `max_pairs` cap of `equi_join_indices` and `CodeGroups`: a pair count past it is refused before any output is allocated, as `Err(pairs)` (`JoinTooLarge` in Python) | [`core/src/columns.rs`](../core/src/columns.rs) |
-| `CodeGroups` (`build`, `count`, `join`): the right key column grouped by code once and probed by any number of left slices | [`core/src/columns.rs`](../core/src/columns.rs) |
-| `CodeGroups::gather`: the joined columns filled as the pairs are found, with no pair index columns built | [`core/src/columns.rs`](../core/src/columns.rs) |
+| Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/columns/mod.rs`](../core/src/columns/mod.rs), [`join.rs`](../core/src/columns/join.rs) |
+| `join_count`: a join's pair count, from the counting pass alone, no pair allocated | [`core/src/columns/join.rs`](../core/src/columns/join.rs) |
+| The `max_pairs` cap of `equi_join_indices` and `CodeGroups`: a pair count past it is refused before any output is allocated, as `Err(pairs)` (`JoinTooLarge` in Python) | [`core/src/columns/join.rs`](../core/src/columns/join.rs) |
+| `CodeGroups` (`build`, `count`, `join`): the right key column grouped by code once and probed by any number of left slices | [`core/src/columns/join.rs`](../core/src/columns/join.rs) |
+| `CodeGroups::gather`: the joined columns filled as the pairs are found, with no pair index columns built | [`core/src/columns/join.rs`](../core/src/columns/join.rs) |
 | View state (`QuadsSource`, its accessors, view constructors and `located_window`; `Tail`) | [`core/src/store/view/mod.rs`](../core/src/store/view/mod.rs) |
 | Read paths consuming the view | [`core/src/store/read/quads.rs`](../core/src/store/read/quads.rs), [`core/src/store/read/rows.rs`](../core/src/store/read/rows.rs), [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
