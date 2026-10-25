@@ -387,6 +387,6 @@ stays out of `cargo test --workspace`. The `interface-tests` job of
 | `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
 | The scan driver of a file view's reads | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs) |
 | `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
-| `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
+| `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs) |
 | `vortex_session`, the `vortex_scan` re-export | [`core/src/lib.rs`](../core/src/lib.rs) |
 | Conformance through DataFusion, the Arrow recipe, the example | [`interface-tests/Cargo.toml`](../interface-tests/Cargo.toml), [`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs), [`tests/arrow.rs`](../interface-tests/tests/arrow.rs), [`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs) |
