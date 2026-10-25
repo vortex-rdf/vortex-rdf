@@ -329,7 +329,47 @@ where
 /// A pending filter's evaluation over a selection: each evaluated split's
 /// surviving mask (one bit per row of its range, tombstoned rows cleared)
 /// beside the split's range, clamped to the selection, in file order.
-pub(crate) type SplitMasks = Vec<(Mask, Range<u64>)>;
+pub(crate) struct SplitMasks(Vec<(Mask, Range<u64>)>);
+
+impl SplitMasks {
+    /// Each evaluated split's mask beside its range, in file order.
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, (Mask, Range<u64>)> {
+        self.0.iter()
+    }
+
+    /// How many rows the masks keep.
+    pub(crate) fn kept(&self) -> usize {
+        self.0.iter().map(|(mask, _)| mask.true_count()).sum()
+    }
+
+    /// The first `want` row ids the masks keep, in file order, read off the
+    /// masks' bits (no index list is built on a mask).
+    pub(crate) fn first_ids(&self, want: usize) -> Vec<RowId> {
+        let mut ids = Vec::with_capacity(self.kept().min(want));
+        for (mask, range) in &self.0 {
+            if ids.len() >= want {
+                break;
+            }
+            push_kept_ids(&mut ids, mask, range);
+        }
+        ids.truncate(want);
+        ids
+    }
+
+    /// Whether the masks take less memory than the ids of the rows they
+    /// keep: a mask keeping some but not all of its range's rows holds a bit
+    /// a row of that range, a mask keeping all or none of them holds
+    /// nothing, and an id is 64 bits.
+    pub(crate) fn smaller_than_ids(&self) -> bool {
+        let bits: u64 = self
+            .0
+            .iter()
+            .filter(|(mask, _)| mask.values().is_some())
+            .map(|(_, range)| range.end - range.start)
+            .sum();
+        (self.kept() as u64).saturating_mul(64) >= bits
+    }
+}
 
 /// The masks of `filter` over every split the selection touches, in file
 /// order: the evaluation a window runs, run to the end.
@@ -353,7 +393,7 @@ pub(crate) async fn split_masks_until(
 ) -> Result<SplitMasks> {
     let mut masks = Vec::new();
     if want == 0 {
-        return Ok(masks);
+        return Ok(SplitMasks(masks));
     }
     let mut found = 0usize;
     fold_filter_splits_ordered(file, filter, selection, deleted, |mask, range| {
@@ -362,22 +402,7 @@ pub(crate) async fn split_masks_until(
         found < want
     })
     .await?;
-    Ok(masks)
-}
-
-/// The first `want` row ids `masks` keep, in file order, read off the masks'
-/// bits (no index list is built on a mask).
-pub(crate) fn first_ids(masks: &[(Mask, Range<u64>)], want: usize) -> Vec<RowId> {
-    let kept: usize = masks.iter().map(|(mask, _)| mask.true_count()).sum();
-    let mut ids = Vec::with_capacity(kept.min(want));
-    for (mask, range) in masks {
-        if ids.len() >= want {
-            break;
-        }
-        push_kept_ids(&mut ids, mask, range);
-    }
-    ids.truncate(want);
-    ids
+    Ok(SplitMasks(masks))
 }
 
 /// Append the row ids `mask` keeps over `range` to `ids`, ascending, read

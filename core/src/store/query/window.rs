@@ -9,8 +9,6 @@
 //! row keeps the view, the filter's evaluation with it.
 
 #[cfg(feature = "file-io")]
-use std::ops::Range;
-#[cfg(feature = "file-io")]
 use std::sync::Arc;
 
 #[cfg(feature = "file-io")]
@@ -214,7 +212,7 @@ impl VortexRdfStore {
     /// With `limit` matches the window is their ids, in base order, with no
     /// filter and the tail cut off. With fewer it cuts no base row: the view
     /// keeps its filter with the masks kept for its reads where the masks are
-    /// smaller than the matches' ids ([`masks_smaller_than_ids`]) and the
+    /// smaller than the matches' ids ([`SplitMasks::smaller_than_ids`]) and the
     /// filter is one the reads by id check ([`read_plan::point_readable`]),
     /// else holds those ids with no filter, and its tail is windowed to the
     /// rest of the limit.
@@ -232,10 +230,10 @@ impl VortexRdfStore {
         }
         let deleted = self.quads.deleted.as_ref();
         let masks = file_filter::split_masks_until(file, filter, selection, deleted, limit).await?;
-        let found: usize = masks.iter().map(|(mask, _)| mask.true_count()).sum();
+        let found = masks.kept();
         let primary = self.layout.strategy().primary_column_names();
         let keep_masks = found < limit
-            && masks_smaller_than_ids(&masks, found)
+            && masks.smaller_than_ids()
             && read_plan::point_readable(file, primary, Some(filter));
         let (quads, tail_limit) = if keep_masks {
             (
@@ -244,7 +242,7 @@ impl VortexRdfStore {
             )
         } else {
             let taken = found.min(limit);
-            let ids = Buffer::from(file_filter::first_ids(&masks, taken));
+            let ids = Buffer::from(masks.first_ids(taken));
             let selection = ViewSelection::Exact(RowSelection::from_ids(ids));
             (
                 self.quads.file_with(base, None, selection, None),
@@ -292,20 +290,6 @@ impl VortexRdfStore {
         let live = live.unwrap_or_else(|| selection.live_len(deleted, base_len));
         Ok((selection.window(offset, limit, deleted, base_len), live))
     }
-}
-
-/// Whether split masks that keep `found` rows take less memory than those
-/// rows' ids: a mask keeping some but not all of its range's rows holds a bit
-/// a row of that range, a mask keeping all or none of them holds nothing,
-/// and an id is 64 bits.
-#[cfg(feature = "file-io")]
-fn masks_smaller_than_ids(masks: &[(vortex_mask::Mask, Range<u64>)], found: usize) -> bool {
-    let bits: u64 = masks
-        .iter()
-        .filter(|(mask, _)| mask.values().is_some())
-        .map(|(_, range)| range.end - range.start)
-        .sum();
-    (found as u64).saturating_mul(64) >= bits
 }
 
 /// What a window's check ([`window_check`](VortexRdfStore::window_check))

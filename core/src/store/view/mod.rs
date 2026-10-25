@@ -220,7 +220,7 @@ impl QuadsSource {
             masks: Some(masks), ..
         }) = &self.backend
         {
-            return Some(masks.iter().map(|(mask, _)| mask.true_count()).sum());
+            return Some(masks.kept());
         }
         None
     }

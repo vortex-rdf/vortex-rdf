@@ -14,6 +14,7 @@ use vortex_mask::Mask;
 use crate::error::Result;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::eq_code_pairs;
+use crate::store::scan::file_filter::SplitMasks;
 use crate::store::schema::RowId;
 use crate::store::view::selection::{RowSelection, point_sized};
 
@@ -199,10 +200,10 @@ impl MaskedRead {
     /// mask beside its range, clamped to the view's selection, in file order.
     /// The kept ids are weighed, as [`ExactRead`] weighs exact ids, against
     /// the natural splits holding them.
-    pub(crate) fn of(file: &NativeStoreFile, masks: &[(Mask, Range<u64>)]) -> Result<Self> {
+    pub(crate) fn of(file: &NativeStoreFile, masks: &SplitMasks) -> Result<Self> {
         let splits = file.splits()?;
         let (mut ids, mut touched, mut rows) = (0u64, 0u64, 0u64);
-        for (mask, range) in masks {
+        for (mask, range) in masks.iter() {
             let kept = mask.true_count() as u64;
             if kept == 0 {
                 continue;

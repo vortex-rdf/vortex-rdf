@@ -22,7 +22,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::read::available_parallelism;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
-use crate::store::scan::file_filter;
+use crate::store::scan::file_filter::{self, SplitMasks};
 use crate::store::scan::file_scans::{collect_row_splits, read_all_rows};
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::scan::read_plan::{Footprint, POINT_READ_ROWS};
@@ -343,7 +343,7 @@ pub(crate) type SplitRead = BoxFuture<'static, VortexResult<Option<ArrayRef>>>;
 pub(crate) fn masked_split_tasks(
     file: &Arc<NativeStoreFile>,
     columns: &[&'static str],
-    masks: &[(Mask, Range<u64>)],
+    masks: &SplitMasks,
     take: bool,
 ) -> Result<(DType, Vec<SplitRead>)> {
     let reader = file.layout_reader()?;
@@ -353,7 +353,7 @@ pub(crate) fn masked_split_tasks(
     let dtype = projection.dtype().clone();
     let columns: Arc<[&'static str]> = Arc::from(columns);
     let mut tasks: Vec<SplitRead> = Vec::new();
-    for (mask, range) in masks {
+    for (mask, range) in masks.iter() {
         if mask.all_false() {
             continue;
         }
@@ -387,7 +387,7 @@ pub(crate) fn masked_split_tasks(
 pub(crate) async fn masked_projection(
     file: &Arc<NativeStoreFile>,
     columns: &[&'static str],
-    masks: &[(Mask, Range<u64>)],
+    masks: &SplitMasks,
 ) -> Result<ArrayRef> {
     let (dtype, tasks) = masked_split_tasks(file, columns, masks, false)?;
     collect_row_splits(dtype, tasks, 4 * available_parallelism()).await

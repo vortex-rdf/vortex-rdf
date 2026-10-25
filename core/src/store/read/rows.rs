@@ -5,8 +5,6 @@
 #[cfg(feature = "file-io")]
 use std::borrow::Cow;
 #[cfg(feature = "file-io")]
-use std::ops::Range;
-#[cfg(feature = "file-io")]
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -326,7 +324,7 @@ impl VortexRdfStore {
     ) -> Result<(FileReadScope<'a>, ExactRead)> {
         let (selection, by_id_columns, filter) = match &base.masks {
             Some(masks) => {
-                let ids = Buffer::from(file_filter::first_ids(masks, usize::MAX));
+                let ids = Buffer::from(masks.first_ids(usize::MAX));
                 (Cow::Owned(RowSelection::from_ids(ids)), columns, None)
             }
             None => {
@@ -409,11 +407,11 @@ impl VortexRdfStore {
     async fn masked_codes(
         file: &Arc<NativeStoreFile>,
         columns: &[&'static str],
-        masks: &[(Mask, Range<u64>)],
+        masks: &SplitMasks,
     ) -> Result<[Buffer<TermCode>; 4]> {
         let read = MaskedRead::of(file, masks)?;
         if read != MaskedRead::Project {
-            let ids = file_filter::first_ids(masks, usize::MAX);
+            let ids = masks.first_ids(usize::MAX);
             if read == MaskedRead::Points
                 && let Some(codes) =
                     file_reads::file_point_codes(file, columns, None, ids.clone()).await?

@@ -12,8 +12,6 @@ use crate::store::layouts::ChunkDecode;
 use crate::store::{Backend, MemoryBase, RawQuad, SharedQuad, Tail, VortexRdfStore};
 
 #[cfg(feature = "file-io")]
-use std::ops::Range;
-#[cfg(feature = "file-io")]
 use std::sync::Arc;
 
 #[cfg(feature = "file-io")]
@@ -33,7 +31,7 @@ use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_filter;
+use crate::store::scan::file_filter::SplitMasks;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_reads;
 #[cfg(feature = "file-io")]
@@ -286,13 +284,13 @@ impl VortexRdfStore {
     async fn masked_chunks<T: ChunkDecode>(
         &self,
         file: &Arc<NativeStoreFile>,
-        masks: &[(Mask, Range<u64>)],
+        masks: &SplitMasks,
         tail: Vec<Result<T>>,
     ) -> Result<Chunks<T>> {
         let primary = self.layout.strategy().primary_column_names();
         let read = MaskedRead::of(file, masks)?;
         if read == MaskedRead::Points {
-            let ids = file_filter::first_ids(masks, usize::MAX);
+            let ids = masks.first_ids(usize::MAX);
             if let Some(rows) = file_reads::file_point_rows(file, primary, None, ids).await? {
                 let chunk = T::decode_async(&self.layout, &rows).await;
                 return Ok(with_tail(stream::iter([chunk]), tail));
