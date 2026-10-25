@@ -395,6 +395,42 @@ impl ReadCounters {
     }
 }
 
+/// Each of `view`'s streams drained in turn: `code_chunks` and `row_chunks`
+/// at 4,096 rows a chunk and the data source's scan answer `codes`, and
+/// `quads()` answers `quads`. After each, `check` is handed the stream's name
+/// and the read counters from just before it.
+async fn assert_streams_answer(
+    view: &VortexRdfStore,
+    codes: &[[TermCode; 4]],
+    quads: &[Quad],
+    label: &str,
+    check: impl Fn(&str, ReadCounters),
+) {
+    let before = ReadCounters::now();
+    let (streamed, _) = collect_code_chunks(view, &QuadColumn::ALL, 4_096).await;
+    assert_eq!(streamed, codes, "{label}: code_chunks");
+    check("code_chunks", before);
+    let before = ReadCounters::now();
+    assert_eq!(
+        struct_chunk_codes(&collect_row_chunks(view, 4_096).await),
+        codes,
+        "{label}: row_chunks"
+    );
+    check("row_chunks", before);
+    let before = ReadCounters::now();
+    let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
+    assert_eq!(streamed, quads, "{label}: quads()");
+    check("quads()", before);
+    let before = ReadCounters::now();
+    let source = view.data_source().unwrap();
+    assert_eq!(
+        scan_codes(&source, ScanRequest::default()).await,
+        codes,
+        "{label}: the data source's scan"
+    );
+    check("data_source", before);
+}
+
 /// The streams over a view whose window kept its filter's masks (`code_chunks`,
 /// `row_chunks`, `quads()` and the data source's scan) read the masks' ids as
 /// exact ids with no filter: the plain view's rows, each reader evaluating no
@@ -438,29 +474,7 @@ async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
                 assert!(after.takes > before.takes, "{label}: the ids taken");
             }
         };
-        let before = ReadCounters::now();
-        let (kept_codes, _) = collect_code_chunks(&kept, &QuadColumn::ALL, 4_096).await;
-        assert_eq!(kept_codes, codes, "{shape}: code_chunks");
-        check("code_chunks", before);
-        let before = ReadCounters::now();
-        assert_eq!(
-            struct_chunk_codes(&collect_row_chunks(&kept, 4_096).await),
-            codes,
-            "{shape}: row_chunks"
-        );
-        check("row_chunks", before);
-        let before = ReadCounters::now();
-        let kept_quads: Vec<Quad> = kept.quads().try_collect().await.unwrap();
-        assert_eq!(kept_quads, quads, "{shape}: quads()");
-        check("quads()", before);
-        let before = ReadCounters::now();
-        let source = kept.data_source().unwrap();
-        assert_eq!(
-            scan_codes(&source, ScanRequest::default()).await,
-            codes,
-            "{shape}: the data source's scan"
-        );
-        check("data_source", before);
+        assert_streams_answer(&kept, &codes, &quads, shape, check).await;
     }
 }
 
@@ -541,29 +555,7 @@ async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
                 );
                 assert_eq!(after.masked, before.masked, "{label}: no masked read");
             };
-            let before = ReadCounters::now();
-            let (streamed, _) = collect_code_chunks(view, &QuadColumn::ALL, 4_096).await;
-            assert_eq!(streamed, codes, "{label}: code_chunks");
-            check("code_chunks", before);
-            let before = ReadCounters::now();
-            assert_eq!(
-                struct_chunk_codes(&collect_row_chunks(view, 4_096).await),
-                codes,
-                "{label}: row_chunks"
-            );
-            check("row_chunks", before);
-            let before = ReadCounters::now();
-            let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
-            assert_eq!(streamed, quads, "{label}: quads()");
-            check("quads()", before);
-            let before = ReadCounters::now();
-            let source = view.data_source().unwrap();
-            assert_eq!(
-                scan_codes(&source, ScanRequest::default()).await,
-                codes,
-                "{label}: the data source's scan"
-            );
-            check("data_source", before);
+            assert_streams_answer(view, &codes, &quads, label, check).await;
         }
     }
 }
