@@ -17,13 +17,7 @@ use vortex_session::VortexSession;
 /// the microtask-queue `WasmRuntime` on wasm32-unknown-unknown, where the file
 /// writer spawns tasks.
 pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<LayoutSession>()
-        .with::<ScalarFnSession>()
-        .with::<RuntimeSession>();
-    #[cfg(all(feature = "file-io", not(target_arch = "wasm32")))]
-    let session = session.with_tokio();
+    let session = registries();
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     let session = session.with_handle(vortex_io::runtime::wasm::WasmRuntime::handle());
     vortex_file::register_default_encodings(&session);
@@ -37,6 +31,17 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
 /// refused ([`newer_root_id`](crate::io::container::newer_root_id)), from a
 /// buffer or by positioned reads of a path.
 pub(crate) static FOREIGN_LAYOUT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = registries();
+    session.allow_unknown();
+    session
+});
+
+/// The registries both sessions start from: arrays, layouts, scalar
+/// functions and the runtime, which natively runs on tokio. The store
+/// session adds its encodings, its layout and its write editions (and its
+/// runtime handle on wasm32-unknown-unknown), the placeholder session its
+/// reading of unknown layouts.
+fn registries() -> VortexSession {
     let session = VortexSession::empty()
         .with::<ArraySession>()
         .with::<LayoutSession>()
@@ -44,9 +49,8 @@ pub(crate) static FOREIGN_LAYOUT_SESSION: LazyLock<VortexSession> = LazyLock::ne
         .with::<RuntimeSession>();
     #[cfg(all(feature = "file-io", not(target_arch = "wasm32")))]
     let session = session.with_tokio();
-    session.allow_unknown();
     session
-});
+}
 
 /// The frozen Vortex `core` edition the store writes with: every array
 /// encoding, layout, extension dtype and zone-map aggregate a store file may
