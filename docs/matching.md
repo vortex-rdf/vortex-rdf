@@ -1277,7 +1277,7 @@ other one's spelling is read and evaluated. No verdict is memoized. Kinds:
 candidate passes or fails only where the native rules agree with rdflib, and
 is undecided wherever rdflib may read it differently — rules in the
 [`predicates`](../core/src/store/layouts/dictionary/predicates/mod.rs) module and its
-[`regex_filter.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter.rs),
+[`regex_filter/mod.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter/mod.rs),
 checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 
 ---
@@ -1310,7 +1310,7 @@ checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 | `size`, `size_capped`, `exists`, `live_len_if_known` | [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
 | `Probe` (with `Probe::parse`), `match_many`, `count_many`, `run_probe`, `count_probe` | [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs) |
 | `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
-| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules, the regex subset | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs), [`numeric.rs`](../core/src/store/layouts/dictionary/predicates/numeric.rs), [`literal.rs`](../core/src/store/layouts/dictionary/predicates/literal.rs), [`text.rs`](../core/src/store/layouts/dictionary/predicates/text.rs), [`regex_filter.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter.rs) |
+| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules, the regex subset | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs), [`numeric.rs`](../core/src/store/layouts/dictionary/predicates/numeric.rs), [`literal.rs`](../core/src/store/layouts/dictionary/predicates/literal.rs), [`text.rs`](../core/src/store/layouts/dictionary/predicates/text.rs), [`regex_filter/mod.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter/mod.rs) |
 | The RDF/XSD datatype IRIs the predicates and the TypedObject layout share | [`core/src/common/vocab.rs`](../core/src/common/vocab.rs) |
 | Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/columns/mod.rs`](../core/src/columns/mod.rs), [`join.rs`](../core/src/columns/join.rs) |
 | `join_count`: a join's pair count, from the counting pass alone, no pair allocated | [`core/src/columns/join.rs`](../core/src/columns/join.rs) |

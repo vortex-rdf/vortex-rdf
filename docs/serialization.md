@@ -345,9 +345,9 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L234)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage/mod.rs#L234)):
 one symbol table is trained on the whole column and the terms are compressed in
-independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L36)
+independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36)
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
@@ -613,7 +613,7 @@ the segment target) are constants, tabulated in [file-format.md §11](file-forma
 | In-memory sort | [`core/src/store/builders/sorted_in_memory.rs`](../core/src/store/builders/sorted_in_memory.rs) |
 | External merge sort, index spill mergers and their pull-based component source | [`core/src/store/builders/sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`stream_indexes.rs`](../core/src/store/builders/stream_indexes.rs), [`spill.rs`](../core/src/store/builders/spill.rs) |
 | Layout columns | [`core/src/store/layouts/default.rs`](../core/src/store/layouts/default.rs), [`typed_object.rs`](../core/src/store/layouts/typed_object.rs), [`dictionary/codec.rs`](../core/src/store/layouts/dictionary/codec.rs) |
-| Dictionary construction, interning, FSST windows | [`core/src/store/layouts/dictionary/ingest.rs`](../core/src/store/layouts/dictionary/ingest.rs), [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs) |
+| Dictionary construction, interning, FSST windows | [`core/src/store/layouts/dictionary/ingest.rs`](../core/src/store/layouts/dictionary/ingest.rs), [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs) |
 | Index children | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Write driver and entry points, a store file's atomic replacement at its path | [`core/src/io/write.rs`](../core/src/io/write.rs), [`pending.rs`](../core/src/io/pending.rs) |
 | Container write strategy, component sources, wire metadata | [`core/src/io/container/write.rs`](../core/src/io/container/write.rs), [`sources.rs`](../core/src/io/container/sources.rs), [`wire.rs`](../core/src/io/container/wire.rs) |

@@ -262,13 +262,13 @@ are bare codes and cannot be decoded without it.
 | `name` / `role` | `dictionary` / `dictionary` |
 | `implementation` / `version` | `sorted-terms-fsst-v1` / 2 ([`DICT_VERSION`](../core/src/io/container/mod.rs#L47)); version 1, without zone maps, is read the same way, and a higher version is refused at open |
 | `required` / `sorted` | `true` / `true` |
-| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage.rs#L30): non-nullable `Utf8` |
+| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage/mod.rs#L30): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
-| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage.rs#L193)), not of the format |
+| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage/mod.rs#L193)), not of the format |
 
 The column is FSST-compressed **at the source**, in independent windows of
-65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L36))
+65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36))
 that share one symbol table trained on the whole column. The child is written
 through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L293)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
@@ -606,7 +606,7 @@ open rather than being read around.
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L16) |
 | row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L115) |
 | data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L111), [`child_strategy`](../core/src/io/container/sources.rs#L156) |
-| `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L36) |
+| `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs#L36) |
 | `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L47) |
@@ -631,7 +631,7 @@ open rather than being read around.
 | Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/file.rs`](../core/src/io/file.rs), [`read.rs`](../core/src/io/read.rs) |
 | The opened-file handle and its bounded memos | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs) |
 | Primary column names | [`core/src/store/schema.rs`](../core/src/store/schema.rs), [`layouts/typed_object.rs`](../core/src/store/layouts/typed_object.rs) |
-| Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage.rs`](../core/src/store/layouts/dictionary/storage.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |
+| Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
 | Locating and point-reading index runs on file | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
