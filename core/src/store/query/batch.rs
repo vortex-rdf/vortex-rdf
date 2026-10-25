@@ -8,7 +8,6 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use crate::common::terms::{self, Trust, at};
 use crate::error::Result;
 use crate::store::query::keep::Keep;
-use crate::store::query::window::WindowCheck;
 use crate::store::schema::QuadColumn;
 
 use crate::store::IdsNeed;
@@ -146,15 +145,9 @@ impl VortexRdfStore {
         // A window that cannot cut a row is the matched view itself.
         let limit = probe.limit.unwrap_or(usize::MAX);
         let view = if windowed {
-            match view.window_check(probe.offset, limit)? {
-                WindowCheck::CannotCut => view,
-                WindowCheck::MayCut {
-                    base_live,
-                    masks_first,
-                } => {
-                    view.window_cut(probe.offset, limit, base_live, masks_first)
-                        .await?
-                }
+            match view.window_cutting(probe.offset, limit).await? {
+                Some(cut) => cut,
+                None => view,
             }
         } else {
             view
