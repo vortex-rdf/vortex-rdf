@@ -26,6 +26,8 @@ use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds}
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, PatternCodes, ResolvedLayout};
+#[cfg(test)]
+use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
 use crate::store::scan::file_exprs::eq_conjunction;
 use crate::store::scan::file_reads::{component_point_chunk, values_at};
@@ -169,14 +171,17 @@ pub(crate) async fn read_located_rids(
         "an empty run or window reads nothing: its caller does not ask"
     );
     #[cfg(test)]
-    file.note_located_rid_reads(range.end - range.start);
+    file.note(
+        FileCounter::LocatedRidReads,
+        (range.end - range.start) as usize,
+    );
     if point_sized(range.end - range.start)
         && let Some(ids) = rid_point_reads(file, child, range.clone()).await?
     {
         return Ok(ids);
     }
     #[cfg(test)]
-    file.note_located_rid_scan();
+    file.note(FileCounter::LocatedRidScans, 1);
     scan_located_row_ids(child, range).await
 }
 

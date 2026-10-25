@@ -22,6 +22,8 @@ use crate::io::read::{
     available_parallelism, collect_scan, collect_scan_spawned, collect_whole_scan, inline_splits,
     spawned_splits,
 };
+#[cfg(test)]
+use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::QUAD_SCOPE;
 use crate::store::schema::{RowId, TermCode};
@@ -284,7 +286,7 @@ pub(crate) async fn column_positions(
     use vortex_array::arrays::{PrimitiveArray, StructArray};
 
     #[cfg(test)]
-    file.note_column_stream();
+    file.note(FileCounter::ColumnStreams, 1);
     let mut scan = file.scan()?;
     let scope = scan.dtype()?;
     scan = scan.with_projection(file.bound_exprs().bind(

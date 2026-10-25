@@ -87,19 +87,9 @@ pub(crate) struct NativeStoreFile {
     /// compaction rewrites its rows over; none for a file opened over a
     /// buffer.
     path: Option<PathBuf>,
-    /// How many times a quad column has been streamed through a scan for a
-    /// keep (test hook: pins which keeps were served without reading a column).
+    /// The tests' counts of how reads reached the file ([`FileCounter`]).
     #[cfg(test)]
-    column_streams: std::sync::atomic::AtomicUsize,
-    /// How many row ids reads of located index-child runs have asked for
-    /// (test hook: pins that a count reads none and a window only its own
-    /// rows).
-    #[cfg(test)]
-    located_rid_reads: std::sync::atomic::AtomicUsize,
-    /// How many of those reads were rid-only scans rather than point reads
-    /// (test hook: pins that a narrow run is point-read wherever it sits).
-    #[cfg(test)]
-    located_rid_scans: std::sync::atomic::AtomicUsize,
+    counters: [std::sync::atomic::AtomicUsize; 3],
 }
 
 /// The readers of one opened file: the quad table's root reader and one
@@ -142,6 +132,22 @@ pub(crate) struct LocatedTables {
     pub(crate) sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
     /// Per reference index (`index:ref-p`, `index:ref-o`), its `(val, rid)`.
     pub(crate) references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
+}
+
+/// What the tests count of how reads reached a file
+/// ([`NativeStoreFile::note`], [`NativeStoreFile::count`]).
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum FileCounter {
+    /// Quad columns streamed through a scan for a keep: pins which keeps
+    /// were served without reading a column.
+    ColumnStreams,
+    /// Row ids that reads of located index-child runs asked for: pins that a
+    /// count reads none and a window only its own rows.
+    LocatedRidReads,
+    /// Those reads that were rid-only scans rather than point reads: pins
+    /// that a narrow run is point-read wherever it sits.
+    LocatedRidScans,
 }
 
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`]: sized for a query
@@ -228,11 +234,7 @@ impl NativeStoreFile {
             identity,
             path,
             #[cfg(test)]
-            column_streams: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            located_rid_reads: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            located_rid_scans: std::sync::atomic::AtomicUsize::new(0),
+            counters: Default::default(),
         })
     }
 
@@ -248,50 +250,16 @@ impl NativeStoreFile {
         self.bound_exprs.debug_len()
     }
 
-    /// Record one column stream for a keep (test hook).
+    /// Count `n` more of `counter` (test hook).
     #[cfg(test)]
-    pub(crate) fn note_column_stream(&self) {
-        self.column_streams
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn note(&self, counter: FileCounter, n: usize) {
+        self.counters[counter as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// How many column streams keeps have run on this handle (test hook).
+    /// The count of `counter` so far (test hook).
     #[cfg(test)]
-    pub(crate) fn debug_column_streams(&self) -> usize {
-        self.column_streams
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Record a read of `rows` row ids from a located index-child run (test
-    /// hook).
-    #[cfg(test)]
-    pub(crate) fn note_located_rid_reads(&self, rows: u64) {
-        self.located_rid_reads
-            .fetch_add(rows as usize, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// How many row ids reads of located runs have asked for on this handle
-    /// (test hook).
-    #[cfg(test)]
-    pub(crate) fn debug_located_rid_reads(&self) -> usize {
-        self.located_rid_reads
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Record one read of a located run's row ids by a rid-only scan (test
-    /// hook).
-    #[cfg(test)]
-    pub(crate) fn note_located_rid_scan(&self) {
-        self.located_rid_scans
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// How many reads of located runs' row ids were rid-only scans on this
-    /// handle (test hook).
-    #[cfg(test)]
-    pub(crate) fn debug_located_rid_scans(&self) -> usize {
-        self.located_rid_scans
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn count(&self, counter: FileCounter) -> usize {
+        self.counters[counter as usize].load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the file is read through a memory mapping.

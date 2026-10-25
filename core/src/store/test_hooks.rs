@@ -23,6 +23,8 @@ use crate::store::indexes::IndexComponent;
 use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::{DictAccess, QuadPattern};
+#[cfg(feature = "file-io")]
+use crate::store::persist::native_file::FileCounter;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{DictSnapshot, RowId, TermCode, VortexRdfStore};
 
@@ -333,7 +335,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_column_streams(&self) -> Option<usize> {
         self.quads
             .file()
-            .map(|base| base.file.debug_column_streams())
+            .map(|base| base.file.count(FileCounter::ColumnStreams))
     }
 
     /// Whether this view's selection is pending with no serve plan to read
@@ -387,7 +389,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_located_rid_reads(&self) -> Option<usize> {
         self.quads
             .file()
-            .map(|base| base.file.debug_located_rid_reads())
+            .map(|base| base.file.count(FileCounter::LocatedRidReads))
     }
 
     /// How many of those reads were rid-only scans of the run instead of
@@ -395,7 +397,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_located_rid_scans(&self) -> Option<usize> {
         self.quads
             .file()
-            .map(|base| base.file.debug_located_rid_scans())
+            .map(|base| base.file.count(FileCounter::LocatedRidScans))
     }
 
     /// The exact row range the located-run kernel computes for the subject
