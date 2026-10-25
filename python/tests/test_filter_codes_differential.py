@@ -42,7 +42,9 @@ from rdflib.plugins.sparql import operators as op
 from rdflib.plugins.sparql.sparql import SPARQLError
 from rdflib.term import XSDToPython
 
-from vortex_rdf import U64Column, VortexRdfStore, serialize_rdf
+from vortex_rdf import U64Column, VortexRdfStore
+
+from conftest import serialized
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -102,11 +104,13 @@ class Built(NamedTuple):
 def build(tmp_path_factory, name: str, objects: list[str]) -> Built:
     """Serialize one triple per N-Triples object spelling into a Dictionary
     store, and decode its terms."""
-    directory = tmp_path_factory.mktemp(name)
-    nt = directory / f"{name}.nt"
-    nt.write_text("".join(f"<urn:s:{i}> <urn:p> {obj} .\n" for i, obj in enumerate(objects)), encoding="utf-8")
-    out = directory / f"{name}.vortex"
-    serialize_rdf(nt, out, format="ntriples", layout="dictionary")
+    out = serialized(
+        tmp_path_factory.mktemp(name),
+        name,
+        (f"<urn:s:{i}> <urn:p> {obj} ." for i, obj in enumerate(objects)),
+        format="ntriples",
+        layout="dictionary",
+    )
     term_dict = VortexRdfStore(out, in_memory=True).term_dict()
     spellings = term_dict.decode_many(list(range(len(term_dict))))
     return Built(out, spellings, parse_terms(spellings))
@@ -714,13 +718,13 @@ def test_normalized_datatypes_are_undecided_under_str(tmp_path):
     normalized = [f'"{lexical}"^^<{dt}>' for dt in datatypes]
     plain, tagged = f'"{lexical}"', f'"{lexical}"@en'
     gyear, unknown = f'"{lexical}"^^<{XSD}gYear>', f'"{lexical}"^^<http://ex.org/dt>'
-    nt = tmp_path / "datatypes.nt"
-    nt.write_text(
-        "".join(f"<urn:s:{i}> <urn:p> {s} .\n" for i, s in enumerate(normalized + [plain, tagged, gyear, unknown])),
-        encoding="utf-8",
+    out = serialized(
+        tmp_path,
+        "datatypes",
+        (f"<urn:s:{i}> <urn:p> {s} ." for i, s in enumerate(normalized + [plain, tagged, gyear, unknown])),
+        format="ntriples",
+        layout="dictionary",
     )
-    out = tmp_path / "datatypes.vortex"
-    serialize_rdf(nt, out, format="ntriples", layout="dictionary")
     for in_memory in (False, True):
         term_dict = VortexRdfStore(out, in_memory=in_memory).term_dict()
         assert term_dict.file_backed == (not in_memory)

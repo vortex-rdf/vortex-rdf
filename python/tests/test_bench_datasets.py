@@ -5,13 +5,7 @@ same data."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-BENCH_DIR = Path(__file__).resolve().parents[1] / "bench"
-sys.path.insert(0, str(BENCH_DIR))
-
-from datasets import (  # noqa: E402
+from datasets import (
     DatasetOpts,
     Moduli,
     dataset_prefix,

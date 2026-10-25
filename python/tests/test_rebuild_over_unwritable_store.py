@@ -11,6 +11,8 @@ import pytest
 
 from vortex_rdf import VortexRdfStore, serialize_rdf
 
+from conftest import write_ntriples
+
 # The store at the path, and the rebuild refused over it.
 OLD_TRIPLES = 3_000
 NEW_TRIPLES = 5
@@ -21,19 +23,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def write_ntriples(path, tag, count):
-    path.write_text(
-        "".join(
-            f'<http://ex.org/{tag}/s{i}> <http://ex.org/p{i % 3}> "{tag} {i}" .\n'
-            for i in range(count)
-        )
-    )
+def statements(tag, count):
+    """`count` triples whose subjects and literals carry `tag`."""
+    return (f'<http://ex.org/{tag}/s{i}> <http://ex.org/p{i % 3}> "{tag} {i}" .' for i in range(count))
 
 
 def test_serialize_refuses_to_replace_a_store_it_cannot_write(tmp_path):
-    old_nt, new_nt = tmp_path / "old.nt", tmp_path / "new.nt"
-    write_ntriples(old_nt, "old", OLD_TRIPLES)
-    write_ntriples(new_nt, "new", NEW_TRIPLES)
+    old_nt = write_ntriples(tmp_path / "old.nt", statements("old", OLD_TRIPLES))
+    new_nt = write_ntriples(tmp_path / "new.nt", statements("new", NEW_TRIPLES))
     store = tmp_path / "store.vortex"
     serialize_rdf(old_nt, store)
     before = store.read_bytes()

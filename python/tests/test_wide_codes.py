@@ -16,7 +16,7 @@ from array import array
 import pytest
 
 import vortex_rdf
-from vortex_rdf import U64Column, VortexRdfStore
+from vortex_rdf import U64Column
 
 from conftest import u64s
 
@@ -26,12 +26,6 @@ WIDE = (1 << 32) + 5
 TOP = (1 << 64) - 1
 #: Out of the u64 range on either side.
 OUT_OF_RANGE = [-1, 1 << 64]
-
-
-@pytest.fixture(params=["resident", "file-backed"])
-def store(request, vortex_files):
-    """The dictionary-layout fixture loaded whole or opened mapped."""
-    return VortexRdfStore(vortex_files["dictionary"], in_memory=request.param == "resident")
 
 
 def test_the_column_type_is_u64_and_has_no_u32_alias():
@@ -106,15 +100,15 @@ NOT_U64 = {
 
 
 @pytest.mark.parametrize("form", NOT_U64)
-def test_code_inputs_refuse_buffers_of_other_items(store, form):
+def test_code_inputs_refuse_buffers_of_other_items(dictionary_store, form):
     # Refused outright: a buffer is never read element by element.
-    for name, take in _code_takers(store).items():
+    for name, take in _code_takers(dictionary_store).items():
         with pytest.raises(ValueError, match=CAST_Q):
             take(NOT_U64[form]())
             pytest.fail(f"{name} took {form}")
 
 
-def test_code_inputs_take_u64s_non_negative_i64s_and_raw_bytes(store):
+def test_code_inputs_take_u64s_non_negative_i64s_and_raw_bytes(dictionary_store):
     # Below 2**63, so the signed forms hold them too; a tuple of four is a
     # code set even as a keep.
     values = [WIDE, 0, (1 << 63) - 1, 5]
@@ -134,13 +128,13 @@ def test_code_inputs_take_u64s_non_negative_i64s_and_raw_bytes(store):
     if array("L").itemsize == 8:
         forms["array-L"] = array("L", values)
         forms["array-l"] = array("l", values)
-    term_dict = store.term_dict()
+    term_dict = dictionary_store.term_dict()
     decoded = term_dict.decode_many(values)
-    kept = store.count_quads(keep={"s": values})
+    kept = dictionary_store.count_quads(keep={"s": values})
     for name, form in forms.items():
         assert u64s(U64Column(form)) == values, name
         assert term_dict.decode_many(form) == decoded, name
-        assert store.count_quads(keep={"s": form}) == kept, name
+        assert dictionary_store.count_quads(keep={"s": form}) == kept, name
     assert u64s(U64Column(range(WIDE, WIDE + 3))) == [WIDE, WIDE + 1, WIDE + 2]
 
 
@@ -186,17 +180,17 @@ def test_u64_column_refuses_a_partial_code():
         U64Column(b"\x01\x02\x03\x04")
 
 
-def test_match_codes_hands_out_u64_columns(store):
-    cols = store.match_codes()
+def test_match_codes_hands_out_u64_columns(dictionary_store):
+    cols = dictionary_store.match_codes()
     assert all(isinstance(col, U64Column) for col in cols)
     assert all(memoryview(col).nbytes == 8 * len(col) for col in cols)
-    term_dict = store.term_dict()
+    term_dict = dictionary_store.term_dict()
     rows = sorted(zip(*(term_dict.decode_many(memoryview(col).cast("Q")) for col in cols)))
-    assert rows == sorted(store.get_quads())
+    assert rows == sorted(dictionary_store.get_quads())
 
 
-def test_term_dict_takes_codes_past_u32(store):
-    term_dict = store.term_dict()
+def test_term_dict_takes_codes_past_u32(dictionary_store):
+    term_dict = dictionary_store.term_dict()
     n = len(term_dict)
     every = list(range(n))
     wide = [code + (1 << 32) for code in every]
@@ -216,8 +210,8 @@ def test_term_dict_takes_codes_past_u32(store):
 
 
 @pytest.mark.parametrize("bad", OUT_OF_RANGE)
-def test_term_dict_refuses_codes_outside_u64(store, bad):
-    term_dict = store.term_dict()
+def test_term_dict_refuses_codes_outside_u64(dictionary_store, bad):
+    term_dict = dictionary_store.term_dict()
     with pytest.raises((ValueError, OverflowError)):
         term_dict.decode(bad)
     with pytest.raises((ValueError, OverflowError)):
@@ -226,10 +220,10 @@ def test_term_dict_refuses_codes_outside_u64(store, bad):
         term_dict.filter_codes("is_iri", "", [0, bad])
 
 
-def test_keeps_take_codes_past_u32(store):
-    term_dict = store.term_dict()
+def test_keeps_take_codes_past_u32(dictionary_store):
+    term_dict = dictionary_store.term_dict()
     alice = term_dict.encode("<http://ex.org/alice>")
-    rows = store.count_quads(keep={"s": [alice]})
+    rows = dictionary_store.count_quads(keep={"s": [alice]})
     assert rows == 2
     wide = alice + (1 << 32)
     for keep in (
@@ -240,19 +234,19 @@ def test_keeps_take_codes_past_u32(store):
         {"s": (wide, wide + 1)},
         {0: (wide, TOP)},
     ):
-        assert all(len(col) == 0 for col in store.match_codes(keep=keep)), keep
-        assert store.count_quads(keep=keep) == 0, keep
+        assert all(len(col) == 0 for col in dictionary_store.match_codes(keep=keep)), keep
+        assert dictionary_store.count_quads(keep=keep) == 0, keep
     # A wide code beside a narrow one admits the narrow one's rows only.
-    assert store.count_quads(keep={"s": [alice, wide]}) == rows
-    assert store.count_quads_many([{"keep": {"s": [wide]}}, {"keep": {"s": [alice]}}]) == [0, rows]
-    [cols] = store.match_codes_many([{"keep": {"s": U64Column([wide])}}])
+    assert dictionary_store.count_quads(keep={"s": [alice, wide]}) == rows
+    assert dictionary_store.count_quads_many([{"keep": {"s": [wide]}}, {"keep": {"s": [alice]}}]) == [0, rows]
+    [cols] = dictionary_store.match_codes_many([{"keep": {"s": U64Column([wide])}}])
     assert all(len(col) == 0 for col in cols)
 
 
 @pytest.mark.parametrize("bad", OUT_OF_RANGE)
-def test_keeps_refuse_codes_outside_u64(store, bad):
+def test_keeps_refuse_codes_outside_u64(dictionary_store, bad):
     for keep in ({"s": [0, bad]}, {"s": (0, bad)}, {"s": (bad, 1)}):
         with pytest.raises(ValueError):
-            store.match_codes(keep=keep)
+            dictionary_store.match_codes(keep=keep)
         with pytest.raises(ValueError):
-            store.count_quads(keep=keep)
+            dictionary_store.count_quads(keep=keep)

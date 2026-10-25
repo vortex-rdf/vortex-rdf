@@ -8,7 +8,7 @@ import pytest
 
 from vortex_rdf import CancelToken, Cancelled, VortexRdfError, VortexRdfStore
 
-from conftest import NAME, u64_rows
+from conftest import NAME, one_shot, u64_rows
 
 #: Probes over the conftest fixture, as tuples and dicts: a bound
 #: predicate, a subject, a subject with no rows, a window and every quad.
@@ -19,18 +19,6 @@ FIXTURE_PROBES = [
     {"p": NAME, "limit": 2, "offset": 1},
     {},
 ]
-
-
-@pytest.fixture(scope="module", params=["file", "in-memory"])
-def code_store(request, vortex_files):
-    """The conftest fixture's Dictionary-layout store, opened mapped or
-    loaded whole."""
-    return VortexRdfStore(vortex_files["dictionary"], in_memory=request.param == "in-memory")
-
-
-def _one_shot(store, probe):
-    """`match_codes` of one batch probe."""
-    return store.match_codes(**probe) if isinstance(probe, dict) else store.match_codes(*probe)
 
 
 @pytest.fixture(scope="module")
@@ -50,47 +38,47 @@ def test_a_failing_probe_raises_its_error_from_the_batch(string_store):
         string_store.count_quads_many([failing] + [probe] * 3)
 
 
-def test_answers_are_pulled_one_probe_at_a_time_in_input_order(code_store):
-    answers = code_store.match_codes_many(FIXTURE_PROBES)
+def test_answers_are_pulled_one_probe_at_a_time_in_input_order(dictionary_store):
+    answers = dictionary_store.match_codes_many(FIXTURE_PROBES)
     assert iter(answers) is answers
     assert len(answers) == len(FIXTURE_PROBES)
     for probe in FIXTURE_PROBES:
-        assert u64_rows(next(answers)) == u64_rows(_one_shot(code_store, probe)), probe
+        assert u64_rows(next(answers)) == u64_rows(one_shot(dictionary_store.match_codes, probe)), probe
     for _ in range(2):
         with pytest.raises(StopIteration):
             next(answers)
     assert len(answers) == len(FIXTURE_PROBES)
 
 
-def test_a_window_of_one_answers_like_the_default_window(code_store):
-    one = [u64_rows(cols) for cols in code_store.match_codes_many(FIXTURE_PROBES, lookahead=1)]
-    default = [u64_rows(cols) for cols in code_store.match_codes_many(FIXTURE_PROBES)]
+def test_a_window_of_one_answers_like_the_default_window(dictionary_store):
+    one = [u64_rows(cols) for cols in dictionary_store.match_codes_many(FIXTURE_PROBES, lookahead=1)]
+    default = [u64_rows(cols) for cols in dictionary_store.match_codes_many(FIXTURE_PROBES)]
     assert one == default
-    counts = code_store.count_quads_many(FIXTURE_PROBES, lookahead=1)
-    assert counts == code_store.count_quads_many(FIXTURE_PROBES)
-    for many in (code_store.match_codes_many, code_store.count_quads_many):
+    counts = dictionary_store.count_quads_many(FIXTURE_PROBES, lookahead=1)
+    assert counts == dictionary_store.count_quads_many(FIXTURE_PROBES)
+    for many in (dictionary_store.match_codes_many, dictionary_store.count_quads_many):
         with pytest.raises(ValueError, match="lookahead"):
             many(FIXTURE_PROBES, lookahead=0)
 
 
-def test_a_window_past_the_batch_answers_like_the_default_window(code_store):
+def test_a_window_past_the_batch_answers_like_the_default_window(dictionary_store):
     widest = [
         u64_rows(cols)
-        for cols in code_store.match_codes_many(FIXTURE_PROBES, lookahead=sys.maxsize)
+        for cols in dictionary_store.match_codes_many(FIXTURE_PROBES, lookahead=sys.maxsize)
     ]
-    assert widest == [u64_rows(cols) for cols in code_store.match_codes_many(FIXTURE_PROBES)]
-    counts = code_store.count_quads_many(FIXTURE_PROBES, lookahead=sys.maxsize)
-    assert counts == code_store.count_quads_many(FIXTURE_PROBES)
+    assert widest == [u64_rows(cols) for cols in dictionary_store.match_codes_many(FIXTURE_PROBES)]
+    counts = dictionary_store.count_quads_many(FIXTURE_PROBES, lookahead=sys.maxsize)
+    assert counts == dictionary_store.count_quads_many(FIXTURE_PROBES)
 
 
-def test_a_cancelled_token_refuses_the_calls_before_anything_runs(code_store, string_store):
+def test_a_cancelled_token_refuses_the_calls_before_anything_runs(dictionary_store, string_store):
     cancelled = CancelToken()
     cancelled.cancel()
     # Run, this probe fails (a keep needs the Dictionary layout), so a call
     # that raises `Cancelled` for it checked the token before the probe's
     # error could surface.
     failing = {"o": "<http://ex.org/o/7>", "keep": {"s": (0, 5)}}
-    for store in (code_store, string_store):
+    for store in (dictionary_store, string_store):
         with pytest.raises(Cancelled):
             store.match_codes_many(FIXTURE_PROBES, cancel=cancelled)
         with pytest.raises(Cancelled):
@@ -121,10 +109,10 @@ def test_a_cancelled_token_refuses_the_calls_before_anything_runs(code_store, st
         next(answers)
 
 
-def test_a_cancelled_token_raises_at_the_next_pull_then_stops(code_store):
+def test_a_cancelled_token_raises_at_the_next_pull_then_stops(dictionary_store):
     token = CancelToken()
-    answers = code_store.match_codes_many(FIXTURE_PROBES, cancel=token)
-    assert u64_rows(next(answers)) == u64_rows(_one_shot(code_store, FIXTURE_PROBES[0]))
+    answers = dictionary_store.match_codes_many(FIXTURE_PROBES, cancel=token)
+    assert u64_rows(next(answers)) == u64_rows(one_shot(dictionary_store.match_codes, FIXTURE_PROBES[0]))
     token.cancel()
     with pytest.raises(Cancelled):
         next(answers)

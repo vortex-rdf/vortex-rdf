@@ -12,17 +12,11 @@ this environment (see `bench/adapters.py` on why each gets its own virtualenv).
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-BENCH_DIR = Path(__file__).resolve().parents[1] / "bench"
-sys.path.insert(0, str(BENCH_DIR))
-
-from adapters import VORTEX_SLUGS, build_adapter, split_term  # noqa: E402
-from conftest import NAME  # noqa: E402
-from datasets import FULL_SCAN_PATTERN, Pat  # noqa: E402
+from adapters import VORTEX_SLUGS, build_adapter, split_term
+from conftest import NAME
+from datasets import FULL_SCAN_PATTERN, Pat
 
 #: The fixture holds two `foaf:name` triples on IRI subjects plus one on a
 #: blank node; a bound predicate is the pattern that routes through a secondary
