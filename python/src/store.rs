@@ -134,12 +134,8 @@ impl ProbeAnswers {
                 .unwrap_or_else(PoisonError::into_inner)
                 .next(self.token.as_ref())
         });
-        match answer {
-            Pulled::Done(None) => Ok(None),
-            Pulled::Done(Some(Ok(columns))) => Ok(Some(columns.map(code_columns))),
-            Pulled::Done(Some(Err(error))) => Err(py_err(error)),
-            Pulled::Cancelled => Err(cancelled()),
-        }
+        let answer = settled(answer.map(Option::transpose))?;
+        Ok(answer.map(|columns| columns.map(code_columns)))
     }
 
     fn __len__(&self) -> usize {
@@ -413,13 +409,11 @@ impl VortexRdfStore {
         cancel: Option<&Bound<'_, CancelToken>>,
     ) -> PyResult<usize> {
         let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
-        match token_of(cancel)? {
-            None => detached(py, || self.store.count_probe(&probe)),
-            Some(token) => {
-                let store = self.store.clone();
-                raced(py, &token, async move { store.count_probe(&probe).await })
-            }
-        }
+        let token = token_of(cancel)?;
+        let store = self.store.clone();
+        raced(py, token.as_ref(), async move {
+            store.count_probe(&probe).await
+        })
     }
 
     /// [`Self::count_quads`] for a batch of probes in one GIL-released call,
@@ -533,13 +527,10 @@ impl VortexRdfStore {
         if self.store.dict_reader().is_none() {
             return Ok(None);
         }
-        let columns = match token {
-            None => detached(py, || probe_codes(&self.store, &probe))?,
-            Some(token) => {
-                let store = self.store.clone();
-                raced(py, &token, async move { probe_codes(&store, &probe).await })?
-            }
-        };
+        let store = self.store.clone();
+        let columns = raced(py, token.as_ref(), async move {
+            probe_codes(&store, &probe).await
+        })?;
         Ok(columns.map(code_columns))
     }
 
@@ -594,10 +585,7 @@ impl VortexRdfStore {
                 .await?
                 .code_chunks(&wanted, batch_rows)
         };
-        let stream = match &token {
-            None => detached(py, || chunks)?,
-            Some(token) => raced(py, token, chunks)?,
-        };
+        let stream = raced(py, token.as_ref(), chunks)?;
         Ok(Some(CodeChunks::new(stream, token, columns, batch_rows)))
     }
 

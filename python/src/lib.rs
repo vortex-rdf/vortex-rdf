@@ -101,15 +101,17 @@ pub(crate) fn settled<T>(pulled: Pulled<Result<T, CoreError>>) -> PyResult<T> {
     }
 }
 
-/// [`detached`] for a call given a cancel token: `fut` runs as a task on
-/// [`RUNTIME`] raced with `token` (see [`pull`]) while the calling thread
-/// waits with the GIL released.
-pub(crate) fn raced<T, Fut>(py: Python<'_>, token: &Token, fut: Fut) -> PyResult<T>
+/// Drives `fut` to completion on [`RUNTIME`] with the GIL released, raising
+/// its outcome as [`settled`] does. Given the call's cancel token, `fut` runs
+/// as a task raced with it while the calling thread waits (see [`pull`]);
+/// without one it runs on the calling thread, pinned in place, as
+/// [`detached`] runs a future.
+pub(crate) fn raced<T, Fut>(py: Python<'_>, token: Option<&Token>, fut: Fut) -> PyResult<T>
 where
     T: Send + 'static,
     Fut: Future<Output = Result<T, CoreError>> + Send + 'static,
 {
-    settled(py.detach(|| pull(&RUNTIME, Some(token), fut)))
+    settled(py.detach(|| pull(&RUNTIME, token, fut)))
 }
 
 /// A cancel token for one query's long calls: passed as `cancel=` to the

@@ -5,6 +5,7 @@
 //! Free of Python types, so `tests/cancel.rs` compiles this file as it is.
 
 use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,8 +60,20 @@ pub(crate) enum Pulled<T> {
     Cancelled,
 }
 
+impl<T> Pulled<T> {
+    /// The pull's output passed through `f`; a cancelled pull stays
+    /// cancelled.
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Pulled<U> {
+        match self {
+            Pulled::Done(output) => Pulled::Done(f(output)),
+            Pulled::Cancelled => Pulled::Cancelled,
+        }
+    }
+}
+
 /// Drives `fut` to completion on `runtime`, blocking the calling thread.
-/// Without a token this is `runtime.block_on(fut)`, with nothing spawned.
+/// Without a token this is `runtime.block_on(fut)`, with nothing spawned and
+/// `fut` pinned where the pull holds it rather than moved into the runtime.
 /// With one, `fut` runs as a spawned task raced with the token, the
 /// token's side polled first: a token cancelled before the pull or while
 /// `fut` waits at an await ends the pull there, dropping `fut` on the
@@ -72,7 +85,7 @@ where
     F::Output: Send + 'static,
 {
     let Some(token) = token else {
-        return Pulled::Done(runtime.block_on(fut));
+        return Pulled::Done(runtime.block_on(pin!(fut)));
     };
     let token = token.clone();
     let task = runtime.spawn(async move {
@@ -107,14 +120,12 @@ where
     let Some(mut stream) = slot.take() else {
         return Pulled::Done(None);
     };
-    match pull(runtime, token, async move {
+    pull(runtime, token, async move {
         let item = stream.next().await;
         (stream, item)
-    }) {
-        Pulled::Done((stream, item)) => {
-            *slot = Some(stream);
-            Pulled::Done(item)
-        }
-        Pulled::Cancelled => Pulled::Cancelled,
-    }
+    })
+    .map(|(stream, item)| {
+        *slot = Some(stream);
+        item
+    })
 }

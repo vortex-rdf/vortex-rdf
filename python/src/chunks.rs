@@ -10,7 +10,7 @@ use vortex_rdf_core::{CodeChunkStream, QuadColumn};
 
 use crate::cancel::{Pulled, Token, pull_next};
 use crate::codes::U64Column;
-use crate::{RUNTIME, cancelled, py_err};
+use crate::{RUNTIME, settled};
 
 /// A match's term-code columns in chunks of at most `batch_rows` rows, in
 /// base row order (`VortexRdfStore.match_code_chunks`). Each `__next__`
@@ -65,15 +65,10 @@ impl CodeChunks {
             }
             pulled
         });
-        match pulled {
-            Pulled::Done(Some(Ok(chunk))) => Ok(Some(PyTuple::new(
-                py,
-                chunk.into_iter().map(|codes| U64Column { codes }),
-            )?)),
-            Pulled::Done(Some(Err(error))) => Err(py_err(error)),
-            Pulled::Done(None) => Ok(None),
-            Pulled::Cancelled => Err(cancelled()),
-        }
+        let chunk = settled(pulled.map(Option::transpose))?;
+        chunk
+            .map(|chunk| PyTuple::new(py, chunk.into_iter().map(|codes| U64Column { codes })))
+            .transpose()
     }
 
     /// The names of the columns each chunk holds, in order.
