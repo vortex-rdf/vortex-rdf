@@ -9,7 +9,8 @@ use futures::StreamExt;
 use js_sys::{Object, Reflect};
 use vortex_rdf_core::common::{formats::format_from_name, terms::parse_quads_from_reader};
 use vortex_rdf_core::{
-    DictSnapshot, LayoutStrategy, Result as CoreResult, VortexRdfStore as CoreStore, export_rdf,
+    DictSnapshot, LayoutStrategy, Probe, Result as CoreResult, VortexRdfStore as CoreStore,
+    export_rdf,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -21,7 +22,7 @@ use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_
 use crate::options::parse_build_options;
 use crate::probes::{batch_signal, chunk_probe, parse_probes, read_probe};
 use crate::resolve_now;
-use crate::terms::{JsPattern, quad_arg};
+use crate::terms::{pattern_probe, quad_arg};
 
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
 extern "C" {
@@ -321,12 +322,12 @@ impl VortexRdfStore {
     ) -> Result<JsValue, JsValue> {
         // Parse the pattern eagerly (cheap, synchronous) so only owned oxrdf
         // terms — not JsValues — are moved into the resolving future.
-        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
+        let probe = pattern_probe(subject, predicate, object, graph)?;
         // Ensure the shared dictionary view synchronously (Dictionary layout);
         // it is not dependent on the matched rows and must be built off `self`.
         let dict = self.code_path_dict();
         let inner = self.inner.clone();
-        let promise = future_to_promise(async move { match_payload(inner, dict, pattern).await });
+        let promise = future_to_promise(async move { match_payload(inner, dict, probe).await });
         Ok(make_lazy_quad_stream(&promise.into()))
     }
 
@@ -344,9 +345,9 @@ impl VortexRdfStore {
         object: JsValue,
         graph: JsValue,
     ) -> Result<js_sys::Array, JsValue> {
-        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
+        let probe = pattern_probe(subject, predicate, object, graph)?;
         let dict = self.code_path_dict();
-        let payload = resolve_now(match_payload(self.inner.clone(), dict, pattern))??;
+        let payload = resolve_now(match_payload(self.inner.clone(), dict, probe))??;
         Ok(build_lazy_quads(&payload))
     }
 
@@ -365,7 +366,7 @@ impl VortexRdfStore {
         options: Option<Object>,
     ) -> Result<usize, JsValue> {
         let probe = read_probe(
-            JsPattern::parse(subject, predicate, object, graph)?,
+            pattern_probe(subject, predicate, object, graph)?,
             options.as_deref(),
         )?;
         resolve_now(self.inner.count_probe(&probe))?.map_err(js_err)
@@ -413,7 +414,7 @@ impl VortexRdfStore {
         options: Option<Object>,
     ) -> Result<JsValue, JsValue> {
         let probe = read_probe(
-            JsPattern::parse(subject, predicate, object, graph)?,
+            pattern_probe(subject, predicate, object, graph)?,
             options.as_deref(),
         )?;
         // Same gate as `code_path_dict`: without a dictionary snapshot the
@@ -445,7 +446,7 @@ impl VortexRdfStore {
         options: Option<Object>,
     ) -> Result<JsValue, JsValue> {
         let (probe, shape) = chunk_probe(
-            JsPattern::parse(subject, predicate, object, graph)?,
+            pattern_probe(subject, predicate, object, graph)?,
             options.as_deref(),
         )?;
         if self.dict_snapshot().is_none() {
@@ -512,9 +513,9 @@ impl VortexRdfStore {
 async fn match_payload(
     store: CoreStore,
     dict: Option<JsValue>,
-    pattern: JsPattern,
+    probe: Probe,
 ) -> Result<JsValue, JsValue> {
-    let matched = pattern.matched(&store).await?;
+    let matched = store.run_probe(&probe).await.map_err(js_err)?;
     let payload = Object::new();
 
     // Code payload: code columns + the shared dictionary.
