@@ -40,15 +40,23 @@ pub(crate) fn finished_iterable() -> JsValue {
     make_handle_iterable(JsValue::UNDEFINED, &JsValue::UNDEFINED)
 }
 
-/// The rows `probe` matches on `store` as `{ s, p, o, g, length }`, four
-/// `Float64Array`s of exact codes, or `null` when codes are not the matched
-/// view's vocabulary. Shared by `matchCodes` and `matchCodesMany`.
+/// The rows `probe` matches on `store` as their [`code_columns`], or `null`
+/// when codes are not the matched view's vocabulary. Shared by `matchCodes`
+/// and `matchCodesMany`.
 pub(crate) fn probe_codes(store: &CoreStore, probe: &Probe) -> Result<JsValue, JsValue> {
     let matched = resolve_now(store.run_probe(probe))?.map_err(js_err)?;
-    match resolve_now(matched.code_columns_gathered())?.map_err(js_err)? {
-        Some(columns) => columns_object(&QuadColumn::ALL, &columns),
-        None => Ok(JsValue::NULL),
-    }
+    Ok(code_columns(&matched)?.unwrap_or(JsValue::NULL))
+}
+
+/// A matched view's rows as `{ s, p, o, g, length }`, four `Float64Array`s
+/// of exact codes, or `None` when codes are not the view's vocabulary. The
+/// answer of `matchCodes`, and with the store's `LazyDict` beside it the code
+/// payload of `match` and `getQuads`.
+pub(crate) fn code_columns(matched: &CoreStore) -> Result<Option<JsValue>, JsValue> {
+    resolve_now(matched.code_columns_gathered())?
+        .map_err(js_err)?
+        .map(|columns| columns_object(&QuadColumn::ALL, &columns))
+        .transpose()
 }
 
 /// The error a handle's `next()` throws once the store it reads is freed.

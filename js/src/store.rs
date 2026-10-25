@@ -9,14 +9,16 @@ use futures::StreamExt;
 use js_sys::{Object, Reflect};
 use vortex_rdf_core::common::{formats::format_from_name, terms::parse_quads_from_reader};
 use vortex_rdf_core::{
-    DictSnapshot, LayoutStrategy, Probe, Result as CoreResult, VortexRdfStore as CoreStore,
-    export_rdf,
+    DictSnapshot, LayoutStrategy, Probe, QuadColumn, Result as CoreResult,
+    VortexRdfStore as CoreStore, export_rdf,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
-use crate::chunks::{CodeChunks, ProbeAnswers, finished_iterable, handle_iterable, probe_codes};
-use crate::codes::{code_array, code_from_js, code_to_js};
+use crate::chunks::{
+    CodeChunks, ProbeAnswers, code_columns, finished_iterable, handle_iterable, probe_codes,
+};
+use crate::codes::{code_from_js, code_to_js};
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
 use crate::options::parse_build_options;
@@ -75,32 +77,27 @@ impl VortexRdfStore {
         self.inner.dict_reader()?.snapshot()
     }
 
-    /// The dictionary for decoding a match's code columns, or `None` when
-    /// the code path does not apply (see [`dict_snapshot`](Self::dict_snapshot));
-    /// reads it declines fall back to the always-correct term path.
-    fn code_path_dict(&self) -> Option<JsValue> {
-        let snapshot = self.dict_snapshot()?;
-        Some(self.dict_view(snapshot))
-    }
-
-    /// The store's `LazyDict` over `snapshot`, built once and cached.
+    /// The store's `LazyDict`, which decodes a match's code columns, built
+    /// once over a snapshot and cached; `None` when the code path does not
+    /// apply (see [`dict_snapshot`](Self::dict_snapshot)), and reads it
+    /// declines fall back to the always-correct term path.
     ///
     /// The `LazyDict` holds a [`DictSnapshot`] and decodes each code the first
     /// time it is observed, interning the result — so a query pays one boundary
     /// crossing per *distinct* term it actually reads, and a query that only
     /// counts rows or compares terms by code pays none at all. Building it is
-    /// O(1): nothing is flattened or copied up front.
+    /// O(1): nothing is flattened or copied up front. `makeDictView` only
+    /// constructs it and never calls back into the store, so the cache can
+    /// stay borrowed across that call.
     ///
     /// Because the snapshot is immutable, `LazyQuad`s handed out before a
     /// mutation keep decoding against the dictionary their codes address, even
     /// though `self.dict_view` is dropped so later reads pick up the new one.
-    fn dict_view(&self, snapshot: DictSnapshot) -> JsValue {
-        if let Some(dv) = self.dict_view.borrow().as_ref() {
-            return dv.clone();
-        }
-        let dv = make_dict_view(TermDict { snapshot });
-        *self.dict_view.borrow_mut() = Some(dv.clone());
-        dv
+    fn lazy_dict(&self) -> Option<JsValue> {
+        let snapshot = self.dict_snapshot()?;
+        let mut cached = self.dict_view.borrow_mut();
+        let view = cached.get_or_insert_with(|| make_dict_view(TermDict { snapshot }));
+        Some(view.clone())
     }
 }
 
@@ -325,7 +322,7 @@ impl VortexRdfStore {
         let probe = pattern_probe(subject, predicate, object, graph)?;
         // Ensure the shared dictionary view synchronously (Dictionary layout);
         // it is not dependent on the matched rows and must be built off `self`.
-        let dict = self.code_path_dict();
+        let dict = self.lazy_dict();
         let inner = self.inner.clone();
         let promise = future_to_promise(async move { match_payload(inner, dict, probe).await });
         Ok(make_lazy_quad_stream(&promise.into()))
@@ -346,7 +343,7 @@ impl VortexRdfStore {
         graph: JsValue,
     ) -> Result<js_sys::Array, JsValue> {
         let probe = pattern_probe(subject, predicate, object, graph)?;
-        let dict = self.code_path_dict();
+        let dict = self.lazy_dict();
         let payload = resolve_now(match_payload(self.inner.clone(), dict, probe))??;
         Ok(build_lazy_quads(&payload))
     }
@@ -417,8 +414,8 @@ impl VortexRdfStore {
             pattern_probe(subject, predicate, object, graph)?,
             options.as_deref(),
         )?;
-        // Same gate as `code_path_dict`: without a dictionary snapshot the
-        // codes would not resolve via `termDict`.
+        // Same gate as `lazy_dict`: without a dictionary snapshot the codes
+        // would not resolve via `termDict`.
         if self.dict_snapshot().is_none() {
             return Ok(JsValue::NULL);
         }
@@ -506,84 +503,64 @@ impl VortexRdfStore {
 /// Resolve a pattern and pack the matched rows into the columnar payload the JS
 /// lazy read model consumes. Shared by `match` and `getQuads`.
 ///
-/// Dictionary layout (`dict` is `Some`) ships four code columns plus the
-/// shared dictionary — no term strings are touched. Other layouts ship packed
-/// N-Triples term columns (`{offsets, bytes}`) filled from
-/// `shared_quad_chunks()`.
+/// With the store's `LazyDict` (`dict` is `Some`), the payload is the matched
+/// rows' code columns as `matchCodes` answers them ([`code_columns`]) plus
+/// `dict`: no term strings are touched. Otherwise, or when codes are not the
+/// matched view's vocabulary, it is the [`term_payload`].
 async fn match_payload(
     store: CoreStore,
     dict: Option<JsValue>,
     probe: Probe,
 ) -> Result<JsValue, JsValue> {
     let matched = store.run_probe(&probe).await.map_err(js_err)?;
-    let payload = Object::new();
-
-    // Code payload: code columns + the shared dictionary.
     if let Some(dict) = dict
-        && let Some(n) = set_code_columns(&payload, &matched).await?
+        && let Some(payload) = code_columns(&matched)?
     {
-        Reflect::set(&payload, &"kind".into(), &"code".into())?;
         Reflect::set(&payload, &"dict".into(), &dict)?;
-        Reflect::set(&payload, &"length".into(), &JsValue::from_f64(n as f64))?;
-        return Ok(payload.into());
+        return Ok(payload);
     }
+    term_payload(&matched).await
+}
 
-    // Term payload: packed N-Triples term columns — the always-correct path,
-    // taken whenever the rows cannot be described as codes against the store's
-    // cached dictionary. The shared decode hands each term over in its
-    // N-Triples spelling already (the default graph as the empty string, this
-    // payload's vocabulary for it), so the bytes go straight into the
-    // column — no parse into oxrdf terms, no re-render.
+/// A matched view's rows as packed N-Triples term columns: `{ offsets, bytes }`
+/// under `s`, `p`, `o` and `g`, plus `length`. The always-correct path, taken
+/// whenever the rows cannot be described as codes against the store's cached
+/// dictionary. The shared decode hands each term over in its N-Triples
+/// spelling already (the default graph as the empty string, this payload's
+/// vocabulary for it), so the bytes go straight into the column — no parse
+/// into oxrdf terms, no re-render.
+async fn term_payload(matched: &CoreStore) -> Result<JsValue, JsValue> {
+    // (offsets seeded with a leading 0, bytes) per column.
+    let mut columns: [(Vec<u32>, Vec<u8>); 4] = std::array::from_fn(|_| (vec![0], Vec::new()));
     let mut chunks = matched.shared_quad_chunks();
-    // (offsets seeded with a leading 0, bytes) per s/p/o/g column.
-    let mut cols: [(Vec<u32>, Vec<u8>); 4] = [
-        (vec![0], Vec::new()),
-        (vec![0], Vec::new()),
-        (vec![0], Vec::new()),
-        (vec![0], Vec::new()),
-    ];
-    let mut n = 0u32;
     while let Some(chunk) = chunks.next().await {
         for row in chunk {
             let row = row.map_err(js_err)?;
-            for (col, term) in cols.iter_mut().zip([&row.s, &row.p, &row.o, &row.g]) {
-                col.1.extend_from_slice(term.as_bytes());
-                col.0.push(col.1.len() as u32);
+            let terms = [&row.s, &row.p, &row.o, &row.g];
+            for ((offsets, bytes), term) in columns.iter_mut().zip(terms) {
+                bytes.extend_from_slice(term.as_bytes());
+                offsets.push(bytes.len() as u32);
             }
-            n += 1;
         }
     }
-    Reflect::set(&payload, &"kind".into(), &"term".into())?;
-    for (name, (offsets, bytes)) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
-        Reflect::set(&payload, &(*name).into(), &term_column(offsets, bytes))?;
+    let payload = Object::new();
+    for (column, (offsets, bytes)) in QuadColumn::ALL.iter().zip(&columns) {
+        let packed = term_column(offsets, bytes)?;
+        Reflect::set(&payload, &column.name().into(), &packed)?;
     }
-    Reflect::set(&payload, &"length".into(), &JsValue::from_f64(n as f64))?;
+    let rows = columns[0].0.len() - 1;
+    Reflect::set(&payload, &"length".into(), &JsValue::from_f64(rows as f64))?;
     Ok(payload.into())
 }
 
-/// Set a matched view's four code columns on `payload` under `s`/`p`/`o`/`g`,
-/// as `Float64Array`s of the codes ([`code_array`]), returning the row count
-/// — or `None` when codes are not that view's vocabulary at all, in which
-/// case nothing is set and the caller falls back to the term path.
-async fn set_code_columns(payload: &Object, matched: &CoreStore) -> Result<Option<usize>, JsValue> {
-    let Some(cols) = matched.code_columns_gathered().await.map_err(js_err)? else {
-        return Ok(None);
-    };
-    for (name, col) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
-        let codes = code_array(col.as_slice())?;
-        Reflect::set(payload, &(*name).into(), &codes)?;
-    }
-    Ok(Some(cols[0].len()))
-}
-
 /// Pack one term column's offsets/bytes into a `{offsets, bytes}` JS object.
-fn term_column(offsets: &[u32], bytes: &[u8]) -> JsValue {
+fn term_column(offsets: &[u32], bytes: &[u8]) -> Result<JsValue, JsValue> {
     let offs = js_sys::Uint32Array::new_with_length(offsets.len() as u32);
     offs.copy_from(offsets);
     let bys = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
     bys.copy_from(bytes);
-    let obj = Object::new();
-    Reflect::set(&obj, &"offsets".into(), &offs).unwrap();
-    Reflect::set(&obj, &"bytes".into(), &bys).unwrap();
-    obj.into()
+    let column = Object::new();
+    Reflect::set(&column, &"offsets".into(), &offs)?;
+    Reflect::set(&column, &"bytes".into(), &bys)?;
+    Ok(column.into())
 }

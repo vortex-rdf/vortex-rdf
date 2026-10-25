@@ -147,8 +147,10 @@ class LazyQuad {
 }
 
 // Normalize a Rust-built payload into four self-describing column accessors.
+// A code payload is `matchCodes`' columns plus the store's LazyDict as `dict`;
+// a term payload holds `{offsets, bytes}` per column and no `dict`.
 function normalize(payload) {
-    const col = payload.kind === 'code'
+    const col = payload.dict
         ? (name) => ({ dict: payload.dict, codes: payload[name] })
         : (name) => ({ offsets: payload[name].offsets, bytes: payload[name].bytes });
     return { s: col('s'), p: col('p'), o: col('o'), g: col('g') };
