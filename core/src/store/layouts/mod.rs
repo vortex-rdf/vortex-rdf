@@ -17,8 +17,6 @@
 //! index modules own those columns and their names (see
 //! [`IndexType`](crate::store::indexes::IndexType)).
 
-use std::sync::Arc;
-
 #[cfg(feature = "file-io")]
 use futures::FutureExt as _;
 #[cfg(feature = "file-io")]
@@ -187,15 +185,6 @@ impl LayoutStrategy {
             LayoutStrategy::TypedObject => typed_object::COLUMNS,
             LayoutStrategy::Dictionary => &PRIMARY_COLUMNS,
         }
-    }
-
-    /// [`primary_column_names`](Self::primary_column_names) as owned field
-    /// names, for building the struct dtype.
-    pub(crate) fn field_names(self) -> Vec<Arc<str>> {
-        self.primary_column_names()
-            .iter()
-            .map(|&n| n.into())
-            .collect()
     }
 
     /// This layout's primary column arrays for `quads`; an empty slice yields

@@ -36,8 +36,8 @@ flowchart LR
 | Term dictionary | a `TermDictionary` inside the resolved layout | the required `dictionary` child |
 
 A builder hands these back in one of two shapes
-([`BuiltArray`](../core/src/store/builders/mod.rs#L98) and the crate-private
-[`BuiltStream`](../core/src/store/builders/mod.rs#L112)):
+([`BuiltArray`](../core/src/store/builders/mod.rs#L96) and the crate-private
+[`BuiltStream`](../core/src/store/builders/mod.rs#L110)):
 
 - **`BuiltArray`** — everything materialized: the quad array, the components,
   the dictionary. What `VortexRdfStore::from_built` adopts.
@@ -174,7 +174,7 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, stripped
 of its adjacent repeats, and built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L173); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L171); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
@@ -220,7 +220,7 @@ flowchart TD
 ([`TermInterner`](../core/src/store/builders/interner.rs#L36)): each distinct
 term is held once under a provisional `u32` id, in arrival order, and a quad is
 kept as its four ids. The buffer holds up to
-[`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L56) (1,048,576) quads,
+[`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L54) (1,048,576) quads,
 16 bytes each; a buffer that would overflow is sorted in its terms' order (an
 equal id is an equal term, never read), deduplicated and spilled as one run
 ([`QuadSpiller`](../core/src/store/builders/runs.rs#L261)). A dataset that fits
@@ -253,9 +253,9 @@ merged as they are, never deduplicated — are unique because their row ids are.
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229)):
 every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
-([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L117)) or,
+([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L116)) or,
 under the string layouts, as their terms again
-([`build_struct_array`](../core/src/store/builders/mod.rs#L173)). With indexes a
+([`build_struct_array`](../core/src/store/builders/mod.rs#L171)). With indexes a
 first merge runs to completion
 ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L116)):
 row ids are only known as the merge assigns them, and an index child is a
@@ -321,7 +321,7 @@ full) or to a writable directory (any other failure).
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L54)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L52)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |
@@ -392,7 +392,7 @@ Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
 ([file-format.md §6](file-format.md#6-the-index-children)).
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L207)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L197)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
 family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L138),
 or the code tuple under Dictionary), then gather the columns through that

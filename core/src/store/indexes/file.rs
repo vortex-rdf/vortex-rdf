@@ -28,7 +28,7 @@ use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, PatternCodes, ResolvedLayout};
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
 use crate::store::scan::file_exprs::eq_conjunction;
-use crate::store::scan::file_reads::component_point_chunk;
+use crate::store::scan::file_reads::{component_point_chunk, values_at};
 use crate::store::scan::file_scans::read_all_rows;
 use crate::store::schema::{RowId, TermCode};
 use crate::store::view::selection::point_sized;
@@ -81,15 +81,12 @@ async fn rid_point_reads(
     let Some(chunks) = file.component_column_chunks(child.name, COL_RID) else {
         return Ok(None);
     };
-    let source = file.segment_source();
-    let session = file.session();
     // A point-read run is at most `POINT_GATHER_MAX_ROWS` wide.
-    let mut ids = Vec::with_capacity((range.end - range.start) as usize);
-    for row in range {
-        match chunks.value_at(row, &source, session).await? {
-            Some(rid) => ids.push(super::base_row(rid)),
-            None => return Ok(None),
-        }
+    let Some(mut ids) = values_at(file, &chunks, range).await? else {
+        return Ok(None);
+    };
+    for id in &mut ids {
+        *id = super::base_row(*id);
     }
     ids.sort_unstable();
     check_addressable(&ids)?;

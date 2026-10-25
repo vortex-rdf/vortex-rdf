@@ -28,9 +28,9 @@
 //! (compaction, a mutated store's serialization) do the same in one place
 //! (`sorted_live_raw_quads`) before they call [`build_parts_from_raws`].
 
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::array::stamp_is_sorted;
+use crate::store::array::{named_struct, stamp_is_sorted};
 use crate::store::indexes::{
     ALL_INDEX_TYPES, IndexComponent, IndexInput, IndexType, Indexes, check_indexed_rows,
 };
@@ -39,9 +39,7 @@ use crate::store::layouts::{LayoutStrategy, dictionary};
 use futures::{Stream, stream};
 use std::future::Future;
 use std::sync::Arc;
-use vortex_array::arrays::StructArray;
 use vortex_array::dtype::DType;
-use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 
 /// Number of quads per StructArray chunk in streaming/chunked builders.
@@ -178,7 +176,6 @@ pub(crate) fn build_struct_array(
     if layout == LayoutStrategy::Dictionary && quads.is_empty() {
         return dictionary::empty_struct();
     }
-    let field_names = layout.field_names();
     let field_arrays = layout.build_columns(quads)?;
 
     if s_sorted {
@@ -186,14 +183,7 @@ pub(crate) fn build_struct_array(
         stamp_is_sorted(&field_arrays[0]);
     }
 
-    StructArray::try_new(
-        field_names.into(),
-        field_arrays,
-        quads.len(),
-        Validity::NonNullable,
-    )
-    .map_err(VortexRdfError::Vortex)
-    .map(|a| a.into_array())
+    named_struct(layout.primary_column_names(), field_arrays, quads.len()).map(|a| a.into_array())
 }
 
 /// The requested indexes' children over a complete in-memory dataset in final

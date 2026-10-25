@@ -233,9 +233,10 @@ pub(crate) mod out_of_core {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::{ArrayRef, IntoArray};
 
-    use super::super::components::{TermColumn, child_struct};
+    use super::super::components::TermColumn;
     use super::{CHILD_COLUMNS, CopyFamily};
     use crate::error::Result;
+    use crate::store::array::named_struct;
     use crate::store::array::stamp_is_sorted;
     use crate::store::schema::RowId;
 
@@ -259,7 +260,7 @@ pub(crate) mod out_of_core {
             PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
         ];
         stamp_is_sorted(&columns[family.key_order()[0]]);
-        child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
+        named_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
     }
 
     /// A quad's terms rearranged into one family's sort-key order, so deriving

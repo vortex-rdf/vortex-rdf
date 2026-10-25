@@ -12,12 +12,13 @@ use futures::{FutureExt as _, StreamExt, stream};
 use vortex_array::dtype::DType;
 use vortex_array::expr::{Expression, root, select};
 use vortex_array::{ArrayRef, MaskFuture};
-use vortex_buffer::{Buffer, BufferMut};
+use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::available_parallelism;
+use crate::store::array::named_struct;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
 use crate::store::scan::file_filter::{self, SplitMasks};
@@ -46,10 +47,10 @@ pub(crate) async fn file_point_rows(
     let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
     };
-    point_read_struct(file, &points.handles, columns, &points.live, |col| {
-        points.constant(col)
-    })
-    .await
+    let Some(values) = points.columns(file, columns).await? else {
+        return Ok(None);
+    };
+    u64_struct(&points.handles, columns, values, points.live.len())
 }
 
 /// [`file_point_rows`] as one code buffer per column of `columns`, in that
@@ -65,26 +66,8 @@ pub(crate) async fn file_point_codes(
     let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
     };
-    let source = file.segment_source();
-    let session = file.session();
-    let mut out = Vec::with_capacity(columns.len());
-    for (handle, col) in points.handles.iter().zip(columns) {
-        let codes = match points.constant(col) {
-            Some(code) => BufferMut::full(code, points.live.len()).freeze(),
-            None => {
-                let mut codes = BufferMut::with_capacity(points.live.len());
-                for &row in &points.live {
-                    match handle.value_at(row, &source, session).await? {
-                        Some(code) => codes.push(code),
-                        None => return Ok(None),
-                    }
-                }
-                codes.freeze()
-            }
-        };
-        out.push(codes);
-    }
-    Ok(Some(out))
+    let values = points.columns(file, columns).await?;
+    Ok(values.map(|values| values.into_iter().map(Buffer::from).collect()))
 }
 
 /// What a point read by id reads: the chunk-probe handle of each read
@@ -143,6 +126,51 @@ impl PointRows {
     fn constant(&self, column: &str) -> Option<u64> {
         self.eqs.iter().find(|(c, _)| c == column).map(|(_, v)| *v)
     }
+
+    /// The live rows' values of `columns`, the columns `handles` read, in
+    /// their order, one value column each: a column the filter pins filled
+    /// with its code, every other read point by point ([`values_at`]), so no
+    /// column is read twice. `None` when a chunk the reads reach has no probe.
+    async fn columns(
+        &self,
+        file: &NativeStoreFile,
+        columns: &[&str],
+    ) -> Result<Option<Vec<Vec<u64>>>> {
+        let mut out = Vec::with_capacity(columns.len());
+        for (handle, column) in self.handles.iter().zip(columns) {
+            let values = match self.constant(column) {
+                Some(code) => vec![code; self.live.len()],
+                None => match values_at(file, handle, self.live.iter().copied()).await? {
+                    Some(values) => values,
+                    None => return Ok(None),
+                },
+            };
+            out.push(values);
+        }
+        Ok(Some(out))
+    }
+}
+
+/// The values of `handle`'s column at `rows`, in order, read point by point
+/// through its chunk probes (chunk fetches cached on `file`): the one loop
+/// every point read by row runs. `None` when a chunk the reads reach has no
+/// probe.
+pub(crate) async fn values_at(
+    file: &NativeStoreFile,
+    handle: &vortex_rdf_encoded_search::ColumnChunks,
+    rows: impl IntoIterator<Item = u64>,
+) -> Result<Option<Vec<u64>>> {
+    let source = file.segment_source();
+    let session = file.session();
+    let rows = rows.into_iter();
+    let mut values = Vec::with_capacity(rows.size_hint().0);
+    for row in rows {
+        match handle.value_at(row, &source, session).await? {
+            Some(value) => values.push(value),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(values))
 }
 
 /// A column's chunk-probe handle beside the code its rows must read.
@@ -156,22 +184,17 @@ async fn rows_reading(
     checks: &[CodeCheck],
     rows: Vec<u64>,
 ) -> Result<Option<Vec<u64>>> {
-    let source = file.segment_source();
-    let session = file.session();
     let mut live = rows;
     for (handle, code) in checks {
         if live.is_empty() {
             break;
         }
-        let mut kept = Vec::with_capacity(live.len());
-        for &row in &live {
-            match handle.value_at(row, &source, session).await? {
-                Some(v) if v == *code => kept.push(row),
-                Some(_) => {}
-                None => return Ok(None),
-            }
-        }
-        live = kept;
+        let Some(values) = values_at(file, handle, live.iter().copied()).await? else {
+            return Ok(None);
+        };
+        live = (live.into_iter().zip(values))
+            .filter_map(|(row, value)| (value == *code).then_some(row))
+            .collect();
     }
     Ok(Some(live))
 }
@@ -280,9 +303,6 @@ async fn chunk_take(
     ids: &[RowId],
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::IntoArray;
-    use vortex_array::arrays::StructArray;
-    use vortex_array::dtype::FieldName;
-    use vortex_array::validity::Validity;
 
     let Some(handles) = columns
         .iter()
@@ -300,10 +320,8 @@ async fn chunk_take(
             None => return Ok(None),
         }
     }
-    let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
     Ok(Some(
-        StructArray::try_new(names.into(), children, ids.len(), Validity::NonNullable)?
-            .into_array(),
+        named_struct(columns, children, ids.len())?.into_array(),
     ))
 }
 
@@ -368,49 +386,27 @@ pub(crate) async fn masked_projection(
     collect_row_splits(dtype, tasks, 4 * available_parallelism()).await
 }
 
-/// `columns` at `rows`, read point by point through their chunk-probe
-/// `handles` into one canonical struct chunk; a column `constant` answers is
-/// filled with that value instead of being read. `Ok(None)` declines: a
-/// chunk without a probe, or a column type the canonical child cannot hold.
-async fn point_read_struct(
-    file: &NativeStoreFile,
+/// One canonical struct chunk of `columns` holding `values`, `len` rows of
+/// each, every column as the primitive type its chunk-probe handle (of
+/// `handles`) reads. `Ok(None)` for a column type the canonical child cannot
+/// hold.
+fn u64_struct(
     handles: &[Arc<vortex_rdf_encoded_search::ColumnChunks>],
     columns: &[&str],
-    rows: &[u64],
-    constant: impl Fn(&str) -> Option<u64>,
+    values: Vec<Vec<u64>>,
+    len: usize,
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::IntoArray;
-    use vortex_array::arrays::StructArray;
-    use vortex_array::dtype::FieldName;
-    use vortex_array::validity::Validity;
 
-    let source = file.segment_source();
-    let session = file.session();
     let mut children = Vec::with_capacity(columns.len());
-    for (handle, col) in handles.iter().zip(columns) {
-        let mut values = Vec::with_capacity(rows.len());
-        match constant(col) {
-            Some(v) => values.extend(std::iter::repeat_n(v, rows.len())),
-            None => {
-                for &row in rows {
-                    match handle.value_at(row, &source, session).await? {
-                        Some(v) => values.push(v),
-                        None => return Ok(None),
-                    }
-                }
-            }
-        }
+    for (handle, values) in handles.iter().zip(values) {
         let Some(child) = primitive_from_u64_reads(handle.dtype().as_ptype(), values.into_iter())
         else {
             return Ok(None);
         };
         children.push(child);
     }
-    let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
-    Ok(Some(
-        StructArray::try_new(names.into(), children, rows.len(), Validity::NonNullable)?
-            .into_array(),
-    ))
+    Ok(Some(named_struct(columns, children, len)?.into_array()))
 }
 
 /// A located serve run's projected component columns, read point by point
@@ -431,8 +427,16 @@ pub(crate) async fn component_point_chunk(
     else {
         return Ok(None);
     };
-    let rows: Vec<u64> = range.collect();
-    point_read_struct(file, &handles, columns, &rows, |_| None).await
+    // The run's rows, under no filter: every column is read.
+    let run = PointRows {
+        handles,
+        eqs: Vec::new(),
+        live: range.collect(),
+    };
+    let Some(values) = run.columns(file, columns).await? else {
+        return Ok(None);
+    };
+    u64_struct(&run.handles, columns, values, run.live.len())
 }
 
 /// Test hook: how many reads this thread gathered by taking exact ids

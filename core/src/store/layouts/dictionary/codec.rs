@@ -12,14 +12,13 @@ use oxrdf::Quad;
 use rustc_hash::FxHashMap;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArray;
-use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{field_as, stamp_is_sorted};
+use crate::store::array::{field_as, named_struct, stamp_is_sorted};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TermCode};
 use crate::store::{RawQuad, SharedQuad};
 
@@ -121,7 +120,6 @@ pub(crate) fn build_code_chunk(
 ) -> Result<ArrayRef> {
     let start = debug::timer();
     let n = range.len();
-    let names: Vec<Arc<str>> = PRIMARY_COLUMNS.iter().map(|&name| name.into()).collect();
     let arrays: Vec<ArrayRef> = vec![
         PrimitiveArray::from_iter(codes.s[range.clone()].iter().copied()).into_array(),
         PrimitiveArray::from_iter(codes.p[range.clone()].iter().copied()).into_array(),
@@ -131,9 +129,7 @@ pub(crate) fn build_code_chunk(
     if s_sorted {
         stamp_is_sorted(&arrays[0]);
     }
-    let chunk = StructArray::try_new(names.into(), arrays, n, Validity::NonNullable)
-        .map_err(VortexRdfError::Vortex)
-        .map(|a| a.into_array())?;
+    let chunk = named_struct(&PRIMARY_COLUMNS, arrays, n)?.into_array();
     log::debug!(
         "[Dictionary] Built encoded chunk of {} rows in {:?}",
         n,

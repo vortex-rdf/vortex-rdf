@@ -2,8 +2,8 @@
 //! index data takes. One [`IndexComponent`] is one child of a native store
 //! file, or its in-memory twin: rows under the child's own column names,
 //! carrying the writer's sortedness provenance. Builders emit components
-//! beside primary-only quad rows; this module assembles a child's rows
-//! ([`child_struct`]), writes one as a native child ([`index_child_write`]),
+//! beside primary-only quad rows; this module writes a child's rows as a
+//! native child ([`index_child_write`]),
 //! adopts a persisted one back into memory ([`adopt_component`]), maps an
 //! implementation slug onto its identity ([`known_component`]), and decodes a
 //! rid column into the sorted base row ids every resolution answers in
@@ -20,9 +20,8 @@ use std::sync::{Arc, OnceLock};
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::dtype::{DType, FieldName, Nullability};
+use vortex_array::dtype::{DType, Nullability};
 use vortex_array::scalar::Scalar;
-use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::{Buffer, BufferMut};
 
@@ -33,7 +32,7 @@ use crate::io::container::{
     child_strategy,
 };
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{into_struct_array, make_string_array};
+use crate::store::array::{into_struct_array, make_string_array, named_struct};
 use crate::store::probes::StructProbes;
 use crate::store::schema::{ROW_ID_PTYPE, RowId, TermCode};
 
@@ -44,7 +43,8 @@ use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 /// queryable: a row of a leaf's static table
 /// ([`IndexType::component_identities`]), which an [`IndexComponent`] holds
 /// and the slug registry scans. The columns behind an identity are the
-/// leaf's ([`child_struct`] assembles them).
+/// leaf's ([`named_struct`](crate::store::array::named_struct) assembles
+/// them).
 pub(crate) struct ComponentIdentity {
     /// The component name (`index:posg`, `index:ref-o`, …) the persisted
     /// child carries.
@@ -419,28 +419,6 @@ pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes 
         .collect()
 }
 
-/// A child's rows assembled from its column arrays: `columns[i]` under the
-/// `child_columns[i]` name, non-nullable throughout. The one construction
-/// every builder's component emission goes through, in memory and out of
-/// core alike.
-pub(crate) fn child_struct(
-    child_columns: &[&'static str],
-    columns: Vec<ArrayRef>,
-    len: usize,
-) -> Result<StructArray> {
-    StructArray::try_new(
-        child_columns
-            .iter()
-            .map(|n| FieldName::from(*n))
-            .collect::<Vec<_>>()
-            .into(),
-        columns,
-        len,
-        Validity::NonNullable,
-    )
-    .map_err(VortexRdfError::Vortex)
-}
-
 /// An index column's term encoding (`String` terms, or [`TermCode`]s under
 /// the Dictionary layout), with the array a column of them assembles into:
 /// the one spelling both families' builders emit their term columns through.
@@ -473,7 +451,7 @@ pub(crate) fn components_from(
         .into_iter()
         .map(|(identity, columns)| {
             let len = columns.first().map_or(0, |column| column.len());
-            let rows = child_struct(child_columns, columns, len)?;
+            let rows = named_struct(child_columns, columns, len)?;
             Ok(IndexComponent::built(identity, rows, true))
         })
         .collect()
@@ -562,7 +540,7 @@ mod tests {
     fn tiny(identity: &'static ComponentIdentity) -> IndexComponent {
         let val = PrimitiveArray::from_iter([0 as TermCode]).into_array();
         let rid = PrimitiveArray::from_iter([0 as RowId]).into_array();
-        let rows = child_struct(&["val", "rid"], vec![val, rid], 1).unwrap();
+        let rows = named_struct(&["val", "rid"], vec![val, rid], 1).unwrap();
         IndexComponent::built(identity, rows, true)
     }
 

@@ -248,7 +248,7 @@ flowchart TD
   run directory named after that file.
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L232) and adopts
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L222) and adopts
   the result through [`from_built`](../core/src/store/construct.rs#L108), in the
   same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).

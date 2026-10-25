@@ -1,6 +1,6 @@
 //! Low-level helpers over Vortex arrays: string-array construction, canonical
-//! string-column access, sortedness statistics, chunk assembly and slicing,
-//! sorted-column binary search, and mask conversion.
+//! string-column access, sortedness statistics, chunk and struct assembly
+//! and slicing, sorted-column binary search, and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
@@ -9,8 +9,9 @@ use crate::store::schema;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::arrays::{BoolArray, ChunkedArray, Struct, StructArray, VarBinViewArray};
-use vortex_array::dtype::DType;
+use vortex_array::dtype::{DType, FieldName};
 use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
+use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, Executable, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
@@ -139,6 +140,20 @@ pub(crate) fn rechunk(
         rows.slice(start..start.saturating_add(batch_rows).min(len))
             .map_err(VortexRdfError::Vortex)
     })
+}
+
+/// A non-nullable struct of `columns` under `names`, `columns[i]` named
+/// `names[i]`, every column `len` rows long: the one construction of the
+/// crate's named struct chunks, from a layout's primary columns to an index
+/// child's rows and a point read's.
+pub(crate) fn named_struct(
+    names: &[&str],
+    columns: Vec<ArrayRef>,
+    len: usize,
+) -> Result<StructArray> {
+    let names: Vec<FieldName> = names.iter().map(|&n| FieldName::from(n)).collect();
+    StructArray::try_new(names.into(), columns, len, Validity::NonNullable)
+        .map_err(VortexRdfError::Vortex)
 }
 
 /// `arr` as a `StructArray`: a plain downcast when it already is one, else

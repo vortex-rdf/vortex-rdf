@@ -125,9 +125,10 @@ pub(crate) mod out_of_core {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::{ArrayRef, IntoArray};
 
-    use super::super::components::{TermColumn, child_struct};
+    use super::super::components::TermColumn;
     use super::CHILD_COLUMNS;
     use crate::error::Result;
+    use crate::store::array::named_struct;
     use crate::store::array::stamp_is_sorted;
     use crate::store::schema::RowId;
 
@@ -140,7 +141,7 @@ pub(crate) mod out_of_core {
         let val = V::column(pairs.iter().map(|(v, _)| v));
         stamp_is_sorted(&val);
         let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
-        child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
+        named_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
     }
 }
 
