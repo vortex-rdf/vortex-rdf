@@ -1,5 +1,11 @@
 //! The `VortexRdfStore` and `TermDict` wasm bindings, and the columnar
 //! payload construction behind `match`/`getQuads` (`match_payload`).
+//!
+//! Every `pub` method here is exported to JS under its `js_name`, or under
+//! its own name without one. api.d.ts, the published type surface, documents
+//! what each does; the docs here say only what the Rust side adds. The reads
+//! are synchronous although core's are `async`: no wasm read path performs
+//! I/O (see `resolve_now`), and only `match` defers its read, into a promise.
 
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -117,10 +123,8 @@ impl VortexRdfStore {
     }
 }
 
-/// An immutable handle on a store's term dictionary, decoding a term code to
-/// its N-Triples string. Codes are `u64` and cross as JS numbers, checked
-/// both ways (see `crate::codes`): exact up to 2^53 − 1, never rounded or
-/// wrapped.
+/// An immutable snapshot of a store's term dictionary, the JS `TermDict`. Its
+/// codes cross as JS numbers, checked both ways by `crate::codes`.
 ///
 /// Handed to the JS lazy read model so that codes produced by one read stay
 /// decodable after the store is mutated — a mutation re-encodes the store
@@ -133,12 +137,9 @@ pub struct TermDict {
 
 #[wasm_bindgen]
 impl TermDict {
-    /// Decode a term code, or `undefined` when it is out of range. A value
-    /// that is no code — not a number, or a number that is not an integer
-    /// from 0 to 2^53 − 1 — throws. Taken as a `JsValue`, so nothing is
+    /// Takes the code as a `JsValue`, not an `f64`, so that nothing is
     /// coerced: `null`, `[]` or `false` never decodes as code 0, nor `true`,
     /// `'1'` or `[1]` as code 1.
-    #[wasm_bindgen(js_name = decode)]
     pub fn decode(&self, code: JsValue) -> Result<Option<String>, JsValue> {
         let number = code.as_f64().ok_or_else(|| {
             js_err(format!(
@@ -151,14 +152,7 @@ impl TermDict {
         Ok(self.snapshot.decode(code))
     }
 
-    /// Encode a term to its code (inverse of [`decode`](Self::decode)), or
-    /// `undefined` when this dictionary does not hold the term. Tolerant of
-    /// spelling: an IRI with or without angle brackets, a literal with escape
-    /// variants, an `xsd:string` typing, an upper-case language tag, or
-    /// `default`/`[]` for the default graph all find the stored form's code.
-    /// Throws for a malformed term, and for a code past 2^53 − 1, which no JS
-    /// number holds exactly.
-    #[wasm_bindgen(js_name = encode)]
+    /// Core's [`DictSnapshot::encode`], whose code must also fit a JS number.
     pub fn encode(&self, term: &str) -> Result<Option<f64>, JsValue> {
         self.snapshot
             .encode(term)
@@ -171,20 +165,19 @@ impl TermDict {
 
 #[wasm_bindgen]
 impl VortexRdfStore {
-    #[wasm_bindgen(skip_typescript)]
     pub fn empty() -> VortexRdfStore {
         VortexRdfStore::wrap(CoreStore::empty())
     }
 
     /// Takes ownership of the buffer wasm-bindgen marshalled from the caller's
     /// `Uint8Array`, so the load holds a single copy of the bytes.
-    #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
+    #[wasm_bindgen(js_name = fromBytes)]
     pub async fn from_bytes(bytes: Vec<u8>) -> Result<VortexRdfStore, JsValue> {
         let inner = CoreStore::from_bytes_owned(bytes).await.map_err(js_err)?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
-    #[wasm_bindgen(js_name = fromString, skip_typescript)]
+    #[wasm_bindgen(js_name = fromString)]
     pub async fn from_string(
         input: String,
         format_name: &str,
@@ -195,9 +188,7 @@ impl VortexRdfStore {
         Self::build(parse_quads_from_reader(Cursor::new(input), format), config).await
     }
 
-    /// Build directly from RDF/JS quads — either an array or a `Stream<Quad>`
-    /// (a Node-style event emitter) — skipping a serialize/parse round-trip.
-    #[wasm_bindgen(js_name = fromQuads, skip_typescript)]
+    #[wasm_bindgen(js_name = fromQuads)]
     pub async fn from_quads(quads: JsValue, options: JsValue) -> Result<VortexRdfStore, JsValue> {
         let config = parse_build_options(options)?;
         if !Array::is_array(&quads) {
@@ -214,15 +205,11 @@ impl VortexRdfStore {
         Self::build(stream::iter(quads.into_iter().map(Ok)), config).await
     }
 
-    #[wasm_bindgen(skip_typescript)]
     pub fn layout(&self) -> String {
         // Core's Display: the canonical kebab-case name every frontend reports.
         self.inner.layout().to_string()
     }
 
-    /// The secondary indexes this store was built with, as their canonical
-    /// kebab-case names.
-    #[wasm_bindgen(skip_typescript)]
     pub fn indexes(&self) -> Vec<String> {
         self.inner
             .indexes()
@@ -231,7 +218,7 @@ impl VortexRdfStore {
             .collect()
     }
 
-    #[wasm_bindgen(js_name = toBytes, skip_typescript)]
+    #[wasm_bindgen(js_name = toBytes)]
     pub async fn to_bytes(&self) -> Result<Vec<u8>, JsValue> {
         // Complete native-container bytes: the quad table is the transparent
         // root child and, under the Dictionary layout, the FSST-compressed
@@ -244,7 +231,7 @@ impl VortexRdfStore {
             .map_err(|e| js_err_ctx("Vortex serialization error", e))
     }
 
-    #[wasm_bindgen(js_name = toRdf, skip_typescript)]
+    #[wasm_bindgen(js_name = toRdf)]
     pub async fn to_rdf(&self, format_name: &str) -> Result<String, JsValue> {
         let format = format_from_name(format_name).map_err(js_err)?;
         let mut buffer = Vec::new();
@@ -254,16 +241,10 @@ impl VortexRdfStore {
         String::from_utf8(buffer).map_err(|e| js_err_ctx("UTF-8 error", e))
     }
 
-    /// Number of quads in the store. Returns synchronously: no wasm read path
-    /// performs I/O, so there is nothing to await (see `resolve_now`).
-    #[wasm_bindgen(skip_typescript)]
     pub fn size(&self) -> Result<usize, JsValue> {
         resolve_now(self.inner.size())
     }
 
-    /// Whether the quad is in the store. Returns synchronously; throws on a
-    /// malformed quad object (`addQuad`/`deleteQuad` reject it).
-    #[wasm_bindgen(skip_typescript)]
     pub fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
         let quad = quad_arg(&quad_js)?;
         resolve_now(self.inner.contains(&quad))
@@ -292,34 +273,28 @@ impl VortexRdfStore {
         Ok(())
     }
 
-    #[wasm_bindgen(js_name = addQuad, skip_typescript)]
+    #[wasm_bindgen(js_name = addQuad)]
     pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
         let quad = quad_arg(&quad_js)?;
         self.mutate(async |s| s.add_quad(quad).await).await
     }
 
-    #[wasm_bindgen(js_name = addQuads, skip_typescript)]
+    #[wasm_bindgen(js_name = addQuads)]
     pub async fn add_quads(&mut self, quads_js: js_sys::Array) -> Result<(), JsValue> {
         let quads = js_array_to_quads(&quads_js)?;
         self.mutate(async |s| s.add_quads(quads).await).await
     }
 
-    #[wasm_bindgen(js_name = deleteQuad, skip_typescript)]
+    #[wasm_bindgen(js_name = deleteQuad)]
     pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
         let quad = quad_arg(&quad_js)?;
         self.mutate(async |s| s.delete_quad(&quad).await).await
     }
 
-    /// RDF/JS `Source.match`: stream the quads matching a pattern as a
-    /// `Stream<Quad>` of lazy, zero-copy `LazyQuad`s.
-    ///
-    /// Returns synchronously. The pattern is resolved lazily inside a `Promise`
-    /// that yields a columnar payload, handed to a minimal RDF/JS `Stream`
-    /// (`.on('data'|'end'|'error', …)`, `.read()`, and — as a convenience —
-    /// `Symbol.asyncIterator` for `for await`). No term strings are materialized
-    /// until a `LazyTerm`'s `.value`/`.termType` is read. An invalid pattern
-    /// term throws synchronously.
-    #[wasm_bindgen(js_name = match, skip_typescript)]
+    /// The pattern resolves in a promise of its columnar payload
+    /// (`match_payload`), which lazy-rdf.js's `makeLazyQuadStream` serves as
+    /// the RDF/JS stream.
+    #[wasm_bindgen(js_name = match)]
     pub fn match_pattern(
         &self,
         subject: JsValue,
@@ -341,13 +316,9 @@ impl VortexRdfStore {
         Ok(make_lazy_quad_stream(&promise.into()))
     }
 
-    /// Materialize the quads matching a pattern into a `LazyQuad[]` — the
-    /// array-returning counterpart of [`match`](Self::match_pattern).
-    ///
-    /// Returns synchronously: no wasm read path performs I/O, so there is
-    /// nothing to await (see `resolve_now`). The quads still decode their
-    /// term strings lazily on access.
-    #[wasm_bindgen(js_name = getQuads, skip_typescript)]
+    /// The payload [`match`](Self::match_pattern) resolves (`match_payload`),
+    /// built now and made lazy quads by lazy-rdf.js's `buildLazyQuads`.
+    #[wasm_bindgen(js_name = getQuads)]
     pub fn get_quads(
         &self,
         subject: JsValue,
@@ -360,12 +331,7 @@ impl VortexRdfStore {
         Ok(build_lazy_quads(&payload))
     }
 
-    /// Number of quads matching a pattern, counted from the match's row
-    /// selection alone — no term string is materialized. The `keep`, `limit`
-    /// and `offset` of `options` narrow the match as for
-    /// [`matchCodes`](Self::match_codes); a `limit` stops the count once that
-    /// many rows are known to exist.
-    #[wasm_bindgen(js_name = countQuads, skip_typescript)]
+    #[wasm_bindgen(js_name = countQuads)]
     pub fn count_quads(
         &self,
         subject: JsValue,
@@ -381,15 +347,11 @@ impl VortexRdfStore {
         resolve_now(self.inner.count_probe(&probe))
     }
 
-    /// [`countQuads`](Self::count_quads) for each of `probes`, one after
-    /// another in input order, as an array of numbers. Every probe is parsed
-    /// before any runs; the first that fails throws, and none after it runs.
-    /// Runs on every layout.
-    ///
     /// Core's `count_many` joins the counts, which polls them in input order
     /// and stops at the first error; each completes on its first poll here
-    /// (see `resolve_now`), so they run one after another.
-    #[wasm_bindgen(js_name = countQuadsMany, skip_typescript)]
+    /// (see `resolve_now`), so the probes run one after another and none after
+    /// a failing one runs.
+    #[wasm_bindgen(js_name = countQuadsMany)]
     pub fn count_quads_many(&self, probes: JsValue) -> Result<js_sys::Array, JsValue> {
         let counts = resolve_now(self.inner.count_many(&parse_probes(&probes)?))?;
         Ok(counts
@@ -398,24 +360,7 @@ impl VortexRdfStore {
             .collect())
     }
 
-    /// Low-level: resolve a pattern to the matched rows' raw term codes —
-    /// `{ s, p, o, g }` as `Float64Array`s of exact integer codes plus
-    /// `length` — with no term strings materialized; a code past 2^53 − 1
-    /// throws. `null` unless the store's rows are code-addressable
-    /// (Dictionary layout, no pending appends, resident dictionary); decode
-    /// codes through [`termDict`](Self::term_dict). An invalid pattern term
-    /// or option throws whether or not the rows are code-addressable.
-    ///
-    /// `options.keep` narrows the match inside the store, before any row is
-    /// gathered: per position, a code set (a `Float64Array`, or an array of
-    /// codes of any length but two) or a code range (`[lo, hi]`, the
-    /// half-open codes `lo <= code < hi`). `options.offset` and
-    /// `options.limit` then window the kept rows: a window that cuts rows
-    /// takes them in base row order, while a limit that cannot cut a row (no
-    /// offset, and at least the match's row count, or a bound on it, known
-    /// without reading) returns the match as it is, in the order the call
-    /// without a limit returns.
-    #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
+    #[wasm_bindgen(js_name = matchCodes)]
     pub fn match_codes(
         &self,
         subject: JsValue,
@@ -436,18 +381,7 @@ impl VortexRdfStore {
         probe_codes(&self.inner, &probe)
     }
 
-    /// Low-level: [`matchCodes`](Self::match_codes) in chunks — an
-    /// `Iterable` whose items are `{ <column>: Float64Array, …, length }` of
-    /// at most `options.batchRows` rows (8,192 by default), in base row
-    /// order, holding the columns `options.columns` names (all four by
-    /// default) — or `null` under the same gate as `matchCodes`. This call
-    /// resolves the narrowed match (`keep`, `limit`, `offset`, as for
-    /// `matchCodes`); each `next()` reads or gathers one chunk's rows. An
-    /// aborted `options.signal` ends the iteration at the next `next()`, and
-    /// one aborted before the call makes it return a finished iterable
-    /// without resolving the match. `batchRows` 0, no column or an unknown
-    /// column name throws.
-    #[wasm_bindgen(js_name = matchCodeChunks, skip_typescript)]
+    #[wasm_bindgen(js_name = matchCodeChunks)]
     pub fn match_code_chunks(
         &self,
         subject: JsValue,
@@ -474,16 +408,7 @@ impl VortexRdfStore {
         Ok(handle_iterable(chunks, &shape.signal.value))
     }
 
-    /// Low-level: [`matchCodes`](Self::match_codes) for each of `probes`, as
-    /// an `Iterable` answering one probe per `next()` in input order. A probe
-    /// is an array `[s, p, o, g]` of pattern terms or an object with keys
-    /// `s`, `p`, `o`, `g`, `keep`, `limit` and `offset`. Every probe is
-    /// parsed before any runs; the first that fails throws from its
-    /// `next()`. On a store whose rows are not code-addressable every answer
-    /// is `null` and no probe runs. An aborted `options.signal` ends the
-    /// iteration at the next `next()`, and one aborted before the call makes
-    /// it return a finished iterable.
-    #[wasm_bindgen(js_name = matchCodesMany, skip_typescript)]
+    #[wasm_bindgen(js_name = matchCodesMany)]
     pub fn match_codes_many(
         &self,
         probes: JsValue,
@@ -499,15 +424,8 @@ impl VortexRdfStore {
         Ok(handle_iterable(answers, &signal.value))
     }
 
-    /// Low-level: an immutable [`TermDict`] handle on this store's term
-    /// dictionary — the one door to code↔term translation (`decode`/`encode`
-    /// of N-Triples term strings: `<iri>`, `_:blank`, `"lit"@lang`,
-    /// `"lit"^^<dt>`, or `""` for the default graph). `undefined` short of
-    /// core's [`dict_reader`](CoreStore::dict_reader) gate and a resident
-    /// snapshot (Dictionary layout, no append tail, resident dictionary). The
-    /// handle keeps decoding correctly after the store is mutated, because it
-    /// retains the dictionary its codes address.
-    #[wasm_bindgen(js_name = termDict, skip_typescript)]
+    /// A [`TermDict`] over `dict_snapshot`, the gate of every code read.
+    #[wasm_bindgen(js_name = termDict)]
     pub fn term_dict(&self) -> Option<TermDict> {
         let snapshot = self.dict_snapshot()?;
         Some(TermDict { snapshot })

@@ -63,9 +63,8 @@ fn freed_store() -> JsValue {
     js_err("the VortexRdfStore this iterator reads has been freed")
 }
 
-/// The chunks of a `matchCodeChunks` call: the match's code columns pulled
-/// one chunk per `next()`, in base row order, each column a `Float64Array`
-/// copy of the chunk's codes.
+/// The handle under `matchCodeChunks`' iterable: the match's code chunks,
+/// one pulled per `next()`.
 #[wasm_bindgen(skip_typescript)]
 pub struct CodeChunks {
     /// The chunk stream; `None` once it has ended or failed.
@@ -88,10 +87,9 @@ impl CodeChunks {
 
 #[wasm_bindgen]
 impl CodeChunks {
-    /// The next chunk, `{ <column>: Float64Array, …, length }` holding the
-    /// requested columns, or `undefined` once the match is exhausted. Throws
-    /// once the store has been freed, for a failed read and for a code past
-    /// 2^53 − 1; after the end or an error, every call returns `undefined`.
+    /// The JS `next()`. The stream is dropped at its end and at the first
+    /// error, a freed store's included, so every later call returns
+    /// `undefined`.
     #[wasm_bindgen(js_name = next)]
     pub fn pull(&mut self) -> Result<JsValue, JsValue> {
         let Some(stream) = self.stream.as_mut() else {
@@ -135,8 +133,8 @@ fn columns_object(
     Ok(object.into())
 }
 
-/// The answers of a `matchCodesMany` call: one probe answered per `next()`,
-/// in input order.
+/// The handle under `matchCodesMany`' iterable: one probe answered per
+/// `next()`.
 #[wasm_bindgen(skip_typescript)]
 pub struct ProbeAnswers {
     /// The store the probes run on; `None` when its rows have no codes, so
@@ -160,11 +158,10 @@ impl ProbeAnswers {
 
 #[wasm_bindgen]
 impl ProbeAnswers {
-    /// The next probe's code columns, `{ s, p, o, g, length }` as for
-    /// `matchCodes`, `null` when the store's rows have no codes, or
-    /// `undefined` once every probe has answered. Throws once the store has
-    /// been freed and for the first probe that fails; after the end or an
-    /// error, every call returns `undefined`.
+    /// The JS `next()`. The probes are dropped at the first error, a freed
+    /// store's included, so every later call returns `undefined`; once every
+    /// probe has answered, a freed store no longer throws (a `CodeChunks`
+    /// throws until it has seen its stream end).
     #[wasm_bindgen(js_name = next)]
     pub fn pull(&mut self) -> Result<JsValue, JsValue> {
         let Some(probe) = self.probes.next() else {
