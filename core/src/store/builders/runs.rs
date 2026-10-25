@@ -147,32 +147,31 @@ impl RecordReader {
 
 /// One sorted run of a merge, read in order.
 pub(crate) trait RunRead {
-    type Item: Ord;
+    type Item: Ord + Copy;
 
     /// The run's next item, or `None` once it is drained.
     fn next(&mut self) -> Result<Option<Self::Item>>;
 }
 
-/// Streams items in global sorted order: a K-way merge over sorted runs.
+/// Streams items in global sorted order: a K-way merge over sorted runs, an
+/// item that appears more than once (in several runs, or repeated inside
+/// one) coming out once.
 pub(crate) struct RunMerger<R: RunRead> {
     runs: Vec<R>,
     /// Primed with each run's head; empty while a single run is read
     /// straight through.
     heap: BinaryHeap<Head<R::Item>>,
-    /// Whether an item present more than once comes out once.
-    distinct: bool,
+    /// The item last emitted. Equal items are adjacent in the merged order,
+    /// so a repeat is the item just emitted.
+    last: Option<R::Item>,
 }
 
 impl<R: RunRead> RunMerger<R> {
-    /// Merge `runs`, each already sorted. With `distinct`, an item that
-    /// appears more than once (in several runs, or repeated inside one) comes
-    /// out once.
-    pub(crate) fn new(mut runs: Vec<R>, distinct: bool) -> Result<Self> {
+    /// Merge `runs`, each already sorted. A lone run reads straight
+    /// through; several fill the heap with their heads.
+    pub(crate) fn new(mut runs: Vec<R>) -> Result<Self> {
         let mut heap = BinaryHeap::new();
-        // A lone run reads straight through, unless its repeats must be
-        // dropped: that takes the heap, which sees the next item of a run
-        // before anything is emitted.
-        if runs.len() > 1 || distinct {
+        if runs.len() > 1 {
             for (run_idx, run) in runs.iter_mut().enumerate() {
                 if let Some(item) = run.next()? {
                     heap.push(Head { item, run_idx });
@@ -182,29 +181,31 @@ impl<R: RunRead> RunMerger<R> {
         Ok(Self {
             runs,
             heap,
-            distinct,
+            last: None,
         })
     }
 
-    /// The next item in global order, or `None` once every run is drained.
+    /// The next item in global order, a repeat of the last one skipped, or
+    /// `None` once every run is drained.
     pub(crate) fn next(&mut self) -> Result<Option<R::Item>> {
-        if self.runs.len() == 1 && !self.distinct {
-            return self.runs[0].next();
-        }
-        let Some(Head { item, run_idx }) = self.heap.pop() else {
-            return Ok(None);
-        };
-        self.refill(run_idx)?;
-        if self.distinct {
-            // Equal items are adjacent in the merged order, so every other
-            // copy of `item` is the head of its run: at the top of the heap.
-            while self.heap.peek().is_some_and(|top| top.item == item) {
-                if let Some(Head { run_idx, .. }) = self.heap.pop() {
-                    self.refill(run_idx)?;
+        loop {
+            let item = if self.runs.len() == 1 {
+                match self.runs[0].next()? {
+                    Some(item) => item,
+                    None => return Ok(None),
                 }
+            } else {
+                let Some(Head { item, run_idx }) = self.heap.pop() else {
+                    return Ok(None);
+                };
+                self.refill(run_idx)?;
+                item
+            };
+            if self.last != Some(item) {
+                self.last = Some(item);
+                return Ok(Some(item));
             }
         }
-        Ok(Some(item))
     }
 
     /// Put run `run_idx`'s next item, if it has one, back on the heap.
@@ -376,7 +377,7 @@ impl QuadRuns {
                 })
                 .collect::<Result<_>>()?,
         };
-        RunMerger::new(runs, true)
+        RunMerger::new(runs)
     }
 }
 
@@ -569,7 +570,7 @@ impl<E: IndexEntry> EntrySpiller<E> {
             let run = EntryRunReader(EntrySource::Memory(
                 std::mem::take(&mut self.buf).into_iter(),
             ));
-            return RunMerger::new(vec![run], false);
+            return RunMerger::new(vec![run]);
         }
         if !self.buf.is_empty() {
             self.flush_run()?;
@@ -579,7 +580,7 @@ impl<E: IndexEntry> EntrySpiller<E> {
             .iter()
             .map(|path| EntryRunReader::open(path))
             .collect::<Result<_>>()?;
-        RunMerger::new(runs, false)
+        RunMerger::new(runs)
     }
 }
 

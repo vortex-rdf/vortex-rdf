@@ -10,7 +10,7 @@ use std::thread::LocalKey;
 
 use js_sys::Reflect;
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-use vortex_rdf_core::{Probe, VortexRdfStore as CoreStore};
+use vortex_rdf_core::Probe;
 use wasm_bindgen::prelude::*;
 
 use crate::error::js_err;
@@ -237,47 +237,25 @@ pub(crate) fn quad_arg(val: &JsValue) -> Result<Quad, JsValue> {
     js_to_quad(val).ok_or_else(|| js_err("Invalid quad object"))
 }
 
-/// A four-position match pattern parsed from the JS arguments of `match`,
-/// `getQuads`, `countQuads`, `matchCodes` and `matchCodeChunks`, or from a
-/// probe of `matchCodesMany` and `countQuadsMany`: `None` is a wildcard.
-pub(crate) struct JsPattern {
-    pub s: Option<NamedOrBlankNode>,
-    pub p: Option<NamedNode>,
-    pub o: Option<Term>,
-    pub g: Option<GraphName>,
-}
-
-impl JsPattern {
-    /// Parse the four pattern slots. A slot is a wildcard when it is
-    /// `null`/`undefined` or an RDF/JS `Variable` term; any other value must
-    /// parse as a term of the position's kind (a bare string is a NamedNode
-    /// IRI), or the whole pattern is rejected with `Invalid {position} term`.
-    pub(crate) fn parse(s: JsValue, p: JsValue, o: JsValue, g: JsValue) -> Result<Self, JsValue> {
-        Ok(Self {
-            s: pattern_slot(s, "subject", subject)?,
-            p: pattern_slot(p, "predicate", predicate)?,
-            o: pattern_slot(o, "object", object)?,
-            g: pattern_slot(g, "graph", graph)?,
-        })
-    }
-
-    /// This pattern as a core [`Probe`], with no narrowing.
-    pub(crate) fn into_probe(self) -> Probe {
-        Probe::new(self.s, self.p, self.o, self.g)
-    }
-
-    /// The view of `store` matching this pattern, with the error shaped for JS.
-    pub(crate) async fn matched(&self, store: &CoreStore) -> Result<CoreStore, JsValue> {
-        store
-            .match_pattern(
-                self.s.as_ref(),
-                self.p.as_ref(),
-                self.o.as_ref(),
-                self.g.as_ref(),
-            )
-            .await
-            .map_err(js_err)
-    }
+/// A four-position match pattern as a core [`Probe`] with no narrowing,
+/// parsed from the JS arguments of `match`, `getQuads`, `countQuads`,
+/// `matchCodes` and `matchCodeChunks`, or from a probe of `matchCodesMany`
+/// and `countQuadsMany`. A slot is a wildcard when it is `null`/`undefined`
+/// or an RDF/JS `Variable` term; any other value must parse as a term of the
+/// position's kind (a bare string is a NamedNode IRI), or the whole pattern
+/// is rejected with `Invalid {position} term`.
+pub(crate) fn pattern_probe(
+    s: JsValue,
+    p: JsValue,
+    o: JsValue,
+    g: JsValue,
+) -> Result<Probe, JsValue> {
+    Ok(Probe::new(
+        pattern_slot(s, "subject", subject)?,
+        pattern_slot(p, "predicate", predicate)?,
+        pattern_slot(o, "object", object)?,
+        pattern_slot(g, "graph", graph)?,
+    ))
 }
 
 /// One pattern slot: `Ok(None)` for a wildcard, `Ok(Some)` for a term of the

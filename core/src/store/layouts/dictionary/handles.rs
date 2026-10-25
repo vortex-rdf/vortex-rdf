@@ -48,7 +48,7 @@ impl DictAccess {
     pub(in crate::store::layouts) async fn resolve_pattern(
         &self,
         pattern: QuadPattern<'_>,
-        codes: &mut PatternCodes<'_>,
+        codes: &mut PatternCodes,
     ) -> Result<()> {
         match self {
             DictAccess::Resident(dict) => {
@@ -65,8 +65,7 @@ impl DictAccess {
                 let resolved =
                     futures::future::join_all(rendered.iter().map(|t| fb.encode_exact(t))).await;
                 for (term, code) in pattern.bound_roles().zip(resolved) {
-                    let code = code?;
-                    codes.resolve(term, |_| code);
+                    codes.seed(term, code?);
                 }
             }
         }

@@ -164,6 +164,8 @@ export type Probe =
  * its `datatype.value` is, else simple. A literal's `datatype`, when present,
  * is a NamedNode object: a non-object such as a bare IRI string is malformed,
  * in a quad and in a pattern alike. An absent graph is the default graph.
+ * `addQuads` and `fromQuads` name a malformed quad by its index in the array
+ * (`Invalid quad object at index 70000`), or by its position in a stream.
  */
 export class VortexRdfStore {
     static empty(): VortexRdfStore;
@@ -218,9 +220,8 @@ export class VortexRdfStore {
     /**
      * Number of quads matching a pattern — counted from the match's row
      * selection alone, no term string materialized. `options` narrow the
-     * match as for `matchCodes`; with a `limit` the count stops once that
-     * many rows are known to exist (`limit: 1` is an existence test). A
-     * `keep` needs code-addressable rows and throws without them.
+     * match (`ReadOptions`); with a `limit` the count stops once that many
+     * rows are known to exist (`limit: 1` is an existence test).
      */
     countQuads(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ReadOptions): number;
     /**
@@ -236,16 +237,9 @@ export class VortexRdfStore {
      * a code past `Number.MAX_SAFE_INTEGER` (2^53 - 1) throws rather than
      * rounding. `null` unless the store's rows are code-addressable
      * (Dictionary layout, no pending appends, resident dictionary); decode
-     * codes through `termDict()`. An invalid pattern term or option throws
-     * whether or not the rows are code-addressable.
-     *
-     * `options.keep` keeps the rows whose code in a position is in a code set
-     * or range (`CodeKeep`), inside the store, before any row is gathered;
-     * `options.offset` and `options.limit` then window the kept rows: a
-     * window that cuts rows takes them in base row order, while a limit that
-     * cannot cut a row (no offset, and at least the match's row count, or a
-     * bound on it, known without reading) returns the match as it is, in the
-     * order the call without a limit returns.
+     * codes through `termDict()`. `options` narrow the match (`ReadOptions`).
+     * An invalid pattern term or option throws whether or not the rows are
+     * code-addressable.
      */
     matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ReadOptions): CodeColumns | null;
     /**
@@ -253,7 +247,7 @@ export class VortexRdfStore {
      * `options.batchRows` rows (8,192 by default) in base row order, each a
      * `Float64Array` copy of the columns `options.columns` names (all four
      * by default). `null` under the same conditions as `matchCodes`. The
-     * call resolves the narrowed match (`keep`, `limit`, `offset`); each
+     * call resolves the match, narrowed by `options` (`ReadOptions`); each
      * `next()` reads or gathers one chunk's rows, so stopping the pulls stops
      * the work. The iterable's `return()` (a `for…of` left early) and
      * `[Symbol.dispose]` (`using`) free its wasm handle, as does its end; an

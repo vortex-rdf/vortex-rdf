@@ -18,7 +18,7 @@ use super::*;
 use crate::store::array::field_as;
 use crate::store::builders::{BuildSizes, sorted_stream};
 use crate::store::test_hooks::RowIdBase;
-use crate::store::{Probe, RowId, StoreParts};
+use crate::store::{BuiltArray, Probe, RowId};
 use vortex_array::VortexSessionExecute as _;
 use vortex_array::arrays::PrimitiveArray;
 
@@ -44,20 +44,12 @@ fn single_index_sets() -> impl Iterator<Item = Indexes> {
     index_sets().into_iter().filter(|set| set.len() == 1)
 }
 
-fn iri(s: &str) -> NamedNode {
-    NamedNode::new(format!("http://example.org/{s}")).unwrap()
-}
-
-fn g1() -> GraphName {
-    GraphName::NamedNode(iri("g1"))
-}
-
 /// 900 quads `s{i:04} p{i % 3} "o{i % 7}"`, alternating between the default
 /// graph and `g1`: quad `i` is row `i` (subjects are unique and sort as `i`),
 /// `p1` covers 300 rows (past the point-read cap), `"o2"` 129 (inside it),
 /// and both together 43.
 fn dataset() -> Vec<Quad> {
-    graph_modular_quads(N, 4, 3, 7, &[GraphName::DefaultGraph, g1()])
+    graph_modular_quads(N, 4, 3, 7, &[GraphName::DefaultGraph, iri_graph("g1")])
 }
 
 /// The rows of `quads` at the indexes `keep` accepts, in row order.
@@ -90,36 +82,24 @@ async fn partition_strings(view: &VortexRdfStore, n: usize) -> Vec<String> {
 /// and tombstones over index matches.
 async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     let p1 = iri("p1");
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let o2 = plain_literal("o2");
     assert_eq!(store.size().await.unwrap(), N, "{label}");
 
     // ── matches ──────────────────────────────────────────────────────────
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(store, None, Some(&p1), None, None).await;
     let p_rows = rows_where(quads, |i| i % 3 == 1);
     assert_eq!(view_strings(&by_p).await, p_rows, "{label}: by predicate");
-    let by_o = store
-        .match_pattern(None, None, Some(&o2), None)
-        .await
-        .unwrap();
+    let by_o = matched_view(store, None, None, Some(&o2), None).await;
     assert_eq!(
         view_strings(&by_o).await,
         rows_where(quads, |i| i % 7 == 2),
         "{label}: by object"
     );
-    let both = store
-        .match_pattern(None, Some(&p1), Some(&o2), None)
-        .await
-        .unwrap();
+    let both = matched_view(store, None, Some(&p1), Some(&o2), None).await;
     let both_rows = rows_where(quads, |i| i % 21 == 16);
     assert_eq!(view_strings(&both).await, both_rows, "{label}: by both");
-    let g = g1();
-    let by_g = store
-        .match_pattern(None, None, None, Some(&g))
-        .await
-        .unwrap();
+    let g = iri_graph("g1");
+    let by_g = matched_view(store, None, None, None, Some(&g)).await;
     assert_eq!(
         view_strings(&by_g).await,
         rows_where(quads, |i| i % 2 == 1),
@@ -128,10 +108,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     // An index match's rows, narrowed by a second index match: the first
     // match's ids — deferred behind a serve plan, or a located run — are
     // read to intersect them.
-    let chained = by_p
-        .match_pattern(None, None, Some(&o2), None)
-        .await
-        .unwrap();
+    let chained = matched_view(&by_p, None, None, Some(&o2), None).await;
     assert_eq!(view_strings(&chained).await, both_rows, "{label}: chained");
 
     // ── partitions of the index matches ──────────────────────────────────
@@ -191,10 +168,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .await
         .unwrap();
     let live = |i: usize| i != 1 && i != 2;
-    let by_p = deleted
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&deleted, None, Some(&p1), None, None).await;
     assert_eq!(
         view_strings(&by_p).await,
         rows_where(quads, |i| i % 3 == 1 && live(i)),
@@ -205,10 +179,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         rows_where(quads, |i| i % 3 == 1 && live(i)),
         "{label}: partitions of the predicate match after deletes"
     );
-    let by_o = deleted
-        .match_pattern(None, None, Some(&o2), None)
-        .await
-        .unwrap();
+    let by_o = matched_view(&deleted, None, None, Some(&o2), None).await;
     assert_eq!(
         view_strings(&by_o).await,
         rows_where(quads, |i| i % 7 == 2 && live(i)),
@@ -237,14 +208,11 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
 /// [`N`] rows numbered from `base`: each child's row ids are `base..base + N`,
 /// each once, and a reference child's rows are in `(val, rid)` order. Returns
 /// how many reference children had a value whose run crosses `u32::MAX`.
-fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
+fn check_children(parts: &BuiltArray, base: RowId, label: &str) -> usize {
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     let mut straddling = 0;
-    assert!(
-        !parts.built.components.is_empty(),
-        "{label}: index children"
-    );
-    for component in &parts.built.components {
+    assert!(!parts.components.is_empty(), "{label}: index children");
+    for component in &parts.components {
         let who = format!("{label} / {}", component.identity.name);
         let rows = component.rows().unwrap();
         let rid: PrimitiveArray = field_as(rows, "rid", &mut ctx).unwrap();
@@ -376,7 +344,7 @@ async fn row_ids_past_u32_round_trip_through_a_file() {
     let _base = RowIdBase::set(BASE);
     let quads = dataset();
     let p1 = iri("p1");
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let o2 = plain_literal("o2");
     for layout in LAYOUTS {
         for indexes in single_index_sets() {
             let label = format!("{layout:?} {indexes:?}");
@@ -511,10 +479,8 @@ async fn row_ids_past_u32_survive_compaction() {
     let extra = quads.pop().unwrap();
     for layout in LAYOUTS {
         let label = format!("{layout:?}");
-        let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
-        let store = VortexRdfStore::from_quads(quad_stream(quads.clone()), layout, indexes.clone())
-            .await
-            .unwrap();
+        let indexes = ALL_INDEX_TYPES.to_vec();
+        let store = streamed_store(quads.clone(), layout, indexes.clone()).await;
         let grown = store.add_quad(extra.clone()).await.unwrap();
         let mut all = quads.clone();
         all.push(extra.clone());

@@ -1,48 +1,44 @@
 //! The builders: chunk-boundary behaviour of the streaming builder, the
 //! spill-and-merge path of the streaming one, the file writer's ordering,
-//! and the sorted stamp a build leaves on its subject column.
+//! the sorted stamp a build leaves on its subject column, the one store
+//! every builder makes of an empty dataset, and the push-based sink's wire
+//! form, the in-memory builder's.
 
 use super::*;
 use crate::store::builders::{BuildSizes, sorted_stream};
 
-/// The chunk-boundary harness: chunk_size 3 over the 10 given quads must
-/// split as [3, 3, 3, 1], whatever the `layout`. Hands back the collected
-/// chunks — plus the dictionary the stream carried beside them, for the
-/// Dictionary layout — for the callers' layout-specific follow-up assertions.
-async fn run_chunk_boundary_builders(
+/// The chunk-boundary harness: `sorted_stream`'s chunk stream at chunk_size
+/// 3 over the 10 given quads must split as [3, 3, 3, 1], whatever the
+/// `layout`. Hands back the collected chunks — plus the dictionary the
+/// stream carried beside them, for the Dictionary layout — for the callers'
+/// layout-specific follow-up assertions.
+async fn run_chunk_boundary_builder(
     layout: LayoutStrategy,
     quads: &[Quad],
-) -> Vec<(
-    &'static str,
+) -> (
     Vec<vortex_array::ArrayRef>,
     Option<std::sync::Arc<crate::store::layouts::dictionary::TermDictionary>>,
-)> {
-    let mut out = Vec::new();
-    for (name, result) in [(
-        "sorted_stream",
-        sorted_stream::build_chunk_stream(
-            Box::new(quad_stream(quads.to_vec())),
-            layout,
-            vec![],
-            BuildSizes::uniform(3),
-            None,
-        )
-        .await,
-    )] {
-        let built = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-        let dict = built.dict.clone();
-        let chunks: Vec<_> = built
-            .chunks
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|c| c.unwrap_or_else(|e| panic!("{name}: {e}")))
-            .collect();
-        let lens: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
-        assert_eq!(lens, [3, 3, 3, 1], "{name}: unexpected chunk sizes");
-        out.push((name, chunks, dict));
-    }
-    out
+) {
+    let built = sorted_stream::build_chunk_stream(
+        Box::new(quad_stream(quads.to_vec())),
+        layout,
+        vec![],
+        BuildSizes::uniform(3),
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("sorted_stream: {e}"));
+    let dict = built.dict.clone();
+    let chunks: Vec<_> = built
+        .chunks
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|c| c.unwrap_or_else(|e| panic!("sorted_stream: {e}")))
+        .collect();
+    let lens: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+    assert_eq!(lens, [3, 3, 3, 1], "sorted_stream: unexpected chunk sizes");
+    (chunks, dict)
 }
 
 #[tokio::test]
@@ -61,23 +57,25 @@ async fn test_default_streaming_chunk_boundaries() {
         })
         .collect();
 
-    for (name, chunks, _) in run_chunk_boundary_builders(LayoutStrategy::Default, &quads).await {
-        // Decode all chunks in order and verify global subject sort.
-        let subjects: Vec<String> = chunks
-            .iter()
-            .flat_map(|c| store::layouts::ResolvedLayout::Default.decode_chunk(c))
-            .map(|q| q.unwrap().subject.to_string())
-            .collect();
-        let mut sorted = subjects.clone();
-        sorted.sort();
-        assert_eq!(subjects, sorted, "{name}: output not globally sorted");
-        assert_eq!(subjects.len(), 10, "{name}: wrong quad count");
-        if let vortex_array::dtype::DType::Struct(fields, _) = chunks[0].dtype() {
-            let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
-            assert_eq!(names, ["s", "p", "o", "g"], "{name}");
-        } else {
-            panic!("{name}: expected struct dtype");
-        }
+    let (chunks, _) = run_chunk_boundary_builder(LayoutStrategy::Default, &quads).await;
+    // Decode all chunks in order and verify global subject sort.
+    let subjects: Vec<String> = chunks
+        .iter()
+        .flat_map(|c| store::layouts::ResolvedLayout::Default.decode_chunk(c))
+        .map(|q| q.unwrap().subject.to_string())
+        .collect();
+    let mut sorted = subjects.clone();
+    sorted.sort();
+    assert_eq!(
+        subjects, sorted,
+        "sorted_stream: output not globally sorted"
+    );
+    assert_eq!(subjects.len(), 10, "sorted_stream: wrong quad count");
+    if let vortex_array::dtype::DType::Struct(fields, _) = chunks[0].dtype() {
+        let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
+        assert_eq!(names, ["s", "p", "o", "g"], "sorted_stream");
+    } else {
+        panic!("sorted_stream: expected struct dtype");
     }
 }
 
@@ -85,29 +83,26 @@ async fn test_default_streaming_chunk_boundaries() {
 async fn test_dictionary_streaming_chunk_boundaries() {
     let quads = dictionary_test_quads();
 
-    for (name, chunks, dict) in
-        run_chunk_boundary_builders(LayoutStrategy::Dictionary, &quads).await
-    {
-        // Reassemble and decode through a store: the chunks hold bare
-        // codes, and the dictionary the stream carried beside them is
-        // handed back with the reassembled array — all chunks' codes must
-        // reference that same global dictionary.
-        let dtype = chunks[0].dtype().clone();
-        let arr = crate::store::array::chunked_or_single(chunks, dtype).unwrap();
-        let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
-            array: arr,
-            components: Vec::new(),
-            dict,
-        })
-        .unwrap();
-        assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{name}");
-        let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
-        assert_eq!(
-            quad_strings(&decoded),
-            quad_strings(&quads),
-            "{name}: bad roundtrip"
-        );
-    }
+    let (chunks, dict) = run_chunk_boundary_builder(LayoutStrategy::Dictionary, &quads).await;
+    // Reassemble and decode through a store: the chunks hold bare codes, and
+    // the dictionary the stream carried beside them is handed back with the
+    // reassembled array — all chunks' codes must reference that same global
+    // dictionary.
+    let dtype = chunks[0].dtype().clone();
+    let arr = crate::store::array::chunked_or_single(chunks, dtype).unwrap();
+    let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
+        array: arr,
+        components: Vec::new(),
+        dict,
+    })
+    .unwrap();
+    assert_eq!(store.layout(), LayoutStrategy::Dictionary, "sorted_stream");
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
+    assert_eq!(
+        quad_strings(&decoded),
+        quad_strings(&quads),
+        "sorted_stream: bad roundtrip"
+    );
 }
 
 /// With a chunk size far below the dataset the streaming ingest spills
@@ -119,7 +114,7 @@ async fn test_dictionary_streaming_chunk_boundaries() {
 /// against the merged dictionary) alike.
 #[tokio::test]
 async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
-    let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let indexes = ALL_INDEX_TYPES.to_vec();
     // Fed in reverse so nothing is accidentally in order, and wide enough
     // (24 quads over a chunk size of 3) to force 8 runs.
     let mut quads = modular_quads(24, 3, 4);
@@ -178,8 +173,8 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 
         // And the index columns the spill merge emitted actually route: the
         // same selectivities the single-run copy-index test asserts.
-        let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
+        let p1 = iri("p1");
+        let o1 = plain_literal("object 1");
         for (tag, pp, po, want) in [
             ("P", Some(&p1), None, 8),
             ("O", None, Some(&o1), 6),
@@ -199,10 +194,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 #[tokio::test]
 async fn test_sorted_stream_empty_dataset() {
     for layout in LAYOUTS {
-        for indexes in [
-            vec![],
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-        ] {
+        for indexes in [vec![], ALL_INDEX_TYPES.to_vec()] {
             let built = sorted_stream::build_array(
                 Box::new(quad_stream(vec![])),
                 layout,
@@ -221,12 +213,75 @@ async fn test_sorted_stream_empty_dataset() {
             assert_eq!(store.layout(), layout);
             assert_eq!(store.indexes(), indexes.as_slice());
             assert_eq!(store.size().await.unwrap(), 0, "{layout:?}/{indexes:?}");
-            let p = NamedNode::new("http://example.org/p0").unwrap();
+            let p = iri("p0");
             assert_eq!(
                 matched_size(&store, None, Some(&p), None, None).await,
                 0,
                 "{layout:?}/{indexes:?}"
             );
+        }
+    }
+}
+
+/// An empty dataset is the same store whichever builder makes it: the
+/// streaming writer's bytes are what the out-of-core and in-memory builds,
+/// and under the Dictionary layout the push sink, serialize to, under every
+/// layout and index set, and each build reports its rows sorted.
+#[tokio::test]
+async fn test_builders_agree_on_an_empty_dataset() {
+    for layout in LAYOUTS {
+        for indexes in index_sets() {
+            let who = format!("{layout:?} / {indexes:?}");
+            let mut written = Vec::new();
+            quads_stream_to_vortex_writer(
+                quad_stream(vec![]),
+                &mut written,
+                layout,
+                indexes.clone(),
+            )
+            .await
+            .unwrap();
+            let mut builds = vec![
+                (
+                    "out of core",
+                    sorted_stream::build_array(
+                        Box::new(quad_stream(vec![])),
+                        layout,
+                        indexes.clone(),
+                        BuildSizes::uniform(3),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                (
+                    "in memory",
+                    build_array::<SortedInMemoryBuilder>(
+                        quad_stream(vec![]),
+                        layout,
+                        indexes.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+            ];
+            if layout == LayoutStrategy::Dictionary {
+                builds.push((
+                    "sink",
+                    DictionaryQuadSink::new(indexes.clone()).finish().unwrap(),
+                ));
+            }
+            for (builder, built) in builds {
+                let store = VortexRdfStore::from_built(built).unwrap();
+                assert_eq!(
+                    store.view_statistics().unwrap().sort_order,
+                    Some(crate::store::SortOrder::Spog),
+                    "{who}: {builder}"
+                );
+                assert!(
+                    store.to_bytes().await.unwrap() == written,
+                    "{who}: {builder} serializes otherwise than the writer"
+                );
+            }
         }
     }
 }
@@ -327,7 +382,7 @@ fn child_table(component: &crate::store::indexes::IndexComponent) -> Vec<(String
                     let col: VarBinViewArray = field_as(rows, name.as_ref(), &mut ctx).unwrap();
                     let reader = StrColReader::new(&col);
                     (0..col.len())
-                        .map(|i| reader.str_at(i).unwrap().to_owned())
+                        .map(|i| reader.str_at(i).to_owned())
                         .collect()
                 } else {
                     let col: PrimitiveArray = field_as(rows, name.as_ref(), &mut ctx).unwrap();
@@ -345,10 +400,7 @@ fn child_table(component: &crate::store::indexes::IndexComponent) -> Vec<(String
 /// named ones, so every key position of a copy child is exercised.
 #[tokio::test]
 async fn test_spilled_children_equal_in_memory_children() {
-    let graph = |name: &str| {
-        GraphName::NamedNode(NamedNode::new(format!("http://example.org/{name}")).unwrap())
-    };
-    let graphs = [GraphName::DefaultGraph, graph("g1"), graph("g2")];
+    let graphs = [GraphName::DefaultGraph, iri_graph("g1"), iri_graph("g2")];
     let mut quads = graph_modular_quads(24, 2, 3, 4, &graphs);
     quads.reverse();
     quads.extend(quads[..6].to_vec());
@@ -425,7 +477,7 @@ async fn test_spilled_string_layouts_decode_terms_verbatim() {
         let built = sorted_stream::build_array(
             Box::new(stream::iter(raws.clone().into_iter().map(Ok))),
             layout,
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            ALL_INDEX_TYPES.to_vec(),
             BuildSizes::uniform(2),
         )
         .await
@@ -498,7 +550,7 @@ async fn test_input_error_after_spilling_removes_the_runs() {
         let result = sorted_stream::build_chunk_stream(
             Box::new(stream::iter(raws)),
             layout,
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            ALL_INDEX_TYPES.to_vec(),
             BuildSizes::uniform(3),
             None,
         )
@@ -557,4 +609,28 @@ async fn test_peak_spill_is_term_ids_and_compact_entries() {
             assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 10, "{who}");
         }
     }
+}
+
+/// The push-based sink and the sorted in-memory builder serialize the same
+/// quads to the same bytes: the sink's single-chunk array, dictionary and
+/// components are the builder's.
+#[tokio::test]
+async fn test_dictionary_quad_sink_serializes_like_the_builder() {
+    let quads = dictionary_test_quads();
+    let mut sink = DictionaryQuadSink::new(vec![IndexType::SecondaryByCopy]);
+    for quad in &quads {
+        sink.push(crate::store::RawQuad::from_quad(quad));
+    }
+    let sunk = VortexRdfStore::from_built(sink.finish().unwrap()).unwrap();
+    let built = built_store(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    assert_eq!(
+        sunk.to_bytes().await.unwrap(),
+        built.to_bytes().await.unwrap(),
+        "the sink's wire form must be the builder's"
+    );
 }

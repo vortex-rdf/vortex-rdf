@@ -14,7 +14,6 @@
 //! (the persisted-child model and the slug registry) are re-exported here,
 //! so callers see one `indexes::` surface.
 
-#[cfg(feature = "file-io")]
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -61,13 +60,10 @@ pub(crate) const COL_RID: &str = "rid";
 #[inline]
 fn row_id_base() -> RowId {
     #[cfg(test)]
-    {
-        crate::store::test_hooks::row_id_base()
+    if let Some(base) = crate::store::test_hooks::row_id_base() {
+        return base;
     }
-    #[cfg(not(test))]
-    {
-        0
-    }
+    0
 }
 
 /// The most quads an indexed build numbers: one per row id from the base up
@@ -520,7 +516,7 @@ impl LazyRowIds {
     }
 
     /// Lazy ids over a located run of a file index child whose rids ascend
-    /// within the run, as [`window_async`](Self::window_async) requires.
+    /// within the run, as [`window`](Self::window) requires.
     #[cfg(feature = "file-io")]
     pub(crate) fn from_located_run(
         file: Arc<crate::store::persist::native_file::NativeStoreFile>,
@@ -533,8 +529,10 @@ impl LazyRowIds {
         }
     }
 
-    /// The ids of rows `offset..offset + limit` of a located run, in base row
-    /// order, read from the window's own rows and no others. A reference
+    /// The ids of rows `offset..offset + limit` of a run whose rids ascend,
+    /// in base row order, read from the window's own rows and no others: an
+    /// in-memory run's cut out of its rid column before they are decoded, a
+    /// located file run's read from those rows of its child. A reference
     /// child's rows are ordered by `(val, rid)` (the order this crate's
     /// writers emit, docs/file-format.md §6), so within one value the rids
     /// ascend: row `k` of the run holds the run's `k`-th smallest rid, and a
@@ -542,46 +540,32 @@ impl LazyRowIds {
     /// A deep page costs its limit, and an empty window (no limit, or an
     /// offset at or past the run's end) reads nothing. `None` for any other
     /// source.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn window_async(
+    pub(crate) async fn window(
         &self,
         offset: usize,
         limit: usize,
     ) -> Result<Option<Buffer<RowId>>> {
-        let LazyRowIdSource::LocatedRun { file, child, range } = &self.source else {
-            return Ok(None);
+        let ids = match &self.source {
+            LazyRowIdSource::Component {
+                rids,
+                ascending: true,
+            } => match window_rows(offset, limit, rids.len() as u64) {
+                Some(rows) => sorted_row_ids(rids.slice(rows.start as usize..rows.end as usize)?)?,
+                None => Buffer::empty(),
+            },
+            #[cfg(feature = "file-io")]
+            LazyRowIdSource::LocatedRun { file, child, range } => {
+                match window_rows(offset, limit, range.end - range.start) {
+                    Some(rows) => {
+                        let rows = range.start + rows.start..range.start + rows.end;
+                        read_located_rids(file, child, rows).await?
+                    }
+                    None => Buffer::empty(),
+                }
+            }
+            _ => return Ok(None),
         };
-        let width = range.end - range.start;
-        let start = (offset as u64).min(width);
-        let end = (offset as u64).saturating_add(limit as u64).min(width);
-        if start >= end {
-            return Ok(Some(Buffer::empty()));
-        }
-        let rows = range.start + start..range.start + end;
-        Ok(Some(read_located_rids(file, child, rows).await?))
-    }
-
-    /// The ids of rows `offset..offset + limit` of an in-memory run whose rids
-    /// ascend, in base row order: the window's own rows cut out of the rid
-    /// column before they are decoded, so a deep page costs its limit and an
-    /// empty window (no limit, or an offset at or past the run's end) decodes
-    /// nothing. `None` for any other source.
-    pub(crate) fn window(&self, offset: usize, limit: usize) -> Result<Option<Buffer<RowId>>> {
-        let LazyRowIdSource::Component {
-            rids,
-            ascending: true,
-        } = &self.source
-        else {
-            return Ok(None);
-        };
-        let width = rids.len();
-        let start = offset.min(width);
-        let end = offset.saturating_add(limit).min(width);
-        if start >= end {
-            return Ok(Some(Buffer::empty()));
-        }
-        let window = rids.slice(start..end)?;
-        Ok(Some(sorted_row_ids(window)?))
+        Ok(Some(ids))
     }
 
     /// How many rows the ids cover, when knowable without computing them: an
@@ -624,7 +608,7 @@ impl LazyRowIds {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
+            LazyRowIdSource::Component { .. } => return self.materialized(),
             LazyRowIdSource::IndexChild {
                 child, constraints, ..
             } => scan_index_row_ids(child, constraints).await?,
@@ -659,6 +643,14 @@ impl LazyRowIds {
     }
 }
 
+/// The rows `offset..offset + limit` of a run `width` rows wide, clamped to
+/// it; `None` when the window holds no row.
+fn window_rows(offset: usize, limit: usize, width: u64) -> Option<Range<u64>> {
+    let start = (offset as u64).min(width);
+    let end = (offset as u64).saturating_add(limit as u64).min(width);
+    (start < end).then_some(start..end)
+}
+
 /// The pattern resolved against the configured indexes over an in-memory
 /// base: the first outcome that isn't `Declined`, the indexes tried in
 /// declaration (preference) order. `Declined` when none applies, and the
@@ -668,7 +660,7 @@ pub(crate) fn resolve_indexes_in_memory(
     components: &[IndexComponent],
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     for index in indexes {
         let Some(probe) = index.choose(pattern, layout) else {
@@ -693,7 +685,7 @@ pub(crate) async fn resolve_indexes_file(
     file: &Arc<crate::store::persist::native_file::NativeStoreFile>,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
-    codes: &mut PatternCodes<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
     for index in indexes {
         let Some(probe) = index.choose(pattern, layout) else {

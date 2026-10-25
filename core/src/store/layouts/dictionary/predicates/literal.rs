@@ -97,26 +97,29 @@ impl<'a> LiteralView<'a> {
     }
 }
 
-/// The kind of a spelling, from its first byte: the byte the kind ranges
-/// split the sorted dictionary on.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kind {
-    /// The empty spelling of the default graph.
-    DefaultGraph,
+/// The kind of a term, from its spelling's first byte: the byte the kind
+/// ranges split the sorted dictionary on, so a code's range gives the same
+/// kind before its spelling is read
+/// ([`KindRanges::kind_of_code`](super::KindRanges::kind_of_code)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
     Literal,
     Iri,
     Blank,
-    /// A spelling no dictionary of this crate holds.
+    /// The default graph's empty spelling, or a spelling no dictionary of
+    /// this crate holds (a foreign writer's, in the gaps between the
+    /// ranges).
     Other,
 }
 
+/// The kind `spelling`'s first byte gives it.
 pub(super) fn kind_of(spelling: &str) -> Kind {
     match spelling.as_bytes().first() {
-        None => Kind::DefaultGraph,
         Some(b'"') => Kind::Literal,
         Some(b'<') => Kind::Iri,
         Some(b'_') => Kind::Blank,
-        Some(_) => Kind::Other,
+        // The default graph's `""`, or a foreign spelling.
+        _ => Kind::Other,
     }
 }
 

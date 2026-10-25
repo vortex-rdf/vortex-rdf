@@ -4,23 +4,20 @@
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container;
+#[cfg(feature = "file-io")]
+use crate::io::file::{FileAccess, open_vortex_file};
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
 use crate::store::indexes::{
     ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
 };
-use crate::store::layouts::DictAccess;
 use crate::store::layouts::dictionary::TermDictionary;
+use crate::store::layouts::{DictAccess, LayoutStrategy};
 #[cfg(feature = "file-io")]
 use crate::store::{
-    Backend, FileBase, QuadsSource,
-    array::into_struct_array,
-    indexes::Indexes,
-    layouts::{LayoutStrategy, dictionary::FileBackedDict},
-    persist::native_file::NativeStoreFile,
+    Backend, FileBase, QuadsSource, array::into_struct_array, indexes::Indexes,
+    layouts::dictionary::FileBackedDict, persist::native_file::NativeStoreFile,
 };
-
-use vortex_file::OpenOptionsSessionExt as _;
 
 use std::sync::Arc;
 
@@ -147,7 +144,10 @@ pub(in crate::store) struct IndexChild {
 /// child through the roster (the resolvers, the listing, the adoptions)
 /// reaches only the children classified here.
 pub(super) struct ComponentRoster {
-    /// The slot of the `dictionary` child, when the inventory carries one.
+    /// The slot of the `dictionary` child the quad table's codes read. Only
+    /// the Dictionary layout has codes, and the quad table's dtype alone
+    /// decides the layout, so a dictionary child beside string columns is
+    /// left out like a skipped component.
     pub(super) dict: Option<usize>,
     /// The known index children, in inventory order.
     pub(super) index_children: Vec<IndexChild>,
@@ -172,19 +172,21 @@ impl ComponentRoster {
             .layout()
             .as_::<container::RdfStoreLayoutVTable>();
         let descriptors = &root.data().components;
+        let dictionary_layout =
+            LayoutStrategy::from_dtype(file.dtype()) == LayoutStrategy::Dictionary;
         let mut roster = Self {
             dict: None,
             index_children: Vec::new(),
         };
         for (slot, descriptor) in descriptors.iter().enumerate() {
             match classify_component(descriptor)? {
-                ComponentKind::Dict => roster.dict = Some(slot),
+                ComponentKind::Dict if dictionary_layout => roster.dict = Some(slot),
                 ComponentKind::Index(identity) => roster.index_children.push(IndexChild {
                     identity,
                     slot,
                     sorted: descriptor.sorted,
                 }),
-                ComponentKind::Skip => {}
+                ComponentKind::Dict | ComponentKind::Skip => {}
             }
         }
         for child in &roster.index_children {
@@ -233,7 +235,7 @@ impl VortexRdfStore {
     /// mapped file. Network filesystems are not supported for mapping.
     #[cfg(feature = "file-io")]
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        Self::open_file(path, read::FileAccess::Mapped).await
+        Self::open_file(path, FileAccess::Mapped).await
     }
 
     /// Load a store file whole into memory (quad rows, dictionary and every
@@ -243,7 +245,7 @@ impl VortexRdfStore {
     /// match can bind it directly.
     #[cfg(feature = "file-io")]
     pub async fn from_file_in_memory<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        let opened = Self::open_file(path, read::FileAccess::Read).await?;
+        let opened = Self::open_file(path, FileAccess::Read).await?;
         Self::from_parts(opened.to_serializable_parts().await?)
     }
 
@@ -253,17 +255,14 @@ impl VortexRdfStore {
     /// shape declines that handle: then it is held whole, the only way left
     /// to read it.
     #[cfg(feature = "file-io")]
-    async fn open_file<P: AsRef<std::path::Path>>(
-        path: P,
-        access: read::FileAccess,
-    ) -> Result<Self> {
+    async fn open_file<P: AsRef<std::path::Path>>(path: P, access: FileAccess) -> Result<Self> {
         // The footer only (schema and layout metadata); no row is read yet.
         // The handle owns the reader tree, so this store and the views
         // derived from it share decoded zone-map stats; it refuses a file this
         // version cannot read and classifies its roster once
         // (`ComponentRoster::of`).
         let file = Arc::new(NativeStoreFile::try_new(
-            read::open_vortex_file(path.as_ref(), access).await?,
+            open_vortex_file(path.as_ref(), access).await?,
         )?);
         log::debug!(
             "[open] {} {}",
@@ -282,20 +281,17 @@ impl VortexRdfStore {
                 indexes.push(child.identity.index);
             }
         }
-        // Only the Dictionary layout reads a dictionary.
-        let dict = match LayoutStrategy::from_dtype(file.dtype()) {
-            LayoutStrategy::Dictionary => match FileBackedDict::open(&file).await? {
-                Some(dict) => Some(DictAccess::FileBacked(dict)),
-                // One full scan of the dictionary child; the chunks keep their
-                // FSST.
-                None => match file.component_reader(container::DICT_COMPONENT_NAME)? {
-                    Some(reader) => Some(DictAccess::Resident(Arc::new(
-                        TermDictionary::from_child_reader(reader).await?,
-                    ))),
-                    None => None,
-                },
+        // The roster holds a dictionary under the Dictionary layout only.
+        let dict = match FileBackedDict::open(&file).await? {
+            Some(dict) => Some(DictAccess::FileBacked(dict)),
+            // One full scan of the dictionary child; the chunks keep their
+            // FSST.
+            None => match file.component_reader(container::DICT_COMPONENT_NAME)? {
+                Some(reader) => Some(DictAccess::Resident(Arc::new(
+                    TermDictionary::from_child_reader(reader).await?,
+                ))),
+                None => None,
             },
-            LayoutStrategy::Default | LayoutStrategy::TypedObject => None,
         };
         let layout = resolved_layout(dict, file.dtype())?;
         // No filter and no selection yet: this view covers all quad rows.
@@ -342,11 +338,7 @@ impl VortexRdfStore {
     /// whenever the caller already owns the bytes; `from_bytes` copies a
     /// borrowed slice into one.
     pub async fn from_bytes_owned(bytes: impl Into<vortex_buffer::ByteBuffer>) -> Result<Self> {
-        let bytes: vortex_buffer::ByteBuffer = bytes.into();
-        let file = VORTEX_SESSION
-            .open_options()
-            .open_buffer(bytes.clone())
-            .map_err(|error| read::open_failure(error, container::newer_root_id(&bytes)))?;
+        let file = read::open_store_buffer(bytes.into())?;
         // Refused before a row is read, for a fault of the roster too.
         let roster = ComponentRoster::of(&file)?;
         // The root scan is the transparent quad child.
@@ -360,14 +352,7 @@ impl VortexRdfStore {
         let quads = crate::store::array::with_subject_stamp(quads, typed.data().quads_sorted)?;
 
         // A reader of the roster's component in `slot`, over the buffer.
-        let reader = |slot: usize| -> vortex_error::VortexResult<vortex_layout::LayoutReaderRef> {
-            container::component_child(typed, slot)?.new_reader(
-                typed.data().components[slot].name.as_str().into(),
-                file.segment_source(),
-                file.session(),
-                &Default::default(),
-            )
-        };
+        let reader = |slot: usize| container::component_reader(&file, slot);
         let dict = match roster.dict {
             Some(slot) => Some(DictAccess::Resident(Arc::new(
                 TermDictionary::from_child_reader(reader(slot)?).await?,

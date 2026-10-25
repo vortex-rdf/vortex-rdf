@@ -9,17 +9,6 @@ use vortex_layout::layouts::zoned::Zoned;
 
 // ─── File-backed dictionary ────────────────────────────────────────────
 
-/// Sorted string forms of a pattern match on `store`.
-async fn matched_strings(
-    store: &VortexRdfStore,
-    s: Option<&NamedOrBlankNode>,
-    p: Option<&NamedNode>,
-    o: Option<&Term>,
-    g: Option<&GraphName>,
-) -> Vec<String> {
-    view_strings(&store.match_pattern(s, p, o, g).await.unwrap()).await
-}
-
 /// A file-backed dictionary's shared reads equal the resident open's, whole
 /// and index-served: each chunk's distinct codes resolve through one
 /// dictionary scan into shared strings, and the chunk decodes against them.
@@ -35,20 +24,14 @@ async fn test_file_backed_dictionary_shared_quads_match_resident() {
     let fb = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(fb.dict_reader().unwrap().is_file_backed());
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let served = |store: &VortexRdfStore| {
-        let store = store.clone();
-        let p0 = p0.clone();
-        async move {
-            store
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap()
-        }
-    };
+    let p0 = iri("p0");
     for (tag, a, b) in [
         ("full", resident.clone(), fb.clone()),
-        ("served", served(&resident).await, served(&fb).await),
+        (
+            "served",
+            matched_view(&resident, None, Some(&p0), None, None).await,
+            matched_view(&fb, None, Some(&p0), None, None).await,
+        ),
     ] {
         let want = assert_shared_matches_quads(&a, &format!("resident {tag}")).await;
         let got = assert_shared_matches_quads(&b, &format!("file-backed {tag}")).await;
@@ -95,12 +78,12 @@ async fn assert_file_backed_matches_resident(
         "{tag}"
     );
 
-    let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let s3 = iri_subject("s03");
+    let p0 = iri("p0");
+    let o1 = plain_literal("object 1");
+    let g = iri_graph("g");
     let default_g = GraphName::DefaultGraph;
-    let absent = NamedNode::new("http://example.org/absent").unwrap();
+    let absent = iri("absent");
 
     // Full reconstruction, then one pattern per family: subject / predicate /
     // object / graph bound and multi-role.
@@ -119,7 +102,7 @@ async fn assert_file_backed_matches_resident(
     let q0 = &quads[3];
     assert!(fb.contains(q0).await.unwrap(), "{tag}: contains");
     // A term absent from the dictionary matches nothing.
-    let empty = matched_strings(&fb, None, Some(&absent), None, None).await;
+    let empty = view_strings(&matched_view(&fb, None, Some(&absent), None, None).await).await;
     assert!(empty.is_empty(), "{tag}: absent term matches nothing");
     (dir, fb, resident)
 }
@@ -138,8 +121,8 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
 
     // And explicitly confirm the serving plan engages on the file-backed
     // store (the equality above would hold even off the fallback path).
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let matched = fb.match_pattern(None, Some(&p0), None, None).await.unwrap();
+    let p0 = iri("p0");
+    let matched = matched_view(&fb, None, Some(&p0), None, None).await;
     assert_eq!(served_component(&matched), Some("index:posg"));
     // The located run is small, so its ids resolved eagerly by rid point
     // reads at match time — no deferred rid scan remains.
@@ -198,10 +181,7 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
 /// load of the same file writes.
 #[tokio::test]
 async fn export_of_a_file_backed_store_never_lifts_the_dictionary() {
-    let graphs = [
-        GraphName::DefaultGraph,
-        GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap()),
-    ];
+    let graphs = [GraphName::DefaultGraph, iri_graph("g")];
     let quads = graph_modular_quads(1_000, 4, 3, 7, &graphs);
     let (_dir, path) = write_chunked_store_file(&quads, 256).await;
     let splits = crate::tests::open_mapped(&path)
@@ -491,21 +471,15 @@ async fn test_file_backed_dictionary_serves_wide_run() {
 
     // 300 rows per predicate: past the point-read cap, so the run is read
     // by range.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let served = fb.match_pattern(None, Some(&p1), None, None).await.unwrap();
+    let p1 = iri("p1");
+    let served = matched_view(&fb, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&served), Some("index:posg"));
     assert_eq!(served.size().await.unwrap(), 300);
     assert!(served.size().await.unwrap() > crate::store::view::selection::POINT_GATHER_MAX_ROWS);
     let want = expected_strings(&quads, |i| i % 3 == 1);
     assert_eq!(view_strings(&served).await, want);
     assert_eq!(
-        view_strings(
-            &resident
-                .match_pattern(None, Some(&p1), None, None)
-                .await
-                .unwrap()
-        )
-        .await,
+        view_strings(&matched_view(&resident, None, Some(&p1), None, None).await).await,
         want
     );
     let shared = assert_shared_matches_quads(&served, "file-backed wide run").await;
@@ -519,7 +493,7 @@ async fn test_file_backed_dictionary_serves_wide_run() {
 /// `!`, which sorts before `"`.
 #[tokio::test]
 async fn test_file_backed_dictionary_rejects_below_first_term() {
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let g = iri_graph("g");
     let quads: Vec<Quad> = (0..3)
         .map(|i| {
             make_quad(
@@ -558,10 +532,6 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
 /// resident instead, answering every pattern exactly.
 #[tokio::test]
 async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
-    use crate::io::container::{
-        BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
-    };
-    use std::sync::Arc;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 
     let quads = dictionary_test_quads();
@@ -576,23 +546,12 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
         .dict
         .clone()
         .expect("a Dictionary build carries its dictionary");
-    let chunks = dict.child_chunks().unwrap();
-    let dtype = chunks[0].dtype().clone();
     // The dictionary component written as a single flat leaf.
-    let flat = NativeComponentWrite::new(
-        StoreComponentDescriptor {
-            name: DICT_COMPONENT_NAME.into(),
-            role: StoreComponentRole::Dictionary,
-            implementation: container::DICT_IMPLEMENTATION.into(),
-            version: container::DICT_VERSION,
-            required: true,
-            sorted: true,
-            dtype,
-        },
-        Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
-        Arc::new(FlatLayoutStrategy::default()),
-    )
-    .unwrap();
+    let flat = dict_child_write(
+        &dict,
+        container::DICT_VERSION,
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
+    );
     let mut bytes: Vec<u8> = Vec::new();
     container::write_store(
         &crate::session::VORTEX_SESSION,
@@ -619,9 +578,9 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     assert!(!store.dict_reader().unwrap().is_file_backed());
     assert!(store.dict_reader().unwrap().snapshot().is_some());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     assert_eq!(
-        matched_strings(&store, None, Some(&p0), None, None).await,
+        view_strings(&matched_view(&store, None, Some(&p0), None, None).await).await,
         expected_strings(&quads, |i| i % 3 == 0)
     );
 
@@ -651,11 +610,8 @@ async fn test_dictionary_terms_stay_fsst_through_bytes() {
 
     // And the terms still resolve, through the compressed representation.
     assert_eq!(reread.size().await.unwrap(), 2_000);
-    let p = NamedNode::new("http://example.org/predicate/3").unwrap();
-    let matched = reread
-        .match_pattern(None, Some(&p), None, None)
-        .await
-        .unwrap();
+    let p = iri("predicate/3");
+    let matched = matched_view(&reread, None, Some(&p), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 125);
 }
 
@@ -670,7 +626,7 @@ async fn test_dictionary_native_file_roundtrip() {
     // One self-contained file: the native root with the quad-source child
     // and the dictionary as an auxiliary child.
     assert!(!path.with_extension("dict.vortex").exists());
-    let file = crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+    let file = crate::io::file::open_vortex_file(&path, crate::io::file::FileAccess::Mapped)
         .await
         .unwrap();
     assert!(container::is_native_file(&file));
@@ -682,11 +638,8 @@ async fn test_dictionary_native_file_roundtrip() {
     assert_eq!(store.layout(), LayoutStrategy::Dictionary);
     assert_eq!(store.size().await.unwrap(), quads.len());
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let p0 = iri("p0");
+    let matched = matched_view(&store, None, Some(&p0), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 4);
     let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
@@ -701,14 +654,18 @@ async fn test_dictionary_native_file_roundtrip() {
 async fn test_dictionary_empty_store_roundtrip() {
     use crate::store::{RowCountHint, TermPredicate};
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let (_dir, path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
     let built = built_store(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
     assert!(
         built.dict_reader().unwrap().snapshot().is_some(),
         "a built store's dictionary is resident"
     );
-    let mut stores: Vec<(&str, VortexRdfStore)> = reopened_stores(&path).await.into();
+    let mut stores: Vec<(&str, VortexRdfStore)> = reopened_stores(&path)
+        .await
+        .into_iter()
+        .map(|(open, store)| (open.tag(), store))
+        .collect();
     stores.push(("built", built));
 
     // Both handles of an empty dictionary are empty, its kind ranges hold no
@@ -873,11 +830,7 @@ async fn test_unzoned_dictionary_child_opens_mapped() {
 /// window bounds read from the leaves themselves.
 #[tokio::test]
 async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
-    use crate::io::container::{
-        BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
-    };
     use crate::store::layouts::dictionary::TermDictionary;
-    use std::sync::Arc;
 
     let terms: Vec<String> = (0..20_000)
         .map(|i| format!("\"object value {i:06}\""))
@@ -886,23 +839,7 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
         vortex_array::arrays::VarBinViewArray::from_iter_str(terms.iter().map(String::as_str)),
     )
     .unwrap();
-    let chunks = dict.child_chunks().unwrap();
-    let dtype = chunks[0].dtype().clone();
-    let unzoned = NativeComponentWrite::new(
-        StoreComponentDescriptor {
-            name: DICT_COMPONENT_NAME.into(),
-            role: StoreComponentRole::Dictionary,
-            implementation: container::DICT_IMPLEMENTATION.into(),
-            version: container::DICT_VERSION,
-            required: true,
-            sorted: true,
-            dtype,
-        },
-        Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
-        container::dict_child_strategy(None),
-    )
-    .unwrap();
-    let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![unzoned]).await;
+    let bytes = write_dict_only_store_as(&dict, container::DICT_VERSION, false).await;
     let (_dir, path) = temp_store_file(&bytes);
     let native = crate::tests::open_mapped(&path).await;
     assert!(!dict_term_column(&native).is::<Zoned>());

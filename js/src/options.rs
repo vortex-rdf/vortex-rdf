@@ -29,21 +29,22 @@ impl Default for BuildConfig {
 /// core's `FromStr` impls (the canonical kebab-case names shared by every
 /// frontend); parse failures become JS exceptions.
 pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsValue> {
-    if options.is_null() || options.is_undefined() {
-        return Ok(BuildConfig::default());
-    }
-
     let mut config = BuildConfig::default();
-    if let Some(name) = get_string_option(&options, "layout")? {
+    if options.is_null_or_undefined() {
+        return Ok(config);
+    }
+    if let Some(layout) = option(&options, "layout")? {
+        let name = layout
+            .as_string()
+            .ok_or_else(|| js_err("Option 'layout' must be a string"))?;
         config.layout = name.parse().map_err(js_err)?;
     }
-    let indexes = Reflect::get(&options, &"indexes".into())
-        .map_err(|_| js_err("Could not read the 'indexes' option"))?;
-    if !indexes.is_null() && !indexes.is_undefined() {
+    if let Some(indexes) = option(&options, "indexes")? {
         if !js_sys::Array::is_array(&indexes) {
             return Err(js_err("Option 'indexes' must be an array"));
         }
-        config.indexes = js_sys::Array::from(&indexes)
+        config.indexes = indexes
+            .unchecked_ref::<js_sys::Array>()
             .iter()
             .map(|value| match value.as_string() {
                 Some(name) => name.parse::<IndexType>().map_err(js_err),
@@ -54,15 +55,9 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
     Ok(config)
 }
 
-/// Read an optional string field, erroring if present but not a string.
-fn get_string_option(options: &JsValue, key: &str) -> Result<Option<String>, JsValue> {
+/// The option `key` of `options`, `None` when it is `undefined` or `null`.
+fn option(options: &JsValue, key: &str) -> Result<Option<JsValue>, JsValue> {
     let value = Reflect::get(options, &key.into())
-        .map_err(|_| js_err(format!("Could not read the '{}' option", key)))?;
-    if value.is_null() || value.is_undefined() {
-        return Ok(None);
-    }
-    match value.as_string() {
-        Some(name) => Ok(Some(name)),
-        None => Err(js_err(format!("Option '{}' must be a string", key))),
-    }
+        .map_err(|_| js_err(format!("Could not read the '{key}' option")))?;
+    Ok((!value.is_null_or_undefined()).then_some(value))
 }

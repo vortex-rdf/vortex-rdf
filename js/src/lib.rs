@@ -58,8 +58,8 @@ pub async fn deserialize_rdf(bytes: Vec<u8>, format_name: &str) -> Result<String
         .await
 }
 
-/// Drive a read future to completion without suspending, or `Err` if it would
-/// have suspended.
+/// Drive a core read to completion without suspending, its error shaped for
+/// JS, or `Err` if it would have suspended.
 ///
 /// The read paths are `async` because a file-backed store resolves its rows
 /// (and its dictionary) through I/O — but this crate builds core with
@@ -67,10 +67,12 @@ pub async fn deserialize_rdf(bytes: Vec<u8>, format_name: &str) -> Result<String
 /// `Backend::File` exists here. Every await in a wasm read is therefore
 /// already resolved; a future that did suspend surfaces as an error instead
 /// of a hang.
-pub(crate) fn resolve_now<F: std::future::Future>(future: F) -> Result<F::Output, JsValue> {
+pub(crate) fn resolve_now<T>(
+    read: impl std::future::Future<Output = vortex_rdf_core::Result<T>>,
+) -> Result<T, JsValue> {
     use futures::FutureExt;
 
-    future
-        .now_or_never()
-        .ok_or_else(|| error::js_err("read suspended: no wasm read path performs I/O"))
+    read.now_or_never()
+        .ok_or_else(|| error::js_err("read suspended: no wasm read path performs I/O"))?
+        .map_err(error::js_err)
 }

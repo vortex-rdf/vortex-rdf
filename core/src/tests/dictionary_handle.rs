@@ -9,13 +9,12 @@ use oxrdf::{BlankNode, Literal};
 /// plain, language-tagged and typed literals, a named graph beside the
 /// default graph.
 fn mixed_kind_quads() -> Vec<Quad> {
-    let p = |name: &str| NamedNode::new(format!("http://example.org/{name}")).unwrap();
-    let s = |i: usize| NamedOrBlankNode::NamedNode(p(&format!("s{i:02}")));
-    let g = NamedNode::new("http://example.org/g").unwrap();
+    let s = |i: usize| iri_subject(&format!("s{i:02}"));
+    let g = iri("g");
     let mut quads = vec![
         Quad::new(
             s(0),
-            p("name"),
+            iri("name"),
             Term::Literal(Literal::new_language_tagged_literal_unchecked(
                 "hallo", "de",
             )),
@@ -23,25 +22,25 @@ fn mixed_kind_quads() -> Vec<Quad> {
         ),
         Quad::new(
             s(0),
-            p("age"),
+            iri("age"),
             Term::Literal(Literal::new_typed_literal("42", oxrdf::vocab::xsd::INTEGER)),
             GraphName::DefaultGraph,
         ),
         Quad::new(
             s(1),
-            p("name"),
-            Term::Literal(Literal::new_simple_literal("plain \"quoted\" value")),
+            iri("name"),
+            plain_literal("plain \"quoted\" value"),
             GraphName::NamedNode(g.clone()),
         ),
         Quad::new(
             s(1),
-            p("knows"),
+            iri("knows"),
             Term::BlankNode(BlankNode::new("b1").unwrap()),
             GraphName::NamedNode(g),
         ),
         Quad::new(
             NamedOrBlankNode::BlankNode(BlankNode::new("b1").unwrap()),
-            p("age"),
+            iri("age"),
             Term::Literal(Literal::new_typed_literal(
                 "3.5",
                 oxrdf::vocab::xsd::DECIMAL,
@@ -51,12 +50,6 @@ fn mixed_kind_quads() -> Vec<Quad> {
     ];
     quads.extend(modular_quads(12, 3, 4));
     quads
-}
-
-async fn memory_dictionary_store(quads: Vec<Quad>) -> VortexRdfStore {
-    VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, vec![])
-        .await
-        .unwrap()
 }
 
 /// Every term of the dictionary, in code order.
@@ -444,7 +437,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
 /// agrees with the snapshot's, and the snapshot is reachable from it.
 #[tokio::test]
 async fn test_dict_reader_resident_matches_snapshot() {
-    let store = memory_dictionary_store(mixed_kind_quads()).await;
+    let store = streamed_store(mixed_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let reader = store.dict_reader().expect("Dictionary layout, no tail");
     assert!(!reader.is_file_backed());
     let snapshot = reader
@@ -459,19 +452,13 @@ async fn test_dict_reader_resident_matches_snapshot() {
 /// resident dictionary stays held; compaction restores it.
 #[tokio::test]
 async fn test_dict_reader_gates_on_layout_and_tail() {
-    let strings = VortexRdfStore::from_quads(
-        quad_stream(mixed_kind_quads()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let strings = streamed_store(mixed_kind_quads(), LayoutStrategy::Default, vec![]).await;
     assert!(
         strings.dict_reader().is_none(),
         "string layouts have no dictionary"
     );
 
-    let store = memory_dictionary_store(mixed_kind_quads()).await;
+    let store = streamed_store(mixed_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let tailed = store
         .add_quad(make_quad(
             "http://example.org/new",
@@ -504,7 +491,7 @@ async fn test_dict_reader_gates_on_layout_and_tail() {
 /// literals, IRIs, blank nodes — and every term lands in its kind's range.
 #[tokio::test]
 async fn test_kind_ranges_partition_codes() {
-    let store = memory_dictionary_store(mixed_kind_quads()).await;
+    let store = streamed_store(mixed_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let reader = store.dict_reader().unwrap();
     let terms = all_terms(&reader).await;
     let kinds = reader.kind_ranges().await.unwrap();
@@ -571,7 +558,7 @@ async fn test_kind_ranges_partition_codes() {
 /// looked up, and absent terms stay absent either way.
 #[tokio::test]
 async fn test_encode_variant_spellings_agree_with_the_stored_form() {
-    let store = memory_dictionary_store(mixed_kind_quads()).await;
+    let store = streamed_store(mixed_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let snapshot = store.dict_reader().unwrap().snapshot().unwrap();
     for (variant, stored) in tolerated_spellings() {
         let first = snapshot.encode(variant).unwrap();
@@ -622,18 +609,16 @@ async fn test_dict_reader_file_backed_matches_resident() {
 
     // A served and a scanned view's gathered codes decode through the
     // file-backed handle to the quads the view holds.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let name = NamedNode::new("http://example.org/name").unwrap();
+    let p0 = iri("p0");
+    let name = iri("name");
     for (tag, view) in [
         (
             "served",
-            fb.match_pattern(None, Some(&p0), None, None).await.unwrap(),
+            matched_view(&fb, None, Some(&p0), None, None).await,
         ),
         (
             "scanned",
-            fb.match_pattern(None, Some(&name), None, None)
-                .await
-                .unwrap(),
+            matched_view(&fb, None, Some(&name), None, None).await,
         ),
         ("whole", fb.clone()),
     ] {

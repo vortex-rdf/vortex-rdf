@@ -1,6 +1,13 @@
+import sys
+from pathlib import Path
+
 import pytest
 
-from vortex_rdf import serialize_rdf
+from vortex_rdf import VortexRdfStore, serialize_rdf
+
+# The benchmark harness's modules (`bench/`), which the tests of its adapters
+# and dataset generator import.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 
 FIXTURE_NT = """\
 <http://ex.org/alice> <http://xmlns.com/foaf/0.1/name> "Alice" .
@@ -36,6 +43,29 @@ def u64s(col):
 def u64_rows(cols):
     """The rows of `match_codes` columns, as tuples of codes."""
     return list(zip(*(u64s(col) for col in cols)))
+
+
+def one_shot(call, probe):
+    """`call` (a store's `match_codes` or `count_quads`) on one batch probe:
+    a dict's keys as its keywords, a tuple's or list's slots as its
+    positions."""
+    return call(**probe) if isinstance(probe, dict) else call(*probe)
+
+
+def write_ntriples(path, lines):
+    """`lines`, one N-Triples statement each, written to `path` as a
+    document; returns `path`."""
+    path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    return path
+
+
+def serialized(directory, name, lines, **options):
+    """`lines` written to `<name>.nt` in `directory` and serialized beside it
+    to `<name>.vortex` with `serialize_rdf`'s `options`; returns the store's
+    path."""
+    out = directory / f"{name}.vortex"
+    serialize_rdf(write_ntriples(directory / f"{name}.nt", lines), out, **options)
+    return out
 
 
 @pytest.fixture(params=LAYOUTS)
@@ -78,6 +108,15 @@ def vortex_files(fixture_nt_path, tmp_path_factory):
         tmp_path_factory.mktemp("vortex"),
         [(layout, layout, []) for layout in LAYOUTS],
     )
+
+
+@pytest.fixture(params=["file", "in-memory"])
+def dictionary_store(request, vortex_files):
+    """The fixture's Dictionary-layout store opened from its file (a mapped,
+    file-backed dictionary) or loaded whole (an in-memory one)."""
+    store = VortexRdfStore(vortex_files["dictionary"], in_memory=request.param == "in-memory")
+    assert store.term_dict().file_backed == (request.param == "file")
+    return store
 
 
 @pytest.fixture(scope="session")

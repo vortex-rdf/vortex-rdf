@@ -6,9 +6,9 @@ import threading
 
 import pytest
 
-from vortex_rdf import CancelToken, Cancelled, VortexRdfError, VortexRdfStore, serialize_rdf
+from vortex_rdf import CancelToken, Cancelled, VortexRdfError, VortexRdfStore
 
-from conftest import u64_rows, u64s
+from conftest import serialized, u64_rows, u64s
 
 ROWS = 1_000
 #: A predicate on every seventh row: 143 rows spread over the store.
@@ -20,23 +20,18 @@ def files(tmp_path_factory):
     """One source as a Dictionary file, the same with a by-copy index, and
     as a Default-layout file, keyed by those names."""
     directory = tmp_path_factory.mktemp("streaming")
-    source = directory / "rows.nt"
-    source.write_text(
-        "".join(
-            f"<http://ex.org/s/{i % 97}> <http://ex.org/p/{i % 7}> <http://ex.org/o/{i}> .\n"
-            for i in range(ROWS)
-        ),
-        encoding="utf-8",
-    )
-    paths = {}
-    for name, layout, indexes in (
-        ("dictionary", "dictionary", []),
-        ("served", "dictionary", ["secondary-by-copy"]),
-        ("default", "default", []),
-    ):
-        paths[name] = directory / f"{name}.vortex"
-        serialize_rdf(source, paths[name], layout=layout, indexes=indexes)
-    return paths
+    rows = [
+        f"<http://ex.org/s/{i % 97}> <http://ex.org/p/{i % 7}> <http://ex.org/o/{i}> ."
+        for i in range(ROWS)
+    ]
+    return {
+        name: serialized(directory, name, rows, layout=layout, indexes=indexes)
+        for name, layout, indexes in (
+            ("dictionary", "dictionary", []),
+            ("served", "dictionary", ["secondary-by-copy"]),
+            ("default", "default", []),
+        )
+    }
 
 
 @pytest.fixture(scope="module", params=["file", "in-memory", "bytes", "served"])

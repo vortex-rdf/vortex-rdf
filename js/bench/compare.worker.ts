@@ -13,6 +13,7 @@ import {
     reclaim, collect, unsupportedRow, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
     type Row, type Pat, type StoreAdapter, type WorkerOutput,
 } from './shared.js';
+import { making, onFresh } from './util.js';
 
 const [, , slug, role, outFile] = process.argv;
 if (!slug || !role || !outFile) {
@@ -147,10 +148,18 @@ function probesFor(a: StoreAdapter): Pat[] {
     return a.quadsUnsupported ? probes.triples : [...probes.triples, ...probes.quads];
 }
 
+/** The graph probes' rows for a store whose model has no graphs, `reason`
+ *  saying so per probe, so the cells read as unsupported, not as benchmarks
+ *  nobody ran. Such a store answers the triple patterns on the projection of
+ *  the same rows. */
+function graphProbesUnsupported(slug: string, reason: string, regime: 'warm' | 'cold'): Row[] {
+    return datasetProbes(N_TRIPLES, { graphs: GRAPHS }).quads.flatMap((p) =>
+        [`${slug}::${p.name}`, `${slug}::${p.name}::count`].map((id) => ({ ...unsupportedRow(id, reason), regime })));
+}
+
 async function runQuery(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     const pats = probesFor(a);
-    const qProbes = datasetProbes(N_TRIPLES, { graphs: GRAPHS });
 
     console.log(`[${a.label}] query…`);
     const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
@@ -168,19 +177,12 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
         wasmHeapMb: delta(after.wasm, before.wasm),
     });
 
-    const tCost = await countAll(a, th, pats);
-    const tSplit = splitBySpeed(pats, tCost);
-    if (tSplit.fast.length) {
-        await bench('query_triples', rows, QUERY_OPTS, (b) => {
-            for (const p of tSplit.fast) {
-                b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
-                b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(th, p); });
-            }
-        }, 'warm');
-    }
-    if (tSplit.slow.length) {
-        await bench('query_triples_slow', rows, ONE_SHOT, (b) => {
-            for (const p of tSplit.slow) {
+    const { fast, slow } = splitBySpeed(pats, await countAll(a, th, pats));
+    const groups = [['query_triples', QUERY_OPTS, fast], ['query_triples_slow', ONE_SHOT, slow]] as const;
+    for (const [phase, opts, probes] of groups) {
+        if (!probes.length) continue;
+        await bench(phase, rows, opts, (b) => {
+            for (const p of probes) {
                 b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
                 b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(th, p); });
             }
@@ -189,30 +191,14 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     reclaim(a, th);
     th = null;
 
-    if (a.quadsUnsupported) {
-        // No graph in the model at all — say so per probe, so the cells
-        // read as unsupported, not as benchmarks nobody ran. This store answered the
-        // triple patterns above, on the projection of the same rows.
-        for (const p of qProbes.quads) {
-            for (const id of [`${a.slug}::${p.name}`, `${a.slug}::${p.name}::count`]) {
-                const r = unsupportedRow(id, a.quadsUnsupported);
-                r.regime = 'warm';
-                rows.push(r);
-            }
-        }
-    }
+    if (a.quadsUnsupported) rows.push(...graphProbesUnsupported(a.slug, a.quadsUnsupported, 'warm'));
 
     if (a.ingestUnsupported) {
         rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
     } else {
         console.log(`[${a.label}] ingest…`);
         await bench('ingest', rows, HEAVY_OPTS, (b) => {
-            // Dispose in `afterEach` (untimed), so freeing the previous store
-            // never pollutes the measured ingest cost.
-            let h: unknown;
-            b.add(`ingest::${a.slug}`, async () => { h = await a.build(triples); }, {
-                afterEach: () => { reclaim(a, h); h = undefined; },
-            });
+            b.add(`ingest::${a.slug}`, ...making(() => a.build(triples), (h) => reclaim(a, h)));
         });
     }
 
@@ -250,22 +236,17 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
         return rows;
     }
 
+    const dispose = (h: unknown) => a.dispose?.(h);
+
     // One dataset's cold pass: adopt per iteration (untimed), query (timed).
     const coldPass = async (
         phase: string, snap: unknown, probes: Pat[],
     ): Promise<void> => {
+        const open = () => a.open!(snap);
         await bench(phase, rows, COLD_QUERY_OPTS, (b) => {
             for (const p of probes) {
-                let h: unknown;
-                b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(h, p); }, {
-                    beforeEach: async () => { h = await a.open!(snap); },
-                    afterEach: () => { a.dispose?.(h); h = undefined; },
-                });
-                let hc: unknown;
-                b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(hc, p); }, {
-                    beforeEach: async () => { hc = await a.open!(snap); },
-                    afterEach: () => { a.dispose?.(hc); hc = undefined; },
-                });
+                b.add(`${a.slug}::${p.name}`, ...onFresh(open, (h) => a.countMatch(h, p), dispose));
+                b.add(`${a.slug}::${p.name}::count`, ...onFresh(open, (h) => a.countOnly(h, p), dispose));
             }
         }, 'cold');
     };
@@ -283,23 +264,12 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     // it the cold column's context — how much of a cold start is the open — is
     // not on the page.
     await bench('open', rows, HEAVY_OPTS, (b) => {
-        let h: unknown;
-        b.add(`open::${a.slug}`, async () => { h = await a.open!(tSnap); }, {
-            afterEach: () => { a.dispose?.(h); h = undefined; },
-        });
+        b.add(`open::${a.slug}`, ...making(() => a.open!(tSnap), dispose));
     });
 
     await coldPass('query_cold', tSnap, pats);
 
-    if (a.quadsUnsupported) {
-        for (const p of datasetProbes(N_TRIPLES, { graphs: GRAPHS }).quads) {
-            for (const id of [`${a.slug}::${p.name}`, `${a.slug}::${p.name}::count`]) {
-                const r = unsupportedRow(id, a.quadsUnsupported);
-                r.regime = 'cold';
-                rows.push(r);
-            }
-        }
-    }
+    if (a.quadsUnsupported) rows.push(...graphProbesUnsupported(a.slug, a.quadsUnsupported, 'cold'));
 
     return rows;
 }
@@ -355,19 +325,13 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
         }, 'warm');
         if (a.snapshot && a.open) {
             const snap = await a.snapshot(h);
+            const open = () => a.open!(snap);
+            const dispose = (fresh: unknown) => a.dispose?.(fresh);
             await bench('full_cold', rows, opts, (b) => {
-                let fresh: unknown;
-                b.add(`${a.slug}::full`, async () => { await a.countMatch(fresh, FULL_SCAN_PATTERN); }, {
-                    beforeEach: async () => { fresh = await a.open!(snap); },
-                    afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
-                });
+                b.add(`${a.slug}::full`, ...onFresh(open, (fresh) => a.countMatch(fresh, FULL_SCAN_PATTERN), dispose));
             }, 'cold');
             await bench('full_count_cold', rows, FULL_SCAN_OPTS, (b) => {
-                let fresh: unknown;
-                b.add(`${a.slug}::full::count`, async () => { await a.countOnly(fresh, FULL_SCAN_PATTERN); }, {
-                    beforeEach: async () => { fresh = await a.open!(snap); },
-                    afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
-                });
+                b.add(`${a.slug}::full::count`, ...onFresh(open, (fresh) => a.countOnly(fresh, FULL_SCAN_PATTERN), dispose));
             }, 'cold');
         }
     }
@@ -382,28 +346,17 @@ async function runMutate(a: StoreAdapter): Promise<Row[]> {
     const delSlice = genDatasetPrefix(N_TRIPLES, MUT_BATCH);
 
     console.log(`\n[${a.label}] add (${MUT_BATCH})…`);
+    const dispose = (h: unknown) => reclaim(a, h);
     await bench('add', rows, HEAVY_OPTS, (b) => {
-        let h: unknown;
-        b.add(`add::${a.slug}`, async () => {
-            h = await a.newEmpty();
-            await a.addAll(h, fresh);
-        }, { afterEach: () => { reclaim(a, h); h = undefined; } });
+        b.add(`add::${a.slug}`, ...making(() => a.newEmpty(), dispose, (h) => a.addAll(h, fresh)));
         if (a.addBatch) {
-            let hb: unknown;
-            b.add(`add_batch::${a.slug}`, async () => {
-                hb = await a.newEmpty();
-                await a.addBatch!(hb, fresh);
-            }, { afterEach: () => { reclaim(a, hb); hb = undefined; } });
+            b.add(`add_batch::${a.slug}`, ...making(() => a.newEmpty(), dispose, (h) => a.addBatch!(h, fresh)));
         }
     });
 
     console.log(`[${a.label}] delete (${MUT_BATCH})…`);
-    let dh: unknown = null;
     await bench('delete', rows, HEAVY_OPTS, (b) => {
-        b.add(`delete::${a.slug}`, async () => { await a.deleteAll(dh, delSlice); }, {
-            beforeEach: async () => { dh = await a.build(delSlice); },
-            afterEach: () => { reclaim(a, dh); dh = null; },
-        });
+        b.add(`delete::${a.slug}`, ...onFresh(() => a.build(delSlice), (h) => a.deleteAll(h, delSlice), dispose));
     });
 
     return rows;

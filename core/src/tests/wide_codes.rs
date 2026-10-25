@@ -20,14 +20,6 @@ use crate::store::{Keep, Probe, QuadColumn, TermCode, TermPredicate};
 /// unhooked dictionary of this size, but below every code here.
 const BASE: TermCode = (1 << 32) + 5;
 
-fn iri(s: &str) -> NamedNode {
-    NamedNode::new(format!("http://example.org/{s}")).unwrap()
-}
-
-fn subject(s: &str) -> NamedOrBlankNode {
-    NamedOrBlankNode::NamedNode(iri(s))
-}
-
 /// Quads covering every term kind: IRIs, plain, language-tagged and typed
 /// literals, a blank node, the default graph and a named graph.
 fn dataset() -> Vec<Quad> {
@@ -36,31 +28,31 @@ fn dataset() -> Vec<Quad> {
     let blank = oxrdf::BlankNode::new("b1").unwrap();
     vec![
         Quad::new(
-            subject("alice"),
+            iri_subject("alice"),
             iri("name"),
-            Term::Literal(Literal::new_simple_literal("Alice")),
+            plain_literal("Alice"),
             GraphName::DefaultGraph,
         ),
         Quad::new(
-            subject("alice"),
+            iri_subject("alice"),
             iri("age"),
             Term::Literal(Literal::new_typed_literal("30", xsd_int.clone())),
             GraphName::DefaultGraph,
         ),
         Quad::new(
-            subject("alice"),
+            iri_subject("alice"),
             iri("knows"),
             Term::NamedNode(iri("bob")),
             g1.clone(),
         ),
         Quad::new(
-            subject("bob"),
+            iri_subject("bob"),
             iri("name"),
             Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap()),
             GraphName::DefaultGraph,
         ),
         Quad::new(
-            subject("bob"),
+            iri_subject("bob"),
             iri("knows"),
             Term::BlankNode(blank.clone()),
             GraphName::DefaultGraph,
@@ -68,11 +60,11 @@ fn dataset() -> Vec<Quad> {
         Quad::new(
             NamedOrBlankNode::BlankNode(blank),
             iri("name"),
-            Term::Literal(Literal::new_simple_literal("Carol")),
+            plain_literal("Carol"),
             g1,
         ),
         Quad::new(
-            subject("bob"),
+            iri_subject("bob"),
             iri("age"),
             Term::Literal(Literal::new_typed_literal("25", xsd_int)),
             GraphName::DefaultGraph,
@@ -248,7 +240,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     // A fresh built base holds its code columns compressed behind an unfilled
     // payload cache, so this keep reads them through the encoded probe
     // rather than a canonical slice.
-    let alice = subject("alice");
+    let alice = iri_subject("alice");
     let alice_code = code(store, &terms, "<http://example.org/alice>").await;
     let alice_rows = expected(quads, |q| q.subject == alice);
     let early = store
@@ -268,40 +260,28 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         as_set(quads.to_vec())
     );
     let name = iri("name");
-    let by_predicate = store
-        .match_pattern(None, Some(&name), None, None)
-        .await
-        .unwrap();
+    let by_predicate = matched_view(store, None, Some(&name), None, None).await;
     assert_eq!(
         decoded_row_set(&by_predicate).await,
         expected(quads, |q| q.predicate == name),
         "{label}: predicate (index) match"
     );
     let bob_iri = Term::NamedNode(iri("bob"));
-    let by_object = store
-        .match_pattern(None, None, Some(&bob_iri), None)
-        .await
-        .unwrap();
+    let by_object = matched_view(store, None, None, Some(&bob_iri), None).await;
     assert_eq!(
         decoded_row_set(&by_object).await,
         expected(quads, |q| q.object == bob_iri),
         "{label}: object (index) match"
     );
     let age = iri("age");
-    let residual = store
-        .match_pattern(Some(&alice), Some(&age), None, None)
-        .await
-        .unwrap();
+    let residual = matched_view(store, Some(&alice), Some(&age), None, None).await;
     assert_eq!(
         decoded_row_set(&residual).await,
         expected(quads, |q| q.subject == alice && q.predicate == age),
         "{label}: subject + residual match"
     );
     let g1 = GraphName::NamedNode(iri("g1"));
-    let by_graph = store
-        .match_pattern(None, None, None, Some(&g1))
-        .await
-        .unwrap();
+    let by_graph = matched_view(store, None, None, None, Some(&g1)).await;
     assert_eq!(
         decoded_row_set(&by_graph).await,
         expected(quads, |q| q.graph_name == g1),
@@ -330,10 +310,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
             Some((alice_code, last_subject)),
             "{label}: the whole base's bound"
         );
-        let run = store
-            .match_pattern(Some(&alice), None, None, None)
-            .await
-            .unwrap();
+        let run = matched_view(store, Some(&alice), None, None, None).await;
         assert_eq!(
             run.view_statistics().unwrap().code_bounds[QuadColumn::S.index()],
             Some((alice_code, alice_code)),
@@ -457,13 +434,7 @@ fn indexes() -> Indexes {
 async fn codes_past_u32_round_trip_in_memory() {
     let _base = CodeBase::set(BASE);
     let quads = dataset();
-    let store = VortexRdfStore::from_quads(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        indexes(),
-    )
-    .await
-    .unwrap();
+    let store = streamed_store(quads.clone(), LayoutStrategy::Dictionary, indexes()).await;
     // Compressed and uncached, so the first keep reads through the probe.
     assert_eq!(store.debug_base_child_int_canonical("s"), Some(false));
     check_store(&store, &quads, "built in memory").await;
@@ -539,13 +510,7 @@ async fn codes_past_u32_survive_mutation_rebuilds() {
     let _base = CodeBase::set(BASE);
     let mut quads = dataset();
     let extra = quads.pop().unwrap();
-    let store = VortexRdfStore::from_quads(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        indexes(),
-    )
-    .await
-    .unwrap();
+    let store = streamed_store(quads.clone(), LayoutStrategy::Dictionary, indexes()).await;
     let grown = store
         .add_quad(extra.clone())
         .await
@@ -577,22 +542,16 @@ async fn check_chunk_exports(store: &VortexRdfStore, label: &str) {
     use vortex_array::expr::{eq, get_item, lit, root};
 
     let name = iri("name");
-    let alice = subject("alice");
+    let alice = iri_subject("alice");
     let views = [
         ("whole", store.clone()),
         (
             "predicate",
-            store
-                .match_pattern(None, Some(&name), None, None)
-                .await
-                .unwrap(),
+            matched_view(store, None, Some(&name), None, None).await,
         ),
         (
             "subject",
-            store
-                .match_pattern(Some(&alice), None, None, None)
-                .await
-                .unwrap(),
+            matched_view(store, Some(&alice), None, None, None).await,
         ),
     ];
     for (tag, view) in &views {
@@ -642,7 +601,7 @@ async fn codes_past_u32_through_the_chunk_exports() {
     {
         let (_dir, path) = write_store_file(dataset(), LayoutStrategy::Dictionary, indexes()).await;
         for (open, store) in reopened_stores(&path).await {
-            check_chunk_exports(&store, open).await;
+            check_chunk_exports(&store, open.tag()).await;
         }
     }
 }

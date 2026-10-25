@@ -10,21 +10,22 @@ use super::runs::{
 };
 use super::spill::TempRunsGuard;
 use crate::error::Result;
-use crate::io::container::NativeComponentWrite;
-use crate::io::container::sources::{PullComponentSource, PullFn};
-use crate::store::indexes::components::{ComponentIdentity, TermColumn, index_child_write};
+use crate::io::container::sources::NativeComponentSource;
+use crate::store::indexes::components::{ChildStream, ComponentIdentity, TermColumn};
 use crate::store::indexes::copy::CopyFamily;
-use crate::store::indexes::copy::out_of_core::{CopyKey, copy_child_chunk, copy_child_dtype};
+use crate::store::indexes::copy::out_of_core::{CopyKey, copy_child_chunk};
 use crate::store::indexes::reference::RefFamily;
-use crate::store::indexes::reference::out_of_core::{ref_child_chunk, ref_child_dtype};
+use crate::store::indexes::reference::out_of_core::ref_child_chunk;
 use crate::store::indexes::{IndexType, next_row_id};
 use crate::store::schema::RowId;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
+use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt, SendableArrayStream};
+use vortex_error::VortexResult;
 
 /// One of each child of a family.
 type Pair<T> = (T, T);
@@ -118,7 +119,7 @@ pub(super) fn merge_feeding_indexes<V>(
     sizes: BuildSizes,
     indexes: &[IndexType],
     decode: impl Fn(u32) -> Result<V> + Clone + Send + 'static,
-) -> Result<Vec<NativeComponentWrite>>
+) -> Result<Vec<ChildStream>>
 where
     V: TermColumn + Send + 'static,
 {
@@ -148,27 +149,28 @@ fn decode_key<V>(decode: &impl Fn(u32) -> Result<V>, key: &[u32; 4]) -> Result<[
     ])
 }
 
-/// Each family's child as a native component write ([`index_child_write`])
-/// streaming its chunks off its merger in windows of `chunk_size` entries,
+/// Each family's child as a [`ChildStream`] whose source streams its chunks
+/// off its merger in windows of `chunk_size` entries,
 /// never materialized and not in lockstep with the quad stream; `decode`
-/// spells each window's ranks as `V`, which the child dtypes follow. Every
-/// pull holds the run guard, so the run files outlive their readers.
+/// spells each window's ranks as `V`. Each child's empty chunk, built by the
+/// same chunk builder over no entries, gives the child its dtype. Every pull
+/// holds the run guard, so the run files outlive their readers.
 fn merger_components<V>(
     mergers: IndexMergers,
     chunk_size: usize,
     guard: &Arc<TempRunsGuard>,
     decode: impl Fn(u32) -> Result<V> + Clone + Send + 'static,
-) -> Result<Vec<NativeComponentWrite>>
+) -> Result<Vec<ChildStream>>
 where
     V: TermColumn + Send + 'static,
 {
-    let mut families: Vec<(&'static ComponentIdentity, DType, PullFn)> = Vec::new();
+    let mut families: Vec<(&'static ComponentIdentity, ArrayRef, PullFn)> = Vec::new();
     if let Some((posg, ospg)) = mergers.copies {
-        let dtype = copy_child_dtype::<V>();
         for (family, mut merger) in [(CopyFamily::Posg, posg), (CopyFamily::Ospg, ospg)] {
+            let empty = copy_child_chunk::<V>(family, &[])?;
             let decode = decode.clone();
             let pull = pull_fn(guard, move |n| {
-                chunk_of(merger.next_batch(n)?, n, |entries| {
+                chunk_of(merger.next_batch(n)?, |entries| {
                     let keys = entries
                         .iter()
                         .map(|(key, rid)| Ok((CopyKey(decode_key(&decode, key)?), *rid)))
@@ -176,15 +178,15 @@ where
                     copy_child_chunk(family, &keys)
                 })
             });
-            families.push((family.identity(), dtype.clone(), pull));
+            families.push((family.identity(), empty, pull));
         }
     }
     if let Some((o, p)) = mergers.refs {
-        let dtype = ref_child_dtype::<V>();
         for (family, mut merger) in [(RefFamily::Object, o), (RefFamily::Predicate, p)] {
+            let empty = ref_child_chunk::<V>(&[])?;
             let decode = decode.clone();
             let pull = pull_fn(guard, move |n| {
-                chunk_of(merger.next_batch(n)?, n, |entries| {
+                chunk_of(merger.next_batch(n)?, |entries| {
                     let pairs = entries
                         .iter()
                         .map(|&(rank, rid)| Ok((decode(rank)?, rid)))
@@ -192,31 +194,27 @@ where
                     ref_child_chunk(&pairs)
                 })
             });
-            families.push((family.identity(), dtype.clone(), pull));
+            families.push((family.identity(), empty, pull));
         }
     }
-    families
+    Ok(families
         .into_iter()
-        .map(|(identity, dtype, pull)| {
+        .map(|(identity, empty, pull)| ChildStream {
+            identity,
             // The merger emits the family in its global sort order.
-            index_child_write(
-                identity,
-                true,
-                Arc::new(PullComponentSource::new(dtype, chunk_size, pull)),
-            )
+            sorted: true,
+            source: Arc::new(PullComponentSource::new(empty, chunk_size, pull)),
         })
-        .collect()
+        .collect())
 }
 
 /// `batch`, a window of a family's merged entries, as one child chunk;
-/// `None` once a non-empty pull came back empty (a zero-row pull builds the
-/// empty chunk).
+/// `None` once the merger is exhausted and the window comes back empty.
 fn chunk_of<T>(
     batch: Vec<T>,
-    n: usize,
     chunk: impl FnOnce(&[T]) -> Result<ArrayRef>,
 ) -> Result<Option<ArrayRef>> {
-    if batch.is_empty() && n > 0 {
+    if batch.is_empty() {
         return Ok(None);
     }
     chunk(&batch).map(Some)
@@ -232,4 +230,79 @@ fn pull_fn(
         let _hold_runs = &guard;
         Ok(pull(n)?)
     })
+}
+
+/// A pull closure yielding one component chunk of at most the given rows per
+/// call, `Ok(None)` once exhausted.
+type PullFn = Box<dyn FnMut(usize) -> VortexResult<Option<ArrayRef>> + Send>;
+
+/// A single-shot component source over a pull closure: each call reads the
+/// next window off a spill-run merger's run files, so the component is never
+/// materialized. `empty` is the child's empty chunk: its dtype is the
+/// source's, and it is the one chunk a child whose first pull is exhausted
+/// writes.
+struct PullComponentSource {
+    empty: ArrayRef,
+    batch_rows: usize,
+    pull: Mutex<Option<PullFn>>,
+}
+
+impl PullComponentSource {
+    fn new(empty: ArrayRef, batch_rows: usize, pull: PullFn) -> Self {
+        Self {
+            empty,
+            batch_rows,
+            pull: Mutex::new(Some(pull)),
+        }
+    }
+}
+
+impl NativeComponentSource for PullComponentSource {
+    fn dtype(&self) -> &DType {
+        self.empty.dtype()
+    }
+
+    fn open(&self) -> VortexResult<SendableArrayStream> {
+        let pull = self
+            .pull
+            .lock()
+            .expect("pull source lock")
+            .take()
+            .ok_or_else(|| {
+                vortex_error::vortex_err!("a pull-backed component source replays only once")
+            })?;
+        let batch_rows = self.batch_rows;
+        // At least one chunk is emitted: the child strategy needs one,
+        // possibly empty, to write a schema-complete component, so an empty
+        // component contributes the empty chunk the source holds.
+        let empty = Some(self.empty.clone());
+        let stream =
+            futures::stream::unfold((Some(pull), empty), move |(state, empty)| async move {
+                let mut pull = state?;
+                match pull(batch_rows) {
+                    Ok(Some(chunk)) => Some((Ok(chunk), (Some(pull), None))),
+                    Ok(None) => empty.map(|empty| (Ok(empty), (None, None))),
+                    Err(e) => Some((Err(e), (None, None))),
+                }
+            });
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.empty.dtype().clone(),
+            stream,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pull-backed source hands out its stream once; a second open is an
+    /// error.
+    #[test]
+    fn pull_source_replays_once() {
+        let empty = ref_child_chunk::<String>(&[]).unwrap();
+        let source = PullComponentSource::new(empty, 1, Box::new(|_| Ok(None)));
+        assert!(source.open().is_ok());
+        assert!(source.open().is_err());
+    }
 }

@@ -7,7 +7,9 @@
 //! [`view_statistics`](VortexRdfStore::view_statistics) and
 //! [`dict_reader`](VortexRdfStore::dict_reader).
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::thread::LocalKey;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::{Struct, StructArray};
@@ -21,6 +23,8 @@ use crate::store::indexes::IndexComponent;
 use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::{DictAccess, QuadPattern};
+#[cfg(feature = "file-io")]
+use crate::store::persist::native_file::FileCounter;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{DictSnapshot, RowId, TermCode, VortexRdfStore};
 
@@ -39,24 +43,51 @@ thread_local! {
     static DECODED_RIDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
     /// The code the dictionaries built or opened on this thread give their
-    /// first term (see [`CodeBase`]); 0 outside a guard.
-    static CODE_BASE: std::cell::Cell<TermCode> = const { std::cell::Cell::new(0) };
+    /// first term, while a [`CodeBase`] guard is live.
+    static CODE_BASE: Cell<Option<TermCode>> = const { Cell::new(None) };
 
-    /// The most distinct terms an out-of-core build on this thread may hold
-    /// (see [`TermCap`]); the dictionary's `i32::MAX` outside a guard.
+    /// The most distinct terms an out-of-core build on this thread may hold,
+    /// while a [`TermCap`] guard is live.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    static TERM_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(i32::MAX as usize) };
+    static TERM_CAP: Cell<Option<usize>> = const { Cell::new(None) };
 
-    /// The row id the indexed builds on this thread give their first row
-    /// (see [`RowIdBase`]); 0 outside a guard.
-    static ROW_ID_BASE: std::cell::Cell<RowId> = const { std::cell::Cell::new(0) };
+    /// The row id the indexed builds on this thread give their first row,
+    /// while a [`RowIdBase`] guard is live.
+    static ROW_ID_BASE: Cell<Option<RowId>> = const { Cell::new(None) };
+}
+
+/// A thread's override of a value production code reads, live while the
+/// guard is: `cell` holds the value, `None` meaning the production one, and
+/// dropping the guard restores what it replaced, so guards nest. Every
+/// guard of the test seams ([`RowIdBase`], [`CodeBase`], [`TermCap`], the
+/// driver's `ForcedLimit`, the rechunk's `FailingCut`) is one. Thread-local
+/// like `GATHERS`, for the same reason.
+pub(crate) struct Override<T: Copy + 'static> {
+    cell: &'static LocalKey<Cell<Option<T>>>,
+    replaced: Option<T>,
+}
+
+impl<T: Copy + 'static> Override<T> {
+    /// Hold `value` in `cell` until the guard drops.
+    pub(crate) fn set(cell: &'static LocalKey<Cell<Option<T>>>, value: T) -> Self {
+        Self {
+            cell,
+            replaced: cell.replace(Some(value)),
+        }
+    }
+}
+
+impl<T: Copy + 'static> Drop for Override<T> {
+    fn drop(&mut self) {
+        self.cell.set(self.replaced);
+    }
 }
 
 /// The row id the indexed builds on this thread give their first row, and
-/// that the readers on this thread take off every row id they read: 0,
-/// unless a [`RowIdBase`] guard is live.
-pub(crate) fn row_id_base() -> RowId {
-    ROW_ID_BASE.with(std::cell::Cell::get)
+/// that the readers on this thread take off every row id they read, while a
+/// [`RowIdBase`] guard is live.
+pub(crate) fn row_id_base() -> Option<RowId> {
+    ROW_ID_BASE.get()
 }
 
 /// While alive, every indexed build on this thread numbers its rows from
@@ -69,29 +100,27 @@ pub(crate) fn row_id_base() -> RowId {
 /// `RowId::MAX` instead makes the refusal of an id past the last one
 /// reachable with a handful of quads. The base is never written: a store
 /// built under a guard must be read under the same one, as a store of 2^32
-/// more rows would be. Dropping the guard restores the base it replaced.
-/// Thread-local like `GATHERS`, for the same reason.
-pub(crate) struct RowIdBase(RowId);
+/// more rows would be. Dropping the guard restores the base it replaced
+/// ([`Override`]).
+pub(crate) struct RowIdBase {
+    _guard: Override<RowId>,
+}
 
 impl RowIdBase {
     /// Number this thread's indexed builds from `base` until the guard
     /// drops.
     pub(crate) fn set(base: RowId) -> Self {
-        RowIdBase(ROW_ID_BASE.with(|cell| cell.replace(base)))
-    }
-}
-
-impl Drop for RowIdBase {
-    fn drop(&mut self) {
-        ROW_ID_BASE.with(|cell| cell.set(self.0));
+        Self {
+            _guard: Override::set(&ROW_ID_BASE, base),
+        }
     }
 }
 
 /// The code a dictionary built or opened on this thread gives its first
-/// term: 0, unless a [`CodeBase`] guard is live. Read once by every
-/// dictionary constructor (`TermDictionary::new`, `FileBackedDict::open`).
-pub(crate) fn code_base() -> TermCode {
-    CODE_BASE.with(std::cell::Cell::get)
+/// term, while a [`CodeBase`] guard is live. Read once by every dictionary
+/// constructor (`TermDictionary::new`, `FileBackedDict::open`).
+pub(crate) fn code_base() -> Option<TermCode> {
+    CODE_BASE.get()
 }
 
 /// While alive, every dictionary built or opened on this thread numbers its
@@ -102,51 +131,45 @@ pub(crate) fn code_base() -> TermCode {
 /// dictionary handles and the column kernels — without four billion terms.
 /// The base is never written: a file built under a guard must be reopened
 /// under the same one, as a file of 2^32 more terms would be. Dropping the
-/// guard restores the base it replaced. Thread-local like `GATHERS`, for
-/// the same reason.
-pub(crate) struct CodeBase(TermCode);
+/// guard restores the base it replaced ([`Override`]).
+pub(crate) struct CodeBase {
+    _guard: Override<TermCode>,
+}
 
 impl CodeBase {
     /// Number this thread's dictionaries from `base` until the guard drops.
     pub(crate) fn set(base: TermCode) -> Self {
-        CodeBase(CODE_BASE.with(|cell| cell.replace(base)))
+        Self {
+            _guard: Override::set(&CODE_BASE, base),
+        }
     }
 }
 
-impl Drop for CodeBase {
-    fn drop(&mut self) {
-        CODE_BASE.with(|cell| cell.set(self.0));
-    }
-}
-
-/// The most distinct terms an out-of-core build on this thread may hold:
-/// `i32::MAX`, unless a [`TermCap`] guard is live. Read by the build's term
-/// interner at every new term.
+/// The most distinct terms an out-of-core build on this thread may hold,
+/// while a [`TermCap`] guard is live. Read by the build's term interner at
+/// every new term.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn term_cap() -> usize {
-    TERM_CAP.with(std::cell::Cell::get)
+pub(crate) fn term_cap() -> Option<usize> {
+    TERM_CAP.get()
 }
 
 /// While alive, every out-of-core build on this thread refuses its term past
 /// `cap` instead of past `i32::MAX`, so a few terms reach the refusal a
 /// dictionary of two billion terms would. Dropping the guard restores the cap
-/// it replaced. Thread-local like `GATHERS`, for the same reason.
+/// it replaced ([`Override`]).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) struct TermCap(usize);
+pub(crate) struct TermCap {
+    _guard: Override<usize>,
+}
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl TermCap {
     /// Cap this thread's builds at `cap` distinct terms until the guard
     /// drops.
     pub(crate) fn set(cap: usize) -> Self {
-        TermCap(TERM_CAP.with(|cell| cell.replace(cap)))
-    }
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-impl Drop for TermCap {
-    fn drop(&mut self) {
-        TERM_CAP.with(|cell| cell.set(self.0));
+        Self {
+            _guard: Override::set(&TERM_CAP, cap),
+        }
     }
 }
 
@@ -312,7 +335,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_column_streams(&self) -> Option<usize> {
         self.quads
             .file()
-            .map(|base| base.file.debug_column_streams())
+            .map(|base| base.file.count(FileCounter::ColumnStreams))
     }
 
     /// Whether this view's selection is pending with no serve plan to read
@@ -366,7 +389,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_located_rid_reads(&self) -> Option<usize> {
         self.quads
             .file()
-            .map(|base| base.file.debug_located_rid_reads())
+            .map(|base| base.file.count(FileCounter::LocatedRidReads))
     }
 
     /// How many of those reads were rid-only scans of the run instead of
@@ -374,7 +397,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_located_rid_scans(&self) -> Option<usize> {
         self.quads
             .file()
-            .map(|base| base.file.debug_located_rid_scans())
+            .map(|base| base.file.count(FileCounter::LocatedRidScans))
     }
 
     /// The exact row range the located-run kernel computes for the subject
@@ -384,11 +407,11 @@ impl VortexRdfStore {
         &self,
         range: Range<TermCode>,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_reads;
+        use crate::store::scan::subject_runs;
         let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
-        file_reads::locate_subject_code_range(file, range).await
+        subject_runs::locate_subject_code_range(file, range).await
     }
 
     /// Whether one named integer child of an in-memory base is a canonical
@@ -423,7 +446,7 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::{file_filter, file_reads};
+        use crate::store::scan::{file_exprs, file_filter};
         let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
@@ -431,7 +454,7 @@ impl VortexRdfStore {
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(Some(0..0));
         };
-        match file_reads::build_file_filter(pattern, &mut codes)? {
+        match file_exprs::build_file_filter(pattern, &mut codes)? {
             Some(filter) => file_filter::row_range_from_pruning(file, &filter).await,
             None => Ok(None),
         }
@@ -444,7 +467,7 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_reads;
+        use crate::store::scan::subject_runs;
         let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
@@ -454,7 +477,7 @@ impl VortexRdfStore {
         else {
             return Ok(None);
         };
-        file_reads::locate_subject_run(file, &mut codes, subject).await
+        subject_runs::locate_subject_run(file, &mut codes, subject).await
     }
 
     /// The index-child run the reference index's file resolution locates for

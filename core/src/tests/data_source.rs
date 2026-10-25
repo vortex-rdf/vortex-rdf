@@ -530,7 +530,7 @@ async fn test_data_source_request_semantics() {
     // the range: one chunk, cut from the range's first row. With rows
     // deleted, the store streams its chunks (windows of 8,192 live ids) and
     // cuts the range out of them: a piece on each side of the boundary.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let deleted = memory
         .delete_matching(None, Some(&p0), None, None)
         .await
@@ -563,10 +563,7 @@ async fn test_data_source_request_semantics() {
         // a limit, a range ending mid-chunk, one starting past the first
         // chunk, and one starting mid-chunk under a selection of every 7th
         // row.
-        let filtered = mapped
-            .match_pattern(None, Some(&p0), None, None)
-            .await
-            .unwrap();
+        let filtered = matched_view(&mapped, None, Some(&p0), None, None).await;
         assert!(filtered.view_statistics().unwrap().pending_filter);
         let tombstoned = mapped
             .delete_matching(None, Some(&p0), None, None)
@@ -637,19 +634,20 @@ async fn test_component_data_sources() {
     let store = built_store(
         fixture_quads(),
         LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        ALL_INDEX_TYPES.to_vec(),
     )
     .await;
     assert_eq!(assert_component_tables(&store, "memory").await, 4);
     {
-        for (tag, _dir, store) in file_stores().await {
-            let children = if tag.starts_with("file/no-index") {
+        for fixture in file_stores().await {
+            let tag = fixture.tag();
+            let children = if fixture.index == IndexConfig::NoIndex {
                 0
             } else {
                 2
             };
             assert_eq!(
-                assert_component_tables(&store, &tag).await,
+                assert_component_tables(&fixture.store, &tag).await,
                 children,
                 "{tag}"
             );

@@ -4,9 +4,6 @@
 //! `build_struct_array` path; index children are built over the codes,
 //! which sort as the terms do.
 
-use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::hash::Hash;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -15,25 +12,27 @@ use oxrdf::Quad;
 use rustc_hash::FxHashMap;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArray;
-use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{field_as, stamp_is_sorted};
+use crate::store::array::{field_as, named_struct, stamp_is_sorted};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TermCode};
 use crate::store::{RawQuad, SharedQuad};
 
 #[cfg(feature = "file-io")]
 use super::file_backed::FileBackedDict;
+use super::ingest::BorrowedTermCodeMap;
 use super::storage::DictCursor;
 use super::term_dict::{CodeSpace, TermDictionary, check_code};
 
 /// Dictionary-encoded quad columns: every term replaced by its code. Code
 /// order is the terms' byte order, so index children built over the codes
-/// sort as they would over the terms.
+/// sort as they would over the terms. The default is the encoding of no
+/// quads, whose chunk still carries the code dtypes.
+#[derive(Default)]
 pub(crate) struct QuadCodes {
     pub(crate) s: Vec<TermCode>,
     pub(crate) p: Vec<TermCode>,
@@ -42,45 +41,44 @@ pub(crate) struct QuadCodes {
 }
 
 impl QuadCodes {
-    /// The encoding of no quads: an empty build's index children are built
-    /// over it, so they carry the code dtypes.
-    pub(crate) fn empty() -> Self {
+    /// No codes yet, with room for `n` quads'.
+    pub(crate) fn with_capacity(n: usize) -> Self {
         Self {
-            s: Vec::new(),
-            p: Vec::new(),
-            o: Vec::new(),
-            g: Vec::new(),
+            s: Vec::with_capacity(n),
+            p: Vec::with_capacity(n),
+            o: Vec::with_capacity(n),
+            g: Vec::with_capacity(n),
         }
+    }
+
+    /// Append one quad's `[s, p, o, g]` codes.
+    #[inline]
+    pub(crate) fn push(&mut self, [s, p, o, g]: [TermCode; 4]) {
+        self.s.push(s);
+        self.p.push(p);
+        self.o.push(o);
+        self.g.push(g);
     }
 }
 
-/// The code of `term` in `code_map`, keyed by owned or borrowed terms; a
-/// `Serialization` error for a term the map lacks.
-pub(crate) fn code_of<K>(code_map: &HashMap<K, TermCode>, term: &str) -> Result<TermCode>
-where
-    K: Borrow<str> + Eq + Hash,
-{
-    code_map.get(term).copied().ok_or_else(|| {
-        VortexRdfError::Serialization(format!(
-            "Term missing from dictionary during encoding: {}",
-            term
-        ))
-    })
-}
-
-/// Every term of every quad as its code in `code_map` ([`code_of`]).
-pub(crate) fn encode_quads<K>(
+/// Every term of every quad as its code in `code_map`; a `Serialization`
+/// error for a term the map lacks.
+pub(crate) fn encode_quads(
     quads: &[RawQuad],
-    code_map: &HashMap<K, TermCode>,
-) -> Result<QuadCodes>
-where
-    K: Borrow<str> + Eq + Hash,
-{
+    code_map: &BorrowedTermCodeMap<'_>,
+) -> Result<QuadCodes> {
     let start = debug::timer();
     let encode_column = |term_of: fn(&RawQuad) -> &str| -> Result<Vec<TermCode>> {
         let mut codes: Vec<TermCode> = Vec::with_capacity(quads.len());
         for q in quads {
-            codes.push(code_of(code_map, term_of(q))?);
+            let term = term_of(q);
+            let code = code_map.get(term).copied().ok_or_else(|| {
+                VortexRdfError::Serialization(format!(
+                    "Term missing from dictionary during encoding: {}",
+                    term
+                ))
+            })?;
+            codes.push(code);
         }
         Ok(codes)
     };
@@ -100,16 +98,6 @@ where
     Ok(codes)
 }
 
-/// The whole dataset as one chunk. `codes` must be in global (s, p, o, g)
-/// order: the `s` column is stamped sorted.
-pub(crate) fn build_array(codes: &QuadCodes) -> Result<ArrayRef> {
-    if codes.s.is_empty() {
-        return empty_struct();
-    }
-    let n = codes.s.len();
-    build_code_chunk(codes, 0..n, true)
-}
-
 /// The chunk of rows `range` of `codes`: the four code columns and nothing
 /// else (the dictionary travels beside the array). `s_sorted` stamps
 /// `IsSorted` on the `s` column, which queries trust as global (s, p, o, g)
@@ -122,7 +110,6 @@ pub(crate) fn build_code_chunk(
 ) -> Result<ArrayRef> {
     let start = debug::timer();
     let n = range.len();
-    let names: Vec<Arc<str>> = PRIMARY_COLUMNS.iter().map(|&name| name.into()).collect();
     let arrays: Vec<ArrayRef> = vec![
         PrimitiveArray::from_iter(codes.s[range.clone()].iter().copied()).into_array(),
         PrimitiveArray::from_iter(codes.p[range.clone()].iter().copied()).into_array(),
@@ -132,20 +119,13 @@ pub(crate) fn build_code_chunk(
     if s_sorted {
         stamp_is_sorted(&arrays[0]);
     }
-    let chunk = StructArray::try_new(names.into(), arrays, n, Validity::NonNullable)
-        .map_err(VortexRdfError::Vortex)
-        .map(|a| a.into_array())?;
+    let chunk = named_struct(&PRIMARY_COLUMNS, arrays, n)?.into_array();
     log::debug!(
         "[Dictionary] Built encoded chunk of {} rows in {:?}",
         n,
         debug::elapsed(start)
     );
     Ok(chunk)
-}
-
-/// An empty chunk with the code schema, `s` unstamped.
-pub(crate) fn empty_struct() -> Result<ArrayRef> {
-    build_code_chunk(&QuadCodes::empty(), 0..0, false)
 }
 
 /// The four code columns of `chunk` in `[s, p, o, g]` order. The decoders'
@@ -533,6 +513,7 @@ pub(crate) async fn decode_chunk_raw_file_backed(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::HashMap;
 
     use vortex_array::arrays::VarBinViewArray;
 

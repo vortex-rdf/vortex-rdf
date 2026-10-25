@@ -6,9 +6,7 @@
 //! ingest drops repeated quads after its sort, before anything is derived
 //! from them.
 
-use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
@@ -21,8 +19,8 @@ use crate::store::builders::{BuiltArray, build_components};
 use crate::store::indexes::{IndexInput, Indexes};
 use crate::store::schema::TermCode;
 
-use super::codec::{QuadCodes, build_array};
-use super::term_dict::{CodeSpace, TermDictionary};
+use super::codec::{QuadCodes, build_code_chunk};
+use super::term_dict::TermDictionary;
 
 /// Term → code lookup borrowing its keys from the quads being encoded.
 pub(crate) type BorrowedTermCodeMap<'a> = HashMap<&'a str, TermCode>;
@@ -42,25 +40,18 @@ fn sorted_unique_terms(quads: &[RawQuad]) -> Vec<&str> {
     terms
 }
 
-/// The term → code map of `sorted` unique terms: a term's code is the code
-/// of its rank in `code_space`, and the keys are the terms moved in.
-fn code_map<K: Eq + Hash>(sorted: Vec<K>, code_space: CodeSpace) -> HashMap<K, TermCode> {
-    sorted
+/// Freeze `sorted` unique terms into the dictionary, FSST-compressed in
+/// windows, beside their term → code map: a term's code is the code of its
+/// rank in the dictionary's code space, and the keys are the terms moved in.
+fn freeze(sorted: Vec<&str>) -> Result<(TermDictionary, BorrowedTermCodeMap<'_>)> {
+    let plain = VarBinViewArray::from_iter_str(sorted.iter().copied());
+    let dict = TermDictionary::from_sorted_column(plain)?;
+    let code_space = dict.code_space();
+    let code_map = sorted
         .into_iter()
         .enumerate()
         .map(|(rank, term)| (term, code_space.code_at(rank)))
-        .collect()
-}
-
-/// Freeze `sorted` unique terms into the dictionary, beside their
-/// [`code_map`] in the dictionary's code space.
-fn freeze<K>(sorted: Vec<K>) -> Result<(TermDictionary, HashMap<K, TermCode>)>
-where
-    K: Borrow<str> + Eq + Hash,
-{
-    let dict =
-        TermDictionary::from_sorted(sorted.iter().map(|term| <K as Borrow<str>>::borrow(term)))?;
-    let code_map = code_map(sorted, dict.code_space());
+        .collect();
     Ok((dict, code_map))
 }
 
@@ -90,7 +81,9 @@ pub(crate) fn finish_interned(
     indexes: &Indexes,
 ) -> Result<BuiltArray> {
     let (dict, codes) = interner.finish()?;
-    let array = build_array(&codes)?;
+    // The codes are in global (s, p, o, g) order, rows or none: `s` is
+    // stamped sorted.
+    let array = build_code_chunk(&codes, 0..codes.s.len(), true)?;
     let components = build_components(indexes, IndexInput::Codes(&codes))?;
     Ok(BuiltArray {
         array,
@@ -229,17 +222,9 @@ impl InterningQuadBuilder {
         let remap_elapsed = debug::elapsed(remap_start);
         let n = self.quads.len();
 
-        let mut codes = QuadCodes {
-            s: Vec::with_capacity(n),
-            p: Vec::with_capacity(n),
-            o: Vec::with_capacity(n),
-            g: Vec::with_capacity(n),
-        };
-        for [s, p, o, g] in self.quads {
-            codes.s.push(s);
-            codes.p.push(p);
-            codes.o.push(o);
-            codes.g.push(g);
+        let mut codes = QuadCodes::with_capacity(n);
+        for quad in self.quads {
+            codes.push(quad);
         }
 
         log::debug!(

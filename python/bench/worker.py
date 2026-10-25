@@ -266,112 +266,70 @@ def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
                         )
                         | {"regime": regime}
                     )
-    # Term parsing happens once per pattern, outside every timed region.
-    prepared = {pat.name: a.prepare(pat) for pat in pattern_set}
-    for pat in pattern_set:
-        log(a.label, f"match {pat.name}…")
-        query = prepared[pat.name]
-        counts[pat.name] = a.count(handle, query)
-        # A count path that resolves differently must fail loudly here, not
-        # time the wrong work below.
-        n_count = a.count_only(handle, query)
-        if n_count != counts[pat.name]:
-            raise RuntimeError(
-                f"count_only disagrees for {pat.name}: {n_count} != {counts[pat.name]}"
-            )
-        measure(
-            f"{a.slug}::{pat.name}",
-            lambda _, q=query: a.count(handle, q),
-            rows,
-            QUERY_ITERS,
-            QUERY_WARMUP,
-            regime="warm",
-        )
-        measure(
-            f"{a.slug}::{pat.name}::count",
-            lambda _, q=query: a.count_only(handle, q),
-            rows,
-            QUERY_ITERS,
-            QUERY_WARMUP,
-            regime="warm",
-        )
-
-    # --- match: the same patterns, COLD ---
-    # Each iteration answers the FIRST query on a freshly opened handle. The
-    # open runs in `setup`, which is outside the timed region, so this isolates
-    # what a query costs against empty caches, excluding the open -- which is
-    # measured on its own as `open::<slug>` above.
-    #
-    # Gated on `has_distinct_open`: for a store that lives only in memory,
-    # opening IS re-parsing the source, so its cold cell would be tens of
-    # seconds of ingest sitting in a microsecond column. Those adapters simply
-    # have no cold rows, and the dashboard leaves the cells blank.
+    # The COLD regime: each iteration answers the FIRST query on a freshly
+    # opened handle. The open runs in `setup`, which is outside the timed
+    # region, so this isolates what a query costs against empty caches,
+    # excluding the open -- which is measured on its own as `open::<slug>`
+    # above.
     def open_cold():
         return a.open(artifact, src)
 
     def drop_cold(h, _result):
         a.dispose(h)
 
+    def counted(name: str, query: Any) -> int:
+        """`count`'s answer for `query`, checked against `count_only`'s: a
+        count path that resolves differently must fail loudly here, not time
+        the wrong work."""
+        count = a.count(handle, query)
+        n_count = a.count_only(handle, query)
+        if n_count != count:
+            raise RuntimeError(f"count_only disagrees for {name}: {n_count} != {count}")
+        return count
+
+    def measure_both(name: str, query: Any, iters: int, warmup: int, regime: str) -> None:
+        """Time `count` and `count_only` of `query` as `<slug>::<name>` and
+        `<slug>::<name>::count`: warm on the open handle, or cold."""
+        for suffix, fn in (("", a.count), ("::count", a.count_only)):
+            ident = f"{a.slug}::{name}{suffix}"
+            if regime == "warm":
+                measure(ident, lambda _, fn=fn: fn(handle, query), rows, iters, warmup, regime="warm")
+            else:
+                measure(
+                    ident,
+                    lambda h, fn=fn: fn(h, query),
+                    rows,
+                    iters,
+                    warmup,
+                    setup=open_cold,
+                    teardown=drop_cold,
+                    regime="cold",
+                )
+
+    # Term parsing happens once per pattern, outside every timed region.
+    prepared = {pat.name: a.prepare(pat) for pat in pattern_set}
+    for pat in pattern_set:
+        log(a.label, f"match {pat.name}…")
+        counts[pat.name] = counted(pat.name, prepared[pat.name])
+        measure_both(pat.name, prepared[pat.name], QUERY_ITERS, QUERY_WARMUP, "warm")
+
+    # --- match: the same patterns, COLD ---
+    # Gated on `has_distinct_open`: for a store that lives only in memory,
+    # opening IS re-parsing the source, so its cold cell would be tens of
+    # seconds of ingest sitting in a microsecond column. Those adapters simply
+    # have no cold rows, and the dashboard leaves the cells blank.
     if a.has_distinct_open:
         for pat in pattern_set:
             log(a.label, f"match {pat.name} (cold)…")
-            query = prepared[pat.name]
-            measure(
-                f"{a.slug}::{pat.name}",
-                lambda h, q=query: a.count(h, q),
-                rows,
-                QUERY_ITERS,
-                QUERY_WARMUP,
-                setup=open_cold,
-                teardown=drop_cold,
-                regime="cold",
-            )
-            measure(
-                f"{a.slug}::{pat.name}::count",
-                lambda h, q=query: a.count_only(h, q),
-                rows,
-                QUERY_ITERS,
-                QUERY_WARMUP,
-                setup=open_cold,
-                teardown=drop_cold,
-                regime="cold",
-            )
+            measure_both(pat.name, prepared[pat.name], QUERY_ITERS, QUERY_WARMUP, "cold")
 
     log(a.label, "match full…")
     full = a.prepare(FULL_SCAN_PATTERN)
-    counts["full"] = a.count(handle, full)
-    n_count = a.count_only(handle, full)
-    if n_count != counts["full"]:
-        raise RuntimeError(f"count_only disagrees for full: {n_count} != {counts['full']}")
-    measure(f"{a.slug}::full", lambda _: a.count(handle, full), rows, FULL_SCAN_ITERS, regime="warm")
-    measure(
-        f"{a.slug}::full::count",
-        lambda _: a.count_only(handle, full),
-        rows,
-        FULL_SCAN_ITERS,
-        regime="warm",
-    )
-
+    counts["full"] = counted("full", full)
+    measure_both("full", full, FULL_SCAN_ITERS, 0, "warm")
     if a.has_distinct_open:
         log(a.label, "match full (cold)…")
-        measure(
-            f"{a.slug}::full",
-            lambda h: a.count(h, full),
-            rows,
-            FULL_SCAN_ITERS,
-            setup=open_cold,
-            teardown=drop_cold,
-            regime="cold",
-        )
-        measure(
-            f"{a.slug}::full::count",
-            lambda h: a.count_only(h, full),
-            rows,
-            FULL_SCAN_ITERS,
-            setup=open_cold,
-            teardown=drop_cold,
-            regime="cold",
-        )
+        measure_both("full", full, FULL_SCAN_ITERS, 0, "cold")
     a.dispose(handle)
     del handle
     gc.collect()

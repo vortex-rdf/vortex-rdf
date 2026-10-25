@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::codes::{code_from_js, safe_u64};
 use crate::error::{js_range_err, js_type_err};
-use crate::terms::JsPattern;
+use crate::terms::pattern_probe;
 
 /// The most rows a chunk of `matchCodeChunks` holds when its options name no
 /// `batchRows`.
@@ -48,22 +48,22 @@ pub(crate) struct Signal {
     pub(crate) aborted: bool,
 }
 
-/// The probe of `matchCodes` and `countQuads`: `pattern` narrowed by the
-/// `keep`, `limit` and `offset` of `options`.
-pub(crate) fn read_probe(pattern: JsPattern, options: Option<&JsValue>) -> Result<Probe, JsValue> {
+/// The probe of `matchCodes` and `countQuads`: the pattern `probe` narrowed
+/// by the `keep`, `limit` and `offset` of `options`.
+pub(crate) fn read_probe(probe: Probe, options: Option<&JsValue>) -> Result<Probe, JsValue> {
     let mut options = Fields::read(options, "options", "option", &READ_OPTIONS)?;
-    narrowed(pattern.into_probe(), &mut options)
+    narrowed(probe, &mut options)
 }
 
-/// The probe and the chunk shape of `matchCodeChunks`: `pattern` narrowed as
-/// for [`read_probe`], every column unless `columns` names some, and
-/// [`DEFAULT_BATCH_ROWS`] unless `batchRows` is given.
+/// The probe and the chunk shape of `matchCodeChunks`: the pattern `probe`
+/// narrowed as for [`read_probe`], every column unless `columns` names some,
+/// and [`DEFAULT_BATCH_ROWS`] unless `batchRows` is given.
 pub(crate) fn chunk_probe(
-    pattern: JsPattern,
+    probe: Probe,
     options: Option<&JsValue>,
 ) -> Result<(Probe, ChunkShape), JsValue> {
     let mut options = Fields::read(options, "options", "option", &CHUNK_OPTIONS)?;
-    let probe = narrowed(pattern.into_probe(), &mut options)?;
+    let probe = narrowed(probe, &mut options)?;
     let columns = match options.take("columns") {
         Some(names) => chunk_columns(&names)?,
         None => QuadColumn::ALL.to_vec(),
@@ -115,8 +115,7 @@ fn parse_probe(probe: &JsValue) -> Result<Probe, JsValue> {
                 slots.length()
             )));
         }
-        let pattern = JsPattern::parse(slots.get(0), slots.get(1), slots.get(2), slots.get(3))?;
-        return Ok(pattern.into_probe());
+        return pattern_probe(slots.get(0), slots.get(1), slots.get(2), slots.get(3));
     }
     if !probe.is_object() {
         return Err(js_type_err(
@@ -126,8 +125,8 @@ fn parse_probe(probe: &JsValue) -> Result<Probe, JsValue> {
     }
     let mut fields = Fields::read(Some(probe), "a probe", "probe key", &PROBE_KEYS)?;
     let mut term = |key| fields.take(key).unwrap_or(JsValue::UNDEFINED);
-    let pattern = JsPattern::parse(term("s"), term("p"), term("o"), term("g"))?;
-    narrowed(pattern.into_probe(), &mut fields)
+    let probe = pattern_probe(term("s"), term("p"), term("o"), term("g"))?;
+    narrowed(probe, &mut fields)
 }
 
 /// `probe` narrowed by the `keep`, `limit` and `offset` of `fields`.

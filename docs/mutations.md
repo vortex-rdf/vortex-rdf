@@ -21,7 +21,7 @@ mutations are layered on top of it as two side structures
 
 | Layer | For | Held as |
 |---|---|---|
-| **Tail** | additions | an in-memory array of appended rows beside the base ([`Tail`](../core/src/store/view/mod.rs#L432)) |
+| **Tail** | additions | an in-memory array of appended rows beside the base ([`Tail`](../core/src/store/view/mod.rs#L421)) |
 | **Tombstones** | deletions | one bit per base row, `None` until the first delete (the source's [`deleted`](../core/src/store/view/mod.rs#L52) field, whichever backend holds the base) |
 
 ```mermaid
@@ -74,15 +74,15 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: an in-batch `HashSet` catches the
   latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/query/matching.rs#L774) — one fully bound
+  [`contains`](../core/src/store/query/matching.rs#L758) — one fully bound
   `match_pattern` over base and tail ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
   accumulator; the accreted chunks are folded into the flat first chunk
   geometrically — once their rows rival the flat prefix (with a floor so a
   small tail does not flatten on every add), or once enough chunks pile up
   that tail scans, which visit every chunk, would stop being dense
-  ([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L451),
-  [`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L455)). Amortized, each
+  ([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L440),
+  [`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L444)). Amortized, each
   appended row is copied O(1) times.
 - **Tail-local ids.** The tail has its own `RowSelection` and its own
   `deleted` mask, in tail-local ids (`0..rows.len()`), separate from the
@@ -92,7 +92,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`Tail::layout_for`](../core/src/store/view/mod.rs#L462));
+  stores Default-layout N-Triples strings ([`Tail::layout_for`](../core/src/store/view/mod.rs#L451));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L166) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L156) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -132,7 +132,7 @@ flowchart TD
   That set is folded into `deleted: Option<Mask>` — one bit per base row —
   carried beside the base, and separately beside the tail. A later delete
   unions into the existing mask
-  ([`union_deleted`](../core/src/store/view/mod.rs#L578)), so it composes
+  ([`union_deleted`](../core/src/store/view/mod.rs#L567)), so it composes
   with rows already tombstoned; the matcher does not consult the existing
   tombstones, and the union absorbs a doomed set that names already-dead
   rows.
@@ -149,13 +149,13 @@ flowchart TD
   — the single place a view becomes rows — so applying the mask cannot be
   forgotten by one of them. [`size`](../core/src/store/read/count.rs#L15) counts
   the live bits without gathering; the tail applies its own mask through
-  [`Tail::live_rows`](../core/src/store/view/mod.rs#L525).
+  [`Tail::live_rows`](../core/src/store/view/mod.rs#L514).
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L221) (through
-  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L460)), and on
+  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L486)), and on
   every later read the mask is applied **inside the scan**
-  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L237)) — as an
+  ([`restrict_scan`](../core/src/store/scan/file_scans.rs#L223)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`
   selection, or subtracted up front from an id list — so it composes with a
   pushed-down filter, whose output carries no row ids to re-align against.
@@ -173,7 +173,7 @@ flowchart TD
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/read/rows.rs#L571): base rows first (in view
+[`live_raw_quads`](../core/src/store/read/rows.rs#L429): base rows first (in view
 order), then tail rows, tombstones already excluded. Both put them in order the
 same way ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L87)):
 the tail is sorted alone and merged into the sorted base in one linear pass (a
@@ -215,9 +215,9 @@ flowchart TD
 ```
 
 - **A file-backed owner stays file-backed**
-  ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L117)): the
+  ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L118)): the
   writer is prepared first
-  ([`PendingStore::create`](../core/src/io/write.rs#L267), the one writer every
+  ([`PendingStore::create`](../core/src/io/pending.rs#L106), the one writer every
   path-taking build shares), so a source file the process cannot write (a
   read-only file) is refused with `PermissionDenied` before a quad is
   gathered or built ([`add_quads`'s auto-compaction](#51-auto-compaction)
@@ -225,9 +225,9 @@ flowchart TD
   `<store>.write-<uuid>.tmp` exists before the work starts (a process killed
   meanwhile leaves it behind, and nothing removes it later). The sorted rows
   are then streamed through the out-of-core builder
-  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L247))
+  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229))
   into it
-  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L77)), which is
+  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L78)), which is
   then renamed over the original path, and the store is reopened
   memory-mapped. Only the file the store opened is replaced: the file's
   device and inode are recorded at open and checked against the path before
@@ -241,15 +241,15 @@ flowchart TD
   there a file-backed store cannot compact over its own path: the compaction
   fails with the I/O error and the file stays as it was. The builder's spill
   runs are placed in the temp file's directory
-  ([`spill_site`](../core/src/io/write.rs#L413), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
+  ([`spill_site`](../core/src/io/pending.rs#L252), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default), in a
   run directory named after that file.
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L231) and adopts
-  the result through [`from_built`](../core/src/store/construct.rs#L108), in the
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L223) and adopts
+  the result through [`from_built`](../core/src/store/construct.rs#L106), in the
   same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
 
@@ -257,8 +257,8 @@ flowchart TD
 
 `add_quads` is append-then-check: the append itself is policy-free, and
 whichever call pushes the tail past a threshold
-([`should_auto_compact`](../core/src/store/write/compaction.rs#L151) →
-[`tail_needs_compaction`](../core/src/store/write/compaction.rs#L174)) pays for
+([`should_auto_compact`](../core/src/store/write/compaction.rs#L143) →
+[`tail_needs_compaction`](../core/src/store/write/compaction.rs#L166)) pays for
 folding it back into the base, which amortizes the O(n log n) rebuild to
 roughly constant cost per appended row. The tail is folded once it reaches
 either of:
@@ -281,7 +281,7 @@ batch: the batch stays in the in-memory tail, where matches and counts see it
 like any appended row, and the call returns `Ok` with the store. Only the
 writer's own refusal is absorbed
 ([`is_unwritable`](../core/src/error.rs#L105)): the
-[`PendingStore::create`](../core/src/io/write.rs#L267) that finds, before a quad
+[`PendingStore::create`](../core/src/io/pending.rs#L106) that finds, before a quad
 is gathered, that the file or its directory cannot be written
 (`PermissionDenied`, or a read-only filesystem). Any other failure of the
 compaction is returned, a permission error from later in the rewrite (a spill
@@ -293,7 +293,7 @@ open of the file and no rebuild (a debug-level log line says so), and every
 later append over the threshold retries the same way, folding the tail as soon
 as the file can be written again. An explicit `compact()` of such a store still
 fails with `PermissionDenied`: it is the call that reports why the tail is not
-being folded, and [`tail_len`](../core/src/store/mod.rs#L166) shows the tail
+being folded, and [`tail_len`](../core/src/store/mod.rs#L156) shows the tail
 growing. The tail then has no bound but memory, and every query mask-scans it,
 so a read-only store is for reading: append to a copy.
 
@@ -324,11 +324,11 @@ runs the mutation on the store the view came from.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `TAIL_FLATTEN_FLOOR` | 1,024 | [`view/mod.rs`](../core/src/store/view/mod.rs#L451) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
-| `TAIL_MAX_CHUNKS` | 64 | [`view/mod.rs`](../core/src/store/view/mod.rs#L455) | the tail is flattened once it holds more chunks than this, whatever their row counts |
-| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/write/compaction.rs#L160) | below this many tail rows `add_quads` never compacts |
-| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/write/compaction.rs#L164) | compact once the tail reaches base / 10 |
-| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/write/compaction.rs#L170) | compact once the tail could fill a builder chunk, however large the base |
+| `TAIL_FLATTEN_FLOOR` | 1,024 | [`view/mod.rs`](../core/src/store/view/mod.rs#L440) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
+| `TAIL_MAX_CHUNKS` | 64 | [`view/mod.rs`](../core/src/store/view/mod.rs#L444) | the tail is flattened once it holds more chunks than this, whatever their row counts |
+| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/write/compaction.rs#L152) | below this many tail rows `add_quads` never compacts |
+| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/write/compaction.rs#L156) | compact once the tail reaches base / 10 |
+| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/write/compaction.rs#L162) | compact once the tail could fill a builder chunk, however large the base |
 
 ---
 
@@ -341,10 +341,10 @@ runs the mutation on the store the view came from.
 | `QuadsSource` (selection, `deleted`, and the `Backend` holding the base) and its view constructors (`with_tombstones`, …), `Tail` (`Tail::layout_for`, accretion and the flatten policy, tombstones), `union_deleted` | [`core/src/store/view/mod.rs`](../core/src/store/view/mod.rs) |
 | `RowSelection::live_mask`, `to_mask` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | `gather_live` — the in-memory read paths' one gather | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) |
-| `restrict_scan`, `matching_file_rows` — tombstones inside a file scan | [`core/src/store/scan/file_reads.rs`](../core/src/store/scan/file_reads.rs), [`file_filter.rs`](../core/src/store/scan/file_filter.rs) |
+| `restrict_scan`, `matching_file_rows` — tombstones inside a file scan | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs), [`file_filter.rs`](../core/src/store/scan/file_filter.rs) |
 | `size` | [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
 | `live_raw_quads` | [`core/src/store/read/rows.rs`](../core/src/store/read/rows.rs) |
 | `match_pattern`, `match_tail`, `contains` | [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
 | `tail_len` | [`core/src/store/mod.rs`](../core/src/store/mod.rs) |
 | Rebuilding a tailed or tombstoned store for serialization | [`core/src/store/persist/serialize.rs`](../core/src/store/persist/serialize.rs) |
-| The rebuild pipeline compaction reuses | [`core/src/store/builders/mod.rs`](../core/src/store/builders/mod.rs), [`sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`core/src/store/construct.rs`](../core/src/store/construct.rs), [`core/src/io/write.rs`](../core/src/io/write.rs) |
+| The rebuild pipeline compaction reuses | [`core/src/store/builders/mod.rs`](../core/src/store/builders/mod.rs), [`sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`core/src/store/construct.rs`](../core/src/store/construct.rs), [`core/src/io/write.rs`](../core/src/io/write.rs), [`pending.rs`](../core/src/io/pending.rs) |

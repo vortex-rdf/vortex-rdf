@@ -585,8 +585,8 @@ fn parse_rejects_malformed() {
 /// Dictionary store.
 async fn predicate_store() -> VortexRdfStore {
     let mut quads = dictionary_test_quads();
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/typed").unwrap());
-    let p = NamedNode::new("http://example.org/value").unwrap();
+    let s = iri_subject("typed");
+    let p = iri("value");
     for spelling in [
         typed("5", "integer"),
         typed("-3", "integer"),
@@ -615,9 +615,7 @@ async fn predicate_store() -> VortexRdfStore {
             GraphName::DefaultGraph,
         ));
     }
-    VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, vec![])
-        .await
-        .unwrap()
+    streamed_store(quads, LayoutStrategy::Dictionary, vec![]).await
 }
 
 /// Over any candidate subset, `filter_codes` answers exactly what `eval`

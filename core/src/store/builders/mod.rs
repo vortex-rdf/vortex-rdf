@@ -28,9 +28,9 @@
 //! (compaction, a mutated store's serialization) do the same in one place
 //! (`sorted_live_raw_quads`) before they call [`build_parts_from_raws`].
 
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::array::stamp_is_sorted;
+use crate::store::array::{named_struct, stamp_is_sorted};
 use crate::store::indexes::{
     ALL_INDEX_TYPES, IndexComponent, IndexInput, IndexType, Indexes, check_indexed_rows,
 };
@@ -39,9 +39,7 @@ use crate::store::layouts::{LayoutStrategy, dictionary};
 use futures::{Stream, stream};
 use std::future::Future;
 use std::sync::Arc;
-use vortex_array::arrays::StructArray;
 use vortex_array::dtype::DType;
-use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 
 /// Number of quads per StructArray chunk in streaming/chunked builders.
@@ -106,16 +104,17 @@ pub struct BuiltArray {
 }
 
 /// The streaming counterpart of [`BuiltArray`]: the schema dtype, the lazy
-/// stream of primary-only quad chunks, the index children as writable
-/// components, and the dictionary the serializer writes as the `dictionary`
+/// stream of primary-only quad chunks, the index children as streams of
+/// their rows, and the dictionary the serializer writes as the `dictionary`
 /// child.
 pub(crate) struct BuiltStream {
     /// The schema dtype shared by every chunk.
     pub dtype: DType,
     /// The lazy stream of primary-only quad chunks.
     pub chunks: ChunkStream,
-    /// The index children riding beside the rows as writable components.
-    pub(crate) components: Vec<crate::io::container::NativeComponentWrite>,
+    /// The index children riding beside the rows, each its identity,
+    /// provenance and rows: the writer spells their descriptors.
+    pub(crate) components: Vec<crate::store::indexes::components::ChildStream>,
     /// Whether the chunks are in global `(s, p, o, g)` order; written as the
     /// root's `quads_sorted`.
     pub(crate) quads_sorted: bool,
@@ -163,9 +162,9 @@ pub trait VortexArrayBuilder {
 
 /// One StructArray chunk of primary quad columns for `layout`; indexes are
 /// built beside it as components ([`build_components`]). An empty `quads`
-/// builds every layout's empty chunk, the Dictionary layout's being
-/// [`dictionary::empty_struct`] (unstamped: nothing to sort); a non-empty
-/// Dictionary chunk needs the dictionary's codes ([`dictionary::build_code_chunk`]).
+/// builds every layout's empty chunk, the Dictionary layout's over no codes;
+/// a non-empty Dictionary chunk needs the dictionary's codes
+/// ([`dictionary::build_code_chunk`]).
 ///
 /// `s_sorted` stamps `IsSorted` on the `s` column, which `match_pattern`
 /// trusts as global `(s, p, o, g)` order: it must be `true` only when `quads`
@@ -176,9 +175,8 @@ pub(crate) fn build_struct_array(
     s_sorted: bool,
 ) -> Result<ArrayRef> {
     if layout == LayoutStrategy::Dictionary && quads.is_empty() {
-        return dictionary::empty_struct();
+        return dictionary::build_code_chunk(&dictionary::QuadCodes::default(), 0..0, s_sorted);
     }
-    let field_names = layout.field_names();
     let field_arrays = layout.build_columns(quads)?;
 
     if s_sorted {
@@ -186,14 +184,7 @@ pub(crate) fn build_struct_array(
         stamp_is_sorted(&field_arrays[0]);
     }
 
-    StructArray::try_new(
-        field_names.into(),
-        field_arrays,
-        quads.len(),
-        Validity::NonNullable,
-    )
-    .map_err(VortexRdfError::Vortex)
-    .map(|a| a.into_array())
+    named_struct(layout.primary_column_names(), field_arrays, quads.len()).map(|a| a.into_array())
 }
 
 /// The requested indexes' children over a complete in-memory dataset in final
@@ -225,9 +216,10 @@ pub(crate) fn build_components(
 /// layout, a fresh term dictionary derived from `raws` (empty for no rows,
 /// with the components over empty codes, so the index roster and its code
 /// dtypes survive). Every compaction and every mutated store's serialization
-/// runs it. `raws` must be SPOG-sorted with each quad once (as
-/// `sorted_live_raw_quads` hands them over): the `s` column is stamped sorted
-/// and the index children are numbered by these rows.
+/// runs it, and so does the in-memory builder under the string layouts.
+/// `raws` must be SPOG-sorted with each quad once (as `sorted_live_raw_quads`
+/// and the in-memory builder's sort hand them over): the `s` column is
+/// stamped sorted and the index children are numbered by these rows.
 pub(crate) fn build_parts_from_raws(
     raws: &[RawQuad],
     strategy: LayoutStrategy,

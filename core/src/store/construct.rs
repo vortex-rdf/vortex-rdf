@@ -1,10 +1,8 @@
 //! In-memory construction of a [`VortexRdfStore`]: the constructors from a
-//! quad stream, a builder's output and [`StoreParts`], the empty store, and
-//! the layout, adoption and assembly steps they share.
+//! quad stream, a builder's output and a store's serializable parts, the
+//! empty store, and the layout, adoption and assembly steps they share.
 
 use crate::error::{Result, VortexRdfError};
-#[cfg(feature = "file-io")]
-use crate::store::StoreParts;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::store::builders::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -78,7 +76,7 @@ impl VortexRdfStore {
         Self::from_built(built)
     }
 
-    /// Rebuild a store from [`StoreParts`], the inverse of
+    /// Rebuild a store from its serializable parts, the inverse of
     /// [`to_serializable_parts`](Self::to_serializable_parts) and the
     /// in-memory file open's adoption. Dict-less Dictionary parts are refused:
     /// bare code columns carry no way back to their terms. The base's and
@@ -90,9 +88,9 @@ impl VortexRdfStore {
     /// `(s, p, o, g)` order, and the match fast paths search every bound role
     /// on it: rows sorted by subject alone must not carry it.
     #[cfg(feature = "file-io")]
-    pub(crate) fn from_parts(parts: StoreParts) -> Result<Self> {
+    pub(crate) fn from_parts(parts: BuiltArray) -> Result<Self> {
         Self::adopt(
-            parts.built,
+            parts,
             resident::with_searchable_int_children,
             IndexComponent::into_searchable,
         )

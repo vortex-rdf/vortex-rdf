@@ -14,7 +14,7 @@ use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::probes::StructProbes;
 use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
 #[cfg(feature = "file-io")]
-use crate::store::scan::{file_filter, file_reads};
+use crate::store::scan::{file_exprs, file_filter, file_reads, subject_runs};
 use crate::store::schema;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{Backend, MemoryBase, Tail};
@@ -177,7 +177,7 @@ impl VortexRdfStore {
     pub(in crate::store) async fn prepared_codes(
         &self,
         pattern: QuadPattern<'_>,
-    ) -> Result<Option<PatternCodes<'_>>> {
+    ) -> Result<Option<PatternCodes>> {
         let codes = self.layout.prepare_pattern(pattern).await?;
         Ok((!codes.provably_empty(pattern)).then_some(codes))
     }
@@ -200,7 +200,7 @@ impl VortexRdfStore {
         &self,
         memory: &MemoryBase,
         pattern: QuadPattern<'_>,
-        codes: &mut PatternCodes<'_>,
+        codes: &mut PatternCodes,
         need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
@@ -343,7 +343,7 @@ impl VortexRdfStore {
         struct_arr: &StructArray,
         base: &ArrayRef,
         probes: &StructProbes,
-        codes: &mut PatternCodes<'_>,
+        codes: &mut PatternCodes,
         pat: &mut QuadPattern<'_>,
         mut selection: RowSelection,
         t: Option<Instant>,
@@ -385,21 +385,12 @@ impl VortexRdfStore {
             // the string layouts stop here, their columns resolving none.
             if let RowSelection::Range(range) = &selection {
                 let mut run = range.start as usize..range.end as usize;
-                let roles = [
-                    (pat.predicate.map(TermRef::Predicate), schema::COL_P),
-                    (pat.object.map(TermRef::Object), schema::COL_O),
-                    (pat.graph.map(TermRef::Graph), schema::COL_G),
-                ];
                 let mut answered = 0;
-                for (term, column) in roles {
-                    let Some(term) = term else { break };
-                    let Some(owned) = probes.by_name(base, column).flatten() else {
+                for term in pat.prefix_behind_subject() {
+                    let Some(owned) = probes.by_name(base, term.role().name()).flatten() else {
                         break;
                     };
-                    let Some(needle) = codes
-                        .probe_scalar(term)?
-                        .and_then(|scalar| u64::try_from(&scalar).ok())
-                    else {
+                    let Some(needle) = codes.probe_code(term)? else {
                         break;
                     };
                     // `bounds_in` consults only the window's order: a
@@ -413,14 +404,7 @@ impl VortexRdfStore {
                 }
                 if answered > 0 {
                     selection = RowSelection::Range(run.start as u64..run.end as u64);
-                    // Exactly the roles the run now satisfies, in order.
-                    pat.predicate = None;
-                    if answered > 1 {
-                        pat.object = None;
-                    }
-                    if answered > 2 {
-                        pat.graph = None;
-                    }
+                    pat.clear_prefix_behind_subject(answered);
                     debug::step!(
                         t,
                         "[match_pattern] In-memory prefix of {answered} more roles bounded by binary search"
@@ -442,7 +426,7 @@ impl VortexRdfStore {
         probes: &StructProbes,
         selection: RowSelection,
         pat: QuadPattern<'_>,
-        codes: &mut PatternCodes<'_>,
+        codes: &mut PatternCodes,
         t: Option<Instant>,
     ) -> Result<Option<RowSelection>> {
         // The residual binds a subset of the roles the caller's gate
@@ -496,7 +480,7 @@ impl VortexRdfStore {
         &self,
         base: &FileBase,
         pattern: QuadPattern<'_>,
-        codes: &mut PatternCodes<'_>,
+        codes: &mut PatternCodes,
         need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
@@ -556,7 +540,7 @@ impl VortexRdfStore {
                 let pat = resolves.clear(pat);
                 // Built before the ids fold: a run held for a count needs
                 // nothing residual left to filter.
-                let residual = file_reads::build_file_filter(pat, codes)?;
+                let residual = file_exprs::build_file_filter(pat, codes)?;
                 let serve = keep_serve.then_some(serve).flatten();
                 // With the plan kept, the resolution is the view's sole id
                 // restriction, so its deferred ids are the selection, pending
@@ -608,7 +592,7 @@ impl VortexRdfStore {
             // filter.
             IndexResolution::Declined => {
                 debug::step!(t, "[match_pattern] File index declined");
-                (file_reads::build_file_filter(pat, codes)?, None, None)
+                (file_exprs::build_file_filter(pat, codes)?, None, None)
             }
         };
         // ANDed with the filter earlier matches left on this view.
@@ -687,19 +671,19 @@ impl VortexRdfStore {
     #[cfg(feature = "file-io")]
     async fn locate_subject(
         file: &NativeStoreFile,
-        codes: &mut PatternCodes<'_>,
+        codes: &mut PatternCodes,
         pat: &mut QuadPattern<'_>,
         t: Option<Instant>,
     ) -> Result<Option<Range<u64>>> {
         let Some(subject) = pat.subject else {
             return Ok(None);
         };
-        let Some(mut range) = file_reads::locate_subject_run(file, codes, subject).await? else {
+        let Some(mut range) = subject_runs::locate_subject_run(file, codes, subject).await? else {
             return Ok(None);
         };
         pat.subject = None;
         debug::step!(t, "[match_pattern] File subject bounded by chunk probe");
-        let answered = file_reads::narrow_subject_run(file, codes, pat, &mut range).await?;
+        let answered = subject_runs::narrow_subject_run(file, codes, pat, &mut range).await?;
         if answered > 0 {
             debug::step!(
                 t,

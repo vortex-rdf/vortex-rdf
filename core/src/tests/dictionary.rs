@@ -36,21 +36,12 @@ async fn test_dictionary_quad_sink_matches_sorted_in_memory_builder() {
     assert_eq!(view_strings(&sunk).await, quad_strings(&quads));
     assert_eq!(view_strings(&sunk).await, view_strings(&built).await);
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let served = sunk
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let p0 = iri("p0");
+    let served = matched_view(&sunk, None, Some(&p0), None, None).await;
     assert_eq!(served_component(&served), Some("index:posg"));
     assert_eq!(
         view_strings(&served).await,
-        view_strings(
-            &built
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap()
-        )
-        .await
+        view_strings(&matched_view(&built, None, Some(&p0), None, None).await).await
     );
 }
 
@@ -66,9 +57,7 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
         if i.is_multiple_of(3) {
             GraphName::DefaultGraph
         } else {
-            GraphName::NamedNode(
-                NamedNode::new(format!("http://example.org/graph/{}", i % 5)).unwrap(),
-            )
+            iri_graph(&format!("graph/{}", i % 5))
         }
     };
     let quads: Vec<Quad> = (0..2_000)
@@ -99,11 +88,9 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
 
     // The same rows reached through a match (a shorter chunk, decoded by the
     // same path) must agree term for term.
-    let p3 = NamedNode::new("http://example.org/predicate/3").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p3), None, None)
+    let p3 = iri("predicate/3");
+    let matched = matched_view(&store, None, Some(&p3), None, None)
         .await
-        .unwrap()
         .quads_vec()
         .await
         .unwrap();
@@ -177,11 +164,8 @@ async fn test_dict_reader_survives_from_bytes() {
 
     // The gather the bindings pair with the snapshot: a served match's
     // codes, read off the answering index.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let matched = adopted
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let p0 = iri("p0");
+    let matched = matched_view(&adopted, None, Some(&p0), None, None).await;
     assert_eq!(served_component(&matched), Some("index:posg"));
     let matched_codes = matched.code_columns_gathered().await.unwrap().unwrap();
     let mut rows = decoded_rows(&matched_codes, &dict).await;

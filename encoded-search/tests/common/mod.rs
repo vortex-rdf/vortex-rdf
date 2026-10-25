@@ -4,9 +4,13 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::dtype::NativePType;
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
-use vortex_array::{ArrayRef, IntoArray as _};
+use vortex_array::{ArrayRef, IntoArray as _, VortexSessionExecute as _};
+use vortex_btrblocks::schemes::integer;
+use vortex_btrblocks::{BtrBlocksCompressorBuilder, CompressionSessionExt as _, Scheme, SchemeExt};
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
 use vortex_layout::{LayoutRef, LayoutStrategy};
@@ -73,12 +77,61 @@ fn enable_test_editions(session: &VortexSession) {
     session.enable_edition(TEST_EDITION).unwrap();
 }
 
+/// The frame-of-reference scheme; the session's edition refines it to a
+/// single reference.
+pub static FOR: integer::FoRScheme = integer::FoRScheme::v1();
+
+/// `data` compressed through exactly `schemes`, with the wire forms the
+/// session's edition allows.
+pub fn compress_with<T: NativePType>(schemes: &[&'static dyn Scheme], data: &[T]) -> ArrayRef {
+    compress_array_with(
+        schemes,
+        PrimitiveArray::from_iter(data.iter().copied()).into_array(),
+    )
+}
+
+/// [`compress_with`] over a canonical array of any unsigned width.
+pub fn compress_array_with(schemes: &[&'static dyn Scheme], canonical: ArrayRef) -> ArrayRef {
+    let session = session();
+    let stock: Vec<_> = session
+        .compression()
+        .schemes()
+        .iter()
+        .map(|s| s.id())
+        .collect();
+    let mut builder = BtrBlocksCompressorBuilder::from_session(&session).exclude_schemes(stock);
+    for scheme in schemes {
+        builder = builder.with_new_scheme(*scheme);
+    }
+    builder
+        .build()
+        .compress(&canonical, &mut session.create_execution_ctx())
+        .unwrap()
+}
+
+/// `data` compressed by the session's default cascade.
+pub fn compress_default<T: NativePType>(data: &[T]) -> ArrayRef {
+    let session = session();
+    let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
+    BtrBlocksCompressorBuilder::from_session(&session)
+        .build()
+        .compress(&canonical, &mut session.create_execution_ctx())
+        .unwrap()
+}
+
 /// The `partition_point` floor: the half-open run of `needle` in sorted
 /// `data`.
-pub fn canonical_bounds(data: &[u32], needle: u64) -> Range<u64> {
-    let lo = data.partition_point(|&v| u64::from(v) < needle) as u64;
-    let hi = data.partition_point(|&v| u64::from(v) <= needle) as u64;
+pub fn canonical_bounds<T: Copy + Into<u64>>(data: &[T], needle: u64) -> Range<u64> {
+    let lo = data.partition_point(|&v| v.into() < needle) as u64;
+    let hi = data.partition_point(|&v| v.into() <= needle) as u64;
     lo..hi.max(lo)
+}
+
+/// [`canonical_bounds`] as the `(lo, hi)` index pair a `SortedProbe`
+/// answers.
+pub fn canonical_index_bounds<T: Copy + Into<u64>>(data: &[T], needle: u64) -> (usize, usize) {
+    let range = canonical_bounds(data, needle);
+    (range.start as usize, range.end as usize)
 }
 
 /// A struct chunk over the given arrays, all of one length.

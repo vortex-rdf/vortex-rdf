@@ -118,32 +118,19 @@ pub(super) fn choose<'a>(pattern: QuadPattern<'a>) -> Option<IndexProbe<'a>> {
 }
 
 /// The emission surface of the out-of-core builder (compiled out on
-/// wasm32-unknown-unknown with it): the persisted child dtype and the child
-/// chunks built from windows of merged `(value, row id)` pairs.
+/// wasm32-unknown-unknown with it): the child chunks built from windows of
+/// merged `(value, row id)` pairs.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod out_of_core {
     use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::dtype::DType;
     use vortex_array::{ArrayRef, IntoArray};
 
-    use super::super::components::{TermColumn, child_struct, child_struct_dtype};
+    use super::super::components::TermColumn;
     use super::CHILD_COLUMNS;
     use crate::error::Result;
+    use crate::store::array::named_struct;
     use crate::store::array::stamp_is_sorted;
-    use crate::store::schema::{ROW_ID_PTYPE, RowId};
-
-    /// The persisted child's struct dtype: sorted `V` values (strings, or
-    /// codes under the Dictionary layout) plus the u64 primary row id.
-    pub(crate) fn ref_child_dtype<V: TermColumn>() -> DType {
-        use vortex_array::dtype::Nullability;
-        child_struct_dtype(
-            &CHILD_COLUMNS,
-            vec![
-                V::dtype(),
-                DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable),
-            ],
-        )
-    }
+    use crate::store::schema::RowId;
 
     /// One chunk of a reference component's persisted child from a window of its
     /// merged `(value, row id)` pairs, value column stamped sorted. `V` is the
@@ -154,7 +141,7 @@ pub(crate) mod out_of_core {
         let val = V::column(pairs.iter().map(|(v, _)| v));
         stamp_is_sorted(&val);
         let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
-        child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
+        named_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
     }
 }
 
@@ -295,7 +282,7 @@ mod tests {
             assert_eq!(rids.len(), quads.len());
             let mut repeats = 0;
             for row in 1..rids.len() {
-                let (before, at) = (vals.str_at(row - 1).unwrap(), vals.str_at(row).unwrap());
+                let (before, at) = (vals.str_at(row - 1), vals.str_at(row));
                 assert!(before <= at, "{name}: values ascend at row {row}");
                 if before == at {
                     repeats += 1;

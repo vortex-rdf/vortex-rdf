@@ -60,11 +60,13 @@ interface MemoryRow {
     storeFootprint?: WorkerOutput['storeFootprint'];
 }
 
+type Role = 'query' | 'querycold' | 'fullscan' | 'mutate';
+
 /** One adapter, one role, one process. A worker that cannot finish is skipped:
  *  the remaining adapters still run and still produce their rows. The caller
  *  records a failure for a null return, so the missing rows stay attributed on
  *  the page as failures, not as benchmarks nobody ran. */
-function runWorker(slug: string, role: 'query' | 'querycold' | 'fullscan' | 'mutate'): WorkerOutput | null {
+function runWorker(slug: string, role: Role): WorkerOutput | null {
     return runWorkerProcess<WorkerOutput>(workerPath, [slug, role], `${slug}/${role}`);
 }
 
@@ -87,15 +89,6 @@ async function main(): Promise<void> {
     // the reference. Applied to every role that counts anything: the full
     // scan reports from its own process, and it is the strongest check of the set.
     const countWarnings: string[] = [];
-    // A worker that never produced output — crash or the WORKER_TIMEOUT_MS
-    // kill — still gets a failures entry, so its absent rows are attributed
-    // in the results file, exactly like an in-worker phase failure.
-    const workerLost = (a: { slug: string; label: string }, role: string): void => {
-        failures.push({
-            slug: a.slug, label: a.label, role, phase: 'worker',
-            error: 'worker process did not finish (crash or WORKER_TIMEOUT_MS backstop) — see the run log',
-        });
-    };
     const mergeMatched = (label: string, out: WorkerOutput): void => {
         for (const [pat, n] of Object.entries(out.matched)) {
             if (matched[pat] === undefined) matched[pat] = n;
@@ -110,67 +103,65 @@ async function main(): Promise<void> {
         }
     };
 
-    for (const a of ADAPTERS) {
-        const out = runWorker(a.slug, 'query');
-        if (!out) { workerLost(a, 'query'); continue; }
-        results.push(...out.rows);
+    /** Run `role` for each of `adapters`, each in its own process: keep its
+     *  rows and failures, and hand its output to `after` for what the role
+     *  adds. */
+    const runRole = (
+        adapters: { slug: string; label: string }[], role: Role,
+        after?: (a: { slug: string; label: string }, out: WorkerOutput) => void,
+    ): void => {
+        for (const a of adapters) {
+            const out = runWorker(a.slug, role);
+            if (!out) {
+                // A worker that never produced output — crash or the
+                // WORKER_TIMEOUT_MS kill — still gets a failures entry, so its
+                // absent rows are attributed in the results file, exactly like
+                // an in-worker phase failure.
+                failures.push({
+                    slug: a.slug, label: a.label, role, phase: 'worker',
+                    error: 'worker process did not finish (crash or WORKER_TIMEOUT_MS backstop) — see the run log',
+                });
+                continue;
+            }
+            results.push(...out.rows);
+            for (const f of out.failures) {
+                failures.push({ slug: a.slug, label: a.label, role, ...f });
+                console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
+            }
+            after?.(a, out);
+        }
+    };
+
+    runRole(ADAPTERS, 'query', (a, out) => {
         memory.push({
             slug: a.slug, label: a.label, role: 'query',
             peakRssMb: out.peakRssMb, storeFootprint: out.storeFootprint,
         });
-        for (const f of out.failures) {
-            failures.push({ slug: a.slug, label: a.label, role: 'query', ...f });
-            console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
-        }
         mergeMatched(a.label, out);
         console.log(
             `[${a.label}] peak RSS: ${out.peakRssMb ?? 'unknown'} MB` +
             `, store: ${out.storeFootprint?.rssMb ?? '?'} MB RSS` +
             ` / ${out.storeFootprint?.wasmHeapMb ?? '-'} MB wasm`,
         );
-    }
+    });
 
     // The cold regime gets its own process per adapter: every iteration adopts a
     // fresh store, and the first query on one retains its whole buffer past
     // free() in wasm memory that never shrinks. Sharing the query process piles
     // those adoptions on top of a live store until the wasm allocator traps.
     // Adapters with no persistent form return no rows here (see runQueryCold).
-    for (const a of ADAPTERS) {
-        const out = runWorker(a.slug, 'querycold');
-        if (!out) { workerLost(a, 'querycold'); continue; }
-        results.push(...out.rows);
-        for (const f of out.failures) {
-            failures.push({ slug: a.slug, label: a.label, role: 'querycold', ...f });
-            console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
-        }
-    }
+    runRole(ADAPTERS, 'querycold');
 
     // The full scan gets its own process per adapter, for the same reason each
     // adapter gets one: it is heavy enough that a store's retained memory makes
     // it order-dependent, so sharing a process with the query and ingest phases
     // measures the residue of those on top of the scan. See runFullScan.
-    for (const a of ADAPTERS) {
-        const out = runWorker(a.slug, 'fullscan');
-        if (!out) { workerLost(a, 'fullscan'); continue; }
-        results.push(...out.rows);
-        mergeMatched(a.label, out);
-        for (const f of out.failures) {
-            failures.push({ slug: a.slug, label: a.label, role: 'fullscan', ...f });
-            console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
-        }
-    }
+    runRole(ADAPTERS, 'fullscan', (a, out) => mergeMatched(a.label, out));
 
-    for (const a of MUT_ADAPTERS) {
-        const out = runWorker(a.slug, 'mutate');
-        if (!out) { workerLost(a, 'mutate'); continue; }
-        results.push(...out.rows);
+    runRole(MUT_ADAPTERS, 'mutate', (a, out) => {
         memory.push({ slug: a.slug, label: a.label, role: 'mutate', peakRssMb: out.peakRssMb });
-        for (const f of out.failures) {
-            failures.push({ slug: a.slug, label: a.label, role: 'mutate', ...f });
-            console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
-        }
         console.log(`[${a.label}] peak RSS: ${out.peakRssMb ?? 'unknown'} MB`);
-    }
+    });
 
     // A library whose model rules mutation out entirely (hdt: the file is
     // immutable once built) is not in MUT_ADAPTERS, but its cells should still

@@ -48,11 +48,8 @@ fn assert_refused<T>(result: crate::error::Result<T>, label: &str) {
 async fn assert_reads_back(store: &VortexRdfStore, rows: usize, label: &str) {
     let quads = quads(rows);
     assert_eq!(store.size().await.unwrap(), rows, "{label}");
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let p1 = iri("p1");
+    let matched = matched_view(store, None, Some(&p1), None, None).await;
     assert_eq!(
         view_strings(&matched).await,
         expected_strings(&quads, |i| i % 2 == 1),
@@ -216,9 +213,7 @@ async fn rebuilds_refuse_a_store_grown_past_the_top() {
     let _base = RowIdBase::set(TOP);
     let mut all = quads(LIMIT + 1);
     let extra = all.pop().unwrap();
-    let store = VortexRdfStore::from_quads(quad_stream(all), LayoutStrategy::Dictionary, indexes())
-        .await
-        .unwrap();
+    let store = streamed_store(all, LayoutStrategy::Dictionary, indexes()).await;
     let grown = store.add_quad(extra).await.unwrap();
     assert_eq!(
         grown.size().await.unwrap(),

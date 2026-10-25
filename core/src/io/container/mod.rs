@@ -59,7 +59,8 @@ pub(crate) use layout::store_metadata_of_bytes;
 #[cfg(test)]
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
-    RdfStoreLayoutVTable, component_child, is_native_file, newer_root_id, register,
+    RdfStoreLayoutVTable, component_child, component_reader, is_native_file, newer_root_id,
+    register,
 };
 #[cfg(test)]
 pub(crate) use sources::default_child_strategy;
@@ -289,18 +290,6 @@ mod tests {
             sources::BufferedComponentSource::try_new(vec![dict_chunk(&["a"]), dict_chunk(&["b"])])
                 .is_ok()
         );
-    }
-
-    /// A pull-backed source hands out its stream once; a second open is an
-    /// error.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    #[test]
-    fn pull_source_replays_once() {
-        use sources::{NativeComponentSource as _, PullComponentSource};
-        let dtype = dict_chunk(&["a"]).dtype().clone();
-        let source = PullComponentSource::new(dtype, 1, Box::new(|_| Ok(None)));
-        assert!(source.open().is_ok());
-        assert!(source.open().is_err());
     }
 
     /// The write-side round trips.

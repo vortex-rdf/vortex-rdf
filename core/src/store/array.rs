@@ -1,6 +1,6 @@
 //! Low-level helpers over Vortex arrays: string-array construction, canonical
-//! string-column access, sortedness statistics, chunk assembly and slicing,
-//! sorted-column binary search, and mask conversion.
+//! string-column access, sortedness statistics, chunk and struct assembly
+//! and slicing, sorted-column binary search, and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
@@ -9,8 +9,9 @@ use crate::store::schema;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::arrays::{BoolArray, ChunkedArray, Struct, StructArray, VarBinViewArray};
-use vortex_array::dtype::DType;
+use vortex_array::dtype::{DType, FieldName};
 use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
+use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, Executable, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
@@ -46,8 +47,8 @@ impl<'a> StrColReader<'a> {
     /// ([`trusted_str`]); a decoder's oxrdf constructors make the single owned
     /// copy.
     #[inline]
-    pub(crate) fn str_at(&self, i: usize) -> Result<&'a str> {
-        buf_as_str(self.bytes_at(i))
+    pub(crate) fn str_at(&self, i: usize) -> &'a str {
+        trusted_str(self.bytes_at(i))
     }
 }
 
@@ -141,6 +142,20 @@ pub(crate) fn rechunk(
     })
 }
 
+/// A non-nullable struct of `columns` under `names`, `columns[i]` named
+/// `names[i]`, every column `len` rows long: the one construction of the
+/// crate's named struct chunks, from a layout's primary columns to an index
+/// child's rows and a point read's.
+pub(crate) fn named_struct(
+    names: &[&str],
+    columns: Vec<ArrayRef>,
+    len: usize,
+) -> Result<StructArray> {
+    let names: Vec<FieldName> = names.iter().map(|&n| FieldName::from(n)).collect();
+    StructArray::try_new(names.into(), columns, len, Validity::NonNullable)
+        .map_err(VortexRdfError::Vortex)
+}
+
 /// `arr` as a `StructArray`: a plain downcast when it already is one, else
 /// an execution to the canonical struct.
 pub(crate) fn into_struct_array(arr: ArrayRef) -> Result<StructArray> {
@@ -225,13 +240,6 @@ pub(crate) fn trusted_str(buf: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(buf) }
 }
 
-/// [`trusted_str`] as a `Result`, so decode call sites that `?` their
-/// fallible neighbours stay uniform.
-#[inline]
-pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
-    Ok(trusted_str(buf))
-}
-
 /// Test hook: how many slices this thread's [`rechunk`] iterators cut, and a
 /// guard that fails one of the next cuts.
 #[cfg(test)]
@@ -239,6 +247,7 @@ pub(crate) mod rechunk_hooks {
     use std::cell::Cell;
 
     use crate::error::{Result, VortexRdfError};
+    use crate::store::test_hooks::Override;
 
     thread_local! {
         static CUTS: Cell<usize> = const { Cell::new(0) };
@@ -264,19 +273,16 @@ pub(crate) mod rechunk_hooks {
     /// While alive, the cut this thread's `rechunk` iterators make `n` cuts
     /// from now (`0`: the next) fails. Dropping it restores the failure it
     /// replaced.
-    pub(crate) struct FailingCut(Option<usize>);
+    pub(crate) struct FailingCut {
+        _guard: Override<usize>,
+    }
 
     impl FailingCut {
         /// Fail the cut `n` cuts from now.
         pub(crate) fn after(n: usize) -> Self {
-            let cut = cuts() + n;
-            FailingCut(FAILING.with(|c| c.replace(Some(cut))))
-        }
-    }
-
-    impl Drop for FailingCut {
-        fn drop(&mut self) {
-            FAILING.with(|c| c.set(self.0));
+            Self {
+                _guard: Override::set(&FAILING, cuts() + n),
+            }
         }
     }
 }

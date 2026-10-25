@@ -2,9 +2,9 @@
 //! index data takes. One [`IndexComponent`] is one child of a native store
 //! file, or its in-memory twin: rows under the child's own column names,
 //! carrying the writer's sortedness provenance. Builders emit components
-//! beside primary-only quad rows; this module assembles a child's rows
-//! ([`child_struct`]), writes one as a native child ([`index_child_write`]),
-//! adopts a persisted one back into memory ([`adopt_component`]), maps an
+//! beside primary-only quad rows; this module streams a child's rows to the
+//! writer, which spells its descriptor ([`ChildStream`]), adopts a
+//! persisted one back into memory ([`adopt_component`]), maps an
 //! implementation slug onto its identity ([`known_component`]), and decodes a
 //! rid column into the sorted base row ids every resolution answers in
 //! ([`sorted_row_ids`]).
@@ -20,9 +20,8 @@ use std::sync::{Arc, OnceLock};
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::dtype::{DType, FieldName, Nullability};
+use vortex_array::dtype::{DType, Nullability};
 use vortex_array::scalar::Scalar;
-use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::{Buffer, BufferMut};
 
@@ -33,7 +32,7 @@ use crate::io::container::{
     child_strategy,
 };
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{into_struct_array, make_string_array};
+use crate::store::array::{into_struct_array, make_string_array, named_struct};
 use crate::store::probes::StructProbes;
 use crate::store::schema::{ROW_ID_PTYPE, RowId, TermCode};
 
@@ -44,7 +43,8 @@ use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 /// queryable: a row of a leaf's static table
 /// ([`IndexType::component_identities`]), which an [`IndexComponent`] holds
 /// and the slug registry scans. The columns behind an identity are the
-/// leaf's ([`child_struct`] assembles them).
+/// leaf's ([`named_struct`](crate::store::array::named_struct) assembles
+/// them).
 pub(crate) struct ComponentIdentity {
     /// The component name (`index:posg`, `index:ref-o`, …) the persisted
     /// child carries.
@@ -186,45 +186,42 @@ impl IndexComponent {
         Ok(self.rows.cell.get_or_init(|| executed))
     }
 
-    /// This component as a replayable native child write
-    /// ([`index_child_write`]), its descriptor carrying the component's own
+    /// This component as a [`ChildStream`] over its rows, carrying its own
     /// sortedness provenance: how a store's serialization hands its
-    /// components to the container writer. A deferred adoption materializes
-    /// here, so the written child is byte-identical to an eagerly adopted
-    /// one's.
-    pub(crate) fn to_write(&self) -> Result<NativeComponentWrite> {
+    /// components to the writer. A deferred adoption materializes here, so
+    /// the written child is byte-identical to an eagerly adopted one's.
+    pub(crate) fn to_stream(&self) -> Result<ChildStream> {
         let array = self.rows()?.clone().into_array();
-        index_child_write(
-            self.identity,
-            self.sorted,
-            Arc::new(crate::io::container::BufferedComponentSource::try_new(
+        Ok(ChildStream {
+            identity: self.identity,
+            sorted: self.sorted,
+            source: Arc::new(crate::io::container::BufferedComponentSource::try_new(
                 vec![array],
             )?),
-        )
+        })
     }
 
-    /// The inverse of [`to_write`](Self::to_write): the write's streamed
-    /// chunks executed to one struct in child schema, under the registry
-    /// identity of its implementation slug and with the descriptor's `sorted`
-    /// provenance. A foreign slug is an error.
+    /// This component as the native child write the writer makes of it
+    /// ([`to_stream`](Self::to_stream), [`ChildStream::into_write`]), for
+    /// the tests that assemble store files by hand.
+    #[cfg(test)]
+    pub(crate) fn to_write(&self) -> Result<NativeComponentWrite> {
+        self.to_stream()?.into_write()
+    }
+
+    /// The inverse of [`to_stream`](Self::to_stream): the child's streamed
+    /// chunks executed to one struct in child schema, under the child's
+    /// identity and with its `sorted` provenance.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) async fn from_write(
-        write: &crate::io::container::NativeComponentWrite,
-    ) -> Result<Self> {
+    pub(crate) async fn from_stream(child: ChildStream) -> Result<Self> {
         use futures::TryStreamExt as _;
 
-        let implementation = &write.descriptor.implementation;
-        let identity = known_component(implementation).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "unknown index component implementation: {implementation}"
-            ))
-        })?;
-        let chunks: Vec<ArrayRef> = write.source.open()?.try_collect().await?;
-        let rows = crate::store::array::chunked_or_single(chunks, write.descriptor.dtype.clone())?;
+        let chunks: Vec<ArrayRef> = child.source.open()?.try_collect().await?;
+        let rows = crate::store::array::chunked_or_single(chunks, child.source.dtype().clone())?;
         Ok(Self::built(
-            identity,
+            child.identity,
             into_struct_array(rows)?,
-            write.descriptor.sorted,
+            child.sorted,
         ))
     }
 
@@ -381,33 +378,39 @@ impl IndexComponent {
     }
 }
 
-/// `source` as the native child write of an index component under the
-/// registry row `identity`: its descriptor names the component and its
-/// slug, carries `sorted` (the writer's provenance) and `source`'s dtype,
-/// and the child is written through [`child_strategy`]. The one spelling of
-/// an index child's descriptor, for a component's own rows
-/// ([`IndexComponent::to_write`]) and the out-of-core builder's streamed
-/// children alike.
-pub(crate) fn index_child_write(
-    identity: &'static ComponentIdentity,
-    sorted: bool,
-    source: Arc<dyn NativeComponentSource>,
-) -> Result<NativeComponentWrite> {
-    let dtype = source.dtype().clone();
-    let strategy = child_strategy(&dtype);
-    Ok(NativeComponentWrite::new(
-        StoreComponentDescriptor {
-            name: identity.name.into(),
-            role: StoreComponentRole::Index,
-            implementation: identity.slug.into(),
-            version: INDEX_VERSION,
-            required: false,
-            sorted,
-            dtype,
-        },
-        source,
-        strategy,
-    )?)
+/// An index child on its way to the writer: the registry row it is, the
+/// writer's sortedness provenance, and the source of its rows. A store's
+/// components ([`IndexComponent::to_stream`]) and the out-of-core builder's
+/// merged children travel as one, and the writer alone spells its descriptor
+/// ([`into_write`](Self::into_write)), as it does the dictionary's.
+pub(crate) struct ChildStream {
+    pub(crate) identity: &'static ComponentIdentity,
+    pub(crate) sorted: bool,
+    pub(crate) source: Arc<dyn NativeComponentSource>,
+}
+
+impl ChildStream {
+    /// This child as a native child write: its descriptor names the
+    /// component and its slug, carries `sorted` and the source's dtype, and
+    /// the child is written through [`child_strategy`]. The one spelling of
+    /// an index child's descriptor.
+    pub(crate) fn into_write(self) -> Result<NativeComponentWrite> {
+        let dtype = self.source.dtype().clone();
+        let strategy = child_strategy(&dtype);
+        Ok(NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: self.identity.name.into(),
+                role: StoreComponentRole::Index,
+                implementation: self.identity.slug.into(),
+                version: INDEX_VERSION,
+                required: false,
+                sorted: self.sorted,
+                dtype,
+            },
+            self.source,
+            strategy,
+        )?)
+    }
 }
 
 /// The index set a component roster implies, in declaration (preference)
@@ -419,61 +422,22 @@ pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes 
         .collect()
 }
 
-/// A child's rows assembled from its column arrays: `columns[i]` under the
-/// `child_columns[i]` name, non-nullable throughout. The one construction
-/// every builder's component emission goes through, in memory and out of
-/// core alike.
-pub(crate) fn child_struct(
-    child_columns: &[&'static str],
-    columns: Vec<ArrayRef>,
-    len: usize,
-) -> Result<StructArray> {
-    StructArray::try_new(
-        child_columns
-            .iter()
-            .map(|n| FieldName::from(*n))
-            .collect::<Vec<_>>()
-            .into(),
-        columns,
-        len,
-        Validity::NonNullable,
-    )
-    .map_err(VortexRdfError::Vortex)
-}
-
 /// An index column's term encoding (`String` terms, or [`TermCode`]s under
-/// the Dictionary layout), with the dtype a column of them has and the array
-/// it assembles into: the one spelling both families' builders emit their
-/// term columns and declare their child dtypes through.
+/// the Dictionary layout), with the array a column of them assembles into:
+/// the one spelling both families' builders emit their term columns through.
 pub(crate) trait TermColumn: Clone + Default + Ord {
-    /// The dtype of a column of these terms, which the out-of-core builder's
-    /// child dtypes (`copy_child_dtype`, `ref_child_dtype`) declare. Compiled
-    /// where the out-of-core builder is.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn dtype() -> DType;
-
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
     where
         Self: 'a;
 }
 
 impl TermColumn for String {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn dtype() -> DType {
-        DType::Utf8(Nullability::NonNullable)
-    }
-
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         make_string_array(it.map(String::as_str))
     }
 }
 
 impl TermColumn for TermCode {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn dtype() -> DType {
-        DType::Primitive(crate::store::schema::CODE_PTYPE, Nullability::NonNullable)
-    }
-
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         PrimitiveArray::from_iter(it.copied()).into_array()
     }
@@ -490,33 +454,10 @@ pub(crate) fn components_from(
         .into_iter()
         .map(|(identity, columns)| {
             let len = columns.first().map_or(0, |column| column.len());
-            let rows = child_struct(child_columns, columns, len)?;
+            let rows = named_struct(child_columns, columns, len)?;
             Ok(IndexComponent::built(identity, rows, true))
         })
         .collect()
-}
-
-/// The child struct dtype under `child_columns` names: the dtype counterpart
-/// of [`child_struct`], shared with the builders' direct child dtypes
-/// (`copy_child_dtype`/`ref_child_dtype`) so a component's declared and built
-/// shapes cannot drift. Compiled out on wasm with those builders.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn child_struct_dtype(
-    child_columns: &[&'static str],
-    field_dtypes: Vec<DType>,
-) -> DType {
-    use vortex_array::dtype::StructFields;
-    DType::Struct(
-        StructFields::new(
-            child_columns
-                .iter()
-                .map(|n| (*n).into())
-                .collect::<Vec<std::sync::Arc<str>>>()
-                .into(),
-            field_dtypes,
-        ),
-        Nullability::NonNullable,
-    )
 }
 
 /// A row-id column decoded into the ascending, unique `Buffer<RowId>` every
@@ -602,7 +543,7 @@ mod tests {
     fn tiny(identity: &'static ComponentIdentity) -> IndexComponent {
         let val = PrimitiveArray::from_iter([0 as TermCode]).into_array();
         let rid = PrimitiveArray::from_iter([0 as RowId]).into_array();
-        let rows = child_struct(&["val", "rid"], vec![val, rid], 1).unwrap();
+        let rows = named_struct(&["val", "rid"], vec![val, rid], 1).unwrap();
         IndexComponent::built(identity, rows, true)
     }
 

@@ -2,8 +2,7 @@
 //! buffers decoded with a linear cursor, and RDF/JS `Stream<Quad>` adaptation.
 
 use futures::channel::mpsc;
-use futures::{Stream, stream};
-use js_sys::Reflect;
+use js_sys::{Array, Reflect};
 use oxrdf::Quad;
 use vortex_rdf_core::{
     BuiltArray, DictionaryQuadSink, Indexes, RawQuad, Result as CoreResult, VortexRdfError,
@@ -16,14 +15,10 @@ use crate::terms::{TermKind, graph, js_to_quad, object, predicate, subject};
 #[wasm_bindgen(module = "/js-snippets/pack-quads.js")]
 extern "C" {
     /// Flatten a range of an RDF/JS quad array into one length-prefixed byte
-    /// buffer host-side, decoded by [`packed_to_quads_into`]. Throws on a
-    /// malformed quad (hence `catch`).
+    /// buffer host-side, decoded by [`decode_packed`]. Throws on a malformed
+    /// quad (hence `catch`).
     #[wasm_bindgen(js_name = packQuads, catch)]
-    fn pack_quads(
-        quads: &js_sys::Array,
-        start: u32,
-        end: u32,
-    ) -> Result<js_sys::Uint8Array, JsValue>;
+    fn pack_quads(quads: &Array, start: u32, end: u32) -> Result<js_sys::Uint8Array, JsValue>;
 }
 
 /// Quads per `packQuads` call. The packed buffer is copied into linear memory
@@ -31,26 +26,30 @@ extern "C" {
 /// transient to one chunk's term bytes.
 const PACK_CHUNK: u32 = 1 << 16;
 
-/// Decode a JS quad array in `PACK_CHUNK`-sized ranges, converting with `emit`.
-fn js_array_decode<T>(
-    quads: &js_sys::Array,
-    mut emit: impl FnMut(Quad) -> T,
-) -> Result<Vec<T>, JsValue> {
+/// Decode a JS quad array in `PACK_CHUNK`-sized ranges, handing each quad to
+/// `emit` as it is decoded.
+fn js_array_decode(quads: &Array, mut emit: impl FnMut(Quad)) -> Result<(), JsValue> {
     let total = quads.length();
-    let mut out: Vec<T> = Vec::with_capacity(total as usize);
     let mut start = 0u32;
     while start < total {
         let end = (start + PACK_CHUNK).min(total);
-        let packed = pack_quads(quads, start, end)?;
-        packed_to_quads_into(&packed.to_vec(), &mut emit, &mut out)?;
+        let packed = pack_quads(quads, start, end)?.to_vec();
+        decode_packed(&packed, start as usize, &mut emit)?;
         start = end;
     }
+    Ok(())
+}
+
+/// Every quad of a JS quad array, converted by `convert`, in one allocation.
+fn js_array_collect<T>(quads: &Array, convert: impl Fn(Quad) -> T) -> Result<Vec<T>, JsValue> {
+    let mut out = Vec::with_capacity(quads.length() as usize);
+    js_array_decode(quads, |quad| out.push(convert(quad)))?;
     Ok(out)
 }
 
 /// Ingest form: quads as [`RawQuad`], which is what every builder consumes.
-fn js_array_to_raw_quads(quads: js_sys::Array) -> Result<Vec<RawQuad>, JsValue> {
-    js_array_decode(&quads, |q| RawQuad::from_quad(&q))
+pub(crate) fn js_array_to_raw_quads(quads: &Array) -> Result<Vec<RawQuad>, JsValue> {
+    js_array_collect(quads, |q| RawQuad::from_quad(&q))
 }
 
 /// Dictionary-layout ingest: decode each packed chunk straight into the
@@ -61,13 +60,11 @@ fn js_array_to_raw_quads(quads: js_sys::Array) -> Result<Vec<RawQuad>, JsValue> 
 /// high-water holds one packed chunk plus one copy of every distinct term
 /// instead of four owned Strings per quad.
 pub(crate) fn js_array_to_dictionary_array(
-    quads: js_sys::Array,
+    quads: &Array,
     indexes: Indexes,
 ) -> Result<BuiltArray, JsValue> {
     let mut sink = DictionaryQuadSink::new(indexes);
-    // `push` returns `()`, so the decode loop's collected results are a ZST
-    // vector: nothing per quad is allocated.
-    js_array_decode(&quads, |q| sink.push(RawQuad::from_quad(&q)))?;
+    js_array_decode(quads, |q| sink.push(RawQuad::from_quad(&q)))?;
     sink.finish().map_err(js_err)
 }
 
@@ -75,55 +72,45 @@ pub(crate) fn js_array_to_dictionary_array(
 /// duplicate check goes through `match_pattern` on the parsed terms. Bounded by
 /// the batch size, so the extra owned copy is not the ingest concern that
 /// [`js_array_to_raw_quads`] avoids.
-pub(crate) fn js_array_to_quads(quads: js_sys::Array) -> Result<Vec<Quad>, JsValue> {
-    js_array_decode(&quads, |q| q)
+pub(crate) fn js_array_to_quads(quads: &Array) -> Result<Vec<Quad>, JsValue> {
+    js_array_collect(quads, |q| q)
 }
 
-/// Decode the buffer [`pack_quads`] produced back into owned quads. Each term
-/// is built by its position's validated constructor in [`crate::terms`], the
+/// Decode the buffer [`pack_quads`] produced for the quads from array index
+/// `first` on, handing each quad to `emit` as it is decoded. Each term is
+/// built by its position's validated constructor in [`crate::terms`], the
 /// ones the reflection reader [`js_to_quad`] builds through, so both decoders
 /// accept the same terms; a term a constructor rejects is reported with its
-/// quad's index.
+/// quad's index in the array, as the packer reports the quads it rejects.
 ///
-/// `emit` converts each decoded quad as it is produced, so on the ingest path
-/// the `oxrdf::Quad` is dropped inside the loop and at most one packed chunk's
+/// On the ingest path `emit` converts each quad as it is produced, so the
+/// `oxrdf::Quad` is dropped inside the loop and at most one packed chunk's
 /// terms are live at a time.
-fn packed_to_quads_into<T>(
-    bytes: &[u8],
-    emit: &mut impl FnMut(Quad) -> T,
-    out: &mut Vec<T>,
-) -> Result<(), JsValue> {
+fn decode_packed(bytes: &[u8], first: usize, emit: &mut impl FnMut(Quad)) -> Result<(), JsValue> {
     struct Cursor<'a> {
         bytes: &'a [u8],
         pos: usize,
     }
     impl<'a> Cursor<'a> {
-        fn u8(&mut self) -> Result<u8, JsValue> {
-            let b = *self
-                .bytes
-                .get(self.pos)
-                .ok_or_else(|| js_err("Truncated quad buffer"))?;
-            self.pos += 1;
-            Ok(b)
-        }
-        fn u32(&mut self) -> Result<u32, JsValue> {
-            let end = self.pos + 4;
-            let s = self
+        /// The next `len` bytes.
+        fn take(&mut self, len: usize) -> Result<&'a [u8], JsValue> {
+            let end = self.pos + len;
+            let taken = self
                 .bytes
                 .get(self.pos..end)
                 .ok_or_else(|| js_err("Truncated quad buffer"))?;
             self.pos = end;
-            Ok(u32::from_le_bytes(s.try_into().unwrap()))
+            Ok(taken)
+        }
+        fn u8(&mut self) -> Result<u8, JsValue> {
+            Ok(self.take(1)?[0])
+        }
+        fn u32(&mut self) -> Result<u32, JsValue> {
+            Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
         }
         fn str(&mut self) -> Result<&'a str, JsValue> {
             let len = self.u32()? as usize;
-            let end = self.pos + len;
-            let s = self
-                .bytes
-                .get(self.pos..end)
-                .ok_or_else(|| js_err("Truncated quad buffer"))?;
-            self.pos = end;
-            std::str::from_utf8(s).map_err(|_| js_err("Invalid UTF-8 in quad buffer"))
+            std::str::from_utf8(self.take(len)?).map_err(|_| js_err("Invalid UTF-8 in quad buffer"))
         }
         /// One packed term — its tag, then (tags 0–4) its value and (tags
         /// 3–4) its extra — built by `build` with borrowed strings: `Ok(None)`
@@ -145,33 +132,14 @@ fn packed_to_quads_into<T>(
     let invalid = |i: usize| js_err(format!("Invalid quad object at index {}", i));
     let mut cur = Cursor { bytes, pos: 0 };
     let n = cur.u32()? as usize;
-    out.reserve(n);
-    for i in 0..n {
+    for i in first..first + n {
         let s = cur.term(subject)?.ok_or_else(|| invalid(i))?;
         let p = cur.term(predicate)?.ok_or_else(|| invalid(i))?;
         let o = cur.term(object)?.ok_or_else(|| invalid(i))?;
         let g = cur.term(graph)?.ok_or_else(|| invalid(i))?;
-        out.push(emit(Quad::new(s, p, o, g)));
+        emit(Quad::new(s, p, o, g));
     }
     Ok(())
-}
-
-/// A quad stream boxed for core's `VortexRdfStore::from_quads`, whichever of
-/// the two `fromQuads` input shapes it came from.
-pub(crate) type BoxedQuadStream = Box<dyn Stream<Item = CoreResult<RawQuad>> + Unpin + Send>;
-
-/// Accept either shape `fromQuads` allows: a plain array (eagerly validated
-/// and wrapped in `stream::iter`), or an RDF/JS `Stream<Quad>` (consumed
-/// through its event-emitter interface).
-pub(crate) fn js_to_quad_stream(value: JsValue) -> Result<BoxedQuadStream, JsValue> {
-    if js_sys::Array::is_array(&value) {
-        let quads = js_array_to_raw_quads(js_sys::Array::from(&value))?;
-        let stream: BoxedQuadStream = Box::new(stream::iter(
-            quads.into_iter().map(Ok::<RawQuad, VortexRdfError>),
-        ));
-        return Ok(stream);
-    }
-    rdfjs_stream_to_quads(value)
 }
 
 /// Consume an RDF/JS `Stream<Quad>` — a Node-style event emitter with
@@ -185,7 +153,9 @@ pub(crate) fn js_to_quad_stream(value: JsValue) -> Result<BoxedQuadStream, JsVal
 /// listener has no natural Rust-side owner to drop them. Without an explicit
 /// `close_channel()` on `'end'`, the receiver would otherwise wait forever
 /// for a value that will never come.
-fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue> {
+pub(crate) fn rdfjs_stream_to_quads(
+    stream_val: JsValue,
+) -> Result<mpsc::UnboundedReceiver<CoreResult<RawQuad>>, JsValue> {
     let on = Reflect::get(&stream_val, &"on".into())
         .ok()
         .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
@@ -238,5 +208,5 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
     on_error.forget();
     on_end.forget();
 
-    Ok(Box::new(rx))
+    Ok(rx)
 }

@@ -1,37 +1,23 @@
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use vortex_buffer::Buffer;
-use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
 use crate::batch::Batch;
-use crate::cancel::{Pulled, Token};
-use crate::chunks::{CodeChunks, chunk_columns, every_column};
-use crate::codes::{TermDict, U64Column, decode_slice};
+use crate::cancel::Token;
+use crate::dict::{TermDict, decode_slice};
+use crate::iterators::{
+    Answers, CodeChunks, CodeColumns, ProbeAnswers, ProbeColumns, chunk_columns, code_columns,
+    every_column,
+};
 use crate::probes::{narrowed_probe, parse_probes};
 use crate::{CancelToken, RUNTIME, VortexRdfError, cancelled, detached, py_err, raced, settled};
 use vortex_rdf_core::Probe;
-
-/// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
-type CodeColumns = (U64Column, U64Column, U64Column, U64Column);
-
-fn code_columns([s, p, o, g]: [Buffer<TermCode>; 4]) -> CodeColumns {
-    (
-        U64Column { codes: s },
-        U64Column { codes: p },
-        U64Column { codes: o },
-        U64Column { codes: g },
-    )
-}
-
-/// One probe's gathered `(s, p, o, g)` code columns, or `None` where the
-/// code path does not apply.
-type ProbeColumns = Option<[Buffer<TermCode>; 4]>;
 
 /// The rows `probe` matches as `(s, p, o, g)` term-code columns, gathered,
 /// or `None` when the match declines the code path.
@@ -71,82 +57,6 @@ fn token_of(cancel: Option<&Bound<'_, CancelToken>>) -> PyResult<Option<Token>> 
     Ok(token)
 }
 
-/// The answers of [`VortexRdfStore::match_codes_many`], one per probe in
-/// input order: its `(s, p, o, g)` code columns, or `None` where the code
-/// path does not apply. A bounded [`Batch`] runs the probes from the call
-/// on; each `__next__` waits, GIL-released, for its next answer, raced with
-/// the call's cancel token if it passed one. The first failing probe, or a
-/// cancelled pull, raises at its position and ends the iteration, and
-/// dropping the iterator aborts the probes still in flight.
-#[pyclass(frozen, module = "vortex_rdf._native")]
-pub struct ProbeAnswers {
-    answers: Mutex<Answers>,
-    /// The token every pull races, when the call passed one.
-    token: Option<Token>,
-    /// The number of probes, answered or not.
-    len: usize,
-}
-
-/// What a [`ProbeAnswers`] has still to answer.
-enum Answers {
-    /// The probes' gathered code columns, from a running batch.
-    Batch(Batch<ProbeColumns>),
-    /// `None` for each of this many probes: the store's rows have no codes,
-    /// so no probe runs.
-    Declined(usize),
-}
-
-impl Answers {
-    /// The next probe's answer, pulled with `token`; `None` once the probes
-    /// have all answered, one has failed or a pull was cancelled.
-    fn next(&mut self, token: Option<&Token>) -> Pulled<Option<Result<ProbeColumns, CoreError>>> {
-        match self {
-            Answers::Batch(batch) => batch.next(&RUNTIME, token),
-            // No probe runs, so a cancelled token is read here: it ends the
-            // answers still due.
-            Answers::Declined(left) if *left > 0 && token.is_some_and(Token::is_cancelled) => {
-                *left = 0;
-                Pulled::Cancelled
-            }
-            Answers::Declined(left) => Pulled::Done(match left.checked_sub(1) {
-                Some(rest) => {
-                    *left = rest;
-                    Some(Ok(None))
-                }
-                None => None,
-            }),
-        }
-    }
-}
-
-#[pymethods]
-impl ProbeAnswers {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Option<CodeColumns>>> {
-        // The lock is taken GIL-released, so a thread waiting on it holds
-        // no GIL the answering thread needs back.
-        let answer = py.detach(|| {
-            self.answers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .next(self.token.as_ref())
-        });
-        match answer {
-            Pulled::Done(None) => Ok(None),
-            Pulled::Done(Some(Ok(columns))) => Ok(Some(columns.map(code_columns))),
-            Pulled::Done(Some(Err(error))) => Err(py_err(error)),
-            Pulled::Cancelled => Err(cancelled()),
-        }
-    }
-
-    fn __len__(&self) -> usize {
-        self.len
-    }
-}
-
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
 /// Held as `Py<PyString>` so a term repeated down a column is one Python object
 /// shared by every row that uses it.
@@ -176,20 +86,21 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
             columns.iter().map(Vec::len).collect::<Vec<_>>()
         )));
     }
-    let mut out: [Vec<Py<PyString>>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
-    for (position, column) in columns.into_iter().enumerate() {
-        for (row, term) in column.into_iter().enumerate() {
-            match term {
-                Some(term) => out[position].push(term),
-                None => {
-                    return Err(VortexRdfError::new_err(format!(
+    let resolved = |column: Vec<Option<Py<PyString>>>| {
+        column
+            .into_iter()
+            .enumerate()
+            .map(|(row, term)| {
+                term.ok_or_else(|| {
+                    VortexRdfError::new_err(format!(
                         "matched row {row} has a term code outside the store dictionary"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(out)
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()
+    };
+    let [s, p, o, g] = columns;
+    Ok([resolved(s)?, resolved(p)?, resolved(o)?, resolved(g)?])
 }
 
 /// A read-only Vortex-RDF store opened from a `.vortex` file or from
@@ -214,34 +125,42 @@ pub struct VortexRdfStore {
 }
 
 impl VortexRdfStore {
-    /// The matched rows as four columns of N-Triples strings, in
-    /// subject-predicate-object-graph order. The default graph is the empty
-    /// string, the spelling `Probe::parse` accepts for it.
+    /// The rows the pattern `(s, p, o, g)` matches as four columns of
+    /// N-Triples strings, in subject-predicate-object-graph order. The
+    /// default graph is the empty string, the spelling `Probe::parse` accepts
+    /// for it.
     ///
     /// Backs both [`Self::get_quads`] and [`Self::match_columns`], so the two
     /// resolve a pattern the same way.
-    fn matched_columns(&self, py: Python<'_>, probe: &Probe) -> PyResult<[Vec<Py<PyString>>; 4]> {
-        if let Some(reader) = self.store.dict_reader() {
-            // `dict_reader` reports only that the path can apply (a Dictionary
-            // layout), whether the dictionary is in memory or
-            // left in the mapped file; the match itself still decides, so fall
-            // through when it declines.
-            if let Some(codes) = detached(py, || probe_codes(&self.store, probe))? {
-                let mut decoded = Vec::with_capacity(4);
-                for column in &codes {
-                    decoded.push(decode_slice(py, &reader, column.as_slice())?);
-                }
-                let decoded: [_; 4] = decoded
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("four code columns"));
-                return resolve_columns(decoded);
-            }
+    fn matched_columns(
+        &self,
+        py: Python<'_>,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+    ) -> PyResult<[Vec<Py<PyString>>; 4]> {
+        let probe = Probe::parse(s, p, o, g).map_err(py_err)?;
+        // `dict_reader` reports only that the path can apply (a Dictionary
+        // layout), whether the dictionary is in memory or left in the mapped
+        // file; the match itself still decides, so fall through when it
+        // declines.
+        if let Some(reader) = self.store.dict_reader()
+            && let Some([subjects, predicates, objects, graphs]) =
+                detached(py, || probe_codes(&self.store, &probe))?
+        {
+            return resolve_columns([
+                decode_slice(py, &reader, &subjects)?,
+                decode_slice(py, &reader, &predicates)?,
+                decode_slice(py, &reader, &objects)?,
+                decode_slice(py, &reader, &graphs)?,
+            ]);
         }
 
         // The matched quads with shared-string terms: each distinct term of a
         // decoded chunk is one `Arc<str>`, handed to every row repeating it.
         let rows = detached(py, || async {
-            self.store.run_probe(probe).await?.shared_quads_vec().await
+            self.store.run_probe(&probe).await?.shared_quads_vec().await
         })?;
         // Intern by `Arc` address: `rows` holds every `Arc` for the whole
         // loop, so an address identifies one term. A strong count of one means
@@ -370,18 +289,14 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<Vec<PyQuad>> {
-        let probe = Probe::parse(s, p, o, g).map_err(py_err)?;
-        let [subjects, predicates, objects, graphs] = self.matched_columns(py, &probe)?;
-        let mut rows = Vec::with_capacity(subjects.len());
-        for (((s, p), o), g) in subjects
+        let [subjects, predicates, objects, graphs] = self.matched_columns(py, s, p, o, g)?;
+        Ok(subjects
             .into_iter()
             .zip(predicates)
             .zip(objects)
             .zip(graphs)
-        {
-            rows.push((s, p, o, g));
-        }
-        Ok(rows)
+            .map(|(((s, p), o), g)| (s, p, o, g))
+            .collect())
     }
 
     /// Number of quads matching a pattern, counted from the match's row
@@ -413,13 +328,11 @@ impl VortexRdfStore {
         cancel: Option<&Bound<'_, CancelToken>>,
     ) -> PyResult<usize> {
         let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
-        match token_of(cancel)? {
-            None => detached(py, || self.store.count_probe(&probe)),
-            Some(token) => {
-                let store = self.store.clone();
-                raced(py, &token, async move { store.count_probe(&probe).await })
-            }
-        }
+        let token = token_of(cancel)?;
+        let store = self.store.clone();
+        raced(py, token.as_ref(), async move {
+            store.count_probe(&probe).await
+        })
     }
 
     /// [`Self::count_quads`] for a batch of probes in one GIL-released call,
@@ -472,8 +385,7 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<StringColumns> {
-        let probe = Probe::parse(s, p, o, g).map_err(py_err)?;
-        let [subjects, predicates, objects, graphs] = self.matched_columns(py, &probe)?;
+        let [subjects, predicates, objects, graphs] = self.matched_columns(py, s, p, o, g)?;
         Ok((subjects, predicates, objects, graphs))
     }
 
@@ -533,13 +445,10 @@ impl VortexRdfStore {
         if self.store.dict_reader().is_none() {
             return Ok(None);
         }
-        let columns = match token {
-            None => detached(py, || probe_codes(&self.store, &probe))?,
-            Some(token) => {
-                let store = self.store.clone();
-                raced(py, &token, async move { probe_codes(&store, &probe).await })?
-            }
-        };
+        let store = self.store.clone();
+        let columns = raced(py, token.as_ref(), async move {
+            probe_codes(&store, &probe).await
+        })?;
         Ok(columns.map(code_columns))
     }
 
@@ -594,10 +503,7 @@ impl VortexRdfStore {
                 .await?
                 .code_chunks(&wanted, batch_rows)
         };
-        let stream = match &token {
-            None => detached(py, || chunks)?,
-            Some(token) => raced(py, token, chunks)?,
-        };
+        let stream = raced(py, token.as_ref(), chunks)?;
         Ok(Some(CodeChunks::new(stream, token, columns, batch_rows)))
     }
 
@@ -636,10 +542,6 @@ impl VortexRdfStore {
                 |store, probe| async move { probe_codes(&store, &probe).await },
             ))
         };
-        Ok(ProbeAnswers {
-            answers: Mutex::new(answers),
-            token,
-            len,
-        })
+        Ok(ProbeAnswers::new(answers, token, len))
     }
 }

@@ -9,32 +9,19 @@ from array import array
 
 import pytest
 
-from vortex_rdf import U64Column, VortexRdfStore, serialize_rdf
+from vortex_rdf import JoinTooLarge, U64Column, VortexRdfError, VortexRdfStore
 
-from conftest import INDEXES, NAME, PATTERNS, u64_rows, u64s
+from conftest import INDEXES, NAME, PATTERNS, one_shot, serialized, u64_rows, u64s
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
-
-
-@pytest.fixture(params=["resident", "file-backed"])
-def dictionary(request, vortex_files):
-    """The fixture's dictionary-layout store loaded whole (resident
-    dictionary) or opened from its file (mapped, file-backed dictionary), as
-    `(store, term_dict)`."""
-    path = vortex_files["dictionary"]
-    store = VortexRdfStore(path, in_memory=request.param == "resident")
-    term_dict = store.term_dict()
-    assert term_dict is not None
-    assert term_dict.file_backed == (request.param == "file-backed")
-    return store, term_dict
 
 
 def _terms(term_dict):
     return term_dict.decode_many(list(range(len(term_dict))))
 
 
-def test_encode_is_spelling_tolerant(dictionary):
-    _, term_dict = dictionary
+def test_encode_is_spelling_tolerant(dictionary_store):
+    term_dict = dictionary_store.term_dict()
     alice = term_dict.encode("<http://ex.org/alice>")
     assert alice is not None
     assert term_dict.encode("http://ex.org/alice") == alice
@@ -50,8 +37,8 @@ def test_encode_is_spelling_tolerant(dictionary):
             term_dict.encode(malformed)
 
 
-def test_encode_many_matches_encode(dictionary):
-    _, term_dict = dictionary
+def test_encode_many_matches_encode(dictionary_store):
+    term_dict = dictionary_store.term_dict()
     terms = _terms(term_dict)
     probes = terms + ["http://ex.org/alice", '"Bob"@EN', "default", "<http://ex.org/nobody>"]
     assert term_dict.encode_many(probes) == [term_dict.encode(t) for t in probes]
@@ -60,8 +47,8 @@ def test_encode_many_matches_encode(dictionary):
         term_dict.encode_many(["<http://ex.org/alice>", '"unterminated'])
 
 
-def test_decode_many_any_order_with_repeats(dictionary):
-    _, term_dict = dictionary
+def test_decode_many_any_order_with_repeats(dictionary_store):
+    term_dict = dictionary_store.term_dict()
     terms = _terms(term_dict)
     n = len(terms)
     codes = [n - 1, 0, 3, 3, n, 1, n + 5, 0]
@@ -71,28 +58,24 @@ def test_decode_many_any_order_with_repeats(dictionary):
     assert term_dict.decode_many([]) == []
 
 
-@pytest.fixture(params=["resident", "file-backed"])
+@pytest.fixture(params=["file", "in-memory"])
 def wide_dictionary(request, tmp_path_factory):
     """A dictionary of 602 terms (300 subjects, one predicate, 300 literals
-    and the default graph), resident or file-backed, as `(term_dict,
+    and the default graph), file-backed or in memory, as `(term_dict,
     spellings)`: the sorted N-Triples spellings, so a term's code is its
     index."""
-    root = tmp_path_factory.mktemp("wide")
-    source = root / "wide.nt"
-    source.write_text(
-        "".join(
-            f'<http://ex.org/s{i:03}> <http://ex.org/p> "v{i:03}" .\n' for i in range(300)
-        ),
-        encoding="utf-8",
+    out = serialized(
+        tmp_path_factory.mktemp("wide"),
+        "wide",
+        (f'<http://ex.org/s{i:03}> <http://ex.org/p> "v{i:03}" .' for i in range(300)),
+        layout="dictionary",
     )
-    out = root / "wide.vortex"
-    serialize_rdf(source, out, layout="dictionary")
     spellings = {"", "<http://ex.org/p>"}
     spellings |= {f"<http://ex.org/s{i:03}>" for i in range(300)}
     spellings |= {f'"v{i:03}"' for i in range(300)}
-    store = VortexRdfStore(out, in_memory=request.param == "resident")
+    store = VortexRdfStore(out, in_memory=request.param == "in-memory")
     term_dict = store.term_dict()
-    assert term_dict.file_backed == (request.param == "file-backed")
+    assert term_dict.file_backed == (request.param == "file")
     return term_dict, sorted(spellings, key=lambda t: t.encode())
 
 
@@ -117,7 +100,7 @@ def test_decode_many_colliding_repeats_unsorted_and_out_of_range(wide_dictionary
 
 
 # The bucket count of the batch's sharing cache (`RECENT_BUCKETS` in
-# `src/codes.rs`): codes this far apart evict one another.
+# `src/dict.rs`): codes this far apart evict one another.
 RECENT_BUCKETS = 256
 
 
@@ -160,11 +143,11 @@ def test_decode_many_of_a_batch_longer_than_the_text_reservation(wide_dictionary
     assert term_dict.decode_many(beyond) == [None] * len(beyond)
 
 
-def test_prefix_range_and_lower_bound(dictionary):
+def test_prefix_range_and_lower_bound(dictionary_store):
     """One call of each probe per residency: a present term, a probe past
     every term and the empty prefix. The byte-order sweep against brute
     force runs in core, on the same handle (`core/src/tests/dictionary_handle.rs`)."""
-    _, term_dict = dictionary
+    term_dict = dictionary_store.term_dict()
     n = len(term_dict)
     alice = term_dict.encode("<http://ex.org/alice>")
     assert term_dict.lower_bound("<http://ex.org/alice>") == alice
@@ -173,11 +156,11 @@ def test_prefix_range_and_lower_bound(dictionary):
     assert term_dict.prefix_range("") == (0, n)
 
 
-def test_filter_codes_validates_its_arguments(dictionary):
+def test_filter_codes_validates_its_arguments(dictionary_store):
     """An unknown kind, a malformed argument or an option the kind does not
     take raises `ValueError`. Candidates must be sorted, unique and inside the
     dictionary, however they are passed; none at all is two empty columns."""
-    _, term_dict = dictionary
+    term_dict = dictionary_store.term_dict()
     n = len(term_dict)
     every = U64Column(range(n))
     for kind, arg, options in [
@@ -224,7 +207,7 @@ def test_filter_codes_validates_its_arguments(dictionary):
 
 
 @pytest.mark.parametrize("api", ["decode", "decode_many"])
-def test_match_codes_decode_to_get_quads(dictionary, api):
+def test_match_codes_decode_to_get_quads(dictionary_store, api):
     """Decoding the code columns position by position reproduces `get_quads`,
     under either residency and through either decode call.
 
@@ -232,7 +215,8 @@ def test_match_codes_decode_to_get_quads(dictionary, api):
     decode-and-zip assembly: columns swapped or misaligned would still yield
     plausible-looking rows of real terms.
     """
-    store, term_dict = dictionary
+    store = dictionary_store
+    term_dict = store.term_dict()
     assert repr(term_dict) == f"TermDict(len={len(term_dict)}, file_backed={term_dict.file_backed})"
     for pattern in PATTERNS:
         cols = store.match_codes(**pattern)
@@ -247,16 +231,8 @@ def test_match_codes_decode_to_get_quads(dictionary, api):
 # ─── keeps, windows, batches ──────────────────────────────────────────────
 
 
-@pytest.fixture(params=["file", "in-memory"])
-def code_store(request, vortex_files):
-    """The fixture's dictionary-layout store under each open mode."""
-    store = VortexRdfStore(vortex_files["dictionary"], in_memory=request.param == "in-memory")
-    assert store.term_dict().file_backed == (request.param == "file")
-    return store
-
-
-def test_keep_narrows_like_filtering(code_store):
-    store = code_store
+def test_keep_narrows_like_filtering(dictionary_store):
+    store = dictionary_store
     term_dict = store.term_dict()
     all_rows = u64_rows(store.match_codes())
     name = term_dict.encode(NAME)
@@ -297,8 +273,8 @@ def test_keep_narrows_like_filtering(code_store):
     )
 
 
-def test_keep_rejects_bad_specs(code_store):
-    store = code_store
+def test_keep_rejects_bad_specs(dictionary_store):
+    store = dictionary_store
     for keep in [
         "p",
         {"x": [1]},
@@ -333,8 +309,8 @@ def test_keep_needs_codes(vortex_files):
     assert strings.count_quads(limit=100) == 5
 
 
-def test_window_slices_base_order(code_store):
-    store = code_store
+def test_window_slices_base_order(dictionary_store):
+    store = dictionary_store
     rows = u64_rows(store.match_codes())
     n = len(rows)
     for offset, limit in [(0, 2), (1, 3), (3, 10), (n, 1), (0, 0), (2, None)]:
@@ -349,8 +325,8 @@ def test_window_slices_base_order(code_store):
     assert store.count_quads(s="<http://ex.org/nobody>", limit=1) == 0
 
 
-def test_many_matches_singles(code_store, vortex_files):
-    store = code_store
+def test_many_matches_singles(dictionary_store, vortex_files):
+    store = dictionary_store
     term_dict = store.term_dict()
     lit_lo, lit_hi = term_dict.prefix_range('"')
     probes = [
@@ -366,12 +342,8 @@ def test_many_matches_singles(code_store, vortex_files):
     counts = store.count_quads_many(probes)
     assert len(many) == len(counts) == len(probes)
     for probe, cols, count in zip(probes, many, counts):
-        if isinstance(probe, dict):
-            single = store.match_codes(**probe)
-            single_count = store.count_quads(**probe)
-        else:
-            single = store.match_codes(*probe)
-            single_count = store.count_quads(*probe)
+        single = one_shot(store.match_codes, probe)
+        single_count = one_shot(store.count_quads, probe)
         assert u64_rows(cols) == u64_rows(single), probe
         assert count == single_count == len(u64_rows(cols)), probe
     assert list(store.match_codes_many([])) == []
@@ -394,8 +366,6 @@ def test_many_matches_singles(code_store, vortex_files):
 
 
 def test_column_kernels():
-    from vortex_rdf import U64Column
-
     col = U64Column([3, 1, 3, 2, 1, 3])
     assert len(col) == 6 and u64s(col) == [3, 1, 3, 2, 1, 3]
     assert u64s(U64Column(col)) == u64s(col)
@@ -460,35 +430,20 @@ def test_join_count_counts_the_pairs_join_indices_makes():
 
 
 def test_join_indices_refuses_more_pairs_than_max_pairs():
-    from vortex_rdf import JoinTooLarge, VortexRdfError
-
     col = U64Column([3, 1, 3, 2, 1, 3])
     right = [1, 9, 3, 3]
     pairs = col.join_count(right)
     with pytest.raises(JoinTooLarge) as refused:
         col.join_indices(right, max_pairs=pairs - 1)
     message, count = refused.value.args
-    assert count == pairs and str(pairs) in message
+    assert count == refused.value.pairs == pairs and str(pairs) in message
     assert f"max_pairs of {pairs - 1}" in message, "the message names the cap"
     assert isinstance(refused.value, VortexRdfError)
     capped = col.join_indices(right, max_pairs=pairs)
     assert [u64s(c) for c in capped] == [u64s(c) for c in col.join_indices(right)]
 
 
-def test_join_too_large_names_its_pair_count():
-    from vortex_rdf import JoinTooLarge
-
-    col = U64Column([3, 1, 3, 2, 1, 3])
-    right = [1, 9, 3, 3]
-    pairs = col.join_count(right)
-    with pytest.raises(JoinTooLarge) as refused:
-        col.join_indices(right, max_pairs=pairs - 1)
-    assert refused.value.pairs == refused.value.args[1] == pairs
-
-
 def test_groups_gather_is_the_join_indices_taken():
-    from vortex_rdf import JoinTooLarge
-
     left = U64Column([3, 1, 3, 2, 1, 3])
     right = U64Column([1, 9, 3, 3])
     left_values = U64Column([10, 11, 12, 13, 14, 15])
@@ -511,8 +466,6 @@ def test_groups_gather_is_the_join_indices_taken():
 
 
 def test_groups_join_slice_by_slice_like_join_indices():
-    from vortex_rdf import JoinTooLarge
-
     left = U64Column([3, 1, 3, 2, 1, 3])
     right = U64Column([1, 9, 3, 3])
     groups = right.groups()
@@ -532,12 +485,10 @@ def test_groups_join_slice_by_slice_like_join_indices():
     assert refused.value.args[1] == 8
 
 
-def test_kernels_round_trip_store_columns(code_store):
+def test_kernels_round_trip_store_columns(dictionary_store):
     """Distinct subjects and a self-join over the fixture's codes decode to
     the expected terms."""
-    from vortex_rdf import U64Column
-
-    store = code_store
+    store = dictionary_store
     term_dict = store.term_dict()
     s, p, o, g = store.match_codes()
     subjects = term_dict.decode_many(s.distinct())
@@ -557,16 +508,22 @@ def test_kernels_round_trip_store_columns(code_store):
     assert isinstance(left_idx, U64Column)
 
 
-def test_filter_codes_regex(dictionary):
-    _, term_dict = dictionary
+def _regex_over_every_code(term_dict):
+    """`run(pattern, **options)`, `filter_codes("regex", ...)` over every code
+    of `term_dict` answering `(passed, undecided)` as code lists, and the code
+    of each of its terms."""
     terms = _terms(term_dict)
     every = U64Column(range(len(terms)))
-    code = {t: c for c, t in enumerate(terms)}
 
     def run(arg, **options):
         passed, undecided = term_dict.filter_codes("regex", arg, every, **options)
         return u64s(passed), u64s(undecided)
 
+    return run, {t: c for c, t in enumerate(terms)}
+
+
+def test_filter_codes_regex(dictionary_store):
+    run, code = _regex_over_every_code(dictionary_store.term_dict())
     alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
     assert run("^A") == ([alice, anon], [0])
     assert run("B", flags="i") == ([bob], [0])
@@ -578,22 +535,15 @@ def test_filter_codes_regex(dictionary):
     assert run("(?=A)") == ([], [0, alice, anon, bob])
 
 
-def test_filter_codes_regex_options(dictionary):
+def test_filter_codes_regex_options(dictionary_store):
     """`case` and `as_str` apply to `regex` like to every string kind, in the
     order `REGEX(LCASE(STR(?x)), pattern)`; `flags` are rdflib's: `i`, `s` and
     `m` apply and any other letter is ignored."""
-    _, term_dict = dictionary
-    terms = _terms(term_dict)
-    every = U64Column(range(len(terms)))
-    code = {t: c for c, t in enumerate(terms)}
-
-    def run(arg, **options):
-        passed, undecided = term_dict.filter_codes("regex", arg, every, **options)
-        return u64s(passed), u64s(undecided)
-
+    term_dict = dictionary_store.term_dict()
+    run, code = _regex_over_every_code(term_dict)
     alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
     forty_two, blank = code[f'"42"^^<{XSD}integer>'], code["_:b0"]
-    iris = sorted(code[t] for t in terms if t.startswith("<"))
+    iris = sorted(c for t, c in code.items() if t.startswith("<"))
     ex = sorted(code[t] for t in ("<http://ex.org/age>", "<http://ex.org/alice>", "<http://ex.org/bob>"))
     # STR() first, then the case wrapper: an IRI's string is lower-cased as a
     # whole, and under STR() a blank node or a normalized literal is undecided.
@@ -612,19 +562,20 @@ def test_filter_codes_regex_options(dictionary):
     assert run("^a..n$", flags="i")[0] == [anon]
     # A pattern outside the subset is undecided on the texts whatever the
     # options, and the rules for non-texts do not change.
-    assert run("(?=a)", as_str=True) == ([], list(range(len(terms))))
+    assert run("(?=a)", as_str=True) == ([], list(range(len(code))))
     assert run("(?=a)", case="lower") == ([], [0, alice, anon, bob])
     # An option that applies to no kind but the string kinds is refused as before.
+    every = U64Column(range(len(code)))
     with pytest.raises(ValueError):
         term_dict.filter_codes("lang", "en", every, case="lower")
     with pytest.raises(ValueError):
         term_dict.filter_codes("contains", '"a"', every, flags="i")
 
 
-def test_filter_codes_rejects_malformed_constants(dictionary):
+def test_filter_codes_rejects_malformed_constants(dictionary_store):
     """A string constant is a strict N-Triples spelling: a malformed one raises
     instead of failing every candidate silently."""
-    _, term_dict = dictionary
+    term_dict = dictionary_store.term_dict()
     every = U64Column(range(len(term_dict)))
     malformed = [
         '"a"^^xsd:string',  # a prefixed name
@@ -726,20 +677,17 @@ def _nt_literal(text):
 @pytest.fixture(scope="module")
 def regex_corpus(tmp_path_factory):
     assert len(set(REGEX_TEXTS)) == len(REGEX_TEXTS)
-    directory = tmp_path_factory.mktemp("regex")
-    nt = directory / "corpus.nt"
-    nt.write_text(
-        "".join(f"<http://ex.org/s{i}> <http://ex.org/p> {_nt_literal(t)} .\n" for i, t in enumerate(REGEX_TEXTS)),
-        encoding="utf-8",
+    return serialized(
+        tmp_path_factory.mktemp("regex"),
+        "corpus",
+        (f"<http://ex.org/s{i}> <http://ex.org/p> {_nt_literal(t)} ." for i, t in enumerate(REGEX_TEXTS)),
+        layout="dictionary",
     )
-    out = directory / "corpus.vortex"
-    serialize_rdf(nt, out, layout="dictionary")
-    return out
 
 
-@pytest.fixture(params=["resident", "file-backed"])
+@pytest.fixture(params=["file", "in-memory"])
 def regex_dictionary(request, regex_corpus):
-    store = VortexRdfStore(regex_corpus, in_memory=request.param == "resident")
+    store = VortexRdfStore(regex_corpus, in_memory=request.param == "in-memory")
     term_dict = store.term_dict()
     assert term_dict is not None
     return store, term_dict

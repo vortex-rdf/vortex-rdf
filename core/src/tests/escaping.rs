@@ -12,19 +12,17 @@ use std::collections::HashMap;
 /// Shared with `common::terms`' inline parser tests, so the parse family and
 /// the store round-trips are exercised over one case list.
 pub(crate) fn escaped_literal_cases() -> Vec<Term> {
-    let dt = NamedNode::new("http://example.org/dt").unwrap();
+    let dt = iri("dt");
     vec![
-        Term::Literal(Literal::new_simple_literal("with \"quotes\" inside")),
-        Term::Literal(Literal::new_simple_literal("back\\slash")),
-        Term::Literal(Literal::new_simple_literal("trailing backslash \\")),
-        Term::Literal(Literal::new_simple_literal("line\nbreak")),
-        Term::Literal(Literal::new_simple_literal("carriage\rreturn")),
-        Term::Literal(Literal::new_simple_literal("tab\there")),
-        Term::Literal(Literal::new_simple_literal(
-            "caret^^<http://example.org/nope> inside",
-        )),
-        Term::Literal(Literal::new_simple_literal("say \"hi\"@home")),
-        Term::Literal(Literal::new_simple_literal("emoji \u{1F600} tail")),
+        plain_literal("with \"quotes\" inside"),
+        plain_literal("back\\slash"),
+        plain_literal("trailing backslash \\"),
+        plain_literal("line\nbreak"),
+        plain_literal("carriage\rreturn"),
+        plain_literal("tab\there"),
+        plain_literal("caret^^<http://example.org/nope> inside"),
+        plain_literal("say \"hi\"@home"),
+        plain_literal("emoji \u{1F600} tail"),
         Term::Literal(Literal::new_language_tagged_literal("q\"x", "en").unwrap()),
         Term::Literal(Literal::new_language_tagged_literal("say \"hi\"@home", "en").unwrap()),
         Term::Literal(Literal::new_language_tagged_literal("back\\slash", "en-GB").unwrap()),
@@ -37,14 +35,7 @@ fn escaped_literal_quads() -> Vec<Quad> {
     escaped_literal_cases()
         .into_iter()
         .enumerate()
-        .map(|(i, o)| {
-            Quad::new(
-                subject_node(i, 2),
-                NamedNode::new("http://example.org/p").unwrap(),
-                o,
-                GraphName::DefaultGraph,
-            )
-        })
+        .map(|(i, o)| Quad::new(subject_node(i, 2), iri("p"), o, GraphName::DefaultGraph))
         .collect()
 }
 
@@ -66,10 +57,7 @@ async fn run_escaped_literal_roundtrip(layout: LayoutStrategy, indexes: Vec<Inde
             .unwrap_or_else(|| panic!("{:?}: missing row for {}", layout, q.subject));
         assert_eq!(object, q.object, "{:?}: object not round-tripped", layout);
 
-        let matched = store
-            .match_pattern(None, None, Some(&q.object), None)
-            .await
-            .unwrap();
+        let matched = matched_view(&store, None, None, Some(&q.object), None).await;
         assert_eq!(
             matched.size().await.unwrap(),
             1,
@@ -108,7 +96,7 @@ async fn escaped_literals_roundtrip_with_secondary_indexes() {
         for indexes in [
             vec![IndexType::SecondaryByReference],
             vec![IndexType::SecondaryByCopy],
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            ALL_INDEX_TYPES.to_vec(),
         ] {
             run_escaped_literal_roundtrip(layout, indexes).await;
         }

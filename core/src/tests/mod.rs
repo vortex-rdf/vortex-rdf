@@ -4,6 +4,7 @@
 use super::*;
 use crate::io::quads_stream_to_vortex_writer;
 use crate::store::VortexArrayBuilder;
+use crate::store::indexes::ALL_INDEX_TYPES;
 use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::OnceLock;
@@ -24,11 +25,13 @@ mod indexes;
 mod indexes_file;
 mod leaf_geometry;
 mod mapping;
+mod masks_first;
 mod matching;
 mod metadata;
 mod mutation;
 mod names;
 mod narrowing;
+mod open_errors;
 mod predicates;
 mod roundtrip;
 mod row_limit;
@@ -44,21 +47,86 @@ const LAYOUTS: [LayoutStrategy; 3] = [
     LayoutStrategy::Dictionary,
 ];
 
+/// A store's index configuration in the suites' fixture matrix: no index,
+/// or one family alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexConfig {
+    NoIndex,
+    Copy,
+    Reference,
+}
+
+impl IndexConfig {
+    /// Every configuration, in the order the suites check them.
+    const ALL: [IndexConfig; 3] = [
+        IndexConfig::NoIndex,
+        IndexConfig::Copy,
+        IndexConfig::Reference,
+    ];
+
+    /// The index set a store of this configuration is built with.
+    fn types(self) -> Indexes {
+        match self {
+            IndexConfig::NoIndex => vec![],
+            IndexConfig::Copy => vec![IndexType::SecondaryByCopy],
+            IndexConfig::Reference => vec![IndexType::SecondaryByReference],
+        }
+    }
+
+    /// The configuration as a fixture's tag names it.
+    fn name(self) -> &'static str {
+        match self {
+            IndexConfig::NoIndex => "no-index",
+            IndexConfig::Copy => "copy",
+            IndexConfig::Reference => "reference",
+        }
+    }
+}
+
 /// Every index set worth building: none, each family alone, both.
 fn index_sets() -> Vec<Indexes> {
-    vec![
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-    ]
+    IndexConfig::ALL
+        .into_iter()
+        .map(IndexConfig::types)
+        .chain([ALL_INDEX_TYPES.to_vec()])
+        .collect()
+}
+
+/// The IRI `<http://example.org/{name}>`: the namespace of the suites'
+/// terms.
+fn iri(name: &str) -> NamedNode {
+    NamedNode::new(format!("http://example.org/{name}")).unwrap()
+}
+
+/// [`iri`] as a subject.
+fn iri_subject(name: &str) -> NamedOrBlankNode {
+    NamedOrBlankNode::NamedNode(iri(name))
+}
+
+/// [`iri`] as a named graph.
+fn iri_graph(name: &str) -> GraphName {
+    GraphName::NamedNode(iri(name))
+}
+
+/// Graph `k` of a dataset that numbers its graphs: the default graph for 0,
+/// `g{k}` for any other `k`.
+fn numbered_graph(k: usize) -> GraphName {
+    match k {
+        0 => GraphName::DefaultGraph,
+        k => iri_graph(&format!("g{k}")),
+    }
+}
+
+/// The plain literal `"{value}"`, as an object.
+fn plain_literal(value: &str) -> Term {
+    Term::Literal(Literal::new_simple_literal(value))
 }
 
 fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
     Quad::new(
         NamedOrBlankNode::NamedNode(NamedNode::new(s).unwrap()),
         NamedNode::new(p).unwrap(),
-        Term::Literal(Literal::new_simple_literal(o_lit)),
+        plain_literal(o_lit),
         g,
     )
 }
@@ -68,7 +136,7 @@ fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
 /// zero-padded to two digits (lexicographic order is numeric order below
 /// 100); predicates and objects recur on their moduli, so match
 /// selectivities are arithmetic.
-fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
+pub(crate) fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
     (0..n)
         .map(|i| {
             make_quad(
@@ -84,7 +152,7 @@ fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
 /// Serialize `quads` with `quads_stream_to_vortex_file` into `store.vortex`
 /// inside a fresh temp dir, handing back the dir guard beside the path. Keep
 /// the `TempDir` alive for the store's lifetime.
-async fn write_store_file(
+pub(crate) async fn write_store_file(
     quads: Vec<Quad>,
     layout: LayoutStrategy,
     indexes: Indexes,
@@ -95,23 +163,6 @@ async fn write_store_file(
         .await
         .unwrap();
     (dir, path)
-}
-
-/// [`modular_quads`] at the stock moduli (three predicates, four objects),
-/// for the unit tests that sit beside the code they cover, outside this
-/// module's tree.
-pub(crate) fn modular_quads_for_tests(n: usize) -> Vec<Quad> {
-    modular_quads(n, 3, 4)
-}
-
-/// [`write_store_file`] in the Dictionary layout, for the unit tests that sit
-/// beside the code they cover, outside this module's tree. Keep the `TempDir`
-/// alive for the store's lifetime.
-pub(crate) async fn write_store_file_for_tests(
-    quads: Vec<Quad>,
-    indexes: Indexes,
-) -> (tempfile::TempDir, std::path::PathBuf) {
-    write_store_file(quads, LayoutStrategy::Dictionary, indexes).await
 }
 
 /// A Dictionary-layout store file holding `quads` out of subject order —
@@ -130,12 +181,10 @@ async fn write_unsorted_store_file(
     let (dict, code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
     let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
     let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
-    let parts = crate::store::StoreParts {
-        built: crate::store::BuiltArray {
-            array: primary,
-            components: Vec::new(),
-            dict: Some(std::sync::Arc::new(dict)),
-        },
+    let parts = crate::store::BuiltArray {
+        array: primary,
+        components: Vec::new(),
+        dict: Some(std::sync::Arc::new(dict)),
     };
     let mut bytes: Vec<u8> = Vec::new();
     crate::io::write::built_stream_to_vortex_writer(parts.into_stream().unwrap(), &mut bytes)
@@ -352,185 +401,6 @@ async fn multi_window_dictionary_file() -> (tempfile::TempDir, std::path::PathBu
     .await
 }
 
-/// The rows of one leaf, and so of one split, of [`masks_file`].
-const MASKS_SPLIT_ROWS: usize = 1_024;
-/// The splits of [`masks_file`].
-const MASKS_SPLITS: usize = 16;
-/// The split of [`masks_quads`] that holds none of its patterns' matches.
-const MASKS_EMPTY_SPLIT: usize = 3;
-
-/// [`MASKS_SPLITS`] × [`MASKS_SPLIT_ROWS`] quads with subjects `s{i:05}`, so in
-/// row order, whose patterns match at three densities in every split but
-/// [`MASKS_EMPTY_SPLIT`]: the object `"sparse"` on every 512th row, the
-/// predicate `pm` on every 32nd and the graph `gd` on every other one. Any
-/// other row has the predicate `p{i % 3}`, the object `"o{i % 7}"` and the
-/// default graph.
-fn masks_quads() -> Vec<Quad> {
-    let gd = GraphName::NamedNode(NamedNode::new("http://example.org/gd").unwrap());
-    (0..MASKS_SPLITS * MASKS_SPLIT_ROWS)
-        .map(|i| {
-            let matched = i / MASKS_SPLIT_ROWS != MASKS_EMPTY_SPLIT;
-            let p = if matched && i % 32 == 0 {
-                "http://example.org/pm".to_string()
-            } else {
-                format!("http://example.org/p{}", i % 3)
-            };
-            let o = if matched && i % 512 == 7 {
-                "sparse".to_string()
-            } else {
-                format!("o{}", i % 7)
-            };
-            let g = if matched && i % 2 == 1 {
-                gd.clone()
-            } else {
-                GraphName::DefaultGraph
-            };
-            make_quad(&format!("http://example.org/s{i:05}"), &p, &o, g)
-        })
-        .collect()
-}
-
-/// The probes of [`masks_quads`], each beside its tag and the read its masks
-/// choose: the object (two rows a split) and the predicate with `"o0"` (about
-/// five a split) point by point, the predicate (32 a split) by a take, and
-/// the graph (half the rows) by projecting each split at its mask.
-fn masks_probes() -> Vec<(
-    &'static str,
-    Probe,
-    crate::store::scan::file_reads::MaskedRead,
-)> {
-    use crate::store::scan::file_reads::MaskedRead;
-    let pm = NamedNode::new("http://example.org/pm").unwrap();
-    let literal = |value: &str| Term::Literal(Literal::new_simple_literal(value));
-    let gd = GraphName::NamedNode(NamedNode::new("http://example.org/gd").unwrap());
-    vec![
-        (
-            "O",
-            Probe::new(None, None, Some(literal("sparse")), None),
-            MaskedRead::Points,
-        ),
-        (
-            "PO",
-            Probe::new(None, Some(pm.clone()), Some(literal("o0")), None),
-            MaskedRead::Points,
-        ),
-        (
-            "P",
-            Probe::new(None, Some(pm), None, None),
-            MaskedRead::Take,
-        ),
-        (
-            "G",
-            Probe::new(None, None, None, Some(gd)),
-            MaskedRead::Project,
-        ),
-    ]
-}
-
-/// [`masks_quads`] as a Dictionary-layout file of [`MASKS_SPLIT_ROWS`]-row
-/// leaves ([`write_chunked_store_file`]), so of [`MASKS_SPLITS`] splits, with
-/// no index, in a fresh temp dir. Serialized once per process (see
-/// [`cached_store_bytes`]). Keep the `TempDir` alive for the file's lifetime.
-async fn masks_file() -> (tempfile::TempDir, std::path::PathBuf) {
-    masks_file_with(false).await
-}
-
-/// [`masks_file`] with its dictionary child written as one flat struct leaf,
-/// which a mapped open holds resident (see [`write_chunked_store`]).
-async fn masks_file_resident_dictionary() -> (tempfile::TempDir, std::path::PathBuf) {
-    masks_file_with(true).await
-}
-
-async fn masks_file_with(flat_dictionary: bool) -> (tempfile::TempDir, std::path::PathBuf) {
-    static BYTES: [OnceLock<Vec<u8>>; 2] = [const { OnceLock::new() }; 2];
-    let bytes = cached_store_bytes(&BYTES[usize::from(flat_dictionary)], || async move {
-        let (_dir, path) = write_chunked_store(
-            &masks_quads(),
-            MASKS_SPLIT_ROWS,
-            false,
-            flat_dictionary,
-            None,
-        )
-        .await;
-        std::fs::read(&path).unwrap()
-    })
-    .await;
-    temp_store_file(bytes)
-}
-
-/// Twelve quads to append into a tail, each with the predicate `pm` and the
-/// graph `gd`, and the object `"sparse"` and `"o0"` by turns: of the
-/// [`masks_probes`] patterns, `P` and `G` match all twelve, `O` and `PO` half.
-fn masks_tail() -> Vec<Quad> {
-    let gd = GraphName::NamedNode(NamedNode::new("http://example.org/gd").unwrap());
-    (0..12)
-        .map(|k| {
-            let o = if k % 2 == 0 { "sparse" } else { "o0" };
-            make_quad(
-                &format!("http://example.org/tail{k:02}"),
-                "http://example.org/pm",
-                o,
-                gd.clone(),
-            )
-        })
-        .collect()
-}
-
-/// `store` with some of every [`masks_probes`] pattern's rows deleted, each
-/// pattern keeping its read: the predicate's rows whose object is `"o3"`, the
-/// graph's whose object is `"o5"`, the object's whose predicate is `p1`, and
-/// three of the rows of `pm` with `"o0"`.
-async fn masks_deleted(store: &VortexRdfStore) -> VortexRdfStore {
-    let iri = |name: &str| NamedNode::new(format!("http://example.org/{name}")).unwrap();
-    let literal = |value: &str| Term::Literal(Literal::new_simple_literal(value));
-    let gd = GraphName::NamedNode(iri("gd"));
-    let mut store = store
-        .delete_matching(None, Some(&iri("pm")), Some(&literal("o3")), None)
-        .await
-        .unwrap()
-        .delete_matching(None, None, Some(&literal("o5")), Some(&gd))
-        .await
-        .unwrap()
-        .delete_matching(None, Some(&iri("p1")), Some(&literal("sparse")), None)
-        .await
-        .unwrap();
-    let po = masks_quads()
-        .into_iter()
-        .filter(|q| q.predicate == iri("pm") && q.object == literal("o0"));
-    for quad in po.take(3) {
-        store = store.delete_quad(&quad).await.unwrap();
-    }
-    store
-}
-
-/// The rows of one leaf, and so of one split, of [`many_splits_file`].
-const MANY_SPLIT_ROWS: usize = 32;
-/// The splits of [`many_splits_file`]: more than a spawned scan keeps in
-/// flight, four per unit of available parallelism, on most hosts.
-const MANY_SPLITS: usize = 256;
-
-/// [`MANY_SPLITS`] × [`MANY_SPLIT_ROWS`] quads `s{i:05} p{i % 3} "o{i % 4}"` in
-/// the default graph as a Dictionary-layout file of [`MANY_SPLIT_ROWS`]-row
-/// leaves with no index, in a fresh temp dir: `p0`'s matches spread over every
-/// split, ten or eleven a split. Serialized once per process (see
-/// [`cached_store_bytes`]). Keep the `TempDir` alive for the file's lifetime.
-async fn many_splits_file() -> (tempfile::TempDir, std::path::PathBuf) {
-    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = cached_store_bytes(&BYTES, || async {
-        let quads = graph_modular_quads(
-            MANY_SPLITS * MANY_SPLIT_ROWS,
-            5,
-            3,
-            4,
-            &[GraphName::DefaultGraph],
-        );
-        let (_dir, path) = write_chunked_store_file(&quads, MANY_SPLIT_ROWS).await;
-        std::fs::read(&path).unwrap()
-    })
-    .await;
-    temp_store_file(bytes)
-}
-
 fn quad_stream(
     quads: Vec<Quad>,
 ) -> impl futures::Stream<Item = crate::error::Result<crate::store::RawQuad>> + Unpin + Send + 'static
@@ -566,9 +436,33 @@ async fn built_store(quads: Vec<Quad>, layout: LayoutStrategy, indexes: Indexes)
     VortexRdfStore::from_built(built).unwrap()
 }
 
-/// The number of quads `store` holds for the pattern `(s, p, o, g)`: a
-/// [`match_pattern`](VortexRdfStore::match_pattern) and its
-/// [`size`](VortexRdfStore::size), both unwrapped.
+/// The store [`VortexRdfStore::from_quads`] builds from `quads`, unwrapped:
+/// [`built_store`]'s counterpart through the crate's own entry point, which
+/// sorts through [`SortedStreamBuilder`] wherever a filesystem exists.
+async fn streamed_store(
+    quads: Vec<Quad>,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+) -> VortexRdfStore {
+    VortexRdfStore::from_quads(quad_stream(quads), layout, indexes)
+        .await
+        .unwrap()
+}
+
+/// The view of `store` the pattern `(s, p, o, g)` matches: a
+/// [`match_pattern`](VortexRdfStore::match_pattern), unwrapped.
+async fn matched_view(
+    store: &VortexRdfStore,
+    s: Option<&NamedOrBlankNode>,
+    p: Option<&NamedNode>,
+    o: Option<&Term>,
+    g: Option<&GraphName>,
+) -> VortexRdfStore {
+    store.match_pattern(s, p, o, g).await.unwrap()
+}
+
+/// The number of quads `store` holds for the pattern `(s, p, o, g)`: the
+/// [`matched_view`]'s [`size`](VortexRdfStore::size), unwrapped.
 async fn matched_size(
     store: &VortexRdfStore,
     s: Option<&NamedOrBlankNode>,
@@ -576,13 +470,20 @@ async fn matched_size(
     o: Option<&Term>,
     g: Option<&GraphName>,
 ) -> usize {
+    matched_view(store, s, p, o, g).await.size().await.unwrap()
+}
+
+/// `store` with each quad of `doomed` deleted, in turn: a
+/// [`delete_quad`](VortexRdfStore::delete_quad) each, unwrapped.
+async fn delete_all<'a>(
+    store: &VortexRdfStore,
+    doomed: impl IntoIterator<Item = &'a Quad>,
+) -> VortexRdfStore {
+    let mut store = store.clone();
+    for quad in doomed {
+        store = store.delete_quad(quad).await.unwrap();
+    }
     store
-        .match_pattern(s, p, o, g)
-        .await
-        .unwrap()
-        .size()
-        .await
-        .unwrap()
 }
 
 /// The index child that answers `view`'s reads from its own columns, if any:
@@ -645,7 +546,7 @@ fn reference_pairs(
         let col: VarBinViewArray = field_as(rows, "val", &mut ctx).unwrap();
         let reader = StrColReader::new(&col);
         (0..col.len())
-            .map(|i| Val::Term(reader.str_at(i).unwrap().to_owned()))
+            .map(|i| Val::Term(reader.str_at(i).to_owned()))
             .collect()
     } else {
         let col: PrimitiveArray = field_as(rows, "val", &mut ctx).unwrap();
@@ -683,7 +584,7 @@ fn dictionary_test_quads() -> Vec<Quad> {
             let g = if i % 2 == 0 {
                 GraphName::DefaultGraph
             } else {
-                GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap())
+                iri_graph("g")
             };
             make_quad(
                 &format!("http://example.org/s{:02}", i),
@@ -741,6 +642,75 @@ async fn unstamped_store_bytes(
     bytes
 }
 
+/// The write of a component holding `chunks` under `descriptor`, laid out
+/// by `strategy`.
+fn component_write(
+    descriptor: crate::io::container::StoreComponentDescriptor,
+    chunks: Vec<vortex_array::ArrayRef>,
+    strategy: std::sync::Arc<dyn vortex_layout::LayoutStrategy>,
+) -> crate::io::container::NativeComponentWrite {
+    use crate::io::container::{BufferedComponentSource, NativeComponentWrite};
+    NativeComponentWrite::new(
+        descriptor,
+        std::sync::Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
+        strategy,
+    )
+    .unwrap()
+}
+
+/// The [`component_write`] of an index child named `name` under the
+/// implementation slug `slug`, holding `chunks`: at version 1, optional
+/// unless `required`, its sort claimed global when `sorted`, of the first
+/// chunk's dtype and laid out by the default child strategy.
+fn index_child_write(
+    name: &str,
+    slug: &str,
+    required: bool,
+    sorted: bool,
+    chunks: Vec<vortex_array::ArrayRef>,
+) -> crate::io::container::NativeComponentWrite {
+    use crate::io::container::{self, StoreComponentDescriptor, StoreComponentRole};
+    let dtype = chunks[0].dtype().clone();
+    component_write(
+        StoreComponentDescriptor {
+            name: name.into(),
+            role: StoreComponentRole::Index,
+            implementation: slug.into(),
+            version: 1,
+            required,
+            sorted,
+            dtype,
+        },
+        chunks,
+        container::default_child_strategy(),
+    )
+}
+
+/// The [`component_write`] of `dict`'s child chunks as the dictionary
+/// component, its descriptor at `version`, laid out by `strategy`.
+fn dict_child_write(
+    dict: &crate::store::layouts::dictionary::TermDictionary,
+    version: u32,
+    strategy: std::sync::Arc<dyn vortex_layout::LayoutStrategy>,
+) -> crate::io::container::NativeComponentWrite {
+    use crate::io::container::{self, StoreComponentDescriptor, StoreComponentRole};
+    let chunks = dict.child_chunks().unwrap();
+    let dtype = chunks[0].dtype().clone();
+    component_write(
+        StoreComponentDescriptor {
+            name: container::DICT_COMPONENT_NAME.into(),
+            role: StoreComponentRole::Dictionary,
+            implementation: container::DICT_IMPLEMENTATION.into(),
+            version,
+            required: true,
+            sorted: true,
+            dtype,
+        },
+        chunks,
+        strategy,
+    )
+}
+
 /// A component of the shape a future change set could write: an optional
 /// (unless `required`) index child named `name` under the implementation slug
 /// `slug`, holding three bare code rows.
@@ -749,22 +719,13 @@ fn unknown_component(
     slug: &str,
     required: bool,
 ) -> crate::io::container::NativeComponentWrite {
-    use crate::io::container;
-    let rows = bare_code_quad_array(&[1, 2, 3]);
-    container::NativeComponentWrite::new(
-        container::StoreComponentDescriptor {
-            name: name.into(),
-            role: container::StoreComponentRole::Index,
-            implementation: slug.into(),
-            version: 1,
-            required,
-            sorted: false,
-            dtype: rows.dtype().clone(),
-        },
-        std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
-        container::default_child_strategy(),
+    index_child_write(
+        name,
+        slug,
+        required,
+        false,
+        vec![bare_code_quad_array(&[1, 2, 3])],
     )
-    .unwrap()
 }
 
 /// A minimal native Dictionary-layout file: a one-row zero-code quad child
@@ -788,26 +749,9 @@ pub(crate) async fn write_dict_only_store_as(
     version: u32,
     zoned: bool,
 ) -> Vec<u8> {
-    use crate::io::container::{
-        self, BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
-        StoreComponentRole,
-    };
-    let chunks = dict.child_chunks().unwrap();
-    let dtype = chunks[0].dtype().clone();
-    let component = NativeComponentWrite::new(
-        StoreComponentDescriptor {
-            name: container::DICT_COMPONENT_NAME.into(),
-            role: StoreComponentRole::Dictionary,
-            implementation: container::DICT_IMPLEMENTATION.into(),
-            version,
-            required: true,
-            sorted: true,
-            dtype,
-        },
-        std::sync::Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
-        container::dict_child_strategy(zoned.then(|| dict.uniform_window()).flatten()),
-    )
-    .unwrap();
+    let strategy =
+        crate::io::container::dict_child_strategy(zoned.then(|| dict.uniform_window()).flatten());
+    let component = dict_child_write(dict, version, strategy);
     unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![component]).await
 }
 
@@ -854,7 +798,7 @@ pub(crate) fn open_native_bytes(
 pub(crate) async fn open_mapped(
     path: &std::path::Path,
 ) -> crate::store::persist::native_file::NativeStoreFile {
-    use crate::io::read::{FileAccess, open_vortex_file};
+    use crate::io::file::{FileAccess, open_vortex_file};
     crate::store::persist::native_file::NativeStoreFile::try_new(
         open_vortex_file(path, FileAccess::Mapped).await.unwrap(),
     )
@@ -871,7 +815,8 @@ pub(crate) async fn mapped_file(
     tempfile::TempDir,
     crate::store::persist::native_file::NativeStoreFile,
 ) {
-    let (dir, path) = write_store_file_for_tests(modular_quads_for_tests(n), indexes).await;
+    let (dir, path) =
+        write_store_file(modular_quads(n, 3, 4), LayoutStrategy::Dictionary, indexes).await;
     (dir, open_mapped(&path).await)
 }
 
@@ -915,7 +860,7 @@ fn bare_code_quad_array(codes: &[TermCode]) -> vortex_array::ArrayRef {
 
 /// `<http://example.org/s{i}>` zero-padded to `width` digits.
 fn subject_node(i: usize, width: usize) -> NamedOrBlankNode {
-    NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{i:0width$}")).unwrap())
+    iri_subject(&format!("s{i:0width$}"))
 }
 
 /// Sorted string forms of the quads at the indexes `keep` accepts.
@@ -965,15 +910,29 @@ fn graph_modular_quads(
         .collect()
 }
 
+/// The quad `s99 p0 "object 9"` in the default graph: one to add to a store
+/// of a few [`modular_quads`], whose subjects stop short of it.
+fn extra_quad() -> Quad {
+    make_quad(
+        "http://example.org/s99",
+        "http://example.org/p0",
+        "object 9",
+        GraphName::DefaultGraph,
+    )
+}
+
 /// 3,000 quads `s{i:04} p{i % 5} "o{i % 7}"` cycling through the default
 /// graph, `g1` and `g2`: the dataset of the suites that check narrowed views
 /// and their exports against the gathered codes. Subjects are unique, so a
 /// bound subject matches one row.
 fn fixture_quads() -> Vec<Quad> {
-    let g = |name: &str| {
-        GraphName::NamedNode(NamedNode::new(format!("http://example.org/{name}")).unwrap())
-    };
-    graph_modular_quads(3_000, 4, 5, 7, &[GraphName::DefaultGraph, g("g1"), g("g2")])
+    graph_modular_quads(
+        3_000,
+        4,
+        5,
+        7,
+        &[GraphName::DefaultGraph, iri_graph("g1"), iri_graph("g2")],
+    )
 }
 
 /// `n` quads `tail{i} p9 "late"` in the default graph, terms
@@ -991,58 +950,128 @@ fn appended_quads(n: usize) -> Vec<Quad> {
         .collect()
 }
 
-/// The three opens of the store file at `path`, each beside its tag: mapped
-/// (`from_file`, a Dictionary layout's dictionary file-backed), loaded whole
-/// (`from_file_in_memory`) and adopted from its bytes (`from_bytes_owned`).
-async fn reopened_stores(path: &std::path::Path) -> [(&'static str, VortexRdfStore); 3] {
-    [
-        ("mapped", VortexRdfStore::from_file(path).await.unwrap()),
-        (
-            "loaded",
-            VortexRdfStore::from_file_in_memory(path).await.unwrap(),
-        ),
-        (
-            "bytes",
-            VortexRdfStore::from_bytes_owned(std::fs::read(path).unwrap())
-                .await
-                .unwrap(),
-        ),
-    ]
+/// One way to open a store's serialized form: from its bytes, borrowed or
+/// adopted, or from a file holding them, mapped or loaded whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
+    /// [`from_bytes`](VortexRdfStore::from_bytes), over the buffer.
+    Bytes,
+    /// [`from_bytes_owned`](VortexRdfStore::from_bytes_owned), adopting it.
+    BytesOwned,
+    /// [`from_file`](VortexRdfStore::from_file), the file mapped.
+    Mapped,
+    /// [`from_file_in_memory`](VortexRdfStore::from_file_in_memory), the file
+    /// loaded whole.
+    Loaded,
 }
 
-/// [`fixture_quads`] written as a Dictionary-layout file with no index, the
-/// copy index and the reference index, each file opened every way
-/// [`reopened_stores`] opens it. Each store is tagged `file/<index>/<open>`
-/// and comes beside its file's dir guard; keep the guard alive for the
-/// store's lifetime. Each file is written by [`write_store_file`] once per
-/// process (see [`cached_store_bytes`]), and its bytes into a fresh temp dir
-/// per call.
-async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, VortexRdfStore)> {
+impl Open {
+    /// The opens the suites check a store file under, in their order: mapped
+    /// (a Dictionary layout's dictionary left in the file), loaded whole, and
+    /// adopted from its bytes.
+    const FILE: [Open; 3] = [Open::Mapped, Open::Loaded, Open::BytesOwned];
+
+    /// The store file at `path`, opened this way; the byte opens read its
+    /// bytes first.
+    async fn open(self, path: &std::path::Path) -> crate::error::Result<VortexRdfStore> {
+        match self {
+            Open::Bytes => VortexRdfStore::from_bytes(&std::fs::read(path).unwrap()).await,
+            Open::BytesOwned => {
+                VortexRdfStore::from_bytes_owned(std::fs::read(path).unwrap()).await
+            }
+            Open::Mapped => VortexRdfStore::from_file(path).await,
+            Open::Loaded => VortexRdfStore::from_file_in_memory(path).await,
+        }
+    }
+
+    /// The open as a fixture's tag names it.
+    fn tag(self) -> &'static str {
+        match self {
+            Open::Bytes | Open::BytesOwned => "bytes",
+            Open::Mapped => "mapped",
+            Open::Loaded => "loaded",
+        }
+    }
+}
+
+/// An open as failure messages name it: the constructor's name.
+impl std::fmt::Display for Open {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Open::Bytes => "from_bytes",
+            Open::BytesOwned => "from_bytes_owned",
+            Open::Mapped => "from_file",
+            Open::Loaded => "from_file_in_memory",
+        })
+    }
+}
+
+/// The store file at `path` opened each way [`Open::FILE`] lists, each
+/// beside its open.
+async fn reopened_stores(path: &std::path::Path) -> Vec<(Open, VortexRdfStore)> {
+    let mut stores = Vec::new();
+    for open in Open::FILE {
+        stores.push((open, open.open(path).await.unwrap()));
+    }
+    stores
+}
+
+/// A store of the fixture matrix, beside how it was made: its index
+/// configuration, and the open of its file, or none for a store built in
+/// memory. The dir guard keeps a file alive for the store's lifetime.
+struct FixtureStore {
+    index: IndexConfig,
+    open: Option<Open>,
+    store: VortexRdfStore,
+    _dir: Option<std::sync::Arc<tempfile::TempDir>>,
+}
+
+impl FixtureStore {
+    /// The store's label in failure messages: `file/<index>/<open>`, or
+    /// `memory/<index>` for a store built in memory.
+    fn tag(&self) -> String {
+        match self.open {
+            Some(open) => format!("file/{}/{}", self.index.name(), open.tag()),
+            None => format!("memory/{}", self.index.name()),
+        }
+    }
+
+    /// Whether the store is a file opened mapped.
+    fn mapped(&self) -> bool {
+        self.open == Some(Open::Mapped)
+    }
+}
+
+/// [`fixture_quads`] written as a Dictionary-layout file under each index
+/// configuration, each file opened every way [`Open::FILE`] lists. Each file
+/// is written by [`write_store_file`] once per process (see
+/// [`cached_store_bytes`]), and its bytes into a fresh temp dir per call.
+async fn file_stores() -> Vec<FixtureStore> {
     static BYTES: [OnceLock<Vec<u8>>; 3] = [const { OnceLock::new() }; 3];
     let mut stores = Vec::new();
-    for ((tag, indexes), cell) in [
-        ("file/no-index", vec![]),
-        ("file/copy", vec![IndexType::SecondaryByCopy]),
-        ("file/reference", vec![IndexType::SecondaryByReference]),
-    ]
-    .into_iter()
-    .zip(&BYTES)
-    {
+    for (index, cell) in IndexConfig::ALL.into_iter().zip(&BYTES) {
         let bytes = cached_store_bytes(cell, || async move {
             let (_dir, path) =
-                write_store_file(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
+                write_store_file(fixture_quads(), LayoutStrategy::Dictionary, index.types()).await;
             std::fs::read(&path).unwrap()
         })
         .await;
         let (dir, path) = temp_store_file(bytes);
         let dir = std::sync::Arc::new(dir);
         for (open, store) in reopened_stores(&path).await {
+            let fixture = FixtureStore {
+                index,
+                open: Some(open),
+                store,
+                _dir: Some(std::sync::Arc::clone(&dir)),
+            };
             assert_eq!(
-                store.dict_reader().unwrap().is_file_backed(),
-                open == "mapped",
-                "{tag}/{open}: only the mapped open keeps its dictionary in the file"
+                fixture.store.dict_reader().unwrap().is_file_backed(),
+                fixture.mapped(),
+                "{}: only the mapped open keeps its dictionary in the file",
+                fixture.tag()
             );
-            stores.push((format!("{tag}/{open}"), std::sync::Arc::clone(&dir), store));
+            stores.push(fixture);
         }
     }
     stores
@@ -1054,34 +1083,22 @@ async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, Vortex
 /// an empty window.
 async fn views_of(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
     let s = subject_node(17, 4);
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let p1 = iri("p1");
+    let o3 = plain_literal("o3");
     let dict = store.dict_reader().unwrap();
     let (lo, hi) = dict.prefix_range("<http://example.org/s1").await.unwrap();
-    let predicate = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
-    let chained = predicate
-        .match_pattern(None, None, Some(&o3), None)
-        .await
-        .unwrap();
+    let predicate = matched_view(store, None, Some(&p1), None, None).await;
+    let chained = matched_view(&predicate, None, None, Some(&o3), None).await;
     vec![
         ("whole", store.clone()),
         (
             "subject",
-            store
-                .match_pattern(Some(&s), None, None, None)
-                .await
-                .unwrap(),
+            matched_view(store, Some(&s), None, None, None).await,
         ),
         ("predicate", predicate),
         (
             "object",
-            store
-                .match_pattern(None, None, Some(&o3), None)
-                .await
-                .unwrap(),
+            matched_view(store, None, None, Some(&o3), None).await,
         ),
         (
             "keep",
@@ -1188,6 +1205,14 @@ async fn unprobed_object_store() -> VortexRdfStore {
     VortexRdfStore::from_built(pco_coded_build("o").await).unwrap()
 }
 
+/// The rows of `N` code columns, in order: row `i` holds code `i` of each
+/// column, in the columns' order.
+fn code_rows<const N: usize>(columns: &[vortex_buffer::Buffer<TermCode>]) -> Vec<[TermCode; N]> {
+    (0..columns[0].len())
+        .map(|i| std::array::from_fn(|c| columns[c][i]))
+        .collect()
+}
+
 /// The row tuples of a view's gathered codes, in the order gathered.
 async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     let cols = view
@@ -1195,9 +1220,16 @@ async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
         .await
         .unwrap()
         .expect("a Dictionary-layout view without a tail gathers codes");
-    (0..cols[0].len())
-        .map(|i| [cols[0][i], cols[1][i], cols[2][i], cols[3][i]])
-        .collect()
+    code_rows(&cols)
+}
+
+/// The row tuples of a view's gathered codes, sorted — order-free, since a
+/// served view gathers in its index's order and a narrowed one in base
+/// order.
+async fn sorted_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    let mut rows = row_list(view).await;
+    rows.sort_unstable();
+    rows
 }
 
 /// The view's rows in base row order: a keep that admits every code drops
@@ -1208,8 +1240,8 @@ async fn base_ordered_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
 }
 
 /// The rows of one [`code_chunks`](VortexRdfStore::code_chunks) chunk over
-/// `N` columns, in the chunk's column order. Asserts one buffer per column,
-/// all of one length.
+/// `N` columns, in the chunk's column order ([`code_rows`]). Asserts one
+/// buffer per column, all of one length.
 fn code_chunk_rows<const N: usize>(
     chunk: &[vortex_buffer::Buffer<TermCode>],
 ) -> Vec<[TermCode; N]> {
@@ -1219,9 +1251,7 @@ fn code_chunk_rows<const N: usize>(
         chunk.iter().all(|b| b.len() == n),
         "column buffers agree in length"
     );
-    (0..n)
-        .map(|i| std::array::from_fn(|c| chunk[c][i]))
-        .collect()
+    code_rows(chunk)
 }
 
 /// The rows of every `code_chunks` chunk a drained stream held, in order:
@@ -1320,7 +1350,7 @@ fn chunk_strings(chunks: &[vortex_array::ArrayRef], name: &str) -> Vec<String> {
         let col = field_as::<VarBinViewArray>(&s, name, &mut ctx).unwrap();
         let reader = StrColReader::new(&col);
         for i in 0..col.len() {
-            out.push(reader.str_at(i).unwrap().to_string());
+            out.push(reader.str_at(i).to_string());
         }
     }
     out
@@ -1378,72 +1408,23 @@ fn two_quads() -> Vec<Quad> {
     ]
 }
 
-/// Default layout over [`two_quads`]: a bound predicate over the string
-/// columns, hit and miss.
-async fn probe_default(store: VortexRdfStore) {
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let filtered = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
-    assert_eq!(filtered.size().await.unwrap(), 1);
-    let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
-    assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
-
-    let p3 = NamedNode::new("http://example.org/p3").unwrap();
-    let empty = store
-        .match_pattern(None, Some(&p3), None, None)
-        .await
-        .unwrap();
-    assert_eq!(empty.size().await.unwrap(), 0);
-}
-
-/// TypedObject layout over [`two_quads`]: a bound object literal (over the
-/// typed o_kind/o_value columns), hit and miss, and a bound predicate.
-async fn probe_typed_object(store: VortexRdfStore) {
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-    let filtered = store
-        .match_pattern(None, None, Some(&o1), None)
-        .await
-        .unwrap();
-    assert_eq!(filtered.size().await.unwrap(), 1);
-    let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
-    assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
-    assert_eq!(results[0].object.to_string(), "\"o1\"");
-
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let matched_p = store
-        .match_pattern(None, Some(&p2), None, None)
-        .await
-        .unwrap();
-    assert_eq!(matched_p.size().await.unwrap(), 1);
-
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
-    let empty = store
-        .match_pattern(None, None, Some(&o3), None)
-        .await
-        .unwrap();
-    assert_eq!(empty.size().await.unwrap(), 0);
-}
-
 /// One row per term kind in every role, each object distinct: an IRI, a
 /// blank node, a plain, a language-tagged and a typed literal as objects;
 /// a blank-node subject; a blank-node graph beside a named one and the
 /// default graph.
 fn term_kind_quads() -> Vec<Quad> {
     use oxrdf::BlankNode;
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+    let s = iri_subject("s");
     let blank_s = NamedOrBlankNode::BlankNode(BlankNode::new("bs").unwrap());
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let p1 = iri("p1");
+    let p2 = iri("p2");
+    let g = iri_graph("g");
     let blank_g = GraphName::BlankNode(BlankNode::new("bg").unwrap());
-    let plain = |text: &str| Term::Literal(Literal::new_simple_literal(text));
     vec![
         Quad::new(
             s.clone(),
             p1.clone(),
-            Term::NamedNode(NamedNode::new("http://example.org/o-iri").unwrap()),
+            Term::NamedNode(iri("o-iri")),
             GraphName::DefaultGraph,
         ),
         Quad::new(
@@ -1452,7 +1433,7 @@ fn term_kind_quads() -> Vec<Quad> {
             Term::BlankNode(BlankNode::new("bo").unwrap()),
             GraphName::DefaultGraph,
         ),
-        Quad::new(s.clone(), p2.clone(), plain("plain"), g.clone()),
+        Quad::new(s.clone(), p2.clone(), plain_literal("plain"), g.clone()),
         Quad::new(
             s.clone(),
             p2.clone(),
@@ -1471,10 +1452,15 @@ fn term_kind_quads() -> Vec<Quad> {
         Quad::new(
             blank_s.clone(),
             p1,
-            plain("blank subject, blank graph"),
+            plain_literal("blank subject, blank graph"),
             blank_g.clone(),
         ),
-        Quad::new(blank_s, p2, plain("blank subject, second row"), blank_g),
+        Quad::new(
+            blank_s,
+            p2,
+            plain_literal("blank subject, second row"),
+            blank_g,
+        ),
     ]
 }
 
@@ -1595,11 +1581,11 @@ async fn assert_patterns_agree(
     patterns: &[Pattern<'_>],
 ) {
     for &(name, s, p, o, g) in patterns {
-        let expected = want.match_pattern(s, p, o, g).await.unwrap();
+        let expected = matched_view(want, s, p, o, g).await;
         let size = expected.size().await.unwrap();
         let strings = view_strings(&expected).await;
         for (kind, store) in got {
-            let view = store.match_pattern(s, p, o, g).await.unwrap();
+            let view = matched_view(store, s, p, o, g).await;
             assert_eq!(
                 view.size().await.unwrap(),
                 size,

@@ -8,11 +8,13 @@
 
 mod batch;
 mod cancel;
-mod chunks;
-mod codes;
+mod dict;
+mod iterators;
+mod kernels;
 mod probes;
 mod serialize;
 mod store;
+mod u64s;
 
 use std::future::Future;
 use std::pin::pin;
@@ -101,15 +103,17 @@ pub(crate) fn settled<T>(pulled: Pulled<Result<T, CoreError>>) -> PyResult<T> {
     }
 }
 
-/// [`detached`] for a call given a cancel token: `fut` runs as a task on
-/// [`RUNTIME`] raced with `token` (see [`pull`]) while the calling thread
-/// waits with the GIL released.
-pub(crate) fn raced<T, Fut>(py: Python<'_>, token: &Token, fut: Fut) -> PyResult<T>
+/// Drives `fut` to completion on [`RUNTIME`] with the GIL released, raising
+/// its outcome as [`settled`] does. Given the call's cancel token, `fut` runs
+/// as a task raced with it while the calling thread waits (see [`pull`]);
+/// without one it runs on the calling thread, pinned in place, as
+/// [`detached`] runs a future.
+pub(crate) fn raced<T, Fut>(py: Python<'_>, token: Option<&Token>, fut: Fut) -> PyResult<T>
 where
     T: Send + 'static,
     Fut: Future<Output = Result<T, CoreError>> + Send + 'static,
 {
-    settled(py.detach(|| pull(&RUNTIME, Some(token), fut)))
+    settled(py.detach(|| pull(&RUNTIME, token, fut)))
 }
 
 /// A cancel token for one query's long calls: passed as `cancel=` to the
@@ -150,12 +154,12 @@ impl CancelToken {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     keep_freed_heap();
     m.add_class::<store::VortexRdfStore>()?;
-    m.add_class::<store::ProbeAnswers>()?;
-    m.add_class::<chunks::CodeChunks>()?;
+    m.add_class::<iterators::ProbeAnswers>()?;
+    m.add_class::<iterators::CodeChunks>()?;
     m.add_class::<CancelToken>()?;
-    m.add_class::<codes::TermDict>()?;
-    m.add_class::<codes::U64Column>()?;
-    m.add_class::<codes::CodeGroups>()?;
+    m.add_class::<dict::TermDict>()?;
+    m.add_class::<kernels::U64Column>()?;
+    m.add_class::<kernels::CodeGroups>()?;
     m.add_function(wrap_pyfunction!(serialize::serialize_rdf, m)?)?;
     m.add("VortexRdfError", m.py().get_type::<VortexRdfError>())?;
     m.add("JoinTooLarge", m.py().get_type::<JoinTooLarge>())?;

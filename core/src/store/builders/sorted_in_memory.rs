@@ -9,11 +9,13 @@
 //! repeats are dropped right after the sort, before any column or index child
 //! is built, so the rows, the row ids and every child describe the same
 //! deduplicated dataset, and terms are interned by their canonical spelling.
+//!
+//! [`build_components`]: super::build_components
 
-use super::{BuiltArray, VortexArrayBuilder, build_components, build_struct_array};
+use super::{BuiltArray, VortexArrayBuilder, build_parts_from_raws};
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::indexes::{IndexInput, Indexes};
+use crate::store::indexes::Indexes;
 use crate::store::layouts::LayoutStrategy;
 use crate::store::layouts::dictionary::ingest::{InterningQuadBuilder, finish_interned};
 
@@ -45,11 +47,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
             finish_interned(interner, &indexes)?
         } else {
             let quads = ingest_and_sort(quad_stream).await?;
-            BuiltArray {
-                array: build_struct_array(&quads, layout, true)?,
-                components: build_components(&indexes, IndexInput::Quads(&quads))?,
-                dict: None,
-            }
+            build_parts_from_raws(&quads, layout, &indexes)?
         };
         log::debug!(
             "[SortedInMemoryBuilder] Built {} quads in {:?}",

@@ -19,7 +19,8 @@ use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
 use vortex_sparse::{Sparse, SparseSlots};
 
-use crate::node::{Chunk, DeltaNode, DeltaWidth, Node, PackedNode, PatchProbe, Words};
+use crate::delta::{DeltaNode, DeltaWidth};
+use crate::node::{Chunk, Node, PackedNode, PatchProbe, Words};
 
 /// Child array at a fixed slot index, `'a`-borrowed from the erased slots.
 fn slot(slots: &[Option<ArrayRef>], idx: usize) -> Option<&ArrayRef> {

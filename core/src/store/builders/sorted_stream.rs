@@ -69,26 +69,11 @@ impl VortexArrayBuilder for SortedStreamBuilder {
     }
 }
 
-impl SortedStreamBuilder {
-    /// The dataset as a lazy chunk stream for the file writer. After the
-    /// (blocking) run-sort phase, merged chunks are built on demand as the
-    /// writer polls. `spill` places the runs as [`build_chunk_stream`]'s does.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-        layout: LayoutStrategy,
-        indexes: Indexes,
-        spill: Option<(&OsStr, &Path)>,
-    ) -> Result<BuiltStream> {
-        build_chunk_stream(quad_stream, layout, indexes, BuildSizes::DEFAULT, spill).await
-    }
-}
-
 /// The chunk stream materialized into one array, its `s` column stamped
 /// sorted (every chunk is a window of the global merge, and assembling chunks
 /// loses the per-chunk stats `match_pattern` gates its binary searches on),
 /// and each streamed index child materialized as an in-memory component
-/// ([`IndexComponent::from_write`]).
+/// ([`IndexComponent::from_stream`]).
 pub(crate) async fn build_array(
     quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
@@ -99,14 +84,14 @@ pub(crate) async fn build_array(
     let BuiltStream {
         dtype,
         chunks,
-        components: writes,
+        components: children,
         dict,
         ..
     } = build_chunk_stream(quad_stream, layout, indexes, sizes, None).await?;
     let chunks: Vec<ArrayRef> = chunks.try_collect().await?;
-    let mut components = Vec::with_capacity(writes.len());
-    for write in &writes {
-        components.push(IndexComponent::from_write(write).await?);
+    let mut components = Vec::with_capacity(children.len());
+    for child in children {
+        components.push(IndexComponent::from_stream(child).await?);
     }
     let array = with_subject_stamp(chunked_or_single(chunks, dtype)?, true)?;
     log::debug!(
@@ -165,17 +150,14 @@ impl Encoding {
         match self {
             Encoding::Codes { dict } => {
                 let n = ranks.len();
-                let mut codes = QuadCodes {
-                    s: Vec::with_capacity(n),
-                    p: Vec::with_capacity(n),
-                    o: Vec::with_capacity(n),
-                    g: Vec::with_capacity(n),
-                };
+                let mut codes = QuadCodes::with_capacity(n);
                 for &[s, p, o, g] in ranks {
-                    codes.s.push(code_of_rank(dict, s)?);
-                    codes.p.push(code_of_rank(dict, p)?);
-                    codes.o.push(code_of_rank(dict, o)?);
-                    codes.g.push(code_of_rank(dict, g)?);
+                    codes.push([
+                        code_of_rank(dict, s)?,
+                        code_of_rank(dict, p)?,
+                        code_of_rank(dict, o)?,
+                        code_of_rank(dict, g)?,
+                    ]);
                 }
                 dictionary::build_code_chunk(&codes, 0..n, true)
             }

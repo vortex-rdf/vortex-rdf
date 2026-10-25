@@ -15,11 +15,8 @@ async fn test_from_file_maps_the_file() {
     let mapped = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(mapped.debug_file_mapped(), Some(true));
     assert_eq!(view_strings(&mapped).await, quad_strings(&quads));
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let by_p = mapped
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let p0 = iri("p0");
+    let by_p = matched_view(&mapped, None, Some(&p0), None, None).await;
     assert_eq!(by_p.size().await.unwrap(), 4);
 }
 
@@ -87,7 +84,7 @@ async fn test_from_file_is_listed_in_the_process_maps_only_while_mapped() {
 #[tokio::test]
 async fn test_from_file_in_memory_never_maps_the_file() {
     use crate::io::container;
-    use crate::io::read::map_probe;
+    use crate::io::file::map_probe;
 
     let (_dir, good) = write_store_file(
         dictionary_test_quads(),

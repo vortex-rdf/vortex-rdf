@@ -172,10 +172,7 @@ impl<T: Send + 'static> Batch<T> {
             }
             Ok(collected)
         });
-        match pull(runtime, token, AbortOnDrop(collecting)) {
-            Pulled::Done(joined) => Pulled::Done(answer(joined)),
-            Pulled::Cancelled => Pulled::Cancelled,
-        }
+        pull(runtime, token, AbortOnDrop(collecting)).map(answer)
     }
 }
 

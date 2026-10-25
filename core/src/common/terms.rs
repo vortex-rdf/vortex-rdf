@@ -348,21 +348,6 @@ pub(crate) fn canonical_spelling(spelling: &str) -> Result<String> {
     Ok(term(spelling, Trust::Input)?.to_string())
 }
 
-/// The quad [`RawQuad::canonical`] returns: each position parsed as
-/// [`Trust::Input`], as a pattern's slots are, and the quad rendered by
-/// [`RawQuad::from_quad`], so a term comes out exactly as
-/// [`canonical_spelling`] renders it. Unlike `canonical_spelling`, each term
-/// must be one its position can hold: a literal is no subject, predicate or
-/// graph, and a blank node is no predicate. A failure names the position.
-pub(crate) fn canonical_raw_quad(s: &str, p: &str, o: &str, g: &str) -> Result<RawQuad> {
-    Ok(RawQuad::from_quad(&Quad::new(
-        at("quad subject", subject(s, Trust::Input))?,
-        at("quad predicate", named_node(p, Trust::Input))?,
-        at("quad object", term(o, Trust::Input))?,
-        at("quad graph", graph_name(g, Trust::Input))?,
-    )))
-}
-
 /// The quads of an RDF document read from `reader` in `format`, as
 /// [`RawQuad`]s: each parsed `Quad` is converted and dropped at once, so no
 /// second copy of its terms stays alive. A parse error is a

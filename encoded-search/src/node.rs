@@ -3,9 +3,11 @@
 //! arithmetic or one bit-packed word extraction, with no `ExecutionCtx`, no
 //! decode and no allocation. The exception is [`DeltaNode`], whose values
 //! are running sums: it decodes a 1024-value block the first time one of its
-//! values is read, and keeps it.
+//! values is read, and keeps it. The searches the nodes run are in
+//! [`crate::search`].
 
-use std::sync::OnceLock;
+use crate::delta::DeltaNode;
+use crate::search::{partition, search_ascending};
 
 /// Values per FastLanes chunk: the stride of a chunked FoR's references and
 /// of a run-length array's value offsets.
@@ -124,40 +126,32 @@ impl PackedNode<'_> {
         if self.bit_width == 0 {
             return 0;
         }
+        let index = i + self.offset;
+        match &self.packed {
+            Words::U8(s) => self.unpack(s, index),
+            Words::U16(s) => self.unpack(s, index),
+            Words::U32(s) => self.unpack(s, index),
+            Words::U64(s) => self.unpack(s, index),
+        }
+    }
+
+    /// The packed value at physical `index` of `packed`, widened.
+    fn unpack<T>(&self, packed: &[T], index: usize) -> u64
+    where
+        T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64>,
+    {
         // SAFETY: the packed buffer length is pinned to
         // `(len + offset).div_ceil(1024) * 128 * bit_width` words at array
-        // construction, and callers keep `i < len`, so `i + offset` is within
-        // the length the buffer was packed for.
-        match &self.packed {
-            Words::U8(s) => u64::from(unsafe {
-                vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<u8>(
-                    s,
-                    self.bit_width,
-                    i + self.offset,
-                )
-            }),
-            Words::U16(s) => u64::from(unsafe {
-                vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<u16>(
-                    s,
-                    self.bit_width,
-                    i + self.offset,
-                )
-            }),
-            Words::U32(s) => u64::from(unsafe {
-                vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<u32>(
-                    s,
-                    self.bit_width,
-                    i + self.offset,
-                )
-            }),
-            Words::U64(s) => unsafe {
-                vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<u64>(
-                    s,
-                    self.bit_width,
-                    i + self.offset,
-                )
-            },
+        // construction, and callers keep `i < len`, so `index = i + offset`
+        // is within the length the buffer was packed for.
+        unsafe {
+            vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<T>(
+                packed,
+                self.bit_width,
+                index,
+            )
         }
+        .into()
     }
 }
 
@@ -239,226 +233,6 @@ pub(crate) enum Node<'a> {
     },
 }
 
-/// The integer width a FastLanes delta block is decoded in: the wrapping
-/// arithmetic that undoes the deltas runs in the stored type, so the width
-/// is part of the node, not of the `u64` values it answers.
-#[derive(Clone, Copy)]
-pub(crate) enum DeltaWidth {
-    U8,
-    U16,
-    U32,
-    U64,
-}
-
-impl DeltaWidth {
-    /// Lanes per 1024-value block: how many bases a block carries.
-    fn lanes(self) -> usize {
-        match self {
-            DeltaWidth::U8 => 128,
-            DeltaWidth::U16 => 64,
-            DeltaWidth::U32 => 32,
-            DeltaWidth::U64 => 16,
-        }
-    }
-}
-
-/// A FastLanes delta-encoded node: every 1024-value block stores one base
-/// per lane and the transposed deltas (typically bit-packed beneath). A
-/// value is a running sum down its lane, so a block is decoded whole the
-/// first time any of its values is read, by the encoding's own `undelta`
-/// and `untranspose` kernels, and kept for the node's lifetime: a bounds
-/// search decodes only the blocks its bisection crosses.
-pub(crate) struct DeltaNode<'a> {
-    bases: Box<Node<'a>>,
-    deltas: Box<Node<'a>>,
-    width: DeltaWidth,
-    /// Physical offset of the first logical value inside the first block
-    /// (`< 1024`, a sliced array's leading rows).
-    offset: usize,
-    len: usize,
-    /// Decoded blocks, filled on first touch; an untouched slot costs one
-    /// pointer.
-    blocks: Vec<OnceLock<Box<[u64; 1024]>>>,
-}
-
-impl<'a> DeltaNode<'a> {
-    /// A node over resolved `bases` and `deltas` children; `None` for an
-    /// `offset` of a whole block or more, or children too short for the
-    /// blocks `offset + len` spans.
-    pub(crate) fn new(
-        bases: Node<'a>,
-        deltas: Node<'a>,
-        width: DeltaWidth,
-        offset: usize,
-        len: usize,
-    ) -> Option<Self> {
-        if offset >= 1024 {
-            return None;
-        }
-        let blocks = (offset + len).div_ceil(1024);
-        if deltas.len() < blocks * 1024 || bases.len() < blocks * width.lanes() {
-            return None;
-        }
-        Some(Self {
-            bases: Box::new(bases),
-            deltas: Box::new(deltas),
-            width,
-            offset,
-            len,
-            blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
-        })
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Exact logical value at `i`; requires `i < self.len()`.
-    pub(crate) fn value_at(&self, i: usize) -> u64 {
-        let physical = self.offset + i;
-        self.block(physical / 1024)[physical % 1024]
-    }
-
-    fn block(&self, b: usize) -> &[u64; 1024] {
-        self.blocks[b].get_or_init(|| {
-            Box::new(match self.width {
-                DeltaWidth::U8 => decode_block::<u8, 128>(&self.bases, &self.deltas, b),
-                DeltaWidth::U16 => decode_block::<u16, 64>(&self.bases, &self.deltas, b),
-                DeltaWidth::U32 => decode_block::<u32, 32>(&self.bases, &self.deltas, b),
-                DeltaWidth::U64 => decode_block::<u64, 16>(&self.bases, &self.deltas, b),
-            })
-        })
-    }
-
-    pub(crate) fn collect_kinds(&self, out: &mut Vec<crate::NodeKind>) {
-        out.push(crate::NodeKind::Delta);
-        self.bases.collect_kinds(out);
-        self.deltas.collect_kinds(out);
-    }
-}
-
-/// Decode block `b` of a delta node in the stored width `T`: gather the
-/// block's transposed deltas and its lane bases through the children's
-/// point reads, run the FastLanes kernels, and widen the result.
-fn decode_block<T, const LANES: usize>(bases: &Node<'_>, deltas: &Node<'_>, b: usize) -> [u64; 1024]
-where
-    T: fastlanes::Delta + fastlanes::Transpose + Copy + Default + Into<u64> + TryFrom<u64>,
-{
-    // The children hold values of width `T` by construction (the array's
-    // dtype), so the narrowing conversions cannot fail.
-    let narrow = |v: u64| T::try_from(v).unwrap_or_default();
-    let mut chunk = [T::default(); 1024];
-    for (j, slot) in chunk.iter_mut().enumerate() {
-        *slot = narrow(deltas.value_at(b * 1024 + j));
-    }
-    let mut lane_bases = [T::default(); LANES];
-    for (l, slot) in lane_bases.iter_mut().enumerate() {
-        *slot = narrow(bases.value_at(b * LANES + l));
-    }
-    let mut transposed = [T::default(); 1024];
-    T::undelta::<LANES>(&chunk, &lane_bases, &mut transposed);
-    let mut decoded = [T::default(); 1024];
-    T::untranspose(&transposed, &mut decoded);
-    let mut wide = [0u64; 1024];
-    for (w, v) in wide.iter_mut().zip(decoded) {
-        *w = v.into();
-    }
-    wide
-}
-
-/// Split points [`search_ascending`] may place by interpolation.
-const INTERPOLATION_STEPS: usize = 4;
-
-/// Windows up to this many values [`search_ascending`] splits at their middle:
-/// a split by value saves little on so few.
-const INTERPOLATION_MIN: usize = 16;
-
-/// The first index of `0..n` whose value is `>= needle`, over values
-/// ascending in that range: what `partition(n, |i| value(i) < needle)`
-/// returns, with fewer reads where the values are spread evenly. It bisects
-/// until a probe has landed on each side of the needle, then, while the
-/// window is wider than [`INTERPOLATION_MIN`] and the two values bracketing it
-/// span at least a quarter of its width, splits it where an even spread
-/// between them puts the needle, for up to [`INTERPOLATION_STEPS`] splits, and
-/// bisects the rest. Every split lies inside the window, so the answer is the
-/// bisection's; the bracketing values are ones the probes read anyway, so long
-/// plateaus and small windows cost what bisection does.
-pub(crate) fn search_ascending(n: usize, value: impl Fn(usize) -> u64, needle: u64) -> usize {
-    search_ascending_capped(n, value, needle).0
-}
-
-/// [`search_ascending`], with the first position its probes found holding a
-/// value `> needle` (`n` when none did): the end of the needle's rows lies
-/// between the answer and it, so the rows are bounded with no further read.
-pub(crate) fn search_ascending_capped(
-    n: usize,
-    value: impl Fn(usize) -> u64,
-    needle: u64,
-) -> (usize, usize) {
-    // The answer is in [lo, hi]. Bisect until a probe has landed on each side
-    // of the needle: below = value(lo - 1) < needle <= value(hi) = at.
-    let (mut lo, mut hi, mut past) = (0usize, n, n);
-    let mut probe = |i: usize| {
-        let v = value(i);
-        if v > needle && i < past {
-            past = i;
-        }
-        v
-    };
-    let (mut below, mut at) = (None, None);
-    while lo < hi && (below.is_none() || at.is_none()) {
-        let mid = lo + (hi - lo) / 2;
-        let v = probe(mid);
-        if v < needle {
-            (lo, below) = (mid + 1, Some(v));
-        } else {
-            (hi, at) = (mid, Some(v));
-        }
-    }
-    // Interpolate between them while the window is wide and its values are
-    // spread; bisect what is left.
-    if let (Some(mut b), Some(mut a)) = (below, at) {
-        for _ in 0..INTERPOLATION_STEPS {
-            let width = hi - lo;
-            if width <= INTERPOLATION_MIN || a - b < width as u64 / 4 {
-                break;
-            }
-            // Between positions lo - 1 and hi, which hold b and a.
-            let ahead = u128::from(needle - b) * (width as u128 + 1) / u128::from(a - b);
-            let split = (lo - 1 + ahead as usize).clamp(lo, hi - 1);
-            let v = probe(split);
-            if v < needle {
-                (lo, b) = (split + 1, v);
-            } else {
-                (hi, a) = (split, v);
-            }
-        }
-    }
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if probe(mid) < needle {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    (lo, past)
-}
-
-/// `partition_point` over a virtual index range, probing through a closure.
-pub(crate) fn partition(n: usize, mut below: impl FnMut(usize) -> bool) -> usize {
-    let (mut lo, mut hi) = (0usize, n);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if below(mid) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
 impl Node<'_> {
     pub(crate) fn len(&self) -> usize {
         match self {
@@ -500,9 +274,7 @@ impl Node<'_> {
                 references,
                 offset,
                 child,
-            } => child
-                .value_at(i)
-                .wrapping_add(references.value_at((offset + i) / FL_CHUNK)),
+            } => chunked_for_value_at(references, *offset, child, i),
             Node::BitPacked(p) => p.value_at(i),
             Node::Slice { child, start, .. } => child.value_at(start + i),
             Node::Chunked { chunks, .. } => {
@@ -690,6 +462,18 @@ impl Node<'_> {
     }
 }
 
+/// [`Node::value_at`] of a [`Node::ChunkedFoR`]: the child's value plus the
+/// reference of its FastLanes chunk. Out of line on purpose: written in
+/// `value_at`'s match, the sum of two recursive reads lets the compiler turn
+/// the recursion into a loop carrying an accumulator, which every node visit
+/// then pays for (a stack slot zeroed on entry, a load and an add on return).
+#[inline(never)]
+fn chunked_for_value_at(references: &Node<'_>, offset: usize, child: &Node<'_>, i: usize) -> u64 {
+    child
+        .value_at(i)
+        .wrapping_add(references.value_at((offset + i) / FL_CHUNK))
+}
+
 /// Position `q` among `len` positions, clamped to `len`. A quotient the index
 /// type cannot hold lies past every position: on a 32-bit target a `u64`
 /// quotient above `u32::MAX` clamps rather than wrapping to its low bits.
@@ -762,49 +546,6 @@ fn run_start(ends: &Node<'_>, run: usize, offset: usize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `search_ascending` returns what bisection does, and its cap bounds the
-    /// needle's rows, whatever the spread:
-    /// even, skewed (a few huge gaps), plateaus of repeated values, values
-    /// near `u64::MAX`, and lengths around the bisect-outright threshold; for
-    /// needles at, between and past every value.
-    #[test]
-    fn ascending_searches_match_bisection() {
-        let mut series: Vec<Vec<u64>> = vec![
-            (0..10_000).map(|i| 7 + 3 * i).collect(),
-            (0..5_000u64).map(|i| i * i * i).collect(),
-            (0..4_000u64).map(|i| (i / 250) * 1_000_000).collect(),
-            (0..3_000u64).map(|i| u64::MAX - 3_000 + i).collect(),
-            (0..2_000u64)
-                .map(|i| if i < 1_990 { i } else { 1 << 60 })
-                .collect(),
-        ];
-        for n in [0usize, 1, 2, 15, 16, 17, 18, 40] {
-            series.push((0..n as u64).map(|i| 100 + 2 * i).collect());
-        }
-        for values in &series {
-            let mut needles = vec![0, 1, u64::MAX];
-            for &v in values.iter().step_by((values.len() / 300).max(1)) {
-                needles.extend([v.saturating_sub(1), v, v.saturating_add(1)]);
-            }
-            for needle in needles {
-                let want = partition(values.len(), |i| values[i] < needle);
-                let len = values.len();
-                assert_eq!(
-                    search_ascending(len, |i| values[i], needle),
-                    want,
-                    "len {len} needle {needle}"
-                );
-                let (at, past) = search_ascending_capped(len, |i| values[i], needle);
-                assert_eq!(at, want, "capped: len {len} needle {needle}");
-                let end = partition(len, |i| values[i] <= needle);
-                assert!(
-                    end <= past && (past == len || values[past] > needle),
-                    "len {len} needle {needle}: cap {past}, rows end {end}"
-                );
-            }
-        }
-    }
 
     fn seq(base: u64, multiplier: u64, len: usize) -> Node<'static> {
         Node::Sequence {

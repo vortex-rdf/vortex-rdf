@@ -22,11 +22,8 @@ async fn test_default_fixture_adopts() {
     assert_eq!(store.size().await.unwrap(), quads.len());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let p1 = iri("p1");
+    let matched = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(
         view_strings(&matched).await,
         expected_strings(&quads, |i| i % 3 == 1)
@@ -62,12 +59,9 @@ async fn test_dictionary_fixture_adopts() {
     assert_eq!(store.size().await.unwrap(), quads.len());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let (cached, resolved) = probe_hooks::binds();
-    let served = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let served = matched_view(&store, None, Some(&p1), None, None).await;
     let after = probe_hooks::binds();
     assert!(after.0 > cached && after.1 == resolved, "{after:?}");
     for name in components {
@@ -125,7 +119,7 @@ async fn test_fixtures_match_regenerated_stores() {
             DICTIONARY_FIXTURE,
             "store-dictionary-both-indexes.vortex",
             LayoutStrategy::Dictionary,
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            ALL_INDEX_TYPES.to_vec(),
         ),
     ] {
         let regenerated = built_store(quads.clone(), layout, indexes).await;

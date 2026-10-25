@@ -6,23 +6,19 @@
 //! Vortex keys its reader caches by the identity of the bound trees, so the
 //! reader tree is retired whenever the bound-tree memo clears.
 
-use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::hash::Hash;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use rustc_hash::FxHashMap;
 use vortex_array::ArrayRef;
 use vortex_array::expr::{BoundExpression, Expression, root, select};
 use vortex_error::VortexResult;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::{Layout, LayoutReaderRef, LayoutRef};
 
+use super::memo::{BoundExprMemo, BoundedMemo, ChunkMemo, ColumnHandle};
 use crate::io::container::{self, RdfStoreLayoutVTable};
-use crate::io::read::{FileIdentity, OpenedFile};
+use crate::io::file::{FileIdentity, OpenedFile};
 use crate::store::persist::open::{ComponentRoster, IndexChild};
 use crate::store::schema;
 
@@ -91,19 +87,9 @@ pub(crate) struct NativeStoreFile {
     /// compaction rewrites its rows over; none for a file opened over a
     /// buffer.
     path: Option<PathBuf>,
-    /// How many times a quad column has been streamed through a scan for a
-    /// keep (test hook: pins which keeps were served without reading a column).
+    /// The tests' counts of how reads reached the file ([`FileCounter`]).
     #[cfg(test)]
-    column_streams: std::sync::atomic::AtomicUsize,
-    /// How many row ids reads of located index-child runs have asked for
-    /// (test hook: pins that a count reads none and a window only its own
-    /// rows).
-    #[cfg(test)]
-    located_rid_reads: std::sync::atomic::AtomicUsize,
-    /// How many of those reads were rid-only scans rather than point reads
-    /// (test hook: pins that a narrow run is point-read wherever it sits).
-    #[cfg(test)]
-    located_rid_scans: std::sync::atomic::AtomicUsize,
+    counters: [std::sync::atomic::AtomicUsize; 3],
 }
 
 /// The readers of one opened file: the quad table's root reader and one
@@ -138,8 +124,6 @@ impl ReaderTree {
     }
 }
 
-type ColumnHandle = Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>;
-
 /// The chunk-probe handles of the tables a located run is found in, `None`
 /// where one declines or the file has no such table.
 pub(crate) struct LocatedTables {
@@ -150,153 +134,20 @@ pub(crate) struct LocatedTables {
     pub(crate) references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
 }
 
-/// Chunk-probe handles by table and column, each built on first use; `None`
-/// memoizes a decline. `T` names the table: `()` for the quad table, the
-/// component name for an index child.
-///
-/// A lookup borrows its key, hashed with `FxHash` (the keys are the file's
-/// own table and column names, and the quad table's `()` hashes to nothing);
-/// a miss builds with the lock released, so two racing misses may both build
-/// and the first insert wins. Every entry is complete when it is inserted, so
-/// a lock poisoned by a panic elsewhere guards consistent entries and is taken
-/// over.
-#[derive(Default)]
-struct ChunkMemo<T>(Mutex<FxHashMap<T, FxHashMap<String, ColumnHandle>>>);
-
-impl<T: Hash + Eq> ChunkMemo<T> {
-    /// `table`'s `column` handle, from `build` on a miss.
-    fn get_or_build<Q>(
-        &self,
-        table: &Q,
-        column: &str,
-        build: impl FnOnce() -> ColumnHandle,
-    ) -> ColumnHandle
-    where
-        T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
-    {
-        if let Some(found) = self
-            .handles()
-            .get(table)
-            .and_then(|columns| columns.get(column))
-        {
-            return found.clone();
-        }
-        let built = build();
-        self.handles()
-            .entry(table.to_owned())
-            .or_default()
-            .entry(column.to_owned())
-            .or_insert(built)
-            .clone()
-    }
-
-    fn handles(&self) -> MutexGuard<'_, FxHashMap<T, FxHashMap<String, ColumnHandle>>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Structural (scope, expression) → the one [`BoundExpression`] this file
-/// hands out for that shape.
-///
-/// Vortex keys its reader-side pruning and evaluation caches by bound-tree
-/// *identity* (`ExactBoundExpr` compares the children `Arc` pointer), not
-/// structure, and those caches live as long as their reader: a fresh `bind`
-/// per call would miss them and grow them on every call. This memo pins one
-/// identity per shape, so repeats, across splits and across calls, land on
-/// the entries the first use created; a clone of a memoized tree shares its
-/// `Arc`s and so its identity. The scope tag separates trees bound against
-/// different schemas (the quad root vs. an index child). Bounded by
-/// [`BIND_MEMO_MAX`]; each clear retires the file's reader tree
-/// ([`ReaderTree`]).
-pub(crate) struct BoundExprMemo(BoundedMemo<(&'static str, Expression), BoundExpression>);
-
-/// Entry cap on [`BoundExprMemo`]: sized for a query workload's distinct
-/// filter shapes, not for arbitrary term churn.
-pub(crate) const BIND_MEMO_MAX: usize = 4096;
-
-impl BoundExprMemo {
-    fn new() -> Self {
-        Self(BoundedMemo::new(BIND_MEMO_MAX))
-    }
-
-    /// The memoized bound form of `expr` against `dtype`, binding on first
-    /// use. `scope` names the schema the dtype belongs to; the same shape
-    /// bound against two scopes is two entries.
-    pub(crate) fn bind(
-        &self,
-        scope: &'static str,
-        expr: &Expression,
-        dtype: &vortex_array::dtype::DType,
-    ) -> VortexResult<BoundExpression> {
-        self.0
-            .get_or_try_insert_with((scope, expr.clone()), || expr.bind(dtype))
-    }
-
-    /// How many times the memo has cleared: the generation of the reader tree
-    /// its identities belong to.
-    fn clears(&self) -> u64 {
-        self.0.clears.load(Ordering::Acquire)
-    }
-
-    /// Entries held: what the tests read to pin which shapes get bound.
-    #[cfg(test)]
-    pub(crate) fn debug_len(&self) -> usize {
-        self.0.map.lock().expect("memo lock").len()
-    }
-}
-
-/// A lock-guarded memo with an entry cap: once `cap` entries are held, the
-/// next insert clears the map wholesale before adding its entry.
-struct BoundedMemo<K, V> {
-    map: Mutex<HashMap<K, V>>,
-    cap: usize,
-    /// How many times the map has been cleared at its cap.
-    clears: AtomicU64,
-}
-
-impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
-    fn new(cap: usize) -> Self {
-        Self {
-            map: Mutex::new(HashMap::new()),
-            cap,
-            clears: AtomicU64::new(0),
-        }
-    }
-
-    fn get(&self, key: &K) -> Option<V> {
-        self.map.lock().expect("memo lock").get(key).cloned()
-    }
-
-    fn insert(&self, key: K, value: V) {
-        let mut map = self.map.lock().expect("memo lock");
-        self.insert_capped(&mut map, key, value);
-    }
-
-    /// The value under `key`, computed by `build` and inserted on a miss;
-    /// the lock is held across `build`, so a shape is built once even under
-    /// concurrent misses.
-    fn get_or_try_insert_with(
-        &self,
-        key: K,
-        build: impl FnOnce() -> VortexResult<V>,
-    ) -> VortexResult<V> {
-        let mut map = self.map.lock().expect("memo lock");
-        if let Some(value) = map.get(&key) {
-            return Ok(value.clone());
-        }
-        let value = build()?;
-        self.insert_capped(&mut map, key, value.clone());
-        Ok(value)
-    }
-
-    fn insert_capped(&self, map: &mut HashMap<K, V>, key: K, value: V) {
-        if map.len() >= self.cap {
-            map.clear();
-            self.clears.fetch_add(1, Ordering::Release);
-        }
-        map.insert(key, value);
-    }
+/// What the tests count of how reads reached a file
+/// ([`NativeStoreFile::note`], [`NativeStoreFile::count`]).
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum FileCounter {
+    /// Quad columns streamed through a scan for a keep: pins which keeps
+    /// were served without reading a column.
+    ColumnStreams,
+    /// Row ids that reads of located index-child runs asked for: pins that a
+    /// count reads none and a window only its own rows.
+    LocatedRidReads,
+    /// Those reads that were rid-only scans rather than point reads: pins
+    /// that a narrow run is point-read wherever it sits.
+    LocatedRidScans,
 }
 
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`]: sized for a query
@@ -383,11 +234,7 @@ impl NativeStoreFile {
             identity,
             path,
             #[cfg(test)]
-            column_streams: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            located_rid_reads: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            located_rid_scans: std::sync::atomic::AtomicUsize::new(0),
+            counters: Default::default(),
         })
     }
 
@@ -403,50 +250,16 @@ impl NativeStoreFile {
         self.bound_exprs.debug_len()
     }
 
-    /// Record one column stream for a keep (test hook).
+    /// Count `n` more of `counter` (test hook).
     #[cfg(test)]
-    pub(crate) fn note_column_stream(&self) {
-        self.column_streams
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn note(&self, counter: FileCounter, n: usize) {
+        self.counters[counter as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// How many column streams keeps have run on this handle (test hook).
+    /// The count of `counter` so far (test hook).
     #[cfg(test)]
-    pub(crate) fn debug_column_streams(&self) -> usize {
-        self.column_streams
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Record a read of `rows` row ids from a located index-child run (test
-    /// hook).
-    #[cfg(test)]
-    pub(crate) fn note_located_rid_reads(&self, rows: u64) {
-        self.located_rid_reads
-            .fetch_add(rows as usize, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// How many row ids reads of located runs have asked for on this handle
-    /// (test hook).
-    #[cfg(test)]
-    pub(crate) fn debug_located_rid_reads(&self) -> usize {
-        self.located_rid_reads
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Record one read of a located run's row ids by a rid-only scan (test
-    /// hook).
-    #[cfg(test)]
-    pub(crate) fn note_located_rid_scan(&self) {
-        self.located_rid_scans
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// How many reads of located runs' row ids were rid-only scans on this
-    /// handle (test hook).
-    #[cfg(test)]
-    pub(crate) fn debug_located_rid_scans(&self) -> usize {
-        self.located_rid_scans
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn count(&self, counter: FileCounter) -> usize {
+        self.counters[counter as usize].load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the file is read through a memory mapping.
@@ -620,12 +433,7 @@ impl NativeStoreFile {
         if let Some(reader) = cell.get() {
             return Ok(reader.clone());
         }
-        let reader = self.slot_layout(slot)?.new_reader(
-            self.root().data().components[slot].name.as_str().into(),
-            self.file.segment_source(),
-            self.file.session(),
-            &Default::default(),
-        )?;
+        let reader = container::component_reader(&self.file, slot)?;
         Ok(cell.get_or_init(|| reader).clone())
     }
 
@@ -672,55 +480,8 @@ impl NativeStoreFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vortex_array::dtype::{DType, Nullability, PType, StructFields};
-    use vortex_array::expr::{ExactBoundExpr, eq, get_item, lit, root};
-
-    /// Reaching the cap clears the memo before the next insert, so it never
-    /// holds more than `cap` entries.
-    #[test]
-    fn bounded_memo_clears_at_cap() {
-        let memo: BoundedMemo<u32, u32> = BoundedMemo::new(2);
-        memo.insert(1, 10);
-        memo.insert(2, 20);
-        assert_eq!(memo.map.lock().unwrap().len(), 2);
-        memo.insert(3, 30);
-        assert_eq!(memo.map.lock().unwrap().len(), 1);
-        assert_eq!(memo.get(&3), Some(30));
-        assert_eq!(memo.get(&1), None);
-
-        let built = memo.get_or_try_insert_with(4, || Ok(40)).unwrap();
-        assert_eq!(built, 40);
-        let hit = memo
-            .get_or_try_insert_with(4, || panic!("a hit does not rebuild"))
-            .unwrap();
-        assert_eq!(hit, 40);
-    }
-
-    /// Two binds of one shape hand out the same tree identity, which a fresh
-    /// bind of the same expression does not share.
-    #[test]
-    fn bound_expr_memo_pins_one_identity_per_shape() {
-        let dtype = DType::Struct(
-            StructFields::new(
-                vec![Arc::<str>::from("s")].into(),
-                vec![DType::Primitive(PType::U32, Nullability::NonNullable)],
-            ),
-            Nullability::NonNullable,
-        );
-        let expr = eq(get_item("s", root()), lit(1u32));
-        let memo = BoundExprMemo::new();
-        let first = memo.bind("quads", &expr, &dtype).unwrap();
-        let second = memo.bind("quads", &expr, &dtype).unwrap();
-        assert_eq!(ExactBoundExpr(first.clone()), ExactBoundExpr(second));
-
-        let fresh = expr.bind(&dtype).unwrap();
-        assert_eq!(fresh, first, "structurally the same tree");
-        assert_ne!(ExactBoundExpr(fresh), ExactBoundExpr(first.clone()));
-
-        let other_scope = memo.bind("index", &expr, &dtype).unwrap();
-        assert_ne!(ExactBoundExpr(other_scope), ExactBoundExpr(first));
-        assert_eq!(memo.0.map.lock().unwrap().len(), 2);
-    }
+    use crate::store::persist::memo::BIND_MEMO_MAX;
+    use vortex_array::expr::{eq, get_item, lit, root};
 
     /// Chunk-probe handles are memoized, one per quad column and one per
     /// (index component, column): every call hands out the same handle, so

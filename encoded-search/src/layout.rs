@@ -77,6 +77,13 @@ struct ChunkLeaf {
     last: OnceLock<u64>,
 }
 
+impl ChunkLeaf {
+    /// The column row past the leaf's last row.
+    fn end(&self) -> u64 {
+        self.row_offset + self.row_count
+    }
+}
+
 /// The flat chunk leaves of one non-nullable unsigned-integer column of a
 /// struct layout, addressable for global bounds queries and point reads.
 ///
@@ -179,7 +186,10 @@ impl ColumnChunks {
         // row. A run that ends inside that chunk is bounded by one search of
         // the chunk; one that reaches its end may continue into the next
         // chunks, whose bound the global search finds.
-        let Some(idx) = self.first_chunk_reaching(needle, source, session).await? else {
+        let Some(idx) = self
+            .first_reaching(0..self.chunks.len(), needle, source, session)
+            .await?
+        else {
             return Ok(None);
         };
         if idx == self.chunks.len() {
@@ -213,7 +223,10 @@ impl ColumnChunks {
         session: &VortexSession,
     ) -> VortexResult<Option<u64>> {
         // The first chunk whose last value reaches the needle holds it.
-        let Some(lo) = self.first_chunk_reaching(needle, source, session).await? else {
+        let Some(lo) = self
+            .first_reaching(0..self.chunks.len(), needle, source, session)
+            .await?
+        else {
             return Ok(None);
         };
         if lo == self.chunks.len() {
@@ -227,16 +240,17 @@ impl ColumnChunks {
         ))
     }
 
-    /// Index of the first chunk whose last value is `>= needle` (the chunk
-    /// count when none is), by bisection over the chunks' cached last values.
-    /// `Ok(None)` when a needed chunk's encoding declines the probe.
-    async fn first_chunk_reaching(
+    /// Index of the first chunk of `leaves` whose last value is `>= needle`
+    /// (`leaves.end` when none is), by bisection over the chunks' cached last
+    /// values. `Ok(None)` when a needed chunk's encoding declines the probe.
+    async fn first_reaching(
         &self,
+        leaves: Range<usize>,
         needle: u64,
         source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
     ) -> VortexResult<Option<usize>> {
-        let (mut lo, mut hi) = (0usize, self.chunks.len());
+        let (mut lo, mut hi) = (leaves.start, leaves.end);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let Some(last) = self.chunk_last(mid, source, session).await? else {
@@ -330,36 +344,31 @@ impl ColumnChunks {
         source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
     ) -> VortexResult<Option<LeafRows<'_>>> {
-        let first = self
-            .chunks
-            .partition_point(|c| c.row_offset + c.row_count <= window.start);
-        let last = self
-            .chunks
-            .partition_point(|c| c.row_offset + c.row_count < window.end)
-            .max(first);
-        let (mut lo, mut hi) = (first, last);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let Some(value) = self.chunk_last(mid, source, session).await? else {
-                return Ok(None);
-            };
-            if value < needle {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
+        let first = self.leaf_holding(window.start);
+        let last = self.leaf_holding(window.end - 1).max(first);
+        let Some(lo) = self
+            .first_reaching(first..last, needle, source, session)
+            .await?
+        else {
+            return Ok(None);
+        };
         let leaf = &self.chunks[lo];
         let Some(probe) = self.chunk_probe(lo, source, session).await? else {
             return Ok(None);
         };
         let start = window.start.max(leaf.row_offset) - leaf.row_offset;
-        let end = window.end.min(leaf.row_offset + leaf.row_count) - leaf.row_offset;
+        let end = window.end.min(leaf.end()) - leaf.row_offset;
         Ok(Some(LeafRows {
             probe: probe.probe(),
             row_offset: leaf.row_offset,
             window: start as usize..end as usize,
         }))
+    }
+
+    /// Index of the chunk leaf holding `row`: the leaf count for a row past
+    /// every leaf.
+    fn leaf_holding(&self, row: u64) -> usize {
+        self.chunks.partition_point(|c| c.end() <= row)
     }
 
     /// The row past the end of the chunk leaf holding `row`, from the layout
@@ -369,10 +378,7 @@ impl ColumnChunks {
     /// Panics if `row >= self.row_count()`.
     pub fn leaf_end(&self, row: u64) -> u64 {
         assert!(row < self.row_count, "row {row} out of bounds");
-        let leaf = &self.chunks[self
-            .chunks
-            .partition_point(|c| c.row_offset + c.row_count <= row)];
-        leaf.row_offset + leaf.row_count
+        self.chunks[self.leaf_holding(row)].end()
     }
 
     /// The rows `rows` (absolute, non-empty) as a [`LeafRows`] of the one
@@ -393,11 +399,9 @@ impl ColumnChunks {
             rows.start < rows.end && rows.end <= self.row_count,
             "rows {rows:?} out of bounds"
         );
-        let idx = self
-            .chunks
-            .partition_point(|c| c.row_offset + c.row_count <= rows.start);
+        let idx = self.leaf_holding(rows.start);
         let leaf = &self.chunks[idx];
-        if rows.end > leaf.row_offset + leaf.row_count {
+        if rows.end > leaf.end() {
             return Ok(None);
         }
         let Some(probe) = self.chunk_probe(idx, source, session).await? else {
@@ -424,10 +428,7 @@ impl ColumnChunks {
         session: &VortexSession,
     ) -> VortexResult<Option<u64>> {
         assert!(row < self.row_count, "row {row} out of bounds");
-        let idx = self
-            .chunks
-            .partition_point(|c| c.row_offset + c.row_count <= row)
-            .min(self.chunks.len() - 1);
+        let idx = self.leaf_holding(row).min(self.chunks.len() - 1);
         let Some(probe) = self.chunk_probe(idx, source, session).await? else {
             return Ok(None);
         };
@@ -461,9 +462,9 @@ impl ColumnChunks {
         let mut idx = 0;
         while let Some(&first) = rest.first() {
             assert!(first < self.row_count, "row {first} out of bounds");
-            idx += self.chunks[idx..].partition_point(|c| c.row_offset + c.row_count <= first);
+            idx += self.chunks[idx..].partition_point(|c| c.end() <= first);
             let leaf = &self.chunks[idx];
-            let inside = rest.partition_point(|&row| row < leaf.row_offset + leaf.row_count);
+            let inside = rest.partition_point(|&row| row < leaf.end());
             let Some(probe) = self.chunk_probe(idx, source, session).await? else {
                 return Ok(None);
             };

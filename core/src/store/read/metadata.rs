@@ -14,7 +14,7 @@ use crate::store::indexes::copy::CopyFamily;
 use crate::store::indexes::{ComponentIdentity, IndexType};
 use crate::store::read::count::BaseRows;
 use crate::store::schema::{QuadColumn, TermCode};
-use crate::store::view::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, SelectedRows, ViewSelection};
 use crate::store::{Backend, LayoutStrategy, MemoryBase, VortexRdfStore};
 
 /// A sort order of quad rows, by the columns compared first to last.
@@ -197,13 +197,8 @@ impl VortexRdfStore {
                 if self.quads.subject_sorted()
                     && self.quads.deleted.is_none()
                     && let ViewSelection::Exact(sel) = &self.quads.selection
-                    && let Some(run) = match sel {
-                        RowSelection::All if base_len > 0 => Some(0..base_len),
-                        RowSelection::Range(r) if r.start < r.end && r.end <= base_len as u64 => {
-                            Some(r.start as usize..r.end as usize)
-                        }
-                        _ => None,
-                    }
+                    && let SelectedRows::Run(run) = sel.as_rows(base_len)
+                    && !run.is_empty()
                     && let Some(owned) = probes.by_name(base, QuadColumn::S.name()).flatten()
                 {
                     let probe = owned.probe();
@@ -215,7 +210,7 @@ impl VortexRdfStore {
             Backend::File(FileBase { filter, .. }) => {
                 // The pushed-down equalities bound their columns exactly.
                 if let Some(filter) = filter
-                    && let Some(pairs) = crate::store::scan::file_reads::eq_code_pairs(filter)
+                    && let Some(pairs) = crate::store::scan::file_exprs::eq_code_pairs(filter)
                 {
                     for (column, code) in pairs {
                         if let Some(column) = QuadColumn::from_name(&column) {

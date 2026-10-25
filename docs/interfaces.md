@@ -18,10 +18,10 @@ is the path such an engine takes.
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L103) on any view, registered with vortex's `VortexTable` |
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L156), [`index_components`](../core/src/store/read/metadata.rs#L235), [`partitions`](../core/src/store/read/metadata.rs#L270) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L243) (from [`dict_reader`](../core/src/store/mod.rs#L203)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L156), [`index_components`](../core/src/store/read/metadata.rs#L230), [`partitions`](../core/src/store/read/metadata.rs#L265) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) (from [`dict_reader`](../core/src/store/mod.rs#L193)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L142), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L267) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L142), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L266) |
 | The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L82), with [`vortex_scan`](../core/src/lib.rs#L76) re-exported |
 
 ---
@@ -205,10 +205,10 @@ Every read is lazy, and a stream's first poll decides how it runs:
   the call's error.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
-  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L67)), and a
+  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L57)), and a
   scan first polled where no tokio runtime is current run inline on the
   polling task. Any other scan spawns its splits
-  ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L44)) onto the tokio
+  ([`ScanDriver`](../core/src/store/scan/file_scans.rs#L34)) onto the tokio
   runtime it is polled in, and vortex looks that runtime up
   (`Handle::current()`) at every spawn, so every later poll of the stream
   must run inside a tokio runtime too. A filtered file view's capped count,
@@ -325,13 +325,13 @@ valid.
   re-takes the dictionary handle after the compaction.
 - The persisted children ([§2](#2-the-persisted-children-as-tables)) are
   the base's, untouched by tombstones and tails.
-- A store opened by [`from_file`](../core/src/store/persist/open.rs#L235)
+- A store opened by [`from_file`](../core/src/store/persist/open.rs#L237)
   reads its memory-mapped file in place, and so does every view, data
   source, partition and stream derived from it: the file must not be
   truncated or rewritten while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
-  [`from_file_in_memory`](../core/src/store/persist/open.rs#L245) loads the
+  [`from_file_in_memory`](../core/src/store/persist/open.rs#L247) loads the
   file whole instead and never reads it again.
 
 ## 8. Through DataFusion
@@ -385,8 +385,8 @@ stays out of `cargo test --workspace`. The `interface-tests` job of
 | `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
 | `row_chunks`, `code_chunks` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
 | `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
-| The scan driver of a file view's reads | [`core/src/store/scan/file_reads.rs`](../core/src/store/scan/file_reads.rs) |
+| The scan driver of a file view's reads | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs) |
 | `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
-| `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
+| `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs) |
 | `vortex_session`, the `vortex_scan` re-export | [`core/src/lib.rs`](../core/src/lib.rs) |
 | Conformance through DataFusion, the Arrow recipe, the example | [`interface-tests/Cargo.toml`](../interface-tests/Cargo.toml), [`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs), [`tests/arrow.rs`](../interface-tests/tests/arrow.rs), [`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs) |

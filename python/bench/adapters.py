@@ -520,33 +520,30 @@ VORTEX_VARIANTS = [
 
 VORTEX_SLUGS = [v.slug for v in VORTEX_VARIANTS]
 
+#: The other libraries' adapters, in dashboard row order, each named by its
+#: class's `slug`.
+LIBRARY_ADAPTERS = (PyoxigraphAdapter, PycottasAdapter, RdflibAdapter, LightrdfAdapter)
+
 
 def build_adapter(slug: str) -> Adapter:
     """Construct one adapter by slug, importing only that library."""
     for v in VORTEX_VARIANTS:
         if slug == v.slug:
             return VortexAdapter(v.slug, v.label, v.layout, list(v.indexes), v.in_memory)
-    if slug == "pyoxigraph":
-        return PyoxigraphAdapter()
-    if slug == "pycottas":
-        return PycottasAdapter()
-    if slug == "lightrdf":
-        return LightrdfAdapter()
-    if slug == "rdflib":
-        return RdflibAdapter()
+    for library in LIBRARY_ADAPTERS:
+        if slug == library.slug:
+            return library()
     raise KeyError(f"unknown adapter slug: {slug}")
 
 
 #: Every adapter a full run measures, in dashboard row order: each Vortex
 #: variant is a row in the cross-library panels alongside the other libraries,
 #: not a footnote to them.
-ALL_SLUGS = VORTEX_SLUGS + ["pyoxigraph", "pycottas", "rdflib", "lightrdf"]
+ALL_SLUGS = VORTEX_SLUGS + [library.slug for library in LIBRARY_ADAPTERS]
 
-#: Which virtualenv each adapter needs. Vortex variants share one.
+#: Which virtualenv each adapter needs. Vortex variants share one; every other
+#: library has its own, named after it.
 VENV_FOR = {
     **{slug: "vortex" for slug in VORTEX_SLUGS},
-    "pyoxigraph": "pyoxigraph",
-    "pycottas": "pycottas",
-    "rdflib": "rdflib",
-    "lightrdf": "lightrdf",
+    **{library.slug: library.slug for library in LIBRARY_ADAPTERS},
 }

@@ -19,16 +19,16 @@ use crate::store::RawQuad;
 
 /// The most distinct terms a build may hold: the term dictionary's cap
 /// (`TermDictionary::from_sorted_column`), so every id and rank fits a `u32`.
-#[cfg(not(test))]
-fn term_cap() -> usize {
-    i32::MAX as usize
-}
+const TERM_CAP: usize = i32::MAX as usize;
 
-/// The cap under the tests' `TermCap` hook, which lowers it so a few terms
-/// reach the refusal.
-#[cfg(test)]
+/// [`TERM_CAP`], or the lower cap of the tests' `TermCap` hook, which lets a
+/// few terms reach the refusal.
 fn term_cap() -> usize {
-    crate::store::test_hooks::term_cap()
+    #[cfg(test)]
+    if let Some(cap) = crate::store::test_hooks::term_cap() {
+        return cap;
+    }
+    TERM_CAP
 }
 
 /// Every distinct term of a build once, by provisional id: `terms[id]` is the

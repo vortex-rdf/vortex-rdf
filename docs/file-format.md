@@ -80,9 +80,9 @@ of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
 The writer is limited to two editions: Vortex's frozen `core` edition
-`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L58)) — every
+`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L62)) — every
 encoding, layout, extension dtype and zone-map aggregate a store file may hold
-— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L69)), whose
+— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L73)), whose
 one member is the root layout. A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
 per-chunk frame-of-reference (`fastlanes.for.v2`), is never written. Files
@@ -170,7 +170,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
 matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L54));
-[`classify_component`](../core/src/store/persist/open.rs#L89) then turns each
+[`classify_component`](../core/src/store/persist/open.rs#L86) then turns each
 descriptor into the dictionary, a known index, or a skip — an index child by
 its implementation slug alone, whatever its name. The open classifies the
 roster once, and every later read reaches a child only through it.
@@ -217,7 +217,7 @@ column
 
 An id column — a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64`
 row-id `rid` — takes the same pipeline with one change, through the writer's
-per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L230)):
+per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L156)):
 if it does not dictionary-encode (a row-id column never does: its ids are
 unique), it coalesces toward ~2 MiB, 262,144 rows per leaf. A code column that
 dictionary-encodes keeps its codes at ~1 MiB: they are as narrow as its
@@ -255,22 +255,25 @@ What the store reads from this structure:
 ## 5. The `dictionary` child
 
 Present under the `Dictionary` layout, and then **required**: the quad columns
-are bare codes and cannot be decoded without it.
+are bare codes and cannot be decoded without it. Beside string columns a
+`dictionary` child is classified like any other component, so one this version
+cannot read is still refused, and is otherwise left unread by every open path:
+the dtype alone decides the layout ([§4](#4-the-quad-table)).
 
 | Property | Value |
 |---|---|
 | `name` / `role` | `dictionary` / `dictionary` |
 | `implementation` / `version` | `sorted-terms-fsst-v1` / 2 ([`DICT_VERSION`](../core/src/io/container/mod.rs#L47)); version 1, without zone maps, is read the same way, and a higher version is refused at open |
 | `required` / `sorted` | `true` / `true` |
-| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage.rs#L30): non-nullable `Utf8` |
+| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage/mod.rs#L30): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
-| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage.rs#L198)), not of the format |
+| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage/mod.rs#L193)), not of the format |
 
 The column is FSST-compressed **at the source**, in independent windows of
-65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L36))
+65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L367)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L293)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates
@@ -280,9 +283,9 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L235)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L237)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L228)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L132)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
@@ -336,13 +339,13 @@ Shared rules:
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
   ([`RowId`](../core/src/store/schema.rs#L33)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
-  ([`check_id_columns`](../core/src/store/persist/open.rs#L42)): rebuild such a store
+  ([`check_id_columns`](../core/src/store/persist/open.rs#L39)): rebuild such a store
   from its RDF source.
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L110)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L124))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L106)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L120))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
@@ -370,7 +373,7 @@ row ids.
 On a file-backed store an index child is never lifted into memory. Under the
 `Dictionary` layout its run is located by binary-searching the child's
 encoded chunks through the chunk probes of [§4](#4-the-quad-table)
-([`locate_component_run`](../core/src/store/indexes/file.rs#L40)): a
+([`locate_component_run`](../core/src/store/indexes/file.rs#L47)): a
 located run of at most `POINT_GATHER_MAX_ROWS` rows is point-read, a wider
 one is read as a scan of exactly that row range. A run the probes cannot
 locate — a string-keyed child under the other layouts — is answered by a
@@ -471,9 +474,9 @@ a call is working on and the bounded structures below. Residency is the
 kernel's decision; no segment cache sits in between.
 
 What a file store keeps for its lifetime, and what bounds it. The opened handle
-([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L40)) and the file-backed
+([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L36)) and the file-backed
 dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L228))
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L132))
 keep:
 
 | Kept | Bound |
@@ -483,7 +486,7 @@ keep:
 | pruning envelopes per filter shape | 512 entries, cleared wholesale at the cap |
 | bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap; a clear retires the reader tree, and the caches go with its readers once no view holds one |
 | the dictionary child's reader, the window leaf layouts, the dictionary's window bounds ([§5](#5-the-dictionary-child)) and its kind ranges | two terms per 65,536-term window and a handful of codes |
-| the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed.rs#L67) (4 MiB) per opened file, charging each window its code offsets at 4 bytes each plus [`WINDOW_ENTRY_OVERHEAD`](../core/src/store/layouts/dictionary/file_backed.rs#L73) (4 KiB); least recently used evicted; an FSST window of 65,536 terms is charged about 260 KiB, so about 15 fit. For a memory-mapped file store, which every `from_file` store is, the code bytes are slices of the map, so the charge bounds the heap the cache holds |
+| the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) (4 MiB) per opened file, charging each window its code offsets at 4 bytes each plus [`WINDOW_ENTRY_OVERHEAD`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) (4 KiB); least recently used evicted; an FSST window of 65,536 terms is charged about 260 KiB, so about 15 fit. For a memory-mapped file store, which every `from_file` store is, the code bytes are slices of the map, so the charge bounds the heap the cache holds |
 
 Keeps (`VALUES`, FILTER code sets) never become filter expressions, so the
 two memos only see a workload's pattern shapes. No count, decode or predicate
@@ -500,7 +503,7 @@ A row scan — the reads that
 materialize a view's rows: serialization and the `from_file_in_memory` load, a
 compaction's gather, and the one-shot reads (`code_columns_gathered`,
 `quads_vec`, `shared_quads_vec`) the reads by id decline — filters and decodes
-per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L67)
+per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L57)
 (42) splits runs inline, a larger one is spawned across the runtime's workers.
 Without a Tokio runtime these scans run inline. A one-shot read under a
 pending filter of code equalities over columns with chunk probes evaluates
@@ -604,20 +607,20 @@ open rather than being read around.
 |---|---|---|
 | `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L28) |
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L16) |
-| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L189) |
-| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L185), [`child_strategy`](../core/src/io/container/sources.rs#L230) |
-| `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L36) |
-| `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L67) |
-| `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L73) |
+| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L115) |
+| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L111), [`child_strategy`](../core/src/io/container/sources.rs#L156) |
+| `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs#L36) |
+| `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |
+| `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L47) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L51) |
-| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L522) |
-| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L699) |
-| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L850) |
-| `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L735) |
-| `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L67) |
-| `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: an emitted chunk's size, an index child chunk's size and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L48) |
-| `DEFAULT_RUN_ROWS` | 1,048,576 entries per out-of-core spill run: quads per quad run, entries per index-family run (whose `u32` row offsets this bounds) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L56) |
+| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L532) |
+| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L24) |
+| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L35) |
+| `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L30) |
+| `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scans.rs`](../core/src/store/scan/file_scans.rs#L57) |
+| `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: an emitted chunk's size, an index child chunk's size and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L46) |
+| `DEFAULT_RUN_ROWS` | 1,048,576 entries per out-of-core spill run: quads per quad run, entries per index-family run (whose `u32` row offsets this bounds) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L54) |
 
 ---
 
@@ -628,10 +631,10 @@ open rather than being read around.
 | Container identity, root layout vtable, component addressing | [`core/src/io/container/mod.rs`](../core/src/io/container/mod.rs), [`layout.rs`](../core/src/io/container/layout.rs) |
 | Inventory descriptors and their JSON codec | [`core/src/io/container/wire.rs`](../core/src/io/container/wire.rs) |
 | Write strategy, component sources | [`core/src/io/container/write.rs`](../core/src/io/container/write.rs), [`sources.rs`](../core/src/io/container/sources.rs) |
-| Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/read.rs`](../core/src/io/read.rs) |
-| The opened-file handle and its bounded memos | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs) |
+| Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/file.rs`](../core/src/io/file.rs), [`read.rs`](../core/src/io/read.rs) |
+| The opened-file handle and its bounded memos | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs), [`memo.rs`](../core/src/store/persist/memo.rs) |
 | Primary column names | [`core/src/store/schema.rs`](../core/src/store/schema.rs), [`layouts/typed_object.rs`](../core/src/store/layouts/typed_object.rs) |
-| Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage.rs`](../core/src/store/layouts/dictionary/storage.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
+| Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
 | Locating and point-reading index runs on file | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |

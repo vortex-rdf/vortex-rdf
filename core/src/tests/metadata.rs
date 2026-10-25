@@ -16,11 +16,9 @@ use crate::store::{
 async fn assert_views_share_identity(store: &VortexRdfStore, tag: &str) {
     let generation = store.generation();
     let dictionary = store.dict_reader().unwrap().dictionary_id();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let kept = store
-        .match_pattern(None, Some(&p1), None, None)
+    let p1 = iri("p1");
+    let kept = matched_view(store, None, Some(&p1), None, None)
         .await
-        .unwrap()
         .keep(QuadColumn::S, &Keep::range(0..TermCode::MAX))
         .await
         .unwrap();
@@ -127,10 +125,10 @@ async fn test_generation_and_dictionary_identity() {
         // Every open of a file is new data over its own dictionary, which
         // the open's views share.
         let stores = file_stores().await;
-        let generations: BTreeSet<u64> = stores.iter().map(|(_, _, s)| s.generation()).collect();
+        let generations: BTreeSet<u64> = stores.iter().map(|f| f.store.generation()).collect();
         let dictionaries: BTreeSet<u64> = stores
             .iter()
-            .map(|(_, _, s)| s.dict_reader().unwrap().dictionary_id())
+            .map(|f| f.store.dict_reader().unwrap().dictionary_id())
             .collect();
         assert_eq!(generations.len(), stores.len(), "every open is new data");
         assert_eq!(
@@ -138,8 +136,8 @@ async fn test_generation_and_dictionary_identity() {
             stores.len(),
             "every open reads its own dictionary"
         );
-        for (tag, _dir, store) in &stores {
-            assert_views_share_identity(store, tag).await;
+        for fixture in &stores {
+            assert_views_share_identity(&fixture.store, &fixture.tag()).await;
         }
 
         // The same file opened twice; a delete on a file, which keeps its
@@ -212,10 +210,7 @@ async fn test_view_statistics_in_memory() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let mut deleted = store.clone();
-    for quad in quads.iter().step_by(50).take(20) {
-        deleted = deleted.delete_quad(quad).await.unwrap();
-    }
+    let deleted = delete_all(&store, quads.iter().step_by(50).take(20)).await;
     for (base, tombstones) in [(&store, 0), (&deleted, 20)] {
         for (name, view) in views_of(base).await {
             let tag = format!("{tombstones} tombstones, {name}");
@@ -289,10 +284,8 @@ async fn test_view_statistics_in_memory() {
         stats.code_bounds, [None; 4],
         "no codes under a string layout"
     );
-    let base_rows_only = strings
-        .match_pattern(Some(&subject_node(17, 4)), None, None, None)
+    let base_rows_only = matched_view(&strings, Some(&subject_node(17, 4)), None, None, None)
         .await
-        .unwrap()
         .view_statistics()
         .unwrap();
     assert_eq!(
@@ -312,12 +305,9 @@ async fn test_view_statistics_in_memory() {
 async fn test_view_statistics_file_backed() {
     let quads = fixture_quads();
     let stores = file_stores().await;
-    for (tag, _dir, store) in &stores {
-        let mapped = tag.ends_with("/mapped");
-        let mut deleted = store.clone();
-        for quad in quads.iter().step_by(100).take(10) {
-            deleted = deleted.delete_quad(quad).await.unwrap();
-        }
+    for fixture in &stores {
+        let (tag, store, mapped) = (fixture.tag(), &fixture.store, fixture.mapped());
+        let deleted = delete_all(store, quads.iter().step_by(100).take(10)).await;
         for (base, tombstones) in [(store, 0), (&deleted, 10)] {
             for (name, view) in views_of(base).await {
                 let tag = format!("{tag} {tombstones} tombstones, {name}");
@@ -337,15 +327,16 @@ async fn test_view_statistics_file_backed() {
         }
     }
 
-    let open = |want: &str| {
+    // The mapped open of the file under an index configuration.
+    let mapped_file = |index: IndexConfig| {
         stores
             .iter()
-            .find(|(tag, _, _)| tag == want)
-            .map(|(_, _, store)| store.clone())
+            .find(|f| f.index == index && f.mapped())
+            .map(|f| f.store.clone())
             .unwrap()
     };
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let store = open("file/no-index/mapped");
+    let p1 = iri("p1");
+    let store = mapped_file(IndexConfig::NoIndex);
     let whole = store.view_statistics().unwrap();
     assert_eq!(whole.rows, RowCountHint::exact(quads.len()));
     assert!(whole.file_backed && !whole.pending_filter);
@@ -368,10 +359,7 @@ async fn test_view_statistics_file_backed() {
     );
     // Unindexed, a predicate match pushes a filter down: the rows it still
     // has to test bound the count, and its code bounds the column.
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     let stats = by_p.view_statistics().unwrap();
     let p_code = store
         .dict_reader()
@@ -398,24 +386,22 @@ async fn test_view_statistics_file_backed() {
             )
         })
         .collect();
-    let by_p = store
-        .add_quads(p1_tail.clone())
-        .await
-        .unwrap()
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(
+        &store.add_quads(p1_tail.clone()).await.unwrap(),
+        None,
+        Some(&p1),
+        None,
+        None,
+    )
+    .await;
     let stats = by_p.view_statistics().unwrap();
     assert!(stats.pending_filter);
     assert_eq!(stats.tail_rows, 3);
     assert_eq!(stats.rows, RowCountHint::at_most(quads.len() + 3));
 
     // Indexed, the match is served and its count exact.
-    let copy = open("file/copy/mapped");
-    let by_p = copy
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let copy = mapped_file(IndexConfig::Copy);
+    let by_p = matched_view(&copy, None, Some(&p1), None, None).await;
     let stats = by_p.view_statistics().unwrap();
     assert_eq!(stats.selection, SelectionKind::PendingIndexRun);
     assert_eq!(stats.served_component, Some("index:posg"));
@@ -423,11 +409,8 @@ async fn test_view_statistics_file_backed() {
     assert!(!stats.pending_filter);
     // A bound graph rides the served run as a filter: the run's 600 rows
     // bound the count.
-    let g1 = GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap());
-    let by_pg = copy
-        .match_pattern(None, Some(&p1), None, Some(&g1))
-        .await
-        .unwrap();
+    let g1 = iri_graph("g1");
+    let by_pg = matched_view(&copy, None, Some(&p1), None, Some(&g1)).await;
     let stats = by_pg.view_statistics().unwrap();
     assert_eq!(stats.served_component, Some("index:posg"));
     assert!(stats.pending_filter);
@@ -436,23 +419,21 @@ async fn test_view_statistics_file_backed() {
     // A tombstone in the served run: the run's width bounds its live rows
     // until its ids are read, which counts them.
     let deleted = copy.delete_quad(&quads[1]).await.unwrap();
-    let by_p = deleted
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&deleted, None, Some(&p1), None, None).await;
     let rows = |view: &VortexRdfStore| view.view_statistics().unwrap().rows;
     assert_eq!(rows(&by_p), RowCountHint::at_most(600));
     assert_eq!(by_p.size().await.unwrap(), 599);
     assert_eq!(rows(&by_p), RowCountHint::exact(599));
     // With rows appended under the predicate, the bound is the run's width
     // and the tail's rows.
-    let by_p = deleted
-        .add_quads(p1_tail)
-        .await
-        .unwrap()
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(
+        &deleted.add_quads(p1_tail).await.unwrap(),
+        None,
+        Some(&p1),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(rows(&by_p), RowCountHint::at_most(600 + 3));
     assert_eq!(by_p.size().await.unwrap(), 602);
 }
@@ -494,16 +475,12 @@ async fn test_index_components() {
             "built {indexes:?}"
         );
     }
-    for (tag, _dir, store) in file_stores().await {
-        let indexes = match tag.split('/').nth(1) {
-            Some("copy") => vec![IndexType::SecondaryByCopy],
-            Some("reference") => vec![IndexType::SecondaryByReference],
-            _ => vec![],
-        };
+    for fixture in file_stores().await {
         assert_eq!(
-            store.index_components().unwrap(),
-            roster(&indexes, quads.len()),
-            "{tag}"
+            fixture.store.index_components().unwrap(),
+            roster(&fixture.index.types(), quads.len()),
+            "{}",
+            fixture.tag()
         );
     }
 }
@@ -526,7 +503,6 @@ async fn test_index_components_classify_children_by_slug() {
     .await
     .unwrap();
     let ospg = parts
-        .built
         .components
         .iter()
         .find(|c| c.identity.name == "index:ospg")
@@ -534,7 +510,7 @@ async fn test_index_components_classify_children_by_slug() {
         .to_write()
         .unwrap();
     let foreign = unknown_component("index:posg", "secondary-by-copy/posg-v2", false);
-    let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], vec![foreign, ospg]).await;
+    let bytes = unstamped_store_bytes(vec![parts.array.clone()], vec![foreign, ospg]).await;
     let (_dir, path) = temp_store_file(&bytes);
     let want = roster(&[IndexType::SecondaryByCopy], quads.len())
         .into_iter()
@@ -542,9 +518,10 @@ async fn test_index_components_classify_children_by_slug() {
         .collect::<Vec<_>>();
     // The copy index answers a bound predicate from `index:posg`, here the
     // foreign child, and a bound object from `index:ospg`.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let p1 = iri("p1");
+    let o3 = plain_literal("o3");
     for (open, store) in reopened_stores(&path).await {
+        let open = open.tag();
         assert_eq!(store.index_components().unwrap(), want, "{open}");
         // The data source names the children as the roster does.
         let source = |name: &str| store.component_data_source(name).unwrap();
@@ -553,18 +530,17 @@ async fn test_index_components_classify_children_by_slug() {
         for (pattern, view, served, rows) in [
             (
                 "predicate",
-                store.match_pattern(None, Some(&p1), None, None).await,
+                matched_view(&store, None, Some(&p1), None, None).await,
                 None,
                 expected_strings(&quads, |i| i % 5 == 1),
             ),
             (
                 "object",
-                store.match_pattern(None, None, Some(&o3), None).await,
+                matched_view(&store, None, None, Some(&o3), None).await,
                 Some("index:ospg"),
                 expected_strings(&quads, |i| i % 7 == 3),
             ),
         ] {
-            let view = view.unwrap();
             let stats = view.view_statistics().unwrap();
             assert_eq!(stats.served_component, served, "{open} {pattern}");
             assert_eq!(view_strings(&view).await, rows, "{open} {pattern}");
@@ -619,16 +595,9 @@ async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
 #[tokio::test]
 async fn test_partitions_in_memory() {
     let quads = fixture_quads();
-    for indexes in [
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-    ] {
+    for indexes in IndexConfig::ALL.map(IndexConfig::types) {
         let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
-        let mut deleted = store.clone();
-        for quad in quads.iter().step_by(9).take(40) {
-            deleted = deleted.delete_quad(quad).await.unwrap();
-        }
+        let deleted = delete_all(&store, quads.iter().step_by(9).take(40)).await;
         for (base, tombstones) in [(&store, 0), (&deleted, 40)] {
             for (name, view) in views_of(base).await {
                 assert_partitions_tile(&view, &format!("{indexes:?} {tombstones} {name}")).await;
@@ -684,12 +653,10 @@ async fn test_partitions_in_memory() {
 #[tokio::test]
 async fn test_partitions_file_backed() {
     let quads = fixture_quads();
-    for (tag, _dir, store) in file_stores().await {
-        let mut deleted = store.clone();
-        for quad in quads.iter().step_by(13).take(30) {
-            deleted = deleted.delete_quad(quad).await.unwrap();
-        }
-        for (base, tombstones) in [(&store, 0), (&deleted, 30)] {
+    for fixture in file_stores().await {
+        let (tag, store) = (fixture.tag(), &fixture.store);
+        let deleted = delete_all(store, quads.iter().step_by(13).take(30)).await;
+        for (base, tombstones) in [(store, 0), (&deleted, 30)] {
             for (name, view) in views_of(base).await {
                 assert_partitions_tile(&view, &format!("{tag} {tombstones} {name}")).await;
             }
