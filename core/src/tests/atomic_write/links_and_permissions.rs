@@ -14,6 +14,24 @@ fn is_link(path: &Path) -> bool {
         .is_symlink()
 }
 
+/// The number of quads the store file at `path` holds, opened mapped.
+async fn stored_size(path: &Path) -> usize {
+    VortexRdfStore::from_file(path)
+        .await
+        .unwrap()
+        .size()
+        .await
+        .unwrap()
+}
+
+/// `error` is an I/O error of kind `PermissionDenied`.
+fn assert_permission_denied(error: &VortexRdfError) {
+    assert!(
+        matches!(error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "{error}"
+    );
+}
+
 async fn rebuild(path: &Path, quads: Vec<Quad>) -> crate::error::Result<()> {
     crate::io::quads_stream_to_vortex_file(
         quad_stream(quads),
@@ -88,15 +106,7 @@ async fn test_a_chain_of_symlinks_is_followed_to_the_end() {
         PathBuf::from("current")
     );
     assert_eq!(std::fs::read_link(&current).unwrap(), v3);
-    assert_eq!(
-        VortexRdfStore::from_file(&v3)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        7
-    );
+    assert_eq!(stored_size(&v3).await, 7);
 }
 
 /// A link to a file that is not there yet is written through: the file is
@@ -114,15 +124,7 @@ async fn test_a_dangling_symlink_gets_its_target_created() {
     assert!(is_link(&next));
     let v4 = versions.join("v4.vortex");
     assert!(!is_link(&v4));
-    assert_eq!(
-        VortexRdfStore::from_file(&next)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        6
-    );
+    assert_eq!(stored_size(&next).await, 6);
     assert_eq!(entries(&versions), vec![v4]);
 }
 
@@ -162,12 +164,7 @@ async fn test_a_symlink_to_a_directory_or_a_loop_is_refused() {
 async fn test_compacting_a_store_opened_through_a_symlink_keeps_the_link() {
     let (_dir, v3, current) = versioned_store().await;
     let store = VortexRdfStore::from_file(&current).await.unwrap();
-    let extra = make_quad(
-        "http://example.org/s99",
-        "http://example.org/p0",
-        "object 9",
-        GraphName::DefaultGraph,
-    );
+    let extra = extra_quad();
 
     let compacted = store
         .add_quad(extra)
@@ -179,15 +176,7 @@ async fn test_compacting_a_store_opened_through_a_symlink_keeps_the_link() {
 
     assert!(is_link(&current) && !is_link(&v3));
     assert_eq!(compacted.size().await.unwrap(), 13);
-    assert_eq!(
-        VortexRdfStore::from_file(&v3)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        13
-    );
+    assert_eq!(stored_size(&v3).await, 13);
 }
 
 /// The new store has the permission bits of the one it replaces, however
@@ -202,15 +191,7 @@ async fn test_a_rebuild_keeps_the_permission_bits_of_the_store_it_replaces() {
         rebuild(&path, modular_quads(5, 2, 2)).await.unwrap();
 
         assert_eq!(mode_of(&path), mode, "{mode:o}");
-        assert_eq!(
-            VortexRdfStore::from_file(&path)
-                .await
-                .unwrap()
-                .size()
-                .await
-                .unwrap(),
-            5
-        );
+        assert_eq!(stored_size(&path).await, 5);
     }
 }
 
@@ -224,15 +205,7 @@ async fn test_a_rebuild_through_a_symlink_keeps_the_targets_permissions() {
 
     // v3 is the file that was replaced (it holds the new five quads), and
     // it kept its bits.
-    assert_eq!(
-        VortexRdfStore::from_file(&v3)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        5
-    );
+    assert_eq!(stored_size(&v3).await, 5);
     assert_eq!(mode_of(&v3), 0o640);
 }
 
@@ -339,14 +312,7 @@ async fn test_a_store_the_process_cannot_write_is_never_replaced() {
     .await
     .expect_err("a read-only store must not be replaced");
 
-    let VortexRdfError::Io(io_error) = &error else {
-        panic!("expected an I/O error, got {error:?}");
-    };
-    assert_eq!(
-        io_error.kind(),
-        std::io::ErrorKind::PermissionDenied,
-        "{error}"
-    );
+    assert_permission_denied(&error);
     assert!(
         error.to_string().contains(&format!("{path:?}")),
         "the error must name the path: {error}"
@@ -389,10 +355,7 @@ async fn test_a_symlink_to_a_store_the_process_cannot_write_is_refused() {
         .await
         .expect_err("a read-only store must not be replaced");
 
-    assert!(
-        matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
-        "{error}"
-    );
+    assert_permission_denied(&error);
     assert!(
         error.to_string().contains(&format!("{current:?}")),
         "the error must name the path it was asked to write: {error}"
@@ -415,12 +378,7 @@ async fn test_compaction_leaves_a_store_the_process_cannot_write_alone() {
     }
     let before = std::fs::read(&path).unwrap();
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let extra = make_quad(
-        "http://example.org/s99",
-        "http://example.org/p0",
-        "object 9",
-        GraphName::DefaultGraph,
-    );
+    let extra = extra_quad();
 
     let tailed = store.add_quad(extra).await.unwrap();
     let gathered = crate::store::test_hooks::gathers();
@@ -437,10 +395,7 @@ async fn test_compaction_leaves_a_store_the_process_cannot_write_alone() {
         "the live rows were gathered although the store file cannot be rewritten"
     );
 
-    assert!(
-        matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
-        "{error}"
-    );
+    assert_permission_denied(&error);
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(entries(dir.path()), vec![path.clone()]);
 }
@@ -500,12 +455,7 @@ async fn test_compaction_spills_beside_the_file_it_replaces_not_the_link() {
     }
     let (dir, v3, current) = versioned_store().await;
     let store = VortexRdfStore::from_file(&current).await.unwrap();
-    let extra = make_quad(
-        "http://example.org/s99",
-        "http://example.org/p0",
-        "object 9",
-        GraphName::DefaultGraph,
-    );
+    let extra = extra_quad();
     let tailed = store.add_quad(extra).await.unwrap();
     let Some(_read_only) = read_only_dir(dir.path()) else {
         return;
@@ -520,15 +470,7 @@ async fn test_compaction_spills_beside_the_file_it_replaces_not_the_link() {
 
     assert!(is_link(&current) && !is_link(&v3));
     assert_eq!(compacted.size().await.unwrap(), 13);
-    assert_eq!(
-        VortexRdfStore::from_file(&v3)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        13
-    );
+    assert_eq!(stored_size(&v3).await, 13);
     let versions = dir.path().join("versions");
     let spilled = spill_hooks::last_dir().expect("the compaction made a run directory");
     assert_ne!(
@@ -559,10 +501,7 @@ fn test_spill_write_error_names_the_directory_and_the_hint() {
         .err()
         .expect("a directory that takes no new files takes no spill run");
 
-    assert!(
-        matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
-        "{error}"
-    );
+    assert_permission_denied(&error);
     let message = error.to_string();
     assert!(
         message.contains(&dir.path().display().to_string()),
@@ -595,10 +534,7 @@ fn test_spill_directory_error_names_the_directory_and_the_hint() {
         .err()
         .expect("a directory that takes no new files takes no run directory");
 
-    assert!(
-        matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
-        "{error}"
-    );
+    assert_permission_denied(&error);
     let message = error.to_string();
     assert!(
         message.contains(&dir.path().display().to_string()),
@@ -690,10 +626,7 @@ async fn assert_kept_in_the_tail(
         .await
         .err()
         .expect("an explicit compaction of a store that cannot be rewritten must fail");
-    assert!(
-        matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
-        "{error}"
-    );
+    assert_permission_denied(&error);
 
     // A later append retries, is refused the same way, and is kept too.
     let extra = make_quad(
@@ -802,12 +735,7 @@ async fn test_compaction_refuses_a_link_retargeted_since_the_store_opened() {
     std::fs::remove_file(&current).unwrap();
     symlink("versions/v4.vortex", &current).unwrap();
     let (v3_before, v4_before) = (std::fs::read(&v3).unwrap(), std::fs::read(&v4).unwrap());
-    let extra = make_quad(
-        "http://example.org/s99",
-        "http://example.org/p0",
-        "object 9",
-        GraphName::DefaultGraph,
-    );
+    let extra = extra_quad();
     let tailed = store.add_quad(extra).await.unwrap();
 
     let error = tailed
@@ -856,12 +784,7 @@ async fn test_compacting_a_store_whose_file_was_removed_writes_it_again() {
     let quads = modular_quads(12, 3, 4);
     let (dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let extra = make_quad(
-        "http://example.org/s99",
-        "http://example.org/p0",
-        "object 9",
-        GraphName::DefaultGraph,
-    );
+    let extra = extra_quad();
     let tailed = store.add_quad(extra.clone()).await.unwrap();
     std::fs::remove_file(&path).unwrap();
 
@@ -921,12 +844,7 @@ async fn test_a_file_replaced_during_the_write_is_not_overwritten() {
         .expect_err("the file changed while the store was written");
 
     assert_replaced_since_open(&error, &path);
-    let rebuilt = VortexRdfStore::from_file(&path).await.unwrap();
-    assert_eq!(
-        rebuilt.size().await.unwrap(),
-        5,
-        "the rebuild was overwritten"
-    );
+    assert_eq!(stored_size(&path).await, 5, "the rebuild was overwritten");
     assert_eq!(entries(dir.path()), vec![path.clone()]);
 }
 
@@ -972,10 +890,7 @@ async fn test_only_the_refusal_before_the_build_counts_as_unwritable() {
         eprintln!("skipped: the rename went through in a 0555 directory (root?)");
         return;
     };
-    assert!(
-        matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
-        "{error}"
-    );
+    assert_permission_denied(&error);
     assert!(
         !error.is_unwritable(),
         "a refused rename after the build is not the pre-flight refusal: {error}"

@@ -1047,6 +1047,17 @@ fn graph_modular_quads(
         .collect()
 }
 
+/// The quad `s99 p0 "object 9"` in the default graph: one to add to a store
+/// of a few [`modular_quads`], whose subjects stop short of it.
+fn extra_quad() -> Quad {
+    make_quad(
+        "http://example.org/s99",
+        "http://example.org/p0",
+        "object 9",
+        GraphName::DefaultGraph,
+    )
+}
+
 /// 3,000 quads `s{i:04} p{i % 5} "o{i % 7}"` cycling through the default
 /// graph, `g1` and `g2`: the dataset of the suites that check narrowed views
 /// and their exports against the gathered codes. Subjects are unique, so a

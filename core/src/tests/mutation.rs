@@ -463,15 +463,7 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
 async fn test_delete_matching_spans_base_and_tail() {
     let quads = modular_quads(12, 3, 4);
     let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
-    let tailed = store
-        .add_quads([make_quad(
-            "http://example.org/s99",
-            "http://example.org/p0",
-            "object 9",
-            GraphName::DefaultGraph,
-        )])
-        .await
-        .unwrap();
+    let tailed = store.add_quads([extra_quad()]).await.unwrap();
     assert_eq!(tailed.size().await.unwrap(), 13);
 
     // p0 is on base rows 0, 3, 6, 9 and on the appended s99.
@@ -930,12 +922,7 @@ async fn run_file_backed_compaction(index: IndexType) {
 
     // A file-backed store keeps its tail until an explicit compact; that
     // compaction folds the appended row into the file too.
-    let extra = make_quad(
-        "http://example.org/s99",
-        "http://example.org/p0",
-        "object 9",
-        GraphName::DefaultGraph,
-    );
+    let extra = extra_quad();
     let appended = reopened.add_quad(extra.clone()).await.unwrap();
     assert_eq!(appended.tail_len(), 1);
     let recompacted = appended.compact().await.unwrap();
