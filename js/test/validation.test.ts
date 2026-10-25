@@ -21,6 +21,21 @@ describe('term validation and malformed input', () => {
         await expect(VortexRdfStore.fromQuads([numeric])).rejects.toThrow(/Invalid quad object at index 0/);
     });
 
+    test('the packed path reports a malformed quad by its index in the whole array', async () => {
+        // The array is packed and decoded 65,536 quads at a time; the last
+        // quad sits in the second chunk. One malformed quad is caught by the
+        // packer, the other's IRI by the Rust-side term constructor.
+        const n = 70_000;
+        const quads = Array.from({ length: n }, (_, i) => df.quad(ex(`s${i}`), ex('p'), df.literal('o')));
+        const badIri = { subject: { termType: 'NamedNode', value: 'not an iri' }, predicate: p, object: o } as unknown as Quad;
+        for (const malformed of [badObject, badIri]) {
+            const input = [...quads.slice(0, n - 1), malformed];
+            const atLast = new RegExp(`Invalid quad object at index ${n - 1}$`);
+            await expect.soft(VortexRdfStore.fromQuads(input)).rejects.toThrow(atLast);
+            await expect.soft(VortexRdfStore.empty().addQuads(input)).rejects.toThrow(atLast);
+        }
+    });
+
     test('the stream path reports the position of a malformed quad', async () => {
         const stream = Readable.from([good, badObject], { objectMode: true });
         await expect(VortexRdfStore.fromQuads(stream)).rejects

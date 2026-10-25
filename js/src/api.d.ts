@@ -164,6 +164,8 @@ export type Probe =
  * its `datatype.value` is, else simple. A literal's `datatype`, when present,
  * is a NamedNode object: a non-object such as a bare IRI string is malformed,
  * in a quad and in a pattern alike. An absent graph is the default graph.
+ * `addQuads` and `fromQuads` name a malformed quad by its index in the array
+ * (`Invalid quad object at index 70000`), or by its position in a stream.
  */
 export class VortexRdfStore {
     static empty(): VortexRdfStore;

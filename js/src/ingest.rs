@@ -33,7 +33,8 @@ fn js_array_decode(quads: &Array, mut emit: impl FnMut(Quad)) -> Result<(), JsVa
     let mut start = 0u32;
     while start < total {
         let end = (start + PACK_CHUNK).min(total);
-        decode_packed(&pack_quads(quads, start, end)?.to_vec(), &mut emit)?;
+        let packed = pack_quads(quads, start, end)?.to_vec();
+        decode_packed(&packed, start as usize, &mut emit)?;
         start = end;
     }
     Ok(())
@@ -75,16 +76,17 @@ pub(crate) fn js_array_to_quads(quads: &Array) -> Result<Vec<Quad>, JsValue> {
     js_array_collect(quads, |q| q)
 }
 
-/// Decode the buffer [`pack_quads`] produced, handing each quad to `emit` as
-/// it is decoded. Each term is built by its position's validated constructor
-/// in [`crate::terms`], the ones the reflection reader [`js_to_quad`] builds
-/// through, so both decoders accept the same terms; a term a constructor
-/// rejects is reported with its quad's index.
+/// Decode the buffer [`pack_quads`] produced for the quads from array index
+/// `first` on, handing each quad to `emit` as it is decoded. Each term is
+/// built by its position's validated constructor in [`crate::terms`], the
+/// ones the reflection reader [`js_to_quad`] builds through, so both decoders
+/// accept the same terms; a term a constructor rejects is reported with its
+/// quad's index in the array, as the packer reports the quads it rejects.
 ///
 /// On the ingest path `emit` converts each quad as it is produced, so the
 /// `oxrdf::Quad` is dropped inside the loop and at most one packed chunk's
 /// terms are live at a time.
-fn decode_packed(bytes: &[u8], emit: &mut impl FnMut(Quad)) -> Result<(), JsValue> {
+fn decode_packed(bytes: &[u8], first: usize, emit: &mut impl FnMut(Quad)) -> Result<(), JsValue> {
     struct Cursor<'a> {
         bytes: &'a [u8],
         pos: usize,
@@ -130,7 +132,7 @@ fn decode_packed(bytes: &[u8], emit: &mut impl FnMut(Quad)) -> Result<(), JsValu
     let invalid = |i: usize| js_err(format!("Invalid quad object at index {}", i));
     let mut cur = Cursor { bytes, pos: 0 };
     let n = cur.u32()? as usize;
-    for i in 0..n {
+    for i in first..first + n {
         let s = cur.term(subject)?.ok_or_else(|| invalid(i))?;
         let p = cur.term(predicate)?.ok_or_else(|| invalid(i))?;
         let o = cur.term(object)?.ok_or_else(|| invalid(i))?;
