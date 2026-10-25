@@ -36,7 +36,7 @@ use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_reads::take_file_rows, read_plan::ExactRead};
 use crate::store::schema::{QuadColumn, RowId, TermCode};
-use crate::store::view::selection::RowSelection;
+use crate::store::view::selection::{RowSelection, SelectedRows};
 
 /// A view's rows as struct chunks in the layout's primary dtype, each of at
 /// most the requested `batch_rows` rows.
@@ -214,20 +214,18 @@ impl VortexRdfStore {
     /// served view's pending selection materializes here.
     fn memory_rows(&self, batch_rows: usize) -> Result<MemoryRows> {
         let base_len = self.quads.base_len();
-        Ok(
-            match (self.quads.selection.materialized()?, &self.quads.deleted) {
-                (RowSelection::All, None) => MemoryRows::Run(0..base_len),
-                (RowSelection::Range(range), None) => {
-                    MemoryRows::Run(range.start as usize..range.end as usize)
-                }
-                (selection, deleted) => MemoryRows::Windows(live_id_windows(
-                    selection,
-                    deleted.clone(),
-                    base_len,
-                    batch_rows,
-                )),
-            },
-        )
+        let selection = self.quads.selection.materialized()?;
+        if self.quads.deleted.is_none()
+            && let SelectedRows::Run(run) = selection.as_rows(base_len)
+        {
+            return Ok(MemoryRows::Run(run));
+        }
+        Ok(MemoryRows::Windows(live_id_windows(
+            &selection,
+            self.quads.deleted.clone(),
+            base_len,
+            batch_rows,
+        )))
     }
 
     /// A file view's base chunks, its [`ExactRead`] chosen once: a selection
@@ -320,16 +318,18 @@ fn id_windows(
 /// tombstones sliced, any other selection walked and filtered one window at a
 /// time, so no id list is built beyond the selection's own.
 fn live_id_windows(
-    selection: RowSelection,
+    selection: &RowSelection,
     deleted: Option<Mask>,
     base_len: usize,
     batch_rows: usize,
 ) -> IdWindows {
-    match (selection, deleted) {
-        (RowSelection::Ids(ids), None) => Box::new(id_windows(ids, batch_rows)),
-        (RowSelection::All, deleted) => filtered_windows(0..base_len as RowId, deleted, batch_rows),
-        (RowSelection::Range(range), deleted) => filtered_windows(range, deleted, batch_rows),
-        (RowSelection::Ids(ids), deleted) => {
+    match (selection.as_rows(base_len), deleted) {
+        (SelectedRows::Ids(ids), None) => Box::new(id_windows(ids.clone(), batch_rows)),
+        (SelectedRows::Run(run), deleted) => {
+            filtered_windows(run.start as RowId..run.end as RowId, deleted, batch_rows)
+        }
+        (SelectedRows::Ids(ids), deleted) => {
+            let ids = ids.clone();
             filtered_windows((0..ids.len()).map(move |k| ids[k]), deleted, batch_rows)
         }
     }

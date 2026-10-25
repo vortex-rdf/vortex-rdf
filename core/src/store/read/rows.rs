@@ -23,9 +23,9 @@ use crate::store::scan::read_plan::{ExactRead, MaskedRead};
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_exprs, file_reads, file_scans};
 use crate::store::schema::{self, RowId, TermCode};
-use crate::store::view::selection::RowSelection;
+use crate::store::view::selection::SelectedRows;
 #[cfg(feature = "file-io")]
-use crate::store::view::selection::ViewSelection;
+use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{Backend, MemoryBase};
 
 use futures::stream::{self, StreamExt};
@@ -148,30 +148,23 @@ impl VortexRdfStore {
         // Without tombstones a contiguous selection shares the base's buffers
         // (a `Buffer` slice is a refcount bump) and an id list is a
         // branch-free gather; only tombstoned views test liveness per row.
+        let rows = selection.as_rows(self.quads.base_len());
         let Some(deleted) = &self.quads.deleted else {
-            return Some(match &selection {
-                RowSelection::All => prims.map(|prim| prim.into_buffer::<TermCode>()),
-                RowSelection::Range(r) => prims.map(|prim| {
-                    prim.into_buffer::<TermCode>()
-                        .slice(r.start as usize..r.end as usize)
-                }),
-                RowSelection::Ids(ids) => gather_codes(&prims, ids),
+            return Some(match rows {
+                SelectedRows::Run(run) => {
+                    prims.map(|prim| prim.into_buffer::<TermCode>().slice(run.clone()))
+                }
+                SelectedRows::Ids(ids) => gather_codes(&prims, ids),
             });
         };
-        let base_len = self.quads.base_len();
         let live = |i: usize| !deleted.value(i);
         let column = |prim: &PrimitiveArray| -> Buffer<TermCode> {
             let slice = prim.as_slice::<TermCode>();
-            match &selection {
-                RowSelection::All => {
-                    Buffer::from_iter((0..base_len).filter(|&i| live(i)).map(|i| slice[i]))
+            match &rows {
+                SelectedRows::Run(run) => {
+                    Buffer::from_iter(run.clone().filter(|&i| live(i)).map(|i| slice[i]))
                 }
-                RowSelection::Range(r) => Buffer::from_iter(
-                    (r.start as usize..r.end as usize)
-                        .filter(|&i| live(i))
-                        .map(|i| slice[i]),
-                ),
-                RowSelection::Ids(ids) => Buffer::from_iter(
+                SelectedRows::Ids(ids) => Buffer::from_iter(
                     ids.iter()
                         .map(|&i| i as usize)
                         .filter(|&i| live(i))

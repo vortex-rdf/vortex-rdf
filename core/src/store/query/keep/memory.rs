@@ -19,7 +19,7 @@ use crate::store::array::{column_is_sorted, into_struct_array};
 use crate::store::probes::StructProbes;
 use crate::store::resident::cached_code_primitive;
 use crate::store::schema::{self, QuadColumn, RowId, TermCode};
-use crate::store::view::selection::{RowSelection, ViewSelection, point_sized};
+use crate::store::view::selection::{RowSelection, SelectedRows, ViewSelection, point_sized};
 use crate::store::{MemoryBase, VortexRdfStore};
 
 impl VortexRdfStore {
@@ -87,10 +87,8 @@ impl VortexRdfStore {
         column: QuadColumn,
         keep: &Keep,
     ) -> Option<RowSelection> {
-        let run = match selection {
-            RowSelection::All => 0..base.len(),
-            RowSelection::Range(range) => range.start as usize..range.end as usize,
-            RowSelection::Ids(_) => return None,
+        let SelectedRows::Run(run) = selection.as_rows(base.len()) else {
+            return None;
         };
         let s_col = struct_arr.unmasked_field_by_name(schema::COL_S).ok()?;
         if !column_is_sorted(s_col) {
@@ -256,14 +254,9 @@ fn keep_by_pieces(
         return Ok(survivors(selection, base_len, kept));
     }
     // The selected rows: every row of one stretch, or an ascending id list.
-    let (stretch, listed) = match selection {
-        RowSelection::All => (0..base_len, None),
-        RowSelection::Range(range) => {
-            let end = usize::try_from(range.end).map_or(base_len, |end| end.min(base_len));
-            let start = usize::try_from(range.start).map_or(end, |start| start.min(end));
-            (start..end, None)
-        }
-        RowSelection::Ids(ids) => (0..base_len, Some(ids.as_slice())),
+    let (stretch, listed) = match selection.as_rows(base_len) {
+        SelectedRows::Run(run) => (run, None),
+        SelectedRows::Ids(ids) => (0..base_len, Some(ids.as_slice())),
     };
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     let mut kept: Vec<RowId> = Vec::new();

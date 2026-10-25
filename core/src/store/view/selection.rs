@@ -194,10 +194,9 @@ impl RowSelection {
                 .map(|start| RowSelection::Range(start..start.saturating_add(per).min(range.end)))
                 .collect()
         }
-        match self {
-            RowSelection::All => ranges(0..base_len as u64, n),
-            RowSelection::Range(range) => ranges(range.clone(), n),
-            RowSelection::Ids(ids) => {
+        match self.as_rows(base_len) {
+            SelectedRows::Run(run) => ranges(run.start as u64..run.end as u64, n),
+            SelectedRows::Ids(ids) => {
                 let len = ids.len();
                 if len == 0 {
                     return Vec::new();
@@ -247,20 +246,15 @@ impl RowSelection {
         deleted: Option<&Mask>,
         base_len: usize,
     ) -> Self {
+        let rows = self.as_rows(base_len);
         let Some(deleted) = deleted else {
-            return match self {
-                RowSelection::All => {
-                    let start = offset.min(base_len);
-                    let end = start.saturating_add(limit).min(base_len);
+            return match rows {
+                SelectedRows::Run(run) => {
+                    let start = run.start.saturating_add(offset).min(run.end);
+                    let end = start.saturating_add(limit).min(run.end);
                     Self::range_or_empty(start as u64..end as u64)
                 }
-                RowSelection::Range(range) => {
-                    let range = clamped(range, base_len);
-                    let start = range.start.saturating_add(offset).min(range.end);
-                    let end = start.saturating_add(limit).min(range.end);
-                    Self::range_or_empty(start as u64..end as u64)
-                }
-                RowSelection::Ids(ids) => {
+                SelectedRows::Ids(ids) => {
                     let start = offset.min(ids.len());
                     let end = start.saturating_add(limit).min(ids.len());
                     if start == end {
@@ -272,20 +266,14 @@ impl RowSelection {
             };
         };
         let live = |id: &RowId| !deleted.value(*id as usize);
-        let ids: Buffer<RowId> = match self {
-            RowSelection::All => {
-                Buffer::from_iter((0..base_len as u64).filter(live).skip(offset).take(limit))
-            }
-            RowSelection::Range(range) => {
-                let range = clamped(range, base_len);
-                Buffer::from_iter(
-                    (range.start as u64..range.end as u64)
-                        .filter(live)
-                        .skip(offset)
-                        .take(limit),
-                )
-            }
-            RowSelection::Ids(ids) => {
+        let ids: Buffer<RowId> = match rows {
+            SelectedRows::Run(run) => Buffer::from_iter(
+                (run.start as u64..run.end as u64)
+                    .filter(live)
+                    .skip(offset)
+                    .take(limit),
+            ),
+            SelectedRows::Ids(ids) => {
                 Buffer::from_iter(ids.iter().copied().filter(live).skip(offset).take(limit))
             }
         };
@@ -312,14 +300,26 @@ impl RowSelection {
     }
 
     /// The base row ids this selection covers out of `base_len` that `keep`
-    /// admits, ascending: one loop per variant, each compiled for the
-    /// caller's own `keep`.
+    /// admits, ascending: one loop per shape of its rows ([`SelectedRows`]),
+    /// each compiled for the caller's own `keep`.
     #[inline]
     pub(crate) fn filter_rows(&self, base_len: usize, keep: impl Fn(usize) -> bool) -> Vec<u64> {
+        match self.as_rows(base_len) {
+            SelectedRows::Run(run) => (run.start as u64..run.end as u64)
+                .filter(|&i| keep(i as usize))
+                .collect(),
+            SelectedRows::Ids(ids) => ids.iter().copied().filter(|&i| keep(i as usize)).collect(),
+        }
+    }
+
+    /// The rows this selection covers out of `base_len`, in the shape its
+    /// readers consume: every row as one run, a range clamped to the base
+    /// as one run, an id list as itself.
+    pub(crate) fn as_rows(&self, base_len: usize) -> SelectedRows<'_> {
         match self {
-            RowSelection::All => (0..base_len as u64).filter(|&i| keep(i as usize)).collect(),
-            RowSelection::Range(range) => range.clone().filter(|&i| keep(i as usize)).collect(),
-            RowSelection::Ids(ids) => ids.iter().copied().filter(|&i| keep(i as usize)).collect(),
+            RowSelection::All => SelectedRows::Run(0..base_len),
+            RowSelection::Range(range) => SelectedRows::Run(clamped(range, base_len)),
+            RowSelection::Ids(ids) => SelectedRows::Ids(ids),
         }
     }
 
@@ -479,6 +479,16 @@ fn restrict_ids(ids: Buffer<RowId>, range: &Range<RowId>) -> Buffer<RowId> {
     let lo = slice.partition_point(|&id| id < range.start);
     let hi = slice.partition_point(|&id| id < range.end);
     ids.slice(lo..hi)
+}
+
+/// A selection's base rows ([`RowSelection::as_rows`]): one run of base row
+/// positions, or an ascending id list, borrowed so a slice of it stays a
+/// refcount bump.
+pub(crate) enum SelectedRows<'a> {
+    /// Every base row of this run, in order.
+    Run(Range<usize>),
+    /// The base rows these ids name, ascending and unique.
+    Ids(&'a Buffer<RowId>),
 }
 
 /// A base row range as `usize` positions, clamped to `base_len` (an
