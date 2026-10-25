@@ -101,16 +101,10 @@ impl VortexRdfStore {
         offset: usize,
         limit: Option<usize>,
     ) -> Result<Option<LocatedCodes>> {
-        use crate::VortexRdfError;
-        use crate::store::layouts::LayoutStrategy;
         use crate::store::persist::native_file::LocatedTables;
         use crate::store::schema::PRIMARY_COLUMNS;
 
-        if self.layout.strategy() != LayoutStrategy::Dictionary
-            || self.tail_len() != 0
-            || self.quads.deleted.is_some()
-            || !self.quads.selection.is_all()
-        {
+        if !self.is_code_view() || self.quads.deleted.is_some() || !self.quads.selection.is_all() {
             return Ok(None);
         }
         let Some(base) = self.quads.file() else {
@@ -160,61 +154,15 @@ impl VortexRdfStore {
             let Some(columns) = columns else {
                 continue;
             };
-            let lead = order[0];
-            let Some(mut run) = columns[lead]
-                .bounds(codes[lead].expect("a bound lead key"), &source, session)
-                .await
-                .map_err(VortexRdfError::Vortex)?
+            let Some(run) = locate_run(columns, order, prefix, &codes, &source, session).await?
             else {
                 continue;
             };
-            let mut declined = false;
-            for &key in &order[1..prefix] {
-                if run.is_empty() {
-                    break;
-                }
-                match columns[key]
-                    .bounds_in(
-                        run.clone(),
-                        codes[key].expect("a bound key"),
-                        &source,
-                        session,
-                    )
-                    .await
-                    .map_err(VortexRdfError::Vortex)?
-                {
-                    Some(narrowed) => run = narrowed,
-                    None => {
-                        declined = true;
-                        break;
-                    }
-                }
-            }
-            if declined {
-                continue;
-            }
             let total = run.end - run.start;
-            let from = run.start.saturating_add(offset as u64).min(run.end);
-            let to = match limit {
-                Some(limit) => from.saturating_add(limit as u64).min(run.end),
-                None => run.end,
-            };
-            let mut out: [Buffer<TermCode>; 4] = Default::default();
-            for (column, slot) in out.iter_mut().enumerate() {
-                *slot = match codes[column] {
-                    Some(code) => {
-                        vortex_buffer::BufferMut::full(code, (to - from) as usize).freeze()
-                    }
-                    None => match read_codes(&columns[column], from..to, &source, session).await? {
-                        Some(codes) => codes,
-                        None => return Ok(None),
-                    },
-                };
-            }
-            return Ok(Some(LocatedCodes {
-                total,
-                columns: out,
-            }));
+            let window = window_of(total, offset, limit);
+            let rows = WindowRows::Run(run.start + window.start..run.start + window.end);
+            let columns = window_columns(&codes, columns, rows, &source, session).await?;
+            return Ok(columns.map(|columns| LocatedCodes { total, columns }));
         }
         // Boxed: its state would otherwise enlarge every lookup's future,
         // the sorted tables' too.
@@ -268,8 +216,6 @@ async fn by_reference(
     source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
     session: &vortex_session::VortexSession,
 ) -> Result<Option<LocatedCodes>> {
-    use crate::VortexRdfError;
-
     let Some(quads) = &tables.sorted[0] else {
         return Ok(None);
     };
@@ -278,10 +224,7 @@ async fn by_reference(
         let (Some(code), Some([val, _])) = (codes[slot], &tables.references[i]) else {
             continue;
         };
-        runs[i] = val
-            .bounds(code, source, session)
-            .await
-            .map_err(VortexRdfError::Vortex)?;
+        runs[i] = val.bounds(code, source, session).await?;
     }
     let Some(index) = (0..2)
         .filter(|&i| runs[i].is_some())
@@ -301,8 +244,7 @@ async fn by_reference(
     let subject = match codes[0] {
         Some(code) if quads_sorted => quads[0]
             .bounds(code, source, session)
-            .await
-            .map_err(VortexRdfError::Vortex)?
+            .await?
             .filter(|subject| subject.end - subject.start <= run.end - run.start),
         _ => None,
     };
@@ -313,14 +255,9 @@ async fn by_reference(
     let checked: Vec<usize> = (0..4)
         .filter(|&slot| slot != key && codes[slot].is_some())
         .collect();
-    let window = |total: u64| {
-        let from = (offset as u64).min(total);
-        let to = limit.map_or(total, |limit| from.saturating_add(limit as u64).min(total));
-        from..to
-    };
     let (total, rows) = if checked.is_empty() {
         let total = run.end - run.start;
-        let w = window(total);
+        let w = window_of(total, offset, limit);
         match read_codes(rid, run.start + w.start..run.start + w.end, source, session).await? {
             Some(rows) => (total, rows),
             None => return Ok(None),
@@ -361,11 +298,7 @@ async fn by_reference(
                 let mut from = other_run.start;
                 while from < other_run.end && !pending.is_empty() {
                     let to = other_rid.leaf_end(from).min(other_run.end);
-                    let Some(leaf) = other_rid
-                        .leaf_rows(from..to, source, session)
-                        .await
-                        .map_err(VortexRdfError::Vortex)?
-                    else {
+                    let Some(leaf) = other_rid.leaf_rows(from..to, source, session).await? else {
                         return Ok(None);
                     };
                     while let Some((&row, rest)) = pending.split_first() {
@@ -395,26 +328,99 @@ async fn by_reference(
                 .collect();
         }
         let total = rows.len() as u64;
-        let w = window(total);
+        let w = window_of(total, offset, limit);
         (
             total,
             Buffer::copy_from(&rows[w.start as usize..w.end as usize]),
         )
     };
+    let columns = window_columns(&codes, quads, WindowRows::Ids(&rows), source, session).await?;
+    Ok(columns.map(|columns| LocatedCodes { total, columns }))
+}
+
+/// The run of a sorted table's rows holding `codes` in the first `prefix`
+/// slots of its key `order` (`(s, p, o, g)` positions): the lead key's
+/// bounds, narrowed key by key inside the run until it empties. `None` when a
+/// chunk declines its probe.
+#[cfg(feature = "file-io")]
+async fn locate_run(
+    columns: &[std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>; 4],
+    order: &[usize; 4],
+    prefix: usize,
+    codes: &[Option<TermCode>; 4],
+    source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
+    session: &vortex_session::VortexSession,
+) -> Result<Option<std::ops::Range<u64>>> {
+    let lead = order[0];
+    let Some(mut run) = columns[lead]
+        .bounds(codes[lead].expect("a bound lead key"), source, session)
+        .await?
+    else {
+        return Ok(None);
+    };
+    for &key in &order[1..prefix] {
+        if run.is_empty() {
+            break;
+        }
+        let code = codes[key].expect("a bound key");
+        let Some(narrowed) = columns[key].bounds_in(run, code, source, session).await? else {
+            return Ok(None);
+        };
+        run = narrowed;
+    }
+    Ok(Some(run))
+}
+
+/// The positions `offset..offset + limit` of `total` matches, clamped to
+/// them (`None`: to the last).
+#[cfg(feature = "file-io")]
+fn window_of(total: u64, offset: usize, limit: Option<usize>) -> std::ops::Range<u64> {
+    let from = (offset as u64).min(total);
+    let to = limit.map_or(total, |limit| from.saturating_add(limit as u64).min(total));
+    from..to
+}
+
+/// A window's quad-table rows: a contiguous run of a sorted table, or the
+/// ascending rows a reference run and its checks kept.
+#[cfg(feature = "file-io")]
+enum WindowRows<'a> {
+    Run(std::ops::Range<u64>),
+    Ids(&'a [u64]),
+}
+
+/// The `(s, p, o, g)` code columns of a window's `rows` of a table whose
+/// columns (in those positions) are `columns`: a bound slot is its code
+/// repeated, a free one read through its chunk probes. `None` when a chunk
+/// declines its probe.
+#[cfg(feature = "file-io")]
+async fn window_columns(
+    codes: &[Option<TermCode>; 4],
+    columns: &[std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>; 4],
+    rows: WindowRows<'_>,
+    source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
+    session: &vortex_session::VortexSession,
+) -> Result<Option<[Buffer<TermCode>; 4]>> {
+    let len = match &rows {
+        WindowRows::Run(run) => (run.end - run.start) as usize,
+        WindowRows::Ids(ids) => ids.len(),
+    };
     let mut out: [Buffer<TermCode>; 4] = Default::default();
     for (slot, column) in out.iter_mut().enumerate() {
-        *column = match codes[slot] {
-            Some(code) => vortex_buffer::BufferMut::full(code, rows.len()).freeze(),
-            None => match take_codes(&quads[slot], &rows, source, session).await? {
-                Some(codes) => codes,
-                None => return Ok(None),
-            },
+        let read = match (codes[slot], &rows) {
+            (Some(code), _) => Some(vortex_buffer::BufferMut::full(code, len).freeze()),
+            (None, WindowRows::Run(run)) => {
+                read_codes(&columns[slot], run.clone(), source, session).await?
+            }
+            (None, WindowRows::Ids(ids)) => {
+                take_codes(&columns[slot], ids, source, session).await?
+            }
         };
+        let Some(read) = read else {
+            return Ok(None);
+        };
+        *column = read;
     }
-    Ok(Some(LocatedCodes {
-        total,
-        columns: out,
-    }))
+    Ok(Some(out))
 }
 
 /// Rows up to which a column is read value by value through its leaves'
@@ -432,18 +438,13 @@ async fn read_codes(
     source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
     session: &vortex_session::VortexSession,
 ) -> Result<Option<Buffer<TermCode>>> {
-    use crate::VortexRdfError;
-
     // A count's window, or a run past the end, reads nothing.
     if rows.is_empty() {
         return Ok(Some(Buffer::empty()));
     }
     // A run inside one leaf reads through that leaf's probe, found once.
     if rows.end - rows.start <= POINT_CODES as u64
-        && let Some(leaf) = column
-            .leaf_rows(rows.clone(), source, session)
-            .await
-            .map_err(VortexRdfError::Vortex)?
+        && let Some(leaf) = column.leaf_rows(rows.clone(), source, session).await?
     {
         let mut codes = vortex_buffer::BufferMut::with_capacity((rows.end - rows.start) as usize);
         codes.extend(rows.map(|row| leaf.value_at(row)));
@@ -463,7 +464,6 @@ async fn take_codes(
     source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
     session: &vortex_session::VortexSession,
 ) -> Result<Option<Buffer<TermCode>>> {
-    use crate::VortexRdfError;
     use crate::session::VORTEX_SESSION;
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::PrimitiveArray;
@@ -475,8 +475,7 @@ async fn take_codes(
             let inside = rest.partition_point(|&row| row < column.leaf_end(first));
             let Some(leaf) = column
                 .leaf_rows(first..rest[inside - 1] + 1, source, session)
-                .await
-                .map_err(VortexRdfError::Vortex)?
+                .await?
             else {
                 return Ok(None);
             };
@@ -485,17 +484,11 @@ async fn take_codes(
         }
         return Ok(Some(codes.freeze()));
     }
-    let Some(taken) = column
-        .take(rows, source, session)
-        .await
-        .map_err(VortexRdfError::Vortex)?
-    else {
+    let Some(taken) = column.take(rows, source, session).await? else {
         return Ok(None);
     };
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let prim = taken
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let prim = taken.execute::<PrimitiveArray>(&mut ctx)?;
     Ok(Some(prim.into_buffer::<TermCode>()))
 }
 
