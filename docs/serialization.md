@@ -178,7 +178,7 @@ of its adjacent repeats, and built into one struct of primary columns through
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
-([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L135)):
+([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L137)):
 each distinct term is held once (a `Box<str>` keyed map), and each quad is kept
 as four provisional `u64` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
@@ -187,7 +187,7 @@ lexicographic ranks, sorting `[u64; 4]` rows is the same order as sorting the
 term strings, so the sort moves 32-byte rows instead of four-string structs;
 equal rows are then adjacent and the repeats are dropped, since equal codes are
 equal terms.
-[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L99) is
+[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L101) is
 the push-based form of the same ingest, for callers that produce quads one at a
 time (the wasm array path).
 
@@ -254,7 +254,7 @@ it.
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229)):
 every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
-([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L116)) or,
+([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L106)) or,
 under the string layouts, as their terms again
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L172)). With indexes a
 first merge runs to completion

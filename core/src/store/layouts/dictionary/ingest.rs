@@ -19,7 +19,7 @@ use crate::store::builders::{BuiltArray, build_components};
 use crate::store::indexes::{IndexInput, Indexes};
 use crate::store::schema::TermCode;
 
-use super::codec::{QuadCodes, build_array};
+use super::codec::{QuadCodes, build_code_chunk};
 use super::term_dict::TermDictionary;
 
 /// Term → code lookup borrowing its keys from the quads being encoded.
@@ -81,7 +81,9 @@ pub(crate) fn finish_interned(
     indexes: &Indexes,
 ) -> Result<BuiltArray> {
     let (dict, codes) = interner.finish()?;
-    let array = build_array(&codes)?;
+    // The codes are in global (s, p, o, g) order, rows or none: `s` is
+    // stamped sorted.
+    let array = build_code_chunk(&codes, 0..codes.s.len(), true)?;
     let components = build_components(indexes, IndexInput::Codes(&codes))?;
     Ok(BuiltArray {
         array,

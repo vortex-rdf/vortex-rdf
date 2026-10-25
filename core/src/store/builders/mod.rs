@@ -162,9 +162,9 @@ pub trait VortexArrayBuilder {
 
 /// One StructArray chunk of primary quad columns for `layout`; indexes are
 /// built beside it as components ([`build_components`]). An empty `quads`
-/// builds every layout's empty chunk, the Dictionary layout's being
-/// [`dictionary::empty_struct`] (unstamped: nothing to sort); a non-empty
-/// Dictionary chunk needs the dictionary's codes ([`dictionary::build_code_chunk`]).
+/// builds every layout's empty chunk, the Dictionary layout's over no codes;
+/// a non-empty Dictionary chunk needs the dictionary's codes
+/// ([`dictionary::build_code_chunk`]).
 ///
 /// `s_sorted` stamps `IsSorted` on the `s` column, which `match_pattern`
 /// trusts as global `(s, p, o, g)` order: it must be `true` only when `quads`
@@ -175,7 +175,7 @@ pub(crate) fn build_struct_array(
     s_sorted: bool,
 ) -> Result<ArrayRef> {
     if layout == LayoutStrategy::Dictionary && quads.is_empty() {
-        return dictionary::empty_struct();
+        return dictionary::build_code_chunk(&dictionary::QuadCodes::default(), 0..0, s_sorted);
     }
     let field_arrays = layout.build_columns(quads)?;
 

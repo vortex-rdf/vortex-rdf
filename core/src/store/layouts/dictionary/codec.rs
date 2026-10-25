@@ -98,16 +98,6 @@ pub(crate) fn encode_quads(
     Ok(codes)
 }
 
-/// The whole dataset as one chunk. `codes` must be in global (s, p, o, g)
-/// order: the `s` column is stamped sorted.
-pub(crate) fn build_array(codes: &QuadCodes) -> Result<ArrayRef> {
-    if codes.s.is_empty() {
-        return empty_struct();
-    }
-    let n = codes.s.len();
-    build_code_chunk(codes, 0..n, true)
-}
-
 /// The chunk of rows `range` of `codes`: the four code columns and nothing
 /// else (the dictionary travels beside the array). `s_sorted` stamps
 /// `IsSorted` on the `s` column, which queries trust as global (s, p, o, g)
@@ -136,11 +126,6 @@ pub(crate) fn build_code_chunk(
         debug::elapsed(start)
     );
     Ok(chunk)
-}
-
-/// An empty chunk with the code schema, `s` unstamped.
-pub(crate) fn empty_struct() -> Result<ArrayRef> {
-    build_code_chunk(&QuadCodes::default(), 0..0, false)
 }
 
 /// The four code columns of `chunk` in `[s, p, o, g]` order. The decoders'

@@ -1,7 +1,8 @@
 //! The builders: chunk-boundary behaviour of the streaming builder, the
 //! spill-and-merge path of the streaming one, the file writer's ordering,
-//! the sorted stamp a build leaves on its subject column, and the
-//! push-based sink's wire form, the in-memory builder's.
+//! the sorted stamp a build leaves on its subject column, the one store
+//! every builder makes of an empty dataset, and the push-based sink's wire
+//! form, the in-memory builder's.
 
 use super::*;
 use crate::store::builders::{BuildSizes, sorted_stream};
@@ -218,6 +219,69 @@ async fn test_sorted_stream_empty_dataset() {
                 0,
                 "{layout:?}/{indexes:?}"
             );
+        }
+    }
+}
+
+/// An empty dataset is the same store whichever builder makes it: the
+/// streaming writer's bytes are what the out-of-core and in-memory builds,
+/// and under the Dictionary layout the push sink, serialize to, under every
+/// layout and index set, and each build reports its rows sorted.
+#[tokio::test]
+async fn test_builders_agree_on_an_empty_dataset() {
+    for layout in LAYOUTS {
+        for indexes in index_sets() {
+            let who = format!("{layout:?} / {indexes:?}");
+            let mut written = Vec::new();
+            quads_stream_to_vortex_writer(
+                quad_stream(vec![]),
+                &mut written,
+                layout,
+                indexes.clone(),
+            )
+            .await
+            .unwrap();
+            let mut builds = vec![
+                (
+                    "out of core",
+                    sorted_stream::build_array(
+                        Box::new(quad_stream(vec![])),
+                        layout,
+                        indexes.clone(),
+                        BuildSizes::uniform(3),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                (
+                    "in memory",
+                    build_array::<SortedInMemoryBuilder>(
+                        quad_stream(vec![]),
+                        layout,
+                        indexes.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+            ];
+            if layout == LayoutStrategy::Dictionary {
+                builds.push((
+                    "sink",
+                    DictionaryQuadSink::new(indexes.clone()).finish().unwrap(),
+                ));
+            }
+            for (builder, built) in builds {
+                let store = VortexRdfStore::from_built(built).unwrap();
+                assert_eq!(
+                    store.view_statistics().unwrap().sort_order,
+                    Some(crate::store::SortOrder::Spog),
+                    "{who}: {builder}"
+                );
+                assert!(
+                    store.to_bytes().await.unwrap() == written,
+                    "{who}: {builder} serializes otherwise than the writer"
+                );
+            }
         }
     }
 }

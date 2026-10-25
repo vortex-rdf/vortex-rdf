@@ -21,7 +21,7 @@ pub(crate) mod term_dict;
 
 pub(super) use self::codec::decode_code_column;
 pub(crate) use self::codec::{
-    QuadCodes, build_code_chunk, decode_chunk, decode_chunk_shared, empty_struct, encode_quads,
+    QuadCodes, build_code_chunk, decode_chunk, decode_chunk_shared, encode_quads,
 };
 #[cfg(feature = "file-io")]
 pub(crate) use self::codec::{
