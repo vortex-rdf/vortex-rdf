@@ -217,7 +217,7 @@ flowchart TD
 - **A file-backed owner stays file-backed**
   ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L117)): the
   writer is prepared first
-  ([`PendingStore::create`](../core/src/io/write.rs#L267), the one writer every
+  ([`PendingStore::create`](../core/src/io/pending.rs#L106), the one writer every
   path-taking build shares), so a source file the process cannot write (a
   read-only file) is refused with `PermissionDenied` before a quad is
   gathered or built ([`add_quads`'s auto-compaction](#51-auto-compaction)
@@ -227,7 +227,7 @@ flowchart TD
   are then streamed through the out-of-core builder
   ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L244))
   into it
-  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L77)), which is
+  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L75)), which is
   then renamed over the original path, and the store is reopened
   memory-mapped. Only the file the store opened is replaced: the file's
   device and inode are recorded at open and checked against the path before
@@ -241,7 +241,7 @@ flowchart TD
   there a file-backed store cannot compact over its own path: the compaction
   fails with the I/O error and the file stays as it was. The builder's spill
   runs are placed in the temp file's directory
-  ([`spill_site`](../core/src/io/write.rs#L413), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
+  ([`spill_site`](../core/src/io/pending.rs#L252), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default), in a
@@ -281,7 +281,7 @@ batch: the batch stays in the in-memory tail, where matches and counts see it
 like any appended row, and the call returns `Ok` with the store. Only the
 writer's own refusal is absorbed
 ([`is_unwritable`](../core/src/error.rs#L105)): the
-[`PendingStore::create`](../core/src/io/write.rs#L267) that finds, before a quad
+[`PendingStore::create`](../core/src/io/pending.rs#L106) that finds, before a quad
 is gathered, that the file or its directory cannot be written
 (`PermissionDenied`, or a read-only filesystem). Any other failure of the
 compaction is returned, a permission error from later in the rewrite (a spill
@@ -347,4 +347,4 @@ runs the mutation on the store the view came from.
 | `match_pattern`, `match_tail`, `contains` | [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
 | `tail_len` | [`core/src/store/mod.rs`](../core/src/store/mod.rs) |
 | Rebuilding a tailed or tombstoned store for serialization | [`core/src/store/persist/serialize.rs`](../core/src/store/persist/serialize.rs) |
-| The rebuild pipeline compaction reuses | [`core/src/store/builders/mod.rs`](../core/src/store/builders/mod.rs), [`sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`core/src/store/construct.rs`](../core/src/store/construct.rs), [`core/src/io/write.rs`](../core/src/io/write.rs) |
+| The rebuild pipeline compaction reuses | [`core/src/store/builders/mod.rs`](../core/src/store/builders/mod.rs), [`sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`core/src/store/construct.rs`](../core/src/store/construct.rs), [`core/src/io/write.rs`](../core/src/io/write.rs), [`pending.rs`](../core/src/io/pending.rs) |

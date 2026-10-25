@@ -87,7 +87,7 @@ async fn test_from_file_is_listed_in_the_process_maps_only_while_mapped() {
 #[tokio::test]
 async fn test_from_file_in_memory_never_maps_the_file() {
     use crate::io::container;
-    use crate::io::read::map_probe;
+    use crate::io::file::map_probe;
 
     let (_dir, good) = write_store_file(
         dictionary_test_quads(),

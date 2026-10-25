@@ -47,7 +47,7 @@ where
     F: FnOnce(tokio::fs::File) -> Fut,
     Fut: std::future::Future<Output = crate::error::Result<()>>,
 {
-    crate::io::write::PendingStore::create(path)
+    crate::io::pending::PendingStore::create(path)
         .await?
         .write(write)
         .await
@@ -414,7 +414,7 @@ async fn test_temp_file_is_a_sibling_and_gone_after_success() {
 /// waits up to a second for the directory to hold only the store.
 #[tokio::test]
 async fn test_dropping_the_creation_at_any_step_leaves_no_temp_file() {
-    use crate::io::write::PendingStore;
+    use crate::io::pending::PendingStore;
     use std::task::Poll;
     use std::time::{Duration, Instant};
 

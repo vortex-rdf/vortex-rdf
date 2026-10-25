@@ -854,7 +854,7 @@ pub(crate) fn open_native_bytes(
 pub(crate) async fn open_mapped(
     path: &std::path::Path,
 ) -> crate::store::persist::native_file::NativeStoreFile {
-    use crate::io::read::{FileAccess, open_vortex_file};
+    use crate::io::file::{FileAccess, open_vortex_file};
     crate::store::persist::native_file::NativeStoreFile::try_new(
         open_vortex_file(path, FileAccess::Mapped).await.unwrap(),
     )

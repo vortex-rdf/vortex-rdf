@@ -22,7 +22,7 @@ use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::{Layout, LayoutReaderRef, LayoutRef};
 
 use crate::io::container::{self, RdfStoreLayoutVTable};
-use crate::io::read::{FileIdentity, OpenedFile};
+use crate::io::file::{FileIdentity, OpenedFile};
 use crate::store::persist::open::{ComponentRoster, IndexChild};
 use crate::store::schema;
 

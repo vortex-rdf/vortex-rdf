@@ -112,15 +112,15 @@ impl VortexRdfStore {
     /// gathered, sorted or built, so a compaction that cannot happen costs a
     /// few stats and one failed open.
     ///
-    /// [`PendingStore`]: crate::io::write::PendingStore
+    /// [`PendingStore`]: crate::io::pending::PendingStore
     #[cfg(feature = "file-io")]
     async fn stream_compacted_to_file(
         &self,
         indexes: Indexes,
         path: &std::path::Path,
-        opened: Option<crate::io::read::FileIdentity>,
+        opened: Option<crate::io::file::FileIdentity>,
     ) -> Result<Self> {
-        let pending = crate::io::write::PendingStore::create_over(path, opened).await?;
+        let pending = crate::io::pending::PendingStore::create_over(path, opened).await?;
         let raws = self.sorted_live_raw_quads().await?;
         let stream = futures::stream::iter(raws.into_iter().map(Ok::<_, VortexRdfError>));
         // The merge runs can reach dataset size: they go in the directory of

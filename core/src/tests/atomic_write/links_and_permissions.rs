@@ -284,7 +284,7 @@ async fn test_the_temp_file_has_the_old_permissions_while_it_is_written() {
 /// new file gets.
 #[tokio::test]
 async fn test_a_temp_standing_in_for_a_store_is_born_private() {
-    use crate::io::write::create_temp;
+    use crate::io::pending::create_temp;
 
     let dir = tempfile::tempdir().unwrap();
     let plain = dir.path().join("plain");
@@ -903,8 +903,8 @@ async fn test_an_append_past_the_floor_does_not_absorb_a_replaced_file() {
 /// file goes.
 #[tokio::test]
 async fn test_a_file_replaced_during_the_write_is_not_overwritten() {
-    use crate::io::read::FileIdentity;
-    use crate::io::write::PendingStore;
+    use crate::io::file::FileIdentity;
+    use crate::io::pending::PendingStore;
     use vortex_io::VortexWrite as _;
 
     let (dir, path) =

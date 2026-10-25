@@ -4,6 +4,8 @@
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container;
+#[cfg(feature = "file-io")]
+use crate::io::file::{FileAccess, open_vortex_file};
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
 use crate::store::indexes::{
@@ -233,7 +235,7 @@ impl VortexRdfStore {
     /// mapped file. Network filesystems are not supported for mapping.
     #[cfg(feature = "file-io")]
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        Self::open_file(path, read::FileAccess::Mapped).await
+        Self::open_file(path, FileAccess::Mapped).await
     }
 
     /// Load a store file whole into memory (quad rows, dictionary and every
@@ -243,7 +245,7 @@ impl VortexRdfStore {
     /// match can bind it directly.
     #[cfg(feature = "file-io")]
     pub async fn from_file_in_memory<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        let opened = Self::open_file(path, read::FileAccess::Read).await?;
+        let opened = Self::open_file(path, FileAccess::Read).await?;
         Self::from_parts(opened.to_serializable_parts().await?)
     }
 
@@ -253,17 +255,14 @@ impl VortexRdfStore {
     /// shape declines that handle: then it is held whole, the only way left
     /// to read it.
     #[cfg(feature = "file-io")]
-    async fn open_file<P: AsRef<std::path::Path>>(
-        path: P,
-        access: read::FileAccess,
-    ) -> Result<Self> {
+    async fn open_file<P: AsRef<std::path::Path>>(path: P, access: FileAccess) -> Result<Self> {
         // The footer only (schema and layout metadata); no row is read yet.
         // The handle owns the reader tree, so this store and the views
         // derived from it share decoded zone-map stats; it refuses a file this
         // version cannot read and classifies its roster once
         // (`ComponentRoster::of`).
         let file = Arc::new(NativeStoreFile::try_new(
-            read::open_vortex_file(path.as_ref(), access).await?,
+            open_vortex_file(path.as_ref(), access).await?,
         )?);
         log::debug!(
             "[open] {} {}",
