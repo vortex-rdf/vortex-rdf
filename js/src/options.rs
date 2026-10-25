@@ -43,7 +43,8 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
         if !js_sys::Array::is_array(&indexes) {
             return Err(js_err("Option 'indexes' must be an array"));
         }
-        config.indexes = js_sys::Array::from(&indexes)
+        config.indexes = indexes
+            .unchecked_ref::<js_sys::Array>()
             .iter()
             .map(|value| match value.as_string() {
                 Some(name) => name.parse::<IndexType>().map_err(js_err),

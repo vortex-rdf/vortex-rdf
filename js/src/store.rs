@@ -5,11 +5,11 @@ use std::cell::RefCell;
 use std::io::Cursor;
 use std::rc::Rc;
 
-use futures::{FutureExt, StreamExt};
-use js_sys::{Object, Reflect};
+use futures::{FutureExt, Stream, StreamExt, stream};
+use js_sys::{Array, Object, Reflect};
 use vortex_rdf_core::common::{formats::format_from_name, terms::parse_quads_from_reader};
 use vortex_rdf_core::{
-    DictSnapshot, LayoutStrategy, Probe, QuadColumn, Result as CoreResult,
+    DictSnapshot, LayoutStrategy, Probe, QuadColumn, RawQuad, Result as CoreResult,
     VortexRdfStore as CoreStore, export_rdf,
 };
 use wasm_bindgen::prelude::*;
@@ -20,8 +20,10 @@ use crate::chunks::{
 };
 use crate::codes::{code_from_js, code_to_js};
 use crate::error::{js_err, js_err_ctx};
-use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
-use crate::options::parse_build_options;
+use crate::ingest::{
+    js_array_to_dictionary_array, js_array_to_quads, js_array_to_raw_quads, rdfjs_stream_to_quads,
+};
+use crate::options::{BuildConfig, parse_build_options};
 use crate::probes::{batch_signal, chunk_probe, parse_probes, read_probe};
 use crate::resolve_now;
 use crate::terms::{pattern_probe, quad_arg};
@@ -66,6 +68,20 @@ impl VortexRdfStore {
             dict_view: RefCell::new(None),
             alive: Rc::new(()),
         }
+    }
+
+    /// Build a store from a quad stream under `config`, labelling a failure
+    /// as the build's. `fromString` builds through here, and so does
+    /// `fromQuads` but for a Dictionary-layout array, which goes through the
+    /// interning sink.
+    async fn build(
+        quads: impl Stream<Item = CoreResult<RawQuad>> + Unpin + Send + 'static,
+        config: BuildConfig,
+    ) -> Result<Self, JsValue> {
+        let inner = CoreStore::from_quads(quads, config.layout, config.indexes)
+            .await
+            .map_err(|e| js_err_ctx("Vortex build error", e))?;
+        Ok(Self::wrap(inner))
     }
 
     /// The store's dictionary as a snapshot, or `None` when the code path
@@ -176,11 +192,7 @@ impl VortexRdfStore {
     ) -> Result<VortexRdfStore, JsValue> {
         let format = format_from_name(format_name).map_err(js_err)?;
         let config = parse_build_options(options)?;
-        let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
-        let inner = CoreStore::from_quads(quads_stream, config.layout, config.indexes)
-            .await
-            .map_err(|e| js_err_ctx("Vortex build error", e))?;
-        Ok(VortexRdfStore::wrap(inner))
+        Self::build(parse_quads_from_reader(Cursor::new(input), format), config).await
     }
 
     /// Build directly from RDF/JS quads — either an array or a `Stream<Quad>`
@@ -188,20 +200,18 @@ impl VortexRdfStore {
     #[wasm_bindgen(js_name = fromQuads, skip_typescript)]
     pub async fn from_quads(quads: JsValue, options: JsValue) -> Result<VortexRdfStore, JsValue> {
         let config = parse_build_options(options)?;
-
-        // Array + Dictionary layout: push each decoded quad straight into the
-        // interning sink so no `Vec<RawQuad>` of the whole array is ever built.
-        if config.layout == LayoutStrategy::Dictionary && js_sys::Array::is_array(&quads) {
-            let built = js_array_to_dictionary_array(js_sys::Array::from(&quads), config.indexes)?;
-            let inner = CoreStore::from_built(built).map_err(js_err)?;
-            return Ok(VortexRdfStore::wrap(inner));
+        if !Array::is_array(&quads) {
+            return Self::build(rdfjs_stream_to_quads(quads)?, config).await;
         }
-
-        let quad_stream = js_to_quad_stream(quads)?;
-        let inner = CoreStore::from_quads(quad_stream, config.layout, config.indexes)
-            .await
-            .map_err(|e| js_err_ctx("Vortex build error", e))?;
-        Ok(VortexRdfStore::wrap(inner))
+        let quads: Array = quads.unchecked_into();
+        // Dictionary layout: push each decoded quad straight into the
+        // interning sink so no `Vec<RawQuad>` of the whole array is ever built.
+        if config.layout == LayoutStrategy::Dictionary {
+            let built = js_array_to_dictionary_array(&quads, config.indexes)?;
+            return Ok(Self::wrap(CoreStore::from_built(built).map_err(js_err)?));
+        }
+        let quads = js_array_to_raw_quads(&quads)?;
+        Self::build(stream::iter(quads.into_iter().map(Ok)), config).await
     }
 
     #[wasm_bindgen(skip_typescript)]
@@ -290,7 +300,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = addQuads, skip_typescript)]
     pub async fn add_quads(&mut self, quads_js: js_sys::Array) -> Result<(), JsValue> {
-        let quads = js_array_to_quads(quads_js)?;
+        let quads = js_array_to_quads(&quads_js)?;
         self.mutate(async |s| s.add_quads(quads).await).await
     }
 
