@@ -12,7 +12,8 @@ use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as C
 use crate::batch::Batch;
 use crate::cancel::{Pulled, Token};
 use crate::chunks::{CodeChunks, chunk_columns, every_column};
-use crate::codes::{TermDict, U64Column, decode_slice};
+use crate::dict::{TermDict, decode_slice};
+use crate::kernels::U64Column;
 use crate::probes::{narrowed_probe, parse_probes};
 use crate::{CancelToken, RUNTIME, VortexRdfError, cancelled, detached, py_err, raced, settled};
 use vortex_rdf_core::Probe;

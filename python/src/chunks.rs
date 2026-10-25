@@ -9,7 +9,7 @@ use pyo3::types::PyTuple;
 use vortex_rdf_core::{CodeChunkStream, QuadColumn};
 
 use crate::cancel::{Pulled, Token, pull_next};
-use crate::codes::U64Column;
+use crate::kernels::U64Column;
 use crate::{RUNTIME, settled};
 
 /// A match's term-code columns in chunks of at most `batch_rows` rows, in

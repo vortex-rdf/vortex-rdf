@@ -9,10 +9,12 @@
 mod batch;
 mod cancel;
 mod chunks;
-mod codes;
+mod dict;
+mod kernels;
 mod probes;
 mod serialize;
 mod store;
+mod u64s;
 
 use std::future::Future;
 use std::pin::pin;
@@ -155,9 +157,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::ProbeAnswers>()?;
     m.add_class::<chunks::CodeChunks>()?;
     m.add_class::<CancelToken>()?;
-    m.add_class::<codes::TermDict>()?;
-    m.add_class::<codes::U64Column>()?;
-    m.add_class::<codes::CodeGroups>()?;
+    m.add_class::<dict::TermDict>()?;
+    m.add_class::<kernels::U64Column>()?;
+    m.add_class::<kernels::CodeGroups>()?;
     m.add_function(wrap_pyfunction!(serialize::serialize_rdf, m)?)?;
     m.add("VortexRdfError", m.py().get_type::<VortexRdfError>())?;
     m.add("JoinTooLarge", m.py().get_type::<JoinTooLarge>())?;

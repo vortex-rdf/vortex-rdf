@@ -8,8 +8,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use vortex_rdf_core::{Keep, Probe, QuadColumn, TermCode};
 
-use crate::codes::extract_u64s;
 use crate::py_err;
+use crate::u64s::extract_u64s;
 
 /// A probe from a pattern's four term spellings and its narrowing: the
 /// keywords of `match_codes`/`count_quads`, or the keys of a dict probe.

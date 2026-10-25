@@ -117,7 +117,7 @@ def test_decode_many_colliding_repeats_unsorted_and_out_of_range(wide_dictionary
 
 
 # The bucket count of the batch's sharing cache (`RECENT_BUCKETS` in
-# `src/codes.rs`): codes this far apart evict one another.
+# `src/dict.rs`): codes this far apart evict one another.
 RECENT_BUCKETS = 256
 
 
