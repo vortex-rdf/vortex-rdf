@@ -29,6 +29,7 @@ mod metadata;
 mod mutation;
 mod names;
 mod narrowing;
+mod open_errors;
 mod predicates;
 mod roundtrip;
 mod row_limit;
@@ -1085,6 +1086,48 @@ fn appended_quads(n: usize) -> Vec<Quad> {
             )
         })
         .collect()
+}
+
+/// One way to open a store's serialized form: from its bytes, borrowed or
+/// adopted, or from a file holding them, mapped or loaded whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
+    /// [`from_bytes`](VortexRdfStore::from_bytes), over the buffer.
+    Bytes,
+    /// [`from_bytes_owned`](VortexRdfStore::from_bytes_owned), adopting it.
+    BytesOwned,
+    /// [`from_file`](VortexRdfStore::from_file), the file mapped.
+    Mapped,
+    /// [`from_file_in_memory`](VortexRdfStore::from_file_in_memory), the file
+    /// loaded whole.
+    Loaded,
+}
+
+impl Open {
+    /// The store file at `path`, opened this way; the byte opens read its
+    /// bytes first.
+    async fn open(self, path: &std::path::Path) -> crate::error::Result<VortexRdfStore> {
+        match self {
+            Open::Bytes => VortexRdfStore::from_bytes(&std::fs::read(path).unwrap()).await,
+            Open::BytesOwned => {
+                VortexRdfStore::from_bytes_owned(std::fs::read(path).unwrap()).await
+            }
+            Open::Mapped => VortexRdfStore::from_file(path).await,
+            Open::Loaded => VortexRdfStore::from_file_in_memory(path).await,
+        }
+    }
+}
+
+/// An open as failure messages name it: the constructor's name.
+impl std::fmt::Display for Open {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Open::Bytes => "from_bytes",
+            Open::BytesOwned => "from_bytes_owned",
+            Open::Mapped => "from_file",
+            Open::Loaded => "from_file_in_memory",
+        })
+    }
 }
 
 /// The three opens of the store file at `path`, each beside its tag: mapped
