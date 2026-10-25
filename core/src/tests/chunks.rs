@@ -529,8 +529,9 @@ async fn test_chunks_skip_tombstones() {
 async fn test_chunks_file_backed_match_gathered() {
     let (_multi_dir, multi_chunk) = multi_chunk_file().await;
     let mut counts = vec![assert_chunks_match(&multi_chunk, "mapped multi-chunk").await];
-    for (tag, _dir, store) in file_stores().await {
-        for (name, view) in views_of(&store).await {
+    for fixture in file_stores().await {
+        let tag = fixture.tag();
+        for (name, view) in views_of(&fixture.store).await {
             counts.push(assert_chunks_match(&view, &format!("{tag} {name}")).await);
         }
     }

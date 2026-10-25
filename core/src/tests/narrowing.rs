@@ -566,31 +566,20 @@ async fn test_narrowing_gates_and_tails() {
 
 // ─── Windows that cannot cut a row ────────────────────────────────────────
 
-/// The stores the window rules are checked over, each beside its tag: every
-/// open of the fixture's files ([`file_stores`]), and the fixture built in
-/// memory with no index, the copy index and the reference index. The dir
-/// guards keep the files alive for the stores' lifetime.
-async fn window_stores() -> (
-    Vec<std::sync::Arc<tempfile::TempDir>>,
-    Vec<(String, VortexRdfStore)>,
-) {
-    let mut dirs = Vec::new();
-    let mut stores = Vec::new();
-    for (tag, dir, store) in file_stores().await {
-        dirs.push(dir);
-        stores.push((tag, store));
+/// The stores the window rules are checked over: every open of the
+/// fixture's files ([`file_stores`]), and the fixture built in memory under
+/// each index configuration.
+async fn window_stores() -> Vec<FixtureStore> {
+    let mut stores = file_stores().await;
+    for index in IndexConfig::ALL {
+        stores.push(FixtureStore {
+            index,
+            open: None,
+            store: streamed_store(fixture_quads(), LayoutStrategy::Dictionary, index.types()).await,
+            _dir: None,
+        });
     }
-    for (tag, indexes) in [
-        ("memory/no-index", vec![]),
-        ("memory/copy", vec![IndexType::SecondaryByCopy]),
-        ("memory/reference", vec![IndexType::SecondaryByReference]),
-    ] {
-        stores.push((
-            tag.to_string(),
-            streamed_store(fixture_quads(), LayoutStrategy::Dictionary, indexes).await,
-        ));
-    }
-    (dirs, stores)
+    stores
 }
 
 /// The probes the window rules are checked with, each beside its shape: `P`,
@@ -629,8 +618,9 @@ fn window_probes() -> Vec<(&'static str, Probe)> {
 /// with exact statistics.
 #[tokio::test]
 async fn test_window_that_cannot_cut_is_the_plain_view() {
-    let (_dirs, stores) = window_stores().await;
-    for (tag, store) in &stores {
+    let stores = window_stores().await;
+    for fixture in &stores {
+        let (tag, store) = (fixture.tag(), &fixture.store);
         for (shape, probe) in window_probes() {
             let label = format!("{tag} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
@@ -647,16 +637,16 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
             // index leaves beside the object's run.
             assert_eq!(
                 stats.served_component.is_some(),
-                tag.contains("copy") && matches!(shape, "P" | "PO" | "O"),
+                fixture.index == IndexConfig::Copy && matches!(shape, "P" | "PO" | "O"),
                 "{label}: served"
             );
             if shape == "SPG" && stats.file_backed {
                 assert!(stats.pending_filter, "{label}: the graph's filter");
             }
             let masks_first = plain.debug_reads_masks_first();
-            let expected = match tag.as_str() {
-                "file/no-index/mapped" => matches!(shape, "P" | "PO" | "O"),
-                "file/reference/mapped" => shape == "PO",
+            let expected = match (fixture.index, fixture.mapped()) {
+                (IndexConfig::NoIndex, true) => matches!(shape, "P" | "PO" | "O"),
+                (IndexConfig::Reference, true) => shape == "PO",
                 _ => false,
             };
             assert_eq!(
@@ -703,9 +693,10 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
 /// with two rows to cut between.
 #[tokio::test]
 async fn test_window_that_cuts_keeps_base_order() {
-    let (_dirs, stores) = window_stores().await;
+    let stores = window_stores().await;
     let mut served = 0;
-    for (tag, store) in &stores {
+    for fixture in &stores {
+        let (tag, store) = (fixture.tag(), &fixture.store);
         for (shape, probe) in window_probes() {
             let label = format!("{tag} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
@@ -778,9 +769,9 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
             )
         }))
         .collect();
-    let (_dirs, stores) = window_stores().await;
-    for (tag, store) in stores {
-        let store = delete_all(&store, &doomed)
+    for fixture in window_stores().await {
+        let tag = fixture.tag();
+        let store = delete_all(&fixture.store, &doomed)
             .await
             .add_quads(appended.clone())
             .await
@@ -802,7 +793,7 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
             assert_eq!(stats.tail_rows, tail_rows, "{label}");
             assert_eq!(
                 stats.served_component.is_some(),
-                tag.contains("copy") && matches!(shape, "P" | "PO" | "O"),
+                fixture.index == IndexConfig::Copy && matches!(shape, "P" | "PO" | "O"),
                 "{label}: served"
             );
             let bound = stats.rows.upper_bound;
@@ -810,7 +801,8 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
             if !stats.file_backed {
                 assert_eq!(stats.rows.exact, Some(n), "{label}: the live rows");
             }
-            if tag == "file/copy/mapped" && matches!(shape, "P" | "O") {
+            if fixture.index == IndexConfig::Copy && fixture.mapped() && matches!(shape, "P" | "O")
+            {
                 assert_eq!(stats.rows.exact, None, "{label}: the run's ids unread");
                 assert!(bound > n, "{label}: the run's width");
                 // The size above read the run's ids into the view: its live
@@ -948,8 +940,9 @@ async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
 async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
     use crate::store::query::window::window_hooks;
 
-    let (_dirs, stores) = window_stores().await;
-    for (tag, store) in stores.iter().filter(|(tag, _)| !tag.contains("reference")) {
+    let stores = window_stores().await;
+    for fixture in stores.iter().filter(|f| f.index != IndexConfig::Reference) {
+        let (tag, store) = (fixture.tag(), &fixture.store);
         for (shape, probe) in window_probes() {
             let label = format!("{tag} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
@@ -959,7 +952,9 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
             let masks_first = plain.debug_reads_masks_first();
             assert_eq!(
                 masks_first,
-                tag == "file/no-index/mapped" && matches!(shape, "P" | "PO" | "O"),
+                fixture.index == IndexConfig::NoIndex
+                    && fixture.mapped()
+                    && matches!(shape, "P" | "PO" | "O"),
                 "{label}: read by the filter's masks first"
             );
             for limit in [bound, bound + 1, usize::MAX] {

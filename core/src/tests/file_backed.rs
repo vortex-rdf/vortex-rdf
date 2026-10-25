@@ -482,8 +482,8 @@ async fn test_file_code_columns_match_memory() {
             }
         }
     };
-    for (tag, _dir, store) in file_stores().await {
-        check(&tag, &store, &memory).await;
+    for fixture in file_stores().await {
+        check(&fixture.tag(), &fixture.store, &memory).await;
     }
     // Tombstones: the same deletions on a file store and in memory.
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
@@ -546,80 +546,88 @@ fn hub_quads() -> Vec<Quad> {
 /// narrowed view or a non-prefix shape; a code no quad holds matches nothing.
 #[tokio::test]
 async fn test_locate_codes_matches_the_term_path() {
-    // The temp dirs stay alive until the stores are checked.
-    let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
-    let mut stores: Vec<(String, VortexRdfStore, Vec<Quad>, usize)> = Vec::new();
-    for (tag, dir, store) in file_stores().await {
-        guards.push(Box::new(dir));
-        stores.push((tag, store, fixture_quads(), 97));
+    /// The store file at `path`, written under `index`, opened mapped, its
+    /// dir guard kept beside it.
+    async fn mapped(
+        index: IndexConfig,
+        (dir, path): (tempfile::TempDir, std::path::PathBuf),
+    ) -> FixtureStore {
+        FixtureStore {
+            index,
+            open: Some(Open::Mapped),
+            store: VortexRdfStore::from_file(&path).await.unwrap(),
+            _dir: Some(std::sync::Arc::new(dir)),
+        }
     }
-    for (name, indexes) in [
-        ("no-index", vec![]),
-        ("copy", vec![IndexType::SecondaryByCopy]),
-        ("reference", vec![IndexType::SecondaryByReference]),
-    ] {
-        let (dir, path) =
-            write_store_file(multiplicity_quads(), LayoutStrategy::Dictionary, indexes).await;
-        let store = VortexRdfStore::from_file(&path).await.unwrap();
-        guards.push(Box::new(dir));
+
+    // Each store beside its tag, the quads it holds and the stride of the
+    // rows checked.
+    let mut stores: Vec<(String, FixtureStore, Vec<Quad>, usize)> = Vec::new();
+    for fixture in file_stores().await {
+        stores.push((fixture.tag(), fixture, fixture_quads(), 97));
+    }
+    for index in IndexConfig::ALL {
+        let file = write_store_file(
+            multiplicity_quads(),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
         stores.push((
-            format!("multiplicity/{name}/mapped"),
-            store,
+            format!("multiplicity/{}/mapped", index.name()),
+            mapped(index, file).await,
             multiplicity_quads(),
             3,
         ));
     }
     // Seven-row flat leaves: most subject runs cross a leaf boundary, so the
     // narrowing and the reads go across leaves as well as inside one.
-    let (dir, path) = write_chunked_store_file(&multiplicity_quads(), 7).await;
-    guards.push(Box::new(dir));
+    let file = write_chunked_store_file(&multiplicity_quads(), 7).await;
     stores.push((
         "multiplicity/seven-row-leaves/mapped".to_string(),
-        VortexRdfStore::from_file(&path).await.unwrap(),
+        mapped(IndexConfig::NoIndex, file).await,
         multiplicity_quads(),
         1,
     ));
     // The reference index in seven-row leaves: a run of `index:ref-p` or
     // `index:ref-o` spans leaves, so the other run is walked leaf by leaf.
-    let (dir, path) = write_chunked_reference_store_file(&multiplicity_quads(), 7).await;
-    guards.push(Box::new(dir));
+    let file = write_chunked_reference_store_file(&multiplicity_quads(), 7).await;
     stores.push((
         "multiplicity/reference/seven-row-leaves/mapped".to_string(),
-        VortexRdfStore::from_file(&path).await.unwrap(),
+        mapped(IndexConfig::Reference, file).await,
         multiplicity_quads(),
         3,
     ));
     // A bound subject's rows are checked when its run is the shorter one, a
     // reference run's otherwise: the hub holds both, in one leaf and in
     // seven-row leaves, where a subject's run crosses them.
-    let (dir, path) = write_store_file(
+    let file = write_store_file(
         hub_quads(),
         LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByReference],
+        IndexConfig::Reference.types(),
     )
     .await;
-    guards.push(Box::new(dir));
     stores.push((
         "hub/reference/mapped".to_string(),
-        VortexRdfStore::from_file(&path).await.unwrap(),
+        mapped(IndexConfig::Reference, file).await,
         hub_quads(),
         3,
     ));
-    let (dir, path) = write_chunked_reference_store_file(&hub_quads(), 7).await;
-    guards.push(Box::new(dir));
+    let file = write_chunked_reference_store_file(&hub_quads(), 7).await;
     stores.push((
         "hub/reference/seven-row-leaves/mapped".to_string(),
-        VortexRdfStore::from_file(&path).await.unwrap(),
+        mapped(IndexConfig::Reference, file).await,
         hub_quads(),
         3,
     ));
-    for (tag, store, quads, step) in stores {
-        check_locate_codes(&tag, &store, &quads, step).await;
+    for (tag, fixture, quads, step) in stores {
+        check_locate_codes(&tag, &fixture, &quads, step).await;
     }
 }
 
-async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], step: usize) {
+async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], step: usize) {
     use crate::{CodePattern, Probe};
+    let store = &fixture.store;
     let dict = store.dict_reader().unwrap();
     let all = row_list(store).await;
     let mut answered = std::collections::BTreeSet::new();
@@ -690,7 +698,7 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
     // among them); the reference index every shape with `p` or `o` bound, the
     // other bound slots checked at its rows; the no-index file none of the
     // index-only shapes, and nothing answers `s??g`.
-    if tag.ends_with("/mapped") {
+    if fixture.mapped() {
         for mask in [0b0001, 0b0011, 0b0111, 0b1111] {
             assert!(
                 answered.contains(&mask),
@@ -698,7 +706,7 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
             );
         }
     }
-    if tag.contains("/copy/") && tag.ends_with("/mapped") {
+    if fixture.index == IndexConfig::Copy && fixture.mapped() {
         for mask in [0b0010, 0b0110, 0b0100, 0b0101] {
             assert!(
                 answered.contains(&mask),
@@ -706,7 +714,7 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
             );
         }
     }
-    if tag.contains("/reference/") && tag.ends_with("/mapped") {
+    if fixture.index == IndexConfig::Reference && fixture.mapped() {
         for mask in [0b0010, 0b0110, 0b0100, 0b0101, 0b1010, 0b1100, 0b1110] {
             assert!(
                 answered.contains(&mask),
@@ -714,7 +722,7 @@ async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], s
             );
         }
     }
-    if tag.contains("/no-index/") {
+    if fixture.index == IndexConfig::NoIndex {
         for mask in [0b0010, 0b0110, 0b0100] {
             assert!(
                 !answered.contains(&mask),

@@ -601,7 +601,7 @@ async fn codes_past_u32_through_the_chunk_exports() {
     {
         let (_dir, path) = write_store_file(dataset(), LayoutStrategy::Dictionary, indexes()).await;
         for (open, store) in reopened_stores(&path).await {
-            check_chunk_exports(&store, open).await;
+            check_chunk_exports(&store, open.tag()).await;
         }
     }
 }

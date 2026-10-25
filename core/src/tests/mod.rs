@@ -966,6 +966,11 @@ enum Open {
 }
 
 impl Open {
+    /// The opens the suites check a store file under, in their order: mapped
+    /// (a Dictionary layout's dictionary left in the file), loaded whole, and
+    /// adopted from its bytes.
+    const FILE: [Open; 3] = [Open::Mapped, Open::Loaded, Open::BytesOwned];
+
     /// The store file at `path`, opened this way; the byte opens read its
     /// bytes first.
     async fn open(self, path: &std::path::Path) -> crate::error::Result<VortexRdfStore> {
@@ -976,6 +981,15 @@ impl Open {
             }
             Open::Mapped => VortexRdfStore::from_file(path).await,
             Open::Loaded => VortexRdfStore::from_file_in_memory(path).await,
+        }
+    }
+
+    /// The open as a fixture's tag names it.
+    fn tag(self) -> &'static str {
+        match self {
+            Open::Bytes | Open::BytesOwned => "bytes",
+            Open::Mapped => "mapped",
+            Open::Loaded => "loaded",
         }
     }
 }
@@ -992,58 +1006,72 @@ impl std::fmt::Display for Open {
     }
 }
 
-/// The three opens of the store file at `path`, each beside its tag: mapped
-/// (`from_file`, a Dictionary layout's dictionary file-backed), loaded whole
-/// (`from_file_in_memory`) and adopted from its bytes (`from_bytes_owned`).
-async fn reopened_stores(path: &std::path::Path) -> [(&'static str, VortexRdfStore); 3] {
-    [
-        ("mapped", VortexRdfStore::from_file(path).await.unwrap()),
-        (
-            "loaded",
-            VortexRdfStore::from_file_in_memory(path).await.unwrap(),
-        ),
-        (
-            "bytes",
-            VortexRdfStore::from_bytes_owned(std::fs::read(path).unwrap())
-                .await
-                .unwrap(),
-        ),
-    ]
+/// The store file at `path` opened each way [`Open::FILE`] lists, each
+/// beside its open.
+async fn reopened_stores(path: &std::path::Path) -> Vec<(Open, VortexRdfStore)> {
+    let mut stores = Vec::new();
+    for open in Open::FILE {
+        stores.push((open, open.open(path).await.unwrap()));
+    }
+    stores
 }
 
-/// [`fixture_quads`] written as a Dictionary-layout file with no index, the
-/// copy index and the reference index, each file opened every way
-/// [`reopened_stores`] opens it. Each store is tagged `file/<index>/<open>`
-/// and comes beside its file's dir guard; keep the guard alive for the
-/// store's lifetime. Each file is written by [`write_store_file`] once per
-/// process (see [`cached_store_bytes`]), and its bytes into a fresh temp dir
-/// per call.
-async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, VortexRdfStore)> {
+/// A store of the fixture matrix, beside how it was made: its index
+/// configuration, and the open of its file, or none for a store built in
+/// memory. The dir guard keeps a file alive for the store's lifetime.
+struct FixtureStore {
+    index: IndexConfig,
+    open: Option<Open>,
+    store: VortexRdfStore,
+    _dir: Option<std::sync::Arc<tempfile::TempDir>>,
+}
+
+impl FixtureStore {
+    /// The store's label in failure messages: `file/<index>/<open>`, or
+    /// `memory/<index>` for a store built in memory.
+    fn tag(&self) -> String {
+        match self.open {
+            Some(open) => format!("file/{}/{}", self.index.name(), open.tag()),
+            None => format!("memory/{}", self.index.name()),
+        }
+    }
+
+    /// Whether the store is a file opened mapped.
+    fn mapped(&self) -> bool {
+        self.open == Some(Open::Mapped)
+    }
+}
+
+/// [`fixture_quads`] written as a Dictionary-layout file under each index
+/// configuration, each file opened every way [`Open::FILE`] lists. Each file
+/// is written by [`write_store_file`] once per process (see
+/// [`cached_store_bytes`]), and its bytes into a fresh temp dir per call.
+async fn file_stores() -> Vec<FixtureStore> {
     static BYTES: [OnceLock<Vec<u8>>; 3] = [const { OnceLock::new() }; 3];
     let mut stores = Vec::new();
-    for ((tag, indexes), cell) in [
-        ("file/no-index", vec![]),
-        ("file/copy", vec![IndexType::SecondaryByCopy]),
-        ("file/reference", vec![IndexType::SecondaryByReference]),
-    ]
-    .into_iter()
-    .zip(&BYTES)
-    {
+    for (index, cell) in IndexConfig::ALL.into_iter().zip(&BYTES) {
         let bytes = cached_store_bytes(cell, || async move {
             let (_dir, path) =
-                write_store_file(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
+                write_store_file(fixture_quads(), LayoutStrategy::Dictionary, index.types()).await;
             std::fs::read(&path).unwrap()
         })
         .await;
         let (dir, path) = temp_store_file(bytes);
         let dir = std::sync::Arc::new(dir);
         for (open, store) in reopened_stores(&path).await {
+            let fixture = FixtureStore {
+                index,
+                open: Some(open),
+                store,
+                _dir: Some(std::sync::Arc::clone(&dir)),
+            };
             assert_eq!(
-                store.dict_reader().unwrap().is_file_backed(),
-                open == "mapped",
-                "{tag}/{open}: only the mapped open keeps its dictionary in the file"
+                fixture.store.dict_reader().unwrap().is_file_backed(),
+                fixture.mapped(),
+                "{}: only the mapped open keeps its dictionary in the file",
+                fixture.tag()
             );
-            stores.push((format!("{tag}/{open}"), std::sync::Arc::clone(&dir), store));
+            stores.push(fixture);
         }
     }
     stores

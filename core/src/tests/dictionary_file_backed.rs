@@ -661,7 +661,11 @@ async fn test_dictionary_empty_store_roundtrip() {
         built.dict_reader().unwrap().snapshot().is_some(),
         "a built store's dictionary is resident"
     );
-    let mut stores: Vec<(&str, VortexRdfStore)> = reopened_stores(&path).await.into();
+    let mut stores: Vec<(&str, VortexRdfStore)> = reopened_stores(&path)
+        .await
+        .into_iter()
+        .map(|(open, store)| (open.tag(), store))
+        .collect();
     stores.push(("built", built));
 
     // Both handles of an empty dictionary are empty, its kind ranges hold no

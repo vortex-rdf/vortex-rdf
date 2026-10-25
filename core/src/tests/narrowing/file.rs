@@ -3,8 +3,8 @@ use std::ops::Range;
 
 #[tokio::test]
 async fn test_keep_on_file_matches_brute_force() {
-    for (tag, _dir, store) in file_stores().await {
-        assert_keeps_match_brute_force(&store, &tag).await;
+    for fixture in file_stores().await {
+        assert_keeps_match_brute_force(&fixture.store, &fixture.tag()).await;
     }
 }
 
@@ -12,16 +12,17 @@ async fn test_keep_on_file_matches_brute_force() {
 async fn test_window_on_file_matches_slicing() {
     let strings =
         |quads: Vec<Quad>| -> Vec<String> { quads.iter().map(ToString::to_string).collect() };
-    for (tag, _dir, store) in file_stores().await {
-        assert_windows_match_slicing(&store, &tag).await;
-        if !tag.ends_with("/mapped") {
+    for fixture in file_stores().await {
+        let (tag, store) = (fixture.tag(), &fixture.store);
+        assert_windows_match_slicing(store, &tag).await;
+        if !fixture.mapped() {
             continue;
         }
         // With quads appended, a match on the unindexed graph keeps its
         // filter pending: a window starting past the base's matches takes
         // the tail's rows from the offset minus the base's match count.
         let graph = GraphName::DefaultGraph;
-        let base_matches = matched_size(&store, None, None, None, Some(&graph)).await;
+        let base_matches = matched_size(store, None, None, None, Some(&graph)).await;
         let tailed = store.add_quads(appended_quads(30)).await.unwrap();
         let matched = matched_view(&tailed, None, None, None, Some(&graph)).await;
         assert!(matched.view_statistics().unwrap().pending_filter, "{tag}");

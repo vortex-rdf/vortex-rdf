@@ -639,14 +639,15 @@ async fn test_component_data_sources() {
     .await;
     assert_eq!(assert_component_tables(&store, "memory").await, 4);
     {
-        for (tag, _dir, store) in file_stores().await {
-            let children = if tag.starts_with("file/no-index") {
+        for fixture in file_stores().await {
+            let tag = fixture.tag();
+            let children = if fixture.index == IndexConfig::NoIndex {
                 0
             } else {
                 2
             };
             assert_eq!(
-                assert_component_tables(&store, &tag).await,
+                assert_component_tables(&fixture.store, &tag).await,
                 children,
                 "{tag}"
             );
