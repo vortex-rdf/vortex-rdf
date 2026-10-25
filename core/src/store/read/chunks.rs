@@ -32,9 +32,9 @@ use crate::session::VORTEX_SESSION;
 use crate::store::FileBase;
 use crate::store::VortexRdfStore;
 use crate::store::array::{field_as, into_struct_array, rechunk};
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_reads::{ExactRead, take_file_rows};
 use crate::store::scan::gather::gather_live;
+#[cfg(feature = "file-io")]
+use crate::store::scan::{file_reads::take_file_rows, read_plan::ExactRead};
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::RowSelection;
 

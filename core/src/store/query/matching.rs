@@ -14,7 +14,7 @@ use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::probes::StructProbes;
 use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
 #[cfg(feature = "file-io")]
-use crate::store::scan::{file_filter, file_reads};
+use crate::store::scan::{file_exprs, file_filter, file_reads, subject_runs};
 use crate::store::schema;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{Backend, MemoryBase, Tail};
@@ -556,7 +556,7 @@ impl VortexRdfStore {
                 let pat = resolves.clear(pat);
                 // Built before the ids fold: a run held for a count needs
                 // nothing residual left to filter.
-                let residual = file_reads::build_file_filter(pat, codes)?;
+                let residual = file_exprs::build_file_filter(pat, codes)?;
                 let serve = keep_serve.then_some(serve).flatten();
                 // With the plan kept, the resolution is the view's sole id
                 // restriction, so its deferred ids are the selection, pending
@@ -608,7 +608,7 @@ impl VortexRdfStore {
             // filter.
             IndexResolution::Declined => {
                 debug::step!(t, "[match_pattern] File index declined");
-                (file_reads::build_file_filter(pat, codes)?, None, None)
+                (file_exprs::build_file_filter(pat, codes)?, None, None)
             }
         };
         // ANDed with the filter earlier matches left on this view.
@@ -694,12 +694,12 @@ impl VortexRdfStore {
         let Some(subject) = pat.subject else {
             return Ok(None);
         };
-        let Some(mut range) = file_reads::locate_subject_run(file, codes, subject).await? else {
+        let Some(mut range) = subject_runs::locate_subject_run(file, codes, subject).await? else {
             return Ok(None);
         };
         pat.subject = None;
         debug::step!(t, "[match_pattern] File subject bounded by chunk probe");
-        let answered = file_reads::narrow_subject_run(file, codes, pat, &mut range).await?;
+        let answered = subject_runs::narrow_subject_run(file, codes, pat, &mut range).await?;
         if answered > 0 {
             debug::step!(
                 t,

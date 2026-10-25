@@ -87,7 +87,7 @@ pub(crate) async fn collect_whole_scan(scan: ScanBuilder<ArrayRef>) -> Result<Ar
 /// tokio runtime on the polling thread: [`ScanDriver::for_row_scan`] picks
 /// this driver only where there is one.
 ///
-/// [`ScanDriver::for_row_scan`]: crate::store::scan::file_reads::ScanDriver::for_row_scan
+/// [`ScanDriver::for_row_scan`]: crate::store::scan::file_scans::ScanDriver::for_row_scan
 #[cfg(feature = "file-io")]
 pub(crate) fn spawned_splits<F, T>(
     tasks: Vec<F>,

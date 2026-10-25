@@ -230,7 +230,7 @@ fn probe_path_quads(n_subjects: usize) -> Vec<Quad> {
 /// row scan.
 #[tokio::test]
 async fn test_file_backed_subject_chunk_probe_matches_memory() {
-    use crate::store::scan::file_reads::scan_hooks;
+    use crate::store::scan::file_scans::scan_hooks;
     let quads = probe_path_quads(2000);
     let (_dir, path) = write_store_file(
         quads.clone(),
@@ -820,12 +820,12 @@ async fn read_rows(view: &VortexRdfStore) -> ReadRows {
 
 /// The masked reads chosen on this thread since `before`, by kind.
 fn masked_reads_since(before: [usize; 3]) -> [usize; 3] {
-    let now = crate::store::scan::file_reads::masked_read_hooks::reads();
+    let now = crate::store::scan::read_plan::masked_read_hooks::reads();
     std::array::from_fn(|kind| now[kind] - before[kind])
 }
 
 /// One masked read of kind `read`, as [`masked_reads_since`] counts them.
-fn one_masked_read(read: crate::store::scan::file_reads::MaskedRead) -> [usize; 3] {
+fn one_masked_read(read: crate::store::scan::read_plan::MaskedRead) -> [usize; 3] {
     let mut reads = [0; 3];
     reads[read as usize] = 1;
     reads
@@ -836,7 +836,7 @@ fn one_masked_read(read: crate::store::scan::file_reads::MaskedRead) -> [usize; 
 /// answers the rows, in order, of the view's scan (`row_chunks`) and of
 /// `memory`'s view.
 async fn assert_masks_first_reads(file: &VortexRdfStore, memory: &VortexRdfStore, tag: &str) {
-    use crate::store::scan::file_reads::masked_read_hooks;
+    use crate::store::scan::read_plan::masked_read_hooks;
     for (shape, probe, read) in masks_probes() {
         let label = format!("{tag} {shape}");
         let view = file.run_probe(&probe).await.unwrap();
@@ -872,10 +872,10 @@ async fn assert_masks_first_reads(file: &VortexRdfStore, memory: &VortexRdfStore
 async fn assert_masked_reads_match(
     view: &VortexRdfStore,
     memory: &VortexRdfStore,
-    read: crate::store::scan::file_reads::MaskedRead,
+    read: crate::store::scan::read_plan::MaskedRead,
     label: &str,
 ) {
-    let before = crate::store::scan::file_reads::masked_read_hooks::reads();
+    let before = crate::store::scan::read_plan::masked_read_hooks::reads();
     let rows = row_list(view).await;
     assert_eq!(
         masked_reads_since(before),
@@ -933,7 +933,7 @@ fn clustered_quads() -> Vec<Quad> {
 #[tokio::test]
 async fn test_masks_first_reads_a_selection_clamped_inside_splits() {
     use crate::store::Keep;
-    use crate::store::scan::file_reads::MaskedRead;
+    use crate::store::scan::read_plan::MaskedRead;
 
     let literal = |value: &str| Term::Literal(Literal::new_simple_literal(value));
     let (_envelope_dir, path) =
@@ -1056,7 +1056,10 @@ async fn test_masks_first_skips_tombstones() {
 /// another, where no tokio runtime is current.
 #[tokio::test]
 async fn test_quads_vec_over_a_filtered_file_matches_quads() {
-    use crate::store::scan::file_reads::{MaskedRead, driver_hooks, masked_read_hooks};
+    use crate::store::scan::{
+        file_scans::driver_hooks,
+        read_plan::{MaskedRead, masked_read_hooks},
+    };
 
     let (_file_backed_dir, file_backed) = masks_file().await;
     let (_resident_dir, resident) = masks_file_resident_dictionary().await;
@@ -1226,7 +1229,7 @@ async fn test_window_that_cuts_a_filter_keeps_base_order() {
 async fn test_cutting_window_over_a_filter_stops_early() {
     use crate::io::read::available_parallelism;
     use crate::store::scan::file_filter::split_hooks;
-    use crate::store::scan::file_reads::driver_hooks;
+    use crate::store::scan::file_scans::driver_hooks;
 
     let (_dir, path) = many_splits_file().await;
     assert_eq!(
@@ -1284,7 +1287,7 @@ async fn test_cutting_window_over_a_filter_stops_early() {
 /// under every limit.
 #[tokio::test]
 async fn test_masks_driver_follows_the_row_scan_rule() {
-    use crate::store::scan::file_reads::{MaskedRead, driver_hooks};
+    use crate::store::scan::{file_scans::driver_hooks, read_plan::MaskedRead};
 
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -1334,7 +1337,7 @@ async fn test_masks_driver_follows_the_row_scan_rule() {
 async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
     use crate::io::read::available_parallelism;
     use crate::store::scan::file_filter::split_hooks;
-    use crate::store::scan::file_reads::driver_hooks;
+    use crate::store::scan::file_scans::driver_hooks;
 
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();

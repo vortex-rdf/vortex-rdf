@@ -603,11 +603,13 @@ async fn test_chunks_take_sparse_file_ids() {
 /// view, through both exports. With the split limit forced to zero a scan
 /// spawns its splits, which tells the scan apart from the reads by id.
 ///
-/// [`ExactRead::of`]: crate::store::scan::file_reads::ExactRead::of
+/// [`ExactRead::of`]: crate::store::scan::read_plan::ExactRead::of
 #[tokio::test]
 async fn test_chunks_choose_a_file_read_once() {
     use crate::store::Keep;
-    use crate::store::scan::file_reads::{driver_hooks, exact_read_hooks, take_hooks};
+    use crate::store::scan::{
+        file_reads::take_hooks, file_scans::driver_hooks, read_plan::exact_read_hooks,
+    };
 
     let (_dir, path) = write_store_file(
         modular_quads(20_000, 3, 4),
@@ -675,7 +677,7 @@ async fn test_chunks_choose_a_file_read_once() {
 /// chunks are the view's base-ordered codes.
 #[tokio::test]
 async fn test_chunks_read_filtered_file_runs_by_id() {
-    use crate::store::scan::file_reads::driver_hooks;
+    use crate::store::scan::file_scans::driver_hooks;
 
     let (_dir, path) =
         write_store_file(term_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
@@ -730,7 +732,7 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
 /// the view's base-ordered codes.
 #[tokio::test]
 async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
-    use crate::store::scan::file_reads::driver_hooks;
+    use crate::store::scan::file_scans::driver_hooks;
 
     let (_dir, path) = write_store_file(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -891,7 +893,7 @@ async fn pull_and_drain<S: futures::Stream + Unpin>(
     before_first_poll: impl FnOnce(),
     rows_of: impl Fn(S::Item) -> usize,
 ) -> (usize, usize) {
-    use crate::store::scan::file_reads::driver_hooks;
+    use crate::store::scan::file_scans::driver_hooks;
     before_first_poll();
     driver_hooks::take_spawned();
     let first = stream.next().await.expect("a first item");
@@ -916,7 +918,10 @@ async fn pull_and_drain<S: futures::Stream + Unpin>(
 async fn test_chunk_stream_over_filtered_file_stays_lazy() {
     use crate::io::read::available_parallelism;
     use crate::store::scan::file_filter::split_hooks;
-    use crate::store::scan::file_reads::{driver_hooks, masked_read_hooks, scan_hooks};
+    use crate::store::scan::{
+        file_scans::{driver_hooks, scan_hooks},
+        read_plan::masked_read_hooks,
+    };
 
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -1004,7 +1009,9 @@ impl ReadCounters {
     fn now() -> Self {
         use crate::store::read::rows::restricted_scan_hooks;
         use crate::store::scan::file_filter::split_hooks;
-        use crate::store::scan::file_reads::{masked_read_hooks, scan_hooks, take_hooks};
+        use crate::store::scan::{
+            file_reads::take_hooks, file_scans::scan_hooks, read_plan::masked_read_hooks,
+        };
         Self {
             evaluated: split_hooks::evaluated(),
             masked: masked_read_hooks::reads(),
@@ -1023,7 +1030,7 @@ impl ReadCounters {
 /// projection's.
 #[tokio::test]
 async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
-    use crate::store::scan::file_reads::MaskedRead;
+    use crate::store::scan::read_plan::MaskedRead;
 
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();

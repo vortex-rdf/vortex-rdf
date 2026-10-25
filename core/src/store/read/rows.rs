@@ -19,9 +19,11 @@ use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::read::chunks::{RowChunkStream, extract_codes};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter::{self, SplitMasks};
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_reads::{self, ExactRead, MaskedRead};
 use crate::store::scan::gather::gather_live;
+#[cfg(feature = "file-io")]
+use crate::store::scan::read_plan::{ExactRead, MaskedRead};
+#[cfg(feature = "file-io")]
+use crate::store::scan::{file_exprs, file_reads, file_scans};
 use crate::store::schema::{self, RowId, TermCode};
 use crate::store::view::selection::RowSelection;
 #[cfg(feature = "file-io")]
@@ -59,7 +61,7 @@ impl BaseRead {
         match self {
             BaseRead::Rows(rows) => Ok(rows),
             #[cfg(feature = "file-io")]
-            BaseRead::Scan(scan) => file_reads::read_all_rows(*scan).await,
+            BaseRead::Scan(scan) => file_scans::read_all_rows(*scan).await,
         }
     }
 
@@ -71,7 +73,7 @@ impl BaseRead {
         match self {
             BaseRead::Rows(rows) => Ok(stream::iter(rechunk(rows, batch_rows)).boxed()),
             #[cfg(feature = "file-io")]
-            BaseRead::Scan(scan) => Ok(file_reads::stream_rows(*scan)?
+            BaseRead::Scan(scan) => Ok(file_scans::stream_rows(*scan)?
                 .flat_map(move |chunk| match chunk {
                     Ok(chunk) => stream::iter(rechunk(chunk, batch_rows)).left_stream(),
                     Err(e) => stream::iter([Err(e)]).right_stream(),
@@ -552,14 +554,14 @@ impl VortexRdfStore {
         let scope = scan.dtype()?;
         let memo = file.bound_exprs();
         scan = scan.with_projection(memo.bind(
-            file_reads::QUAD_SCOPE,
+            file_exprs::QUAD_SCOPE,
             &select(columns, root()),
             &scope,
         )?);
         if let Some(f) = filter {
             #[cfg(test)]
             restricted_scan_hooks::note_filtered();
-            scan = scan.with_filter(memo.bind(file_reads::QUAD_SCOPE, f, &scope)?);
+            scan = scan.with_filter(memo.bind(file_exprs::QUAD_SCOPE, f, &scope)?);
         }
         Ok(selection.restrict_scan(scan, deleted))
     }

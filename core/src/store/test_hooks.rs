@@ -384,11 +384,11 @@ impl VortexRdfStore {
         &self,
         range: Range<TermCode>,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_reads;
+        use crate::store::scan::subject_runs;
         let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
-        file_reads::locate_subject_code_range(file, range).await
+        subject_runs::locate_subject_code_range(file, range).await
     }
 
     /// Whether one named integer child of an in-memory base is a canonical
@@ -423,7 +423,7 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::{file_filter, file_reads};
+        use crate::store::scan::{file_exprs, file_filter};
         let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
@@ -431,7 +431,7 @@ impl VortexRdfStore {
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(Some(0..0));
         };
-        match file_reads::build_file_filter(pattern, &mut codes)? {
+        match file_exprs::build_file_filter(pattern, &mut codes)? {
             Some(filter) => file_filter::row_range_from_pruning(file, &filter).await,
             None => Ok(None),
         }
@@ -444,7 +444,7 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_reads;
+        use crate::store::scan::subject_runs;
         let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
@@ -454,7 +454,7 @@ impl VortexRdfStore {
         else {
             return Ok(None);
         };
-        file_reads::locate_subject_run(file, &mut codes, subject).await
+        subject_runs::locate_subject_run(file, &mut codes, subject).await
     }
 
     /// The index-child run the reference index's file resolution locates for

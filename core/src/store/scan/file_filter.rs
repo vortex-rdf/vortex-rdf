@@ -19,7 +19,8 @@ use vortex_scan::selection::Selection;
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{available_parallelism, spawned_splits};
 use crate::store::persist::native_file::NativeStoreFile;
-use crate::store::scan::file_reads::{QUAD_SCOPE, ScanDriver, eq_code_pairs, strict_ids};
+use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
+use crate::store::scan::file_scans::{ScanDriver, strict_ids};
 use crate::store::schema::{COL_G, COL_O, COL_O_VALUE, COL_P, COL_S, RowId};
 use crate::store::view::selection::RowSelection;
 

@@ -25,7 +25,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, PatternCodes, ResolvedLayout};
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
-use crate::store::scan::file_reads::eq_conjunction;
+use crate::store::scan::file_exprs::eq_conjunction;
 use crate::store::schema::{RowId, TermCode};
 
 /// The `[lo, hi)` run of a sorted component column's rows equal to `native`,
@@ -180,9 +180,9 @@ pub(crate) async fn read_located_rids(
 
 /// Run a rid-only scan and decode its row-id column into the ascending,
 /// unique buffer every index resolution answers in. The scan is driven inline
-/// by `file_reads::read_index_row_ids`.
+/// by `file_scans::read_index_row_ids`.
 async fn read_scanned_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<Buffer<RowId>> {
-    let arr = crate::store::scan::file_reads::read_index_row_ids(scan).await?;
+    let arr = crate::store::scan::file_scans::read_index_row_ids(scan).await?;
 
     if arr.is_empty() {
         return Ok(Buffer::empty());
@@ -569,7 +569,7 @@ impl FileServePlan {
             Some(scan) => scan,
             None => self.projected_filtered_scan()?,
         };
-        let chunk = crate::store::scan::file_reads::read_all_rows(scan).await?;
+        let chunk = crate::store::scan::file_scans::read_all_rows(scan).await?;
         self.decode.chunk_code_columns(&chunk, deleted).map(Some)
     }
 
@@ -610,7 +610,7 @@ mod tests {
         use crate::IndexType;
         use crate::io::read::scan_all_reader;
         use crate::store::array::{field_as, into_struct_array};
-        use crate::store::scan::file_reads::{driver_hooks, read_all_rows};
+        use crate::store::scan::file_scans::{driver_hooks, read_all_rows};
 
         let rows = 50;
         let quads = crate::tests::modular_quads_for_tests(rows);

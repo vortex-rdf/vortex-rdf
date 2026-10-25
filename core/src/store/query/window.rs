@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::store::FileBase;
 use crate::store::VortexRdfStore;
 #[cfg(feature = "file-io")]
-use crate::store::scan::{file_filter, file_reads};
+use crate::store::scan::{file_filter, read_plan};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 
 impl VortexRdfStore {
@@ -183,7 +183,7 @@ impl VortexRdfStore {
     }
 
     /// Whether this view's one-shot reads take its pending filter by the
-    /// filter's masks first ([`ExactRead::Masks`](file_reads::ExactRead::Masks)):
+    /// filter's masks first ([`ExactRead::Masks`](read_plan::ExactRead::Masks)):
     /// a file view with no serve plan and no masks a window kept, an exact
     /// selection, and a filter of code equalities over columns with chunk
     /// probes, at a selection the reads by id decline. The choice those
@@ -203,7 +203,7 @@ impl VortexRdfStore {
             return Ok(false);
         };
         let primary = self.layout.strategy().primary_column_names();
-        file_reads::ExactRead::reads_masks(file, primary, Some(filter), selection)
+        read_plan::ExactRead::reads_masks(file, primary, Some(filter), selection)
     }
 
     /// `window(0, limit)` of a file view with a pending filter, an exact
@@ -215,7 +215,7 @@ impl VortexRdfStore {
     /// filter and the tail cut off. With fewer it cuts no base row: the view
     /// keeps its filter with the masks kept for its reads where the masks are
     /// smaller than the matches' ids ([`masks_smaller_than_ids`]) and the
-    /// filter is one the reads by id check ([`file_reads::point_readable`]),
+    /// filter is one the reads by id check ([`read_plan::point_readable`]),
     /// else holds those ids with no filter, and its tail is windowed to the
     /// rest of the limit.
     #[cfg(feature = "file-io")]
@@ -236,7 +236,7 @@ impl VortexRdfStore {
         let primary = self.layout.strategy().primary_column_names();
         let keep_masks = found < limit
             && masks_smaller_than_ids(&masks, found)
-            && file_reads::point_readable(file, primary, Some(filter));
+            && read_plan::point_readable(file, primary, Some(filter));
         let (quads, tail_limit) = if keep_masks {
             (
                 self.quads.with_evaluated_masks(Arc::new(masks)),

@@ -205,10 +205,10 @@ Every read is lazy, and a stream's first poll decides how it runs:
   the call's error.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
-  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L67)), and a
+  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L55)), and a
   scan first polled where no tokio runtime is current run inline on the
   polling task. Any other scan spawns its splits
-  ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L44)) onto the tokio
+  ([`ScanDriver`](../core/src/store/scan/file_scans.rs#L32)) onto the tokio
   runtime it is polled in, and vortex looks that runtime up
   (`Handle::current()`) at every spawn, so every later poll of the stream
   must run inside a tokio runtime too. A filtered file view's capped count,
@@ -385,7 +385,7 @@ stays out of `cargo test --workspace`. The `interface-tests` job of
 | `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
 | `row_chunks`, `code_chunks` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
 | `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
-| The scan driver of a file view's reads | [`core/src/store/scan/file_reads.rs`](../core/src/store/scan/file_reads.rs) |
+| The scan driver of a file view's reads | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs) |
 | `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
 | `vortex_session`, the `vortex_scan` re-export | [`core/src/lib.rs`](../core/src/lib.rs) |

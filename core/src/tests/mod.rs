@@ -397,9 +397,9 @@ fn masks_quads() -> Vec<Quad> {
 fn masks_probes() -> Vec<(
     &'static str,
     Probe,
-    crate::store::scan::file_reads::MaskedRead,
+    crate::store::scan::read_plan::MaskedRead,
 )> {
-    use crate::store::scan::file_reads::MaskedRead;
+    use crate::store::scan::read_plan::MaskedRead;
     let pm = NamedNode::new("http://example.org/pm").unwrap();
     let literal = |value: &str| Term::Literal(Literal::new_simple_literal(value));
     let gd = GraphName::NamedNode(NamedNode::new("http://example.org/gd").unwrap());

@@ -8,7 +8,7 @@ use super::Keep;
 use crate::debug;
 use crate::error::Result;
 use crate::store::persist::native_file::NativeStoreFile;
-use crate::store::scan::{file_filter, file_reads};
+use crate::store::scan::{file_filter, file_scans, subject_runs};
 use crate::store::schema::QuadColumn;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{FileBase, VortexRdfStore};
@@ -60,7 +60,7 @@ impl VortexRdfStore {
                 };
                 let test = keep.test();
                 let positions =
-                    file_reads::column_positions(file, column.name(), &selection, |code| {
+                    file_scans::column_positions(file, column.name(), &selection, |code| {
                         test.admits(code)
                     })
                     .await?;
@@ -103,11 +103,11 @@ impl VortexRdfStore {
         row_count: usize,
     ) -> Result<Option<RowSelection>> {
         Ok(match keep {
-            Keep::Range(lo, hi) => file_reads::locate_subject_code_range(file, *lo..*hi)
+            Keep::Range(lo, hi) => subject_runs::locate_subject_code_range(file, *lo..*hi)
                 .await?
                 .map(|run| selection.clone().intersect_range(run)),
             Keep::Set(codes) if set_is_located(codes.len(), selection.len(row_count)) => {
-                file_reads::locate_subject_code_runs(file, codes.as_slice())
+                subject_runs::locate_subject_code_runs(file, codes.as_slice())
                     .await?
                     .map(|runs| selection.clone().intersect_runs(&runs))
             }

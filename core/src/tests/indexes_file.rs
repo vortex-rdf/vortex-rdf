@@ -151,7 +151,7 @@ async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
     // the component's chunk probes, with no row scan; an unlocated one scans
     // the child under the plan's filter.
     {
-        use crate::store::scan::file_reads::scan_hooks;
+        use crate::store::scan::file_scans::scan_hooks;
         let by_p = store
             .match_pattern(None, Some(&p1), None, None)
             .await
@@ -374,7 +374,7 @@ async fn sorted_code_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
 /// wherever it sits in the child; a wider one by a scan of the run.
 #[tokio::test]
 async fn test_copy_index_file_serves_code_columns_from_the_run() {
-    use crate::store::scan::file_reads::scan_hooks;
+    use crate::store::scan::file_scans::scan_hooks;
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let o1 = Term::Literal(Literal::new_simple_literal("o1"));
@@ -1518,7 +1518,7 @@ async fn test_reference_index_counts_with_named_graphs() {
 /// dictionary. The rows are the in-memory store's, tombstoned rows dropped.
 #[tokio::test]
 async fn test_reference_index_file_takes_sparse_ids() {
-    use crate::store::scan::file_reads::{scan_hooks, take_hooks};
+    use crate::store::scan::{file_reads::take_hooks, file_scans::scan_hooks};
 
     /// `view`'s N-Quads export, as sorted lines.
     async fn export_lines(view: &VortexRdfStore) -> Vec<String> {

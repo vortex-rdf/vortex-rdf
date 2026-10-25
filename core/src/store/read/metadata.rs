@@ -215,7 +215,7 @@ impl VortexRdfStore {
             Backend::File(FileBase { filter, .. }) => {
                 // The pushed-down equalities bound their columns exactly.
                 if let Some(filter) = filter
-                    && let Some(pairs) = crate::store::scan::file_reads::eq_code_pairs(filter)
+                    && let Some(pairs) = crate::store::scan::file_exprs::eq_code_pairs(filter)
                 {
                     for (column, code) in pairs {
                         if let Some(column) = QuadColumn::from_name(&column) {

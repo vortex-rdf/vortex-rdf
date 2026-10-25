@@ -35,7 +35,9 @@ use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_reads::{self, MaskedRead};
+use crate::store::scan::file_reads;
+#[cfg(feature = "file-io")]
+use crate::store::scan::read_plan::MaskedRead;
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::point_sized;
 #[cfg(feature = "file-io")]
@@ -189,7 +191,7 @@ impl VortexRdfStore {
     /// plan's filter scan for an unlocated one. Every other read is the base's
     /// rows in base row order, over the exact selection
     /// ([`base_read`](Self::base_read)): rows read by id
-    /// ([`ExactRead`](file_reads::ExactRead)) are one chunk, and the
+    /// ([`ExactRead`](crate::store::scan::read_plan::ExactRead)) are one chunk, and the
     /// restricted scan streams split by split. A `one_shot` read of a pending
     /// filter the reads by id leave to the scan reads the filter's masks
     /// first, then the rows they keep ([`masked_chunks`](Self::masked_chunks)),
@@ -366,7 +368,7 @@ impl VortexRdfStore {
         tail: Vec<Result<T>>,
     ) -> Result<Chunks<T>> {
         #[cfg(test)]
-        file_reads::scan_hooks::note();
+        crate::store::scan::file_scans::scan_hooks::note();
         let file_backed_dictionary =
             matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
         let chunks: Chunks<T> = if file_backed_dictionary {
