@@ -225,9 +225,10 @@ pub(crate) fn build_components(
 /// layout, a fresh term dictionary derived from `raws` (empty for no rows,
 /// with the components over empty codes, so the index roster and its code
 /// dtypes survive). Every compaction and every mutated store's serialization
-/// runs it. `raws` must be SPOG-sorted with each quad once (as
-/// `sorted_live_raw_quads` hands them over): the `s` column is stamped sorted
-/// and the index children are numbered by these rows.
+/// runs it, and so does the in-memory builder under the string layouts.
+/// `raws` must be SPOG-sorted with each quad once (as `sorted_live_raw_quads`
+/// and the in-memory builder's sort hand them over): the `s` column is
+/// stamped sorted and the index children are numbered by these rows.
 pub(crate) fn build_parts_from_raws(
     raws: &[RawQuad],
     strategy: LayoutStrategy,
