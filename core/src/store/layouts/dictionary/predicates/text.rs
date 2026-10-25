@@ -217,7 +217,7 @@ impl TextPredicate {
             Kind::Blank if self.as_str => Err(Verdict::Unknown),
             // `string()` of an IRI or a blank node raises: the FILTER fails.
             Kind::Iri | Kind::Blank => Err(Verdict::False),
-            Kind::DefaultGraph | Kind::Other => Err(Verdict::Unknown),
+            Kind::Other => Err(Verdict::Unknown),
             Kind::Literal => {
                 let lit = LiteralView::parse(spelling).ok_or(Verdict::Unknown)?;
                 let lexical = lit.lexical().ok_or(Verdict::Unknown)?;

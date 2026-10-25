@@ -85,27 +85,17 @@ impl KindRanges {
 
 impl KindRanges {
     /// The kind of `code`'s spelling, read off the ranges.
-    pub(crate) fn kind_of_code(&self, code: TermCode) -> CodeKind {
+    pub(crate) fn kind_of_code(&self, code: TermCode) -> Kind {
         if self.literals.contains(&code) {
-            CodeKind::Literal
+            Kind::Literal
         } else if self.iris.contains(&code) {
-            CodeKind::Iri
+            Kind::Iri
         } else if self.blanks.contains(&code) {
-            CodeKind::Blank
+            Kind::Blank
         } else {
-            CodeKind::Other
+            Kind::Other
         }
     }
-}
-
-/// What the kind ranges say about a code before its spelling is read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CodeKind {
-    Literal,
-    Iri,
-    Blank,
-    /// The default graph's `""`, or a foreign spelling in the gaps.
-    Other,
 }
 
 /// The three-valued answer of a predicate for one term.
@@ -301,8 +291,9 @@ impl TermPredicate {
     pub fn eval(&self, spelling: &str) -> Verdict {
         let kind = kind_of(spelling);
         match kind {
-            // The default graph's name is not a term the predicates speak of.
-            Kind::DefaultGraph | Kind::Other => return Verdict::Unknown,
+            // Neither the default graph's name nor a foreign spelling is a
+            // term the predicates speak of.
+            Kind::Other => return Verdict::Unknown,
             Kind::Literal | Kind::Iri | Kind::Blank => {}
         }
         match self {
@@ -340,19 +331,19 @@ impl TermPredicate {
     /// The verdict every code of `kind` gets without its spelling being
     /// read, or `None` when the spelling decides. Always agrees with `eval`
     /// on a spelling of that kind.
-    pub(crate) fn kind_verdict(&self, kind: CodeKind) -> Option<Verdict> {
+    pub(crate) fn kind_verdict(&self, kind: Kind) -> Option<Verdict> {
         match (self, kind) {
-            (_, CodeKind::Other) => Some(Verdict::Unknown),
-            (TermPredicate::IsLiteral, kind) => Some(Verdict::from(kind == CodeKind::Literal)),
-            (TermPredicate::IsIri, kind) => Some(Verdict::from(kind == CodeKind::Iri)),
-            (TermPredicate::IsBlank, kind) => Some(Verdict::from(kind == CodeKind::Blank)),
-            (_, CodeKind::Literal) => None,
+            (_, Kind::Other) => Some(Verdict::Unknown),
+            (TermPredicate::IsLiteral, kind) => Some(Verdict::from(kind == Kind::Literal)),
+            (TermPredicate::IsIri, kind) => Some(Verdict::from(kind == Kind::Iri)),
+            (TermPredicate::IsBlank, kind) => Some(Verdict::from(kind == Kind::Blank)),
+            (_, Kind::Literal) => None,
             // Term inequality holds for every non-literal.
             (TermPredicate::Num(NumOp::Ne, _), _) => Some(Verdict::True),
             // `STR()` of an IRI is its string: read it. rdflib's `STR()` of a
             // blank node is its label, which this layer does not decide.
-            (TermPredicate::Text(text), CodeKind::Iri) if text.as_str => None,
-            (TermPredicate::Text(text), CodeKind::Blank) if text.as_str => Some(Verdict::Unknown),
+            (TermPredicate::Text(text), Kind::Iri) if text.as_str => None,
+            (TermPredicate::Text(text), Kind::Blank) if text.as_str => Some(Verdict::Unknown),
             (
                 TermPredicate::Datatype(_)
                 | TermPredicate::Lang(_)
@@ -1018,17 +1009,6 @@ mod tests {
         }
     }
 
-    /// The kind a code of this range would be given: what the first byte of
-    /// its spelling says.
-    fn code_kind(spelling: &str) -> CodeKind {
-        match kind_of(spelling) {
-            Kind::Literal => CodeKind::Literal,
-            Kind::Iri => CodeKind::Iri,
-            Kind::Blank => CodeKind::Blank,
-            Kind::DefaultGraph | Kind::Other => CodeKind::Other,
-        }
-    }
-
     /// Every spelling up to four characters over the characters that carry a
     /// term's structure — quotes, brackets, escapes, `@`, `^`, `_`, `:` and a
     /// multi-byte letter — which a foreign writer's dictionary may hold in
@@ -1109,7 +1089,7 @@ mod tests {
         for predicate in &predicates {
             for spelling in &spellings {
                 let verdict = predicate.eval(spelling);
-                if let Some(by_kind) = predicate.kind_verdict(code_kind(spelling)) {
+                if let Some(by_kind) = predicate.kind_verdict(kind_of(spelling)) {
                     assert_eq!(by_kind, verdict, "{predicate} on {spelling:?}");
                 }
                 if matches!(predicate, TermPredicate::Text(_))
