@@ -9,7 +9,7 @@
 
 use std::rc::Weak;
 
-use futures::StreamExt;
+use futures::TryStreamExt;
 use js_sys::{Object, Reflect};
 use vortex_rdf_core::{CodeChunkStream, Probe, QuadColumn, TermCode, VortexRdfStore as CoreStore};
 use wasm_bindgen::prelude::*;
@@ -44,7 +44,7 @@ pub(crate) fn finished_iterable() -> JsValue {
 /// when codes are not the matched view's vocabulary. Shared by `matchCodes`
 /// and `matchCodesMany`.
 pub(crate) fn probe_codes(store: &CoreStore, probe: &Probe) -> Result<JsValue, JsValue> {
-    let matched = resolve_now(store.run_probe(probe))?.map_err(js_err)?;
+    let matched = resolve_now(store.run_probe(probe))?;
     Ok(code_columns(&matched)?.unwrap_or(JsValue::NULL))
 }
 
@@ -54,7 +54,6 @@ pub(crate) fn probe_codes(store: &CoreStore, probe: &Probe) -> Result<JsValue, J
 /// payload of `match` and `getQuads`.
 pub(crate) fn code_columns(matched: &CoreStore) -> Result<Option<JsValue>, JsValue> {
     resolve_now(matched.code_columns_gathered())?
-        .map_err(js_err)?
         .map(|columns| columns_object(&QuadColumn::ALL, &columns))
         .transpose()
 }
@@ -115,10 +114,9 @@ fn next_chunk(
     stream: &mut CodeChunkStream,
     columns: &[QuadColumn],
 ) -> Result<Option<JsValue>, JsValue> {
-    match resolve_now(stream.next())? {
-        Some(chunk) => columns_object(columns, &chunk.map_err(js_err)?).map(Some),
-        None => Ok(None),
-    }
+    resolve_now(stream.try_next())?
+        .map(|chunk| columns_object(columns, &chunk))
+        .transpose()
 }
 
 /// Code columns as `{ <column>: Float64Array, …, length }`, one copy per

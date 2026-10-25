@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::io::Cursor;
 use std::rc::Rc;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use js_sys::{Object, Reflect};
 use vortex_rdf_core::common::{formats::format_from_name, terms::parse_quads_from_reader};
 use vortex_rdf_core::{
@@ -248,7 +248,7 @@ impl VortexRdfStore {
     /// performs I/O, so there is nothing to await (see `resolve_now`).
     #[wasm_bindgen(skip_typescript)]
     pub fn size(&self) -> Result<usize, JsValue> {
-        resolve_now(self.inner.size())?.map_err(js_err)
+        resolve_now(self.inner.size())
     }
 
     /// Whether the quad is in the store. Returns synchronously; throws on a
@@ -256,7 +256,7 @@ impl VortexRdfStore {
     #[wasm_bindgen(skip_typescript)]
     pub fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
         let quad = quad_arg(&quad_js)?;
-        resolve_now(self.inner.contains(&quad))?.map_err(js_err)
+        resolve_now(self.inner.contains(&quad))
     }
 
     /// The inner store as one owning its rows, ready for in-place mutation;
@@ -324,7 +324,10 @@ impl VortexRdfStore {
         // it is not dependent on the matched rows and must be built off `self`.
         let dict = self.lazy_dict();
         let inner = self.inner.clone();
-        let promise = future_to_promise(async move { match_payload(inner, dict, probe).await });
+        // The read is synchronous like every other, but runs in the promise's
+        // task, after `match` has returned: a failure is the stream's 'error'
+        // event, not a throw.
+        let promise = future_to_promise(async move { match_payload(&inner, dict, &probe) });
         Ok(make_lazy_quad_stream(&promise.into()))
     }
 
@@ -343,8 +346,7 @@ impl VortexRdfStore {
         graph: JsValue,
     ) -> Result<js_sys::Array, JsValue> {
         let probe = pattern_probe(subject, predicate, object, graph)?;
-        let dict = self.lazy_dict();
-        let payload = resolve_now(match_payload(self.inner.clone(), dict, probe))??;
+        let payload = match_payload(&self.inner, self.lazy_dict(), &probe)?;
         Ok(build_lazy_quads(&payload))
     }
 
@@ -366,22 +368,24 @@ impl VortexRdfStore {
             pattern_probe(subject, predicate, object, graph)?,
             options.as_deref(),
         )?;
-        resolve_now(self.inner.count_probe(&probe))?.map_err(js_err)
+        resolve_now(self.inner.count_probe(&probe))
     }
 
     /// [`countQuads`](Self::count_quads) for each of `probes`, one after
     /// another in input order, as an array of numbers. Every probe is parsed
     /// before any runs; the first that fails throws, and none after it runs.
     /// Runs on every layout.
+    ///
+    /// Core's `count_many` joins the counts, which polls them in input order
+    /// and stops at the first error; each completes on its first poll here
+    /// (see `resolve_now`), so they run one after another.
     #[wasm_bindgen(js_name = countQuadsMany, skip_typescript)]
     pub fn count_quads_many(&self, probes: JsValue) -> Result<js_sys::Array, JsValue> {
-        let probes = parse_probes(&probes)?;
-        let counts = js_sys::Array::new();
-        for probe in &probes {
-            let count = resolve_now(self.inner.count_probe(probe))?.map_err(js_err)?;
-            counts.push(&JsValue::from_f64(count as f64));
-        }
-        Ok(counts)
+        let counts = resolve_now(self.inner.count_many(&parse_probes(&probes)?))?;
+        Ok(counts
+            .into_iter()
+            .map(|count| JsValue::from_f64(count as f64))
+            .collect())
     }
 
     /// Low-level: resolve a pattern to the matched rows' raw term codes —
@@ -452,7 +456,7 @@ impl VortexRdfStore {
         if shape.signal.aborted {
             return Ok(finished_iterable());
         }
-        let matched = resolve_now(self.inner.run_probe(&probe))?.map_err(js_err)?;
+        let matched = resolve_now(self.inner.run_probe(&probe))?;
         let stream = matched
             .code_chunks(&shape.columns, shape.batch_rows)
             .map_err(js_err)?;
@@ -507,19 +511,19 @@ impl VortexRdfStore {
 /// rows' code columns as `matchCodes` answers them ([`code_columns`]) plus
 /// `dict`: no term strings are touched. Otherwise, or when codes are not the
 /// matched view's vocabulary, it is the [`term_payload`].
-async fn match_payload(
-    store: CoreStore,
+fn match_payload(
+    store: &CoreStore,
     dict: Option<JsValue>,
-    probe: Probe,
+    probe: &Probe,
 ) -> Result<JsValue, JsValue> {
-    let matched = store.run_probe(&probe).await.map_err(js_err)?;
+    let matched = resolve_now(store.run_probe(probe))?;
     if let Some(dict) = dict
         && let Some(payload) = code_columns(&matched)?
     {
         Reflect::set(&payload, &"dict".into(), &dict)?;
         return Ok(payload);
     }
-    term_payload(&matched).await
+    term_payload(&matched)
 }
 
 /// A matched view's rows as packed N-Triples term columns: `{ offsets, bytes }`
@@ -529,11 +533,11 @@ async fn match_payload(
 /// spelling already (the default graph as the empty string, this payload's
 /// vocabulary for it), so the bytes go straight into the column — no parse
 /// into oxrdf terms, no re-render.
-async fn term_payload(matched: &CoreStore) -> Result<JsValue, JsValue> {
+fn term_payload(matched: &CoreStore) -> Result<JsValue, JsValue> {
     // (offsets seeded with a leading 0, bytes) per column.
     let mut columns: [(Vec<u32>, Vec<u8>); 4] = std::array::from_fn(|_| (vec![0], Vec::new()));
     let mut chunks = matched.shared_quad_chunks();
-    while let Some(chunk) = chunks.next().await {
+    while let Some(chunk) = resolve_now(chunks.next().map(Ok))? {
         for row in chunk {
             let row = row.map_err(js_err)?;
             let terms = [&row.s, &row.p, &row.o, &row.g];
