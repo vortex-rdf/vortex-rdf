@@ -73,7 +73,7 @@ impl VortexArrayBuilder for SortedStreamBuilder {
 /// sorted (every chunk is a window of the global merge, and assembling chunks
 /// loses the per-chunk stats `match_pattern` gates its binary searches on),
 /// and each streamed index child materialized as an in-memory component
-/// ([`IndexComponent::from_write`]).
+/// ([`IndexComponent::from_stream`]).
 pub(crate) async fn build_array(
     quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
@@ -84,14 +84,14 @@ pub(crate) async fn build_array(
     let BuiltStream {
         dtype,
         chunks,
-        components: writes,
+        components: children,
         dict,
         ..
     } = build_chunk_stream(quad_stream, layout, indexes, sizes, None).await?;
     let chunks: Vec<ArrayRef> = chunks.try_collect().await?;
-    let mut components = Vec::with_capacity(writes.len());
-    for write in &writes {
-        components.push(IndexComponent::from_write(write).await?);
+    let mut components = Vec::with_capacity(children.len());
+    for child in children {
+        components.push(IndexComponent::from_stream(child).await?);
     }
     let array = with_subject_stamp(chunked_or_single(chunks, dtype)?, true)?;
     log::debug!(

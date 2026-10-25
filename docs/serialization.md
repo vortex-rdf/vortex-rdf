@@ -52,7 +52,7 @@ A builder hands these back in one of two shapes
 | Surface | Call | Pipeline | Produces |
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
-| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L136) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L46) | out-of-core | file / any `VortexWrite` |
+| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L65), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L106) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L129) | — (re-serializes a store) | bytes |
 | Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L245) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
@@ -174,7 +174,7 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, stripped
 of its adjacent repeats, and built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L171); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L172); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
@@ -256,9 +256,9 @@ every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
 ([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L116)) or,
 under the string layouts, as their terms again
-([`build_struct_array`](../core/src/store/builders/mod.rs#L171)). With indexes a
+([`build_struct_array`](../core/src/store/builders/mod.rs#L172)). With indexes a
 first merge runs to completion
-([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L116)):
+([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L115)):
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's ranks are pushed into one spiller per requested family
@@ -298,13 +298,13 @@ that file (where the links at its path end), `.<file name>.spill-<uuid>`
 (`.out.vortex.spill-<uuid>` for `out.vortex`), by default a hidden sibling of
 the store, so a directory a crash left behind says which output it belonged
 to; a build with no output path (an in-memory store, or
-[`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L46) into a caller's
+[`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) into a caller's
 writer), or one whose file name would make the directory's name longer than
 255 bytes, uses `.vortex-rdf.spill-<uuid>`. The parent directory is resolved in
 this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
 the `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (a
 serialization to a file,
-[`quads_stream_to_vortex_file`](../core/src/io/write.rs#L136) and so the CLI
+[`quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) and so the CLI
 and Python's `serialize_rdf`, and a compaction both pass the directory of
 their temp file: beside the file they write or replace, links followed, on the
 volume that takes the store), then the OS temp dir (a build with no output
@@ -393,7 +393,7 @@ Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
 ([file-format.md §6](file-format.md#6-the-index-children)).
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L197)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L198)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
 family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L138),
 or the code tuple under Dictionary), then gather the columns through that
@@ -467,7 +467,7 @@ flowchart TD
   `true` by construction for a builder's stream; each component's `sorted` flag
   travels on its descriptor.
 
-One driver feeds this, [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L77):
+One driver feeds this, [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L78):
 a builder's chunk stream (files, compaction; a file is written through a
 [`PendingStore`](../core/src/io/pending.rs#L77) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store

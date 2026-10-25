@@ -10,6 +10,7 @@ use crate::error::{Result, VortexRdfError};
 
 use crate::io::container::{self, child_strategy};
 use crate::store::builders::BuiltStream;
+use crate::store::indexes::components::ChildStream;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_io::VortexWrite;
 
@@ -82,7 +83,9 @@ where
     W: VortexWrite + Unpin + Send,
 {
     refuse_experimental_patches()?;
-    let mut components = built.components;
+    let mut components = (built.components.into_iter())
+        .map(ChildStream::into_write)
+        .collect::<Result<Vec<_>>>()?;
     if let Some(dict) = &built.dict {
         components.push(dict.to_write()?);
     }

@@ -45,7 +45,7 @@ impl BuiltArray {
         );
         let components = components
             .iter()
-            .map(IndexComponent::to_write)
+            .map(IndexComponent::to_stream)
             .collect::<Result<Vec<_>>>()?;
         let quads_sorted = subject_sorted(&array);
         Ok(crate::store::builders::BuiltStream {

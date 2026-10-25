@@ -2,9 +2,9 @@
 //! index data takes. One [`IndexComponent`] is one child of a native store
 //! file, or its in-memory twin: rows under the child's own column names,
 //! carrying the writer's sortedness provenance. Builders emit components
-//! beside primary-only quad rows; this module writes a child's rows as a
-//! native child ([`index_child_write`]),
-//! adopts a persisted one back into memory ([`adopt_component`]), maps an
+//! beside primary-only quad rows; this module streams a child's rows to the
+//! writer, which spells its descriptor ([`ChildStream`]), adopts a
+//! persisted one back into memory ([`adopt_component`]), maps an
 //! implementation slug onto its identity ([`known_component`]), and decodes a
 //! rid column into the sorted base row ids every resolution answers in
 //! ([`sorted_row_ids`]).
@@ -186,45 +186,42 @@ impl IndexComponent {
         Ok(self.rows.cell.get_or_init(|| executed))
     }
 
-    /// This component as a replayable native child write
-    /// ([`index_child_write`]), its descriptor carrying the component's own
+    /// This component as a [`ChildStream`] over its rows, carrying its own
     /// sortedness provenance: how a store's serialization hands its
-    /// components to the container writer. A deferred adoption materializes
-    /// here, so the written child is byte-identical to an eagerly adopted
-    /// one's.
-    pub(crate) fn to_write(&self) -> Result<NativeComponentWrite> {
+    /// components to the writer. A deferred adoption materializes here, so
+    /// the written child is byte-identical to an eagerly adopted one's.
+    pub(crate) fn to_stream(&self) -> Result<ChildStream> {
         let array = self.rows()?.clone().into_array();
-        index_child_write(
-            self.identity,
-            self.sorted,
-            Arc::new(crate::io::container::BufferedComponentSource::try_new(
+        Ok(ChildStream {
+            identity: self.identity,
+            sorted: self.sorted,
+            source: Arc::new(crate::io::container::BufferedComponentSource::try_new(
                 vec![array],
             )?),
-        )
+        })
     }
 
-    /// The inverse of [`to_write`](Self::to_write): the write's streamed
-    /// chunks executed to one struct in child schema, under the registry
-    /// identity of its implementation slug and with the descriptor's `sorted`
-    /// provenance. A foreign slug is an error.
+    /// This component as the native child write the writer makes of it
+    /// ([`to_stream`](Self::to_stream), [`ChildStream::into_write`]), for
+    /// the tests that assemble store files by hand.
+    #[cfg(test)]
+    pub(crate) fn to_write(&self) -> Result<NativeComponentWrite> {
+        self.to_stream()?.into_write()
+    }
+
+    /// The inverse of [`to_stream`](Self::to_stream): the child's streamed
+    /// chunks executed to one struct in child schema, under the child's
+    /// identity and with its `sorted` provenance.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) async fn from_write(
-        write: &crate::io::container::NativeComponentWrite,
-    ) -> Result<Self> {
+    pub(crate) async fn from_stream(child: ChildStream) -> Result<Self> {
         use futures::TryStreamExt as _;
 
-        let implementation = &write.descriptor.implementation;
-        let identity = known_component(implementation).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "unknown index component implementation: {implementation}"
-            ))
-        })?;
-        let chunks: Vec<ArrayRef> = write.source.open()?.try_collect().await?;
-        let rows = crate::store::array::chunked_or_single(chunks, write.descriptor.dtype.clone())?;
+        let chunks: Vec<ArrayRef> = child.source.open()?.try_collect().await?;
+        let rows = crate::store::array::chunked_or_single(chunks, child.source.dtype().clone())?;
         Ok(Self::built(
-            identity,
+            child.identity,
             into_struct_array(rows)?,
-            write.descriptor.sorted,
+            child.sorted,
         ))
     }
 
@@ -381,33 +378,39 @@ impl IndexComponent {
     }
 }
 
-/// `source` as the native child write of an index component under the
-/// registry row `identity`: its descriptor names the component and its
-/// slug, carries `sorted` (the writer's provenance) and `source`'s dtype,
-/// and the child is written through [`child_strategy`]. The one spelling of
-/// an index child's descriptor, for a component's own rows
-/// ([`IndexComponent::to_write`]) and the out-of-core builder's streamed
-/// children alike.
-pub(crate) fn index_child_write(
-    identity: &'static ComponentIdentity,
-    sorted: bool,
-    source: Arc<dyn NativeComponentSource>,
-) -> Result<NativeComponentWrite> {
-    let dtype = source.dtype().clone();
-    let strategy = child_strategy(&dtype);
-    Ok(NativeComponentWrite::new(
-        StoreComponentDescriptor {
-            name: identity.name.into(),
-            role: StoreComponentRole::Index,
-            implementation: identity.slug.into(),
-            version: INDEX_VERSION,
-            required: false,
-            sorted,
-            dtype,
-        },
-        source,
-        strategy,
-    )?)
+/// An index child on its way to the writer: the registry row it is, the
+/// writer's sortedness provenance, and the source of its rows. A store's
+/// components ([`IndexComponent::to_stream`]) and the out-of-core builder's
+/// merged children travel as one, and the writer alone spells its descriptor
+/// ([`into_write`](Self::into_write)), as it does the dictionary's.
+pub(crate) struct ChildStream {
+    pub(crate) identity: &'static ComponentIdentity,
+    pub(crate) sorted: bool,
+    pub(crate) source: Arc<dyn NativeComponentSource>,
+}
+
+impl ChildStream {
+    /// This child as a native child write: its descriptor names the
+    /// component and its slug, carries `sorted` and the source's dtype, and
+    /// the child is written through [`child_strategy`]. The one spelling of
+    /// an index child's descriptor.
+    pub(crate) fn into_write(self) -> Result<NativeComponentWrite> {
+        let dtype = self.source.dtype().clone();
+        let strategy = child_strategy(&dtype);
+        Ok(NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: self.identity.name.into(),
+                role: StoreComponentRole::Index,
+                implementation: self.identity.slug.into(),
+                version: INDEX_VERSION,
+                required: false,
+                sorted: self.sorted,
+                dtype,
+            },
+            self.source,
+            strategy,
+        )?)
+    }
 }
 
 /// The index set a component roster implies, in declaration (preference)

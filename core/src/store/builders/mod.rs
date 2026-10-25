@@ -104,16 +104,17 @@ pub struct BuiltArray {
 }
 
 /// The streaming counterpart of [`BuiltArray`]: the schema dtype, the lazy
-/// stream of primary-only quad chunks, the index children as writable
-/// components, and the dictionary the serializer writes as the `dictionary`
+/// stream of primary-only quad chunks, the index children as streams of
+/// their rows, and the dictionary the serializer writes as the `dictionary`
 /// child.
 pub(crate) struct BuiltStream {
     /// The schema dtype shared by every chunk.
     pub dtype: DType,
     /// The lazy stream of primary-only quad chunks.
     pub chunks: ChunkStream,
-    /// The index children riding beside the rows as writable components.
-    pub(crate) components: Vec<crate::io::container::NativeComponentWrite>,
+    /// The index children riding beside the rows, each its identity,
+    /// provenance and rows: the writer spells their descriptors.
+    pub(crate) components: Vec<crate::store::indexes::components::ChildStream>,
     /// Whether the chunks are in global `(s, p, o, g)` order; written as the
     /// root's `quads_sorted`.
     pub(crate) quads_sorted: bool,

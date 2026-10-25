@@ -227,7 +227,7 @@ flowchart TD
   are then streamed through the out-of-core builder
   ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229))
   into it
-  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L77)), which is
+  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L78)), which is
   then renamed over the original path, and the store is reopened
   memory-mapped. Only the file the store opened is replaced: the file's
   device and inode are recorded at open and checked against the path before
@@ -248,7 +248,7 @@ flowchart TD
   run directory named after that file.
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L222) and adopts
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L223) and adopts
   the result through [`from_built`](../core/src/store/construct.rs#L106), in the
   same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).

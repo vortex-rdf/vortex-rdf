@@ -10,9 +10,8 @@ use super::runs::{
 };
 use super::spill::TempRunsGuard;
 use crate::error::Result;
-use crate::io::container::NativeComponentWrite;
 use crate::io::container::sources::NativeComponentSource;
-use crate::store::indexes::components::{ComponentIdentity, TermColumn, index_child_write};
+use crate::store::indexes::components::{ChildStream, ComponentIdentity, TermColumn};
 use crate::store::indexes::copy::CopyFamily;
 use crate::store::indexes::copy::out_of_core::{CopyKey, copy_child_chunk};
 use crate::store::indexes::reference::RefFamily;
@@ -120,7 +119,7 @@ pub(super) fn merge_feeding_indexes<V>(
     sizes: BuildSizes,
     indexes: &[IndexType],
     decode: impl Fn(u32) -> Result<V> + Clone + Send + 'static,
-) -> Result<Vec<NativeComponentWrite>>
+) -> Result<Vec<ChildStream>>
 where
     V: TermColumn + Send + 'static,
 {
@@ -150,8 +149,8 @@ fn decode_key<V>(decode: &impl Fn(u32) -> Result<V>, key: &[u32; 4]) -> Result<[
     ])
 }
 
-/// Each family's child as a native component write ([`index_child_write`])
-/// streaming its chunks off its merger in windows of `chunk_size` entries,
+/// Each family's child as a [`ChildStream`] whose source streams its chunks
+/// off its merger in windows of `chunk_size` entries,
 /// never materialized and not in lockstep with the quad stream; `decode`
 /// spells each window's ranks as `V`. Each child's empty chunk, built by the
 /// same chunk builder over no entries, gives the child its dtype. Every pull
@@ -161,7 +160,7 @@ fn merger_components<V>(
     chunk_size: usize,
     guard: &Arc<TempRunsGuard>,
     decode: impl Fn(u32) -> Result<V> + Clone + Send + 'static,
-) -> Result<Vec<NativeComponentWrite>>
+) -> Result<Vec<ChildStream>>
 where
     V: TermColumn + Send + 'static,
 {
@@ -198,17 +197,15 @@ where
             families.push((family.identity(), empty, pull));
         }
     }
-    families
+    Ok(families
         .into_iter()
-        .map(|(identity, empty, pull)| {
+        .map(|(identity, empty, pull)| ChildStream {
+            identity,
             // The merger emits the family in its global sort order.
-            index_child_write(
-                identity,
-                true,
-                Arc::new(PullComponentSource::new(empty, chunk_size, pull)),
-            )
+            sorted: true,
+            source: Arc::new(PullComponentSource::new(empty, chunk_size, pull)),
         })
-        .collect()
+        .collect())
 }
 
 /// `batch`, a window of a family's merged entries, as one child chunk;
