@@ -385,21 +385,12 @@ impl VortexRdfStore {
             // the string layouts stop here, their columns resolving none.
             if let RowSelection::Range(range) = &selection {
                 let mut run = range.start as usize..range.end as usize;
-                let roles = [
-                    (pat.predicate.map(TermRef::Predicate), schema::COL_P),
-                    (pat.object.map(TermRef::Object), schema::COL_O),
-                    (pat.graph.map(TermRef::Graph), schema::COL_G),
-                ];
                 let mut answered = 0;
-                for (term, column) in roles {
-                    let Some(term) = term else { break };
-                    let Some(owned) = probes.by_name(base, column).flatten() else {
+                for term in pat.prefix_behind_subject() {
+                    let Some(owned) = probes.by_name(base, term.role().name()).flatten() else {
                         break;
                     };
-                    let Some(needle) = codes
-                        .probe_scalar(term)?
-                        .and_then(|scalar| u64::try_from(&scalar).ok())
-                    else {
+                    let Some(needle) = codes.probe_code(term)? else {
                         break;
                     };
                     // `bounds_in` consults only the window's order: a
@@ -413,14 +404,7 @@ impl VortexRdfStore {
                 }
                 if answered > 0 {
                     selection = RowSelection::Range(run.start as u64..run.end as u64);
-                    // Exactly the roles the run now satisfies, in order.
-                    pat.predicate = None;
-                    if answered > 1 {
-                        pat.object = None;
-                    }
-                    if answered > 2 {
-                        pat.graph = None;
-                    }
+                    pat.clear_prefix_behind_subject(answered);
                     debug::step!(
                         t,
                         "[match_pattern] In-memory prefix of {answered} more roles bounded by binary search"

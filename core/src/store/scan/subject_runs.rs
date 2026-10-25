@@ -26,10 +26,7 @@ pub(crate) async fn locate_subject_run(
     if !file.quads_sorted() {
         return Ok(None);
     }
-    let Ok(Some(probe)) = codes.probe_scalar(TermRef::Subject(subject)) else {
-        return Ok(None);
-    };
-    let Ok(needle) = u64::try_from(&probe) else {
+    let Ok(Some(needle)) = codes.probe_code(TermRef::Subject(subject)) else {
         return Ok(None);
     };
     let Some(chunks) = sorted_subject_chunks(file) else {
@@ -52,24 +49,15 @@ pub(crate) async fn narrow_subject_run(
 ) -> Result<usize> {
     let source = file.segment_source();
     let session = file.session();
-    let roles = [
-        (pattern.predicate.map(TermRef::Predicate), schema::COL_P),
-        (pattern.object.map(TermRef::Object), schema::COL_O),
-        (pattern.graph.map(TermRef::Graph), schema::COL_G),
-    ];
     let mut answered = 0;
-    for (term, column) in roles {
+    for term in pattern.prefix_behind_subject() {
         if run.is_empty() {
             break;
         }
-        let Some(term) = term else { break };
-        let Some(chunks) = file.column_chunks(column) else {
+        let Some(chunks) = file.column_chunks(term.role().name()) else {
             break;
         };
-        let Some(needle) = codes
-            .probe_scalar(term)?
-            .and_then(|scalar| u64::try_from(&scalar).ok())
-        else {
+        let Some(needle) = codes.probe_code(term)? else {
             break;
         };
         let Some(narrowed) = chunks
@@ -81,15 +69,7 @@ pub(crate) async fn narrow_subject_run(
         *run = narrowed;
         answered += 1;
     }
-    if answered > 0 {
-        pattern.predicate = None;
-    }
-    if answered > 1 {
-        pattern.object = None;
-    }
-    if answered > 2 {
-        pattern.graph = None;
-    }
+    pattern.clear_prefix_behind_subject(answered);
     Ok(answered)
 }
 

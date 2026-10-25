@@ -280,6 +280,35 @@ impl<'a> QuadPattern<'a> {
         .into_iter()
         .flatten()
     }
+
+    /// The bound roles behind the subject in `(p, o, g)` order, up to the
+    /// first unbound one: the prefix a bound subject's run narrows by in a
+    /// base sorted by `(s, p, o, g)`, each role searched for inside the run
+    /// the previous one left.
+    pub(crate) fn prefix_behind_subject(&self) -> impl Iterator<Item = TermRef<'a>> + use<'a> {
+        [
+            self.predicate.map(TermRef::Predicate),
+            self.object.map(TermRef::Object),
+            self.graph.map(TermRef::Graph),
+        ]
+        .into_iter()
+        .map_while(|term| term)
+    }
+
+    /// Unbind the first `answered` roles of
+    /// [`prefix_behind_subject`](Self::prefix_behind_subject): the ones a
+    /// prefix probe searched, which the narrowed run now satisfies.
+    pub(crate) fn clear_prefix_behind_subject(&mut self, answered: usize) {
+        if answered > 0 {
+            self.predicate = None;
+        }
+        if answered > 1 {
+            self.object = None;
+        }
+        if answered > 2 {
+            self.graph = None;
+        }
+    }
 }
 
 /// A bound term of a quad pattern, tagged with the role it occupies.
@@ -312,7 +341,7 @@ impl std::fmt::Display for TermRef<'_> {
 
 impl TermRef<'_> {
     /// The column the term's role occupies.
-    fn role(&self) -> QuadColumn {
+    pub(crate) fn role(&self) -> QuadColumn {
         match self {
             TermRef::Subject(_) => QuadColumn::S,
             TermRef::Predicate(_) => QuadColumn::P,
@@ -452,6 +481,17 @@ impl PatternCodes {
             return Ok(Some(Scalar::from(self.render(term))));
         }
         Ok(self.code(term)?.map(Scalar::from))
+    }
+
+    /// The code a code column's probes search for `term`: its
+    /// [`probe_scalar`](Self::probe_scalar) under the Dictionary layout.
+    /// `None` for a term the dictionary lacks, and under the string layouts,
+    /// whose columns hold terms rather than codes.
+    pub(crate) fn probe_code(&self, term: TermRef<'_>) -> Result<Option<TermCode>> {
+        if self.probes_by_string() {
+            return Ok(None);
+        }
+        self.code(term)
     }
 
     /// Whether the layout can prove the pattern matches no row: a bound term
