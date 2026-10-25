@@ -615,9 +615,7 @@ async fn predicate_store() -> VortexRdfStore {
             GraphName::DefaultGraph,
         ));
     }
-    VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, vec![])
-        .await
-        .unwrap()
+    streamed_store(quads, LayoutStrategy::Dictionary, vec![]).await
 }
 
 /// Over any candidate subset, `filter_codes` answers exactly what `eval`

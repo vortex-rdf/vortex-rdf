@@ -12,16 +12,6 @@ fn brute_keep(rows: &[[TermCode; 4]], column: QuadColumn, keep: &Keep) -> Vec<[T
         .collect()
 }
 
-async fn memory_store(indexes: Indexes) -> VortexRdfStore {
-    VortexRdfStore::from_quads(
-        quad_stream(fixture_quads()),
-        LayoutStrategy::Dictionary,
-        indexes,
-    )
-    .await
-    .unwrap()
-}
-
 /// The keeps every column is exercised with: a namespace range, sparse and
 /// dense sets, a singleton, an all-admitting range and an empty set.
 async fn keeps_for(store: &VortexRdfStore, column: QuadColumn) -> Vec<Keep> {
@@ -284,9 +274,7 @@ async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
             )
         })
         .collect();
-    let store = VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, indexes)
-        .await
-        .unwrap();
+    let store = streamed_store(quads, LayoutStrategy::Dictionary, indexes).await;
     let s3 = iri_subject("s3");
     let run = matched_view(&store, Some(&s3), None, None, None).await;
     assert_eq!(run.debug_selection_range(), Some(24..32), "{tag}");
@@ -325,7 +313,8 @@ async fn test_keep_in_memory_matches_brute_force() {
         ("copy", vec![IndexType::SecondaryByCopy]),
         ("reference", vec![IndexType::SecondaryByReference]),
     ] {
-        let store = memory_store(indexes.clone()).await;
+        let store =
+            streamed_store(fixture_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
         assert_keeps_match_brute_force(&store, tag).await;
         assert_sorted_run_keeps_engage(indexes, tag).await;
     }
@@ -362,7 +351,7 @@ async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
 #[tokio::test]
 async fn test_subject_keep_over_every_row_searches_the_sorted_column() {
     use crate::store::query::keep::keep_hooks::sorted_run_keeps;
-    let store = memory_store(vec![]).await;
+    let store = streamed_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let rows = row_list(&store).await;
     let (lo, hi) = store
         .dict_reader()
@@ -477,7 +466,7 @@ async fn test_window_in_memory_matches_slicing() {
         ("no-index", vec![]),
         ("copy", vec![IndexType::SecondaryByCopy]),
     ] {
-        let store = memory_store(indexes).await;
+        let store = streamed_store(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
         assert_windows_match_slicing(&store, tag).await;
     }
 }
@@ -486,7 +475,12 @@ async fn test_window_in_memory_matches_slicing() {
 #[tokio::test]
 async fn test_narrowing_skips_tombstones() {
     let quads = fixture_quads();
-    let store = memory_store(vec![IndexType::SecondaryByCopy]).await;
+    let store = streamed_store(
+        fixture_quads(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
     let deleted = delete_all(&store, quads.iter().step_by(7).take(50)).await;
     assert_eq!(deleted.size().await.unwrap(), quads.len() - 50);
     assert_keeps_match_brute_force(&deleted, "tombstoned").await;
@@ -501,13 +495,7 @@ async fn test_narrowing_skips_tombstones() {
 /// windows and capped counts work on every layout and through a tail.
 #[tokio::test]
 async fn test_narrowing_gates_and_tails() {
-    let strings = VortexRdfStore::from_quads(
-        quad_stream(fixture_quads()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let strings = streamed_store(fixture_quads(), LayoutStrategy::Default, vec![]).await;
     assert!(matches!(
         strings.keep(QuadColumn::P, &Keep::range(0..10)).await,
         Err(VortexRdfError::InvalidOperation(_))
@@ -528,7 +516,7 @@ async fn test_narrowing_gates_and_tails() {
             .unwrap()
     );
 
-    let store = memory_store(vec![]).await;
+    let store = streamed_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let appended: Vec<Quad> = (0..30)
         .map(|i| {
             make_quad(
@@ -610,7 +598,10 @@ async fn window_stores() -> (
         ("memory/copy", vec![IndexType::SecondaryByCopy]),
         ("memory/reference", vec![IndexType::SecondaryByReference]),
     ] {
-        stores.push((tag.to_string(), memory_store(indexes).await));
+        stores.push((
+            tag.to_string(),
+            streamed_store(fixture_quads(), LayoutStrategy::Dictionary, indexes).await,
+        ));
     }
     (dirs, stores)
 }

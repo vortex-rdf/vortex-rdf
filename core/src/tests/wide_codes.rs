@@ -434,13 +434,7 @@ fn indexes() -> Indexes {
 async fn codes_past_u32_round_trip_in_memory() {
     let _base = CodeBase::set(BASE);
     let quads = dataset();
-    let store = VortexRdfStore::from_quads(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        indexes(),
-    )
-    .await
-    .unwrap();
+    let store = streamed_store(quads.clone(), LayoutStrategy::Dictionary, indexes()).await;
     // Compressed and uncached, so the first keep reads through the probe.
     assert_eq!(store.debug_base_child_int_canonical("s"), Some(false));
     check_store(&store, &quads, "built in memory").await;
@@ -516,13 +510,7 @@ async fn codes_past_u32_survive_mutation_rebuilds() {
     let _base = CodeBase::set(BASE);
     let mut quads = dataset();
     let extra = quads.pop().unwrap();
-    let store = VortexRdfStore::from_quads(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        indexes(),
-    )
-    .await
-    .unwrap();
+    let store = streamed_store(quads.clone(), LayoutStrategy::Dictionary, indexes()).await;
     let grown = store
         .add_quad(extra.clone())
         .await

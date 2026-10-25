@@ -1023,13 +1023,7 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
         (IndexType::SecondaryByReference, false),
         (IndexType::SecondaryByCopy, true),
     ] {
-        let store = VortexRdfStore::from_quads(
-            quad_stream(quads.clone()),
-            LayoutStrategy::Dictionary,
-            vec![index],
-        )
-        .await
-        .unwrap();
+        let store = streamed_store(quads.clone(), LayoutStrategy::Dictionary, vec![index]).await;
         let all = matched_view(&store, None, Some(&p1), None, None)
             .await
             .code_columns_gathered()

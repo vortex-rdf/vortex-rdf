@@ -1059,9 +1059,8 @@ async fn test_every_writer_stamps_index_children_with_the_index_version() {
             .await
             .unwrap();
         drop(compacted);
-        let built = VortexRdfStore::from_quads(quad_stream(quads), layout, indexes.clone())
+        let built = streamed_store(quads, layout, indexes.clone())
             .await
-            .unwrap()
             .to_bytes()
             .await
             .unwrap();
@@ -1462,13 +1461,12 @@ async fn test_dictionary_quad_sink_serializes_like_the_builder() {
 async fn test_written_code_columns_avoid_delta() {
     let graphs: Vec<GraphName> = (0..4).map(|i| iri_graph(&format!("g{i}"))).collect();
     let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
-    let store = VortexRdfStore::from_quads(
-        quad_stream(quads),
+    let store = streamed_store(
+        quads,
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
+    .await;
     let bytes = store.to_bytes().await.unwrap();
     let adopted = VortexRdfStore::from_bytes_owned(bytes).await.unwrap();
     let parts = adopted.to_serializable_parts().await.unwrap();
@@ -1535,13 +1533,12 @@ async fn test_written_frame_of_reference_keeps_one_reference() {
 
     let graphs: Vec<GraphName> = (0..4).map(|i| iri_graph(&format!("g{i}"))).collect();
     let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
-    let store = VortexRdfStore::from_quads(
-        quad_stream(quads),
+    let store = streamed_store(
+        quads,
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
+    .await;
     let bytes = store.to_bytes().await.unwrap();
     let adopted = VortexRdfStore::from_bytes_owned(bytes).await.unwrap();
     let parts = adopted.to_serializable_parts().await.unwrap();

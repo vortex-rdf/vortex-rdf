@@ -213,9 +213,7 @@ async fn rebuilds_refuse_a_store_grown_past_the_top() {
     let _base = RowIdBase::set(TOP);
     let mut all = quads(LIMIT + 1);
     let extra = all.pop().unwrap();
-    let store = VortexRdfStore::from_quads(quad_stream(all), LayoutStrategy::Dictionary, indexes())
-        .await
-        .unwrap();
+    let store = streamed_store(all, LayoutStrategy::Dictionary, indexes()).await;
     let grown = store.add_quad(extra).await.unwrap();
     assert_eq!(
         grown.size().await.unwrap(),

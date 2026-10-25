@@ -480,9 +480,7 @@ async fn row_ids_past_u32_survive_compaction() {
     for layout in LAYOUTS {
         let label = format!("{layout:?}");
         let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
-        let store = VortexRdfStore::from_quads(quad_stream(quads.clone()), layout, indexes.clone())
-            .await
-            .unwrap();
+        let store = streamed_store(quads.clone(), layout, indexes.clone()).await;
         let grown = store.add_quad(extra.clone()).await.unwrap();
         let mut all = quads.clone();
         all.push(extra.clone());

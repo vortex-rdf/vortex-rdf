@@ -822,13 +822,7 @@ async fn test_chained_compactions_of_an_in_memory_store() {
         write_store_file(initial.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
     let bytes_on_disk = std::fs::read(&path).unwrap();
     let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-    let built = VortexRdfStore::from_quads(
-        quad_stream(initial.clone()),
-        LayoutStrategy::Dictionary,
-        indexes,
-    )
-    .await
-    .unwrap();
+    let built = streamed_store(initial.clone(), LayoutStrategy::Dictionary, indexes).await;
 
     for (how, mut store) in [("loaded", loaded), ("built", built)] {
         let mut expected = initial.clone();

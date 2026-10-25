@@ -52,12 +52,6 @@ fn mixed_kind_quads() -> Vec<Quad> {
     quads
 }
 
-async fn memory_dictionary_store(quads: Vec<Quad>) -> VortexRdfStore {
-    VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, vec![])
-        .await
-        .unwrap()
-}
-
 /// Every term of the dictionary, in code order.
 async fn all_terms(reader: &DictReader) -> Vec<String> {
     let codes: Vec<TermCode> = (0..reader.len() as TermCode).collect();
@@ -443,7 +437,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
 /// agrees with the snapshot's, and the snapshot is reachable from it.
 #[tokio::test]
 async fn test_dict_reader_resident_matches_snapshot() {
-    let store = memory_dictionary_store(mixed_kind_quads()).await;
+    let store = streamed_store(mixed_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let reader = store.dict_reader().expect("Dictionary layout, no tail");
     assert!(!reader.is_file_backed());
     let snapshot = reader
@@ -458,19 +452,13 @@ async fn test_dict_reader_resident_matches_snapshot() {
 /// resident dictionary stays held; compaction restores it.
 #[tokio::test]
 async fn test_dict_reader_gates_on_layout_and_tail() {
-    let strings = VortexRdfStore::from_quads(
-        quad_stream(mixed_kind_quads()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let strings = streamed_store(mixed_kind_quads(), LayoutStrategy::Default, vec![]).await;
     assert!(
         strings.dict_reader().is_none(),
         "string layouts have no dictionary"
     );
 
-    let store = memory_dictionary_store(mixed_kind_quads()).await;
+    let store = streamed_store(mixed_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let tailed = store
         .add_quad(make_quad(
             "http://example.org/new",
@@ -503,7 +491,7 @@ async fn test_dict_reader_gates_on_layout_and_tail() {
 /// literals, IRIs, blank nodes — and every term lands in its kind's range.
 #[tokio::test]
 async fn test_kind_ranges_partition_codes() {
-    let store = memory_dictionary_store(mixed_kind_quads()).await;
+    let store = streamed_store(mixed_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let reader = store.dict_reader().unwrap();
     let terms = all_terms(&reader).await;
     let kinds = reader.kind_ranges().await.unwrap();
@@ -570,7 +558,7 @@ async fn test_kind_ranges_partition_codes() {
 /// looked up, and absent terms stay absent either way.
 #[tokio::test]
 async fn test_encode_variant_spellings_agree_with_the_stored_form() {
-    let store = memory_dictionary_store(mixed_kind_quads()).await;
+    let store = streamed_store(mixed_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let snapshot = store.dict_reader().unwrap().snapshot().unwrap();
     for (variant, stored) in tolerated_spellings() {
         let first = snapshot.encode(variant).unwrap();

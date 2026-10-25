@@ -590,6 +590,19 @@ async fn built_store(quads: Vec<Quad>, layout: LayoutStrategy, indexes: Indexes)
     VortexRdfStore::from_built(built).unwrap()
 }
 
+/// The store [`VortexRdfStore::from_quads`] builds from `quads`, unwrapped:
+/// [`built_store`]'s counterpart through the crate's own entry point, which
+/// sorts through [`SortedStreamBuilder`] wherever a filesystem exists.
+async fn streamed_store(
+    quads: Vec<Quad>,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+) -> VortexRdfStore {
+    VortexRdfStore::from_quads(quad_stream(quads), layout, indexes)
+        .await
+        .unwrap()
+}
+
 /// The view of `store` the pattern `(s, p, o, g)` matches: a
 /// [`match_pattern`](VortexRdfStore::match_pattern), unwrapped.
 async fn matched_view(
