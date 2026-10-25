@@ -291,18 +291,6 @@ mod tests {
         );
     }
 
-    /// A pull-backed source hands out its stream once; a second open is an
-    /// error.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    #[test]
-    fn pull_source_replays_once() {
-        use sources::{NativeComponentSource as _, PullComponentSource};
-        let dtype = dict_chunk(&["a"]).dtype().clone();
-        let source = PullComponentSource::new(dtype, 1, Box::new(|_| Ok(None)));
-        assert!(source.open().is_ok());
-        assert!(source.open().is_err());
-    }
-
     /// The write-side round trips.
     mod write_tests {
         use std::sync::Arc;

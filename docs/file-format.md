@@ -217,7 +217,7 @@ column
 
 An id column — a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64`
 row-id `rid` — takes the same pipeline with one change, through the writer's
-per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L230)):
+per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L156)):
 if it does not dictionary-encode (a row-id column never does: its ids are
 unique), it coalesces toward ~2 MiB, 262,144 rows per leaf. A code column that
 dictionary-encodes keeps its codes at ~1 MiB: they are as narrow as its
@@ -270,7 +270,7 @@ are bare codes and cannot be decoded without it.
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L36))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L367)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L293)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates
@@ -604,8 +604,8 @@ open rather than being read around.
 |---|---|---|
 | `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L28) |
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L16) |
-| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L189) |
-| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L185), [`child_strategy`](../core/src/io/container/sources.rs#L230) |
+| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L115) |
+| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L111), [`child_strategy`](../core/src/io/container/sources.rs#L156) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L36) |
 | `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) |

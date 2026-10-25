@@ -299,7 +299,10 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                     required: false,
                     // Per-chunk sorts only: the writer may not claim global order.
                     sorted: false,
-                    dtype: crate::store::indexes::copy::out_of_core::copy_child_dtype::<String>(),
+                    dtype: copy_child_chunk::<String>(family, &[])
+                        .unwrap()
+                        .dtype()
+                        .clone(),
                 },
                 std::sync::Arc::new(container::BufferedComponentSource::try_new(chunks).unwrap()),
                 container::default_child_strategy(),

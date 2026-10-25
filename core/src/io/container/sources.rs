@@ -12,9 +12,9 @@ use super::wire::StoreComponentDescriptor;
 
 /// A producer of one component's chunks: buffered arrays
 /// ([`BufferedComponentSource`], replayable) or a spill-run merger pulled
-/// chunk by chunk ([`PullComponentSource`], single-shot). Nothing is produced
-/// until the write strategy polls, so it bounds how many components compress
-/// at once.
+/// chunk by chunk (the out-of-core builder's, single-shot). Nothing is
+/// produced until the write strategy polls, so it bounds how many components
+/// compress at once.
 pub(crate) trait NativeComponentSource: Send + Sync + 'static {
     fn dtype(&self) -> &DType;
     fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream>;
@@ -73,80 +73,6 @@ impl NativeComponentSource for BufferedComponentSource {
 
     fn buffered_bytes(&self) -> u64 {
         self.retained_bytes
-    }
-}
-
-/// A pull closure yielding one component chunk of at most the given rows per
-/// call, `Ok(None)` once exhausted; a zero-row pull yields the empty chunk of
-/// the component's dtype.
-// Made only by the out-of-core builder, absent on wasm32-unknown-unknown.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) type PullFn =
-    Box<dyn FnMut(usize) -> VortexResult<Option<vortex_array::ArrayRef>> + Send>;
-
-/// A single-shot component source over a pull closure: each call reads the
-/// next window off a spill-run merger's run files, so the component is never
-/// materialized.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) struct PullComponentSource {
-    dtype: DType,
-    batch_rows: usize,
-    pull: std::sync::Mutex<Option<PullFn>>,
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-impl PullComponentSource {
-    pub(crate) fn new(dtype: DType, batch_rows: usize, pull: PullFn) -> Self {
-        Self {
-            dtype,
-            batch_rows,
-            pull: std::sync::Mutex::new(Some(pull)),
-        }
-    }
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-impl NativeComponentSource for PullComponentSource {
-    fn dtype(&self) -> &DType {
-        &self.dtype
-    }
-
-    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
-        let pull = self
-            .pull
-            .lock()
-            .expect("pull source lock")
-            .take()
-            .ok_or_else(|| {
-                vortex_error::vortex_err!("a pull-backed component source replays only once")
-            })?;
-        let batch_rows = self.batch_rows;
-        // At least one chunk is emitted: the child strategy needs one,
-        // possibly empty, to write a schema-complete component, so an empty
-        // component contributes its zero-row pull.
-        let stream =
-            futures::stream::unfold((Some(pull), false), move |(state, emitted)| async move {
-                let mut pull = state?;
-                match pull(batch_rows) {
-                    Ok(Some(chunk)) => Some((Ok(chunk), (Some(pull), true))),
-                    Ok(None) if !emitted => {
-                        let empty = pull(0).and_then(|chunk| {
-                            chunk.ok_or_else(|| {
-                                vortex_error::vortex_err!(
-                                    "a zero-row pull must yield an empty chunk"
-                                )
-                            })
-                        });
-                        Some((empty, (None, true)))
-                    }
-                    Ok(None) => None,
-                    Err(e) => Some((Err(e), (None, true))),
-                }
-            });
-        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
-            self.dtype.clone(),
-            stream,
-        )))
     }
 }
 

@@ -226,38 +226,18 @@ fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
 }
 
 /// The emission surface of the out-of-core builder (compiled out on
-/// wasm32-unknown-unknown with it): the persisted child dtype, the child
-/// chunks built from windows of merged `(sort key, row id)` entries, and the
-/// sort key those entries carry.
+/// wasm32-unknown-unknown with it): the child chunks built from windows of
+/// merged `(sort key, row id)` entries, and the sort key those entries carry.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod out_of_core {
     use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::dtype::DType;
     use vortex_array::{ArrayRef, IntoArray};
 
-    use super::super::components::{TermColumn, child_struct, child_struct_dtype};
+    use super::super::components::{TermColumn, child_struct};
     use super::{CHILD_COLUMNS, CopyFamily};
     use crate::error::Result;
     use crate::store::array::stamp_is_sorted;
-    use crate::store::schema::{ROW_ID_PTYPE, RowId};
-
-    /// The persisted child's struct dtype: quad components as `V` terms
-    /// (strings, or codes under the Dictionary layout) plus the u64 primary
-    /// row id.
-    pub(crate) fn copy_child_dtype<V: TermColumn>() -> DType {
-        use vortex_array::dtype::Nullability;
-        let term = V::dtype();
-        child_struct_dtype(
-            &CHILD_COLUMNS,
-            vec![
-                term.clone(),
-                term.clone(),
-                term.clone(),
-                term,
-                DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable),
-            ],
-        )
-    }
+    use crate::store::schema::RowId;
 
     /// One chunk of a copy family's persisted child from a window of its merged
     /// `(sort key, row id)` entries, under plain child column names with the

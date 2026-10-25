@@ -442,38 +442,21 @@ pub(crate) fn child_struct(
 }
 
 /// An index column's term encoding (`String` terms, or [`TermCode`]s under
-/// the Dictionary layout), with the dtype a column of them has and the array
-/// it assembles into: the one spelling both families' builders emit their
-/// term columns and declare their child dtypes through.
+/// the Dictionary layout), with the array a column of them assembles into:
+/// the one spelling both families' builders emit their term columns through.
 pub(crate) trait TermColumn: Clone + Default + Ord {
-    /// The dtype of a column of these terms, which the out-of-core builder's
-    /// child dtypes (`copy_child_dtype`, `ref_child_dtype`) declare. Compiled
-    /// where the out-of-core builder is.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn dtype() -> DType;
-
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
     where
         Self: 'a;
 }
 
 impl TermColumn for String {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn dtype() -> DType {
-        DType::Utf8(Nullability::NonNullable)
-    }
-
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         make_string_array(it.map(String::as_str))
     }
 }
 
 impl TermColumn for TermCode {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn dtype() -> DType {
-        DType::Primitive(crate::store::schema::CODE_PTYPE, Nullability::NonNullable)
-    }
-
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         PrimitiveArray::from_iter(it.copied()).into_array()
     }
@@ -494,29 +477,6 @@ pub(crate) fn components_from(
             Ok(IndexComponent::built(identity, rows, true))
         })
         .collect()
-}
-
-/// The child struct dtype under `child_columns` names: the dtype counterpart
-/// of [`child_struct`], shared with the builders' direct child dtypes
-/// (`copy_child_dtype`/`ref_child_dtype`) so a component's declared and built
-/// shapes cannot drift. Compiled out on wasm with those builders.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn child_struct_dtype(
-    child_columns: &[&'static str],
-    field_dtypes: Vec<DType>,
-) -> DType {
-    use vortex_array::dtype::StructFields;
-    DType::Struct(
-        StructFields::new(
-            child_columns
-                .iter()
-                .map(|n| (*n).into())
-                .collect::<Vec<std::sync::Arc<str>>>()
-                .into(),
-            field_dtypes,
-        ),
-        Nullability::NonNullable,
-    )
 }
 
 /// A row-id column decoded into the ascending, unique `Buffer<RowId>` every

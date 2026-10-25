@@ -257,7 +257,7 @@ struct, their ranks spelled as dictionary codes
 under the string layouts, as their terms again
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L173)). With indexes a
 first merge runs to completion
-([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L114)):
+([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L116)):
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's ranks are pushed into one spiller per requested family
@@ -428,7 +428,7 @@ flowchart TD
     R --> F["Vortex footer, postscript, end-of-file marker"]
 ```
 
-- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L230)
+- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L156)
   — Vortex's default `WriteStrategyBuilder` pipeline: split the struct into
   columns, repartition each column into 8,192-row blocks, compute zoned
   statistics per block, dictionary-encode a column where sampling says it pays,
@@ -436,7 +436,7 @@ flowchart TD
   BtrBlocks-style compressor, and write flat leaf layouts. Each id column —
   a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid` —
   is handed, through the builder's per-field override, to
-  [`id_column_strategy`](../core/src/io/container/sources.rs#L290): the same
+  [`id_column_strategy`](../core/src/io/container/sources.rs#L216): the same
   per-column pipeline rebuilt step for step from Vortex's layout strategies,
   with the coalescing target split in two. A column that does not
   dictionary-encode coalesces toward ~2 MiB, 262,144 rows per leaf for a
@@ -445,12 +445,12 @@ flowchart TD
   copy to Vortex's pipeline: at 1 MiB for both targets it must write the
   stock bytes. A table without id columns — the string layouts' quad
   table — gets the stock pipeline unchanged
-  ([`default_child_strategy`](../core/src/io/container/sources.rs#L212)).
+  ([`default_child_strategy`](../core/src/io/container/sources.rs#L138)).
 - **Index children** take exactly the same strategy, so their encoding is what a
   plain table write produces: plain code columns and `rid` (row ids are
   unique, so never dictionary-encoded) at ~2 MiB, dictionary codes at ~1 MiB,
   term strings under the string layouts at ~1 MiB.
-- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L367):
+- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L293):
   its chunks are already FSST-compressed windows, so they are written verbatim
   as one flat leaf each under a chunked node — no sampling, no re-encoding —
   zoned one zone per window with the window's exact first and last term when
@@ -611,7 +611,7 @@ the segment target) are constants, tabulated in [file-format.md §11](file-forma
 | `RawQuad`, text parsing, format names | [`core/src/common/quad.rs`](../core/src/common/quad.rs), [`terms.rs`](../core/src/common/terms.rs), [`formats.rs`](../core/src/common/formats.rs) |
 | Builder contract, `BuiltArray`/`BuiltStream`, `build_struct_array`, `build_components` | [`core/src/store/builders/mod.rs`](../core/src/store/builders/mod.rs) |
 | In-memory sort | [`core/src/store/builders/sorted_in_memory.rs`](../core/src/store/builders/sorted_in_memory.rs) |
-| External merge sort, index spill mergers | [`core/src/store/builders/sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`stream_indexes.rs`](../core/src/store/builders/stream_indexes.rs), [`spill.rs`](../core/src/store/builders/spill.rs) |
+| External merge sort, index spill mergers and their pull-based component source | [`core/src/store/builders/sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`stream_indexes.rs`](../core/src/store/builders/stream_indexes.rs), [`spill.rs`](../core/src/store/builders/spill.rs) |
 | Layout columns | [`core/src/store/layouts/default.rs`](../core/src/store/layouts/default.rs), [`typed_object.rs`](../core/src/store/layouts/typed_object.rs), [`dictionary/codec.rs`](../core/src/store/layouts/dictionary/codec.rs) |
 | Dictionary construction, interning, FSST windows | [`core/src/store/layouts/dictionary/ingest.rs`](../core/src/store/layouts/dictionary/ingest.rs), [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs) |
 | Index children | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
