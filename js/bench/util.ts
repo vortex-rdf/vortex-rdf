@@ -16,6 +16,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { Quad } from '@rdfjs/types';
+import type { Fn, FnOptions } from 'tinybench';
 
 /** The quad shape every consume helper reads: the three mandatory term slots
  *  plus an optional graph, so rdf-stores, oxigraph and Vortex results all fit. */
@@ -44,6 +45,46 @@ function readTerms(quads: ArrayLike<TermQuad>, from: number, to: number): number
  * makes, is invisible to any instrument here. */
 export function decodeAll(quads: readonly Quad[]): number {
     return readTerms(quads, 0, quads.length);
+}
+
+// ─── Tasks that own a fresh handle ───────────────────────────────────────────
+//
+// A task that builds a store, or queries one opened for it alone, frees that
+// store in `afterEach`, which tinybench does not time (and runs even when the
+// task throws), so freeing never pollutes the measured cost. These return the
+// task's body and hooks, spread into `bench.add(name, ...)`, rather than
+// calling `bench.add` themselves: CodSpeed names a task by the file that calls
+// `bench.add` as well as by the task's name, so that call stays in the bench
+// file.
+
+/** Time making a handle with `make`, then `fill` on it if given; `dispose`
+ *  gets each handle made, or `undefined` if `make` threw, in `afterEach`. */
+export function making<H>(
+    make: () => Promise<H> | H, dispose: (h: H | undefined) => void, fill?: (h: H) => unknown,
+): [Fn, FnOptions] {
+    let h: H | undefined;
+    return [
+        async () => {
+            h = await make();
+            if (fill) await fill(h);
+        },
+        { afterEach: () => { dispose(h); h = undefined; } },
+    ];
+}
+
+/** Time `run` on a handle `make` builds for each iteration in `beforeEach`;
+ *  `dispose` gets it in `afterEach`. */
+export function onFresh<H>(
+    make: () => Promise<H> | H, run: (h: H) => unknown, dispose: (h: H | undefined) => void,
+): [Fn, FnOptions] {
+    let h: H | undefined;
+    return [
+        async () => { await run(h as H); },
+        {
+            beforeEach: async () => { h = await make(); },
+            afterEach: () => { dispose(h); h = undefined; },
+        },
+    ];
 }
 
 /** Human-readable duration from nanoseconds. */

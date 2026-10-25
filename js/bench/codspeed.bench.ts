@@ -31,10 +31,10 @@ import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store'
 // ./datasets.js, the two with no store library behind them (see their purity
 // contracts); shared.ts loads oxigraph and rdf-stores at module scope, which
 // this instrumented process must never do.
-import { decodeAll, fmtNs } from './util.js';
+import { decodeAll, fmtNs, making, onFresh } from './util.js';
 import {
     FULL_SCAN_PATTERN, genDataset, genFresh, genLiteralTriples, genQuads,
-    genTriples, genTriplesPrefix, nn, type Pat,
+    genTriples, genTriplesPrefix, nn, routingProbes, type Pat,
 } from './datasets.js';
 
 // ─── Dataset shape (env-tunable) ─────────────────────────────────────────────
@@ -63,18 +63,7 @@ const g0 = nn(0);
 // The routing classes the resolver branches on, split by which dataset can
 // exercise them: S/P/O/SP/PO/SPO on the triples store, G/SPOG on the quads
 // store.
-const TRIPLE_PATTERNS: Pat[] = [
-    { name: 'S', s: t0, p: null, o: null, g: null },
-    { name: 'P', s: null, p: t0, o: null, g: null },
-    { name: 'O', s: null, p: null, o: t0, g: null },
-    { name: 'SP', s: t0, p: t0, o: null, g: null },
-    { name: 'PO', s: null, p: t0, o: t0, g: null },
-    { name: 'SPO', s: t0, p: t0, o: t0, g: null },
-];
-const QUAD_PATTERNS: Pat[] = [
-    { name: 'G', s: null, p: null, o: null, g: g0 },
-    { name: 'SPOG', s: t0, p: t0, o: t0, g: g0 },
-];
+const { triples: TRIPLE_PATTERNS, quads: QUAD_PATTERNS } = routingProbes(t0, t0, t0, g0);
 
 // ─── Store variants (mirror the Rust star-design axes) ───────────────────────
 type Variant = { slug: string; options: BuildOptions };
@@ -97,6 +86,9 @@ const QUERY_VARIANTS: Variant[] = [
     { slug: 'dict', options: { layout: 'dictionary' } },
     { slug: 'dict_bycopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
 ];
+
+/** Free a store a task made, if it made one. */
+const free = (store: VortexRdfStore | undefined): void => { if (store) store.free(); };
 
 async function drain(stream: unknown): Promise<number> {
     let n = 0;
@@ -171,19 +163,12 @@ async function benchBuild(triples: Quad[], realistic: Quad[], literals: Quad[]):
             // numbers are therefore NOT comparable with the dense-cube
             // variants beside it.
             const data = v.slug === 'dict' ? realistic : triples;
-            let h: VortexRdfStore | undefined;
-            b.add(`build::${v.slug}`, async () => { h = await VortexRdfStore.fromQuads(data, v.options); }, {
-                afterEach: () => { if (h) h.free(); h = undefined; },
-            });
+            b.add(`build::${v.slug}`, ...making(() => VortexRdfStore.fromQuads(data, v.options), free));
         }
-        let hs: VortexRdfStore | undefined;
-        b.add('build::fromString_nquads', async () => {
-            hs = await VortexRdfStore.fromString(nquads, 'nquads', { layout: 'dictionary' });
-        }, { afterEach: () => { if (hs) hs.free(); hs = undefined; } });
-        let hl: VortexRdfStore | undefined;
-        b.add('build::dict_literals', async () => {
-            hl = await VortexRdfStore.fromQuads(literals, { layout: 'dictionary' });
-        }, { afterEach: () => { if (hl) hl.free(); hl = undefined; } });
+        b.add('build::fromString_nquads', ...making(
+            () => VortexRdfStore.fromString(nquads, 'nquads', { layout: 'dictionary' }), free));
+        b.add('build::dict_literals', ...making(
+            () => VortexRdfStore.fromQuads(literals, { layout: 'dictionary' }), free));
     });
 }
 
@@ -207,13 +192,11 @@ async function benchLiterals(literals: Quad[]): Promise<void> {
 async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
     for (const v of QUERY_VARIANTS) {
         const th = await VortexRdfStore.fromQuads(triples, v.options);
-        await warmUp(th, [...TRIPLE_PATTERNS, FULL_SCAN_PATTERN]);
+        const warm = [...TRIPLE_PATTERNS, FULL_SCAN_PATTERN];
+        await warmUp(th, warm);
         await runGroup(READ_OPTS, (b) => {
-            for (const p of TRIPLE_PATTERNS)
+            for (const p of warm)
                 b.add(`query_warm_${v.slug}::${p.name}`, async () => { await th.getQuads(p.s, p.p, p.o, p.g); });
-            b.add(`query_warm_${v.slug}::full`, async () => {
-                await th.getQuads(FULL_SCAN_PATTERN.s, FULL_SCAN_PATTERN.p, FULL_SCAN_PATTERN.o, FULL_SCAN_PATTERN.g);
-            });
         });
         // Cold: the FIRST query on a freshly adopted store — nothing decoded, no
         // probe resolved, no dictionary memo — the regime the Rust suite's
@@ -225,18 +208,11 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
         // warm-up's throwaway store shares no cache with the adopted ones.
         const tbytes = await th.toBytes();
         await warmUpCold(tbytes, TRIPLE_PATTERNS);
+        const adoptT = () => VortexRdfStore.fromBytes(tbytes);
         await runGroup(READ_OPTS, (b) => {
-            let h: VortexRdfStore | undefined;
-            b.add(`open::${v.slug}`, async () => { h = await VortexRdfStore.fromBytes(tbytes); }, {
-                afterEach: () => { if (h) h.free(); h = undefined; },
-            });
-            for (const p of TRIPLE_PATTERNS) {
-                let q: VortexRdfStore | undefined;
-                b.add(`query_cold_${v.slug}::${p.name}`, async () => { await q!.getQuads(p.s, p.p, p.o, p.g); }, {
-                    beforeEach: async () => { q = await VortexRdfStore.fromBytes(tbytes); },
-                    afterEach: () => { if (q) q.free(); q = undefined; },
-                });
-            }
+            b.add(`open::${v.slug}`, ...making(adoptT, free));
+            for (const p of TRIPLE_PATTERNS)
+                b.add(`query_cold_${v.slug}::${p.name}`, ...onFresh(adoptT, (q) => q.getQuads(p.s, p.p, p.o, p.g), free));
         });
         th.free();
 
@@ -248,14 +224,10 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
         });
         const qbytes = await qh.toBytes();
         await warmUpCold(qbytes, QUAD_PATTERNS);
+        const adoptQ = () => VortexRdfStore.fromBytes(qbytes);
         await runGroup(READ_OPTS, (b) => {
-            for (const p of QUAD_PATTERNS) {
-                let q: VortexRdfStore | undefined;
-                b.add(`query_cold_${v.slug}::${p.name}`, async () => { await q!.getQuads(p.s, p.p, p.o, p.g); }, {
-                    beforeEach: async () => { q = await VortexRdfStore.fromBytes(qbytes); },
-                    afterEach: () => { if (q) q.free(); q = undefined; },
-                });
-            }
+            for (const p of QUAD_PATTERNS)
+                b.add(`query_cold_${v.slug}::${p.name}`, ...onFresh(adoptQ, (q) => q.getQuads(p.s, p.p, p.o, p.g), free));
         });
         qh.free();
     }
@@ -309,10 +281,7 @@ async function benchReadback(triples: Quad[]): Promise<void> {
     await runGroup(READ_OPTS, (b) => {
         b.add('readback::toBytes', async () => { await store.toBytes(); });
         b.add('readback::toRdf_nquads', async () => { await store.toRdf('nquads'); });
-        let h: VortexRdfStore | undefined;
-        b.add('readback::fromBytes', async () => { h = await VortexRdfStore.fromBytes(bytes); }, {
-            afterEach: () => { if (h) h.free(); h = undefined; },
-        });
+        b.add('readback::fromBytes', ...making(() => VortexRdfStore.fromBytes(bytes), free));
     });
     store.free();
 }
@@ -325,25 +294,13 @@ async function benchMutate(): Promise<void> {
     const opts: BuildOptions = { layout: 'dictionary' };
 
     await runGroup(HEAVY_OPTS, (b) => {
-        let h: VortexRdfStore | undefined;
-        b.add('mutate::addQuad_loop', async () => {
-            h = VortexRdfStore.empty();
+        b.add('mutate::addQuad_loop', ...making(() => VortexRdfStore.empty(), free, async (h) => {
             for (const q of fresh) await h.addQuad(q);
-        }, { afterEach: () => { if (h) h.free(); h = undefined; } });
-
-        let hb: VortexRdfStore | undefined;
-        b.add('mutate::addQuads_batch', async () => {
-            hb = VortexRdfStore.empty();
-            await hb.addQuads(fresh);
-        }, { afterEach: () => { if (hb) hb.free(); hb = undefined; } });
-
-        let hd: VortexRdfStore | undefined;
-        b.add('mutate::deleteQuad_loop', async () => {
-            for (const q of delSlice) await hd!.deleteQuad(q);
-        }, {
-            beforeEach: async () => { hd = await VortexRdfStore.fromQuads(delSlice, opts); },
-            afterEach: () => { if (hd) hd.free(); hd = undefined; },
-        });
+        }));
+        b.add('mutate::addQuads_batch', ...making(() => VortexRdfStore.empty(), free, (h) => h.addQuads(fresh)));
+        b.add('mutate::deleteQuad_loop', ...onFresh(() => VortexRdfStore.fromQuads(delSlice, opts), async (h) => {
+            for (const q of delSlice) await h.deleteQuad(q);
+        }, free));
     });
 }
 
