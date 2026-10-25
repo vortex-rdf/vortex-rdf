@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use oxrdf::Quad;
 
-use crate::common::terms::quad_from_terms;
+use crate::common::terms::{Trust, at, graph_name, named_node, quad_from_terms, subject, term};
 use crate::error::Result;
 
 /// A quad whose terms are shared N-Triples strings: one `Arc<str>` per
@@ -88,7 +88,15 @@ impl RawQuad {
     /// [`InvalidInput`](crate::VortexRdfError::InvalidInput) error naming the
     /// position.
     pub fn canonical(s: &str, p: &str, o: &str, g: &str) -> Result<Self> {
-        crate::common::terms::canonical_raw_quad(s, p, o, g)
+        // Each position is parsed as `Trust::Input`, as a pattern's slots
+        // are, and the quad rendered by `from_quad`, so a term comes out
+        // exactly as `canonical_spelling` renders it.
+        Ok(RawQuad::from_quad(&Quad::new(
+            at("quad subject", subject(s, Trust::Input))?,
+            at("quad predicate", named_node(p, Trust::Input))?,
+            at("quad object", term(o, Trust::Input))?,
+            at("quad graph", graph_name(g, Trust::Input))?,
+        )))
     }
 
     /// Render an oxrdf [`Quad`]'s four terms in N-Triples form.

@@ -88,7 +88,7 @@ literals go through `oxrdf`'s `Display`, which escapes them.
 
 Where the stream comes from:
 
-- **RDF text** — [`parse_quads_from_reader`](../core/src/common/terms.rs#L370)
+- **RDF text** — [`parse_quads_from_reader`](../core/src/common/terms.rs#L355)
   drives an `oxrdfio` parser and converts each parsed quad on the spot, so no
   second copy of the terms outlives the conversion. Formats: N-Triples,
   N-Quads, Turtle, TriG, N3, RDF/XML, JSON-LD — named through
