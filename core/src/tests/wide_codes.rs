@@ -20,14 +20,6 @@ use crate::store::{Keep, Probe, QuadColumn, TermCode, TermPredicate};
 /// unhooked dictionary of this size, but below every code here.
 const BASE: TermCode = (1 << 32) + 5;
 
-fn iri(s: &str) -> NamedNode {
-    NamedNode::new(format!("http://example.org/{s}")).unwrap()
-}
-
-fn subject(s: &str) -> NamedOrBlankNode {
-    NamedOrBlankNode::NamedNode(iri(s))
-}
-
 /// Quads covering every term kind: IRIs, plain, language-tagged and typed
 /// literals, a blank node, the default graph and a named graph.
 fn dataset() -> Vec<Quad> {
@@ -36,31 +28,31 @@ fn dataset() -> Vec<Quad> {
     let blank = oxrdf::BlankNode::new("b1").unwrap();
     vec![
         Quad::new(
-            subject("alice"),
+            iri_subject("alice"),
             iri("name"),
-            Term::Literal(Literal::new_simple_literal("Alice")),
+            plain_literal("Alice"),
             GraphName::DefaultGraph,
         ),
         Quad::new(
-            subject("alice"),
+            iri_subject("alice"),
             iri("age"),
             Term::Literal(Literal::new_typed_literal("30", xsd_int.clone())),
             GraphName::DefaultGraph,
         ),
         Quad::new(
-            subject("alice"),
+            iri_subject("alice"),
             iri("knows"),
             Term::NamedNode(iri("bob")),
             g1.clone(),
         ),
         Quad::new(
-            subject("bob"),
+            iri_subject("bob"),
             iri("name"),
             Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap()),
             GraphName::DefaultGraph,
         ),
         Quad::new(
-            subject("bob"),
+            iri_subject("bob"),
             iri("knows"),
             Term::BlankNode(blank.clone()),
             GraphName::DefaultGraph,
@@ -68,11 +60,11 @@ fn dataset() -> Vec<Quad> {
         Quad::new(
             NamedOrBlankNode::BlankNode(blank),
             iri("name"),
-            Term::Literal(Literal::new_simple_literal("Carol")),
+            plain_literal("Carol"),
             g1,
         ),
         Quad::new(
-            subject("bob"),
+            iri_subject("bob"),
             iri("age"),
             Term::Literal(Literal::new_typed_literal("25", xsd_int)),
             GraphName::DefaultGraph,
@@ -248,7 +240,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     // A fresh built base holds its code columns compressed behind an unfilled
     // payload cache, so this keep reads them through the encoded probe
     // rather than a canonical slice.
-    let alice = subject("alice");
+    let alice = iri_subject("alice");
     let alice_code = code(store, &terms, "<http://example.org/alice>").await;
     let alice_rows = expected(quads, |q| q.subject == alice);
     let early = store
@@ -562,7 +554,7 @@ async fn check_chunk_exports(store: &VortexRdfStore, label: &str) {
     use vortex_array::expr::{eq, get_item, lit, root};
 
     let name = iri("name");
-    let alice = subject("alice");
+    let alice = iri_subject("alice");
     let views = [
         ("whole", store.clone()),
         (

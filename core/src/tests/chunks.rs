@@ -311,7 +311,7 @@ async fn test_chunks_in_memory_match_gathered() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let served = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(
         served_component(&served),
@@ -624,8 +624,8 @@ async fn test_chunks_choose_a_file_read_once() {
     let (_runs_dir, runs_path) =
         write_store_file(term_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let runs = VortexRdfStore::from_file(&runs_path).await.unwrap();
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
-    let plain = Term::Literal(Literal::new_simple_literal("plain"));
+    let s = iri_subject("s");
+    let plain = plain_literal("plain");
     let point_run = matched_view(&runs, Some(&s), None, Some(&plain), None).await;
 
     // (view, taken by id, scanned)
@@ -676,10 +676,10 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
     let (_dir, path) =
         write_store_file(term_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let plain = Term::Literal(Literal::new_simple_literal("plain"));
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let s = iri_subject("s");
+    let p2 = iri("p2");
+    let plain = plain_literal("plain");
+    let g = iri_graph("g");
     let views = [
         (
             "<s> ?p \"plain\"",
@@ -724,7 +724,7 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
 
     let (_dir, path) = write_store_file(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     // A pending filter: both exports scan the file.
     let view = matched_view(&store, None, Some(&p1), None, None).await;
     let expected = base_ordered_codes(&view).await;
@@ -910,7 +910,7 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
 
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let view = matched_view(&store, None, Some(&p0), None, None).await;
     assert!(view.view_statistics().unwrap().pending_filter);
     let n = view.size().await.unwrap();

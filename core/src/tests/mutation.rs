@@ -51,11 +51,11 @@ async fn test_multiple_append() {
 
     assert_eq!(store.size().await.unwrap(), 10);
 
-    let p = NamedNode::new("http://example.org/p").unwrap();
+    let p = iri("p");
     let matched = matched_view(&store, None, Some(&p), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 10);
 
-    let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
+    let s5 = iri_subject("s5");
     let matched_s5 = matched_view(&store, Some(&s5), None, None, None).await;
     assert_eq!(matched_s5.size().await.unwrap(), 1);
 }
@@ -99,7 +99,7 @@ async fn run_append_script(store: &VortexRdfStore, quads: &[Quad]) {
 
     // An index-routed base lookup unions with the tail scan: "object 0" is
     // on base rows 0, 3, 6, 9 and on the appended s90.
-    let object = Term::Literal(Literal::new_simple_literal("object 0"));
+    let object = plain_literal("object 0");
     let matched = matched_view(&added, None, None, Some(&object), None).await;
     let subjects = subjects_of(&matched).await;
     assert_eq!(subjects.len(), 5);
@@ -107,11 +107,11 @@ async fn run_append_script(store: &VortexRdfStore, quads: &[Quad]) {
 
     // Terms the base has never seen — the index proves the base empty —
     // still match in the tail.
-    let p9 = NamedNode::new("http://example.org/p9").unwrap();
+    let p9 = iri("p9");
     assert_eq!(matched_size(&added, None, Some(&p9), None, None).await, 1);
-    let s90 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s90").unwrap());
+    let s90 = iri_subject("s90");
     assert_eq!(matched_size(&added, Some(&s90), None, None, None).await, 1);
-    let object9 = Term::Literal(Literal::new_simple_literal("object 9"));
+    let object9 = plain_literal("object 9");
     assert_eq!(
         matched_size(&added, None, None, Some(&object9), None).await,
         1
@@ -119,7 +119,7 @@ async fn run_append_script(store: &VortexRdfStore, quads: &[Quad]) {
 
     // Chained matches narrow base and tail together: of the five
     // "object 0" rows, p0 holds on base rows 0 and 6, and on s90.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let chained = matched_view(&matched, None, Some(&p0), None, None).await;
     assert_eq!(chained.size().await.unwrap(), 3);
 
@@ -224,7 +224,7 @@ async fn test_tail_accretion_flattens_at_chunk_bound() {
     assert!(chunks.iter().all(|c| c.len() == 1));
     assert_eq!(store.tail_len(), TAIL_MAX_CHUNKS);
 
-    let tail_p = NamedNode::new("http://example.org/tail").unwrap();
+    let tail_p = iri("tail");
     let view = matched_view(&store, None, Some(&tail_p), None, None).await;
     assert_eq!(view.size().await.unwrap(), TAIL_MAX_CHUNKS);
 
@@ -283,7 +283,7 @@ async fn test_tail_accretion_flattens_at_row_floor() {
             .collect::<Vec<_>>(),
         [1, TAIL_FLATTEN_FLOOR - 1]
     );
-    let tail_p = NamedNode::new("http://example.org/tail").unwrap();
+    let tail_p = iri("tail");
     let view = matched_view(&below, None, Some(&tail_p), None, None).await;
     assert_eq!(view.size().await.unwrap(), TAIL_FLATTEN_FLOOR);
 
@@ -412,7 +412,7 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
         by_subject.debug_selection_range().is_some(),
         "a bound subject narrows to a row range"
     );
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_predicate = matched_view(&deleted, None, Some(&p1), None, None).await;
     assert_eq!(
         served_component(&by_predicate),
@@ -475,7 +475,7 @@ async fn test_delete_matching_spans_base_and_tail() {
     assert_eq!(tailed.size().await.unwrap(), 13);
 
     // p0 is on base rows 0, 3, 6, 9 and on the appended s99.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let after = tailed
         .delete_matching(None, Some(&p0), None, None)
         .await
@@ -492,9 +492,9 @@ async fn test_delete_matching_spans_base_and_tail() {
 
     // A view whose tail selects nothing (p1 is on base rows only) adds no
     // tail row to a second match, even one the tail row itself would answer.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_p1 = matched_view(&tailed, None, Some(&p1), None, None).await;
-    let object9 = Term::Literal(Literal::new_simple_literal("object 9"));
+    let object9 = plain_literal("object 9");
     let none = matched_view(&by_p1, None, None, Some(&object9), None).await;
     assert_eq!(none.size().await.unwrap(), 0);
     assert!(none.quads_vec().await.unwrap().is_empty());
@@ -580,7 +580,7 @@ async fn test_delete_matching_pattern() {
     let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
     // Delete every quad with predicate p0 (i even): 6 of the 12.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let after = store
         .delete_matching(None, Some(&p0), None, None)
         .await
@@ -597,7 +597,7 @@ async fn test_delete_matching_pattern() {
     assert_eq!(again.size().await.unwrap(), 6);
 
     // A pattern matching nothing leaves the store alone.
-    let missing = NamedNode::new("http://example.org/nope").unwrap();
+    let missing = iri("nope");
     let untouched = again
         .delete_matching(None, Some(&missing), None, None)
         .await
@@ -645,12 +645,12 @@ async fn test_add_quads_auto_compacts_past_threshold() {
 
     // The compacted base is SPOG-sorted and fully routable: subject
     // binary search and the rebuilt object index both answer.
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02050").unwrap());
+    let s = iri_subject("s02050");
     assert_eq!(
         matched_size(&compacted, Some(&s), None, None, None).await,
         1
     );
-    let object = Term::Literal(Literal::new_simple_literal("object 3"));
+    let object = plain_literal("object 3");
     assert_eq!(
         matched_size(&compacted, None, None, Some(&object), None).await,
         822
@@ -731,7 +731,7 @@ async fn test_file_backed_add_auto_compacts_past_threshold() {
     let reopened = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(reopened.size().await.unwrap(), 4_204);
     assert_eq!(reopened.indexes(), &[IndexType::SecondaryByReference]);
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02050").unwrap());
+    let s = iri_subject("s02050");
     assert_eq!(matched_size(&reopened, Some(&s), None, None, None).await, 1);
 }
 
@@ -904,7 +904,7 @@ async fn run_file_backed_compaction(index: IndexType) {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
     // Delete "object 0" (i = 0, 3, 6, 9): 4 rows tombstoned, 8 live.
-    let object0 = Term::Literal(Literal::new_simple_literal("object 0"));
+    let object0 = plain_literal("object 0");
     let after = store
         .delete_matching(None, None, Some(&object0), None)
         .await
@@ -953,7 +953,7 @@ async fn run_file_backed_compaction(index: IndexType) {
     let reopened2 = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(reopened2.size().await.unwrap(), 9);
     assert_eq!(reopened2.indexes(), &vec![index]);
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let by_p = matched_view(&reopened2, None, Some(&p0), None, None).await;
     assert_eq!(
         served_component(&by_p),
@@ -1010,13 +1010,13 @@ async fn test_dictionary_add_probes_tail_by_string() {
 
     // The base's dictionary proves these terms unmatchable *in the base*;
     // the tail must still answer.
-    let new_object = Term::Literal(Literal::new_simple_literal("brand new object"));
+    let new_object = plain_literal("brand new object");
     assert_eq!(
         matched_size(&added, None, None, Some(&new_object), None).await,
         1
     );
     // Dictionary-coded base terms keep routing as before.
-    let old_object = Term::Literal(Literal::new_simple_literal("object 1"));
+    let old_object = plain_literal("object 1");
     assert_eq!(
         matched_size(&added, None, None, Some(&old_object), None).await,
         4
@@ -1129,12 +1129,12 @@ async fn test_compaction_folds_tail_and_sorts() {
     );
 
     // Subject lookups and the rebuilt object index both answer.
-    let s0 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s0").unwrap());
+    let s0 = iri_subject("s0");
     assert_eq!(
         matched_size(&compacted, Some(&s0), None, None, None).await,
         1
     );
-    let object = Term::Literal(Literal::new_simple_literal("object 0"));
+    let object = plain_literal("object 0");
     assert_eq!(
         matched_size(&compacted, None, None, Some(&object), None).await,
         4
@@ -1190,7 +1190,7 @@ async fn test_owned_file_view_leaves_source_file_intact() {
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let view = matched_view(&store, None, Some(&p1), None, None).await;
     let independent = view.owned().await.unwrap();
     assert_eq!(independent.size().await.unwrap(), 4, "the view's own rows");
@@ -1236,7 +1236,7 @@ async fn test_owned_of_an_owner_keeps_its_tombstones_and_indexes() {
     assert_eq!(owned.size().await.unwrap(), 11);
 
     // `quads[1]` is a p1 row: the view holds its tombstone until it compacts.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let view = matched_view(&deleted, None, Some(&p1), None, None).await;
     assert_eq!(view.view_statistics().unwrap().tombstones, 1);
     let compacted = view.owned().await.unwrap();
@@ -1263,7 +1263,7 @@ async fn test_derived_view_rejects_mutations() {
 
     let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
-    let object = Term::Literal(Literal::new_simple_literal("object 0"));
+    let object = plain_literal("object 0");
     let view = matched_view(&store, None, None, Some(&object), None).await;
     assert_eq!(view.size().await.unwrap(), 3);
 

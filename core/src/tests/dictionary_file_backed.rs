@@ -24,7 +24,7 @@ async fn test_file_backed_dictionary_shared_quads_match_resident() {
     let fb = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(fb.dict_reader().unwrap().is_file_backed());
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     for (tag, a, b) in [
         ("full", resident.clone(), fb.clone()),
         (
@@ -78,12 +78,12 @@ async fn assert_file_backed_matches_resident(
         "{tag}"
     );
 
-    let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let s3 = iri_subject("s03");
+    let p0 = iri("p0");
+    let o1 = plain_literal("object 1");
+    let g = iri_graph("g");
     let default_g = GraphName::DefaultGraph;
-    let absent = NamedNode::new("http://example.org/absent").unwrap();
+    let absent = iri("absent");
 
     // Full reconstruction, then one pattern per family: subject / predicate /
     // object / graph bound and multi-role.
@@ -121,7 +121,7 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
 
     // And explicitly confirm the serving plan engages on the file-backed
     // store (the equality above would hold even off the fallback path).
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let matched = matched_view(&fb, None, Some(&p0), None, None).await;
     assert_eq!(served_component(&matched), Some("index:posg"));
     // The located run is small, so its ids resolved eagerly by rid point
@@ -181,10 +181,7 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
 /// load of the same file writes.
 #[tokio::test]
 async fn export_of_a_file_backed_store_never_lifts_the_dictionary() {
-    let graphs = [
-        GraphName::DefaultGraph,
-        GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap()),
-    ];
+    let graphs = [GraphName::DefaultGraph, iri_graph("g")];
     let quads = graph_modular_quads(1_000, 4, 3, 7, &graphs);
     let (_dir, path) = write_chunked_store_file(&quads, 256).await;
     let splits = crate::tests::open_mapped(&path)
@@ -474,7 +471,7 @@ async fn test_file_backed_dictionary_serves_wide_run() {
 
     // 300 rows per predicate: past the point-read cap, so the run is read
     // by range.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let served = matched_view(&fb, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&served), Some("index:posg"));
     assert_eq!(served.size().await.unwrap(), 300);
@@ -496,7 +493,7 @@ async fn test_file_backed_dictionary_serves_wide_run() {
 /// `!`, which sorts before `"`.
 #[tokio::test]
 async fn test_file_backed_dictionary_rejects_below_first_term() {
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let g = iri_graph("g");
     let quads: Vec<Quad> = (0..3)
         .map(|i| {
             make_quad(
@@ -596,7 +593,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     assert!(!store.dict_reader().unwrap().is_file_backed());
     assert!(store.dict_reader().unwrap().snapshot().is_some());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     assert_eq!(
         view_strings(&matched_view(&store, None, Some(&p0), None, None).await).await,
         expected_strings(&quads, |i| i % 3 == 0)
@@ -628,7 +625,7 @@ async fn test_dictionary_terms_stay_fsst_through_bytes() {
 
     // And the terms still resolve, through the compressed representation.
     assert_eq!(reread.size().await.unwrap(), 2_000);
-    let p = NamedNode::new("http://example.org/predicate/3").unwrap();
+    let p = iri("predicate/3");
     let matched = matched_view(&reread, None, Some(&p), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 125);
 }
@@ -656,7 +653,7 @@ async fn test_dictionary_native_file_roundtrip() {
     assert_eq!(store.layout(), LayoutStrategy::Dictionary);
     assert_eq!(store.size().await.unwrap(), quads.len());
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let matched = matched_view(&store, None, Some(&p0), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 4);
     let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
@@ -672,7 +669,7 @@ async fn test_dictionary_native_file_roundtrip() {
 async fn test_dictionary_empty_store_roundtrip() {
     use crate::store::{RowCountHint, TermPredicate};
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let (_dir, path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
     let built = built_store(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
     assert!(

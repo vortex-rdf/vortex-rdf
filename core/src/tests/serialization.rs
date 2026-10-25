@@ -24,7 +24,7 @@ async fn test_tombstoned_store_serialization_keeps_indexes_and_sortedness() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let s0 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00").unwrap());
+    let s0 = iri_subject("s00");
     let deleted = store
         .delete_matching(Some(&s0), None, None, None)
         .await
@@ -45,7 +45,7 @@ async fn test_tombstoned_store_serialization_keeps_indexes_and_sortedness() {
         "tombstoned serialization must rebuild, not drop, the indexes"
     );
     assert_eq!(reread.size().await.unwrap(), 11);
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     // p0 was on rows 0, 3, 6, 9; row 0 was deleted.
     assert_eq!(matched_size(&reread, None, Some(&p0), None, None).await, 3);
 }
@@ -109,7 +109,7 @@ async fn test_narrowed_view_serializes_rows_only() {
         vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
     )
     .await;
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let view = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(view.size().await.unwrap(), 4);
 
@@ -174,7 +174,7 @@ async fn test_file_backed_to_bytes_keeps_indexes() {
         "file → bytes must carry the index children across"
     );
     // And they route with correct results after the round-trip.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     assert_eq!(matched_size(&reread, None, Some(&p1), None, None).await, 4);
 }
 
@@ -305,7 +305,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
 
     let store = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
-    let p = NamedNode::new("http://example.org/p/1").unwrap();
+    let p = iri("p/1");
     let matched: Vec<Quad> = matched_view(&store, None, Some(&p), None, None)
         .await
         .quads()
@@ -373,7 +373,7 @@ async fn test_from_bytes_defers_index_child_materialization() {
     let deferred_bytes = reread.to_bytes().await.unwrap();
 
     let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let matched = matched_view(&reread, None, Some(&p1), None, None).await;
     // p1 is on rows 1, 4, 7, 10 — the probe answered through the index.
     assert_eq!(matched.size().await.unwrap(), 4);
@@ -438,9 +438,9 @@ async fn test_from_parts_adopts_searchable_children() {
 
     // The canonical base answers a fully-bound pattern: s01 p1 "object 1"
     // is row 1 exactly.
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s01").unwrap());
-    let p = NamedNode::new("http://example.org/p1").unwrap();
-    let o = Term::Literal(Literal::new_simple_literal("object 1"));
+    let s = iri_subject("s01");
+    let p = iri("p1");
+    let o = plain_literal("object 1");
     assert_eq!(
         matched_size(&store, Some(&s), Some(&p), Some(&o), None).await,
         1
@@ -554,8 +554,8 @@ async fn test_tailed_serialization_sorts_and_keeps_indexes() {
             );
             // The appended row is reachable through the subject fast path the
             // stamp unlocks, not just through a scan.
-            let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00").unwrap());
-            let p = NamedNode::new("http://example.org/p9").unwrap();
+            let s = iri_subject("s00");
+            let p = iri("p9");
             assert_eq!(
                 matched_size(&reread, Some(&s), Some(&p), None, None).await,
                 1,
@@ -564,13 +564,13 @@ async fn test_tailed_serialization_sorts_and_keeps_indexes() {
             // The rebuilt components actually answer: p1 is on base rows 1,
             // 4, 7, 10 plus the appended s99, and the tail's fresh object
             // survives the round-trip.
-            let p1 = NamedNode::new("http://example.org/p1").unwrap();
+            let p1 = iri("p1");
             assert_eq!(
                 matched_size(&reread, None, Some(&p1), None, None).await,
                 5,
                 "{layout:?}/{indexes:?}"
             );
-            let fresh = Term::Literal(Literal::new_simple_literal("fresh object"));
+            let fresh = plain_literal("fresh object");
             assert_eq!(
                 matched_size(&reread, None, None, Some(&fresh), None).await,
                 1,
@@ -628,10 +628,10 @@ async fn test_from_bytes_and_from_parts_answer_every_pattern_like_from_built() {
         "resident adoption must retain probeable children compressed"
     );
 
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02500").unwrap());
-    let s_absent = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/zz").unwrap());
-    let p = NamedNode::new("http://example.org/p4").unwrap();
-    let o = Term::Literal(Literal::new_simple_literal("object 7"));
+    let s = iri_subject("s02500");
+    let s_absent = iri_subject("zz");
+    let p = iri("p4");
+    let o = plain_literal("object 7");
     let g = GraphName::DefaultGraph;
 
     let patterns: [Pattern<'_>; 10] = [
@@ -689,9 +689,9 @@ async fn test_from_parts_retains_dict_children() {
         "the dictionary-encoded object column must stay compressed through adoption"
     );
 
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02500").unwrap());
-    let p = NamedNode::new("http://example.org/p4").unwrap();
-    let o = Term::Literal(Literal::new_simple_literal("object 7"));
+    let s = iri_subject("s02500");
+    let p = iri("p4");
+    let o = plain_literal("object 7");
     let patterns: [Pattern<'_>; 4] = [
         ("O", None, None, Some(&o), None),
         ("PO", None, Some(&p), Some(&o), None),
@@ -1238,7 +1238,7 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
     )
     .await;
     let (from_bytes, from_file, _dir) = open_both(&bytes).await;
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let store = result.unwrap_or_else(|e| panic!("{path}: open should succeed: {e}"));
         assert_eq!(store.size().await.unwrap(), 6, "{path}");
@@ -1460,9 +1460,7 @@ async fn test_dictionary_quad_sink_serializes_like_the_builder() {
 /// here are the writer's.
 #[tokio::test]
 async fn test_written_code_columns_avoid_delta() {
-    let graphs: Vec<GraphName> = (0..4)
-        .map(|i| GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{i}")).unwrap()))
-        .collect();
+    let graphs: Vec<GraphName> = (0..4).map(|i| iri_graph(&format!("g{i}"))).collect();
     let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
     let store = VortexRdfStore::from_quads(
         quad_stream(quads),
@@ -1535,9 +1533,7 @@ async fn test_written_frame_of_reference_keeps_one_reference() {
         }
     }
 
-    let graphs: Vec<GraphName> = (0..4)
-        .map(|i| GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{i}")).unwrap()))
-        .collect();
+    let graphs: Vec<GraphName> = (0..4).map(|i| iri_graph(&format!("g{i}"))).collect();
     let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
     let store = VortexRdfStore::from_quads(
         quad_stream(quads),

@@ -530,7 +530,7 @@ async fn test_data_source_request_semantics() {
     // the range: one chunk, cut from the range's first row. With rows
     // deleted, the store streams its chunks (windows of 8,192 live ids) and
     // cuts the range out of them: a piece on each side of the boundary.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let deleted = memory
         .delete_matching(None, Some(&p0), None, None)
         .await

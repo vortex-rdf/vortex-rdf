@@ -54,11 +54,41 @@ fn index_sets() -> Vec<Indexes> {
     ]
 }
 
+/// The IRI `<http://example.org/{name}>`: the namespace of the suites'
+/// terms.
+fn iri(name: &str) -> NamedNode {
+    NamedNode::new(format!("http://example.org/{name}")).unwrap()
+}
+
+/// [`iri`] as a subject.
+fn iri_subject(name: &str) -> NamedOrBlankNode {
+    NamedOrBlankNode::NamedNode(iri(name))
+}
+
+/// [`iri`] as a named graph.
+fn iri_graph(name: &str) -> GraphName {
+    GraphName::NamedNode(iri(name))
+}
+
+/// Graph `k` of a dataset that numbers its graphs: the default graph for 0,
+/// `g{k}` for any other `k`.
+fn numbered_graph(k: usize) -> GraphName {
+    match k {
+        0 => GraphName::DefaultGraph,
+        k => iri_graph(&format!("g{k}")),
+    }
+}
+
+/// The plain literal `"{value}"`, as an object.
+fn plain_literal(value: &str) -> Term {
+    Term::Literal(Literal::new_simple_literal(value))
+}
+
 fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
     Quad::new(
         NamedOrBlankNode::NamedNode(NamedNode::new(s).unwrap()),
         NamedNode::new(p).unwrap(),
-        Term::Literal(Literal::new_simple_literal(o_lit)),
+        plain_literal(o_lit),
         g,
     )
 }
@@ -364,7 +394,7 @@ const MASKS_EMPTY_SPLIT: usize = 3;
 /// other row has the predicate `p{i % 3}`, the object `"o{i % 7}"` and the
 /// default graph.
 fn masks_quads() -> Vec<Quad> {
-    let gd = GraphName::NamedNode(NamedNode::new("http://example.org/gd").unwrap());
+    let gd = iri_graph("gd");
     (0..MASKS_SPLITS * MASKS_SPLIT_ROWS)
         .map(|i| {
             let matched = i / MASKS_SPLIT_ROWS != MASKS_EMPTY_SPLIT;
@@ -398,18 +428,17 @@ fn masks_probes() -> Vec<(
     crate::store::scan::read_plan::MaskedRead,
 )> {
     use crate::store::scan::read_plan::MaskedRead;
-    let pm = NamedNode::new("http://example.org/pm").unwrap();
-    let literal = |value: &str| Term::Literal(Literal::new_simple_literal(value));
-    let gd = GraphName::NamedNode(NamedNode::new("http://example.org/gd").unwrap());
+    let pm = iri("pm");
+    let gd = iri_graph("gd");
     vec![
         (
             "O",
-            Probe::new(None, None, Some(literal("sparse")), None),
+            Probe::new(None, None, Some(plain_literal("sparse")), None),
             MaskedRead::Points,
         ),
         (
             "PO",
-            Probe::new(None, Some(pm.clone()), Some(literal("o0")), None),
+            Probe::new(None, Some(pm.clone()), Some(plain_literal("o0")), None),
             MaskedRead::Points,
         ),
         (
@@ -460,7 +489,7 @@ async fn masks_file_with(flat_dictionary: bool) -> (tempfile::TempDir, std::path
 /// graph `gd`, and the object `"sparse"` and `"o0"` by turns: of the
 /// [`masks_probes`] patterns, `P` and `G` match all twelve, `O` and `PO` half.
 fn masks_tail() -> Vec<Quad> {
-    let gd = GraphName::NamedNode(NamedNode::new("http://example.org/gd").unwrap());
+    let gd = iri_graph("gd");
     (0..12)
         .map(|k| {
             let o = if k % 2 == 0 { "sparse" } else { "o0" };
@@ -479,22 +508,20 @@ fn masks_tail() -> Vec<Quad> {
 /// graph's whose object is `"o5"`, the object's whose predicate is `p1`, and
 /// three of the rows of `pm` with `"o0"`.
 async fn masks_deleted(store: &VortexRdfStore) -> VortexRdfStore {
-    let iri = |name: &str| NamedNode::new(format!("http://example.org/{name}")).unwrap();
-    let literal = |value: &str| Term::Literal(Literal::new_simple_literal(value));
-    let gd = GraphName::NamedNode(iri("gd"));
+    let gd = iri_graph("gd");
     let mut store = store
-        .delete_matching(None, Some(&iri("pm")), Some(&literal("o3")), None)
+        .delete_matching(None, Some(&iri("pm")), Some(&plain_literal("o3")), None)
         .await
         .unwrap()
-        .delete_matching(None, None, Some(&literal("o5")), Some(&gd))
+        .delete_matching(None, None, Some(&plain_literal("o5")), Some(&gd))
         .await
         .unwrap()
-        .delete_matching(None, Some(&iri("p1")), Some(&literal("sparse")), None)
+        .delete_matching(None, Some(&iri("p1")), Some(&plain_literal("sparse")), None)
         .await
         .unwrap();
     let po = masks_quads()
         .into_iter()
-        .filter(|q| q.predicate == iri("pm") && q.object == literal("o0"));
+        .filter(|q| q.predicate == iri("pm") && q.object == plain_literal("o0"));
     for quad in po.take(3) {
         store = store.delete_quad(&quad).await.unwrap();
     }
@@ -686,7 +713,7 @@ fn dictionary_test_quads() -> Vec<Quad> {
             let g = if i % 2 == 0 {
                 GraphName::DefaultGraph
             } else {
-                GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap())
+                iri_graph("g")
             };
             make_quad(
                 &format!("http://example.org/s{:02}", i),
@@ -918,7 +945,7 @@ fn bare_code_quad_array(codes: &[TermCode]) -> vortex_array::ArrayRef {
 
 /// `<http://example.org/s{i}>` zero-padded to `width` digits.
 fn subject_node(i: usize, width: usize) -> NamedOrBlankNode {
-    NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{i:0width$}")).unwrap())
+    iri_subject(&format!("s{i:0width$}"))
 }
 
 /// Sorted string forms of the quads at the indexes `keep` accepts.
@@ -973,10 +1000,13 @@ fn graph_modular_quads(
 /// and their exports against the gathered codes. Subjects are unique, so a
 /// bound subject matches one row.
 fn fixture_quads() -> Vec<Quad> {
-    let g = |name: &str| {
-        GraphName::NamedNode(NamedNode::new(format!("http://example.org/{name}")).unwrap())
-    };
-    graph_modular_quads(3_000, 4, 5, 7, &[GraphName::DefaultGraph, g("g1"), g("g2")])
+    graph_modular_quads(
+        3_000,
+        4,
+        5,
+        7,
+        &[GraphName::DefaultGraph, iri_graph("g1"), iri_graph("g2")],
+    )
 }
 
 /// `n` quads `tail{i} p9 "late"` in the default graph, terms
@@ -1057,8 +1087,8 @@ async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, Vortex
 /// an empty window.
 async fn views_of(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
     let s = subject_node(17, 4);
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let p1 = iri("p1");
+    let o3 = plain_literal("o3");
     let dict = store.dict_reader().unwrap();
     let (lo, hi) = dict.prefix_range("<http://example.org/s1").await.unwrap();
     let predicate = matched_view(store, None, Some(&p1), None, None).await;
@@ -1372,13 +1402,13 @@ fn two_quads() -> Vec<Quad> {
 /// Default layout over [`two_quads`]: a bound predicate over the string
 /// columns, hit and miss.
 async fn probe_default(store: VortexRdfStore) {
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let filtered = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(filtered.size().await.unwrap(), 1);
     let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
 
-    let p3 = NamedNode::new("http://example.org/p3").unwrap();
+    let p3 = iri("p3");
     let empty = matched_view(&store, None, Some(&p3), None, None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 }
@@ -1386,18 +1416,18 @@ async fn probe_default(store: VortexRdfStore) {
 /// TypedObject layout over [`two_quads`]: a bound object literal (over the
 /// typed o_kind/o_value columns), hit and miss, and a bound predicate.
 async fn probe_typed_object(store: VortexRdfStore) {
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let o1 = plain_literal("o1");
     let filtered = matched_view(&store, None, None, Some(&o1), None).await;
     assert_eq!(filtered.size().await.unwrap(), 1);
     let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
     assert_eq!(results[0].object.to_string(), "\"o1\"");
 
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
+    let p2 = iri("p2");
     let matched_p = matched_view(&store, None, Some(&p2), None, None).await;
     assert_eq!(matched_p.size().await.unwrap(), 1);
 
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let o3 = plain_literal("o3");
     let empty = matched_view(&store, None, None, Some(&o3), None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 }
@@ -1408,18 +1438,17 @@ async fn probe_typed_object(store: VortexRdfStore) {
 /// default graph.
 fn term_kind_quads() -> Vec<Quad> {
     use oxrdf::BlankNode;
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+    let s = iri_subject("s");
     let blank_s = NamedOrBlankNode::BlankNode(BlankNode::new("bs").unwrap());
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let p1 = iri("p1");
+    let p2 = iri("p2");
+    let g = iri_graph("g");
     let blank_g = GraphName::BlankNode(BlankNode::new("bg").unwrap());
-    let plain = |text: &str| Term::Literal(Literal::new_simple_literal(text));
     vec![
         Quad::new(
             s.clone(),
             p1.clone(),
-            Term::NamedNode(NamedNode::new("http://example.org/o-iri").unwrap()),
+            Term::NamedNode(iri("o-iri")),
             GraphName::DefaultGraph,
         ),
         Quad::new(
@@ -1428,7 +1457,7 @@ fn term_kind_quads() -> Vec<Quad> {
             Term::BlankNode(BlankNode::new("bo").unwrap()),
             GraphName::DefaultGraph,
         ),
-        Quad::new(s.clone(), p2.clone(), plain("plain"), g.clone()),
+        Quad::new(s.clone(), p2.clone(), plain_literal("plain"), g.clone()),
         Quad::new(
             s.clone(),
             p2.clone(),
@@ -1447,10 +1476,15 @@ fn term_kind_quads() -> Vec<Quad> {
         Quad::new(
             blank_s.clone(),
             p1,
-            plain("blank subject, blank graph"),
+            plain_literal("blank subject, blank graph"),
             blank_g.clone(),
         ),
-        Quad::new(blank_s, p2, plain("blank subject, second row"), blank_g),
+        Quad::new(
+            blank_s,
+            p2,
+            plain_literal("blank subject, second row"),
+            blank_g,
+        ),
     ]
 }
 

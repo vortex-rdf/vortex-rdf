@@ -15,7 +15,7 @@ async fn test_from_file_maps_the_file() {
     let mapped = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(mapped.debug_file_mapped(), Some(true));
     assert_eq!(view_strings(&mapped).await, quad_strings(&quads));
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let by_p = matched_view(&mapped, None, Some(&p0), None, None).await;
     assert_eq!(by_p.size().await.unwrap(), 4);
 }

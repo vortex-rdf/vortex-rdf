@@ -585,8 +585,8 @@ fn parse_rejects_malformed() {
 /// Dictionary store.
 async fn predicate_store() -> VortexRdfStore {
     let mut quads = dictionary_test_quads();
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/typed").unwrap());
-    let p = NamedNode::new("http://example.org/value").unwrap();
+    let s = iri_subject("typed");
+    let p = iri("value");
     for spelling in [
         typed("5", "integer"),
         typed("-3", "integer"),

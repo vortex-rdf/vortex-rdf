@@ -45,7 +45,7 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
     .await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let p_rare = NamedNode::new("http://example.org/pAAA").unwrap();
+    let p_rare = iri("pAAA");
     let matched = matched_view(&store, None, Some(&p_rare), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 2 * CLUSTER);
 
@@ -88,7 +88,7 @@ async fn test_file_backed_chained_subject_then_object_index() {
 
     // The sorted subject column narrows a bound subject to a sub-range of
     // the file via zone-map pruning (row 12000 lives in the middle zone).
-    let s_mid = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s012000").unwrap());
+    let s_mid = iri_subject("s012000");
     let range = store.debug_subject_pruning_envelope(&s_mid).await.unwrap();
     let range = range.expect("sorted multi-zone file must narrow a bound subject");
     assert!(range.start <= 12000 && 12000 < range.end);
@@ -100,7 +100,7 @@ async fn test_file_backed_chained_subject_then_object_index() {
     // Subject match first (row range), then indexed object match: the
     // object index ids are restricted to the subject's range.
     let by_subject = matched_view(&store, Some(&s_mid), None, None, None).await;
-    let o0 = Term::Literal(Literal::new_simple_literal("o0"));
+    let o0 = plain_literal("o0");
     let chained = matched_view(&by_subject, None, None, Some(&o0), None).await;
     assert_eq!(chained.size().await.unwrap(), 1); // 12000 % 5 == 0
     let results: Vec<Quad> = chained.quads().try_collect().await.unwrap();
@@ -112,12 +112,12 @@ async fn test_file_backed_chained_subject_then_object_index() {
     assert_eq!(results[0].object.to_string(), "\"o0\"");
 
     // Same chain with an object the subject's row doesn't carry.
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let o1 = plain_literal("o1");
     let empty = matched_view(&by_subject, None, None, Some(&o1), None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 
     // Index-to-index chaining: object ids ∩ predicate ids.
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
+    let p2 = iri("p2");
     let step1 = matched_view(&store, None, None, Some(&o1), None).await;
     let step2 = matched_view(&step1, None, Some(&p2), None, None).await;
     let expected = (0..N).filter(|i| i % 5 == 1 && i % 3 == 2).count();
@@ -137,7 +137,7 @@ async fn test_file_backed_subject_metadata_range_for_missing_subject() {
     let (_dir, path) = write_store_file(quads, LayoutStrategy::Default, vec![]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let missing = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
+    let missing = iri_subject("s99");
     let row_range = store
         .debug_subject_pruning_envelope(&missing)
         .await
@@ -173,7 +173,7 @@ async fn test_file_backed_filtered_size_skips_tombstones() {
 
     // Row 3: s03 p0 "object 3".
     let deleted = store.delete_quad(&quads[3]).await.unwrap();
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let matched = matched_view(&deleted, None, Some(&p0), None, None).await;
     // p0 is on rows 0, 3, 6, 9; row 3 is gone.
     assert_eq!(matched.size().await.unwrap(), 3);
@@ -230,8 +230,8 @@ async fn test_file_backed_subject_chunk_probe_matches_memory() {
     let range = store.debug_subject_chunk_probe_range(&mid).await.unwrap();
     assert_eq!(range, Some(777 * 3..777 * 3 + 3), "fast path must engage");
 
-    let p = NamedNode::new("http://example.org/p1").unwrap();
-    let o = Term::Literal(Literal::new_simple_literal("object 3"));
+    let p = iri("p1");
+    let o = plain_literal("object 3");
     let g = GraphName::DefaultGraph;
     for s in [
         subject_node(0, 4),
@@ -262,7 +262,7 @@ async fn test_file_backed_subject_chunk_probe_matches_memory() {
     }
 
     // Absent subject (never in the dictionary) short-circuits to empty.
-    let absent = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/zz").unwrap());
+    let absent = iri_subject("zz");
     let empty = matched_view(&store, Some(&absent), None, None, None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 }
@@ -320,7 +320,7 @@ async fn test_file_backed_subject_chunk_probe_chained() {
     )
     .await;
 
-    let p = NamedNode::new("http://example.org/p2").unwrap();
+    let p = iri("p2");
     let s = subject_node(444, 4);
     let got_first = matched_view(&store, None, Some(&p), None, None).await;
     let got = matched_view(&got_first, Some(&s), None, None, None).await;
@@ -372,7 +372,7 @@ where
 /// Dictionary layout (over `dictionary_test_quads`): a pushed-down integer
 /// filter on the code columns, and a term absent from the dictionary.
 async fn probe_dictionary(store: VortexRdfStore) {
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let filtered = matched_view(&store, None, Some(&p0), None, None).await;
     assert_eq!(filtered.size().await.unwrap(), 4);
     let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
@@ -382,7 +382,7 @@ async fn probe_dictionary(store: VortexRdfStore) {
             .all(|q| q.predicate == "http://example.org/p0")
     );
 
-    let missing_p = NamedNode::new("http://example.org/nope").unwrap();
+    let missing_p = iri("nope");
     let empty = matched_view(&store, None, Some(&missing_p), None, None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 }
@@ -489,10 +489,6 @@ async fn test_file_code_columns_match_memory() {
 /// `(p, o)` several subjects and a `(p, o, s)` several graphs: every key of a
 /// located run's prefix narrows it.
 fn multiplicity_quads() -> Vec<Quad> {
-    let graph = |k: usize| match k {
-        0 => GraphName::DefaultGraph,
-        k => GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{k}")).unwrap()),
-    };
     let mut quads = Vec::new();
     for s in 0..40 {
         for p in 0..3 {
@@ -502,7 +498,7 @@ fn multiplicity_quads() -> Vec<Quad> {
                         &format!("http://example.org/s{s:02}"),
                         &format!("http://example.org/p{}", (s + p) % 5),
                         &format!("o{}", (s * 3 + o) % 7),
-                        graph(g),
+                        numbered_graph(g),
                     ));
                 }
             }
@@ -884,7 +880,6 @@ async fn test_masks_first_reads_a_selection_clamped_inside_splits() {
     use crate::store::Keep;
     use crate::store::scan::read_plan::MaskedRead;
 
-    let literal = |value: &str| Term::Literal(Literal::new_simple_literal(value));
     let (_envelope_dir, path) =
         write_store_file(clustered_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let splits = open_mapped(&path).await.splits().unwrap();
@@ -901,7 +896,7 @@ async fn test_masks_first_reads_a_selection_clamped_inside_splits() {
         ("cd", MaskedRead::Project),
     ] {
         let label = format!("envelope {object}");
-        let probe = Probe::new(None, None, Some(literal(object)), None);
+        let probe = Probe::new(None, None, Some(plain_literal(object)), None);
         let view = file.run_probe(&probe).await.unwrap();
         assert!(
             view.view_statistics().unwrap().pending_filter,
@@ -1186,7 +1181,7 @@ async fn test_cutting_window_over_a_filter_stops_early() {
         MANY_SPLITS
     );
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let view = matched_view(&store, None, Some(&p0), None, None).await;
     let rows = row_list(&view).await;
     let limit = 64;
@@ -1287,7 +1282,7 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
 
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let view = matched_view(&store, None, Some(&p0), None, None).await;
     let _limit = driver_hooks::ForcedLimit::set(0);
     driver_hooks::take_spawned();
@@ -1399,7 +1394,7 @@ async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
         );
     }
     // The fixture's graph `g1`, on every third row: dense enough for masks.
-    let g1 = GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap());
+    let g1 = iri_graph("g1");
     let probe = Probe::new(None, None, None, Some(g1));
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let label = format!("{layout:?} G");
@@ -1524,7 +1519,7 @@ async fn test_kept_masks_never_outlive_a_derivation() {
     let o0 = dict.encode("\"o0\"").await.unwrap().unwrap();
     let o5 = dict.encode("\"o5\"").await.unwrap().unwrap();
     let (s_lo, s_hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
-    let o0_term = Term::Literal(Literal::new_simple_literal("o0"));
+    let o0_term = plain_literal("o0");
     let dense = masks_probes()
         .into_iter()
         .filter(|(shape, ..)| matches!(*shape, "P" | "G"));

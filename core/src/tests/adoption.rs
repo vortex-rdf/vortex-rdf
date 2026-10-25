@@ -22,7 +22,7 @@ async fn test_default_fixture_adopts() {
     assert_eq!(store.size().await.unwrap(), quads.len());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let matched = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(
         view_strings(&matched).await,
@@ -59,7 +59,7 @@ async fn test_dictionary_fixture_adopts() {
     assert_eq!(store.size().await.unwrap(), quads.len());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let (cached, resolved) = probe_hooks::binds();
     let served = matched_view(&store, None, Some(&p1), None, None).await;
     let after = probe_hooks::binds();

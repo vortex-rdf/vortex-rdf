@@ -53,7 +53,7 @@ async fn test_duplicate_index_requests_are_deduplicated() {
 
         // Index-routed matching still works.
         let store = VortexRdfStore::from_built(arr).unwrap();
-        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let p1 = iri("p1");
         let matched = matched_view(&store, None, Some(&p1), None, None).await;
         assert_eq!(matched.size().await.unwrap(), 1, "{layout:?}");
 
@@ -107,7 +107,7 @@ async fn test_in_memory_derived_view_keeps_indexes() {
     assert_eq!(store.indexes(), &vec![IndexType::SecondaryByReference]);
 
     // Match on the object index: 24 quads over 4 objects ⇒ 6 rows.
-    let object = Term::Literal(Literal::new_simple_literal("object 1"));
+    let object = plain_literal("object 1");
     let matched = matched_view(&store, None, None, Some(&object), None).await;
     assert_eq!(matched.size().await.unwrap(), 6);
     assert_eq!(
@@ -119,7 +119,7 @@ async fn test_in_memory_derived_view_keeps_indexes() {
     // Chain a second, index-routed match onto the derived view. Of those 6
     // rows (i = 1, 5, 9, 13, 17, 21), the ones with predicate p1 are
     // i ≡ 1 (mod 3): 1, 13 — the intersection of two index lookups.
-    let predicate = NamedNode::new("http://example.org/p1").unwrap();
+    let predicate = iri("p1");
     let chained = matched_view(&matched, None, Some(&predicate), None, None).await;
     assert_eq!(
         subjects_of(&chained).await,
@@ -147,7 +147,7 @@ async fn test_compact_with_indexes_rebuilds() {
     .await;
 
     // A view over the object index: i = 1, 5, 9, 13, 17, 21 ⇒ 6 rows.
-    let object = Term::Literal(Literal::new_simple_literal("object 1"));
+    let object = plain_literal("object 1");
     let view = matched_view(&store, None, None, Some(&object), None).await;
     assert_eq!(view.size().await.unwrap(), 6);
 
@@ -192,7 +192,7 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
 
     let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
 
-    let object = Term::Literal(Literal::new_simple_literal("object 1"));
+    let object = plain_literal("object 1");
     let indexed = matched_view(&store, None, None, Some(&object), None)
         .await
         .compact_with_indexes(vec![IndexType::SecondaryByReference])
@@ -202,7 +202,7 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
     assert_eq!(indexed.size().await.unwrap(), 6);
 
     // Route through both the rebuilt object and predicate columns.
-    let predicate = NamedNode::new("http://example.org/p1").unwrap();
+    let predicate = iri("p1");
     assert_eq!(
         subjects_of(&matched_view(&indexed, None, Some(&predicate), None, None).await).await,
         vec![
@@ -251,7 +251,7 @@ async fn run_compact_to_empty_keeps_indexes(layout: LayoutStrategy) {
     let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
 
     // A pattern nothing matches: the view is empty, and so is its compaction.
-    let absent = Term::Literal(Literal::new_simple_literal("no such object"));
+    let absent = plain_literal("no such object");
     let empty = matched_view(&store, None, None, Some(&absent), None)
         .await
         .compact_with_indexes(vec![IndexType::SecondaryByReference])
@@ -262,7 +262,7 @@ async fn run_compact_to_empty_keeps_indexes(layout: LayoutStrategy) {
 
     // The empty children are still routable — a probe answers empty rather
     // than erroring or falling back.
-    let object = Term::Literal(Literal::new_simple_literal("object 1"));
+    let object = plain_literal("object 1");
     assert_eq!(
         matched_size(&empty, None, None, Some(&object), None).await,
         0,
@@ -347,7 +347,7 @@ async fn test_delete_keeps_indexes_usable() {
 
     // "object 0" is on i = 0, 3, 6, 9; the index still routes the lookup,
     // and the tombstoned row must not come back.
-    let object = Term::Literal(Literal::new_simple_literal("object 0"));
+    let object = plain_literal("object 0");
     let matched = matched_view(&after, None, None, Some(&object), None).await;
     assert_eq!(matched.size().await.unwrap(), 3);
     assert_eq!(
@@ -451,7 +451,7 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         );
     };
     let codes = layout == LayoutStrategy::Dictionary;
-    let s05 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
+    let s05 = iri_subject("s05");
     let before = probe_hooks::binds();
     let by_subject = matched_view(&store, Some(&s05), None, None, None).await;
     if codes {
@@ -468,7 +468,7 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
     let expect_served = indexes.contains(&IndexType::SecondaryByCopy);
     let index_searched = codes && !indexes.is_empty();
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let before = probe_hooks::binds();
     let by_pred = matched_view(&store, None, Some(&p0), None, None).await;
     if index_searched {
@@ -485,7 +485,7 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         "predicate serve plan mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
-    let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
+    let o1 = plain_literal("object 1");
     let before = probe_hooks::binds();
     let by_obj = matched_view(&store, None, None, Some(&o1), None).await;
     if index_searched {
@@ -502,7 +502,7 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         "object serve plan mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_both = matched_view(&store, None, Some(&p1), Some(&o1), None).await;
     assert_eq!(
         by_both.size().await.unwrap(),
@@ -512,9 +512,9 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
 
     // A subject, a predicate or an object the store does not hold matches
     // nothing.
-    let missing_s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
-    let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-    let missing_o = Term::Literal(Literal::new_simple_literal("nope"));
+    let missing_s = iri_subject("nope");
+    let missing_p = iri("nope");
+    let missing_o = plain_literal("nope");
     for (role, size) in [
         (
             "subject",
@@ -594,10 +594,7 @@ async fn test_index_matrix_sorted_stream() {
 /// The two graphs and the 30-quad dataset every copy-index serving script
 /// runs over: `s{i:02} p{i % 3} "o{i % 5}"` alternating between the graphs.
 pub(super) fn copy_index_script_dataset() -> (Vec<Quad>, [GraphName; 2]) {
-    let graphs = [
-        GraphName::NamedNode(NamedNode::new("http://example.org/g0").unwrap()),
-        GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap()),
-    ];
+    let graphs = [iri_graph("g0"), iri_graph("g1")];
     (graph_modular_quads(30, 2, 3, 5, &graphs), graphs)
 }
 
@@ -634,7 +631,7 @@ pub(super) async fn run_copy_index_serving_script(
 
     // Predicate-bound: i ≡ 1 (mod 3), served from the POSG family's run —
     // the served `quads()` and the row-id `size()` must agree.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p), Some("index:posg"));
     assert_eq!(selection_pending(&by_p), expect.served_pending);
@@ -651,7 +648,7 @@ pub(super) async fn run_copy_index_serving_script(
     assert_eq!(parts.array.len(), 10);
 
     // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let o2 = plain_literal("o2");
     let by_o = matched_view(&store, None, None, Some(&o2), None).await;
     assert_eq!(served_component(&by_o), Some("index:ospg"));
     assert_eq!(selection_pending(&by_o), expect.served_pending);
@@ -664,7 +661,7 @@ pub(super) async fn run_copy_index_serving_script(
     // Predicate and object: one (p, o) prefix resolution fully resolves the
     // pattern — i ≡ 1 (mod 3) ∧ i ≡ 1 (mod 5) ⇔ i ≡ 1 (mod 15) — so the
     // narrowed run is served directly.
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let o1 = plain_literal("o1");
     let by_po = matched_view(&store, None, Some(&p1), Some(&o1), None).await;
     assert_eq!(served_component(&by_po), Some("index:posg"));
     assert_eq!(selection_pending(&by_po), expect.served_pending);
@@ -675,7 +672,7 @@ pub(super) async fn run_copy_index_serving_script(
     );
 
     // A residual graph constraint on top of the resolved predicate.
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
+    let p2 = iri("p2");
     let by_pg = matched_view(&store, None, Some(&p2), None, Some(&graphs[0])).await;
     assert_eq!(
         served_component(&by_pg),
@@ -702,13 +699,13 @@ pub(super) async fn run_copy_index_serving_script(
     );
 
     // A term the store has never seen short-circuits to empty.
-    let missing = NamedNode::new("http://example.org/nope").unwrap();
+    let missing = iri("nope");
     let none = matched_view(&store, None, Some(&missing), None, None).await;
     assert_eq!(none.size().await.unwrap(), 0);
 
     // A term the store knows — but never as a predicate — probes the index
     // child and finds nothing.
-    let subject_as_p = NamedNode::new("http://example.org/s00").unwrap();
+    let subject_as_p = iri("s00");
     let zero = matched_view(&store, None, Some(&subject_as_p), None, None).await;
     assert_eq!(selection_pending(&zero), expect.never_predicate_pending);
     assert_eq!(view_strings(&zero).await, Vec::<String>::new());
@@ -799,7 +796,7 @@ async fn test_in_memory_copy_index_serving() {
     // that cannot cut a row is the served view as it is, plan and order
     // included, while one that cuts a row drops the plan and reads base
     // order.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p), Some("index:posg"));
     let size = by_p.size().await.unwrap();
@@ -856,7 +853,7 @@ async fn test_in_memory_copy_index_serving() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let o1 = plain_literal("o1");
     for (object, width, point_read) in [(Some(&o1), 43, true), (None, 300, false)] {
         let by_p = matched_view(&store, None, Some(&p1), object, None).await;
         assert_eq!(served_component(&by_p), Some("index:posg"));
@@ -913,7 +910,7 @@ async fn test_built_store_compresses_resident_form() {
 
     // The payload path still answers: codes decode to exactly the matched
     // quads (first touch materializes the shared canonical, then zero-copy).
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let matched = matched_view(&store, None, Some(&p1), None, None).await;
     let cols = matched
         .code_columns()
@@ -974,7 +971,7 @@ async fn test_code_columns_serves_from_the_answering_index() {
     )
     .await;
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let matched = matched_view(&store, None, Some(&p1), None, None).await;
     assert!(selection_pending(&matched));
 
@@ -1005,7 +1002,7 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
     use crate::store::{IdsNeed, Probe};
 
     let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let width = 300;
     let span =
         |offset: usize, limit: usize| (offset.min(width), offset.saturating_add(limit).min(width));

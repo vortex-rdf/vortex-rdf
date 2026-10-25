@@ -13,7 +13,7 @@ use super::*;
 async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str, streams: usize) {
     use crate::store::read::quads::chunk_stream_hooks;
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let extra = make_quad(
         "http://example.org/tail-subject",
         "http://example.org/p0",
@@ -69,7 +69,7 @@ async fn test_shared_quads_match_quads_vec_across_layouts() {
     for layout in LAYOUTS {
         let store = built_store(dictionary_test_quads(), layout, vec![]).await;
         assert_shared_matches_quads(&store, &format!("{layout:?}")).await;
-        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        let p0 = iri("p0");
         let matched = matched_view(&store, None, Some(&p0), None, None).await;
         assert_shared_matches_quads(&matched, &format!("{layout:?} matched")).await;
     }
@@ -113,7 +113,7 @@ async fn test_shared_quads_match_quads_vec_on_served_view() {
     )
     .await;
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let served = matched_view(&store, None, Some(&p0), None, None).await;
     assert_eq!(
         served_component(&served),
@@ -149,8 +149,8 @@ async fn test_shared_quads_match_quads_vec_on_views() {
     .await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s01").unwrap());
+    let p0 = iri("p0");
+    let s1 = iri_subject("s01");
     let extra = make_quad(
         "http://example.org/tail-subject",
         "http://example.org/p0",

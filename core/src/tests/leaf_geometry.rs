@@ -250,7 +250,7 @@ async fn every_store_write_path_takes_the_id_column_override() {
             let subject = format!("http://example.org/s{i:06}");
             Quad::new(
                 NamedNode::new(&subject).unwrap(),
-                NamedNode::new(format!("http://example.org/p{}", i % 3)).unwrap(),
+                iri(&format!("p{}", i % 3)),
                 NamedNode::new(&subject).unwrap(),
                 GraphName::DefaultGraph,
             )

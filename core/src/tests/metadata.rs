@@ -16,7 +16,7 @@ use crate::store::{
 async fn assert_views_share_identity(store: &VortexRdfStore, tag: &str) {
     let generation = store.generation();
     let dictionary = store.dict_reader().unwrap().dictionary_id();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let kept = matched_view(store, None, Some(&p1), None, None)
         .await
         .keep(QuadColumn::S, &Keep::range(0..TermCode::MAX))
@@ -340,7 +340,7 @@ async fn test_view_statistics_file_backed() {
             .map(|(_, _, store)| store.clone())
             .unwrap()
     };
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let store = open("file/no-index/mapped");
     let whole = store.view_statistics().unwrap();
     assert_eq!(whole.rows, RowCountHint::exact(quads.len()));
@@ -414,7 +414,7 @@ async fn test_view_statistics_file_backed() {
     assert!(!stats.pending_filter);
     // A bound graph rides the served run as a filter: the run's 600 rows
     // bound the count.
-    let g1 = GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap());
+    let g1 = iri_graph("g1");
     let by_pg = matched_view(&copy, None, Some(&p1), None, Some(&g1)).await;
     let stats = by_pg.view_statistics().unwrap();
     assert_eq!(stats.served_component, Some("index:posg"));
@@ -527,8 +527,8 @@ async fn test_index_components_classify_children_by_slug() {
         .collect::<Vec<_>>();
     // The copy index answers a bound predicate from `index:posg`, here the
     // foreign child, and a bound object from `index:ospg`.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let p1 = iri("p1");
+    let o3 = plain_literal("o3");
     for (open, store) in reopened_stores(&path).await {
         assert_eq!(store.index_components().unwrap(), want, "{open}");
         // The data source names the children as the roster does.

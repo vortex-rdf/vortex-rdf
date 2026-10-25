@@ -48,7 +48,7 @@ fn assert_refused<T>(result: crate::error::Result<T>, label: &str) {
 async fn assert_reads_back(store: &VortexRdfStore, rows: usize, label: &str) {
     let quads = quads(rows);
     assert_eq!(store.size().await.unwrap(), rows, "{label}");
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let matched = matched_view(store, None, Some(&p1), None, None).await;
     assert_eq!(
         view_strings(&matched).await,

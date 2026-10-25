@@ -12,19 +12,17 @@ use std::collections::HashMap;
 /// Shared with `common::terms`' inline parser tests, so the parse family and
 /// the store round-trips are exercised over one case list.
 pub(crate) fn escaped_literal_cases() -> Vec<Term> {
-    let dt = NamedNode::new("http://example.org/dt").unwrap();
+    let dt = iri("dt");
     vec![
-        Term::Literal(Literal::new_simple_literal("with \"quotes\" inside")),
-        Term::Literal(Literal::new_simple_literal("back\\slash")),
-        Term::Literal(Literal::new_simple_literal("trailing backslash \\")),
-        Term::Literal(Literal::new_simple_literal("line\nbreak")),
-        Term::Literal(Literal::new_simple_literal("carriage\rreturn")),
-        Term::Literal(Literal::new_simple_literal("tab\there")),
-        Term::Literal(Literal::new_simple_literal(
-            "caret^^<http://example.org/nope> inside",
-        )),
-        Term::Literal(Literal::new_simple_literal("say \"hi\"@home")),
-        Term::Literal(Literal::new_simple_literal("emoji \u{1F600} tail")),
+        plain_literal("with \"quotes\" inside"),
+        plain_literal("back\\slash"),
+        plain_literal("trailing backslash \\"),
+        plain_literal("line\nbreak"),
+        plain_literal("carriage\rreturn"),
+        plain_literal("tab\there"),
+        plain_literal("caret^^<http://example.org/nope> inside"),
+        plain_literal("say \"hi\"@home"),
+        plain_literal("emoji \u{1F600} tail"),
         Term::Literal(Literal::new_language_tagged_literal("q\"x", "en").unwrap()),
         Term::Literal(Literal::new_language_tagged_literal("say \"hi\"@home", "en").unwrap()),
         Term::Literal(Literal::new_language_tagged_literal("back\\slash", "en-GB").unwrap()),
@@ -37,14 +35,7 @@ fn escaped_literal_quads() -> Vec<Quad> {
     escaped_literal_cases()
         .into_iter()
         .enumerate()
-        .map(|(i, o)| {
-            Quad::new(
-                subject_node(i, 2),
-                NamedNode::new("http://example.org/p").unwrap(),
-                o,
-                GraphName::DefaultGraph,
-            )
-        })
+        .map(|(i, o)| Quad::new(subject_node(i, 2), iri("p"), o, GraphName::DefaultGraph))
         .collect()
 }
 

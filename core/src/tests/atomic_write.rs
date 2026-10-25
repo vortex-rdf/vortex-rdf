@@ -128,16 +128,7 @@ async fn test_successful_write_replaces_the_existing_store() {
     )
     .await;
 
-    let replacement = graph_modular_quads(
-        5,
-        3,
-        2,
-        2,
-        &[
-            GraphName::DefaultGraph,
-            GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap()),
-        ],
-    );
+    let replacement = graph_modular_quads(5, 3, 2, 2, &[GraphName::DefaultGraph, iri_graph("g")]);
     crate::io::quads_stream_to_vortex_file(
         quad_stream(replacement.clone()),
         &path,

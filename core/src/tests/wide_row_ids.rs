@@ -44,20 +44,12 @@ fn single_index_sets() -> impl Iterator<Item = Indexes> {
     index_sets().into_iter().filter(|set| set.len() == 1)
 }
 
-fn iri(s: &str) -> NamedNode {
-    NamedNode::new(format!("http://example.org/{s}")).unwrap()
-}
-
-fn g1() -> GraphName {
-    GraphName::NamedNode(iri("g1"))
-}
-
 /// 900 quads `s{i:04} p{i % 3} "o{i % 7}"`, alternating between the default
 /// graph and `g1`: quad `i` is row `i` (subjects are unique and sort as `i`),
 /// `p1` covers 300 rows (past the point-read cap), `"o2"` 129 (inside it),
 /// and both together 43.
 fn dataset() -> Vec<Quad> {
-    graph_modular_quads(N, 4, 3, 7, &[GraphName::DefaultGraph, g1()])
+    graph_modular_quads(N, 4, 3, 7, &[GraphName::DefaultGraph, iri_graph("g1")])
 }
 
 /// The rows of `quads` at the indexes `keep` accepts, in row order.
@@ -90,7 +82,7 @@ async fn partition_strings(view: &VortexRdfStore, n: usize) -> Vec<String> {
 /// and tombstones over index matches.
 async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     let p1 = iri("p1");
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let o2 = plain_literal("o2");
     assert_eq!(store.size().await.unwrap(), N, "{label}");
 
     // ── matches ──────────────────────────────────────────────────────────
@@ -106,7 +98,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     let both = matched_view(store, None, Some(&p1), Some(&o2), None).await;
     let both_rows = rows_where(quads, |i| i % 21 == 16);
     assert_eq!(view_strings(&both).await, both_rows, "{label}: by both");
-    let g = g1();
+    let g = iri_graph("g1");
     let by_g = matched_view(store, None, None, None, Some(&g)).await;
     assert_eq!(
         view_strings(&by_g).await,
@@ -352,7 +344,7 @@ async fn row_ids_past_u32_round_trip_through_a_file() {
     let _base = RowIdBase::set(BASE);
     let quads = dataset();
     let p1 = iri("p1");
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let o2 = plain_literal("o2");
     for layout in LAYOUTS {
         for indexes in single_index_sets() {
             let label = format!("{layout:?} {indexes:?}");

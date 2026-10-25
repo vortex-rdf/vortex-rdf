@@ -60,8 +60,8 @@ async fn keeps_for(store: &VortexRdfStore, column: QuadColumn) -> Vec<Keep> {
 /// Every keep over every column of every view agrees with brute force, and
 /// the narrowed view's size with its row count.
 async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let p1 = iri("p1");
+    let o3 = plain_literal("o3");
     let s42 = subject_node(42, 4);
     let views: Vec<(&str, VortexRdfStore)> = vec![
         ("whole", store.clone()),
@@ -151,8 +151,8 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
 /// the whole store, a bound predicate, object, subject and predicate-object
 /// pair, and an object keep.
 async fn slicing_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let p1 = iri("p1");
+    let o3 = plain_literal("o3");
     let s42 = subject_node(42, 4);
     vec![
         ("whole", store.clone()),
@@ -296,7 +296,7 @@ async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
     let store = VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, indexes)
         .await
         .unwrap();
-    let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s3").unwrap());
+    let s3 = iri_subject("s3");
     let run = matched_view(&store, Some(&s3), None, None, None).await;
     assert_eq!(run.debug_selection_range(), Some(24..32), "{tag}");
     let rows = row_set(&run).await;
@@ -349,7 +349,7 @@ async fn test_keep_in_memory_matches_brute_force() {
 async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
     let store = unprobed_object_store().await;
     assert_eq!(store.debug_base_child_int_canonical("o"), Some(false));
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     for (tag, view) in [("whole", store.clone()), ("p-bound", by_p)] {
         let rows = row_set(&view).await;
@@ -424,7 +424,7 @@ async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
     let dict = store.dict_reader().unwrap();
     let (g_lo, g_hi) = dict.prefix_range("<http://example.org/g").await.unwrap();
     let (p_lo, p_hi) = dict.prefix_range("<http://example.org/p").await.unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     let keeps = [
         (QuadColumn::G, Keep::range(g_lo..g_hi)),
@@ -453,7 +453,7 @@ async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
             );
         }
     }
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let o3 = plain_literal("o3");
     let point = matched_view(&store, None, Some(&p1), Some(&o3), None).await;
     let rows = row_list(&point).await;
     assert!(
@@ -634,9 +634,9 @@ async fn window_stores() -> (
 fn window_probes() -> Vec<(&'static str, Probe)> {
     // The fixture's row 42: `s0042 p2 "o0"` in the default graph.
     let s = subject_node(42, 4);
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let p1 = iri("p1");
+    let p2 = iri("p2");
+    let o3 = plain_literal("o3");
     vec![
         ("P", Probe::new(None, Some(p1.clone()), None, None)),
         ("PO", Probe::new(None, Some(p1), Some(o3.clone()), None)),
@@ -910,10 +910,6 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
 /// memory the graph is tested at match time, so none of these limits cuts.
 #[tokio::test]
 async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
-    let graph = |k: usize| match k {
-        0 => GraphName::DefaultGraph,
-        k => GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{k}")).unwrap()),
-    };
     // Subjects `s00` to `s31`, each with six objects under `p0`, then six
     // under `p1`, cycling through the default graph, `g1` and `g2`.
     let quads: Vec<Quad> = (0..384)
@@ -922,7 +918,7 @@ async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
                 &format!("http://example.org/s{:02}", i / 12),
                 &format!("http://example.org/p{}", i / 6 % 2),
                 &format!("o{i:03}"),
-                graph(i % 3),
+                numbered_graph(i % 3),
             )
         })
         .collect();
@@ -930,7 +926,7 @@ async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
     // `s05 p0` is a run of six rows, two of them in the default graph.
     let probe = Probe::new(
         Some(subject_node(5, 2)),
-        Some(NamedNode::new("http://example.org/p0").unwrap()),
+        Some(iri("p0")),
         None,
         Some(GraphName::DefaultGraph),
     );
@@ -1056,7 +1052,7 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
     use crate::store::IdsNeed;
     use crate::store::indexes::file::rid_scan_hooks;
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let probe = Probe::new(None, Some(p1.clone()), None, None);
     let matching: Vec<Quad> = fixture_quads()
         .into_iter()
@@ -1157,7 +1153,7 @@ async fn test_masks_first_window_under_tombstones_counts_no_live_rows() {
     for quad in quads.iter().step_by(11).take(40) {
         store = store.delete_quad(quad).await.unwrap();
     }
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let probe = Probe::new(None, Some(p1), None, None);
     let plain = store.run_probe(&probe).await.unwrap();
     assert!(

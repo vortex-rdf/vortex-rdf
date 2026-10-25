@@ -51,7 +51,7 @@ async fn test_keep_wide_set_on_file() {
     let (lo, hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
     assert!(hi - lo > 2_000);
     let wide = Keep::set((lo..hi).filter(|c| c % 3 != 0).chain([0, 1, 2]));
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     for (tag, view) in [
         ("whole", store.clone()),
         (
@@ -87,9 +87,9 @@ async fn test_a_served_view_with_a_residual_filter_counts_up_to_a_cap() {
     )
     .await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
-    let g1 = GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap());
+    let p1 = iri("p1");
+    let o3 = plain_literal("o3");
+    let g1 = iri_graph("g1");
     let expected = quads
         .iter()
         .filter(|q| q.predicate == p1 && q.object == o3 && q.graph_name == g1)
@@ -133,7 +133,7 @@ async fn test_file_keeps_bind_no_expressions() {
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let dict = store.dict_reader().unwrap();
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let view = matched_view(&store, None, Some(&p0), None, None).await;
     let first = dict.encode("\"object 0\"").await.unwrap().unwrap();
     // One keep and one row read bind every shape the loop uses: the
@@ -189,7 +189,7 @@ async fn test_distinct_constants_retire_the_reader_tree() {
     };
 
     for i in 0..distinct {
-        let object = Term::Literal(Literal::new_simple_literal(format!("o{i}")));
+        let object = plain_literal(&format!("o{i}"));
         let matched = matched_view(&store, None, None, Some(&object), None).await;
         assert_eq!(matched.size().await.unwrap(), 1, "object o{i}");
     }
@@ -229,7 +229,7 @@ async fn keep_spans_scan_splits(path: &std::path::Path) {
     let (s_lo, s_hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
     let objects = Keep::set([o_lo + 1, o_lo + 5]);
     let subjects = Keep::range(s_lo..s_lo + (s_hi - s_lo) / 2);
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let views = [
         ("whole", store.clone()),
         (
@@ -343,7 +343,7 @@ impl RunStore {
     /// whole store, a pending filter, an id list (an `o` keep's result),
     /// a row window and a window over the pending filter.
     async fn views(&self) -> Vec<View> {
-        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        let p0 = iri("p0");
         let pending = matched_view(&self.store, None, Some(&p0), None, None).await;
         let (o_lo, _) = self
             .store
@@ -667,7 +667,7 @@ async fn test_s_keeps_bind_no_expressions_and_stream_nothing() {
         .await
         .unwrap();
     assert!(hi - lo >= quads.len() as TermCode);
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let pending = matched_view(&store, None, Some(&p1), None, None).await;
     // Warm the shapes a count and a row read bind on the pending view.
     let warm = pending.size().await.unwrap();
@@ -735,7 +735,7 @@ async fn test_s_keeps_on_an_unsorted_file_stream() {
             "an unsorted file declines"
         );
     }
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let views = [
         ("whole", store.clone()),
         (
@@ -785,7 +785,7 @@ async fn s_keeps_match_brute_force(path: &std::path::Path) {
     let dict = store.dict_reader().unwrap();
     let (o_lo, _) = dict.prefix_range("\"object ").await.unwrap();
     let (lo, hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let views = [
         ("whole", store.clone()),
         (

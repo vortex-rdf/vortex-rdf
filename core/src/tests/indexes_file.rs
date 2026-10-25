@@ -25,7 +25,7 @@ async fn test_file_backed_delete_keeps_indexes() {
 
     // Index-resolved delete: "object 0" is indexed, so this resolves to
     // exact file row ids (i = 0, 3, 6, 9) without a filter scan.
-    let object0 = Term::Literal(Literal::new_simple_literal("object 0"));
+    let object0 = plain_literal("object 0");
     let after = store
         .delete_matching(None, None, Some(&object0), None)
         .await
@@ -46,21 +46,21 @@ async fn test_file_backed_delete_keeps_indexes() {
         0
     );
     // Predicate p0 (i even: 0,2,4,6,8,10) had rows 0 and 6 tombstoned.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let by_p0 = matched_view(&after, None, Some(&p0), None, None).await;
     assert_eq!(by_p0.size().await.unwrap(), 4);
     assert_eq!(by_p0.quads().count().await, 4);
 
     // Filter-scan delete: a subject isn't index-resolved, so this exercises
     // the pruning + filter evaluation path that resolves the doomed rows.
-    let s05 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
+    let s05 = iri_subject("s05");
     let after2 = after
         .delete_matching(Some(&s05), None, None, None)
         .await
         .unwrap();
     assert_eq!(after2.size().await.unwrap(), 7);
     // s05 is object "object 2" (5 % 3); that lookup now returns one fewer.
-    let object2 = Term::Literal(Literal::new_simple_literal("object 2"));
+    let object2 = plain_literal("object 2");
     assert_eq!(
         matched_size(&after2, None, None, Some(&object2), None).await,
         3,
@@ -96,7 +96,7 @@ async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
     // shape): the graph is never one of the keys a copy is searched by (it is
     // the last key of both orders), so the plan filters the child instead of
     // reading a located run.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_pg = matched_view(&store, None, Some(&p1), None, Some(&graphs[1])).await;
     assert_eq!(
         by_pg.debug_serve_row_range(),
@@ -105,7 +105,7 @@ async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
     );
 
     // Predicate, object and graph: i ≡ 1 (mod 15) in g0 (even i) → 16.
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let o1 = plain_literal("o1");
     let by_pog = matched_view(&store, None, Some(&p1), Some(&o1), Some(&graphs[0])).await;
     assert_eq!(served_component(&by_pog), Some("index:posg"));
     assert_eq!(by_pog.debug_serve_row_range(), None);
@@ -117,7 +117,7 @@ async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
     );
 
     // A graph the store never saw matches nothing.
-    let unknown = GraphName::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
+    let unknown = iri_graph("nope");
     let none = matched_view(&store, None, Some(&p1), None, Some(&unknown)).await;
     assert_eq!(none.size().await.unwrap(), 0);
     assert_eq!(view_strings(&none).await, Vec::<String>::new());
@@ -180,7 +180,7 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
     .await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p), Some("index:posg"));
     // POSG order puts p1's run right after p0's 10,000 rows.
@@ -256,7 +256,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
 
     // Predicate-bound: the POSG lead run, located through the dictionary-coded
     // `p` column and served by range in several splits.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p), Some("index:posg"));
     assert_eq!(by_p.debug_serve_row_range(), Some(3_000..6_000));
@@ -280,7 +280,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
     // Predicate and object bound: the windowed second-key search inside the
     // lead run, through the dictionary-coded `o` column — `i ≡ 1 (mod 3)`
     // and `i ≡ 1 (mod 7)` is the second of p1's seven object sub-runs.
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let o1 = plain_literal("o1");
     let by_po = matched_view(&store, None, Some(&p1), Some(&o1), None).await;
     assert_eq!(served_component(&by_po), Some("index:posg"));
     assert_eq!(by_po.debug_serve_row_range(), Some(3_429..3_858));
@@ -291,7 +291,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
     );
 
     // Object-bound: the OSPG lead run through its dictionary-coded `o`.
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let o2 = plain_literal("o2");
     let by_o = matched_view(&store, None, None, Some(&o2), None).await;
     assert_eq!(served_component(&by_o), Some("index:ospg"));
     assert_eq!(by_o.debug_serve_row_range(), Some(2_572..3_858));
@@ -303,7 +303,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
 
     // A term the store knows but never as a predicate: the located run is
     // empty, proving the pattern matches nothing at match time.
-    let subject_as_p = NamedNode::new("http://example.org/s0000").unwrap();
+    let subject_as_p = iri("s0000");
     let zero = matched_view(&store, None, Some(&subject_as_p), None, None).await;
     assert!(!selection_pending(&zero));
     assert_eq!(zero.size().await.unwrap(), 0);
@@ -337,9 +337,9 @@ async fn sorted_code_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
 async fn test_copy_index_file_serves_code_columns_from_the_run() {
     use crate::store::scan::file_scans::scan_hooks;
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let p1 = iri("p1");
+    let o1 = plain_literal("o1");
+    let o2 = plain_literal("o2");
     // 9,000 rows: every run is wider than the point-read cap; 900 rows: the
     // (p, o) runs are inside it.
     for rows in [9_000, 900] {
@@ -456,8 +456,8 @@ async fn test_file_with_both_index_kinds() {
         .unwrap();
     assert_eq!(adopted.indexes(), both.as_slice());
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
+    let p1 = iri("p1");
+    let o1 = plain_literal("object 1");
     let patterns: [Pattern<'_>; 3] = [
         ("P", None, Some(&p1), None, None),
         ("O", None, None, Some(&o1), None),
@@ -492,8 +492,8 @@ async fn run_reference_index_file_test(layout: LayoutStrategy, located: bool) {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(store.indexes(), &[IndexType::SecondaryByReference]);
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let p1 = iri("p1");
+    let o2 = plain_literal("o2");
 
     // Object-bound: 129 rows — a located run inside the point-read cap.
     let by_o = matched_view(&store, None, None, Some(&o2), None).await;
@@ -541,13 +541,13 @@ async fn run_reference_index_file_test(layout: LayoutStrategy, located: bool) {
     );
 
     // A term the store has never seen short-circuits before any location.
-    let missing = Term::Literal(Literal::new_simple_literal("nope"));
+    let missing = plain_literal("nope");
     let none = matched_view(&store, None, None, Some(&missing), None).await;
     assert_eq!(none.size().await.unwrap(), 0);
 
     // A term the store knows — but never as an object — locates an empty run
     // (or scans to the same conclusion) and answers empty.
-    let subject_as_o = Term::NamedNode(NamedNode::new("http://example.org/s0000").unwrap());
+    let subject_as_o = Term::NamedNode(iri("s0000"));
     assert_eq!(
         store
             .debug_reference_index_located_run(None, Some(&subject_as_o))
@@ -619,8 +619,8 @@ async fn test_reference_index_counts_located_runs_from_width() {
         // The rid rows read from located runs: none on the freshly opened
         // file, and no hook in memory, which has no file.
         let no_rid_reads = on_file.then_some(0);
-        let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+        let p1 = iri("p1");
+        let o2 = plain_literal("o2");
         let counted = store
             .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
             .await
@@ -711,8 +711,8 @@ async fn test_reference_index_counts_located_runs_from_width() {
 #[tokio::test]
 async fn test_reference_index_file_checks_sparse_residual_by_point_reads() {
     use crate::store::Probe;
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let p1 = iri("p1");
+    let o2 = plain_literal("o2");
     // (rows, objects, residual point-read): 30,000 rows with each object on
     // 20 or 21 of them, then 900 rows with each object on ~129.
     for (rows, o_mod, sparse) in [(30_000, 1_499, true), (900, 7, false)] {
@@ -766,7 +766,7 @@ async fn test_reference_index_file_checks_sparse_residual_by_point_reads() {
 
         // A residual no located row satisfies — a known term, never a
         // predicate — leaves an empty view.
-        let subject_as_p = NamedNode::new("http://example.org/s00000").unwrap();
+        let subject_as_p = iri("s00000");
         let none = matched_view(&file, None, Some(&subject_as_p), Some(&o2), None).await;
         assert_eq!(none.size().await.unwrap(), 0, "{rows}");
         assert!(view_strings(&none).await.is_empty(), "{rows}");
@@ -886,8 +886,8 @@ async fn test_reference_index_window_reads_only_its_rows() {
     )
     .await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let p1 = iri("p1");
+    let o2 = plain_literal("o2");
     // The 300-row predicate run: windows of 280 and 299 rows, and the whole
     // run, are past the point-read cap.
     assert_windows_read_only_their_rows(
@@ -969,8 +969,8 @@ async fn test_reference_index_pending_run_composes() {
         vec![IndexType::SecondaryByReference],
     )
     .await;
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let p1 = iri("p1");
+    let o2 = plain_literal("o2");
     for store in [
         VortexRdfStore::from_file(&path).await.unwrap(),
         VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
@@ -1117,7 +1117,7 @@ async fn test_only_a_counted_view_is_pending_without_a_plan() {
         vec![IndexType::SecondaryByReference],
     )
     .await;
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     for store in [
         VortexRdfStore::from_file(&path).await.unwrap(),
         VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
@@ -1169,7 +1169,7 @@ async fn stream_a_counted_view(open: impl AsyncFnOnce(&std::path::Path) -> Vorte
     )
     .await;
     let store = open(&path).await;
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p1 = iri("p1");
     let counted = store
         .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
         .await
@@ -1214,8 +1214,8 @@ async fn test_reference_index_runs_across_rid_leaves() {
         }
     }
 
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let p1 = iri("p1");
+    let o2 = plain_literal("o2");
     // p1's run is child rows 300..600, o2's 258..387: each holds a leaf
     // boundary (384 and 512; 384), so a window can straddle one.
     let p_run = store
@@ -1280,17 +1280,15 @@ async fn test_reference_index_runs_at_the_children_edges() {
     )
     .await;
     let leaves = write_chunked_reference_store_file(&quads, 128).await;
-    let predicate = |n: usize| NamedNode::new(format!("http://example.org/p{n}")).unwrap();
-    let object = |n: usize| Term::Literal(Literal::new_simple_literal(format!("o{n}")));
     for (_dir, path) in [&single, &leaves] {
         let store = VortexRdfStore::from_file(path).await.unwrap();
         // The lowest and the highest predicate and object codes: the first
         // and the last run of each child.
         for (p, o, run) in [
-            (Some(predicate(0)), None, 0..300u64),
-            (Some(predicate(2)), None, 600..900),
-            (None, Some(object(0)), 0..129),
-            (None, Some(object(6)), 772..900),
+            (Some(iri("p0")), None, 0..300u64),
+            (Some(iri("p2")), None, 600..900),
+            (None, Some(plain_literal("o0")), 0..129),
+            (None, Some(plain_literal("o6")), 772..900),
         ] {
             let located = store
                 .debug_reference_index_located_run(p.as_ref(), o.as_ref())
@@ -1326,15 +1324,13 @@ async fn test_reference_index_runs_at_the_children_edges() {
 #[tokio::test]
 async fn test_reference_index_counts_with_named_graphs() {
     use crate::store::{IdsNeed, Probe};
-    let named =
-        |n: &str| GraphName::NamedNode(NamedNode::new(format!("http://example.org/{n}")).unwrap());
     // Four graphs against three predicates and seven objects: none of the
     // three determines another.
     let graphs = [
         GraphName::DefaultGraph,
-        named("g1"),
-        named("g2"),
-        named("g3"),
+        iri_graph("g1"),
+        iri_graph("g2"),
+        iri_graph("g3"),
     ];
     let quads = graph_modular_quads(900, 4, 3, 7, &graphs);
     let (_dir, path) = write_store_file(
@@ -1343,8 +1339,8 @@ async fn test_reference_index_counts_with_named_graphs() {
         vec![IndexType::SecondaryByReference],
     )
     .await;
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let p1 = iri("p1");
+    let o2 = plain_literal("o2");
     for store in [
         VortexRdfStore::from_file(&path).await.unwrap(),
         VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
@@ -1443,7 +1439,7 @@ async fn test_reference_index_file_takes_sparse_ids() {
     }
 
     let quads = graph_modular_quads(100_000, 6, 3, 333, &[GraphName::DefaultGraph]);
-    let o5 = Term::Literal(Literal::new_simple_literal("o5"));
+    let o5 = plain_literal("o5");
     let doomed = 5 + 333 * 7;
     for (layout, through_chunks) in [
         (LayoutStrategy::Dictionary, true),

@@ -178,8 +178,8 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 
         // And the index columns the spill merge emitted actually route: the
         // same selectivities the single-run copy-index test asserts.
-        let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
+        let p1 = iri("p1");
+        let o1 = plain_literal("object 1");
         for (tag, pp, po, want) in [
             ("P", Some(&p1), None, 8),
             ("O", None, Some(&o1), 6),
@@ -221,7 +221,7 @@ async fn test_sorted_stream_empty_dataset() {
             assert_eq!(store.layout(), layout);
             assert_eq!(store.indexes(), indexes.as_slice());
             assert_eq!(store.size().await.unwrap(), 0, "{layout:?}/{indexes:?}");
-            let p = NamedNode::new("http://example.org/p0").unwrap();
+            let p = iri("p0");
             assert_eq!(
                 matched_size(&store, None, Some(&p), None, None).await,
                 0,
@@ -345,10 +345,7 @@ fn child_table(component: &crate::store::indexes::IndexComponent) -> Vec<(String
 /// named ones, so every key position of a copy child is exercised.
 #[tokio::test]
 async fn test_spilled_children_equal_in_memory_children() {
-    let graph = |name: &str| {
-        GraphName::NamedNode(NamedNode::new(format!("http://example.org/{name}")).unwrap())
-    };
-    let graphs = [GraphName::DefaultGraph, graph("g1"), graph("g2")];
+    let graphs = [GraphName::DefaultGraph, iri_graph("g1"), iri_graph("g2")];
     let mut quads = graph_modular_quads(24, 2, 3, 4, &graphs);
     quads.reverse();
     quads.extend(quads[..6].to_vec());

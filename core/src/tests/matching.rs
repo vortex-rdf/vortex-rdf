@@ -71,7 +71,7 @@ async fn test_term_kinds_match_under_every_layout() {
             }
             // An empty result carries no index set, so a match chained on it
             // looks nothing up.
-            let absent = Term::NamedNode(NamedNode::new("http://example.org/absent").unwrap());
+            let absent = Term::NamedNode(iri("absent"));
             let none = matched_view(&store, None, None, Some(&absent), None).await;
             assert_eq!(none.size().await.unwrap(), 0, "{tag}: absent object");
             assert!(none.indexes().is_empty(), "{tag}: empty result's indexes");
@@ -122,9 +122,9 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
     quads: &[Quad],
     below_range: Option<std::ops::Range<u64>>,
 ) {
-    let s0 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s0").unwrap());
-    let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
-    let o5 = Term::Literal(Literal::new_simple_literal("o5"));
+    let s0 = iri_subject("s0");
+    let s1 = iri_subject("s1");
+    let o5 = plain_literal("o5");
 
     // "o5" is on s0 at i ≡ 5 (mod 1667) — 3 rows — and once on s1.
     let by_o = matched_view(store, None, None, Some(&o5), None).await;
@@ -164,11 +164,9 @@ async fn test_subject_range_then_index_routing_above_gate() {
     .await;
     run_subject_range_then_index_routing_above_gate(&store, &quads, None).await;
 
-    let o5 = Term::Literal(Literal::new_simple_literal("o5"));
+    let o5 = plain_literal("o5");
     for (subject, rids) in [("s0", 4), ("s1", 0)] {
-        let s = NamedOrBlankNode::NamedNode(
-            NamedNode::new(format!("http://example.org/{subject}")).unwrap(),
-        );
+        let s = iri_subject(subject);
         let before = decoded_rids();
         let matched = matched_view(&store, Some(&s), None, Some(&o5), None).await;
         assert_eq!(decoded_rids() - before, rids, "{subject}");
@@ -199,7 +197,7 @@ fn prefix_quads() -> Vec<Quad> {
                     let g = if gi == 0 {
                         GraphName::DefaultGraph
                     } else {
-                        GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap())
+                        iri_graph("g")
                     };
                     quads.push(make_quad(
                         &format!("http://example.org/s{si:02}"),
@@ -216,10 +214,10 @@ fn prefix_quads() -> Vec<Quad> {
 
 fn prefix_terms() -> (NamedOrBlankNode, NamedNode, Term, GraphName) {
     (
-        NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s01").unwrap()),
-        NamedNode::new("http://example.org/p1").unwrap(),
-        Term::Literal(Literal::new_simple_literal("o1")),
-        GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap()),
+        iri_subject("s01"),
+        iri("p1"),
+        plain_literal("o1"),
+        iri_graph("g"),
     )
 }
 
@@ -270,7 +268,7 @@ async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
         .await;
         expect(by_spo_default, 18..19).await;
         // A run that narrows to nothing: `p1` exists, but not under `s03`.
-        let s03 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
+        let s03 = iri_subject("s03");
         let none = matched_view(&store, Some(&s03), Some(&p), None, None).await;
         assert_eq!(none.size().await.unwrap(), 0);
         assert!(none.quads_vec().await.unwrap().is_empty());
@@ -295,7 +293,7 @@ async fn test_prefix_probe_stops_at_the_first_unbound_role() {
         "o2",
         GraphName::DefaultGraph,
     ));
-    let s04 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s04").unwrap());
+    let s04 = iri_subject("s04");
     for indexes in [vec![], vec![IndexType::SecondaryByReference]] {
         let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
 
@@ -324,7 +322,7 @@ async fn test_prefix_probe_stops_at_the_first_unbound_role() {
 #[tokio::test]
 async fn test_prefix_probe_string_layout_narrows_by_subject_only() {
     let (s, p, o, _) = prefix_terms();
-    let s99 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
+    let s99 = iri_subject("s99");
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let store = built_store(prefix_quads(), layout, vec![]).await;
         let by_s = matched_view(&store, Some(&s), None, None, None).await;
@@ -399,7 +397,7 @@ async fn test_derived_view_does_not_lose_base_rows() {
 
     let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
-    let object = Term::Literal(Literal::new_simple_literal("object 0"));
+    let object = plain_literal("object 0");
     let matched = matched_view(&store, None, None, Some(&object), None).await;
     assert_eq!(matched.size().await.unwrap(), 5);
 
@@ -426,8 +424,8 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
     )
     .await;
     let store = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let p1 = iri("p1");
+    let o2 = plain_literal("o2");
     for _ in 0..2 {
         let (cached, resolved) = probe_hooks::binds();
         let matched = matched_view(&store, None, Some(&p1), Some(&o2), None).await;
@@ -495,7 +493,7 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
         .await;
         expect(&by_spo_default, 18..19);
         // `p1` exists, but not under `s03`: the run narrows to nothing.
-        let s03 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
+        let s03 = iri_subject("s03");
         let none = matched_view(&store, Some(&s03), Some(&p), None, None).await;
         assert_eq!(none.size().await.unwrap(), 0, "{label}");
         assert!(none.quads_vec().await.unwrap().is_empty(), "{label}");

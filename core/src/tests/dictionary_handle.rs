@@ -9,13 +9,12 @@ use oxrdf::{BlankNode, Literal};
 /// plain, language-tagged and typed literals, a named graph beside the
 /// default graph.
 fn mixed_kind_quads() -> Vec<Quad> {
-    let p = |name: &str| NamedNode::new(format!("http://example.org/{name}")).unwrap();
-    let s = |i: usize| NamedOrBlankNode::NamedNode(p(&format!("s{i:02}")));
-    let g = NamedNode::new("http://example.org/g").unwrap();
+    let s = |i: usize| iri_subject(&format!("s{i:02}"));
+    let g = iri("g");
     let mut quads = vec![
         Quad::new(
             s(0),
-            p("name"),
+            iri("name"),
             Term::Literal(Literal::new_language_tagged_literal_unchecked(
                 "hallo", "de",
             )),
@@ -23,25 +22,25 @@ fn mixed_kind_quads() -> Vec<Quad> {
         ),
         Quad::new(
             s(0),
-            p("age"),
+            iri("age"),
             Term::Literal(Literal::new_typed_literal("42", oxrdf::vocab::xsd::INTEGER)),
             GraphName::DefaultGraph,
         ),
         Quad::new(
             s(1),
-            p("name"),
-            Term::Literal(Literal::new_simple_literal("plain \"quoted\" value")),
+            iri("name"),
+            plain_literal("plain \"quoted\" value"),
             GraphName::NamedNode(g.clone()),
         ),
         Quad::new(
             s(1),
-            p("knows"),
+            iri("knows"),
             Term::BlankNode(BlankNode::new("b1").unwrap()),
             GraphName::NamedNode(g),
         ),
         Quad::new(
             NamedOrBlankNode::BlankNode(BlankNode::new("b1").unwrap()),
-            p("age"),
+            iri("age"),
             Term::Literal(Literal::new_typed_literal(
                 "3.5",
                 oxrdf::vocab::xsd::DECIMAL,
@@ -622,8 +621,8 @@ async fn test_dict_reader_file_backed_matches_resident() {
 
     // A served and a scanned view's gathered codes decode through the
     // file-backed handle to the quads the view holds.
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let name = NamedNode::new("http://example.org/name").unwrap();
+    let p0 = iri("p0");
+    let name = iri("name");
     for (tag, view) in [
         (
             "served",

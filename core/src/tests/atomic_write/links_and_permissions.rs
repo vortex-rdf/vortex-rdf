@@ -667,13 +667,12 @@ async fn assert_kept_in_the_tail(
 ) -> VortexRdfStore {
     assert_eq!(appended.tail_len(), 4_200, "the batch is in the tail");
     assert_eq!(appended.size().await.unwrap(), 12 + 4_200);
-    let appended_subject =
-        NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00100").unwrap());
+    let appended_subject = iri_subject("s00100");
     assert_eq!(
         matched_size(&appended, Some(&appended_subject), None, None, None).await,
         1
     );
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let p0 = iri("p0");
     let expected_p0 = modular_quads(12, 3, 4)
         .iter()
         .chain(batch.iter())

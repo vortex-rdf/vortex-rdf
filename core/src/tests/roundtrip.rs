@@ -344,7 +344,7 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
         .await;
         damaged(&path, "index:posg", "o");
         let store = VortexRdfStore::from_file(&path).await.unwrap();
-        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let p1 = iri("p1");
         let served = matched_view(&store, None, Some(&p1), None, None).await;
         assert_eq!(served_component(&served), Some("index:posg"));
         assert_eq!(served.debug_serve_row_range(), Some(4..8));
@@ -414,7 +414,7 @@ fn export_test_quads() -> Vec<Quad> {
     vec![
         Quad::new(
             NamedOrBlankNode::BlankNode(oxrdf::BlankNode::new("b0").unwrap()),
-            NamedNode::new("http://example.org/p").unwrap(),
+            iri("p"),
             Term::Literal(
                 Literal::new_language_tagged_literal("héllo \"quoted\"\nline\\slash", "en")
                     .unwrap(),
@@ -422,13 +422,13 @@ fn export_test_quads() -> Vec<Quad> {
             GraphName::DefaultGraph,
         ),
         Quad::new(
-            NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap()),
-            NamedNode::new("http://example.org/p").unwrap(),
+            iri_subject("s"),
+            iri("p"),
             Term::Literal(Literal::new_typed_literal(
                 "42",
                 NamedNode::new("http://www.w3.org/2001/XMLSchema#integer").unwrap(),
             )),
-            GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap()),
+            iri_graph("g"),
         ),
     ]
 }
@@ -556,7 +556,7 @@ async fn test_export_nquads_fast_path_file_backed() {
 /// which would turn a set comparison into a graph-isomorphism check.
 #[tokio::test]
 async fn test_export_reparses_to_the_same_quads() {
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let g = iri_graph("g");
     let quads = vec![
         make_quad(
             "http://example.org/s1",
@@ -565,18 +565,15 @@ async fn test_export_reparses_to_the_same_quads() {
             GraphName::DefaultGraph,
         ),
         Quad::new(
-            NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s2").unwrap()),
-            NamedNode::new("http://example.org/p").unwrap(),
+            iri_subject("s2"),
+            iri("p"),
             Term::Literal(Literal::new_language_tagged_literal("say \"hi\"@home", "en").unwrap()),
             g.clone(),
         ),
         Quad::new(
-            NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s3").unwrap()),
-            NamedNode::new("http://example.org/p").unwrap(),
-            Term::Literal(Literal::new_typed_literal(
-                "tab\there",
-                NamedNode::new("http://example.org/dt").unwrap(),
-            )),
+            iri_subject("s3"),
+            iri("p"),
+            Term::Literal(Literal::new_typed_literal("tab\there", iri("dt"))),
             g,
         ),
     ];
@@ -634,7 +631,7 @@ impl std::io::Write for FailingWriter {
 /// last graph, with no panic and no partial success.
 #[tokio::test]
 async fn test_export_reports_a_failing_writer_as_its_io_error() {
-    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let g = iri_graph("g");
     let quads = graph_modular_quads(4, 2, 2, 3, &[GraphName::DefaultGraph, g]);
     let store = built_store(quads, LayoutStrategy::Default, vec![]).await;
     for format in [oxrdfio::RdfFormat::TriG, oxrdfio::RdfFormat::NQuads] {
