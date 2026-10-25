@@ -278,40 +278,29 @@ impl QuadsSource {
 
     /// The `limit` rows after skipping `offset` of a run held pending for a
     /// window (`IdsNeed::CountOrWindow`), with the run's width as the base's
-    /// live size, read without the run's other ids: in memory cut, before
-    /// decoding, from a rid column whose rids ascend ([`LazyRowIds::window`]);
-    /// on file read from the window's rows of a located run's rid column
-    /// ([`LazyRowIds::window_async`]). `None` for any other view (an exact
-    /// selection, a run of unknown width or whose rids do not ascend,
-    /// tombstones, a pending file filter), whose window comes from its
-    /// materialized selection.
+    /// live size, read without the run's other ids ([`LazyRowIds::window`]):
+    /// in memory cut, before decoding, from a rid column whose rids ascend;
+    /// on file read from the window's rows of a located run's rid column.
+    /// `None` for any other view (an exact selection, a run of unknown width
+    /// or whose rids do not ascend, tombstones, a pending file filter), whose
+    /// window comes from its materialized selection.
     ///
     /// [`LazyRowIds::window`]: crate::store::indexes::LazyRowIds::window
-    /// [`LazyRowIds::window_async`]: crate::store::indexes::LazyRowIds::window_async
     pub(crate) async fn located_window(
         &self,
         offset: usize,
         limit: usize,
     ) -> Result<Option<(RowSelection, usize)>> {
-        let located = match (&self.selection, &self.deleted, &self.backend) {
-            (ViewSelection::Pending(lazy), None, Backend::InMemory(_)) => match lazy.len_if_known()
-            {
-                Some(live) => lazy.window(offset, limit)?.map(|ids| (ids, live)),
-                None => None,
-            },
-            #[cfg(feature = "file-io")]
-            (ViewSelection::Pending(lazy), None, Backend::File(FileBase { filter: None, .. })) => {
-                match lazy.len_if_known() {
-                    Some(live) => lazy
-                        .window_async(offset, limit)
-                        .await?
-                        .map(|ids| (ids, live)),
-                    None => None,
-                }
-            }
-            _ => None,
+        let (ViewSelection::Pending(lazy), None) = (&self.selection, &self.deleted) else {
+            return Ok(None);
         };
-        Ok(located.map(|(ids, live)| (RowSelection::from_ids(ids), live)))
+        let Some(live) = lazy.len_if_known().filter(|_| !self.has_filter()) else {
+            return Ok(None);
+        };
+        Ok(lazy
+            .window(offset, limit)
+            .await?
+            .map(|ids| (RowSelection::from_ids(ids), live)))
     }
 
     /// This source under `selection`, its reads served by `serve`, over
