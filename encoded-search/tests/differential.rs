@@ -9,13 +9,14 @@
 
 mod common;
 
-use common::session;
+use common::{
+    FOR, canonical_index_bounds, compress_array_with, compress_default, compress_with, session,
+};
 use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, SliceArray};
 use vortex_array::scalar::Scalar;
 use vortex_array::search_sorted::{SearchSorted, SearchSortedSide};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
-use vortex_btrblocks::{BtrBlocksCompressorBuilder, CompressionSessionExt as _, Scheme, SchemeExt};
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 use vortex_sequence::Sequence;
 
@@ -53,46 +54,9 @@ fn ctx() -> ExecutionCtx {
     session().create_execution_ctx()
 }
 
-/// The frame-of-reference scheme; the session's edition refines it to a
-/// single reference.
-static FOR: integer::FoRScheme = integer::FoRScheme::v1();
-
 /// The delta scheme at a zero ratio, which makes the cascade pick Delta
 /// whenever it applies.
 static DELTA: integer::DeltaScheme = integer::DeltaScheme::new(0.0);
-
-/// Compress through exactly `schemes`, with the wire forms the session's
-/// edition allows.
-fn compress_with(schemes: &[&'static dyn Scheme], data: &[u32]) -> ArrayRef {
-    compress_array_with(
-        schemes,
-        PrimitiveArray::from_iter(data.iter().copied()).into_array(),
-    )
-}
-
-/// [`compress_with`] over a canonical array of any unsigned width.
-fn compress_array_with(schemes: &[&'static dyn Scheme], canonical: ArrayRef) -> ArrayRef {
-    let session = session();
-    let stock: Vec<_> = session
-        .compression()
-        .schemes()
-        .iter()
-        .map(|s| s.id())
-        .collect();
-    let mut builder = BtrBlocksCompressorBuilder::from_session(&session).exclude_schemes(stock);
-    for scheme in schemes {
-        builder = builder.with_new_scheme(*scheme);
-    }
-    builder.build().compress(&canonical, &mut ctx()).unwrap()
-}
-
-fn compress_default(data: &[u32]) -> ArrayRef {
-    let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
-    BtrBlocksCompressorBuilder::from_session(&session())
-        .build()
-        .compress(&canonical, &mut ctx())
-        .unwrap()
-}
 
 /// Needle set exercising every boundary of `data`: each distinct value and its
 /// neighbors, domain extremes, and values beyond the array's ptype.
@@ -105,11 +69,6 @@ fn needles_for(data: &[u32]) -> Vec<u64> {
     needles.sort_unstable();
     needles.dedup();
     needles
-}
-
-fn canonical_bounds(data: &[u32], needle: u64) -> (usize, usize) {
-    let range = common::canonical_bounds(data, needle);
-    (range.start as usize, range.end as usize)
 }
 
 /// Sorted 11-row runs whose RunEnd children both land on Sequence.
@@ -207,7 +166,7 @@ fn assert_probe_with_budget(
         let got = probe.bounds(needle);
         assert_eq!(
             got,
-            canonical_bounds(data, needle),
+            canonical_index_bounds(data, needle),
             "canonical oracle, needle {needle}"
         );
         // A generic `search_sorted` call costs orders of magnitude more than
@@ -810,7 +769,7 @@ fn probes_slice_of_piecewise_sorted() {
             let probe = SortedProbe::resolve(arr).unwrap();
             for needle in needles_for(wdata) {
                 let (lo, hi) = probe.bounds_in(window.clone(), needle);
-                let (clo, chi) = canonical_bounds(wdata, needle);
+                let (clo, chi) = canonical_index_bounds(wdata, needle);
                 assert_eq!(
                     (lo - wstart, hi - wstart),
                     (clo, chi),

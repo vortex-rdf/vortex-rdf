@@ -8,54 +8,14 @@
 
 mod common;
 
-use common::session;
+use common::{FOR, canonical_index_bounds, compress_default, compress_with};
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::{ArrayRef, IntoArray};
 use vortex_btrblocks::schemes::integer;
-use vortex_btrblocks::{BtrBlocksCompressorBuilder, CompressionSessionExt as _, Scheme, SchemeExt};
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 
 /// Past `u32::MAX`, so a value narrowed to 32 bits loses its high bits.
 const BASE: u64 = (1 << 32) + 3;
-
-/// The frame-of-reference scheme; the session's edition refines it to a
-/// single reference.
-static FOR: integer::FoRScheme = integer::FoRScheme::v1();
-
-fn compress_with(schemes: &[&'static dyn Scheme], data: &[u64]) -> ArrayRef {
-    let session = session();
-    let stock: Vec<_> = session
-        .compression()
-        .schemes()
-        .iter()
-        .map(|s| s.id())
-        .collect();
-    let mut builder = BtrBlocksCompressorBuilder::from_session(&session).exclude_schemes(stock);
-    for scheme in schemes {
-        builder = builder.with_new_scheme(*scheme);
-    }
-    let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
-    builder
-        .build()
-        .compress(&canonical, &mut session.create_execution_ctx())
-        .unwrap()
-}
-
-fn compress_default(data: &[u64]) -> ArrayRef {
-    let session = session();
-    let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
-    BtrBlocksCompressorBuilder::from_session(&session)
-        .build()
-        .compress(&canonical, &mut session.create_execution_ctx())
-        .unwrap()
-}
-
-/// The half-open run of `needle` in sorted `data`.
-fn canonical_bounds(data: &[u64], needle: u64) -> (usize, usize) {
-    let lo = data.partition_point(|&v| v < needle);
-    let hi = data.partition_point(|&v| v <= needle);
-    (lo, hi.max(lo))
-}
 
 /// Every value and its neighbours, each value's 32-bit truncation, and the
 /// domain edges.
@@ -85,7 +45,7 @@ fn assert_probe(arr: &ArrayRef, data: &[u64], expect_kinds: &[NodeKind]) {
     for needle in needles_for(data) {
         assert_eq!(
             probe.bounds(needle),
-            canonical_bounds(data, needle),
+            canonical_index_bounds(data, needle),
             "needle {needle}"
         );
     }
