@@ -402,6 +402,7 @@ impl PatternCodes {
     /// Seed `term`'s role with `code`, resolved without the rendered term (a
     /// file-backed dictionary's window search), unless the role is cached
     /// already.
+    #[cfg(feature = "file-io")]
     pub(in crate::store::layouts) fn seed(&mut self, term: TermRef<'_>, code: Option<TermCode>) {
         self.roles[term.role().index()].get_or_insert(code);
     }
