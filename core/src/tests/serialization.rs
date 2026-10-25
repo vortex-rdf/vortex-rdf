@@ -281,7 +281,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
         .into_iter()
         .zip(child_chunks)
         .map(|(family, chunks)| {
-            container::NativeComponentWrite::new(
+            component_write(
                 container::StoreComponentDescriptor {
                     name: family.identity().name.into(),
                     role: container::StoreComponentRole::Index,
@@ -295,10 +295,9 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                         .dtype()
                         .clone(),
                 },
-                std::sync::Arc::new(container::BufferedComponentSource::try_new(chunks).unwrap()),
+                chunks,
                 container::default_child_strategy(),
             )
-            .unwrap()
         })
         .collect();
     let bytes = unstamped_store_bytes(quad_chunks, components).await;
@@ -761,20 +760,13 @@ async fn test_open_refuses_code_columns_narrower_than_u64() {
     )
     .await;
     let rows = narrow(&["val", "rid"]);
-    let index = container::NativeComponentWrite::new(
-        container::StoreComponentDescriptor {
-            name: "index:ref-o".into(),
-            role: container::StoreComponentRole::Index,
-            implementation: "secondary-by-reference/o".into(),
-            version: 1,
-            required: false,
-            sorted: true,
-            dtype: rows.dtype().clone(),
-        },
-        std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
-        container::default_child_strategy(),
-    )
-    .unwrap();
+    let index = index_child_write(
+        "index:ref-o",
+        "secondary-by-reference/o",
+        false,
+        true,
+        vec![rows],
+    );
     let index_child = unstamped_store_bytes(
         vec![bare_code_quad_array(&[0])],
         vec![dict.to_write().unwrap(), index],
@@ -827,20 +819,7 @@ async fn test_open_refuses_row_ids_narrower_than_u64() {
         let rows = StructArray::try_new(names.as_slice().into(), arrays, 1, Validity::NonNullable)
             .unwrap()
             .into_array();
-        container::NativeComponentWrite::new(
-            container::StoreComponentDescriptor {
-                name: name.into(),
-                role: container::StoreComponentRole::Index,
-                implementation: slug.into(),
-                version: 1,
-                required: false,
-                sorted: true,
-                dtype: rows.dtype().clone(),
-            },
-            std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
-            container::default_child_strategy(),
-        )
-        .unwrap()
+        index_child_write(name, slug, false, true, vec![rows])
     };
     let code = || Buffer::from_iter([0u64]).into_array();
     let rid = || Buffer::from_iter([0u32]).into_array();
@@ -1275,14 +1254,7 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
                 let descriptor = component.to_write().unwrap().descriptor;
                 let rows = component.rows().unwrap().clone().into_array();
                 let short = rows.slice(0..rows.len() - 1).unwrap();
-                container::NativeComponentWrite::new(
-                    descriptor,
-                    std::sync::Arc::new(
-                        container::BufferedComponentSource::try_new(vec![short]).unwrap(),
-                    ),
-                    container::default_child_strategy(),
-                )
-                .unwrap()
+                component_write(descriptor, vec![short], container::default_child_strategy())
             })
             .collect()
     };

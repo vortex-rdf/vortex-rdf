@@ -779,6 +779,75 @@ async fn unstamped_store_bytes(
     bytes
 }
 
+/// The write of a component holding `chunks` under `descriptor`, laid out
+/// by `strategy`.
+fn component_write(
+    descriptor: crate::io::container::StoreComponentDescriptor,
+    chunks: Vec<vortex_array::ArrayRef>,
+    strategy: std::sync::Arc<dyn vortex_layout::LayoutStrategy>,
+) -> crate::io::container::NativeComponentWrite {
+    use crate::io::container::{BufferedComponentSource, NativeComponentWrite};
+    NativeComponentWrite::new(
+        descriptor,
+        std::sync::Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
+        strategy,
+    )
+    .unwrap()
+}
+
+/// The [`component_write`] of an index child named `name` under the
+/// implementation slug `slug`, holding `chunks`: at version 1, optional
+/// unless `required`, its sort claimed global when `sorted`, of the first
+/// chunk's dtype and laid out by the default child strategy.
+fn index_child_write(
+    name: &str,
+    slug: &str,
+    required: bool,
+    sorted: bool,
+    chunks: Vec<vortex_array::ArrayRef>,
+) -> crate::io::container::NativeComponentWrite {
+    use crate::io::container::{self, StoreComponentDescriptor, StoreComponentRole};
+    let dtype = chunks[0].dtype().clone();
+    component_write(
+        StoreComponentDescriptor {
+            name: name.into(),
+            role: StoreComponentRole::Index,
+            implementation: slug.into(),
+            version: 1,
+            required,
+            sorted,
+            dtype,
+        },
+        chunks,
+        container::default_child_strategy(),
+    )
+}
+
+/// The [`component_write`] of `dict`'s child chunks as the dictionary
+/// component, its descriptor at `version`, laid out by `strategy`.
+fn dict_child_write(
+    dict: &crate::store::layouts::dictionary::TermDictionary,
+    version: u32,
+    strategy: std::sync::Arc<dyn vortex_layout::LayoutStrategy>,
+) -> crate::io::container::NativeComponentWrite {
+    use crate::io::container::{self, StoreComponentDescriptor, StoreComponentRole};
+    let chunks = dict.child_chunks().unwrap();
+    let dtype = chunks[0].dtype().clone();
+    component_write(
+        StoreComponentDescriptor {
+            name: container::DICT_COMPONENT_NAME.into(),
+            role: StoreComponentRole::Dictionary,
+            implementation: container::DICT_IMPLEMENTATION.into(),
+            version,
+            required: true,
+            sorted: true,
+            dtype,
+        },
+        chunks,
+        strategy,
+    )
+}
+
 /// A component of the shape a future change set could write: an optional
 /// (unless `required`) index child named `name` under the implementation slug
 /// `slug`, holding three bare code rows.
@@ -787,22 +856,13 @@ fn unknown_component(
     slug: &str,
     required: bool,
 ) -> crate::io::container::NativeComponentWrite {
-    use crate::io::container;
-    let rows = bare_code_quad_array(&[1, 2, 3]);
-    container::NativeComponentWrite::new(
-        container::StoreComponentDescriptor {
-            name: name.into(),
-            role: container::StoreComponentRole::Index,
-            implementation: slug.into(),
-            version: 1,
-            required,
-            sorted: false,
-            dtype: rows.dtype().clone(),
-        },
-        std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
-        container::default_child_strategy(),
+    index_child_write(
+        name,
+        slug,
+        required,
+        false,
+        vec![bare_code_quad_array(&[1, 2, 3])],
     )
-    .unwrap()
 }
 
 /// A minimal native Dictionary-layout file: a one-row zero-code quad child
@@ -826,26 +886,9 @@ pub(crate) async fn write_dict_only_store_as(
     version: u32,
     zoned: bool,
 ) -> Vec<u8> {
-    use crate::io::container::{
-        self, BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
-        StoreComponentRole,
-    };
-    let chunks = dict.child_chunks().unwrap();
-    let dtype = chunks[0].dtype().clone();
-    let component = NativeComponentWrite::new(
-        StoreComponentDescriptor {
-            name: container::DICT_COMPONENT_NAME.into(),
-            role: StoreComponentRole::Dictionary,
-            implementation: container::DICT_IMPLEMENTATION.into(),
-            version,
-            required: true,
-            sorted: true,
-            dtype,
-        },
-        std::sync::Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
-        container::dict_child_strategy(zoned.then(|| dict.uniform_window()).flatten()),
-    )
-    .unwrap();
+    let strategy =
+        crate::io::container::dict_child_strategy(zoned.then(|| dict.uniform_window()).flatten());
+    let component = dict_child_write(dict, version, strategy);
     unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![component]).await
 }
 

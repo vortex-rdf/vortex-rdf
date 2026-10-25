@@ -532,10 +532,6 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
 /// resident instead, answering every pattern exactly.
 #[tokio::test]
 async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
-    use crate::io::container::{
-        BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
-    };
-    use std::sync::Arc;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 
     let quads = dictionary_test_quads();
@@ -550,23 +546,12 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
         .dict
         .clone()
         .expect("a Dictionary build carries its dictionary");
-    let chunks = dict.child_chunks().unwrap();
-    let dtype = chunks[0].dtype().clone();
     // The dictionary component written as a single flat leaf.
-    let flat = NativeComponentWrite::new(
-        StoreComponentDescriptor {
-            name: DICT_COMPONENT_NAME.into(),
-            role: StoreComponentRole::Dictionary,
-            implementation: container::DICT_IMPLEMENTATION.into(),
-            version: container::DICT_VERSION,
-            required: true,
-            sorted: true,
-            dtype,
-        },
-        Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
-        Arc::new(FlatLayoutStrategy::default()),
-    )
-    .unwrap();
+    let flat = dict_child_write(
+        &dict,
+        container::DICT_VERSION,
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
+    );
     let mut bytes: Vec<u8> = Vec::new();
     container::write_store(
         &crate::session::VORTEX_SESSION,
@@ -841,11 +826,7 @@ async fn test_unzoned_dictionary_child_opens_mapped() {
 /// window bounds read from the leaves themselves.
 #[tokio::test]
 async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
-    use crate::io::container::{
-        BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
-    };
     use crate::store::layouts::dictionary::TermDictionary;
-    use std::sync::Arc;
 
     let terms: Vec<String> = (0..20_000)
         .map(|i| format!("\"object value {i:06}\""))
@@ -854,23 +835,7 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
         vortex_array::arrays::VarBinViewArray::from_iter_str(terms.iter().map(String::as_str)),
     )
     .unwrap();
-    let chunks = dict.child_chunks().unwrap();
-    let dtype = chunks[0].dtype().clone();
-    let unzoned = NativeComponentWrite::new(
-        StoreComponentDescriptor {
-            name: DICT_COMPONENT_NAME.into(),
-            role: StoreComponentRole::Dictionary,
-            implementation: container::DICT_IMPLEMENTATION.into(),
-            version: container::DICT_VERSION,
-            required: true,
-            sorted: true,
-            dtype,
-        },
-        Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
-        container::dict_child_strategy(None),
-    )
-    .unwrap();
-    let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![unzoned]).await;
+    let bytes = write_dict_only_store_as(&dict, container::DICT_VERSION, false).await;
     let (_dir, path) = temp_store_file(&bytes);
     let native = crate::tests::open_mapped(&path).await;
     assert!(!dict_term_column(&native).is::<Zoned>());
