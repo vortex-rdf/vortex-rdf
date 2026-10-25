@@ -48,39 +48,59 @@ fn masks_quads() -> Vec<Quad> {
         .collect()
 }
 
-/// The probes of [`masks_quads`], each beside its tag and the read its masks
-/// choose: the object (two rows a split) and the predicate with `"o0"` (about
-/// five a split) point by point, the predicate (32 a split) by a take, and
-/// the graph (half the rows) by projecting each split at its mask.
-fn masks_probes() -> Vec<(
-    &'static str,
-    Probe,
-    crate::store::scan::read_plan::MaskedRead,
-)> {
+/// A probe of [`masks_quads`], beside what the file makes of it.
+struct MasksProbe {
+    /// Its name in failure messages.
+    shape: &'static str,
+    probe: Probe,
+    /// The read its masks choose.
+    read: crate::store::scan::read_plan::MaskedRead,
+    /// Its masks are smaller than its ids (a bit a row of each split a mask
+    /// keeps some rows of, against 64 a match), so a window that cuts none of
+    /// its rows keeps them.
+    dense: bool,
+    /// How many of [`masks_tail`]'s twelve rows it matches.
+    tail_rows: usize,
+}
+
+/// The probes of [`masks_quads`], each beside the read its masks choose: the
+/// object (two rows a split) and the predicate with `"o0"` (about five a
+/// split) point by point, the predicate (32 a split) by a take, and the graph
+/// (half the rows) by projecting each split at its mask. The predicate and
+/// the graph are the dense ones.
+fn masks_probes() -> Vec<MasksProbe> {
     use crate::store::scan::read_plan::MaskedRead;
     let pm = iri("pm");
     let gd = iri_graph("gd");
     vec![
-        (
-            "O",
-            Probe::new(None, None, Some(plain_literal("sparse")), None),
-            MaskedRead::Points,
-        ),
-        (
-            "PO",
-            Probe::new(None, Some(pm.clone()), Some(plain_literal("o0")), None),
-            MaskedRead::Points,
-        ),
-        (
-            "P",
-            Probe::new(None, Some(pm), None, None),
-            MaskedRead::Take,
-        ),
-        (
-            "G",
-            Probe::new(None, None, None, Some(gd)),
-            MaskedRead::Project,
-        ),
+        MasksProbe {
+            shape: "O",
+            probe: Probe::new(None, None, Some(plain_literal("sparse")), None),
+            read: MaskedRead::Points,
+            dense: false,
+            tail_rows: 6,
+        },
+        MasksProbe {
+            shape: "PO",
+            probe: Probe::new(None, Some(pm.clone()), Some(plain_literal("o0")), None),
+            read: MaskedRead::Points,
+            dense: false,
+            tail_rows: 6,
+        },
+        MasksProbe {
+            shape: "P",
+            probe: Probe::new(None, Some(pm), None, None),
+            read: MaskedRead::Take,
+            dense: true,
+            tail_rows: 12,
+        },
+        MasksProbe {
+            shape: "G",
+            probe: Probe::new(None, None, None, Some(gd)),
+            read: MaskedRead::Project,
+            dense: true,
+            tail_rows: 12,
+        },
     ]
 }
 
@@ -117,7 +137,8 @@ async fn masks_file_with(flat_dictionary: bool) -> (tempfile::TempDir, std::path
 
 /// Twelve quads to append into a tail, each with the predicate `pm` and the
 /// graph `gd`, and the object `"sparse"` and `"o0"` by turns: of the
-/// [`masks_probes`] patterns, `P` and `G` match all twelve, `O` and `PO` half.
+/// [`masks_probes`] patterns, `P` and `G` match all twelve, `O` and `PO` half
+/// (each probe's `tail_rows`).
 fn masks_tail() -> Vec<Quad> {
     let gd = iri_graph("gd");
     (0..12)

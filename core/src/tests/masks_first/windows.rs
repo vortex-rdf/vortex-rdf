@@ -23,7 +23,7 @@ async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let tombstoned = masks_deleted(&store).await;
     for (variant, store) in [("as written", &store), ("tombstoned", &tombstoned)] {
-        for (shape, probe, _) in masks_probes() {
+        for MasksProbe { shape, probe, .. } in masks_probes() {
             let label = format!("{variant} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
             let rows = row_list(&plain).await;
@@ -53,7 +53,7 @@ async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
         }
     }
     let tailed = store.add_quads(masks_tail()).await.unwrap();
-    for (shape, probe, _) in masks_probes() {
+    for MasksProbe { shape, probe, .. } in masks_probes() {
         let label = format!("tailed {shape}");
         let quads = tailed
             .run_probe(&probe)
@@ -135,10 +135,8 @@ async fn test_window_over_a_column_without_chunk_probes_keeps_ids() {
     let twin = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     assert_eq!(store.debug_quad_column_chunks("o"), None, "o: no probes");
     assert!(store.debug_quad_column_chunks("p").is_some(), "p: probes");
-    let dense = masks_probes()
-        .into_iter()
-        .filter(|(shape, ..)| matches!(*shape, "P" | "G"));
-    for (shape, probe, _) in dense {
+    let dense = masks_probes().into_iter().filter(|p| p.dense);
+    for MasksProbe { shape, probe, .. } in dense {
         let plain = store.run_probe(&probe).await.unwrap();
         assert!(
             plain.view_statistics().unwrap().pending_filter,
@@ -174,7 +172,13 @@ async fn test_window_keeps_masks_only_when_smaller_than_ids() {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let tailed = store.add_quads(masks_tail()).await.unwrap();
     for (variant, store) in [("plain", &store), ("tailed", &tailed)] {
-        for (shape, probe, _) in masks_probes() {
+        for MasksProbe {
+            shape,
+            probe,
+            dense,
+            ..
+        } in masks_probes()
+        {
             let label = format!("{variant} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
             let want = read_rows(&plain).await;
@@ -184,7 +188,6 @@ async fn test_window_keeps_masks_only_when_smaller_than_ids() {
                 .run_probe(&probe.clone().window(0, Some(n + 1)))
                 .await
                 .unwrap();
-            let dense = matches!(shape, "P" | "G");
             assert_eq!(
                 windowed.debug_evaluated_len(),
                 dense.then_some(n - tail),
@@ -217,10 +220,8 @@ async fn test_kept_masks_never_outlive_a_derivation() {
     let o5 = dict.encode("\"o5\"").await.unwrap().unwrap();
     let (s_lo, s_hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
     let o0_term = plain_literal("o0");
-    let dense = masks_probes()
-        .into_iter()
-        .filter(|(shape, ..)| matches!(*shape, "P" | "G"));
-    for (shape, probe, _) in dense {
+    let dense = masks_probes().into_iter().filter(|p| p.dense);
+    for MasksProbe { shape, probe, .. } in dense {
         let n = store.run_probe(&probe).await.unwrap().size().await.unwrap();
         let windowed = probe.clone().window(0, Some(n + 1));
         let view = store.run_probe(&windowed).await.unwrap();
@@ -443,10 +444,11 @@ async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
 
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let dense = masks_probes()
-        .into_iter()
-        .filter(|(shape, ..)| matches!(*shape, "P" | "G"));
-    for (shape, probe, read) in dense {
+    let dense = masks_probes().into_iter().filter(|p| p.dense);
+    for MasksProbe {
+        shape, probe, read, ..
+    } in dense
+    {
         let plain = store.run_probe(&probe).await.unwrap();
         let (codes, _) = collect_code_chunks(&plain, &QuadColumn::ALL, 4_096).await;
         let quads: Vec<Quad> = plain.quads().try_collect().await.unwrap();
@@ -492,8 +494,8 @@ async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let shapes = masks_probes()
         .into_iter()
-        .filter(|(shape, ..)| matches!(*shape, "O" | "PO" | "P"));
-    for (shape, probe, _) in shapes {
+        .filter(|p| matches!(p.shape, "O" | "PO" | "P"));
+    for MasksProbe { shape, probe, .. } in shapes {
         let plain = store.run_probe(&probe).await.unwrap();
         assert!(plain.debug_reads_masks_first(), "{shape}: masks first");
         let stats = plain.view_statistics().unwrap();

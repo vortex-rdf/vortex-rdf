@@ -582,29 +582,75 @@ async fn window_stores() -> Vec<FixtureStore> {
     stores
 }
 
-/// The probes the window rules are checked with, each beside its shape: `P`,
-/// `PO` and `O`, which the copy index serves and the reference index
-/// resolves to a run; the located subject runs `S` and `SP`; and `SPG`, a
-/// located `(s, p)` run whose graph is left to a filter, pending on file.
-fn window_probes() -> Vec<(&'static str, Probe)> {
+/// A probe the window rules are checked with, beside what the fixture's
+/// stores make of it.
+struct WindowProbe {
+    /// Its name in failure messages.
+    shape: &'static str,
+    probe: Probe,
+    /// It binds no subject: the copy index serves it, the reference index
+    /// resolves it to a run, and a no-index file leaves it a filter of code
+    /// equalities.
+    index_eligible: bool,
+    /// It binds the predicate and the object: the reference index resolves
+    /// the object to a run and leaves the predicate a filter beside it.
+    predicate_and_object: bool,
+    /// It matches more rows than a point read takes: on a mapped file the
+    /// copy index's served run of it keeps its ids unread, where a
+    /// point-sized run's are read at the match.
+    wide: bool,
+    /// Its graph is left to a filter beside a located `(s, p)` run, pending
+    /// on file.
+    filtered_graph: bool,
+}
+
+/// The probes the window rules are checked with: `P`, `PO` and `O`, which
+/// the copy index serves and the reference index resolves to a run; the
+/// located subject runs `S` and `SP`; and `SPG`, a located `(s, p)` run
+/// whose graph is left to a filter, pending on file.
+fn window_probes() -> Vec<WindowProbe> {
     // The fixture's row 42: `s0042 p2 "o0"` in the default graph.
     let s = subject_node(42, 4);
     let p1 = iri("p1");
     let p2 = iri("p2");
     let o3 = plain_literal("o3");
+    // A probe with every flag unset; each entry below sets its own.
+    let named = |shape, probe| WindowProbe {
+        shape,
+        probe,
+        index_eligible: false,
+        predicate_and_object: false,
+        wide: false,
+        filtered_graph: false,
+    };
     vec![
-        ("P", Probe::new(None, Some(p1.clone()), None, None)),
-        ("PO", Probe::new(None, Some(p1), Some(o3.clone()), None)),
-        ("O", Probe::new(None, None, Some(o3), None)),
-        ("S", Probe::new(Some(s.clone()), None, None, None)),
-        (
+        WindowProbe {
+            index_eligible: true,
+            wide: true,
+            ..named("P", Probe::new(None, Some(p1.clone()), None, None))
+        },
+        WindowProbe {
+            index_eligible: true,
+            predicate_and_object: true,
+            ..named("PO", Probe::new(None, Some(p1), Some(o3.clone()), None))
+        },
+        WindowProbe {
+            index_eligible: true,
+            wide: true,
+            ..named("O", Probe::new(None, None, Some(o3), None))
+        },
+        named("S", Probe::new(Some(s.clone()), None, None, None)),
+        named(
             "SP",
             Probe::new(Some(s.clone()), Some(p2.clone()), None, None),
         ),
-        (
-            "SPG",
-            Probe::new(Some(s), Some(p2), None, Some(GraphName::DefaultGraph)),
-        ),
+        WindowProbe {
+            filtered_graph: true,
+            ..named(
+                "SPG",
+                Probe::new(Some(s), Some(p2), None, Some(GraphName::DefaultGraph)),
+            )
+        },
     ]
 }
 
@@ -621,7 +667,15 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
     let stores = window_stores().await;
     for fixture in &stores {
         let (tag, store) = (fixture.tag(), &fixture.store);
-        for (shape, probe) in window_probes() {
+        for WindowProbe {
+            shape,
+            probe,
+            index_eligible,
+            predicate_and_object,
+            filtered_graph,
+            ..
+        } in window_probes()
+        {
             let label = format!("{tag} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
             let n = plain.size().await.unwrap();
@@ -637,16 +691,16 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
             // index leaves beside the object's run.
             assert_eq!(
                 stats.served_component.is_some(),
-                fixture.index == IndexConfig::Copy && matches!(shape, "P" | "PO" | "O"),
+                fixture.index == IndexConfig::Copy && index_eligible,
                 "{label}: served"
             );
-            if shape == "SPG" && stats.file_backed {
+            if filtered_graph && stats.file_backed {
                 assert!(stats.pending_filter, "{label}: the graph's filter");
             }
             let masks_first = plain.debug_reads_masks_first();
             let expected = match (fixture.index, fixture.mapped()) {
-                (IndexConfig::NoIndex, true) => matches!(shape, "P" | "PO" | "O"),
-                (IndexConfig::Reference, true) => shape == "PO",
+                (IndexConfig::NoIndex, true) => index_eligible,
+                (IndexConfig::Reference, true) => predicate_and_object,
                 _ => false,
             };
             assert_eq!(
@@ -697,7 +751,7 @@ async fn test_window_that_cuts_keeps_base_order() {
     let mut served = 0;
     for fixture in &stores {
         let (tag, store) = (fixture.tag(), &fixture.store);
-        for (shape, probe) in window_probes() {
+        for WindowProbe { shape, probe, .. } in window_probes() {
             let label = format!("{tag} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
             let n = plain.size().await.unwrap();
@@ -776,7 +830,14 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
             .add_quads(appended.clone())
             .await
             .unwrap();
-        for (shape, probe) in window_probes() {
+        for WindowProbe {
+            shape,
+            probe,
+            index_eligible,
+            wide,
+            ..
+        } in window_probes()
+        {
             let label = format!("{tag} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
             // Taken before any read, as a fresh match knows itself.
@@ -785,15 +846,11 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
             let n = rows.len();
             assert_eq!(plain.size().await.unwrap(), n, "{label}");
             assert!(stats.tombstones > 0, "{label}");
-            let tail_rows = if matches!(shape, "P" | "PO" | "O") {
-                20
-            } else {
-                3
-            };
+            let tail_rows = if index_eligible { 20 } else { 3 };
             assert_eq!(stats.tail_rows, tail_rows, "{label}");
             assert_eq!(
                 stats.served_component.is_some(),
-                fixture.index == IndexConfig::Copy && matches!(shape, "P" | "PO" | "O"),
+                fixture.index == IndexConfig::Copy && index_eligible,
                 "{label}: served"
             );
             let bound = stats.rows.upper_bound;
@@ -801,8 +858,7 @@ async fn test_window_that_cannot_cut_spans_tombstones_and_tail() {
             if !stats.file_backed {
                 assert_eq!(stats.rows.exact, Some(n), "{label}: the live rows");
             }
-            if fixture.index == IndexConfig::Copy && fixture.mapped() && matches!(shape, "P" | "O")
-            {
+            if fixture.index == IndexConfig::Copy && fixture.mapped() && wide {
                 assert_eq!(stats.rows.exact, None, "{label}: the run's ids unread");
                 assert!(bound > n, "{label}: the run's width");
                 // The size above read the run's ids into the view: its live
@@ -943,7 +999,13 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
     let stores = window_stores().await;
     for fixture in stores.iter().filter(|f| f.index != IndexConfig::Reference) {
         let (tag, store) = (fixture.tag(), &fixture.store);
-        for (shape, probe) in window_probes() {
+        for WindowProbe {
+            shape,
+            probe,
+            index_eligible,
+            ..
+        } in window_probes()
+        {
             let label = format!("{tag} {shape}");
             let plain = store.run_probe(&probe).await.unwrap();
             let stats = plain.view_statistics().unwrap();
@@ -952,9 +1014,7 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
             let masks_first = plain.debug_reads_masks_first();
             assert_eq!(
                 masks_first,
-                fixture.index == IndexConfig::NoIndex
-                    && fixture.mapped()
-                    && matches!(shape, "P" | "PO" | "O"),
+                fixture.index == IndexConfig::NoIndex && fixture.mapped() && index_eligible,
                 "{label}: read by the filter's masks first"
             );
             for limit in [bound, bound + 1, usize::MAX] {

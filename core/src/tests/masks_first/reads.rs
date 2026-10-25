@@ -27,7 +27,10 @@ fn one_masked_read(read: crate::store::scan::read_plan::MaskedRead) -> [usize; 3
 /// `memory`'s view.
 async fn assert_masks_first_reads(file: &VortexRdfStore, memory: &VortexRdfStore, tag: &str) {
     use crate::store::scan::read_plan::masked_read_hooks;
-    for (shape, probe, read) in masks_probes() {
+    for MasksProbe {
+        shape, probe, read, ..
+    } in masks_probes()
+    {
         let label = format!("{tag} {shape}");
         let view = file.run_probe(&probe).await.unwrap();
         assert!(
@@ -177,7 +180,10 @@ async fn test_masks_first_reads_a_selection_clamped_inside_splits() {
             .any(|split| split.start < row && row < split.end)
     };
     assert!(inside(1_500) && inside(13_500), "{splits:?}");
-    for (shape, probe, read) in masks_probes() {
+    for MasksProbe {
+        shape, probe, read, ..
+    } in masks_probes()
+    {
         let label = format!("subject range {shape}");
         let view = file
             .run_probe(&probe)
@@ -265,11 +271,17 @@ async fn test_quads_vec_over_a_filtered_file_matches_quads() {
         let tailed = store.add_quads(masks_tail()).await.unwrap();
         for forced in [None, Some(0)] {
             let _limit = forced.map(driver_hooks::ForcedLimit::set);
-            for (shape, probe, read) in masks_probes() {
+            for MasksProbe {
+                shape,
+                probe,
+                read,
+                tail_rows,
+                ..
+            } in masks_probes()
+            {
                 let label = format!("{dictionary} {shape} limit {forced:?}");
                 let view = tailed.run_probe(&probe).await.unwrap();
                 let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
-                let tail_rows = if matches!(shape, "P" | "G") { 12 } else { 6 };
                 assert!(
                     streamed[streamed.len() - tail_rows..].iter().all(|q| q
                         .subject
@@ -304,7 +316,10 @@ async fn test_quads_vec_over_a_filtered_file_matches_quads() {
             }
         }
         // A bare executor on a plain thread: no runtime to spawn onto.
-        for (shape, probe, read) in masks_probes() {
+        for MasksProbe {
+            shape, probe, read, ..
+        } in masks_probes()
+        {
             if read == MaskedRead::Points {
                 continue;
             }
@@ -352,7 +367,7 @@ async fn test_plain_and_unbound_limit_reads_return_the_same_rows() {
         ),
     ];
     for (variant, mapped, loaded) in &variants {
-        for (shape, probe, _) in masks_probes() {
+        for MasksProbe { shape, probe, .. } in masks_probes() {
             let want = read_rows(&loaded.run_probe(&probe).await.unwrap()).await;
             for (open, store) in [("mapped", mapped), ("loaded", loaded)] {
                 let label = format!("{variant} {open} {shape}");
@@ -384,7 +399,7 @@ async fn test_plain_and_unbound_limit_reads_return_the_same_rows() {
 async fn test_window_that_cuts_a_filter_keeps_base_order() {
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    for (shape, probe, _) in masks_probes() {
+    for MasksProbe { shape, probe, .. } in masks_probes() {
         let rows = row_list(&store.run_probe(&probe).await.unwrap()).await;
         let n = rows.len();
         for limit in [1, n / 2, n - 1] {
@@ -477,7 +492,10 @@ async fn test_masks_driver_follows_the_row_scan_rule() {
 
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    for (shape, probe, read) in masks_probes() {
+    for MasksProbe {
+        shape, probe, read, ..
+    } in masks_probes()
+    {
         let view = store.run_probe(&probe).await.unwrap();
         let mut answers = Vec::new();
         for limit in [MASKS_SPLITS - 1, MASKS_SPLITS, 0] {
