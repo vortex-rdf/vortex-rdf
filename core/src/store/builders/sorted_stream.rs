@@ -69,21 +69,6 @@ impl VortexArrayBuilder for SortedStreamBuilder {
     }
 }
 
-impl SortedStreamBuilder {
-    /// The dataset as a lazy chunk stream for the file writer. After the
-    /// (blocking) run-sort phase, merged chunks are built on demand as the
-    /// writer polls. `spill` places the runs as [`build_chunk_stream`]'s does.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-        layout: LayoutStrategy,
-        indexes: Indexes,
-        spill: Option<(&OsStr, &Path)>,
-    ) -> Result<BuiltStream> {
-        build_chunk_stream(quad_stream, layout, indexes, BuildSizes::DEFAULT, spill).await
-    }
-}
-
 /// The chunk stream materialized into one array, its `s` column stamped
 /// sorted (every chunk is a window of the global merge, and assembling chunks
 /// loses the per-chunk stats `match_pattern` gates its binary searches on),

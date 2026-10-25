@@ -1,9 +1,10 @@
 //! The write side of the native store container: the driver that writes a
 //! [`BuiltStream`] (a builder's, or a store's parts) through
 //! [`write_store`](crate::io::container::write_store), carrying each part's
-//! sortedness provenance onto the descriptors a reader trusts; and the
-//! `quads_stream_to_*` entry points, the file one through [`PendingStore`],
-//! the one way a store reaches a path on disk.
+//! sortedness provenance onto the descriptors a reader trusts; the
+//! `quads_stream_to_*` entry points; and [`write_sorted_store`], the sorted
+//! build into a file that the file writer and a compaction share, through
+//! [`PendingStore`], the one way a store reaches a path on disk.
 
 use crate::error::{Result, VortexRdfError};
 
@@ -17,7 +18,7 @@ use crate::debug;
 #[cfg(feature = "file-io")]
 use crate::io::pending::PendingStore;
 #[cfg(feature = "file-io")]
-use crate::store::builders::SortedStreamBuilder;
+use crate::store::builders::{BuildSizes, sorted_stream::build_chunk_stream};
 #[cfg(feature = "file-io")]
 use crate::store::{Indexes, LayoutStrategy, RawQuad};
 #[cfg(feature = "file-io")]
@@ -39,6 +40,7 @@ use futures::Stream;
 /// builder interns and compares the spelling it is given, so a hand-built
 /// `RawQuad` in another spelling of the same terms is a different quad.
 ///
+/// [`SortedStreamBuilder`]: crate::SortedStreamBuilder
 /// [`parse_quads_from_reader`]: crate::common::terms::parse_quads_from_reader
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_writer<S, W>(
@@ -55,7 +57,7 @@ where
     let start = debug::timer();
 
     let built =
-        SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes, None).await?;
+        build_chunk_stream(Box::new(quads), layout, indexes, BuildSizes::DEFAULT, None).await?;
     built_stream_to_vortex_writer(built, writer).await?;
 
     log::debug!(
@@ -146,22 +148,40 @@ where
     // The build spills beside the temp file, and an input that fails leaves
     // nothing behind: the run directory and the empty temp file go too.
     let pending = PendingStore::create(path).await?;
-    let built = SortedStreamBuilder::build_vortex_stream(
-        Box::new(quads),
-        layout,
-        indexes,
-        pending.spill_site(),
-    )
-    .await?;
-    pending
-        .write(|writer| built_stream_to_vortex_writer(built, writer))
-        .await?;
+    write_sorted_store(pending, Box::new(quads), layout, indexes).await?;
 
     log::debug!(
         "[write::quads_stream_to_vortex_file] Streaming write took {:?}",
         debug::elapsed(start)
     );
     Ok(())
+}
+
+/// Build `quads` through the out-of-core global sort and write the store
+/// into `pending`, renamed into place once complete: the one path of a sorted
+/// build into a file, which [`quads_stream_to_vortex_file`] and a file-backed
+/// store's compaction share. The sort spills its runs at the pending store's
+/// [`spill_site`](PendingStore::spill_site), beside the file it replaces
+/// (`VORTEX_RDF_SPILL_DIR` outranks that). The caller creates `pending` before
+/// it reads any input, so a path that cannot take a store is refused first.
+#[cfg(feature = "file-io")]
+pub(crate) async fn write_sorted_store(
+    pending: PendingStore,
+    quads: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+) -> Result<()> {
+    let built = build_chunk_stream(
+        quads,
+        layout,
+        indexes,
+        BuildSizes::DEFAULT,
+        pending.spill_site(),
+    )
+    .await?;
+    pending
+        .write(|writer| built_stream_to_vortex_writer(built, writer))
+        .await
 }
 
 /// Refuse a store write while Vortex's experimental patched-array switch is

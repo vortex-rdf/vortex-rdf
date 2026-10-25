@@ -98,13 +98,13 @@ impl VortexRdfStore {
         Ok(raws)
     }
 
-    /// Write this view's compacted rows over `path` through the streaming
-    /// builder and reopen the file, so a file-backed store stays file-backed.
-    /// The rows go to a temporary sibling file renamed over `path`
-    /// ([`PendingStore`], which writes every store file): never written in
-    /// place, atomic against a process crash but not durable against power
-    /// loss (nothing is `fsync`ed first), and `path` untouched on any failure
-    /// before the rename.
+    /// Write this view's compacted rows over `path` through the out-of-core
+    /// build into a file ([`write_sorted_store`]) and reopen the file, so a
+    /// file-backed store stays file-backed. The rows go to a temporary
+    /// sibling file renamed over `path` ([`PendingStore`], which writes every
+    /// store file): never written in place, atomic against a process crash
+    /// but not durable against power loss (nothing is `fsync`ed first), and
+    /// `path` untouched on any failure before the rename.
     ///
     /// The writer is prepared *first*: a source file the process cannot
     /// write, a directory at the path, or a directory that takes no new file
@@ -113,6 +113,7 @@ impl VortexRdfStore {
     /// few stats and one failed open.
     ///
     /// [`PendingStore`]: crate::io::pending::PendingStore
+    /// [`write_sorted_store`]: crate::io::write::write_sorted_store
     #[cfg(feature = "file-io")]
     async fn stream_compacted_to_file(
         &self,
@@ -123,22 +124,13 @@ impl VortexRdfStore {
         let pending = crate::io::pending::PendingStore::create_over(path, opened).await?;
         let raws = self.sorted_live_raw_quads().await?;
         let stream = futures::stream::iter(raws.into_iter().map(Ok::<_, VortexRdfError>));
-        // The merge runs can reach dataset size: they go in the directory of
-        // the writer's temp file, beside the file being replaced with links
-        // followed (not `path`'s directory, as a store opened through a link
-        // may live elsewhere), the volume the finished store is renamed
-        // within. `VORTEX_RDF_SPILL_DIR` still outranks that.
-        let built = crate::store::builders::sorted_stream::build_chunk_stream(
+        crate::io::write::write_sorted_store(
+            pending,
             Box::new(stream),
             self.layout.strategy(),
             indexes,
-            crate::store::builders::BuildSizes::DEFAULT,
-            pending.spill_site(),
         )
         .await?;
-        pending
-            .write(|writer| crate::io::write::built_stream_to_vortex_writer(built, writer))
-            .await?;
         // Reopen mapped. This store's old mapping keeps the replaced file's
         // pages until it drops; Windows refuses the rename above while that
         // mapping lives, and compaction then fails with the I/O error.
