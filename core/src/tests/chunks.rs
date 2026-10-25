@@ -312,10 +312,7 @@ async fn test_chunks_in_memory_match_gathered() {
     )
     .await;
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let served = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let served = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(
         served_component(&served),
         Some("index:posg"),
@@ -629,10 +626,7 @@ async fn test_chunks_choose_a_file_read_once() {
     let runs = VortexRdfStore::from_file(&runs_path).await.unwrap();
     let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
     let plain = Term::Literal(Literal::new_simple_literal("plain"));
-    let point_run = runs
-        .match_pattern(Some(&s), None, Some(&plain), None)
-        .await
-        .unwrap();
+    let point_run = matched_view(&runs, Some(&s), None, Some(&plain), None).await;
 
     // (view, taken by id, scanned)
     let reads = [
@@ -689,19 +683,13 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
     let views = [
         (
             "<s> ?p \"plain\"",
-            store
-                .match_pattern(Some(&s), None, Some(&plain), None)
-                .await
-                .unwrap(),
+            matched_view(&store, Some(&s), None, Some(&plain), None).await,
             QuadColumn::P,
             1,
         ),
         (
             "GRAPH <g> { <s> <p2> ?o }",
-            store
-                .match_pattern(Some(&s), Some(&p2), None, Some(&g))
-                .await
-                .unwrap(),
+            matched_view(&store, Some(&s), Some(&p2), None, Some(&g)).await,
             QuadColumn::O,
             2,
         ),
@@ -738,10 +726,7 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     // A pending filter: both exports scan the file.
-    let view = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let view = matched_view(&store, None, Some(&p1), None, None).await;
     let expected = base_ordered_codes(&view).await;
     assert_eq!(expected.len(), 600);
 
@@ -926,10 +911,7 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let view = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let view = matched_view(&store, None, Some(&p0), None, None).await;
     assert!(view.view_statistics().unwrap().pending_filter);
     let n = view.size().await.unwrap();
     let window = 4 * available_parallelism();

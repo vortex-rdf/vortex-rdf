@@ -9,17 +9,6 @@ use vortex_layout::layouts::zoned::Zoned;
 
 // ─── File-backed dictionary ────────────────────────────────────────────
 
-/// Sorted string forms of a pattern match on `store`.
-async fn matched_strings(
-    store: &VortexRdfStore,
-    s: Option<&NamedOrBlankNode>,
-    p: Option<&NamedNode>,
-    o: Option<&Term>,
-    g: Option<&GraphName>,
-) -> Vec<String> {
-    view_strings(&store.match_pattern(s, p, o, g).await.unwrap()).await
-}
-
 /// A file-backed dictionary's shared reads equal the resident open's, whole
 /// and index-served: each chunk's distinct codes resolve through one
 /// dictionary scan into shared strings, and the chunk decodes against them.
@@ -36,19 +25,13 @@ async fn test_file_backed_dictionary_shared_quads_match_resident() {
     assert!(fb.dict_reader().unwrap().is_file_backed());
 
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let served = |store: &VortexRdfStore| {
-        let store = store.clone();
-        let p0 = p0.clone();
-        async move {
-            store
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap()
-        }
-    };
     for (tag, a, b) in [
         ("full", resident.clone(), fb.clone()),
-        ("served", served(&resident).await, served(&fb).await),
+        (
+            "served",
+            matched_view(&resident, None, Some(&p0), None, None).await,
+            matched_view(&fb, None, Some(&p0), None, None).await,
+        ),
     ] {
         let want = assert_shared_matches_quads(&a, &format!("resident {tag}")).await;
         let got = assert_shared_matches_quads(&b, &format!("file-backed {tag}")).await;
@@ -119,7 +102,7 @@ async fn assert_file_backed_matches_resident(
     let q0 = &quads[3];
     assert!(fb.contains(q0).await.unwrap(), "{tag}: contains");
     // A term absent from the dictionary matches nothing.
-    let empty = matched_strings(&fb, None, Some(&absent), None, None).await;
+    let empty = view_strings(&matched_view(&fb, None, Some(&absent), None, None).await).await;
     assert!(empty.is_empty(), "{tag}: absent term matches nothing");
     (dir, fb, resident)
 }
@@ -139,7 +122,7 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
     // And explicitly confirm the serving plan engages on the file-backed
     // store (the equality above would hold even off the fallback path).
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let matched = fb.match_pattern(None, Some(&p0), None, None).await.unwrap();
+    let matched = matched_view(&fb, None, Some(&p0), None, None).await;
     assert_eq!(served_component(&matched), Some("index:posg"));
     // The located run is small, so its ids resolved eagerly by rid point
     // reads at match time — no deferred rid scan remains.
@@ -492,20 +475,14 @@ async fn test_file_backed_dictionary_serves_wide_run() {
     // 300 rows per predicate: past the point-read cap, so the run is read
     // by range.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let served = fb.match_pattern(None, Some(&p1), None, None).await.unwrap();
+    let served = matched_view(&fb, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&served), Some("index:posg"));
     assert_eq!(served.size().await.unwrap(), 300);
     assert!(served.size().await.unwrap() > crate::store::view::selection::POINT_GATHER_MAX_ROWS);
     let want = expected_strings(&quads, |i| i % 3 == 1);
     assert_eq!(view_strings(&served).await, want);
     assert_eq!(
-        view_strings(
-            &resident
-                .match_pattern(None, Some(&p1), None, None)
-                .await
-                .unwrap()
-        )
-        .await,
+        view_strings(&matched_view(&resident, None, Some(&p1), None, None).await).await,
         want
     );
     let shared = assert_shared_matches_quads(&served, "file-backed wide run").await;
@@ -621,7 +598,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     assert_eq!(
-        matched_strings(&store, None, Some(&p0), None, None).await,
+        view_strings(&matched_view(&store, None, Some(&p0), None, None).await).await,
         expected_strings(&quads, |i| i % 3 == 0)
     );
 
@@ -652,10 +629,7 @@ async fn test_dictionary_terms_stay_fsst_through_bytes() {
     // And the terms still resolve, through the compressed representation.
     assert_eq!(reread.size().await.unwrap(), 2_000);
     let p = NamedNode::new("http://example.org/predicate/3").unwrap();
-    let matched = reread
-        .match_pattern(None, Some(&p), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&reread, None, Some(&p), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 125);
 }
 
@@ -683,10 +657,7 @@ async fn test_dictionary_native_file_roundtrip() {
     assert_eq!(store.size().await.unwrap(), quads.len());
 
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, None, Some(&p0), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 4);
     let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));

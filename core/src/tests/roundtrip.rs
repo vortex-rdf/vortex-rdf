@@ -345,10 +345,7 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
         damaged(&path, "index:posg", "o");
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let served = store
-            .match_pattern(None, Some(&p1), None, None)
-            .await
-            .unwrap();
+        let served = matched_view(&store, None, Some(&p1), None, None).await;
         assert_eq!(served_component(&served), Some("index:posg"));
         assert_eq!(served.debug_serve_row_range(), Some(4..8));
         let quads: Vec<_> = served.quads().collect().await;

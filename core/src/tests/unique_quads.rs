@@ -316,10 +316,7 @@ async fn test_index_served_matches_ignore_the_repeats() {
         .await
         .unwrap();
         let store = VortexRdfStore::from_built(built).unwrap();
-        let served = store
-            .match_pattern(None, Some(&p), None, None)
-            .await
-            .unwrap();
+        let served = matched_view(&store, None, Some(&p), None, None).await;
         assert_eq!(
             served_component(&served),
             Some("index:posg"),

@@ -49,10 +49,7 @@ async fn assert_reads_back(store: &VortexRdfStore, rows: usize, label: &str) {
     let quads = quads(rows);
     assert_eq!(store.size().await.unwrap(), rows, "{label}");
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(store, None, Some(&p1), None, None).await;
     assert_eq!(
         view_strings(&matched).await,
         expected_strings(&quads, |i| i % 2 == 1),

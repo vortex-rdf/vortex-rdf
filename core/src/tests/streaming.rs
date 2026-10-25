@@ -24,10 +24,7 @@ async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str, streams
         ("full", store.clone()),
         (
             "matched",
-            store
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap(),
+            matched_view(&store, None, Some(&p0), None, None).await,
         ),
         ("tailed", store.add_quad(extra).await.unwrap()),
     ];
@@ -73,10 +70,7 @@ async fn test_shared_quads_match_quads_vec_across_layouts() {
         let store = built_store(dictionary_test_quads(), layout, vec![]).await;
         assert_shared_matches_quads(&store, &format!("{layout:?}")).await;
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let matched = store
-            .match_pattern(None, Some(&p0), None, None)
-            .await
-            .unwrap();
+        let matched = matched_view(&store, None, Some(&p0), None, None).await;
         assert_shared_matches_quads(&matched, &format!("{layout:?} matched")).await;
     }
 }
@@ -120,10 +114,7 @@ async fn test_shared_quads_match_quads_vec_on_served_view() {
     .await;
 
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let served = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let served = matched_view(&store, None, Some(&p0), None, None).await;
     assert_eq!(
         served_component(&served),
         Some("index:posg"),
@@ -132,13 +123,14 @@ async fn test_shared_quads_match_quads_vec_on_served_view() {
     let rows = assert_shared_matches_quads(&served, "served").await;
     assert_eq!(rows.len(), 22);
 
-    let tombstoned = store
-        .delete_quad(&quads[0])
-        .await
-        .unwrap()
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let tombstoned = matched_view(
+        &store.delete_quad(&quads[0]).await.unwrap(),
+        None,
+        Some(&p0),
+        None,
+        None,
+    )
+    .await;
     let rows = assert_shared_matches_quads(&tombstoned, "served, tombstoned").await;
     assert_eq!(rows.len(), 21);
 }
@@ -165,10 +157,7 @@ async fn test_shared_quads_match_quads_vec_on_views() {
         "tail object",
         GraphName::DefaultGraph,
     );
-    let served = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let served = matched_view(&store, None, Some(&p0), None, None).await;
     assert_eq!(
         served_component(&served),
         Some("index:posg"),
@@ -179,10 +168,7 @@ async fn test_shared_quads_match_quads_vec_on_views() {
         ("served", served),
         (
             "subject",
-            store
-                .match_pattern(Some(&s1), None, None, None)
-                .await
-                .unwrap(),
+            matched_view(&store, Some(&s1), None, None, None).await,
         ),
         ("tailed", store.add_quad(extra).await.unwrap()),
         ("tombstoned", store.delete_quad(&quads[0]).await.unwrap()),

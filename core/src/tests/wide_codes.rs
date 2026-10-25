@@ -268,40 +268,28 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         as_set(quads.to_vec())
     );
     let name = iri("name");
-    let by_predicate = store
-        .match_pattern(None, Some(&name), None, None)
-        .await
-        .unwrap();
+    let by_predicate = matched_view(store, None, Some(&name), None, None).await;
     assert_eq!(
         decoded_row_set(&by_predicate).await,
         expected(quads, |q| q.predicate == name),
         "{label}: predicate (index) match"
     );
     let bob_iri = Term::NamedNode(iri("bob"));
-    let by_object = store
-        .match_pattern(None, None, Some(&bob_iri), None)
-        .await
-        .unwrap();
+    let by_object = matched_view(store, None, None, Some(&bob_iri), None).await;
     assert_eq!(
         decoded_row_set(&by_object).await,
         expected(quads, |q| q.object == bob_iri),
         "{label}: object (index) match"
     );
     let age = iri("age");
-    let residual = store
-        .match_pattern(Some(&alice), Some(&age), None, None)
-        .await
-        .unwrap();
+    let residual = matched_view(store, Some(&alice), Some(&age), None, None).await;
     assert_eq!(
         decoded_row_set(&residual).await,
         expected(quads, |q| q.subject == alice && q.predicate == age),
         "{label}: subject + residual match"
     );
     let g1 = GraphName::NamedNode(iri("g1"));
-    let by_graph = store
-        .match_pattern(None, None, None, Some(&g1))
-        .await
-        .unwrap();
+    let by_graph = matched_view(store, None, None, None, Some(&g1)).await;
     assert_eq!(
         decoded_row_set(&by_graph).await,
         expected(quads, |q| q.graph_name == g1),
@@ -330,10 +318,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
             Some((alice_code, last_subject)),
             "{label}: the whole base's bound"
         );
-        let run = store
-            .match_pattern(Some(&alice), None, None, None)
-            .await
-            .unwrap();
+        let run = matched_view(store, Some(&alice), None, None, None).await;
         assert_eq!(
             run.view_statistics().unwrap().code_bounds[QuadColumn::S.index()],
             Some((alice_code, alice_code)),
@@ -582,17 +567,11 @@ async fn check_chunk_exports(store: &VortexRdfStore, label: &str) {
         ("whole", store.clone()),
         (
             "predicate",
-            store
-                .match_pattern(None, Some(&name), None, None)
-                .await
-                .unwrap(),
+            matched_view(store, None, Some(&name), None, None).await,
         ),
         (
             "subject",
-            store
-                .match_pattern(Some(&alice), None, None, None)
-                .await
-                .unwrap(),
+            matched_view(store, Some(&alice), None, None, None).await,
         ),
     ];
     for (tag, view) in &views {

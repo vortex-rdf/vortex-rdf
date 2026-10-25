@@ -23,10 +23,7 @@ async fn test_default_fixture_adopts() {
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(
         view_strings(&matched).await,
         expected_strings(&quads, |i| i % 3 == 1)
@@ -64,10 +61,7 @@ async fn test_dictionary_fixture_adopts() {
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let (cached, resolved) = probe_hooks::binds();
-    let served = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let served = matched_view(&store, None, Some(&p1), None, None).await;
     let after = probe_hooks::binds();
     assert!(after.0 > cached && after.1 == resolved, "{after:?}");
     for name in components {

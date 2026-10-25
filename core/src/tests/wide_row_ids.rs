@@ -94,32 +94,20 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     assert_eq!(store.size().await.unwrap(), N, "{label}");
 
     // ── matches ──────────────────────────────────────────────────────────
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(store, None, Some(&p1), None, None).await;
     let p_rows = rows_where(quads, |i| i % 3 == 1);
     assert_eq!(view_strings(&by_p).await, p_rows, "{label}: by predicate");
-    let by_o = store
-        .match_pattern(None, None, Some(&o2), None)
-        .await
-        .unwrap();
+    let by_o = matched_view(store, None, None, Some(&o2), None).await;
     assert_eq!(
         view_strings(&by_o).await,
         rows_where(quads, |i| i % 7 == 2),
         "{label}: by object"
     );
-    let both = store
-        .match_pattern(None, Some(&p1), Some(&o2), None)
-        .await
-        .unwrap();
+    let both = matched_view(store, None, Some(&p1), Some(&o2), None).await;
     let both_rows = rows_where(quads, |i| i % 21 == 16);
     assert_eq!(view_strings(&both).await, both_rows, "{label}: by both");
     let g = g1();
-    let by_g = store
-        .match_pattern(None, None, None, Some(&g))
-        .await
-        .unwrap();
+    let by_g = matched_view(store, None, None, None, Some(&g)).await;
     assert_eq!(
         view_strings(&by_g).await,
         rows_where(quads, |i| i % 2 == 1),
@@ -128,10 +116,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     // An index match's rows, narrowed by a second index match: the first
     // match's ids — deferred behind a serve plan, or a located run — are
     // read to intersect them.
-    let chained = by_p
-        .match_pattern(None, None, Some(&o2), None)
-        .await
-        .unwrap();
+    let chained = matched_view(&by_p, None, None, Some(&o2), None).await;
     assert_eq!(view_strings(&chained).await, both_rows, "{label}: chained");
 
     // ── partitions of the index matches ──────────────────────────────────
@@ -191,10 +176,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .await
         .unwrap();
     let live = |i: usize| i != 1 && i != 2;
-    let by_p = deleted
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&deleted, None, Some(&p1), None, None).await;
     assert_eq!(
         view_strings(&by_p).await,
         rows_where(quads, |i| i % 3 == 1 && live(i)),
@@ -205,10 +187,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         rows_where(quads, |i| i % 3 == 1 && live(i)),
         "{label}: partitions of the predicate match after deletes"
     );
-    let by_o = deleted
-        .match_pattern(None, None, Some(&o2), None)
-        .await
-        .unwrap();
+    let by_o = matched_view(&deleted, None, None, Some(&o2), None).await;
     assert_eq!(
         view_strings(&by_o).await,
         rows_where(quads, |i| i % 7 == 2 && live(i)),

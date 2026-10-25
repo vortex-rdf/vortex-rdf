@@ -34,28 +34,20 @@ async fn test_term_kinds_match_under_every_layout() {
             let store = built_store(quads.clone(), layout, indexes).await;
             assert_eq!(view_strings(&store).await, quad_strings(&quads), "{tag}");
 
-            let by_blank_s = store
-                .match_pattern(Some(&blank_subject), None, None, None)
-                .await
-                .unwrap();
+            let by_blank_s = matched_view(&store, Some(&blank_subject), None, None, None).await;
             assert_eq!(
                 view_strings(&by_blank_s).await,
                 expected_strings(&quads, |i| quads[i].subject == blank_subject),
                 "{tag}: blank subject"
             );
-            let by_blank_g = store
-                .match_pattern(None, None, None, Some(&blank_graph))
-                .await
-                .unwrap();
+            let by_blank_g = matched_view(&store, None, None, None, Some(&blank_graph)).await;
             assert_eq!(
                 view_strings(&by_blank_g).await,
                 expected_strings(&quads, |i| quads[i].graph_name == blank_graph),
                 "{tag}: blank graph"
             );
-            let by_default_g = store
-                .match_pattern(None, None, None, Some(&GraphName::DefaultGraph))
-                .await
-                .unwrap();
+            let by_default_g =
+                matched_view(&store, None, None, None, Some(&GraphName::DefaultGraph)).await;
             let default_rows = by_default_g.quads_vec().await.unwrap();
             assert_eq!(
                 quad_strings(&default_rows),
@@ -69,10 +61,7 @@ async fn test_term_kinds_match_under_every_layout() {
                 "{tag}: default graph rows must decode to the default graph"
             );
             for quad in &quads {
-                let by_o = store
-                    .match_pattern(None, None, Some(&quad.object), None)
-                    .await
-                    .unwrap();
+                let by_o = matched_view(&store, None, None, Some(&quad.object), None).await;
                 assert_eq!(
                     view_strings(&by_o).await,
                     vec![quad.to_string()],
@@ -83,10 +72,7 @@ async fn test_term_kinds_match_under_every_layout() {
             // An empty result carries no index set, so a match chained on it
             // looks nothing up.
             let absent = Term::NamedNode(NamedNode::new("http://example.org/absent").unwrap());
-            let none = store
-                .match_pattern(None, None, Some(&absent), None)
-                .await
-                .unwrap();
+            let none = matched_view(&store, None, None, Some(&absent), None).await;
             assert_eq!(none.size().await.unwrap(), 0, "{tag}: absent object");
             assert!(none.indexes().is_empty(), "{tag}: empty result's indexes");
         }
@@ -141,16 +127,10 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
     let o5 = Term::Literal(Literal::new_simple_literal("o5"));
 
     // "o5" is on s0 at i ≡ 5 (mod 1667) — 3 rows — and once on s1.
-    let by_o = store
-        .match_pattern(None, None, Some(&o5), None)
-        .await
-        .unwrap();
+    let by_o = matched_view(store, None, None, Some(&o5), None).await;
     assert_eq!(by_o.size().await.unwrap(), 4);
 
-    let above = store
-        .match_pattern(Some(&s0), None, Some(&o5), None)
-        .await
-        .unwrap();
+    let above = matched_view(store, Some(&s0), None, Some(&o5), None).await;
     assert_eq!(above.debug_selection_range(), None);
     assert_eq!(served_component(&above), None);
     assert_eq!(
@@ -158,10 +138,7 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
         expected_strings(quads, |i| quads[i].subject == s0 && quads[i].object == o5)
     );
 
-    let below = store
-        .match_pattern(Some(&s1), None, Some(&o5), None)
-        .await
-        .unwrap();
+    let below = matched_view(store, Some(&s1), None, Some(&o5), None).await;
     assert_eq!(below.debug_selection_range(), below_range);
     assert_eq!(served_component(&below), None);
     assert_eq!(
@@ -193,10 +170,7 @@ async fn test_subject_range_then_index_routing_above_gate() {
             NamedNode::new(format!("http://example.org/{subject}")).unwrap(),
         );
         let before = decoded_rids();
-        let matched = store
-            .match_pattern(Some(&s), None, Some(&o5), None)
-            .await
-            .unwrap();
+        let matched = matched_view(&store, Some(&s), None, Some(&o5), None).await;
         assert_eq!(decoded_rids() - before, rids, "{subject}");
         assert_eq!(
             view_strings(&matched).await,
@@ -273,42 +247,31 @@ async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
             view
         };
 
-        let by_s = store
-            .match_pattern(Some(&s), None, None, None)
-            .await
-            .unwrap();
+        let by_s = matched_view(&store, Some(&s), None, None, None).await;
         expect(by_s, 12..24).await;
-        let by_sp = store
-            .match_pattern(Some(&s), Some(&p), None, None)
-            .await
-            .unwrap();
+        let by_sp = matched_view(&store, Some(&s), Some(&p), None, None).await;
         let by_sp = expect(by_sp, 16..20).await;
         for q in by_sp.quads_vec().await.unwrap() {
             assert_eq!(q.subject.to_string(), s.to_string());
             assert_eq!(q.predicate, p);
         }
-        let by_spo = store
-            .match_pattern(Some(&s), Some(&p), Some(&o), None)
-            .await
-            .unwrap();
+        let by_spo = matched_view(&store, Some(&s), Some(&p), Some(&o), None).await;
         expect(by_spo, 18..20).await;
-        let by_spog = store
-            .match_pattern(Some(&s), Some(&p), Some(&o), Some(&g))
-            .await
-            .unwrap();
+        let by_spog = matched_view(&store, Some(&s), Some(&p), Some(&o), Some(&g)).await;
         expect(by_spog, 19..20).await;
         // The default graph is a dictionary term like any other ("").
-        let by_spo_default = store
-            .match_pattern(Some(&s), Some(&p), Some(&o), Some(&GraphName::DefaultGraph))
-            .await
-            .unwrap();
+        let by_spo_default = matched_view(
+            &store,
+            Some(&s),
+            Some(&p),
+            Some(&o),
+            Some(&GraphName::DefaultGraph),
+        )
+        .await;
         expect(by_spo_default, 18..19).await;
         // A run that narrows to nothing: `p1` exists, but not under `s03`.
         let s03 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
-        let none = store
-            .match_pattern(Some(&s03), Some(&p), None, None)
-            .await
-            .unwrap();
+        let none = matched_view(&store, Some(&s03), Some(&p), None, None).await;
         assert_eq!(none.size().await.unwrap(), 0);
         assert!(none.quads_vec().await.unwrap().is_empty());
     }
@@ -336,10 +299,7 @@ async fn test_prefix_probe_stops_at_the_first_unbound_role() {
     for indexes in [vec![], vec![IndexType::SecondaryByReference]] {
         let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
 
-        let by_so = store
-            .match_pattern(Some(&s), None, Some(&o), None)
-            .await
-            .unwrap();
+        let by_so = matched_view(&store, Some(&s), None, Some(&o), None).await;
         assert_eq!(by_so.debug_selection_range(), None, "{indexes:?}");
         assert_eq!(by_so.size().await.unwrap(), 6, "{indexes:?}"); // 3 predicates × 2 graphs
         assert_eq!(
@@ -352,10 +312,7 @@ async fn test_prefix_probe_stops_at_the_first_unbound_role() {
             0,
             "{indexes:?}: s04 and o1 never meet"
         );
-        let by_sg = store
-            .match_pattern(Some(&s), None, None, Some(&g))
-            .await
-            .unwrap();
+        let by_sg = matched_view(&store, Some(&s), None, None, Some(&g)).await;
         assert_eq!(by_sg.debug_selection_range(), None, "{indexes:?}");
         assert_eq!(by_sg.size().await.unwrap(), 6, "{indexes:?}"); // 3 predicates × 2 objects
     }
@@ -370,22 +327,13 @@ async fn test_prefix_probe_string_layout_narrows_by_subject_only() {
     let s99 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let store = built_store(prefix_quads(), layout, vec![]).await;
-        let by_s = store
-            .match_pattern(Some(&s), None, None, None)
-            .await
-            .unwrap();
+        let by_s = matched_view(&store, Some(&s), None, None, None).await;
         assert_eq!(by_s.debug_selection_range(), Some(12..24), "{layout:?}");
-        let by_spo = store
-            .match_pattern(Some(&s), Some(&p), Some(&o), None)
-            .await
-            .unwrap();
+        let by_spo = matched_view(&store, Some(&s), Some(&p), Some(&o), None).await;
         assert_eq!(by_spo.debug_selection_range(), None, "{layout:?}");
         assert_eq!(by_spo.size().await.unwrap(), 2, "{layout:?}");
 
-        let by_missing = store
-            .match_pattern(Some(&s99), None, None, None)
-            .await
-            .unwrap();
+        let by_missing = matched_view(&store, Some(&s99), None, None, None).await;
         assert!(
             by_missing
                 .debug_selection_range()
@@ -403,26 +351,14 @@ async fn test_prefix_probe_chains_within_a_range() {
     let (s, p, o, _) = prefix_terms();
     let store = built_store(prefix_quads(), LayoutStrategy::Dictionary, vec![]).await;
 
-    let by_s = store
-        .match_pattern(Some(&s), None, None, None)
-        .await
-        .unwrap();
-    let by_sp = by_s
-        .match_pattern(Some(&s), Some(&p), None, None)
-        .await
-        .unwrap();
+    let by_s = matched_view(&store, Some(&s), None, None, None).await;
+    let by_sp = matched_view(&by_s, Some(&s), Some(&p), None, None).await;
     assert_eq!(by_sp.debug_selection_range(), Some(16..20));
-    let by_spo = by_sp
-        .match_pattern(Some(&s), Some(&p), Some(&o), None)
-        .await
-        .unwrap();
+    let by_spo = matched_view(&by_sp, Some(&s), Some(&p), Some(&o), None).await;
     assert_eq!(by_spo.debug_selection_range(), Some(18..20));
     // Without the subject re-bound there is no prefix to probe; the residual
     // scan over the inherited range still answers exactly.
-    let by_p_within = by_s
-        .match_pattern(None, Some(&p), None, None)
-        .await
-        .unwrap();
+    let by_p_within = matched_view(&by_s, None, Some(&p), None, None).await;
     assert_eq!(by_p_within.debug_selection_range(), None);
     assert_eq!(by_p_within.size().await.unwrap(), 4);
 }
@@ -438,16 +374,10 @@ async fn test_prefix_probe_declines_an_unstamped_base() {
     let store = unstamped_store(&quads);
     assert_eq!(store.view_statistics().unwrap().sort_order, None);
 
-    let by_s = store
-        .match_pattern(Some(&s), None, None, None)
-        .await
-        .unwrap();
+    let by_s = matched_view(&store, Some(&s), None, None, None).await;
     assert_eq!(by_s.debug_selection_range(), None);
     assert_eq!(by_s.size().await.unwrap(), 12);
-    let by_spo = store
-        .match_pattern(Some(&s), Some(&p), Some(&o), None)
-        .await
-        .unwrap();
+    let by_spo = matched_view(&store, Some(&s), Some(&p), Some(&o), None).await;
     assert_eq!(by_spo.debug_selection_range(), None);
     assert_eq!(by_spo.size().await.unwrap(), 2);
 }
@@ -470,16 +400,13 @@ async fn test_derived_view_does_not_lose_base_rows() {
     let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
     let object = Term::Literal(Literal::new_simple_literal("object 0"));
-    let matched = store
-        .match_pattern(None, None, Some(&object), None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, None, None, Some(&object), None).await;
     assert_eq!(matched.size().await.unwrap(), 5);
 
     // Widening back out from the derived view reaches only what the view
     // selects (5 rows) — but the store it came from is untouched, and a
     // fresh match against it still sees all 10.
-    let widened = matched.match_pattern(None, None, None, None).await.unwrap();
+    let widened = matched_view(&matched, None, None, None, None).await;
     assert_eq!(widened.size().await.unwrap(), 5);
     assert_eq!(store.size().await.unwrap(), 10);
 }
@@ -503,10 +430,7 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
     for _ in 0..2 {
         let (cached, resolved) = probe_hooks::binds();
-        let matched = store
-            .match_pattern(None, Some(&p1), Some(&o2), None)
-            .await
-            .unwrap();
+        let matched = matched_view(&store, None, Some(&p1), Some(&o2), None).await;
         let (cached_after, resolved_after) = probe_hooks::binds();
         assert_eq!(resolved_after, resolved, "no probe is resolved per match");
         assert_eq!(
@@ -548,48 +472,37 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
             );
         };
 
-        let by_sp = store
-            .match_pattern(Some(&s), Some(&p), None, None)
-            .await
-            .unwrap();
+        let by_sp = matched_view(&store, Some(&s), Some(&p), None, None).await;
         expect(&by_sp, 16..20);
         assert_eq!(by_sp.size().await.unwrap(), 4, "{label}");
         for q in by_sp.quads_vec().await.unwrap() {
             assert_eq!(q.subject.to_string(), s.to_string());
             assert_eq!(q.predicate, p);
         }
-        let by_spo = store
-            .match_pattern(Some(&s), Some(&p), Some(&o), None)
-            .await
-            .unwrap();
+        let by_spo = matched_view(&store, Some(&s), Some(&p), Some(&o), None).await;
         expect(&by_spo, 18..20);
         assert_eq!(by_spo.size().await.unwrap(), 2, "{label}");
-        let by_spog = store
-            .match_pattern(Some(&s), Some(&p), Some(&o), Some(&g))
-            .await
-            .unwrap();
+        let by_spog = matched_view(&store, Some(&s), Some(&p), Some(&o), Some(&g)).await;
         expect(&by_spog, 19..20);
         assert_eq!(by_spog.quads_vec().await.unwrap().len(), 1, "{label}");
-        let by_spo_default = store
-            .match_pattern(Some(&s), Some(&p), Some(&o), Some(&GraphName::DefaultGraph))
-            .await
-            .unwrap();
+        let by_spo_default = matched_view(
+            &store,
+            Some(&s),
+            Some(&p),
+            Some(&o),
+            Some(&GraphName::DefaultGraph),
+        )
+        .await;
         expect(&by_spo_default, 18..19);
         // `p1` exists, but not under `s03`: the run narrows to nothing.
         let s03 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
-        let none = store
-            .match_pattern(Some(&s03), Some(&p), None, None)
-            .await
-            .unwrap();
+        let none = matched_view(&store, Some(&s03), Some(&p), None, None).await;
         assert_eq!(none.size().await.unwrap(), 0, "{label}");
         assert!(none.quads_vec().await.unwrap().is_empty(), "{label}");
 
         // An unbound predicate ends the prefix: the object stays a filter
         // over the subject's run.
-        let by_so = store
-            .match_pattern(Some(&s), None, Some(&o), None)
-            .await
-            .unwrap();
+        let by_so = matched_view(&store, Some(&s), None, Some(&o), None).await;
         assert_eq!(by_so.debug_selection_range(), Some(12..24), "{label}");
         let stats = by_so.view_statistics().unwrap();
         assert_eq!(

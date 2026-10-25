@@ -110,10 +110,7 @@ async fn test_narrowed_view_serializes_rows_only() {
     )
     .await;
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let view = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let view = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(view.size().await.unwrap(), 4);
 
     let reread = VortexRdfStore::from_bytes(&view.to_bytes().await.unwrap())
@@ -151,13 +148,7 @@ async fn test_unstamped_owner_to_bytes_records_unsorted() {
     assert_eq!(reread.size().await.unwrap(), 12);
     let s07 = subject_node(7, 2);
     assert_eq!(
-        view_strings(
-            &reread
-                .match_pattern(Some(&s07), None, None, None)
-                .await
-                .unwrap()
-        )
-        .await,
+        view_strings(&matched_view(&reread, Some(&s07), None, None, None).await).await,
         expected_strings(&quads, |i| quads[i].subject == s07)
     );
 }
@@ -315,10 +306,8 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
     let store = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
     let p = NamedNode::new("http://example.org/p/1").unwrap();
-    let matched: Vec<Quad> = store
-        .match_pattern(None, Some(&p), None, None)
+    let matched: Vec<Quad> = matched_view(&store, None, Some(&p), None, None)
         .await
-        .unwrap()
         .quads()
         .try_collect()
         .await
@@ -385,10 +374,7 @@ async fn test_from_bytes_defers_index_child_materialization() {
 
     let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched = reread
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&reread, None, Some(&p1), None, None).await;
     // p1 is on rows 1, 4, 7, 10 — the probe answered through the index.
     assert_eq!(matched.size().await.unwrap(), 4);
     assert_eq!(
@@ -473,15 +459,9 @@ async fn test_from_parts_adopts_searchable_children() {
     let reference = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     for i in [0, 17, 2_999] {
         let subject = subject_node(i, 4);
-        let got = decoded
-            .match_pattern(Some(&subject), None, None, None)
-            .await
-            .unwrap();
+        let got = matched_view(&decoded, Some(&subject), None, None, None).await;
         assert!(got.debug_selection_range().is_some(), "s{i}: searched");
-        let want = reference
-            .match_pattern(Some(&subject), None, None, None)
-            .await
-            .unwrap();
+        let want = matched_view(&reference, Some(&subject), None, None, None).await;
         assert_eq!(view_strings(&got).await, view_strings(&want).await, "s{i}");
     }
     // An unsorted column in such an encoding is decoded too: `from_parts`
@@ -674,10 +654,7 @@ async fn test_from_bytes_and_from_parts_answer_every_pattern_like_from_built() {
     .await;
 
     // The subject run itself: 4 quads per subject by construction.
-    let s_view = lean
-        .match_pattern(Some(&s), None, None, None)
-        .await
-        .unwrap();
+    let s_view = matched_view(&lean, Some(&s), None, None, None).await;
     assert_eq!(s_view.size().await.unwrap(), 4);
 }
 
@@ -1267,13 +1244,7 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
         assert_eq!(store.size().await.unwrap(), 6, "{path}");
         assert!(store.indexes().is_empty(), "{path}");
         assert_eq!(
-            view_strings(
-                &store
-                    .match_pattern(None, Some(&p1), None, None)
-                    .await
-                    .unwrap()
-            )
-            .await,
+            view_strings(&matched_view(&store, None, Some(&p1), None, None).await).await,
             expected_strings(&quads, |i| i % 3 == 1),
             "{path}"
         );

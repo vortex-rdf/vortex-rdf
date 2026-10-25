@@ -66,10 +66,7 @@ async fn run_escaped_literal_roundtrip(layout: LayoutStrategy, indexes: Vec<Inde
             .unwrap_or_else(|| panic!("{:?}: missing row for {}", layout, q.subject));
         assert_eq!(object, q.object, "{:?}: object not round-tripped", layout);
 
-        let matched = store
-            .match_pattern(None, None, Some(&q.object), None)
-            .await
-            .unwrap();
+        let matched = matched_view(&store, None, None, Some(&q.object), None).await;
         assert_eq!(
             matched.size().await.unwrap(),
             1,

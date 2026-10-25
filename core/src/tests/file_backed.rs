@@ -46,10 +46,7 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p_rare = NamedNode::new("http://example.org/pAAA").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p_rare), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, None, Some(&p_rare), None, None).await;
     assert_eq!(matched.size().await.unwrap(), 2 * CLUSTER);
 
     let results: Vec<Quad> = matched.quads().try_collect().await.unwrap();
@@ -102,15 +99,9 @@ async fn test_file_backed_chained_subject_then_object_index() {
 
     // Subject match first (row range), then indexed object match: the
     // object index ids are restricted to the subject's range.
-    let by_subject = store
-        .match_pattern(Some(&s_mid), None, None, None)
-        .await
-        .unwrap();
+    let by_subject = matched_view(&store, Some(&s_mid), None, None, None).await;
     let o0 = Term::Literal(Literal::new_simple_literal("o0"));
-    let chained = by_subject
-        .match_pattern(None, None, Some(&o0), None)
-        .await
-        .unwrap();
+    let chained = matched_view(&by_subject, None, None, Some(&o0), None).await;
     assert_eq!(chained.size().await.unwrap(), 1); // 12000 % 5 == 0
     let results: Vec<Quad> = chained.quads().try_collect().await.unwrap();
     assert_eq!(results.len(), 1);
@@ -122,22 +113,13 @@ async fn test_file_backed_chained_subject_then_object_index() {
 
     // Same chain with an object the subject's row doesn't carry.
     let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-    let empty = by_subject
-        .match_pattern(None, None, Some(&o1), None)
-        .await
-        .unwrap();
+    let empty = matched_view(&by_subject, None, None, Some(&o1), None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 
     // Index-to-index chaining: object ids ∩ predicate ids.
     let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let step1 = store
-        .match_pattern(None, None, Some(&o1), None)
-        .await
-        .unwrap();
-    let step2 = step1
-        .match_pattern(None, Some(&p2), None, None)
-        .await
-        .unwrap();
+    let step1 = matched_view(&store, None, None, Some(&o1), None).await;
+    let step2 = matched_view(&step1, None, Some(&p2), None, None).await;
     let expected = (0..N).filter(|i| i % 5 == 1 && i % 3 == 2).count();
     assert_eq!(step2.size().await.unwrap(), expected);
     let results: Vec<Quad> = step2.quads().try_collect().await.unwrap();
@@ -192,10 +174,7 @@ async fn test_file_backed_filtered_size_skips_tombstones() {
     // Row 3: s03 p0 "object 3".
     let deleted = store.delete_quad(&quads[3]).await.unwrap();
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let matched = deleted
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&deleted, None, Some(&p0), None, None).await;
     // p0 is on rows 0, 3, 6, 9; row 3 is gone.
     assert_eq!(matched.size().await.unwrap(), 3);
     assert_eq!(matched.size().await.unwrap(), matched.quads().count().await);
@@ -265,8 +244,8 @@ async fn test_file_backed_subject_chunk_probe_matches_memory() {
             (Some(&p), Some(&o), None),
             (None, None, Some(&g)),
         ] {
-            let got = store.match_pattern(Some(&s), pp, po, pg).await.unwrap();
-            let want = memory.match_pattern(Some(&s), pp, po, pg).await.unwrap();
+            let got = matched_view(&store, Some(&s), pp, po, pg).await;
+            let want = matched_view(&memory, Some(&s), pp, po, pg).await;
             let scans = scan_hooks::scans();
             let got = view_strings(&got).await;
             assert_eq!(
@@ -284,10 +263,7 @@ async fn test_file_backed_subject_chunk_probe_matches_memory() {
 
     // Absent subject (never in the dictionary) short-circuits to empty.
     let absent = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/zz").unwrap());
-    let empty = store
-        .match_pattern(Some(&absent), None, None, None)
-        .await
-        .unwrap();
+    let empty = matched_view(&store, Some(&absent), None, None, None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 }
 
@@ -302,10 +278,7 @@ async fn test_file_backed_subject_chunk_probe_with_mutation() {
     let s50 = subject_node(50, 4);
     let doomed = quads[50 * 3].clone();
     let store = store.delete_quad(&doomed).await.unwrap();
-    let matched = store
-        .match_pattern(Some(&s50), None, None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, Some(&s50), None, None, None).await;
     assert_eq!(
         matched.size().await.unwrap(),
         2,
@@ -319,10 +292,7 @@ async fn test_file_backed_subject_chunk_probe_with_mutation() {
         GraphName::DefaultGraph,
     );
     let store = store.add_quads([fresh]).await.unwrap();
-    let matched = store
-        .match_pattern(Some(&s50), None, None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, Some(&s50), None, None, None).await;
     assert_eq!(
         matched.size().await.unwrap(),
         3,
@@ -352,22 +322,17 @@ async fn test_file_backed_subject_chunk_probe_chained() {
 
     let p = NamedNode::new("http://example.org/p2").unwrap();
     let s = subject_node(444, 4);
-    let got_first = store
-        .match_pattern(None, Some(&p), None, None)
-        .await
-        .unwrap();
-    let got = got_first
-        .match_pattern(Some(&s), None, None, None)
-        .await
-        .unwrap();
+    let got_first = matched_view(&store, None, Some(&p), None, None).await;
+    let got = matched_view(&got_first, Some(&s), None, None, None).await;
     assert_eq!(served_component(&got), None);
-    let want = memory
-        .match_pattern(None, Some(&p), None, None)
-        .await
-        .unwrap()
-        .match_pattern(Some(&s), None, None, None)
-        .await
-        .unwrap();
+    let want = matched_view(
+        &matched_view(&memory, None, Some(&p), None, None).await,
+        Some(&s),
+        None,
+        None,
+        None,
+    )
+    .await;
     assert_eq!(view_strings(&got).await, view_strings(&want).await);
 }
 
@@ -385,10 +350,7 @@ async fn test_file_backed_subject_chunk_probe_requires_sorted() {
         store.debug_subject_chunk_probe_range(&s).await.unwrap(),
         None
     );
-    let matched = store
-        .match_pattern(Some(&s), None, None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, Some(&s), None, None, None).await;
     assert_eq!(matched.size().await.unwrap(), 3);
 }
 
@@ -411,10 +373,7 @@ where
 /// filter on the code columns, and a term absent from the dictionary.
 async fn probe_dictionary(store: VortexRdfStore) {
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let filtered = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let filtered = matched_view(&store, None, Some(&p0), None, None).await;
     assert_eq!(filtered.size().await.unwrap(), 4);
     let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
     assert!(
@@ -424,10 +383,7 @@ async fn probe_dictionary(store: VortexRdfStore) {
     );
 
     let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-    let empty = store
-        .match_pattern(None, Some(&missing_p), None, None)
-        .await
-        .unwrap();
+    let empty = matched_view(&store, None, Some(&missing_p), None, None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 }
 
@@ -484,18 +440,11 @@ async fn test_file_code_columns_match_memory() {
     let check = async |tag: &str, store: &VortexRdfStore, memory: &VortexRdfStore| {
         for (s, p, o) in &patterns {
             for window in [None, Some((1, 2))] {
-                let view = |base: &VortexRdfStore| {
-                    let base = base.clone();
-                    let (s, p, o) = (s.clone(), p.clone(), o.clone());
-                    async move {
-                        let v = base
-                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), None)
-                            .await
-                            .unwrap();
-                        match window {
-                            Some((offset, limit)) => v.window(offset, limit).await.unwrap(),
-                            None => v,
-                        }
+                let view = async |base: &VortexRdfStore| {
+                    let v = matched_view(base, s.as_ref(), p.as_ref(), o.as_ref(), None).await;
+                    match window {
+                        Some((offset, limit)) => v.window(offset, limit).await.unwrap(),
+                        None => v,
                     }
                 };
                 let got = view(store)
@@ -1238,10 +1187,7 @@ async fn test_cutting_window_over_a_filter_stops_early() {
     );
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let view = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let view = matched_view(&store, None, Some(&p0), None, None).await;
     let rows = row_list(&view).await;
     let limit = 64;
     // `p0` is on every third row: the splits whose matches reach the limit.
@@ -1342,10 +1288,7 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let view = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let view = matched_view(&store, None, Some(&p0), None, None).await;
     let _limit = driver_hooks::ForcedLimit::set(0);
     driver_hooks::take_spawned();
     let evaluated = split_hooks::evaluated();
@@ -1628,12 +1571,8 @@ async fn test_kept_masks_never_outlive_a_derivation() {
             ),
             (
                 "chained match",
-                view.match_pattern(None, None, Some(&o0_term), None)
-                    .await
-                    .unwrap(),
-                twin.match_pattern(None, None, Some(&o0_term), None)
-                    .await
-                    .unwrap(),
+                matched_view(&view, None, None, Some(&o0_term), None).await,
+                matched_view(&twin, None, None, Some(&o0_term), None).await,
             ),
             (
                 "cutting window",

@@ -627,13 +627,11 @@ async fn test_dict_reader_file_backed_matches_resident() {
     for (tag, view) in [
         (
             "served",
-            fb.match_pattern(None, Some(&p0), None, None).await.unwrap(),
+            matched_view(&fb, None, Some(&p0), None, None).await,
         ),
         (
             "scanned",
-            fb.match_pattern(None, Some(&name), None, None)
-                .await
-                .unwrap(),
+            matched_view(&fb, None, Some(&name), None, None).await,
         ),
         ("whole", fb.clone()),
     ] {

@@ -23,10 +23,7 @@ async fn test_window_on_file_matches_slicing() {
         let graph = GraphName::DefaultGraph;
         let base_matches = matched_size(&store, None, None, None, Some(&graph)).await;
         let tailed = store.add_quads(appended_quads(30)).await.unwrap();
-        let matched = tailed
-            .match_pattern(None, None, None, Some(&graph))
-            .await
-            .unwrap();
+        let matched = matched_view(&tailed, None, None, None, Some(&graph)).await;
         assert!(matched.view_statistics().unwrap().pending_filter, "{tag}");
         let rows = strings(matched.quads_vec().await.unwrap());
         assert_eq!(rows.len(), base_matches + 30, "{tag}");
@@ -59,10 +56,7 @@ async fn test_keep_wide_set_on_file() {
         ("whole", store.clone()),
         (
             "filtered",
-            store
-                .match_pattern(None, Some(&p1), None, None)
-                .await
-                .unwrap(),
+            matched_view(&store, None, Some(&p1), None, None).await,
         ),
     ] {
         let rows = row_set(&view).await;
@@ -102,10 +96,7 @@ async fn test_a_served_view_with_a_residual_filter_counts_up_to_a_cap() {
         .count();
     assert!(expected > 2, "the fixture has matches to cap");
 
-    let view = store
-        .match_pattern(None, Some(&p1), Some(&o3), Some(&g1))
-        .await
-        .unwrap();
+    let view = matched_view(&store, None, Some(&p1), Some(&o3), Some(&g1)).await;
 
     assert_eq!(view.size().await.unwrap(), expected);
     assert_eq!(view.size_capped(2).await.unwrap(), 2);
@@ -143,10 +134,7 @@ async fn test_file_keeps_bind_no_expressions() {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let dict = store.dict_reader().unwrap();
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let view = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let view = matched_view(&store, None, Some(&p0), None, None).await;
     let first = dict.encode("\"object 0\"").await.unwrap().unwrap();
     // One keep and one row read bind every shape the loop uses: the
     // keep's filter and column projection, and the row read's projection.
@@ -202,10 +190,7 @@ async fn test_distinct_constants_retire_the_reader_tree() {
 
     for i in 0..distinct {
         let object = Term::Literal(Literal::new_simple_literal(format!("o{i}")));
-        let matched = store
-            .match_pattern(None, None, Some(&object), None)
-            .await
-            .unwrap();
+        let matched = matched_view(&store, None, None, Some(&object), None).await;
         assert_eq!(matched.size().await.unwrap(), 1, "object o{i}");
     }
 
@@ -249,10 +234,7 @@ async fn keep_spans_scan_splits(path: &std::path::Path) {
         ("whole", store.clone()),
         (
             "filtered",
-            store
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap(),
+            matched_view(&store, None, Some(&p0), None, None).await,
         ),
         ("window", store.window(10_000, 140_000).await.unwrap()),
     ];
@@ -362,11 +344,7 @@ impl RunStore {
     /// a row window and a window over the pending filter.
     async fn views(&self) -> Vec<View> {
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let pending = self
-            .store
-            .match_pattern(None, Some(&p0), None, None)
-            .await
-            .unwrap();
+        let pending = matched_view(&self.store, None, Some(&p0), None, None).await;
         let (o_lo, _) = self
             .store
             .dict_reader()
@@ -690,10 +668,7 @@ async fn test_s_keeps_bind_no_expressions_and_stream_nothing() {
         .unwrap();
     assert!(hi - lo >= quads.len() as TermCode);
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let pending = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let pending = matched_view(&store, None, Some(&p1), None, None).await;
     // Warm the shapes a count and a row read bind on the pending view.
     let warm = pending.size().await.unwrap();
     view_strings(&pending).await;
@@ -765,10 +740,7 @@ async fn test_s_keeps_on_an_unsorted_file_stream() {
         ("whole", store.clone()),
         (
             "pending",
-            store
-                .match_pattern(None, Some(&p1), None, None)
-                .await
-                .unwrap(),
+            matched_view(&store, None, Some(&p1), None, None).await,
         ),
     ];
     let keeps = [
@@ -818,10 +790,7 @@ async fn s_keeps_match_brute_force(path: &std::path::Path) {
         ("whole", store.clone()),
         (
             "filtered",
-            store
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap(),
+            matched_view(&store, None, Some(&p0), None, None).await,
         ),
         ("window", store.window(10_000, 140_000).await.unwrap()),
         (

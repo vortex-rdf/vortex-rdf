@@ -17,10 +17,8 @@ async fn assert_views_share_identity(store: &VortexRdfStore, tag: &str) {
     let generation = store.generation();
     let dictionary = store.dict_reader().unwrap().dictionary_id();
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let kept = store
-        .match_pattern(None, Some(&p1), None, None)
+    let kept = matched_view(store, None, Some(&p1), None, None)
         .await
-        .unwrap()
         .keep(QuadColumn::S, &Keep::range(0..TermCode::MAX))
         .await
         .unwrap();
@@ -289,10 +287,8 @@ async fn test_view_statistics_in_memory() {
         stats.code_bounds, [None; 4],
         "no codes under a string layout"
     );
-    let base_rows_only = strings
-        .match_pattern(Some(&subject_node(17, 4)), None, None, None)
+    let base_rows_only = matched_view(&strings, Some(&subject_node(17, 4)), None, None, None)
         .await
-        .unwrap()
         .view_statistics()
         .unwrap();
     assert_eq!(
@@ -368,10 +364,7 @@ async fn test_view_statistics_file_backed() {
     );
     // Unindexed, a predicate match pushes a filter down: the rows it still
     // has to test bound the count, and its code bounds the column.
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     let stats = by_p.view_statistics().unwrap();
     let p_code = store
         .dict_reader()
@@ -398,13 +391,14 @@ async fn test_view_statistics_file_backed() {
             )
         })
         .collect();
-    let by_p = store
-        .add_quads(p1_tail.clone())
-        .await
-        .unwrap()
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(
+        &store.add_quads(p1_tail.clone()).await.unwrap(),
+        None,
+        Some(&p1),
+        None,
+        None,
+    )
+    .await;
     let stats = by_p.view_statistics().unwrap();
     assert!(stats.pending_filter);
     assert_eq!(stats.tail_rows, 3);
@@ -412,10 +406,7 @@ async fn test_view_statistics_file_backed() {
 
     // Indexed, the match is served and its count exact.
     let copy = open("file/copy/mapped");
-    let by_p = copy
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&copy, None, Some(&p1), None, None).await;
     let stats = by_p.view_statistics().unwrap();
     assert_eq!(stats.selection, SelectionKind::PendingIndexRun);
     assert_eq!(stats.served_component, Some("index:posg"));
@@ -424,10 +415,7 @@ async fn test_view_statistics_file_backed() {
     // A bound graph rides the served run as a filter: the run's 600 rows
     // bound the count.
     let g1 = GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap());
-    let by_pg = copy
-        .match_pattern(None, Some(&p1), None, Some(&g1))
-        .await
-        .unwrap();
+    let by_pg = matched_view(&copy, None, Some(&p1), None, Some(&g1)).await;
     let stats = by_pg.view_statistics().unwrap();
     assert_eq!(stats.served_component, Some("index:posg"));
     assert!(stats.pending_filter);
@@ -436,23 +424,21 @@ async fn test_view_statistics_file_backed() {
     // A tombstone in the served run: the run's width bounds its live rows
     // until its ids are read, which counts them.
     let deleted = copy.delete_quad(&quads[1]).await.unwrap();
-    let by_p = deleted
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&deleted, None, Some(&p1), None, None).await;
     let rows = |view: &VortexRdfStore| view.view_statistics().unwrap().rows;
     assert_eq!(rows(&by_p), RowCountHint::at_most(600));
     assert_eq!(by_p.size().await.unwrap(), 599);
     assert_eq!(rows(&by_p), RowCountHint::exact(599));
     // With rows appended under the predicate, the bound is the run's width
     // and the tail's rows.
-    let by_p = deleted
-        .add_quads(p1_tail)
-        .await
-        .unwrap()
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(
+        &deleted.add_quads(p1_tail).await.unwrap(),
+        None,
+        Some(&p1),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(rows(&by_p), RowCountHint::at_most(600 + 3));
     assert_eq!(by_p.size().await.unwrap(), 602);
 }
@@ -552,18 +538,17 @@ async fn test_index_components_classify_children_by_slug() {
         for (pattern, view, served, rows) in [
             (
                 "predicate",
-                store.match_pattern(None, Some(&p1), None, None).await,
+                matched_view(&store, None, Some(&p1), None, None).await,
                 None,
                 expected_strings(&quads, |i| i % 5 == 1),
             ),
             (
                 "object",
-                store.match_pattern(None, None, Some(&o3), None).await,
+                matched_view(&store, None, None, Some(&o3), None).await,
                 Some("index:ospg"),
                 expected_strings(&quads, |i| i % 7 == 3),
             ),
         ] {
-            let view = view.unwrap();
             let stats = view.view_statistics().unwrap();
             assert_eq!(stats.served_component, served, "{open} {pattern}");
             assert_eq!(view_strings(&view).await, rows, "{open} {pattern}");

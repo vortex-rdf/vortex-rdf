@@ -67,38 +67,23 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
         ("whole", store.clone()),
         (
             "p-bound",
-            store
-                .match_pattern(None, Some(&p1), None, None)
-                .await
-                .unwrap(),
+            matched_view(store, None, Some(&p1), None, None).await,
         ),
         (
             "o-bound",
-            store
-                .match_pattern(None, None, Some(&o3), None)
-                .await
-                .unwrap(),
+            matched_view(store, None, None, Some(&o3), None).await,
         ),
         (
             "s-bound",
-            store
-                .match_pattern(Some(&s42), None, None, None)
-                .await
-                .unwrap(),
+            matched_view(store, Some(&s42), None, None, None).await,
         ),
         (
             "sp-bound",
-            store
-                .match_pattern(Some(&s42), Some(&p1), None, None)
-                .await
-                .unwrap(),
+            matched_view(store, Some(&s42), Some(&p1), None, None).await,
         ),
         (
             "po-bound",
-            store
-                .match_pattern(None, Some(&p1), Some(&o3), None)
-                .await
-                .unwrap(),
+            matched_view(store, None, Some(&p1), Some(&o3), None).await,
         ),
     ];
     for (view_tag, view) in &views {
@@ -120,10 +105,7 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
                     "{tag}/{view_tag}: exists"
                 );
                 // A keep composes with a later match, and with a second keep.
-                let chained = narrowed
-                    .match_pattern(None, Some(&p1), None, None)
-                    .await
-                    .unwrap();
+                let chained = matched_view(&narrowed, None, Some(&p1), None, None).await;
                 let p1_code = store
                     .dict_reader()
                     .unwrap()
@@ -176,31 +158,19 @@ async fn slicing_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfSt
         ("whole", store.clone()),
         (
             "p-bound",
-            store
-                .match_pattern(None, Some(&p1), None, None)
-                .await
-                .unwrap(),
+            matched_view(store, None, Some(&p1), None, None).await,
         ),
         (
             "o-bound",
-            store
-                .match_pattern(None, None, Some(&o3), None)
-                .await
-                .unwrap(),
+            matched_view(store, None, None, Some(&o3), None).await,
         ),
         (
             "s-bound",
-            store
-                .match_pattern(Some(&s42), None, None, None)
-                .await
-                .unwrap(),
+            matched_view(store, Some(&s42), None, None, None).await,
         ),
         (
             "po-bound",
-            store
-                .match_pattern(None, Some(&p1), Some(&o3), None)
-                .await
-                .unwrap(),
+            matched_view(store, None, Some(&p1), Some(&o3), None).await,
         ),
         (
             "kept",
@@ -327,10 +297,7 @@ async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
         .await
         .unwrap();
     let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s3").unwrap());
-    let run = store
-        .match_pattern(Some(&s3), None, None, None)
-        .await
-        .unwrap();
+    let run = matched_view(&store, Some(&s3), None, None, None).await;
     assert_eq!(run.debug_selection_range(), Some(24..32), "{tag}");
     let rows = row_set(&run).await;
     let dict = store.dict_reader().unwrap();
@@ -383,10 +350,7 @@ async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
     let store = unprobed_object_store().await;
     assert_eq!(store.debug_base_child_int_canonical("o"), Some(false));
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     for (tag, view) in [("whole", store.clone()), ("p-bound", by_p)] {
         let rows = row_set(&view).await;
         for keep in keeps_for(&store, QuadColumn::O).await {
@@ -461,10 +425,7 @@ async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
     let (g_lo, g_hi) = dict.prefix_range("<http://example.org/g").await.unwrap();
     let (p_lo, p_hi) = dict.prefix_range("<http://example.org/p").await.unwrap();
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     let keeps = [
         (QuadColumn::G, Keep::range(g_lo..g_hi)),
         (QuadColumn::G, Keep::range(g_lo..g_lo + 1)),
@@ -493,10 +454,7 @@ async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
         }
     }
     let o3 = Term::Literal(Literal::new_simple_literal("o3"));
-    let point = store
-        .match_pattern(None, Some(&p1), Some(&o3), None)
-        .await
-        .unwrap();
+    let point = matched_view(&store, None, Some(&p1), Some(&o3), None).await;
     let rows = row_list(&point).await;
     assert!(
         !rows.is_empty() && rows.len() <= 256,

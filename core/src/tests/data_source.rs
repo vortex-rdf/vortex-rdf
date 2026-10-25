@@ -563,10 +563,7 @@ async fn test_data_source_request_semantics() {
         // a limit, a range ending mid-chunk, one starting past the first
         // chunk, and one starting mid-chunk under a selection of every 7th
         // row.
-        let filtered = mapped
-            .match_pattern(None, Some(&p0), None, None)
-            .await
-            .unwrap();
+        let filtered = matched_view(&mapped, None, Some(&p0), None, None).await;
         assert!(filtered.view_statistics().unwrap().pending_filter);
         let tombstoned = mapped
             .delete_matching(None, Some(&p0), None, None)

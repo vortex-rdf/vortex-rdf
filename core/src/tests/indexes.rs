@@ -54,10 +54,7 @@ async fn test_duplicate_index_requests_are_deduplicated() {
         // Index-routed matching still works.
         let store = VortexRdfStore::from_built(arr).unwrap();
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let matched = store
-            .match_pattern(None, Some(&p1), None, None)
-            .await
-            .unwrap();
+        let matched = matched_view(&store, None, Some(&p1), None, None).await;
         assert_eq!(matched.size().await.unwrap(), 1, "{layout:?}");
 
         // The out-of-core builder, on a repeated request out of order: each
@@ -111,10 +108,7 @@ async fn test_in_memory_derived_view_keeps_indexes() {
 
     // Match on the object index: 24 quads over 4 objects ⇒ 6 rows.
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
-    let matched = store
-        .match_pattern(None, None, Some(&object), None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, None, None, Some(&object), None).await;
     assert_eq!(matched.size().await.unwrap(), 6);
     assert_eq!(
         matched.indexes(),
@@ -126,10 +120,7 @@ async fn test_in_memory_derived_view_keeps_indexes() {
     // rows (i = 1, 5, 9, 13, 17, 21), the ones with predicate p1 are
     // i ≡ 1 (mod 3): 1, 13 — the intersection of two index lookups.
     let predicate = NamedNode::new("http://example.org/p1").unwrap();
-    let chained = matched
-        .match_pattern(None, Some(&predicate), None, None)
-        .await
-        .unwrap();
+    let chained = matched_view(&matched, None, Some(&predicate), None, None).await;
     assert_eq!(
         subjects_of(&chained).await,
         vec![
@@ -157,10 +148,7 @@ async fn test_compact_with_indexes_rebuilds() {
 
     // A view over the object index: i = 1, 5, 9, 13, 17, 21 ⇒ 6 rows.
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
-    let view = store
-        .match_pattern(None, None, Some(&object), None)
-        .await
-        .unwrap();
+    let view = matched_view(&store, None, None, Some(&object), None).await;
     assert_eq!(view.size().await.unwrap(), 6);
 
     // An empty index set drops the index and keeps exactly the view's rows.
@@ -191,10 +179,7 @@ async fn test_compact_with_indexes_rebuilds() {
         .await
         .unwrap();
     assert_eq!(reindexed.indexes(), &[IndexType::SecondaryByReference]);
-    let routed = reindexed
-        .match_pattern(None, None, Some(&object), None)
-        .await
-        .unwrap();
+    let routed = matched_view(&reindexed, None, None, Some(&object), None).await;
     assert_eq!(routed.size().await.unwrap(), 6);
 }
 
@@ -208,10 +193,8 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
     let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
 
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
-    let indexed = store
-        .match_pattern(None, None, Some(&object), None)
+    let indexed = matched_view(&store, None, None, Some(&object), None)
         .await
-        .unwrap()
         .compact_with_indexes(vec![IndexType::SecondaryByReference])
         .await
         .unwrap();
@@ -221,13 +204,7 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
     // Route through both the rebuilt object and predicate columns.
     let predicate = NamedNode::new("http://example.org/p1").unwrap();
     assert_eq!(
-        subjects_of(
-            &indexed
-                .match_pattern(None, Some(&predicate), None, None)
-                .await
-                .unwrap()
-        )
-        .await,
+        subjects_of(&matched_view(&indexed, None, Some(&predicate), None, None).await).await,
         vec![
             "<http://example.org/s01>".to_string(),
             "<http://example.org/s13>".to_string(),
@@ -240,19 +217,14 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
 
     // The copy family rebuilds the same way: its sorted copies are cut from
     // the gathered rows, and a predicate match is then served from them.
-    let by_copy = store
-        .match_pattern(None, None, Some(&object), None)
+    let by_copy = matched_view(&store, None, None, Some(&object), None)
         .await
-        .unwrap()
         .compact_with_indexes(vec![IndexType::SecondaryByCopy])
         .await
         .unwrap();
     assert_eq!(by_copy.indexes(), &[IndexType::SecondaryByCopy]);
     assert_eq!(by_copy.size().await.unwrap(), 6);
-    let served = by_copy
-        .match_pattern(None, Some(&predicate), None, None)
-        .await
-        .unwrap();
+    let served = matched_view(&by_copy, None, Some(&predicate), None, None).await;
     assert_eq!(
         served_component(&served),
         Some("index:posg"),
@@ -280,10 +252,8 @@ async fn run_compact_to_empty_keeps_indexes(layout: LayoutStrategy) {
 
     // A pattern nothing matches: the view is empty, and so is its compaction.
     let absent = Term::Literal(Literal::new_simple_literal("no such object"));
-    let empty = store
-        .match_pattern(None, None, Some(&absent), None)
+    let empty = matched_view(&store, None, None, Some(&absent), None)
         .await
-        .unwrap()
         .compact_with_indexes(vec![IndexType::SecondaryByReference])
         .await
         .unwrap();
@@ -331,10 +301,7 @@ async fn test_compact_with_indexes_typed_object_routes_every_object_kind() {
     assert_eq!(indexed.indexes(), &[IndexType::SecondaryByReference]);
     assert_eq!(view_strings(&indexed).await, quad_strings(&quads));
     for quad in &quads {
-        let by_o = indexed
-            .match_pattern(None, None, Some(&quad.object), None)
-            .await
-            .unwrap();
+        let by_o = matched_view(&indexed, None, None, Some(&quad.object), None).await;
         assert_eq!(
             view_strings(&by_o).await,
             vec![quad.to_string()],
@@ -381,10 +348,7 @@ async fn test_delete_keeps_indexes_usable() {
     // "object 0" is on i = 0, 3, 6, 9; the index still routes the lookup,
     // and the tombstoned row must not come back.
     let object = Term::Literal(Literal::new_simple_literal("object 0"));
-    let matched = after
-        .match_pattern(None, None, Some(&object), None)
-        .await
-        .unwrap();
+    let matched = matched_view(&after, None, None, Some(&object), None).await;
     assert_eq!(matched.size().await.unwrap(), 3);
     assert_eq!(
         subjects_of(&matched).await,
@@ -489,10 +453,7 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
     let codes = layout == LayoutStrategy::Dictionary;
     let s05 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
     let before = probe_hooks::binds();
-    let by_subject = store
-        .match_pattern(Some(&s05), None, None, None)
-        .await
-        .unwrap();
+    let by_subject = matched_view(&store, Some(&s05), None, None, None).await;
     if codes {
         cached_searches(before, "subject");
     }
@@ -509,10 +470,7 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
 
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let before = probe_hooks::binds();
-    let by_pred = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
+    let by_pred = matched_view(&store, None, Some(&p0), None, None).await;
     if index_searched {
         cached_searches(before, "predicate");
     }
@@ -529,10 +487,7 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
 
     let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
     let before = probe_hooks::binds();
-    let by_obj = store
-        .match_pattern(None, None, Some(&o1), None)
-        .await
-        .unwrap();
+    let by_obj = matched_view(&store, None, None, Some(&o1), None).await;
     if index_searched {
         cached_searches(before, "object");
     }
@@ -548,10 +503,7 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
     );
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let by_both = store
-        .match_pattern(None, Some(&p1), Some(&o1), None)
-        .await
-        .unwrap();
+    let by_both = matched_view(&store, None, Some(&p1), Some(&o1), None).await;
     assert_eq!(
         by_both.size().await.unwrap(),
         2,
@@ -683,10 +635,7 @@ pub(super) async fn run_copy_index_serving_script(
     // Predicate-bound: i ≡ 1 (mod 3), served from the POSG family's run —
     // the served `quads()` and the row-id `size()` must agree.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p), Some("index:posg"));
     assert_eq!(selection_pending(&by_p), expect.served_pending);
     assert_eq!(by_p.size().await.unwrap(), 10);
@@ -703,10 +652,7 @@ pub(super) async fn run_copy_index_serving_script(
 
     // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
-    let by_o = store
-        .match_pattern(None, None, Some(&o2), None)
-        .await
-        .unwrap();
+    let by_o = matched_view(&store, None, None, Some(&o2), None).await;
     assert_eq!(served_component(&by_o), Some("index:ospg"));
     assert_eq!(selection_pending(&by_o), expect.served_pending);
     assert_eq!(by_o.size().await.unwrap(), 6);
@@ -719,10 +665,7 @@ pub(super) async fn run_copy_index_serving_script(
     // pattern — i ≡ 1 (mod 3) ∧ i ≡ 1 (mod 5) ⇔ i ≡ 1 (mod 15) — so the
     // narrowed run is served directly.
     let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-    let by_po = store
-        .match_pattern(None, Some(&p1), Some(&o1), None)
-        .await
-        .unwrap();
+    let by_po = matched_view(&store, None, Some(&p1), Some(&o1), None).await;
     assert_eq!(served_component(&by_po), Some("index:posg"));
     assert_eq!(selection_pending(&by_po), expect.served_pending);
     assert_eq!(by_po.size().await.unwrap(), 2);
@@ -733,10 +676,7 @@ pub(super) async fn run_copy_index_serving_script(
 
     // A residual graph constraint on top of the resolved predicate.
     let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let by_pg = store
-        .match_pattern(None, Some(&p2), None, Some(&graphs[0]))
-        .await
-        .unwrap();
+    let by_pg = matched_view(&store, None, Some(&p2), None, Some(&graphs[0])).await;
     assert_eq!(
         served_component(&by_pg),
         expect.residual_graph_served.then_some("index:posg")
@@ -753,10 +693,7 @@ pub(super) async fn run_copy_index_serving_script(
 
     // Chaining narrows the first view's row ids — materializing them — so
     // its serve plan drops (its filter no longer selects exactly the rows).
-    let chained = by_p
-        .match_pattern(None, None, Some(&o1), None)
-        .await
-        .unwrap();
+    let chained = matched_view(&by_p, None, None, Some(&o1), None).await;
     assert_eq!(served_component(&chained), None);
     assert!(!selection_pending(&chained));
     assert_eq!(
@@ -766,19 +703,13 @@ pub(super) async fn run_copy_index_serving_script(
 
     // A term the store has never seen short-circuits to empty.
     let missing = NamedNode::new("http://example.org/nope").unwrap();
-    let none = store
-        .match_pattern(None, Some(&missing), None, None)
-        .await
-        .unwrap();
+    let none = matched_view(&store, None, Some(&missing), None, None).await;
     assert_eq!(none.size().await.unwrap(), 0);
 
     // A term the store knows — but never as a predicate — probes the index
     // child and finds nothing.
     let subject_as_p = NamedNode::new("http://example.org/s00").unwrap();
-    let zero = store
-        .match_pattern(None, Some(&subject_as_p), None, None)
-        .await
-        .unwrap();
+    let zero = matched_view(&store, None, Some(&subject_as_p), None, None).await;
     assert_eq!(selection_pending(&zero), expect.never_predicate_pending);
     assert_eq!(view_strings(&zero).await, Vec::<String>::new());
     assert_eq!(zero.size().await.unwrap(), 0);
@@ -794,10 +725,7 @@ pub(super) async fn run_copy_index_serving_script(
     );
     let tailed = store.add_quad(appended.clone()).await.unwrap();
     assert_eq!(tailed.indexes(), &[IndexType::SecondaryByCopy]);
-    let by_p_tailed = tailed
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p_tailed = matched_view(&tailed, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p_tailed), Some("index:posg"));
     assert_eq!(by_p_tailed.size().await.unwrap(), 11);
     let mut want = expected_strings(quads, |i| i % 3 == 1);
@@ -808,10 +736,7 @@ pub(super) async fn run_copy_index_serving_script(
     // A tombstoned row vanishes from served streams too: the read takes copy
     // rows, so the delete reaches it through the family's rid column.
     let deleted = store.delete_quad(&quads[4]).await.unwrap();
-    let by_p_after = deleted
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p_after = matched_view(&deleted, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p_after), Some("index:posg"));
     assert_eq!(by_p_after.size().await.unwrap(), 9);
     assert_eq!(
@@ -826,10 +751,7 @@ pub(super) async fn run_copy_index_serving_script(
         .await
         .unwrap();
     assert_eq!(wiped.size().await.unwrap(), 20);
-    let by_p_wiped = wiped
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p_wiped = matched_view(&wiped, None, Some(&p1), None, None).await;
     assert_eq!(by_p_wiped.size().await.unwrap(), 0);
     assert_eq!(view_strings(&by_p_wiped).await, Vec::<String>::new());
 }
@@ -878,10 +800,7 @@ async fn test_in_memory_copy_index_serving() {
     // included, while one that cuts a row drops the plan and reads base
     // order.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p), Some("index:posg"));
     let size = by_p.size().await.unwrap();
     let whole = by_p.window(0, size).await.unwrap();
@@ -939,10 +858,7 @@ async fn test_in_memory_copy_index_serving() {
     .await;
     let o1 = Term::Literal(Literal::new_simple_literal("o1"));
     for (object, width, point_read) in [(Some(&o1), 43, true), (None, 300, false)] {
-        let by_p = store
-            .match_pattern(None, Some(&p1), object, None)
-            .await
-            .unwrap();
+        let by_p = matched_view(&store, None, Some(&p1), object, None).await;
         assert_eq!(served_component(&by_p), Some("index:posg"));
         let before = point_reads();
         let served: Vec<Quad> = by_p.quads().try_collect().await.unwrap();
@@ -998,10 +914,7 @@ async fn test_built_store_compresses_resident_form() {
     // The payload path still answers: codes decode to exactly the matched
     // quads (first touch materializes the shared canonical, then zero-copy).
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, None, Some(&p1), None, None).await;
     let cols = matched
         .code_columns()
         .expect("compressed base still serves codes through its shared wrappers");
@@ -1062,10 +975,7 @@ async fn test_code_columns_serves_from_the_answering_index() {
     .await;
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let matched = matched_view(&store, None, Some(&p1), None, None).await;
     assert!(selection_pending(&matched));
 
     let cols = matched
@@ -1123,10 +1033,8 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
         )
         .await
         .unwrap();
-        let all = store
-            .match_pattern(None, Some(&p1), None, None)
+        let all = matched_view(&store, None, Some(&p1), None, None)
             .await
-            .unwrap()
             .code_columns_gathered()
             .await
             .unwrap()

@@ -564,9 +564,20 @@ async fn built_store(quads: Vec<Quad>, layout: LayoutStrategy, indexes: Indexes)
     VortexRdfStore::from_built(built).unwrap()
 }
 
-/// The number of quads `store` holds for the pattern `(s, p, o, g)`: a
-/// [`match_pattern`](VortexRdfStore::match_pattern) and its
-/// [`size`](VortexRdfStore::size), both unwrapped.
+/// The view of `store` the pattern `(s, p, o, g)` matches: a
+/// [`match_pattern`](VortexRdfStore::match_pattern), unwrapped.
+async fn matched_view(
+    store: &VortexRdfStore,
+    s: Option<&NamedOrBlankNode>,
+    p: Option<&NamedNode>,
+    o: Option<&Term>,
+    g: Option<&GraphName>,
+) -> VortexRdfStore {
+    store.match_pattern(s, p, o, g).await.unwrap()
+}
+
+/// The number of quads `store` holds for the pattern `(s, p, o, g)`: the
+/// [`matched_view`]'s [`size`](VortexRdfStore::size), unwrapped.
 async fn matched_size(
     store: &VortexRdfStore,
     s: Option<&NamedOrBlankNode>,
@@ -574,13 +585,7 @@ async fn matched_size(
     o: Option<&Term>,
     g: Option<&GraphName>,
 ) -> usize {
-    store
-        .match_pattern(s, p, o, g)
-        .await
-        .unwrap()
-        .size()
-        .await
-        .unwrap()
+    matched_view(store, s, p, o, g).await.size().await.unwrap()
 }
 
 /// The index child that answers `view`'s reads from its own columns, if any:
@@ -1056,30 +1061,18 @@ async fn views_of(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)>
     let o3 = Term::Literal(Literal::new_simple_literal("o3"));
     let dict = store.dict_reader().unwrap();
     let (lo, hi) = dict.prefix_range("<http://example.org/s1").await.unwrap();
-    let predicate = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
-    let chained = predicate
-        .match_pattern(None, None, Some(&o3), None)
-        .await
-        .unwrap();
+    let predicate = matched_view(store, None, Some(&p1), None, None).await;
+    let chained = matched_view(&predicate, None, None, Some(&o3), None).await;
     vec![
         ("whole", store.clone()),
         (
             "subject",
-            store
-                .match_pattern(Some(&s), None, None, None)
-                .await
-                .unwrap(),
+            matched_view(store, Some(&s), None, None, None).await,
         ),
         ("predicate", predicate),
         (
             "object",
-            store
-                .match_pattern(None, None, Some(&o3), None)
-                .await
-                .unwrap(),
+            matched_view(store, None, None, Some(&o3), None).await,
         ),
         (
             "keep",
@@ -1380,19 +1373,13 @@ fn two_quads() -> Vec<Quad> {
 /// columns, hit and miss.
 async fn probe_default(store: VortexRdfStore) {
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let filtered = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
+    let filtered = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(filtered.size().await.unwrap(), 1);
     let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
 
     let p3 = NamedNode::new("http://example.org/p3").unwrap();
-    let empty = store
-        .match_pattern(None, Some(&p3), None, None)
-        .await
-        .unwrap();
+    let empty = matched_view(&store, None, Some(&p3), None, None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 }
 
@@ -1400,27 +1387,18 @@ async fn probe_default(store: VortexRdfStore) {
 /// typed o_kind/o_value columns), hit and miss, and a bound predicate.
 async fn probe_typed_object(store: VortexRdfStore) {
     let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-    let filtered = store
-        .match_pattern(None, None, Some(&o1), None)
-        .await
-        .unwrap();
+    let filtered = matched_view(&store, None, None, Some(&o1), None).await;
     assert_eq!(filtered.size().await.unwrap(), 1);
     let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
     assert_eq!(results[0].object.to_string(), "\"o1\"");
 
     let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let matched_p = store
-        .match_pattern(None, Some(&p2), None, None)
-        .await
-        .unwrap();
+    let matched_p = matched_view(&store, None, Some(&p2), None, None).await;
     assert_eq!(matched_p.size().await.unwrap(), 1);
 
     let o3 = Term::Literal(Literal::new_simple_literal("o3"));
-    let empty = store
-        .match_pattern(None, None, Some(&o3), None)
-        .await
-        .unwrap();
+    let empty = matched_view(&store, None, None, Some(&o3), None).await;
     assert_eq!(empty.size().await.unwrap(), 0);
 }
 
@@ -1593,11 +1571,11 @@ async fn assert_patterns_agree(
     patterns: &[Pattern<'_>],
 ) {
     for &(name, s, p, o, g) in patterns {
-        let expected = want.match_pattern(s, p, o, g).await.unwrap();
+        let expected = matched_view(want, s, p, o, g).await;
         let size = expected.size().await.unwrap();
         let strings = view_strings(&expected).await;
         for (kind, store) in got {
-            let view = store.match_pattern(s, p, o, g).await.unwrap();
+            let view = matched_view(store, s, p, o, g).await;
             assert_eq!(
                 view.size().await.unwrap(),
                 size,
