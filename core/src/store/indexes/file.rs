@@ -628,16 +628,19 @@ mod tests {
     /// splits.
     #[tokio::test]
     async fn index_row_id_scans_drive_inline_whatever_the_limit() {
-        use crate::IndexType;
         use crate::io::read::scan_all_reader;
         use crate::store::array::{field_as, into_struct_array};
         use crate::store::scan::file_scans::driver_hooks;
+        use crate::{IndexType, LayoutStrategy};
 
         let rows = 50;
-        let quads = crate::tests::modular_quads_for_tests(rows);
-        let (_dir, path) =
-            crate::tests::write_store_file_for_tests(quads, vec![IndexType::SecondaryByReference])
-                .await;
+        let quads = crate::tests::modular_quads(rows, 3, 4);
+        let (_dir, path) = crate::tests::write_store_file(
+            quads,
+            LayoutStrategy::Dictionary,
+            vec![IndexType::SecondaryByReference],
+        )
+        .await;
         let file = crate::tests::open_mapped(&path).await;
         let child = file
             .child_reader("index:ref-p")

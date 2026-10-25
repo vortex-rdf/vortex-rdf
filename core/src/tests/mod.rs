@@ -98,7 +98,7 @@ fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
 /// zero-padded to two digits (lexicographic order is numeric order below
 /// 100); predicates and objects recur on their moduli, so match
 /// selectivities are arithmetic.
-fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
+pub(crate) fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
     (0..n)
         .map(|i| {
             make_quad(
@@ -114,7 +114,7 @@ fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
 /// Serialize `quads` with `quads_stream_to_vortex_file` into `store.vortex`
 /// inside a fresh temp dir, handing back the dir guard beside the path. Keep
 /// the `TempDir` alive for the store's lifetime.
-async fn write_store_file(
+pub(crate) async fn write_store_file(
     quads: Vec<Quad>,
     layout: LayoutStrategy,
     indexes: Indexes,
@@ -125,23 +125,6 @@ async fn write_store_file(
         .await
         .unwrap();
     (dir, path)
-}
-
-/// [`modular_quads`] at the stock moduli (three predicates, four objects),
-/// for the unit tests that sit beside the code they cover, outside this
-/// module's tree.
-pub(crate) fn modular_quads_for_tests(n: usize) -> Vec<Quad> {
-    modular_quads(n, 3, 4)
-}
-
-/// [`write_store_file`] in the Dictionary layout, for the unit tests that sit
-/// beside the code they cover, outside this module's tree. Keep the `TempDir`
-/// alive for the store's lifetime.
-pub(crate) async fn write_store_file_for_tests(
-    quads: Vec<Quad>,
-    indexes: Indexes,
-) -> (tempfile::TempDir, std::path::PathBuf) {
-    write_store_file(quads, LayoutStrategy::Dictionary, indexes).await
 }
 
 /// A Dictionary-layout store file holding `quads` out of subject order —
@@ -926,7 +909,8 @@ pub(crate) async fn mapped_file(
     tempfile::TempDir,
     crate::store::persist::native_file::NativeStoreFile,
 ) {
-    let (dir, path) = write_store_file_for_tests(modular_quads_for_tests(n), indexes).await;
+    let (dir, path) =
+        write_store_file(modular_quads(n, 3, 4), LayoutStrategy::Dictionary, indexes).await;
     (dir, open_mapped(&path).await)
 }
 
