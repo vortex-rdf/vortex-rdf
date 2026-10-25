@@ -60,13 +60,10 @@ pub(crate) const COL_RID: &str = "rid";
 #[inline]
 fn row_id_base() -> RowId {
     #[cfg(test)]
-    {
-        crate::store::test_hooks::row_id_base()
+    if let Some(base) = crate::store::test_hooks::row_id_base() {
+        return base;
     }
-    #[cfg(not(test))]
-    {
-        0
-    }
+    0
 }
 
 /// The most quads an indexed build numbers: one per row id from the base up

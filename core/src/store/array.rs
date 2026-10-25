@@ -247,6 +247,7 @@ pub(crate) mod rechunk_hooks {
     use std::cell::Cell;
 
     use crate::error::{Result, VortexRdfError};
+    use crate::store::test_hooks::Override;
 
     thread_local! {
         static CUTS: Cell<usize> = const { Cell::new(0) };
@@ -272,19 +273,16 @@ pub(crate) mod rechunk_hooks {
     /// While alive, the cut this thread's `rechunk` iterators make `n` cuts
     /// from now (`0`: the next) fails. Dropping it restores the failure it
     /// replaced.
-    pub(crate) struct FailingCut(Option<usize>);
+    pub(crate) struct FailingCut {
+        _guard: Override<usize>,
+    }
 
     impl FailingCut {
         /// Fail the cut `n` cuts from now.
         pub(crate) fn after(n: usize) -> Self {
-            let cut = cuts() + n;
-            FailingCut(FAILING.with(|c| c.replace(Some(cut))))
-        }
-    }
-
-    impl Drop for FailingCut {
-        fn drop(&mut self) {
-            FAILING.with(|c| c.set(self.0));
+            Self {
+                _guard: Override::set(&FAILING, cuts() + n),
+            }
         }
     }
 }

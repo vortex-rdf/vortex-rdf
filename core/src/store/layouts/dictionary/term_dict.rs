@@ -35,15 +35,6 @@ pub(crate) struct TermDictionary {
     kinds: OnceLock<KindRanges>,
 }
 
-/// The code a dictionary built or opened now gives its first term: the
-/// tests' `CodeBase` hook, which can start a thread's dictionaries past
-/// `u32::MAX` so a few terms exercise codes no 32-bit width holds. Read once
-/// per dictionary; outside the tests every dictionary starts at 0.
-#[cfg(test)]
-pub(crate) fn code_base() -> TermCode {
-    crate::store::test_hooks::code_base()
-}
-
 /// The rank of `code` in a dictionary of `len` terms from `base`; `None` when
 /// no term has that code. The one code → rank conversion, checked: a code
 /// past what a `usize` holds (on a 32-bit target) is outside, never wrapped
@@ -58,18 +49,21 @@ fn code_rank(code: TermCode, base: TermCode, len: usize) -> Option<usize> {
 /// term's code. Both residencies convert between code and rank through one.
 #[derive(Clone, Copy)]
 pub(super) struct CodeSpace {
-    /// The code of the first term (see `code_base`).
+    /// The code of the first term: 0, unless the tests' `CodeBase` hook
+    /// starts this thread's dictionaries past `u32::MAX`, so a few terms
+    /// exercise codes no 32-bit width holds. Read once per dictionary.
     #[cfg(test)]
     base: TermCode,
     len: usize,
 }
 
 impl CodeSpace {
-    /// The codes of `len` terms, from 0 (from `code_base` under the tests).
+    /// The codes of `len` terms, from 0 (from the `CodeBase` hook's base
+    /// under the tests).
     pub(super) fn new(len: usize) -> Self {
         Self {
             #[cfg(test)]
-            base: code_base(),
+            base: crate::store::test_hooks::code_base().unwrap_or(0),
             len,
         }
     }

@@ -72,6 +72,7 @@ pub(crate) mod driver_hooks {
     use std::cell::Cell;
 
     use super::ScanDriver;
+    use crate::store::test_hooks::Override;
 
     thread_local! {
         static LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
@@ -84,20 +85,14 @@ pub(crate) mod driver_hooks {
 
     /// Forces the split limit to `limit` on this thread until dropped.
     pub(crate) struct ForcedLimit {
-        previous: Option<usize>,
+        _guard: Override<usize>,
     }
 
     impl ForcedLimit {
         pub(crate) fn set(limit: usize) -> Self {
             Self {
-                previous: LIMIT.replace(Some(limit)),
+                _guard: Override::set(&LIMIT, limit),
             }
-        }
-    }
-
-    impl Drop for ForcedLimit {
-        fn drop(&mut self) {
-            LIMIT.set(self.previous);
         }
     }
 
