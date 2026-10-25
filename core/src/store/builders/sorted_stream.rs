@@ -165,17 +165,14 @@ impl Encoding {
         match self {
             Encoding::Codes { dict } => {
                 let n = ranks.len();
-                let mut codes = QuadCodes {
-                    s: Vec::with_capacity(n),
-                    p: Vec::with_capacity(n),
-                    o: Vec::with_capacity(n),
-                    g: Vec::with_capacity(n),
-                };
+                let mut codes = QuadCodes::with_capacity(n);
                 for &[s, p, o, g] in ranks {
-                    codes.s.push(code_of_rank(dict, s)?);
-                    codes.p.push(code_of_rank(dict, p)?);
-                    codes.o.push(code_of_rank(dict, o)?);
-                    codes.g.push(code_of_rank(dict, g)?);
+                    codes.push([
+                        code_of_rank(dict, s)?,
+                        code_of_rank(dict, p)?,
+                        code_of_rank(dict, o)?,
+                        code_of_rank(dict, g)?,
+                    ]);
                 }
                 dictionary::build_code_chunk(&codes, 0..n, true)
             }

@@ -187,14 +187,9 @@ impl TermDictionary {
         )]))
     }
 
-    /// A dictionary of sorted unique `terms`, FSST-compressed in windows
-    /// ([`compress`](Self::compress)).
-    pub(super) fn from_sorted<'a>(terms: impl Iterator<Item = &'a str> + Clone) -> Result<Self> {
-        Self::from_sorted_column(VarBinViewArray::from_iter_str(terms))
-    }
-
-    /// [`from_sorted`](Self::from_sorted) over an assembled plaintext column;
-    /// a `Serialization` error past `i32::MAX` terms.
+    /// A dictionary of `plain`'s sorted unique terms, FSST-compressed in
+    /// windows ([`compress`](Self::compress)); a `Serialization` error past
+    /// `i32::MAX` terms.
     pub(crate) fn from_sorted_column(plain: VarBinViewArray) -> Result<Self> {
         // A conservative cap, not a format limit: nothing in the format needs
         // the count to fit an `i32` (the column's length is a `usize`, codes
