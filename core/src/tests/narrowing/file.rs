@@ -205,8 +205,8 @@ async fn test_distinct_constants_retire_the_reader_tree() {
     );
 }
 
-/// One 160,000-row file, past one scan split's worth of rows, serves both
-/// multi-split keep checks below.
+/// One 160,000-row file, past one scan split's worth of rows, opened mapped
+/// once, serves both multi-split keep checks below over the same views.
 #[tokio::test]
 async fn test_keeps_on_a_multi_split_file() {
     let (_dir, path) = multi_window_dictionary_file().await;
@@ -215,32 +215,38 @@ async fn test_keeps_on_a_multi_split_file() {
         opened.splits().unwrap().len() > 1,
         "the fixture must span several scan splits"
     );
-    keep_spans_scan_splits(&path).await;
-    s_keeps_match_brute_force(&path).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let views = split_file_views(&store).await;
+    keep_spans_scan_splits(&store, &views).await;
+    s_keeps_match_brute_force(&store, &views).await;
+}
+
+/// The views of the multi-split file both of its keep checks narrow, each
+/// beside its tag: the whole file, a pending filter (`p0`) and a row window.
+async fn split_file_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
+    let p0 = iri("p0");
+    vec![
+        ("whole", store.clone()),
+        (
+            "filtered",
+            matched_view(store, None, Some(&p0), None, None).await,
+        ),
+        ("window", store.window(10_000, 140_000).await.unwrap()),
+    ]
 }
 
 /// Past one scan split's worth of rows the column streams in several
 /// chunks: the positions a keep admits must carry across the chunk
 /// boundaries, over the whole file, a pending filter, a row window and a
 /// keep chained on a keep.
-async fn keep_spans_scan_splits(path: &std::path::Path) {
-    let store = VortexRdfStore::from_file(path).await.unwrap();
+async fn keep_spans_scan_splits(store: &VortexRdfStore, views: &[(&str, VortexRdfStore)]) {
     let dict = store.dict_reader().unwrap();
     let (o_lo, _) = dict.prefix_range("\"object ").await.unwrap();
     let (s_lo, s_hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
     let objects = Keep::set([o_lo + 1, o_lo + 5]);
     let subjects = Keep::range(s_lo..s_lo + (s_hi - s_lo) / 2);
-    let p0 = iri("p0");
-    let views = [
-        ("whole", store.clone()),
-        (
-            "filtered",
-            matched_view(&store, None, Some(&p0), None, None).await,
-        ),
-        ("window", store.window(10_000, 140_000).await.unwrap()),
-    ];
     for (tag, view) in views {
-        let rows = sorted_rows(&view).await;
+        let rows = sorted_rows(view).await;
         let narrowed = view.keep(QuadColumn::O, &objects).await.unwrap();
         let expected = brute_keep(&rows, QuadColumn::O, &objects);
         assert!(!expected.is_empty() && expected.len() < rows.len(), "{tag}");
@@ -785,27 +791,18 @@ async fn test_s_keeps_on_an_unsorted_file_stream() {
 /// keeps — ranges, small and mid-size sets looked up, a wide set streamed
 /// — over the whole file, a pending filter, a row window and an id list
 /// agree with brute force.
-async fn s_keeps_match_brute_force(path: &std::path::Path) {
-    let store = VortexRdfStore::from_file(path).await.unwrap();
+async fn s_keeps_match_brute_force(store: &VortexRdfStore, views: &[(&str, VortexRdfStore)]) {
     let dict = store.dict_reader().unwrap();
     let (o_lo, _) = dict.prefix_range("\"object ").await.unwrap();
     let (lo, hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
-    let p0 = iri("p0");
-    let views = [
-        ("whole", store.clone()),
-        (
-            "filtered",
-            matched_view(&store, None, Some(&p0), None, None).await,
-        ),
-        ("window", store.window(10_000, 140_000).await.unwrap()),
-        (
-            "ids",
-            store
-                .keep(QuadColumn::O, &Keep::set([o_lo + 1, o_lo + 5]))
-                .await
-                .unwrap(),
-        ),
-    ];
+    let mut views = views.to_vec();
+    views.push((
+        "ids",
+        store
+            .keep(QuadColumn::O, &Keep::set([o_lo + 1, o_lo + 5]))
+            .await
+            .unwrap(),
+    ));
     // (name, keep, looked up rather than streamed)
     let keeps = [
         ("first half", Keep::range(lo..lo + (hi - lo) / 2), true),

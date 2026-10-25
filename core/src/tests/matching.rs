@@ -221,12 +221,27 @@ fn prefix_terms() -> (NamedOrBlankNode, NamedNode, Term, GraphName) {
     )
 }
 
+/// The bound prefixes of the sort order past `(s, p)` of [`prefix_terms`]
+/// over [`prefix_quads`]: the object and graph each binds beside the subject
+/// and predicate, and the run of sorted rows it resolves to. They are
+/// `(s, p)`, `(s, p, o)`, `(s, p, o, g)`, and `(s, p, o)` in the default
+/// graph, a dictionary term like any other (`""`).
+fn prefix_runs() -> [(Option<Term>, Option<GraphName>, std::ops::Range<u64>); 4] {
+    let (_, _, o, g) = prefix_terms();
+    [
+        (None, None, 16..20),
+        (Some(o.clone()), None, 18..20),
+        (Some(o.clone()), Some(g), 19..20),
+        (Some(o), Some(GraphName::DefaultGraph), 18..19),
+    ]
+}
+
 /// Every bound prefix of the sort order resolves to one exact row range —
 /// under the Dictionary layout, with and without secondary indexes (a
 /// subject-narrowed view skips index routing, so the ranges must agree).
 #[tokio::test]
 async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
-    let (s, p, o, g) = prefix_terms();
+    let (s, p, _, _) = prefix_terms();
     for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
         let store = built_store(prefix_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
 
@@ -247,26 +262,14 @@ async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
 
         let by_s = matched_view(&store, Some(&s), None, None, None).await;
         expect(by_s, 12..24).await;
-        let by_sp = matched_view(&store, Some(&s), Some(&p), None, None).await;
-        let by_sp = expect(by_sp, 16..20).await;
-        for q in by_sp.quads_vec().await.unwrap() {
-            assert_eq!(q.subject.to_string(), s.to_string());
-            assert_eq!(q.predicate, p);
+        for (object, graph, run) in prefix_runs() {
+            let view =
+                matched_view(&store, Some(&s), Some(&p), object.as_ref(), graph.as_ref()).await;
+            for q in expect(view, run).await.quads_vec().await.unwrap() {
+                assert_eq!(q.subject.to_string(), s.to_string());
+                assert_eq!(q.predicate, p);
+            }
         }
-        let by_spo = matched_view(&store, Some(&s), Some(&p), Some(&o), None).await;
-        expect(by_spo, 18..20).await;
-        let by_spog = matched_view(&store, Some(&s), Some(&p), Some(&o), Some(&g)).await;
-        expect(by_spog, 19..20).await;
-        // The default graph is a dictionary term like any other ("").
-        let by_spo_default = matched_view(
-            &store,
-            Some(&s),
-            Some(&p),
-            Some(&o),
-            Some(&GraphName::DefaultGraph),
-        )
-        .await;
-        expect(by_spo_default, 18..19).await;
         // A run that narrows to nothing: `p1` exists, but not under `s03`.
         let s03 = iri_subject("s03");
         let none = matched_view(&store, Some(&s03), Some(&p), None, None).await;
@@ -450,7 +453,7 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
 /// unbound role, whose bound successors stay a filter over the run.
 #[tokio::test]
 async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
-    let (s, p, o, g) = prefix_terms();
+    let (s, p, o, _) = prefix_terms();
     for indexes in [
         vec![],
         vec![IndexType::SecondaryByCopy],
@@ -470,28 +473,19 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
             );
         };
 
-        let by_sp = matched_view(&store, Some(&s), Some(&p), None, None).await;
-        expect(&by_sp, 16..20);
-        assert_eq!(by_sp.size().await.unwrap(), 4, "{label}");
-        for q in by_sp.quads_vec().await.unwrap() {
-            assert_eq!(q.subject.to_string(), s.to_string());
-            assert_eq!(q.predicate, p);
+        for (object, graph, run) in prefix_runs() {
+            let view =
+                matched_view(&store, Some(&s), Some(&p), object.as_ref(), graph.as_ref()).await;
+            let rows = (run.end - run.start) as usize;
+            expect(&view, run);
+            assert_eq!(view.size().await.unwrap(), rows, "{label}");
+            let quads = view.quads_vec().await.unwrap();
+            assert_eq!(quads.len(), rows, "{label}");
+            for q in quads {
+                assert_eq!(q.subject.to_string(), s.to_string());
+                assert_eq!(q.predicate, p);
+            }
         }
-        let by_spo = matched_view(&store, Some(&s), Some(&p), Some(&o), None).await;
-        expect(&by_spo, 18..20);
-        assert_eq!(by_spo.size().await.unwrap(), 2, "{label}");
-        let by_spog = matched_view(&store, Some(&s), Some(&p), Some(&o), Some(&g)).await;
-        expect(&by_spog, 19..20);
-        assert_eq!(by_spog.quads_vec().await.unwrap().len(), 1, "{label}");
-        let by_spo_default = matched_view(
-            &store,
-            Some(&s),
-            Some(&p),
-            Some(&o),
-            Some(&GraphName::DefaultGraph),
-        )
-        .await;
-        expect(&by_spo_default, 18..19);
         // `p1` exists, but not under `s03`: the run narrows to nothing.
         let s03 = iri_subject("s03");
         let none = matched_view(&store, Some(&s03), Some(&p), None, None).await;

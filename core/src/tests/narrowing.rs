@@ -38,13 +38,14 @@ async fn keeps_for(store: &VortexRdfStore, column: QuadColumn) -> Vec<Keep> {
     ]
 }
 
-/// Every keep over every column of every view agrees with brute force, and
-/// the narrowed view's size with its row count.
-async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
+/// The views both the keeps and the windows below are checked over, each
+/// beside its tag: the whole store, and a bound predicate (`p1`), object
+/// (`"o3"`), subject (`s0042`) and predicate-object pair.
+async fn bound_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
     let p1 = iri("p1");
     let o3 = plain_literal("o3");
     let s42 = subject_node(42, 4);
-    let views: Vec<(&str, VortexRdfStore)> = vec![
+    vec![
         ("whole", store.clone()),
         (
             "p-bound",
@@ -59,14 +60,26 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
             matched_view(store, Some(&s42), None, None, None).await,
         ),
         (
-            "sp-bound",
-            matched_view(store, Some(&s42), Some(&p1), None, None).await,
-        ),
-        (
             "po-bound",
             matched_view(store, None, Some(&p1), Some(&o3), None).await,
         ),
-    ];
+    ]
+}
+
+/// Every keep over every column of every view agrees with brute force, and
+/// the narrowed view's size with its row count: the [`bound_views`], and a
+/// bound subject-predicate pair beside the subject's.
+async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
+    let p1 = iri("p1");
+    let s42 = subject_node(42, 4);
+    let mut views = bound_views(store).await;
+    views.insert(
+        4,
+        (
+            "sp-bound",
+            matched_view(store, Some(&s42), Some(&p1), None, None).await,
+        ),
+    );
     for (view_tag, view) in &views {
         let rows = sorted_rows(view).await;
         for column in QuadColumn::ALL {
@@ -129,38 +142,17 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
 }
 
 /// The views [`assert_windows_match_slicing`] windows, each beside its tag:
-/// the whole store, a bound predicate, object, subject and predicate-object
-/// pair, and an object keep.
+/// the [`bound_views`] and an object keep.
 async fn slicing_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
-    let p1 = iri("p1");
-    let o3 = plain_literal("o3");
-    let s42 = subject_node(42, 4);
-    vec![
-        ("whole", store.clone()),
-        (
-            "p-bound",
-            matched_view(store, None, Some(&p1), None, None).await,
-        ),
-        (
-            "o-bound",
-            matched_view(store, None, None, Some(&o3), None).await,
-        ),
-        (
-            "s-bound",
-            matched_view(store, Some(&s42), None, None, None).await,
-        ),
-        (
-            "po-bound",
-            matched_view(store, None, Some(&p1), Some(&o3), None).await,
-        ),
-        (
-            "kept",
-            store
-                .keep(QuadColumn::O, &keeps_for(store, QuadColumn::O).await[3])
-                .await
-                .unwrap(),
-        ),
-    ]
+    let mut views = bound_views(store).await;
+    views.push((
+        "kept",
+        store
+            .keep(QuadColumn::O, &keeps_for(store, QuadColumn::O).await[3])
+            .await
+            .unwrap(),
+    ));
+    views
 }
 
 /// Windows and capped counts of every view agree with slicing its

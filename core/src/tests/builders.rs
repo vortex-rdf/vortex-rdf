@@ -5,44 +5,38 @@
 use super::*;
 use crate::store::builders::{BuildSizes, sorted_stream};
 
-/// The chunk-boundary harness: chunk_size 3 over the 10 given quads must
-/// split as [3, 3, 3, 1], whatever the `layout`. Hands back the collected
-/// chunks — plus the dictionary the stream carried beside them, for the
-/// Dictionary layout — for the callers' layout-specific follow-up assertions.
-async fn run_chunk_boundary_builders(
+/// The chunk-boundary harness: `sorted_stream`'s chunk stream at chunk_size
+/// 3 over the 10 given quads must split as [3, 3, 3, 1], whatever the
+/// `layout`. Hands back the collected chunks — plus the dictionary the
+/// stream carried beside them, for the Dictionary layout — for the callers'
+/// layout-specific follow-up assertions.
+async fn run_chunk_boundary_builder(
     layout: LayoutStrategy,
     quads: &[Quad],
-) -> Vec<(
-    &'static str,
+) -> (
     Vec<vortex_array::ArrayRef>,
     Option<std::sync::Arc<crate::store::layouts::dictionary::TermDictionary>>,
-)> {
-    let mut out = Vec::new();
-    for (name, result) in [(
-        "sorted_stream",
-        sorted_stream::build_chunk_stream(
-            Box::new(quad_stream(quads.to_vec())),
-            layout,
-            vec![],
-            BuildSizes::uniform(3),
-            None,
-        )
-        .await,
-    )] {
-        let built = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-        let dict = built.dict.clone();
-        let chunks: Vec<_> = built
-            .chunks
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|c| c.unwrap_or_else(|e| panic!("{name}: {e}")))
-            .collect();
-        let lens: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
-        assert_eq!(lens, [3, 3, 3, 1], "{name}: unexpected chunk sizes");
-        out.push((name, chunks, dict));
-    }
-    out
+) {
+    let built = sorted_stream::build_chunk_stream(
+        Box::new(quad_stream(quads.to_vec())),
+        layout,
+        vec![],
+        BuildSizes::uniform(3),
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("sorted_stream: {e}"));
+    let dict = built.dict.clone();
+    let chunks: Vec<_> = built
+        .chunks
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|c| c.unwrap_or_else(|e| panic!("sorted_stream: {e}")))
+        .collect();
+    let lens: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+    assert_eq!(lens, [3, 3, 3, 1], "sorted_stream: unexpected chunk sizes");
+    (chunks, dict)
 }
 
 #[tokio::test]
@@ -61,23 +55,25 @@ async fn test_default_streaming_chunk_boundaries() {
         })
         .collect();
 
-    for (name, chunks, _) in run_chunk_boundary_builders(LayoutStrategy::Default, &quads).await {
-        // Decode all chunks in order and verify global subject sort.
-        let subjects: Vec<String> = chunks
-            .iter()
-            .flat_map(|c| store::layouts::ResolvedLayout::Default.decode_chunk(c))
-            .map(|q| q.unwrap().subject.to_string())
-            .collect();
-        let mut sorted = subjects.clone();
-        sorted.sort();
-        assert_eq!(subjects, sorted, "{name}: output not globally sorted");
-        assert_eq!(subjects.len(), 10, "{name}: wrong quad count");
-        if let vortex_array::dtype::DType::Struct(fields, _) = chunks[0].dtype() {
-            let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
-            assert_eq!(names, ["s", "p", "o", "g"], "{name}");
-        } else {
-            panic!("{name}: expected struct dtype");
-        }
+    let (chunks, _) = run_chunk_boundary_builder(LayoutStrategy::Default, &quads).await;
+    // Decode all chunks in order and verify global subject sort.
+    let subjects: Vec<String> = chunks
+        .iter()
+        .flat_map(|c| store::layouts::ResolvedLayout::Default.decode_chunk(c))
+        .map(|q| q.unwrap().subject.to_string())
+        .collect();
+    let mut sorted = subjects.clone();
+    sorted.sort();
+    assert_eq!(
+        subjects, sorted,
+        "sorted_stream: output not globally sorted"
+    );
+    assert_eq!(subjects.len(), 10, "sorted_stream: wrong quad count");
+    if let vortex_array::dtype::DType::Struct(fields, _) = chunks[0].dtype() {
+        let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
+        assert_eq!(names, ["s", "p", "o", "g"], "sorted_stream");
+    } else {
+        panic!("sorted_stream: expected struct dtype");
     }
 }
 
@@ -85,29 +81,26 @@ async fn test_default_streaming_chunk_boundaries() {
 async fn test_dictionary_streaming_chunk_boundaries() {
     let quads = dictionary_test_quads();
 
-    for (name, chunks, dict) in
-        run_chunk_boundary_builders(LayoutStrategy::Dictionary, &quads).await
-    {
-        // Reassemble and decode through a store: the chunks hold bare
-        // codes, and the dictionary the stream carried beside them is
-        // handed back with the reassembled array — all chunks' codes must
-        // reference that same global dictionary.
-        let dtype = chunks[0].dtype().clone();
-        let arr = crate::store::array::chunked_or_single(chunks, dtype).unwrap();
-        let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
-            array: arr,
-            components: Vec::new(),
-            dict,
-        })
-        .unwrap();
-        assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{name}");
-        let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
-        assert_eq!(
-            quad_strings(&decoded),
-            quad_strings(&quads),
-            "{name}: bad roundtrip"
-        );
-    }
+    let (chunks, dict) = run_chunk_boundary_builder(LayoutStrategy::Dictionary, &quads).await;
+    // Reassemble and decode through a store: the chunks hold bare codes, and
+    // the dictionary the stream carried beside them is handed back with the
+    // reassembled array — all chunks' codes must reference that same global
+    // dictionary.
+    let dtype = chunks[0].dtype().clone();
+    let arr = crate::store::array::chunked_or_single(chunks, dtype).unwrap();
+    let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
+        array: arr,
+        components: Vec::new(),
+        dict,
+    })
+    .unwrap();
+    assert_eq!(store.layout(), LayoutStrategy::Dictionary, "sorted_stream");
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
+    assert_eq!(
+        quad_strings(&decoded),
+        quad_strings(&quads),
+        "sorted_stream: bad roundtrip"
+    );
 }
 
 /// With a chunk size far below the dataset the streaming ingest spills
