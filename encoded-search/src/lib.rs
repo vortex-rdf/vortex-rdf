@@ -1,9 +1,11 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
+mod delta;
 mod node;
 mod owned;
 mod resolve;
+mod search;
 
 pub use owned::OwnedSortedProbe;
 
@@ -77,8 +79,8 @@ impl<'a> SortedProbe<'a> {
         let value = |i: usize| self.value_at(range.start + i);
         // The lower bound's probes cap the needle's rows: the first row past
         // them lies between the bound and the nearest probe above the needle.
-        let (lo, past) = node::search_ascending_capped(width, value, needle);
-        let hi = lo + node::partition(past - lo, |i| value(lo + i) <= needle);
+        let (lo, past) = search::search_ascending_capped(width, value, needle);
+        let hi = lo + search::partition(past - lo, |i| value(lo + i) <= needle);
         (range.start + lo, range.start + hi)
     }
 
