@@ -5,6 +5,7 @@
 //! from an index child; and [`FileServePlan`], which reads a resolved view's
 //! quads out of the child's own columns.
 
+use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use vortex_layout::scan::split_by::SplitBy;
 use vortex_mask::Mask;
 
 use super::components::{check_addressable, sorted_row_ids};
+use super::copy::CHILD_COLUMNS;
 use super::resolve::IndexProbe;
 use super::serve::ServeDecode;
 use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
@@ -26,7 +28,10 @@ use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, PatternCodes, ResolvedLayout};
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
 use crate::store::scan::file_exprs::eq_conjunction;
+use crate::store::scan::file_reads::component_point_chunk;
+use crate::store::scan::file_scans::read_all_rows;
 use crate::store::schema::{RowId, TermCode};
+use crate::store::view::selection::point_sized;
 
 /// The `[lo, hi)` run of a sorted component column's rows equal to `native`,
 /// located by binary search over the column's cached chunk probes, reading
@@ -168,7 +173,7 @@ pub(crate) async fn read_located_rids(
     );
     #[cfg(test)]
     file.note_located_rid_reads(range.end - range.start);
-    if crate::store::view::selection::point_sized(range.end - range.start)
+    if point_sized(range.end - range.start)
         && let Some(ids) = rid_point_reads(file, child, range.clone()).await?
     {
         return Ok(ids);
@@ -280,7 +285,7 @@ pub(super) async fn resolve_file(
     // handful of cached-chunk accesses, instead of deferring a whole child
     // scan that a count or a chained match would then pay for.
     let point_read = match &located {
-        Some(range) if crate::store::view::selection::point_sized(range.end - range.start) => {
+        Some(range) if point_sized(range.end - range.start) => {
             rid_point_reads(file, &child, range.clone()).await?
         }
         _ => None,
@@ -421,8 +426,8 @@ pub(crate) struct FileServePlan {
     >,
     /// The child rows the constraints select, when the resolution located
     /// them by chunk probes: exactly the constrained rows, letting a small
-    /// run be point-read and a wide one scanned by range
-    /// ([`Self::located_run_scan`]) instead of filtered. `None` when
+    /// run be point-read ([`Self::point_run`]) and a wide one scanned by
+    /// range ([`Self::scan`]) instead of filtered. `None` when
     /// unlocated, or when a constraint the location did not cover would make
     /// the range over-approximate.
     row_range: Option<Range<u64>>,
@@ -446,8 +451,8 @@ impl FileServePlan {
     /// A plan serving a file's index columns, decoded through `decode`, by a
     /// pushed-down scan filtered to the rows where every `constraints`
     /// equality holds, or, over a located `row_range`, by point reads (a
-    /// small run) or a range-restricted scan split across the workers (a wide
-    /// one; see [`Self::located_run_scan`]).
+    /// small run; see [`Self::point_run`]) or a range-restricted scan split
+    /// across the workers (a wide one; see [`Self::scan`]).
     fn new(
         decode: ServeDecode,
         child: ChildReader,
@@ -474,7 +479,9 @@ impl FileServePlan {
         if let Some(bound) = self.bound.get() {
             return Ok(bound.clone());
         }
-        let projection = select(self.projection(), root());
+        // The serving child's quad columns plus the row-id column, for
+        // tombstones: the copy family's child schema.
+        let projection = select(CHILD_COLUMNS, root());
         // A serve plan always carries at least one constraint (the resolved
         // lead component), so the conjunction is never empty.
         let filter = eq_conjunction(self.constraints.iter().cloned())
@@ -492,27 +499,72 @@ impl FileServePlan {
     }
 
     /// The located child-row range the constraints select, when known.
+    #[cfg(test)]
     pub(crate) fn row_range(&self) -> Option<Range<u64>> {
         self.row_range.clone()
     }
 
-    /// The columns to project from the file to serve these rows: the serving
-    /// child's quad columns plus the row-id column (for tombstones), the
-    /// copy family's child schema ([`CHILD_COLUMNS`](super::copy::CHILD_COLUMNS)).
-    pub(crate) fn projection(&self) -> [&'static str; 5] {
-        super::copy::CHILD_COLUMNS
+    /// The served rows read point by point as one chunk, when the run is
+    /// located and point-sized: the projected columns through the
+    /// component's cached chunk probes ([`component_point_chunk`]), or the
+    /// [`filtered_scan`](Self::filtered_scan)'s rows when a probe declines
+    /// mid-fetch. `None` for every other run, which [`Self::scan`] streams.
+    /// The fallback scan is built, and the plan bound, before the read
+    /// starts, so a bind failure fails this call rather than the read.
+    pub(crate) fn point_run<'a>(
+        &'a self,
+        file: &'a NativeStoreFile,
+    ) -> Result<Option<impl Future<Output = Result<ArrayRef>> + Send + 'a>> {
+        let range = match &self.row_range {
+            Some(run) if point_sized(run.end - run.start) => run.clone(),
+            _ => return Ok(None),
+        };
+        let fallback = self.filtered_scan()?;
+        Ok(Some(async move {
+            match component_point_chunk(file, self.child.name, &CHILD_COLUMNS, range).await? {
+                Some(rows) => Ok(rows),
+                None => read_all_rows(fallback).await,
+            }
+        }))
     }
 
-    /// A scan over the serving index child, to which [`Self::projection`] and
-    /// the plan's bound filter apply.
+    /// The scan the served rows stream from: the serving index child with
+    /// the plan's projection (bound on first use), over exactly the located
+    /// run, split by row count, or, for an unlocated run, the
+    /// [`filtered_scan`](Self::filtered_scan).
+    ///
+    /// The scan spawns one task per split and the consumer decodes each
+    /// chunk inside its task, so the split count is the decode's
+    /// parallelism. The child's natural splits are its leaf chunks, which
+    /// cluster a run into one split however wide it is; splitting the range
+    /// by row count spreads the run's decode over the workers instead
+    /// (`run_split_rows`). No filter rides along a located run: its range is
+    /// exactly the constrained rows (the same fact `size` and the point
+    /// reads rely on).
+    pub(crate) fn scan(&self) -> Result<ScanBuilder<ArrayRef>> {
+        let Some(range) = self.row_range.clone() else {
+            return self.filtered_scan();
+        };
+        let (projection, _) = self.bound_exprs()?;
+        let workers = crate::io::read::available_parallelism() as u64;
+        let split_rows = run_split_rows(&range, workers);
+        Ok(self
+            .child_scan()
+            .with_projection(projection)
+            .with_row_range(range)
+            .with_split_by(SplitBy::RowCount(split_rows)))
+    }
+
+    /// A scan over the serving index child, to which the plan's projection
+    /// and filter apply.
     fn child_scan(&self) -> ScanBuilder<ArrayRef> {
         ScanBuilder::new(VORTEX_SESSION.clone(), self.child.reader.clone())
     }
 
-    /// [`Self::child_scan`] with the plan's projection and filter (bound on
-    /// first use) applied: the form the streaming reads consume for an
-    /// unlocated run.
-    pub(crate) fn projected_filtered_scan(&self) -> Result<ScanBuilder<ArrayRef>> {
+    /// [`Self::child_scan`] with the plan's projection and pushed-down
+    /// filter (bound on first use) applied: an unlocated run's scan, and the
+    /// fallback of a point read a probe declines.
+    fn filtered_scan(&self) -> Result<ScanBuilder<ArrayRef>> {
         let (projection, filter) = self.bound_exprs()?;
         Ok(self
             .child_scan()
@@ -520,42 +572,13 @@ impl FileServePlan {
             .with_filter(filter))
     }
 
-    /// A scan of the located run: [`Self::child_scan`] with the plan's
-    /// projection, restricted to `row_range` and split by row count; the form
-    /// the streaming reads consume for a wide located run. `None` when the
-    /// run is unlocated, and [`Self::projected_filtered_scan`] answers.
-    ///
-    /// The scan spawns one task per split and the consumer decodes each
-    /// chunk inside its task, so the split count is the decode's
-    /// parallelism. The child's natural splits are its leaf chunks, which
-    /// cluster a run into one split however wide it is; splitting the range
-    /// by row count spreads the run's decode over the workers instead
-    /// (`run_split_rows`). No filter rides along: the located range is
-    /// exactly the constrained rows (the same fact `size` and the point
-    /// reads rely on).
-    pub(crate) fn located_run_scan(&self) -> Result<Option<ScanBuilder<ArrayRef>>> {
-        let Some(range) = self.row_range.clone() else {
-            return Ok(None);
-        };
-        let (projection, _) = self.bound_exprs()?;
-        let workers = crate::io::read::available_parallelism() as u64;
-        let split_rows = run_split_rows(&range, workers);
-        Ok(Some(
-            self.child_scan()
-                .with_projection(projection)
-                .with_row_range(range)
-                .with_split_by(SplitBy::RowCount(split_rows)),
-        ))
-    }
-
     /// The served rows' four [`TermCode`] columns, read off the index child's
-    /// own columns by a scan of exactly the located run, or by the filtered
-    /// child scan when the run is unlocated: the file counterpart of
-    /// [`InMemoryServePlan::code_columns`], for a view whose row ids are still
-    /// deferred. Rows come back in the index's order, as the served stream
-    /// reads them, tombstoned rows dropped via the row-id column. `None`
-    /// declines to the caller's gather path: a non-Dictionary decode layout,
-    /// whose columns hold terms, not codes.
+    /// own columns by the plan's [`scan`](Self::scan): the file counterpart
+    /// of [`InMemoryServePlan::code_columns`], for a view whose row ids are
+    /// still deferred. Rows come back in the index's order, as the served
+    /// stream reads them, tombstoned rows dropped via the row-id column.
+    /// `None` declines to the caller's gather path: a non-Dictionary decode
+    /// layout, whose columns hold terms, not codes.
     ///
     /// [`InMemoryServePlan::code_columns`]: super::InMemoryServePlan::code_columns
     pub(crate) async fn code_columns(
@@ -565,11 +588,7 @@ impl FileServePlan {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return Ok(None);
         }
-        let scan = match self.located_run_scan()? {
-            Some(scan) => scan,
-            None => self.projected_filtered_scan()?,
-        };
-        let chunk = crate::store::scan::file_scans::read_all_rows(scan).await?;
+        let chunk = read_all_rows(self.scan()?).await?;
         self.decode.chunk_code_columns(&chunk, deleted).map(Some)
     }
 
@@ -610,7 +629,7 @@ mod tests {
         use crate::IndexType;
         use crate::io::read::scan_all_reader;
         use crate::store::array::{field_as, into_struct_array};
-        use crate::store::scan::file_scans::{driver_hooks, read_all_rows};
+        use crate::store::scan::file_scans::driver_hooks;
 
         let rows = 50;
         let quads = crate::tests::modular_quads_for_tests(rows);

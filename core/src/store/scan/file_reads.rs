@@ -4,7 +4,6 @@
 //! filter's split masks keep, as [`read_plan`](super::read_plan) chooses
 //! them. Functions of the file, with no store state.
 
-use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -15,7 +14,6 @@ use vortex_array::expr::{Expression, root, select};
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::{Buffer, BufferMut};
 use vortex_error::VortexResult;
-use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
@@ -23,23 +21,10 @@ use crate::io::read::available_parallelism;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
 use crate::store::scan::file_filter::{self, SplitMasks};
-use crate::store::scan::file_scans::{collect_row_splits, read_all_rows};
+use crate::store::scan::file_scans::collect_row_splits;
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::scan::read_plan::{Footprint, POINT_READ_ROWS};
 use crate::store::schema::{RowId, TermCode};
-
-/// The rows of a point read when it answers, otherwise the rows of `scan`:
-/// the fallback every point-read fast path keeps for a chunk its probes
-/// decline.
-pub(crate) async fn point_rows_or_scan(
-    point: impl Future<Output = Result<Option<ArrayRef>>>,
-    scan: ScanBuilder<ArrayRef>,
-) -> Result<ArrayRef> {
-    match point.await? {
-        Some(rows) => Ok(rows),
-        None => read_all_rows(scan).await,
-    }
-}
 
 /// The rows of `columns` at `rows`, the live rows
 /// [`ExactRead`](super::read_plan::ExactRead) chose to read point by point,
@@ -382,8 +367,8 @@ pub(crate) fn masked_split_tasks(
 
 /// The rows of `columns` that `masks` keep, each split with a match projected
 /// at its mask ([`masked_split_tasks`]), in one array in split order, the
-/// splits driven as [`read_all_rows`] drives a scan's
-/// ([`collect_row_splits`]).
+/// splits driven as [`read_all_rows`](super::file_scans::read_all_rows)
+/// drives a scan's ([`collect_row_splits`]).
 pub(crate) async fn masked_projection(
     file: &Arc<NativeStoreFile>,
     columns: &[&'static str],

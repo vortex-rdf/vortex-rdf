@@ -37,8 +37,6 @@ use crate::store::scan::file_reads;
 #[cfg(feature = "file-io")]
 use crate::store::scan::read_plan::MaskedRead;
 #[cfg(feature = "file-io")]
-use crate::store::view::selection::point_sized;
-#[cfg(feature = "file-io")]
 use futures::FutureExt as _;
 #[cfg(feature = "file-io")]
 use futures::future::BoxFuture;
@@ -217,17 +215,9 @@ impl VortexRdfStore {
         if let Some(plan) = plan
             && serve
         {
-            // A small located run reads point by point through the
-            // component's cached chunk probes, as one chunk; the filter scan
-            // takes over on a mid-fetch decline.
-            if let Some(range) = plan.row_range()
-                && point_sized(range.end - range.start)
-            {
-                let scan = plan.projected_filtered_scan()?;
-                let projection = plan.projection();
-                let point =
-                    file_reads::component_point_chunk(file, plan.component(), &projection, range);
-                let chunk = match file_reads::point_rows_or_scan(point, scan).await {
+            // A small located run reads point by point, as one chunk.
+            if let Some(read) = plan.point_run(file)? {
+                let chunk = match read.await {
                     Ok(rows) => {
                         plan.decode_columns_async::<T>(&rows, deleted.as_ref())
                             .await
@@ -236,19 +226,13 @@ impl VortexRdfStore {
                 };
                 return Ok(with_tail(stream::iter([chunk]), tail));
             }
-            // A wide located run scans exactly its rows, split by
-            // row count so the decode spreads over the runtime's
-            // workers; an unlocated one keeps the pushed-down filter
-            // scan (see `FileServePlan::located_run_scan`).
-            let scan = match plan.located_run_scan()? {
-                Some(scan) => scan,
-                None => plan.projected_filtered_scan()?,
-            };
+            // Any other run streams the plan's scan (see
+            // `FileServePlan::scan`).
             let decoder = ServedDecoder {
                 plan: plan.clone(),
                 deleted: deleted.clone(),
             };
-            return self.scan_chunks(scan, decoder, tail);
+            return self.scan_chunks(plan.scan()?, decoder, tail);
         }
         if one_shot && let Some(masks) = &base.masks {
             return self.masked_chunks(file, masks, tail).await;
