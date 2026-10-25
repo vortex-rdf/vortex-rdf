@@ -33,6 +33,13 @@ pub struct U64Column {
     pub(crate) codes: Buffer<u64>,
 }
 
+impl From<Buffer<u64>> for U64Column {
+    /// The column over `codes`, sharing their buffer.
+    fn from(codes: Buffer<u64>) -> Self {
+        U64Column { codes }
+    }
+}
+
 #[pymethods]
 impl U64Column {
     /// A column holding `values`: another `U64Column` (shared zero-copy), a
@@ -41,9 +48,7 @@ impl U64Column {
     /// A buffer of other items raises `ValueError` (see [`extract_u64s`]).
     #[new]
     fn new(values: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Ok(U64Column {
-            codes: extract_u64s(values)?,
-        })
+        Ok(U64Column::from(extract_u64s(values)?))
     }
 
     fn __len__(&self) -> usize {
@@ -74,20 +79,20 @@ impl U64Column {
         let codes = self
             .codes
             .slice_with_alignment(start..stop, Alignment::of::<u64>());
-        Ok(U64Column { codes })
+        Ok(U64Column::from(codes))
     }
 
     /// The distinct values, each at its first occurrence, in that order.
     fn distinct(&self, py: Python<'_>) -> U64Column {
         let codes = py.detach(|| columns::distinct_first_seen(self.codes.as_slice()));
-        U64Column { codes }
+        U64Column::from(codes)
     }
 
     /// `(values, counts)`: the distinct values in first-seen order and how
     /// often each occurs.
     fn value_counts(&self, py: Python<'_>) -> (U64Column, U64Column) {
         let (values, counts) = py.detach(|| columns::value_counts(self.codes.as_slice()));
-        (U64Column { codes: values }, U64Column { codes: counts })
+        (U64Column::from(values), U64Column::from(counts))
     }
 
     /// The values at `indices` (a `U64Column`, u64 buffer or int sequence,
@@ -104,7 +109,7 @@ impl U64Column {
                     self.codes.len()
                 ))
             })?;
-        Ok(U64Column { codes })
+        Ok(U64Column::from(codes))
     }
 
     /// The number of row pairs [`join_indices`](Self::join_indices) makes
@@ -135,10 +140,7 @@ impl U64Column {
                 columns::equi_join_indices(self.codes.as_slice(), right.as_slice(), max_pairs)
             })
             .map_err(|pairs| join_too_large(pairs, max_pairs))?;
-        Ok((
-            U64Column { codes: left_idx },
-            U64Column { codes: right_idx },
-        ))
+        Ok((U64Column::from(left_idx), U64Column::from(right_idx)))
     }
 
     /// This column's rows grouped by value: the right side of
@@ -230,10 +232,7 @@ impl CodeGroups {
         let (left_idx, right_idx) = py
             .detach(|| self.groups.join(left.as_slice(), max_pairs))
             .map_err(|pairs| join_too_large(pairs, max_pairs))?;
-        Ok((
-            U64Column { codes: left_idx },
-            U64Column { codes: right_idx },
-        ))
+        Ok((U64Column::from(left_idx), U64Column::from(right_idx)))
     }
 
     /// The columns the join of `column` with the grouped rows gathers,
@@ -286,6 +285,6 @@ impl CodeGroups {
                     .gather(left.as_slice(), &lefts, &rights, max_pairs)
             })
             .map_err(|pairs| join_too_large(pairs, max_pairs))?;
-        PyTuple::new(py, outputs.into_iter().map(|codes| U64Column { codes }))
+        PyTuple::new(py, outputs.into_iter().map(U64Column::from))
     }
 }

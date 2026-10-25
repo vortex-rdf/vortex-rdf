@@ -266,7 +266,7 @@ impl TermDict {
         let (passed, undecided) = detached(py, || {
             self.reader.filter_codes(&predicate, codes.as_slice())
         })?;
-        Ok((U64Column { codes: passed }, U64Column { codes: undecided }))
+        Ok((U64Column::from(passed), U64Column::from(undecided)))
     }
 
     /// The half-open code range `(lo, hi)` of the terms whose N-Triples

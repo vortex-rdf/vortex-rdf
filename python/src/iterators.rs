@@ -72,7 +72,7 @@ impl CodeChunks {
         });
         let chunk = settled(pulled.map(Option::transpose))?;
         chunk
-            .map(|chunk| PyTuple::new(py, chunk.into_iter().map(|codes| U64Column { codes })))
+            .map(|chunk| PyTuple::new(py, chunk.into_iter().map(U64Column::from)))
             .transpose()
     }
 
@@ -121,13 +121,9 @@ pub(crate) fn chunk_columns(names: &[String]) -> PyResult<Vec<QuadColumn>> {
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
 pub(crate) type CodeColumns = (U64Column, U64Column, U64Column, U64Column);
 
-pub(crate) fn code_columns([s, p, o, g]: [Buffer<TermCode>; 4]) -> CodeColumns {
-    (
-        U64Column { codes: s },
-        U64Column { codes: p },
-        U64Column { codes: o },
-        U64Column { codes: g },
-    )
+pub(crate) fn code_columns(columns: [Buffer<TermCode>; 4]) -> CodeColumns {
+    let [s, p, o, g] = columns.map(U64Column::from);
+    (s, p, o, g)
 }
 
 /// One probe's gathered `(s, p, o, g)` code columns, or `None` where the
