@@ -6,7 +6,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use vortex_buffer::Buffer;
 use vortex_rdf_core::{Keep, Probe, QuadColumn, TermCode};
 
 use crate::codes::extract_u64s;
@@ -45,11 +44,11 @@ pub(crate) fn parse_probes(probes: &Bound<'_, PyAny>) -> PyResult<Vec<Probe>> {
 /// keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset` (each optional; any
 /// other key is an error).
 fn parse_probe(obj: &Bound<'_, PyAny>) -> PyResult<Probe> {
+    let mut terms: [Option<String>; 4] = [None, None, None, None];
+    let mut keep = None;
+    let mut limit = None;
+    let mut offset = 0usize;
     if let Ok(dict) = obj.cast::<PyDict>() {
-        let mut terms: [Option<String>; 4] = [None, None, None, None];
-        let mut keep = None;
-        let mut limit = None;
-        let mut offset = 0usize;
         for (key, value) in dict.iter() {
             let key: String = key.extract().map_err(|_| {
                 PyValueError::new_err(
@@ -59,11 +58,11 @@ fn parse_probe(obj: &Bound<'_, PyAny>) -> PyResult<Probe> {
             if value.is_none() {
                 continue;
             }
+            if let Some(column) = QuadColumn::from_name(&key) {
+                terms[column.index()] = Some(value.extract()?);
+                continue;
+            }
             match key.as_str() {
-                "s" => terms[0] = Some(value.extract()?),
-                "p" => terms[1] = Some(value.extract()?),
-                "o" => terms[2] = Some(value.extract()?),
-                "g" => terms[3] = Some(value.extract()?),
                 "keep" => keep = Some(value),
                 "limit" => limit = Some(extract_count(&value, "limit")?),
                 "offset" => offset = extract_count(&value, "offset")?,
@@ -74,41 +73,39 @@ fn parse_probe(obj: &Bound<'_, PyAny>) -> PyResult<Probe> {
                 }
             }
         }
-        let [s, p, o, g] = terms;
-        return narrowed_probe(
-            s.as_deref(),
-            p.as_deref(),
-            o.as_deref(),
-            g.as_deref(),
-            keep.as_ref(),
-            limit,
-            offset,
-        );
-    }
-    let items: Vec<Bound<'_, PyAny>> = if let Ok(tuple) = obj.cast::<PyTuple>() {
-        tuple.iter().collect()
-    } else if let Ok(list) = obj.cast::<PyList>() {
-        list.iter().collect()
     } else {
-        return Err(PyValueError::new_err(
-            "a probe is a (s, p, o, g) tuple of optional term strings or a dict with keys \
-             s, p, o, g, keep, limit, offset",
-        ));
-    };
-    if items.len() != 4 {
-        return Err(PyValueError::new_err(format!(
-            "a probe tuple has four positions (s, p, o, g), got {}",
-            items.len()
-        )));
-    }
-    let mut terms: [Option<String>; 4] = [None, None, None, None];
-    for (slot, item) in terms.iter_mut().zip(&items) {
-        if !item.is_none() {
-            *slot = Some(item.extract()?);
+        let items: Vec<Bound<'_, PyAny>> = if let Ok(tuple) = obj.cast::<PyTuple>() {
+            tuple.iter().collect()
+        } else if let Ok(list) = obj.cast::<PyList>() {
+            list.iter().collect()
+        } else {
+            return Err(PyValueError::new_err(
+                "a probe is a (s, p, o, g) tuple of optional term strings or a dict with keys \
+                 s, p, o, g, keep, limit, offset",
+            ));
+        };
+        if items.len() != 4 {
+            return Err(PyValueError::new_err(format!(
+                "a probe tuple has four positions (s, p, o, g), got {}",
+                items.len()
+            )));
+        }
+        for (slot, item) in terms.iter_mut().zip(&items) {
+            if !item.is_none() {
+                *slot = Some(item.extract()?);
+            }
         }
     }
     let [s, p, o, g] = terms;
-    Probe::parse(s.as_deref(), p.as_deref(), o.as_deref(), g.as_deref()).map_err(py_err)
+    narrowed_probe(
+        s.as_deref(),
+        p.as_deref(),
+        o.as_deref(),
+        g.as_deref(),
+        keep.as_ref(),
+        limit,
+        offset,
+    )
 }
 
 /// A non-negative row count (`limit`, `offset`).
@@ -166,25 +163,26 @@ fn parse_position(position: &Bound<'_, PyAny>) -> PyResult<QuadColumn> {
 /// One keep: a `range` with step 1 or a 2-tuple `(lo, hi)` of ints is a code
 /// range, the half-open codes `lo <= code < hi`; a `U64Column`, a u64 buffer
 /// or any other sequence of ints is a code set, read by [`extract_u64s`] and
-/// built by [`keep_set`]. A 2-tuple is never a set.
+/// shared as it stands when it is already ascending and unique. A 2-tuple is
+/// never a set.
 fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
     let py = spec.py();
     let range_type = py.import("builtins")?.getattr("range")?;
-    if spec.is_instance(&range_type)? {
+    let bounds = if spec.is_instance(&range_type)? {
         let step: i64 = spec.getattr("step")?.extract()?;
         if step != 1 {
             return Err(PyValueError::new_err("a keep range must have step 1"));
         }
-        let lo = code_bound(&spec.getattr("start")?)?;
-        let hi = code_bound(&spec.getattr("stop")?)?;
-        return Ok(Keep::range(lo..hi.max(lo)));
-    }
-    if let Ok(tuple) = spec.cast::<PyTuple>()
+        Some((spec.getattr("start")?, spec.getattr("stop")?))
+    } else if let Ok(tuple) = spec.cast::<PyTuple>()
         && tuple.len() == 2
     {
-        let lo = code_bound(&tuple.get_item(0)?)?;
-        let hi = code_bound(&tuple.get_item(1)?)?;
-        return Ok(Keep::range(lo..hi.max(lo)));
+        Some((tuple.get_item(0)?, tuple.get_item(1)?))
+    } else {
+        None
+    };
+    if let Some((lo, hi)) = bounds {
+        return Ok(Keep::range(code_bound(&lo)?..code_bound(&hi)?));
     }
     let codes = extract_u64s(spec).map_err(|e| {
         PyValueError::new_err(format!(
@@ -193,40 +191,7 @@ fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
              codes lo <= code < hi; a 2-tuple is never a set): {e}"
         ))
     })?;
-    Ok(keep_set(codes))
-}
-
-/// A sorted, unique buffer is a `Keep::Set` as it stands. Anything else is
-/// sorted and its repeats folded first: in place when nothing else holds the
-/// buffer (the codes [`extract_u64s`] copied out of a list or a Python
-/// buffer), in a copy when a `U64Column` shares it.
-fn keep_set(codes: Buffer<TermCode>) -> Keep {
-    if codes.as_slice().windows(2).all(|w| w[0] < w[1]) {
-        return Keep::Set(codes);
-    }
-    let mut codes = codes.into_mut();
-    let sorted = codes.as_mut_slice();
-    sorted.sort_unstable();
-    // Equal codes now sit side by side (at least two codes got here). Count
-    // the repeats, then, if there are any, keep the first code of each run.
-    let repeats = sorted
-        .iter()
-        .zip(&sorted[1..])
-        .filter(|(a, b)| a == b)
-        .count();
-    let unique = sorted.len() - repeats;
-    if repeats > 0 {
-        let mut kept = 1;
-        for i in 1..sorted.len() {
-            if sorted[i] != sorted[kept - 1] {
-                sorted[kept] = sorted[i];
-                kept += 1;
-            }
-        }
-        debug_assert_eq!(kept, unique);
-    }
-    codes.truncate(unique);
-    Keep::Set(codes.freeze())
+    Ok(Keep::from(codes))
 }
 
 /// A range bound as a code: a non-negative int below 2**64.
