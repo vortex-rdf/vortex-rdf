@@ -500,9 +500,7 @@ impl Node<'_> {
                 references,
                 offset,
                 child,
-            } => child
-                .value_at(i)
-                .wrapping_add(references.value_at((offset + i) / FL_CHUNK)),
+            } => chunked_for_value_at(references, *offset, child, i),
             Node::BitPacked(p) => p.value_at(i),
             Node::Slice { child, start, .. } => child.value_at(start + i),
             Node::Chunked { chunks, .. } => {
@@ -688,6 +686,18 @@ impl Node<'_> {
             Node::Delta(d) => d.collect_kinds(out),
         }
     }
+}
+
+/// [`Node::value_at`] of a [`Node::ChunkedFoR`]: the child's value plus the
+/// reference of its FastLanes chunk. Out of line on purpose: written in
+/// `value_at`'s match, the sum of two recursive reads lets the compiler turn
+/// the recursion into a loop carrying an accumulator, which every node visit
+/// then pays for (a stack slot zeroed on entry, a load and an add on return).
+#[inline(never)]
+fn chunked_for_value_at(references: &Node<'_>, offset: usize, child: &Node<'_>, i: usize) -> u64 {
+    child
+        .value_at(i)
+        .wrapping_add(references.value_at((offset + i) / FL_CHUNK))
 }
 
 /// Position `q` among `len` positions, clamped to `len`. A quotient the index
