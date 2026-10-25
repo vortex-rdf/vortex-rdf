@@ -86,20 +86,21 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
             columns.iter().map(Vec::len).collect::<Vec<_>>()
         )));
     }
-    let mut out: [Vec<Py<PyString>>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
-    for (position, column) in columns.into_iter().enumerate() {
-        for (row, term) in column.into_iter().enumerate() {
-            match term {
-                Some(term) => out[position].push(term),
-                None => {
-                    return Err(VortexRdfError::new_err(format!(
+    let resolved = |column: Vec<Option<Py<PyString>>>| {
+        column
+            .into_iter()
+            .enumerate()
+            .map(|(row, term)| {
+                term.ok_or_else(|| {
+                    VortexRdfError::new_err(format!(
                         "matched row {row} has a term code outside the store dictionary"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(out)
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()
+    };
+    let [s, p, o, g] = columns;
+    Ok([resolved(s)?, resolved(p)?, resolved(o)?, resolved(g)?])
 }
 
 /// A read-only Vortex-RDF store opened from a `.vortex` file or from
@@ -124,34 +125,42 @@ pub struct VortexRdfStore {
 }
 
 impl VortexRdfStore {
-    /// The matched rows as four columns of N-Triples strings, in
-    /// subject-predicate-object-graph order. The default graph is the empty
-    /// string, the spelling `Probe::parse` accepts for it.
+    /// The rows the pattern `(s, p, o, g)` matches as four columns of
+    /// N-Triples strings, in subject-predicate-object-graph order. The
+    /// default graph is the empty string, the spelling `Probe::parse` accepts
+    /// for it.
     ///
     /// Backs both [`Self::get_quads`] and [`Self::match_columns`], so the two
     /// resolve a pattern the same way.
-    fn matched_columns(&self, py: Python<'_>, probe: &Probe) -> PyResult<[Vec<Py<PyString>>; 4]> {
-        if let Some(reader) = self.store.dict_reader() {
-            // `dict_reader` reports only that the path can apply (a Dictionary
-            // layout), whether the dictionary is in memory or
-            // left in the mapped file; the match itself still decides, so fall
-            // through when it declines.
-            if let Some(codes) = detached(py, || probe_codes(&self.store, probe))? {
-                let mut decoded = Vec::with_capacity(4);
-                for column in &codes {
-                    decoded.push(decode_slice(py, &reader, column.as_slice())?);
-                }
-                let decoded: [_; 4] = decoded
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("four code columns"));
-                return resolve_columns(decoded);
-            }
+    fn matched_columns(
+        &self,
+        py: Python<'_>,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+    ) -> PyResult<[Vec<Py<PyString>>; 4]> {
+        let probe = Probe::parse(s, p, o, g).map_err(py_err)?;
+        // `dict_reader` reports only that the path can apply (a Dictionary
+        // layout), whether the dictionary is in memory or left in the mapped
+        // file; the match itself still decides, so fall through when it
+        // declines.
+        if let Some(reader) = self.store.dict_reader()
+            && let Some([subjects, predicates, objects, graphs]) =
+                detached(py, || probe_codes(&self.store, &probe))?
+        {
+            return resolve_columns([
+                decode_slice(py, &reader, &subjects)?,
+                decode_slice(py, &reader, &predicates)?,
+                decode_slice(py, &reader, &objects)?,
+                decode_slice(py, &reader, &graphs)?,
+            ]);
         }
 
         // The matched quads with shared-string terms: each distinct term of a
         // decoded chunk is one `Arc<str>`, handed to every row repeating it.
         let rows = detached(py, || async {
-            self.store.run_probe(probe).await?.shared_quads_vec().await
+            self.store.run_probe(&probe).await?.shared_quads_vec().await
         })?;
         // Intern by `Arc` address: `rows` holds every `Arc` for the whole
         // loop, so an address identifies one term. A strong count of one means
@@ -280,18 +289,14 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<Vec<PyQuad>> {
-        let probe = Probe::parse(s, p, o, g).map_err(py_err)?;
-        let [subjects, predicates, objects, graphs] = self.matched_columns(py, &probe)?;
-        let mut rows = Vec::with_capacity(subjects.len());
-        for (((s, p), o), g) in subjects
+        let [subjects, predicates, objects, graphs] = self.matched_columns(py, s, p, o, g)?;
+        Ok(subjects
             .into_iter()
             .zip(predicates)
             .zip(objects)
             .zip(graphs)
-        {
-            rows.push((s, p, o, g));
-        }
-        Ok(rows)
+            .map(|(((s, p), o), g)| (s, p, o, g))
+            .collect())
     }
 
     /// Number of quads matching a pattern, counted from the match's row
@@ -380,8 +385,7 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<StringColumns> {
-        let probe = Probe::parse(s, p, o, g).map_err(py_err)?;
-        let [subjects, predicates, objects, graphs] = self.matched_columns(py, &probe)?;
+        let [subjects, predicates, objects, graphs] = self.matched_columns(py, s, p, o, g)?;
         Ok((subjects, predicates, objects, graphs))
     }
 
