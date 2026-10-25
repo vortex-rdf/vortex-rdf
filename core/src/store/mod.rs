@@ -96,16 +96,6 @@ pub struct VortexRdfStore {
     tail: Option<Tail>,
 }
 
-/// A store's serializable state, a [`BuiltArray`]: the primary quad rows, the
-/// index components describing them and, under the Dictionary layout, the
-/// term dictionary the codes address. The rows' sortedness travels as their
-/// `s` column's stamp. Produced by [`VortexRdfStore::to_serializable_parts`]
-/// and adopted back by [`VortexRdfStore::from_parts`] (the in-memory open,
-/// `from_file_in_memory`).
-pub(crate) struct StoreParts {
-    pub(crate) built: BuiltArray,
-}
-
 impl VortexRdfStore {
     /// A view over the same data as this store (its layout, indexes and
     /// [`generation`](Self::generation)) reading `quads` and `tail`: the

@@ -699,7 +699,7 @@ pub(super) async fn run_copy_index_serving_script(
     // A base-order gather cannot ride the plan: it materializes the ids and
     // must agree with the served read.
     let parts = by_p.to_serializable_parts().await.unwrap();
-    assert_eq!(parts.built.array.len(), 10);
+    assert_eq!(parts.array.len(), 10);
 
     // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
@@ -1014,7 +1014,7 @@ async fn test_built_store_compresses_resident_form() {
     // neither decoded nor re-encoded.
     let unprobed = unprobed_object_store().await;
     assert_eq!(unprobed.debug_base_child_int_canonical("o"), Some(false));
-    let base = unprobed.to_serializable_parts().await.unwrap().built.array;
+    let base = unprobed.to_serializable_parts().await.unwrap().array;
     let base = base.try_downcast::<Struct>().unwrap();
     assert_eq!(
         base.unmasked_field_by_name("o")

@@ -463,10 +463,7 @@ async fn test_from_parts_adopts_searchable_children() {
     // A sorted column in an encoding no probe reads (pcodec):
     // adoption decodes it and keeps its stamp, so a bound subject is still
     // one searched row range, answering as the built store does.
-    let decoded = VortexRdfStore::from_parts(crate::store::StoreParts {
-        built: pco_coded_build("s").await,
-    })
-    .unwrap();
+    let decoded = VortexRdfStore::from_parts(pco_coded_build("s").await).unwrap();
     assert!(decoded.debug_base_probe_resolvable());
     assert_eq!(decoded.debug_base_child_int_canonical("s"), Some(true));
     assert_eq!(
@@ -489,10 +486,7 @@ async fn test_from_parts_adopts_searchable_children() {
     }
     // An unsorted column in such an encoding is decoded too: `from_parts`
     // leaves no integer column without a probe or a primitive.
-    let decoded = VortexRdfStore::from_parts(crate::store::StoreParts {
-        built: pco_coded_build("o").await,
-    })
-    .unwrap();
+    let decoded = VortexRdfStore::from_parts(pco_coded_build("o").await).unwrap();
     assert_eq!(decoded.debug_base_child_int_canonical("o"), Some(true));
     assert_eq!(view_strings(&decoded).await, view_strings(&reference).await);
 
@@ -982,9 +976,9 @@ async fn test_open_rejects_unknown_dictionary_implementation() {
         .to_serializable_parts()
         .await
         .unwrap();
-    let mut dict = parts.built.dict.as_ref().unwrap().to_write().unwrap();
+    let mut dict = parts.dict.as_ref().unwrap().to_write().unwrap();
     dict.descriptor.implementation = "not-a-dictionary-v0".into();
-    let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], vec![dict]).await;
+    let bytes = unstamped_store_bytes(vec![parts.array.clone()], vec![dict]).await;
 
     let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
@@ -1009,15 +1003,14 @@ async fn test_open_rejects_a_dictionary_version_newer_than_this_version_reads() 
         .await
         .unwrap();
     let with_version = |version: u32| {
-        let mut dict = parts.built.dict.as_ref().unwrap().to_write().unwrap();
+        let mut dict = parts.dict.as_ref().unwrap().to_write().unwrap();
         dict.descriptor.version = version;
         dict
     };
 
     for version in [container::DICT_VERSION, container::DICT_VERSION - 1] {
         let bytes =
-            unstamped_store_bytes(vec![parts.built.array.clone()], vec![with_version(version)])
-                .await;
+            unstamped_store_bytes(vec![parts.array.clone()], vec![with_version(version)]).await;
         let (from_bytes, from_file, _dir) = open_both(&bytes).await;
         for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
             assert!(result.is_ok(), "{path}: version {version} must open");
@@ -1026,8 +1019,7 @@ async fn test_open_rejects_a_dictionary_version_newer_than_this_version_reads() 
 
     for version in [container::DICT_VERSION + 1, 99, u32::MAX] {
         let bytes =
-            unstamped_store_bytes(vec![parts.built.array.clone()], vec![with_version(version)])
-                .await;
+            unstamped_store_bytes(vec![parts.array.clone()], vec![with_version(version)]).await;
         let (from_bytes, from_file, dir) = open_both(&bytes).await;
         let in_memory = open_in_memory(&dir).await;
         for (how, result) in [
@@ -1137,8 +1129,8 @@ async fn test_open_rejects_an_index_version_newer_than_this_version_reads() {
     .await
     .unwrap();
     let with_version = |version: u32| {
-        let mut writes = vec![parts.built.dict.as_ref().unwrap().to_write().unwrap()];
-        for component in &parts.built.components {
+        let mut writes = vec![parts.dict.as_ref().unwrap().to_write().unwrap()];
+        for component in &parts.components {
             let mut write = component.to_write().unwrap();
             write.descriptor.version = version;
             writes.push(write);
@@ -1147,7 +1139,7 @@ async fn test_open_rejects_an_index_version_newer_than_this_version_reads() {
     };
 
     let bytes = unstamped_store_bytes(
-        vec![parts.built.array.clone()],
+        vec![parts.array.clone()],
         with_version(container::INDEX_VERSION),
     )
     .await;
@@ -1157,8 +1149,7 @@ async fn test_open_rejects_an_index_version_newer_than_this_version_reads() {
     }
 
     for version in [container::INDEX_VERSION + 1, 99, u32::MAX] {
-        let bytes =
-            unstamped_store_bytes(vec![parts.built.array.clone()], with_version(version)).await;
+        let bytes = unstamped_store_bytes(vec![parts.array.clone()], with_version(version)).await;
         let (from_bytes, from_file, dir) = open_both(&bytes).await;
         let in_memory = open_in_memory(&dir).await;
         for (how, result) in [
@@ -1307,7 +1298,6 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
     .unwrap();
     let short_children = || -> Vec<container::NativeComponentWrite> {
         parts
-            .built
             .components
             .iter()
             .map(|component| {
@@ -1333,7 +1323,7 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
         (short_children(), "holds 5 rows against 6 quad rows"),
         (two_faults, "required component this version cannot"),
     ] {
-        let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], components).await;
+        let bytes = unstamped_store_bytes(vec![parts.array.clone()], components).await;
         let (from_bytes, from_file, _dir) = open_both(&bytes).await;
         for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
             let err = result.err().expect("open should fail");
@@ -1451,19 +1441,17 @@ async fn a_v1_root_fails_to_open_inside_vortex() {
     }
 }
 
-/// `StoreParts::into_stream` requires a Dictionary-layout primary to come
+/// `BuiltArray::into_stream` requires a Dictionary-layout primary to come
 /// with its dictionary; the precondition is a debug assertion, so it is
 /// pinned in debug builds only.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "pairs a Dictionary primary with its dictionary")]
 fn test_parts_stream_requires_dictionary_beside_code_rows() {
-    let parts = crate::store::StoreParts {
-        built: crate::store::BuiltArray {
-            array: bare_code_quad_array(&[1, 2, 3]),
-            components: Vec::new(),
-            dict: None,
-        },
+    let parts = crate::store::BuiltArray {
+        array: bare_code_quad_array(&[1, 2, 3]),
+        components: Vec::new(),
+        dict: None,
     };
     let _ = parts.into_stream();
 }
@@ -1517,9 +1505,9 @@ async fn test_written_code_columns_avoid_delta() {
     let parts = adopted.to_serializable_parts().await.unwrap();
     let mut trees = vec![(
         "quads".to_string(),
-        format!("{}", parts.built.array.display_tree_encodings_only()),
+        format!("{}", parts.array.display_tree_encodings_only()),
     )];
-    for component in &parts.built.components {
+    for component in &parts.components {
         use vortex_array::IntoArray as _;
         let rows = component.rows().unwrap().clone().into_array();
         trees.push((
@@ -1591,8 +1579,8 @@ async fn test_written_frame_of_reference_keeps_one_reference() {
     let adopted = VortexRdfStore::from_bytes_owned(bytes).await.unwrap();
     let parts = adopted.to_serializable_parts().await.unwrap();
     let mut counts = (0, 0);
-    for_nodes(&parts.built.array, &mut counts);
-    for component in &parts.built.components {
+    for_nodes(&parts.array, &mut counts);
+    for component in &parts.components {
         for_nodes(&component.rows().unwrap().clone().into_array(), &mut counts);
     }
     let (single, per_chunk) = counts;

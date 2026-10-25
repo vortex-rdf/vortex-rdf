@@ -8,11 +8,11 @@ use crate::store::FileBase;
 use crate::store::builders::{BuiltArray, build_parts_from_raws};
 use crate::store::layouts::ResolvedLayout;
 
+use crate::store::VortexRdfStore;
 #[cfg(feature = "file-io")]
 use crate::store::persist::open::scanned_index_components;
-use crate::store::{StoreParts, VortexRdfStore};
 
-impl StoreParts {
+impl BuiltArray {
     /// These parts as a single-chunk [`BuiltStream`] for the writer: the rows
     /// as the one chunk, each component as a write, the dictionary beside
     /// them, and the rows' subject stamp as the root's `quads_sorted`. A
@@ -35,7 +35,7 @@ impl StoreParts {
             array,
             components,
             dict,
-        } = self.built;
+        } = self;
         debug_assert!(
             !matches!(
                 LayoutStrategy::from_dtype(array.dtype()),
@@ -59,11 +59,14 @@ impl StoreParts {
 }
 
 impl VortexRdfStore {
-    /// This store's serializable parts: the rows this view covers, base and
-    /// tail combined, as one array of primary columns, the index components
-    /// describing them and, under the Dictionary layout, the term dictionary
-    /// their codes address. `to_bytes` writes them and the in-memory open
-    /// (`from_file_in_memory`) adopts them.
+    /// This store's serializable parts, as a [`BuiltArray`]: the rows this
+    /// view covers, base and tail combined, as one array of primary columns,
+    /// their sortedness traveling as their `s` column's stamp, the index
+    /// components describing them and, under the Dictionary layout, the term
+    /// dictionary their codes address. `to_bytes` writes them
+    /// ([`BuiltArray::into_stream`]) and the in-memory open
+    /// (`from_file_in_memory`) adopts them back
+    /// ([`from_parts`](Self::from_parts)).
     ///
     /// Components come only when their `rid`s address the returned rows: an
     /// unrefined, untombstoned view without a tail passes its components
@@ -82,7 +85,7 @@ impl VortexRdfStore {
     /// own dictionary, a file-backed one lifted resident for the write, and
     /// its rows are read alone (`base_read`), which never materializes
     /// components.
-    pub(crate) async fn to_serializable_parts(&self) -> Result<StoreParts> {
+    pub(crate) async fn to_serializable_parts(&self) -> Result<BuiltArray> {
         let owner_shaped = self.quads.is_unrefined();
         let tombstoned = self.quads.deleted.is_some();
         let rebuild =
@@ -93,9 +96,7 @@ impl VortexRdfStore {
             // artifact carries the subject stamp and readers keep the
             // subject binary search and, on a file, the subject chunk probe.
             let raws = self.sorted_live_raw_quads().await?;
-            return Ok(StoreParts {
-                built: build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes)?,
-            });
+            return build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes);
         }
         let base = self.base_selected_rows().await?;
         let components = if owner_shaped && !tombstoned {
@@ -114,12 +115,10 @@ impl VortexRdfStore {
             ResolvedLayout::Dictionary(access) => Some(access.ensure_resident().await?),
             _ => None,
         };
-        Ok(StoreParts {
-            built: BuiltArray {
-                array: base,
-                components,
-                dict,
-            },
+        Ok(BuiltArray {
+            array: base,
+            components,
+            dict,
         })
     }
 

@@ -130,12 +130,10 @@ async fn write_unsorted_store_file(
     let (dict, code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
     let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
     let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
-    let parts = crate::store::StoreParts {
-        built: crate::store::BuiltArray {
-            array: primary,
-            components: Vec::new(),
-            dict: Some(std::sync::Arc::new(dict)),
-        },
+    let parts = crate::store::BuiltArray {
+        array: primary,
+        components: Vec::new(),
+        dict: Some(std::sync::Arc::new(dict)),
     };
     let mut bytes: Vec<u8> = Vec::new();
     crate::io::write::built_stream_to_vortex_writer(parts.into_stream().unwrap(), &mut bytes)

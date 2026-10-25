@@ -345,7 +345,7 @@ async fn test_tail_accretion_flattens_at_row_floor() {
 async fn test_serializable_parts_on_tailed_dictionary_store() {
     let quads = modular_quads(12, 3, 4);
     let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let base_rows = store.to_serializable_parts().await.unwrap().built.array;
+    let base_rows = store.to_serializable_parts().await.unwrap().array;
 
     let novel = make_quad(
         "http://example.org/brand-new-subject",
@@ -360,13 +360,12 @@ async fn test_serializable_parts_on_tailed_dictionary_store() {
     );
 
     let parts = tailed.to_serializable_parts().await.unwrap();
-    let rows = parts.built.array;
+    let rows = parts.array;
     assert_eq!(rows.len(), 13);
     assert_eq!(rows.len(), tailed.size().await.unwrap());
     assert_eq!(rows.dtype(), base_rows.dtype());
 
     let dict = parts
-        .built
         .dict
         .expect("a Dictionary rebuild carries its dictionary");
     let decoded: Vec<Quad> = crate::store::layouts::dictionary::decode_chunk(&rows, &dict)
@@ -388,7 +387,7 @@ async fn test_serializable_parts_on_tailed_default_store() {
     let appended = [tail_quad(0), tail_quad(1)];
     let tailed = store.add_quads(appended.clone()).await.unwrap();
 
-    let rows = tailed.to_serializable_parts().await.unwrap().built.array;
+    let rows = tailed.to_serializable_parts().await.unwrap().array;
     assert_eq!(rows.len(), 14);
     let decoded: Vec<Quad> = crate::store::layouts::ResolvedLayout::Default
         .decode_chunk(&rows)

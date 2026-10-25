@@ -18,7 +18,7 @@ use super::*;
 use crate::store::array::field_as;
 use crate::store::builders::{BuildSizes, sorted_stream};
 use crate::store::test_hooks::RowIdBase;
-use crate::store::{Probe, RowId, StoreParts};
+use crate::store::{BuiltArray, Probe, RowId};
 use vortex_array::VortexSessionExecute as _;
 use vortex_array::arrays::PrimitiveArray;
 
@@ -237,14 +237,11 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
 /// [`N`] rows numbered from `base`: each child's row ids are `base..base + N`,
 /// each once, and a reference child's rows are in `(val, rid)` order. Returns
 /// how many reference children had a value whose run crosses `u32::MAX`.
-fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
+fn check_children(parts: &BuiltArray, base: RowId, label: &str) -> usize {
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     let mut straddling = 0;
-    assert!(
-        !parts.built.components.is_empty(),
-        "{label}: index children"
-    );
-    for component in &parts.built.components {
+    assert!(!parts.components.is_empty(), "{label}: index children");
+    for component in &parts.components {
         let who = format!("{label} / {}", component.identity.name);
         let rows = component.rows().unwrap();
         let rid: PrimitiveArray = field_as(rows, "rid", &mut ctx).unwrap();
