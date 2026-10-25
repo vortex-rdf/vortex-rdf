@@ -11,15 +11,12 @@ use crate::session::VORTEX_SESSION;
 use crate::store::indexes::{
     ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
 };
-use crate::store::layouts::DictAccess;
 use crate::store::layouts::dictionary::TermDictionary;
+use crate::store::layouts::{DictAccess, LayoutStrategy};
 #[cfg(feature = "file-io")]
 use crate::store::{
-    Backend, FileBase, QuadsSource,
-    array::into_struct_array,
-    indexes::Indexes,
-    layouts::{LayoutStrategy, dictionary::FileBackedDict},
-    persist::native_file::NativeStoreFile,
+    Backend, FileBase, QuadsSource, array::into_struct_array, indexes::Indexes,
+    layouts::dictionary::FileBackedDict, persist::native_file::NativeStoreFile,
 };
 
 use std::sync::Arc;
@@ -147,7 +144,10 @@ pub(in crate::store) struct IndexChild {
 /// child through the roster (the resolvers, the listing, the adoptions)
 /// reaches only the children classified here.
 pub(super) struct ComponentRoster {
-    /// The slot of the `dictionary` child, when the inventory carries one.
+    /// The slot of the `dictionary` child the quad table's codes read. Only
+    /// the Dictionary layout has codes, and the quad table's dtype alone
+    /// decides the layout, so a dictionary child beside string columns is
+    /// left out like a skipped component.
     pub(super) dict: Option<usize>,
     /// The known index children, in inventory order.
     pub(super) index_children: Vec<IndexChild>,
@@ -172,19 +172,21 @@ impl ComponentRoster {
             .layout()
             .as_::<container::RdfStoreLayoutVTable>();
         let descriptors = &root.data().components;
+        let dictionary_layout =
+            LayoutStrategy::from_dtype(file.dtype()) == LayoutStrategy::Dictionary;
         let mut roster = Self {
             dict: None,
             index_children: Vec::new(),
         };
         for (slot, descriptor) in descriptors.iter().enumerate() {
             match classify_component(descriptor)? {
-                ComponentKind::Dict => roster.dict = Some(slot),
+                ComponentKind::Dict if dictionary_layout => roster.dict = Some(slot),
                 ComponentKind::Index(identity) => roster.index_children.push(IndexChild {
                     identity,
                     slot,
                     sorted: descriptor.sorted,
                 }),
-                ComponentKind::Skip => {}
+                ComponentKind::Dict | ComponentKind::Skip => {}
             }
         }
         for child in &roster.index_children {
@@ -279,20 +281,17 @@ impl VortexRdfStore {
                 indexes.push(child.identity.index);
             }
         }
-        // Only the Dictionary layout reads a dictionary.
-        let dict = match LayoutStrategy::from_dtype(file.dtype()) {
-            LayoutStrategy::Dictionary => match FileBackedDict::open(&file).await? {
-                Some(dict) => Some(DictAccess::FileBacked(dict)),
-                // One full scan of the dictionary child; the chunks keep their
-                // FSST.
-                None => match file.component_reader(container::DICT_COMPONENT_NAME)? {
-                    Some(reader) => Some(DictAccess::Resident(Arc::new(
-                        TermDictionary::from_child_reader(reader).await?,
-                    ))),
-                    None => None,
-                },
+        // The roster holds a dictionary under the Dictionary layout only.
+        let dict = match FileBackedDict::open(&file).await? {
+            Some(dict) => Some(DictAccess::FileBacked(dict)),
+            // One full scan of the dictionary child; the chunks keep their
+            // FSST.
+            None => match file.component_reader(container::DICT_COMPONENT_NAME)? {
+                Some(reader) => Some(DictAccess::Resident(Arc::new(
+                    TermDictionary::from_child_reader(reader).await?,
+                ))),
+                None => None,
             },
-            LayoutStrategy::Default | LayoutStrategy::TypedObject => None,
         };
         let layout = resolved_layout(dict, file.dtype())?;
         // No filter and no selection yet: this view covers all quad rows.

@@ -5,7 +5,7 @@
 //! index children and root layouts newer than it reads, a required component
 //! it cannot interpret, an index child whose rows are not the quads', a
 //! generic Vortex file and a `vortex-rdf.store.v1` root. An optional unknown
-//! component is skipped.
+//! component is skipped, and so is a dictionary child beside string columns.
 
 use super::*;
 use crate::io::container;
@@ -446,6 +446,49 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
             expected_strings(&quads, |i| i % 3 == 1),
             "{open}"
         );
+    }
+}
+
+/// The quad table's dtype alone decides the layout: a `dictionary` child
+/// beside string columns, which this crate never writes, is left unread by
+/// every open path. Each opens the store under its string layout, answers
+/// from the strings, and offers no dictionary table.
+#[tokio::test]
+async fn test_open_leaves_a_dictionary_child_beside_string_columns_unread() {
+    let quads = dictionary_test_quads();
+    let dict = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![])
+        .await
+        .to_serializable_parts()
+        .await
+        .unwrap()
+        .dict
+        .unwrap()
+        .to_write()
+        .unwrap();
+    let raws: Vec<crate::store::RawQuad> =
+        quads.iter().map(crate::store::RawQuad::from_quad).collect();
+    let p1 = iri("p1");
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let rows = crate::store::builders::build_struct_array(&raws, layout, false).unwrap();
+        let bytes = unstamped_store_bytes(vec![rows], vec![dict.clone()]).await;
+        let opens = [Open::Bytes, Open::BytesOwned, Open::Mapped, Open::Loaded];
+        let (_dir, opened) = open_each(&bytes, &opens).await;
+        for (open, result) in opened {
+            let store = result.unwrap_or_else(|e| panic!("{layout:?} {open}: open failed: {e}"));
+            assert_eq!(store.layout(), layout, "{open}");
+            assert_eq!(
+                view_strings(&matched_view(&store, None, Some(&p1), None, None).await).await,
+                expected_strings(&quads, |i| i % 3 == 1),
+                "{layout:?} {open}"
+            );
+            assert!(
+                store
+                    .component_data_source(container::DICT_COMPONENT_NAME)
+                    .unwrap()
+                    .is_none(),
+                "{layout:?} {open}: the dictionary child is offered"
+            );
+        }
     }
 }
 

@@ -170,7 +170,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
 matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L54));
-[`classify_component`](../core/src/store/persist/open.rs#L89) then turns each
+[`classify_component`](../core/src/store/persist/open.rs#L86) then turns each
 descriptor into the dictionary, a known index, or a skip — an index child by
 its implementation slug alone, whatever its name. The open classifies the
 roster once, and every later read reaches a child only through it.
@@ -255,7 +255,10 @@ What the store reads from this structure:
 ## 5. The `dictionary` child
 
 Present under the `Dictionary` layout, and then **required**: the quad columns
-are bare codes and cannot be decoded without it.
+are bare codes and cannot be decoded without it. Beside string columns a
+`dictionary` child is classified like any other component, so one this version
+cannot read is still refused, and is otherwise left unread by every open path:
+the dtype alone decides the layout ([§4](#4-the-quad-table)).
 
 | Property | Value |
 |---|---|
@@ -280,7 +283,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L235)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L237)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L132)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -336,7 +339,7 @@ Shared rules:
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
   ([`RowId`](../core/src/store/schema.rs#L33)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
-  ([`check_id_columns`](../core/src/store/persist/open.rs#L42)): rebuild such a store
+  ([`check_id_columns`](../core/src/store/persist/open.rs#L39)): rebuild such a store
   from its RDF source.
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
