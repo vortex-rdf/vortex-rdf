@@ -8,8 +8,8 @@
 
 mod batch;
 mod cancel;
-mod chunks;
 mod dict;
+mod iterators;
 mod kernels;
 mod probes;
 mod serialize;
@@ -154,8 +154,8 @@ impl CancelToken {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     keep_freed_heap();
     m.add_class::<store::VortexRdfStore>()?;
-    m.add_class::<store::ProbeAnswers>()?;
-    m.add_class::<chunks::CodeChunks>()?;
+    m.add_class::<iterators::ProbeAnswers>()?;
+    m.add_class::<iterators::CodeChunks>()?;
     m.add_class::<CancelToken>()?;
     m.add_class::<dict::TermDict>()?;
     m.add_class::<kernels::U64Column>()?;

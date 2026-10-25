@@ -1,38 +1,23 @@
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use vortex_buffer::Buffer;
-use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
 use crate::batch::Batch;
-use crate::cancel::{Pulled, Token};
-use crate::chunks::{CodeChunks, chunk_columns, every_column};
+use crate::cancel::Token;
 use crate::dict::{TermDict, decode_slice};
-use crate::kernels::U64Column;
+use crate::iterators::{
+    Answers, CodeChunks, CodeColumns, ProbeAnswers, ProbeColumns, chunk_columns, code_columns,
+    every_column,
+};
 use crate::probes::{narrowed_probe, parse_probes};
 use crate::{CancelToken, RUNTIME, VortexRdfError, cancelled, detached, py_err, raced, settled};
 use vortex_rdf_core::Probe;
-
-/// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
-type CodeColumns = (U64Column, U64Column, U64Column, U64Column);
-
-fn code_columns([s, p, o, g]: [Buffer<TermCode>; 4]) -> CodeColumns {
-    (
-        U64Column { codes: s },
-        U64Column { codes: p },
-        U64Column { codes: o },
-        U64Column { codes: g },
-    )
-}
-
-/// One probe's gathered `(s, p, o, g)` code columns, or `None` where the
-/// code path does not apply.
-type ProbeColumns = Option<[Buffer<TermCode>; 4]>;
 
 /// The rows `probe` matches as `(s, p, o, g)` term-code columns, gathered,
 /// or `None` when the match declines the code path.
@@ -70,78 +55,6 @@ fn token_of(cancel: Option<&Bound<'_, CancelToken>>) -> PyResult<Option<Token>> 
         return Err(cancelled());
     }
     Ok(token)
-}
-
-/// The answers of [`VortexRdfStore::match_codes_many`], one per probe in
-/// input order: its `(s, p, o, g)` code columns, or `None` where the code
-/// path does not apply. A bounded [`Batch`] runs the probes from the call
-/// on; each `__next__` waits, GIL-released, for its next answer, raced with
-/// the call's cancel token if it passed one. The first failing probe, or a
-/// cancelled pull, raises at its position and ends the iteration, and
-/// dropping the iterator aborts the probes still in flight.
-#[pyclass(frozen, module = "vortex_rdf._native")]
-pub struct ProbeAnswers {
-    answers: Mutex<Answers>,
-    /// The token every pull races, when the call passed one.
-    token: Option<Token>,
-    /// The number of probes, answered or not.
-    len: usize,
-}
-
-/// What a [`ProbeAnswers`] has still to answer.
-enum Answers {
-    /// The probes' gathered code columns, from a running batch.
-    Batch(Batch<ProbeColumns>),
-    /// `None` for each of this many probes: the store's rows have no codes,
-    /// so no probe runs.
-    Declined(usize),
-}
-
-impl Answers {
-    /// The next probe's answer, pulled with `token`; `None` once the probes
-    /// have all answered, one has failed or a pull was cancelled.
-    fn next(&mut self, token: Option<&Token>) -> Pulled<Option<Result<ProbeColumns, CoreError>>> {
-        match self {
-            Answers::Batch(batch) => batch.next(&RUNTIME, token),
-            // No probe runs, so a cancelled token is read here: it ends the
-            // answers still due.
-            Answers::Declined(left) if *left > 0 && token.is_some_and(Token::is_cancelled) => {
-                *left = 0;
-                Pulled::Cancelled
-            }
-            Answers::Declined(left) => Pulled::Done(match left.checked_sub(1) {
-                Some(rest) => {
-                    *left = rest;
-                    Some(Ok(None))
-                }
-                None => None,
-            }),
-        }
-    }
-}
-
-#[pymethods]
-impl ProbeAnswers {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Option<CodeColumns>>> {
-        // The lock is taken GIL-released, so a thread waiting on it holds
-        // no GIL the answering thread needs back.
-        let answer = py.detach(|| {
-            self.answers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .next(self.token.as_ref())
-        });
-        let answer = settled(answer.map(Option::transpose))?;
-        Ok(answer.map(|columns| columns.map(code_columns)))
-    }
-
-    fn __len__(&self) -> usize {
-        self.len
-    }
 }
 
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
@@ -625,10 +538,6 @@ impl VortexRdfStore {
                 |store, probe| async move { probe_codes(&store, &probe).await },
             ))
         };
-        Ok(ProbeAnswers {
-            answers: Mutex::new(answers),
-            token,
-            len,
-        })
+        Ok(ProbeAnswers::new(answers, token, len))
     }
 }
