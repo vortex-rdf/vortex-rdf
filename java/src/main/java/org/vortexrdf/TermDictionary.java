@@ -26,7 +26,8 @@ public final class TermDictionary {
 	}
 
 	/**
-	 * The code of a term, or {@link VortexStore#NONE} when the dictionary lacks it. The spelling is tolerated: an
+	 * The code of a term, or {@link VortexStore#NONE} when the dictionary lacks it, which in a code pattern is a free
+	 * position: check for it before putting the code into one. The spelling is tolerated: an
 	 * IRI with or without angle brackets, a literal with an explicit {@code xsd:string} type or an upper-case
 	 * language tag, and the default graph as {@code ""} all resolve to the stored form's code.
 	 */

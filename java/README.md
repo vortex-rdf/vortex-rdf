@@ -12,14 +12,18 @@ The artifact is not published yet. From a checkout of this repository:
 
 ```bash
 cargo build --release -p vortex-rdf-java        # target/release/libvortex_rdf_jni.so (.dylib on macOS, vortex_rdf_jni.dll on Windows)
-cd java && mvn package                          # target/vortex-rdf-0.13.1.jar
+cd java && mvn package -DskipTests              # target/vortex-rdf-X.Y.Z.jar, X.Y.Z the workspace version
 ```
+
+The tests are skipped here because they read fixture stores built separately (see [Development](#development)).
 
 The JVM finds the native library, in this order, at the path in the system property `vortexrdf.library`, at the path in the environment variable `VORTEX_RDF_JNI_LIB`, or under the name `vortex_rdf_jni` on `java.library.path`:
 
 ```bash
-java -Dvortexrdf.library=/path/to/libvortex_rdf_jni.so -cp vortex-rdf-0.13.1.jar:. MyApp
+java -Dvortexrdf.library=/path/to/libvortex_rdf_jni.so -cp vortex-rdf-X.Y.Z.jar:. MyApp
 ```
+
+On Java 24 and later, loading a native library is a restricted operation. Add `--enable-native-access=ALL-UNNAMED`, or name the module that holds the jar, so the JVM does not print a warning.
 
 ## Quick start
 
@@ -52,7 +56,13 @@ Both work on every layout, with identical results. `quads` is served from the te
 
 ## Term codes (low-level)
 
-A store of the `dictionary` layout keeps each term once in a sorted dictionary and its columns hold integer **term codes**. A query engine that holds codes (a join's per-binding lookup, say) can ask for a pattern of codes and skip the terms altogether. A code is a non-negative `long`; `VortexStore.NONE` (`-1`) is a free position. These calls raise `VortexException` on a store without a dictionary, which `store.dictionary()` tells in advance.
+A store of the `dictionary` layout keeps each term once in a sorted dictionary and its columns hold integer **term codes**. A query engine that holds codes (a join's per-binding lookup, say) can ask for a pattern of codes and skip the terms altogether.
+
+- A code is a non-negative `long`.
+- `VortexStore.NONE` (`-1`) is a free position of a pattern.
+- `encode` answers that same `NONE` for a term the store lacks. Check its answer before putting it into a pattern: there `NONE` is a free position, so an absent term would match every quad.
+
+These calls raise `VortexException` on a store without a dictionary, which `store.dictionary()` tells in advance.
 
 ```java
 TermDictionary dict = store.dictionary().orElseThrow();       // absent for other layouts
@@ -61,16 +71,22 @@ dict.decode(name);                                            // N-Triples spell
 dict.decodeMany(codes);                                       // one native call for a whole column
 dict.ranges();                                                // literals, IRIs, blank nodes and the default graph's code
 
-long n = store.countCodes(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE);
+if (name != VortexStore.NONE) {                               // the store holds the term
+    long n = store.countCodes(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE);
 
-ByteBuffer rows = ByteBuffer.allocateDirect(4096 * VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
-int got = store.matchCodes(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE, 0, rows, 4096);
-for (int i = 0; i < got; i++) {
-    long s = rows.getLong(i * VortexStore.ROW_BYTES), o = rows.getLong(i * VortexStore.ROW_BYTES + 16);
+    ByteBuffer rows = ByteBuffer.allocateDirect(4096 * VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
+    int got = store.matchCodes(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE, 0, rows, 4096);
+    for (int i = 0; i < got; i++) {
+        long s = rows.getLong(i * VortexStore.ROW_BYTES), o = rows.getLong(i * VortexStore.ROW_BYTES + 16);
+    }
 }
 ```
 
-`matchCodes` fills a reusable direct buffer with `(s, p, o, g)` codes, four longs per row, from its start; a long match is read in windows by passing the offset. A pattern that cannot match (a code past the dictionary, a literal in the subject position) gives no rows, not an error. The `long[]`-returning overload is the same call for callers that do not mind an allocation.
+`matchCodes` fills a reusable, writable direct buffer with `(s, p, o, g)` codes, four longs per row, from its start.
+
+- A long match is read in windows by passing the offset. Every window of one pattern comes in the same row order.
+- A pattern that cannot match gives no rows, not an error: a code past the dictionary, or a literal in the subject position.
+- The `long[]`-returning overload is the same call for callers that do not mind an allocation.
 
 When a file store can locate the pattern's rows by binary search (a prefix of the quad table's `(s, p, o, g)` order, or with `secondary-by-copy` the predicate- and object-led orders), a code lookup is one located run with no dictionary search; it takes the general path otherwise, and returns the same rows.
 
@@ -83,8 +99,9 @@ A store is safe to query from any number of threads. `close()` waits for the cal
 The Rust side (`src/engine.rs`, the logic, and `src/lib.rs`, the JNI glue) is tested by `tests/engine.rs` against a scan of the quads it was built from, for every pattern shape, layout and index set, by terms and by codes. The JUnit suite checks the same through the real library; it reads stores and an oracle file that the crate's `fixtures` example writes:
 
 ```bash
+cargo build -p vortex-rdf-java
 cargo run -p vortex-rdf-java --example fixtures -- java/target/fixtures
-cd java && mvn test -Dvortexrdf.library=../target/debug/libvortex_rdf_jni.so
+cd java && mvn test        # reads ../target/debug's library; -Dvortexrdf.library=<path> for another
 ```
 
 `scripts/ci-check.sh java-tests` does both. The JNI functions live in `src/lib.rs`; their Java declarations are the package-private `Native` class.

@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use common::{Quad, builds, quads as make_quads, write};
 use vortex_rdf_core::LayoutStrategy;
-use vortex_rdf_jni::engine::Store;
+use vortex_rdf_jni::engine::{ROW_BYTES, Store};
 
 fn quads() -> Vec<Quad> {
     make_quads(400)
@@ -54,6 +54,12 @@ fn patterns(quads: &[Quad]) -> Vec<[Option<String>; 4]> {
 
 fn as_refs(pattern: &[Option<String>; 4]) -> [Option<&str>; 4] {
     std::array::from_fn(|i| pattern[i].as_deref())
+}
+
+/// The code at `position` of `row` in rows [`Store::match_codes`] wrote.
+fn code_at(out: &[u8], row: usize, position: usize) -> u64 {
+    let at = ROW_BYTES * row + 8 * position;
+    u64::from_ne_bytes(out[at..at + 8].try_into().unwrap())
 }
 
 #[test]
@@ -215,7 +221,7 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
                 let mut seen = BTreeSet::new();
                 let mut offset = 0u64;
                 let page = 5usize;
-                let mut out = vec![0u64; 4 * page];
+                let mut out = vec![0u8; ROW_BYTES * page];
                 loop {
                     let n = store
                         .match_codes(code_pattern, offset, page, &mut out)
@@ -224,7 +230,7 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
                         let spelled: Vec<String> = (0..4)
                             .map(|i| {
                                 store
-                                    .decode(out[4 * row + i])
+                                    .decode(code_at(&out, row, i))
                                     .unwrap()
                                     .expect("a stored code decodes")
                             })
@@ -261,7 +267,7 @@ fn code_patterns_that_cannot_match_are_empty_not_errors() {
         .unwrap()
         .unwrap();
     let blank = store.encode("_:b0").unwrap().unwrap();
-    let mut out = [0u64; 8];
+    let mut out = [0u8; 2 * ROW_BYTES];
     for pattern in [
         [Some(literal), None, None, None],
         [None, Some(blank), None, None],

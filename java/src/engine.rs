@@ -30,6 +30,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A code pattern: one optional term code per position of `(s, p, o, g)`.
 pub type Codes = [Option<u64>; 4];
 
+/// Bytes per row [`Store::match_codes`] writes: four codes of eight bytes.
+pub const ROW_BYTES: usize = 32;
+
 /// One runtime for every store of the process, as in the Python bindings: a store's reads are async, the
 /// caller's threads block on them.
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -249,17 +252,20 @@ impl Store {
         Ok(self.rt.block_on(self.store.count_probe(&probe))? as u64)
     }
 
-    /// Up to `limit` quads matching a code pattern after `offset`, written as `(s, p, o, g)` codes into
-    /// `out`, which must hold `4 * limit` codes. Returns the rows written.
+    /// Up to `limit` quads matching a code pattern after `offset`, written into `out` as [`ROW_BYTES`] per
+    /// row: the `(s, p, o, g)` codes, eight native-endian bytes each. `out` must hold `limit` rows. Returns the
+    /// rows written.
     pub fn match_codes(
         &self,
         pattern: Codes,
         offset: u64,
         limit: usize,
-        out: &mut [u64],
+        out: &mut [u8],
     ) -> Result<usize> {
-        assert!(out.len() >= 4 * limit, "output buffer too small");
+        assert!(out.len() >= ROW_BYTES * limit, "output buffer too small");
         self.dict()?;
+        // `locate_codes` answers or declines by the pattern alone, so every window of one pattern takes the
+        // same path, in the same row order.
         let columns = if let Some(found) = self.rt.block_on(self.store.locate_codes(
             Self::code_pattern(pattern),
             offset as usize,
@@ -281,9 +287,12 @@ impl Store {
                 })?
         };
         let rows = columns[0].len().min(limit);
-        for row in 0..rows {
-            for (position, column) in columns.iter().enumerate() {
-                out[4 * row + position] = column[row];
+        for (row, bytes) in out.as_chunks_mut::<ROW_BYTES>().0[..rows]
+            .iter_mut()
+            .enumerate()
+        {
+            for (code, column) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&columns) {
+                *code = column[row].to_ne_bytes();
             }
         }
         Ok(rows)

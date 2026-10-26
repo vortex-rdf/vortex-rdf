@@ -21,15 +21,20 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * the default graph is the empty string {@code ""}, which is also how a pattern selects it. A malformed term raises
  * {@link VortexException} naming the position.
  *
- * <p>A term code is a non-negative {@code long}; {@link #NONE} ({@code -1}) is a free position of a code pattern.
- * Codes are the ones the Python and JavaScript bindings call term codes. Which store has a dictionary is told by
- * {@link #dictionary()} ({@code dictionary} layout); a code call on another store raises {@link VortexException}.
+ * <p>A term code is a non-negative {@code long}; {@link #NONE} ({@code -1}) is a free position of a code pattern, and
+ * also what {@link TermDictionary#encode} answers for a term the store lacks: check that answer before putting it into
+ * a pattern, where it would match every quad. Codes are the ones the Python and JavaScript bindings call term codes.
+ * Which store has a dictionary is told by {@link #dictionary()} ({@code dictionary} layout); a code call on another
+ * store raises {@link VortexException}.
  *
  * <p>Thread safe: any number of threads may query one store. {@link #close()} waits for the calls in progress and
  * later calls raise {@link IllegalStateException}. The native library is located as described in {@code Native}.
  */
 public final class VortexStore implements AutoCloseable {
-	/** "No code": a free position of a code pattern, and what {@link TermDictionary#encode} answers for an unknown term. */
+	/**
+	 * "No code": a free position of a code pattern, and what {@link TermDictionary#encode} answers for an unknown term.
+	 * Check {@code encode}'s answer before putting it into a pattern, where {@code NONE} matches every quad.
+	 */
 	public static final long NONE = -1;
 
 	/** Bytes per row written by {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)}: four longs. */
@@ -172,20 +177,20 @@ public final class VortexStore implements AutoCloseable {
 	/**
 	 * Writes up to {@code maxRows} quads matching a pattern of codes, after {@code offset} rows of the match, as
 	 * {@code (s, p, o, g)} codes of eight bytes each ({@link #ROW_BYTES} per row), from the start of {@code out}
-	 * (its position and limit are neither read nor changed), and returns the rows written. A code that cannot match
-	 * (past the dictionary, or a term in a position it cannot take) gives no rows.
+	 * (its position and limit are neither read nor changed), and returns the rows written; negative is free. A code
+	 * that cannot match (past the dictionary, or a term in a position it cannot take) gives no rows.
 	 *
-	 * @param out a direct buffer in native byte order ({@code ByteBuffer.allocateDirect(n).order(ByteOrder.nativeOrder())})
-	 *            of at least {@code maxRows * ROW_BYTES} bytes; reuse one across calls
+	 * @param out a writable direct buffer in native byte order
+	 *            ({@code ByteBuffer.allocateDirect(n).order(ByteOrder.nativeOrder())}) of at least
+	 *            {@code maxRows * ROW_BYTES} bytes; reuse one across calls
 	 */
 	public int matchCodes(long s, long p, long o, long g, long offset, ByteBuffer out, int maxRows) {
 		Objects.requireNonNull(out, "out");
-		if (offset < 0 || maxRows < 0) {
-			throw new IllegalArgumentException("offset and maxRows must not be negative");
-		}
-		if (!out.isDirect() || out.order() != ByteOrder.nativeOrder() || out.capacity() < (long) maxRows * ROW_BYTES) {
-			throw new IllegalArgumentException(
-					"out must be a direct, native-order buffer of at least maxRows * " + ROW_BYTES + " bytes");
+		checkWindow(offset, maxRows);
+		if (!out.isDirect() || out.isReadOnly() || out.order() != ByteOrder.nativeOrder()
+				|| out.capacity() < (long) maxRows * ROW_BYTES) {
+			throw new IllegalArgumentException("out must be a writable, direct, native-order buffer of at least maxRows * "
+					+ ROW_BYTES + " bytes");
 		}
 		long h = enter();
 		try {
@@ -197,10 +202,17 @@ public final class VortexStore implements AutoCloseable {
 
 	/** {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)} into a new array of four codes per row. */
 	public long[] matchCodes(long s, long p, long o, long g, long offset, int limit) {
+		checkWindow(offset, limit);
 		ByteBuffer out = ByteBuffer.allocateDirect(Math.multiplyExact(limit, ROW_BYTES)).order(ByteOrder.nativeOrder());
 		int rows = matchCodes(s, p, o, g, offset, out, limit);
 		long[] codes = new long[4 * rows];
 		out.asLongBuffer().get(codes);
 		return codes;
+	}
+
+	private static void checkWindow(long offset, int rows) {
+		if (offset < 0 || rows < 0) {
+			throw new IllegalArgumentException("offset and maxRows must not be negative");
+		}
 	}
 }

@@ -9,7 +9,8 @@ import java.nio.file.Paths;
  * <p>
  * The library is found, in this order, at the path in the system property {@code vortexrdf.library}, at the path
  * in the environment variable {@code VORTEX_RDF_JNI_LIB}, or by {@link System#loadLibrary} under the name
- * {@code vortex_rdf_jni} (on {@code java.library.path}).
+ * {@code vortex_rdf_jni} (on {@code java.library.path}). On Java 24 and later loading it is a restricted method:
+ * {@code --enable-native-access=ALL-UNNAMED} (or the jar's module) keeps the JVM from warning.
  */
 final class Native {
 	static {

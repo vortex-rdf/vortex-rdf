@@ -173,7 +173,7 @@ job_js_tests() {
 # crate's `fixtures` example), then runs Maven.
 job_java_tests() {
   if ! command -v java >/dev/null 2>&1 || ! command -v mvn >/dev/null 2>&1; then
-    skip_job "no JDK or Maven" "install JDK 17 or later and Maven"
+    skip_job "no JDK or Maven" "install JDK 11 or later and Maven"
     return 0
   fi
   local target="${CARGO_TARGET_DIR:-target}" lib

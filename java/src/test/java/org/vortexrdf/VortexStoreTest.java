@@ -248,7 +248,8 @@ class VortexStoreTest {
 			ByteBuffer small = ByteBuffer.allocateDirect(8).order(ByteOrder.nativeOrder());
 			ByteBuffer swapped = ByteBuffer.allocateDirect(64)
 					.order(ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN);
-			for (ByteBuffer bad : new ByteBuffer[] { heap, small, swapped }) {
+			ByteBuffer readOnly = ByteBuffer.allocateDirect(64).asReadOnlyBuffer().order(ByteOrder.nativeOrder());
+			for (ByteBuffer bad : new ByteBuffer[] { heap, small, swapped, readOnly }) {
 				assertThrows(IllegalArgumentException.class,
 						() -> store.matchCodes(-1, -1, -1, -1, 0, bad, 2));
 			}

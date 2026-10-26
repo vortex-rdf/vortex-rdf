@@ -64,4 +64,40 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!-- The native library's file name where it is not Linux's. -->
+    <profile>
+      <id>macos</id>
+      <activation>
+        <os>
+          <family>mac</family>
+        </os>
+      </activation>
+      <properties>
+        <vortexrdf.library>${project.basedir}/../target/debug/libvortex_rdf_jni.dylib</vortexrdf.library>
+      </properties>
+    </profile>
+    <profile>
+      <id>windows</id>
+      <activation>
+        <os>
+          <family>windows</family>
+        </os>
+      </activation>
+      <properties>
+        <vortexrdf.library>${project.basedir}/../target/debug/vortex_rdf_jni.dll</vortexrdf.library>
+      </properties>
+    </profile>
+    <!-- Java 24 and later warn when a native library loads unless native access is enabled. -->
+    <profile>
+      <id>native-access</id>
+      <activation>
+        <jdk>[24,)</jdk>
+      </activation>
+      <properties>
+        <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+      </properties>
+    </profile>
+  </profiles>
 </project>
