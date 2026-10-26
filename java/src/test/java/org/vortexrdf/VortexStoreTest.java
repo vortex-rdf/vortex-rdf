@@ -31,7 +31,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-/** The Java API against a scan of the quads the fixture stores were built from. */
+/**
+ * The Java API through the native library, against the quads the fixture stores were built from. The engine's own
+ * tests (tests/engine.rs) cover every pattern shape, layout and window; these cover what crosses the JNI boundary:
+ * each native method, how its arguments arrive (null, "", -1, offsets, limits, buffers), its errors, and a store's
+ * lifetime and threads.
+ */
 class VortexStoreTest {
 	private static Path fixtures;
 	private static List<String[]> quads;
@@ -75,118 +80,108 @@ class VortexStoreTest {
 		return out;
 	}
 
-	/** Every subset of positions bound to a stored quad's terms, for a spread of quads, plus absent terms. */
+	/** One pattern per way an argument arrives: all free, each position bound, all four, "", an absent term. */
 	private static List<String[]> patterns() {
-		List<String[]> out = new ArrayList<>();
-		for (int row = 0; row < quads.size(); row += 31) {
-			for (int mask = 0; mask < 16; mask++) {
-				String[] p = new String[4];
-				for (int i = 0; i < 4; i++) {
-					p[i] = (mask & (1 << i)) != 0 ? quads.get(row)[i] : null;
-				}
-				out.add(p);
-			}
-		}
-		for (int i = 0; i < 4; i++) {
-			String[] p = new String[4];
-			p[i] = "<http://example.org/absent>";
-			out.add(p);
-		}
-		return out;
+		String[] q = quads.get(quads.size() / 2);
+		return List.of(new String[] { null, null, null, null }, new String[] { q[0], null, null, null },
+				new String[] { null, q[1], null, null }, new String[] { null, null, q[2], null },
+				new String[] { null, null, null, q[3] }, q.clone(), new String[] { null, null, null, "" },
+				new String[] { null, null, "<http://example.org/absent>", null });
 	}
 
 	@ParameterizedTest
 	@ValueSource(strings = { "dictionary", "copy", "reference", "default" })
-	void termPatternsMatchAScanOnEveryStore(String name) {
-		for (boolean inMemory : new boolean[] { false, true }) {
-			try (VortexStore store = open(name, inMemory)) {
-				assertEquals(quads.size(), store.size());
-				assertEquals(!name.equals("default"), store.dictionary().isPresent());
-				for (String[] p : patterns()) {
-					Set<String> want = scan(p);
-					String tag = name + " " + Arrays.toString(p);
-					assertEquals(want.size(), store.count(p[0], p[1], p[2], p[3]), tag);
-					List<String[]> all = store.quads(p[0], p[1], p[2], p[3]);
-					assertEquals(want, keys(all), tag);
-					assertEquals(want.size(), all.size(), tag + " no duplicate rows");
-					Set<String> paged = new TreeSet<>();
-					for (long offset = 0; offset < want.size(); offset += 7) {
-						List<String[]> page = store.quads(p[0], p[1], p[2], p[3], offset, 7);
-						assertEquals(Math.min(7, want.size() - offset), page.size(), tag + " page at " + offset);
-						paged.addAll(keys(page));
-					}
-					assertEquals(want, paged, tag + " pages");
-				}
+	void termPatternsCrossTheBoundary(String name) {
+		try (VortexStore store = open(name, false); VortexStore loaded = open(name, true)) {
+			assertEquals(quads.size(), store.size());
+			assertEquals(store.size(), loaded.size());
+			assertEquals(!name.equals("default"), store.dictionary().isPresent());
+			for (String[] p : patterns()) {
+				Set<String> want = scan(p);
+				String tag = name + " " + Arrays.toString(p);
+				assertEquals(want.size(), store.count(p[0], p[1], p[2], p[3]), tag);
+				List<String[]> all = store.quads(p[0], p[1], p[2], p[3]);
+				assertEquals(want, keys(all), tag);
+				assertEquals(want.size(), all.size(), tag + " no duplicate rows");
 			}
+			// Windows of the whole store: an offset and a limit cross as a long and an int.
+			Set<String> paged = new TreeSet<>();
+			for (long offset = 0; offset < quads.size(); offset += 7) {
+				List<String[]> page = store.quads(null, null, null, null, offset, 7);
+				assertEquals(Math.min(7, quads.size() - offset), page.size(), name + " page at " + offset);
+				paged.addAll(keys(page));
+			}
+			assertEquals(scan(new String[4]), paged, name + " pages");
+			assertTrue(store.quads(null, null, null, null, quads.size(), 5).isEmpty());
+			assertTrue(store.quads(null, null, null, null, 0, 0).isEmpty());
+			assertEquals(quads.size(), store.quads(null, null, null, null, 3, -1).size() + 3);
 		}
 	}
 
 	@ParameterizedTest
 	@ValueSource(strings = { "dictionary", "copy", "reference" })
-	void codePatternsMatchAScanAndRoundTripThroughTheDictionary(String name) {
-		for (boolean inMemory : new boolean[] { false, true }) {
-			try (VortexStore store = open(name, inMemory)) {
-				TermDictionary dict = store.dictionary().get();
-				long terms = dict.size();
-				TermDictionary.Ranges ranges = dict.ranges();
-				long kinds = 0;
-				for (TermDictionary.CodeRange r : List.of(ranges.literals(), ranges.iris(), ranges.blanks())) {
-					kinds += r.end() - r.start();
-				}
-				assertEquals(dict.encode(""), ranges.defaultGraph());
-				assertEquals(terms, kinds + (ranges.defaultGraph() == VortexStore.NONE ? 0 : 1));
+	void codesCrossTheBoundary(String name) {
+		try (VortexStore store = open(name, false)) {
+			TermDictionary dict = store.dictionary().get();
+			long terms = dict.size();
+			TermDictionary.Ranges ranges = dict.ranges();
+			long kinds = 0;
+			for (TermDictionary.CodeRange r : List.of(ranges.literals(), ranges.iris(), ranges.blanks())) {
+				kinds += r.end() - r.start();
+			}
+			assertEquals(dict.encode(""), ranges.defaultGraph());
+			assertEquals(terms, kinds + (ranges.defaultGraph() == VortexStore.NONE ? 0 : 1));
 
-				Set<String> distinct = new TreeSet<>();
-				for (String[] q : quads) {
-					distinct.addAll(Arrays.asList(q));
-				}
-				List<String> terms2 = new ArrayList<>(distinct);
-				long[] codes = new long[terms2.size()];
-				for (int i = 0; i < codes.length; i++) {
-					codes[i] = dict.encode(terms2.get(i));
-					assertNotEquals(VortexStore.NONE, codes[i], terms2.get(i));
-					assertEquals(terms2.get(i), dict.decode(codes[i]));
-					String t = terms2.get(i);
-					TermDictionary.CodeRange kind = t.startsWith("\"") ? ranges.literals()
-							: t.startsWith("_:") ? ranges.blanks() : ranges.iris();
-					assertEquals(!t.isEmpty(), kind.contains(codes[i]), t);
-				}
-				assertArrayEquals(terms2.toArray(new String[0]), dict.decodeMany(codes));
-				assertEquals(VortexStore.NONE, dict.encode("<http://example.org/absent>"));
-				assertNull(dict.decode(terms + 5));
-				assertNull(dict.decode(VortexStore.NONE));
-				String[] decoded = dict.decodeMany(new long[] { codes[0], VortexStore.NONE, terms + 1 });
-				assertEquals(terms2.get(0), decoded[0]);
-				assertNull(decoded[1]);
-				assertNull(decoded[2]);
+			Set<String> distinct = new TreeSet<>();
+			for (String[] q : quads) {
+				distinct.addAll(Arrays.asList(q));
+			}
+			List<String> spellings = new ArrayList<>(distinct);
+			long[] codes = new long[spellings.size()];
+			for (int i = 0; i < codes.length; i++) {
+				String t = spellings.get(i);
+				codes[i] = dict.encode(t);
+				assertNotEquals(VortexStore.NONE, codes[i], t);
+				assertEquals(t, dict.decode(codes[i]));
+				TermDictionary.CodeRange kind = t.startsWith("\"") ? ranges.literals()
+						: t.startsWith("_:") ? ranges.blanks() : ranges.iris();
+				assertEquals(!t.isEmpty(), kind.contains(codes[i]), t);
+			}
+			assertArrayEquals(spellings.toArray(new String[0]), dict.decodeMany(codes));
+			assertEquals(VortexStore.NONE, dict.encode("<http://example.org/absent>"));
+			assertNull(dict.decode(terms + 5));
+			assertNull(dict.decode(VortexStore.NONE));
+			assertArrayEquals(new String[] { spellings.get(0), null, null },
+					dict.decodeMany(new long[] { codes[0], VortexStore.NONE, terms + 1 }));
 
-				ByteBuffer out = ByteBuffer.allocateDirect(5 * VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
-				for (String[] p : patterns()) {
-					Set<String> want = scan(p);
-					long[] pattern = new long[4];
-					for (int i = 0; i < 4; i++) {
-						pattern[i] = p[i] == null ? VortexStore.NONE : dict.encode(p[i]) == VortexStore.NONE ? terms + 7 : dict.encode(p[i]);
-					}
-					String tag = name + " " + Arrays.toString(p);
-					assertEquals(want.size(), store.countCodes(pattern[0], pattern[1], pattern[2], pattern[3]), tag);
-					Set<String> seen = new HashSet<>();
-					for (long offset = 0;; offset += 5) {
-						int n = store.matchCodes(pattern[0], pattern[1], pattern[2], pattern[3], offset, out, 5);
-						for (int row = 0; row < n; row++) {
-							String[] q = new String[4];
-							for (int i = 0; i < 4; i++) {
-								q[i] = dict.decode(out.getLong(row * VortexStore.ROW_BYTES + 8 * i));
-							}
-							assertTrue(seen.add(key(q)), tag + " repeated row");
-						}
-						if (n < 5) {
-							break;
-						}
-					}
-					assertEquals(want, new TreeSet<>(seen), tag);
-					long[] flat = store.matchCodes(pattern[0], pattern[1], pattern[2], pattern[3], 0, 1000);
-					assertEquals(4 * want.size(), flat.length, tag + " array form");
+			ByteBuffer out = ByteBuffer.allocateDirect(5 * VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
+			for (String[] p : patterns()) {
+				Set<String> want = scan(p);
+				long[] pattern = new long[4];
+				for (int i = 0; i < 4; i++) {
+					// An absent term: a code past the dictionary, not NONE, which would free the position.
+					long code = p[i] == null ? VortexStore.NONE : dict.encode(p[i]);
+					pattern[i] = p[i] != null && code == VortexStore.NONE ? terms + 7 : code;
 				}
+				String tag = name + " " + Arrays.toString(p);
+				assertEquals(want.size(), store.countCodes(pattern[0], pattern[1], pattern[2], pattern[3]), tag);
+				Set<String> seen = new HashSet<>();
+				for (long offset = 0;; offset += 5) {
+					int n = store.matchCodes(pattern[0], pattern[1], pattern[2], pattern[3], offset, out, 5);
+					for (int row = 0; row < n; row++) {
+						String[] q = new String[4];
+						for (int i = 0; i < 4; i++) {
+							q[i] = dict.decode(out.getLong(row * VortexStore.ROW_BYTES + 8 * i));
+						}
+						assertTrue(seen.add(key(q)), tag + " repeated row");
+					}
+					if (n < 5) {
+						break;
+					}
+				}
+				assertEquals(want, new TreeSet<>(seen), tag);
+				long[] flat = store.matchCodes(pattern[0], pattern[1], pattern[2], pattern[3], 0, 1000);
+				assertEquals(4 * want.size(), flat.length, tag + " array form");
 			}
 		}
 	}
