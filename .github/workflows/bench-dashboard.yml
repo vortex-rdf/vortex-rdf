@@ -54,7 +54,7 @@ jobs:
           cache-dependency-path: js/package-lock.json
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.3.0
+        uses: astral-sh/setup-uv@v10.3.2
 
       # The built bindings, each with the stamp scripts/refresh.sh writes
       # beside it: a restored artifact whose stamp still matches is not rebuilt
