@@ -125,10 +125,12 @@ impl<'a> TypedEq<'a> {
                 if !col.dtype().is_unsigned_int() {
                     return None;
                 }
-                let canonical = match canonicalize {
-                    true => shared_code_primitive(col),
-                    false => cached_code_primitive(col),
-                };
+                let canonical =
+                    match canonicalize || !vortex_rdf_encoded_search::encoded_search_enabled() {
+                        // VORTEX_RDF_ENCODED_SEARCH=0 decodes the column and compares decoded values
+                        true => shared_code_primitive(col),
+                        false => cached_code_primitive(col),
+                    };
                 if let Some(prim) = canonical {
                     return Some(TypedEq::Code(prim, *code));
                 }

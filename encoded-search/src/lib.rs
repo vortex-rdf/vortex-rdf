@@ -14,7 +14,18 @@ mod layout;
 #[cfg(feature = "layout")]
 pub use layout::{ColumnChunks, FlatLeaf, LeafRows, fetch_flat, flat_leaves};
 
+use std::sync::OnceLock;
+
 use vortex_array::ArrayRef;
+
+/// Ablation switch `VORTEX_RDF_ENCODED_SEARCH`, read once per process: `0` makes every place that searches or
+/// point-reads an encoded column decode it first (to a primitive array) and search the decoded values; the chunk
+/// bisection over chunk probes and the zone-map pruning stay as they are. Unset or any other value: the encoded
+/// search as usual.
+pub fn encoded_search_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VORTEX_RDF_ENCODED_SEARCH").as_deref() != Ok("0"))
+}
 
 /// A resolved, borrowed probe over one encoded (or canonical) array.
 ///
