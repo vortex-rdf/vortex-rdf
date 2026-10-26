@@ -10,9 +10,10 @@
 # also sets X.Y.Z everywhere a version is declared: the three version lines of
 # Cargo.toml ([workspace.package] and the two path dependencies), the workspace
 # entries of Cargo.lock, interface-tests/Cargo.lock and bench-compare/Cargo.lock
-# (`cargo update -w`), and js/package.json with its lock (`npm version`). Python
-# inherits the workspace version through maturin. Released sections (## [x.y.z])
-# are kept verbatim.
+# (`cargo update -w`), js/package.json with its lock (`npm version`), and the
+# project version of java/pom.xml (its first <version>, the line release.yml
+# checks). Python inherits the workspace version through maturin. Released
+# sections (## [x.y.z]) are kept verbatim.
 #
 # Cut the changelog last, once nothing else is waiting to land: a cut section
 # is frozen (the script refuses to cut the same version twice), so a commit
@@ -128,6 +129,12 @@ cargo update -w
 cargo update -w --manifest-path interface-tests/Cargo.toml
 cargo update -w --manifest-path bench-compare/Cargo.toml
 (cd js && npm version "$ver" --no-git-tag-version --allow-same-version)
+# The pom's first <version> is the project's own (release.yml reads the same line).
+awk -v ver="$ver" '!done && sub(/<version>[^<]*<\/version>/, "<version>" ver "</version>") { done = 1 } { print }' \
+  java/pom.xml > java/pom.xml.tmp
+mv java/pom.xml.tmp java/pom.xml
+pom_version="$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' java/pom.xml | head -n 1)"
+[ "$pom_version" = "$ver" ] || { echo "error: java/pom.xml's version is '$pom_version', not $ver; check it by hand" >&2; exit 1; }
 
 write_changelog --tag "$version"
 echo "Cut release $version: versions set to $ver, and its CHANGELOG.md section written."
