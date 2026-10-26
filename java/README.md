@@ -69,7 +69,7 @@ TermDictionary dict = store.dictionary().orElseThrow();       // absent for othe
 long name = dict.encode("<http://xmlns.com/foaf/0.1/name>");  // code of a term, or NONE
 dict.decode(name);                                            // N-Triples spelling, or null past the dictionary
 dict.decodeMany(codes);                                       // one native call for a whole column
-dict.ranges();                                                // literals, IRIs, blank nodes and the default graph's code
+dict.ranges().literals().contains(code);                      // a code's term kind: literals, IRIs or blank nodes
 
 if (name != VortexStore.NONE) {                               // the store holds the term
     long n = store.countCodes(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE);

@@ -130,8 +130,8 @@ class VortexStoreTest {
 				long terms = dict.size();
 				TermDictionary.Ranges ranges = dict.ranges();
 				long kinds = 0;
-				for (long[] r : new long[][] { ranges.literals(), ranges.iris(), ranges.blanks() }) {
-					kinds += r[1] - r[0];
+				for (TermDictionary.CodeRange r : List.of(ranges.literals(), ranges.iris(), ranges.blanks())) {
+					kinds += r.end() - r.start();
 				}
 				assertEquals(dict.encode(""), ranges.defaultGraph());
 				assertEquals(terms, kinds + (ranges.defaultGraph() == VortexStore.NONE ? 0 : 1));
@@ -146,6 +146,10 @@ class VortexStoreTest {
 					codes[i] = dict.encode(terms2.get(i));
 					assertNotEquals(VortexStore.NONE, codes[i], terms2.get(i));
 					assertEquals(terms2.get(i), dict.decode(codes[i]));
+					String t = terms2.get(i);
+					TermDictionary.CodeRange kind = t.startsWith("\"") ? ranges.literals()
+							: t.startsWith("_:") ? ranges.blanks() : ranges.iris();
+					assertEquals(!t.isEmpty(), kind.contains(codes[i]), t);
 				}
 				assertArrayEquals(terms2.toArray(new String[0]), dict.decodeMany(codes));
 				assertEquals(VortexStore.NONE, dict.encode("<http://example.org/absent>"));

@@ -4,12 +4,13 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.LongFunction;
+import java.util.function.LongToIntFunction;
+import java.util.function.LongUnaryOperator;
 
 /**
  * A read-only <a href="https://github.com/vortex-rdf/vortex-rdf">Vortex-RDF</a> store opened from a
@@ -63,18 +64,44 @@ public final class VortexStore implements AutoCloseable {
 		return new VortexStore(Native.open(file.toAbsolutePath().toString(), inMemory));
 	}
 
-	/** Takes the handle for one call; {@link #exit()} releases it. */
-	long enter() {
+	/** {@code call}'s answer for the open store's handle, the store held open until it returns. */
+	<T> T call(LongFunction<T> call) {
+		long h = enter();
+		try {
+			return call.apply(h);
+		} finally {
+			lock.readLock().unlock();
+		}
+	}
+
+	/** {@link #call} of a {@code long} answer. */
+	long callLong(LongUnaryOperator call) {
+		long h = enter();
+		try {
+			return call.applyAsLong(h);
+		} finally {
+			lock.readLock().unlock();
+		}
+	}
+
+	/** {@link #call} of an {@code int} answer. */
+	int callInt(LongToIntFunction call) {
+		long h = enter();
+		try {
+			return call.applyAsInt(h);
+		} finally {
+			lock.readLock().unlock();
+		}
+	}
+
+	/** The handle, read-locked: the caller unlocks. */
+	private long enter() {
 		lock.readLock().lock();
 		if (handle == 0) {
 			lock.readLock().unlock();
 			throw new IllegalStateException("the store is closed");
 		}
 		return handle;
-	}
-
-	void exit() {
-		lock.readLock().unlock();
 	}
 
 	/** Closes the store, after the calls in progress; closing twice is harmless. */
@@ -93,32 +120,17 @@ public final class VortexStore implements AutoCloseable {
 
 	/** The number of quads. */
 	public long size() {
-		long h = enter();
-		try {
-			return Native.size(h);
-		} finally {
-			exit();
-		}
+		return callLong(Native::size);
 	}
 
 	/** The column layout: {@code "dictionary"}, {@code "default"} or {@code "typed-object"}. */
 	public String layout() {
-		long h = enter();
-		try {
-			return Native.layout(h);
-		} finally {
-			exit();
-		}
+		return call(Native::layout);
 	}
 
 	/** The secondary indexes the file carries: {@code "secondary-by-copy"}, {@code "secondary-by-reference"}. */
 	public List<String> indexes() {
-		long h = enter();
-		try {
-			return Collections.unmodifiableList(Arrays.asList(Native.indexes(h)));
-		} finally {
-			exit();
-		}
+		return List.of(call(Native::indexes));
 	}
 
 	/** The term dictionary, present for a store of the {@code dictionary} layout. */
@@ -130,12 +142,7 @@ public final class VortexStore implements AutoCloseable {
 
 	/** The number of quads matching a pattern of terms, counted without reading any term. */
 	public long count(String s, String p, String o, String g) {
-		long h = enter();
-		try {
-			return Native.count(h, s, p, o, g);
-		} finally {
-			exit();
-		}
+		return callLong(h -> Native.count(h, s, p, o, g));
 	}
 
 	/** Every quad matching a pattern of terms, as {@code {s, p, o, g}} spellings, in the store's row order. */
@@ -148,13 +155,7 @@ public final class VortexStore implements AutoCloseable {
 		if (offset < 0) {
 			throw new IllegalArgumentException("offset < 0");
 		}
-		long h = enter();
-		String[] flat;
-		try {
-			flat = Native.quads(h, s, p, o, g, offset, limit);
-		} finally {
-			exit();
-		}
+		String[] flat = call(h -> Native.quads(h, s, p, o, g, offset, limit));
 		List<String[]> rows = new ArrayList<>(flat.length / 4);
 		for (int i = 0; i < flat.length; i += 4) {
 			rows.add(new String[] { flat[i], flat[i + 1], flat[i + 2], flat[i + 3] });
@@ -166,12 +167,7 @@ public final class VortexStore implements AutoCloseable {
 
 	/** The number of quads matching a pattern of codes, exact and without reading rows; negative is free. */
 	public long countCodes(long s, long p, long o, long g) {
-		long h = enter();
-		try {
-			return Native.countCodes(h, s, p, o, g);
-		} finally {
-			exit();
-		}
+		return callLong(h -> Native.countCodes(h, s, p, o, g));
 	}
 
 	/**
@@ -192,12 +188,7 @@ public final class VortexStore implements AutoCloseable {
 			throw new IllegalArgumentException("out must be a writable, direct, native-order buffer of at least maxRows * "
 					+ ROW_BYTES + " bytes");
 		}
-		long h = enter();
-		try {
-			return Native.matchCodes(h, s, p, o, g, out, offset, maxRows);
-		} finally {
-			exit();
-		}
+		return callInt(h -> Native.matchCodes(h, s, p, o, g, out, offset, maxRows));
 	}
 
 	/** {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)} into a new array of four codes per row. */
