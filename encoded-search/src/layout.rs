@@ -61,16 +61,41 @@ impl DictValues {
     }
 }
 
+/// A fetched chunk leaf: its resolved probe, or the array itself when the
+/// chunk's encoding declines resolution, which a take still reads.
+enum FetchedLeaf {
+    Probe(OwnedSortedProbe),
+    Declined(ArrayRef),
+}
+
+impl FetchedLeaf {
+    /// The resolved probe; `None` when the encoding declined it.
+    fn probe(&self) -> Option<&OwnedSortedProbe> {
+        match self {
+            Self::Probe(probe) => Some(probe),
+            Self::Declined(_) => None,
+        }
+    }
+
+    /// The chunk's array in its wire encoding.
+    fn array(&self) -> &ArrayRef {
+        match self {
+            Self::Probe(probe) => probe.array(),
+            Self::Declined(array) => array,
+        }
+    }
+}
+
 /// One flat chunk leaf, never empty: its layout, its first row in the
 /// column, the dictionary its values index into (when it holds a
-/// `vortex.dict` layout's codes), and its fetched, resolved probe (filled on
-/// first use; `None` when the chunk's encoding declines resolution).
+/// `vortex.dict` layout's codes), and its [`FetchedLeaf`] (filled on first
+/// use).
 struct ChunkLeaf {
     layout: FlatLayout,
     row_offset: u64,
     row_count: u64,
     dict: Option<Arc<DictValues>>,
-    cell: OnceLock<Option<OwnedSortedProbe>>,
+    cell: OnceLock<FetchedLeaf>,
     /// The chunk's last value, read once from its probe: the chunk bisection
     /// compares against it, and a probe's `value_at` can cost a search of its
     /// own (a RunEnd one searches its run ends).
@@ -444,8 +469,8 @@ impl ColumnChunks {
     /// The values at `rows` (ascending), as one array of the column's dtype:
     /// each leaf holding some of them takes them from its array in the wire
     /// encoding (the take kernels decode only what they touch), and only
-    /// those leaves are fetched and cached. `Ok(None)` when a leaf the rows
-    /// reach declines its probe.
+    /// those leaves are fetched and cached. A leaf whose encoding declines
+    /// the probe is taken from all the same.
     ///
     /// # Panics
     /// Panics if a row is `>= self.row_count()`.
@@ -454,7 +479,7 @@ impl ColumnChunks {
         rows: &[u64],
         source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
-    ) -> VortexResult<Option<ArrayRef>> {
+    ) -> VortexResult<ArrayRef> {
         use vortex_array::arrays::{ChunkedArray, PrimitiveArray};
 
         let mut parts = Vec::new();
@@ -465,30 +490,39 @@ impl ColumnChunks {
             idx += self.chunks[idx..].partition_point(|c| c.end() <= first);
             let leaf = &self.chunks[idx];
             let inside = rest.partition_point(|&row| row < leaf.end());
-            let Some(probe) = self.chunk_probe(idx, source, session).await? else {
-                return Ok(None);
-            };
+            let array = self.chunk_leaf(idx, source, session).await?.array();
             let offsets =
                 PrimitiveArray::from_iter(rest[..inside].iter().map(|&row| row - leaf.row_offset));
-            parts.push(probe.array().take(offsets.into_array())?);
+            parts.push(array.take(offsets.into_array())?);
             rest = &rest[inside..];
         }
-        Ok(Some(match parts.len() {
+        Ok(match parts.len() {
             1 => parts.pop().vortex_expect("one part"),
             _ => ChunkedArray::try_new(parts, self.dtype.clone())?.into_array(),
-        }))
+        })
     }
 
     /// The chunk's resolved probe, fetched through `source` and resolved on
-    /// first use; `None` when its encoding declines. A codes leaf is composed
-    /// with its dictionary's values before resolution, so the probe reads
-    /// the column's values.
+    /// first use; `None` when its encoding declines.
     async fn chunk_probe(
         &self,
         idx: usize,
         source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
     ) -> VortexResult<Option<&OwnedSortedProbe>> {
+        Ok(self.chunk_leaf(idx, source, session).await?.probe())
+    }
+
+    /// The chunk's [`FetchedLeaf`], fetched through `source` and resolved on
+    /// first use. A codes leaf is composed with its dictionary's values
+    /// before resolution, so the probe, or the declined array, reads the
+    /// column's values.
+    async fn chunk_leaf(
+        &self,
+        idx: usize,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<&FetchedLeaf> {
         let leaf = &self.chunks[idx];
         if leaf.cell.get().is_none() {
             let array = fetch_flat(&leaf.layout, source, session).await?;
@@ -499,13 +533,16 @@ impl ColumnChunks {
                     Array::<Dict>::try_new(array, values)?.into_array()
                 }
             };
-            let _ = leaf.cell.set(OwnedSortedProbe::resolve(array));
+            let fetched = match OwnedSortedProbe::resolve(array.clone()) {
+                Some(probe) => FetchedLeaf::Probe(probe),
+                None => FetchedLeaf::Declined(array),
+            };
+            let _ = leaf.cell.set(fetched);
         }
         Ok(leaf
             .cell
             .get()
-            .vortex_expect("chunk cell was just populated")
-            .as_ref())
+            .vortex_expect("chunk cell was just populated"))
     }
 }
 

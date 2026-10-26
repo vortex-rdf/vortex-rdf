@@ -446,7 +446,8 @@ async fn column_chunks_empty_column() {
 }
 
 /// A leaf whose wire encoding the probe does not support (pcodec) declines
-/// with `Ok(None)` at query time, while the column itself still resolves.
+/// its searches and point reads with `Ok(None)` at query time, while the
+/// column itself still resolves and a take reads the leaf all the same.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_decline_unsupported_leaf() {
     use vortex_array::VortexSessionExecute as _;
@@ -484,6 +485,10 @@ async fn column_chunks_decline_unsupported_leaf() {
     );
     // A leaf whose encoding declined was fetched all the same.
     assert_eq!((column.chunk_count(), column.fetched_chunks()), (1, 1));
+    let rows = [0, 7, 2_048, 4_095];
+    let taken = column.take(&rows, &source, &session).await.unwrap();
+    let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
+    assert_eq!(taken_u32(taken, &session), want);
 }
 
 /// A FastLanes run-length leaf, a wire form of the store's writer edition,
@@ -791,18 +796,10 @@ async fn column_chunks_take_rows_across_leaves() {
     rows.extend([199_999, 200_000, 399_999, 400_000, data.len() as u64 - 1]);
     rows.sort_unstable();
     rows.dedup();
-    let taken = column
-        .take(&rows, &source, &session)
-        .await
-        .unwrap()
-        .expect("all chunks are probeable");
+    let taken = column.take(&rows, &source, &session).await.unwrap();
     let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
     assert_eq!(taken_u32(taken, &session), want);
-    let none = column
-        .take(&[], &source, &session)
-        .await
-        .unwrap()
-        .expect("no row needs no chunk");
+    let none = column.take(&[], &source, &session).await.unwrap();
     assert_eq!(none.len(), 0);
 
     let p: Vec<u32> = (0..9_000).map(|i| (i / 3_000) as u32).collect();
@@ -814,11 +811,7 @@ async fn column_chunks_take_rows_across_leaves() {
     for (field, data) in [("p", &p), ("o", &o)] {
         let column =
             ColumnChunks::from_struct_layout(&root, field).expect("a dict layout resolves");
-        let taken = column
-            .take(&rows, &source, &session)
-            .await
-            .unwrap()
-            .expect("dictionary-coded leaves are probeable");
+        let taken = column.take(&rows, &source, &session).await.unwrap();
         let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
         assert_eq!(taken_u32(taken, &session), want, "{field}");
     }

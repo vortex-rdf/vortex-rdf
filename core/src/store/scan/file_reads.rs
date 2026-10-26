@@ -293,10 +293,9 @@ pub(crate) async fn take_file_rows(
     crate::store::array::chunked_or_single(chunks, dtype).map(Some)
 }
 
-/// `columns` at `ids` (ascending), each taken through its chunk probes
+/// `columns` at `ids` (ascending), each taken from its chunk leaves
 /// ([`ColumnChunks::take`](vortex_rdf_encoded_search::ColumnChunks::take)),
-/// as one struct. `None` when a column has no chunk probes or a leaf the ids
-/// reach declines its probe.
+/// as one struct. `None` when a column has no chunk probes.
 async fn chunk_take(
     file: &NativeStoreFile,
     columns: &[&'static str],
@@ -315,10 +314,7 @@ async fn chunk_take(
     let session = file.session();
     let mut children = Vec::with_capacity(handles.len());
     for handle in &handles {
-        match handle.take(ids, &source, session).await? {
-            Some(child) => children.push(child),
-            None => return Ok(None),
-        }
+        children.push(handle.take(ids, &source, session).await?);
     }
     Ok(Some(
         named_struct(columns, children, ids.len())?.into_array(),
