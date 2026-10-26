@@ -8,9 +8,9 @@
 
 mod common;
 
-use common::{FOR, canonical_index_bounds, compress_default, compress_with};
+use common::{BITPACKING, FOR, canonical_index_bounds, compress_default, compress_with, session};
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::{ArrayRef, IntoArray};
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute as _};
 use vortex_btrblocks::schemes::integer;
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 
@@ -64,14 +64,14 @@ fn sorted_codes(len: u64, run: u64) -> Vec<u64> {
 fn probes_bitpacked_codes_past_u32() {
     // Raw bit-packing at 33 bits: the values themselves are past u32::MAX.
     let data = sorted_codes(4096, 7);
-    let arr = compress_with(&[&integer::BitPackingScheme], &data);
+    let arr = compress_with(&[&BITPACKING], &data);
     assert_probe(&arr, &data, &[NodeKind::BitPacked]);
 }
 
 #[test]
 fn probes_for_bitpacked_codes_past_u32() {
     let data = sorted_codes(4096, 3);
-    let arr = compress_with(&[&FOR, &integer::BitPackingScheme], &data);
+    let arr = compress_with(&[&FOR, &BITPACKING], &data);
     assert_probe(&arr, &data, &[NodeKind::FoR, NodeKind::BitPacked]);
 }
 
@@ -142,6 +142,7 @@ fn probes_sparse_codes_past_u32() {
         PrimitiveArray::from_iter(values).into_array(),
         len,
         Scalar::from(BASE),
+        &mut session().create_execution_ctx(),
     )
     .unwrap()
     .into_array();
@@ -168,6 +169,7 @@ fn probes_sparse_codes_past_u32() {
             .into_array(),
         len,
         Scalar::from(BASE),
+        &mut session().create_execution_ctx(),
     )
     .unwrap()
     .into_array();

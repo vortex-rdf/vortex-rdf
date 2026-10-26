@@ -10,11 +10,12 @@
 mod common;
 
 use common::{
-    FOR, canonical_index_bounds, compress_array_with, compress_default, compress_with, session,
+    BITPACKING, FOR, canonical_index_bounds, compress_array_with, compress_default, compress_with,
+    session,
 };
 use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, SliceArray};
 use vortex_array::scalar::Scalar;
-use vortex_array::search_sorted::{SearchSorted, SearchSortedSide};
+use vortex_array::search_sorted::{SearchSorted, SearchSortedArray, SearchSortedSide};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
@@ -22,15 +23,16 @@ use vortex_sequence::Sequence;
 
 /// Top-level encoding ids the probe resolves; a declined array with one of
 /// these at its root is a resolver bug, not an unsupported shape. Every
-/// frame-of-reference array reports `fastlanes.for.v2` in memory; the
-/// session's edition keeps the compressor's on a single reference.
+/// frame-of-reference array reports `fastlanes.for.v2` in memory, and every
+/// bit-packed array `fastlanes.bitpacked.v2`; the session's edition keeps the
+/// compressor's on a single reference and a single bit width.
 const SUPPORTED_ENCODINGS: &[&str] = &[
     "vortex.primitive",
     "vortex.constant",
     "vortex.sequence",
     "vortex.runend",
     "fastlanes.for.v2",
-    "fastlanes.bitpacked",
+    "fastlanes.bitpacked.v2",
     "fastlanes.delta",
     "vortex.slice",
     "vortex.chunked",
@@ -80,13 +82,13 @@ fn runend_sequence_22k() -> (Vec<u32>, ArrayRef) {
 
 fn bitpacked_4k() -> (Vec<u32>, ArrayRef) {
     let data: Vec<u32> = (0..4096u32).map(|i| i / 7).collect();
-    let arr = compress_with(&[&integer::BitPackingScheme], &data);
+    let arr = compress_with(&[&BITPACKING], &data);
     (data, arr)
 }
 
 fn for_bitpacked_4k() -> (Vec<u32>, ArrayRef) {
     let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i / 3).collect();
-    let arr = compress_with(&[&FOR, &integer::BitPackingScheme], &data);
+    let arr = compress_with(&[&FOR, &BITPACKING], &data);
     (data, arr)
 }
 
@@ -95,7 +97,7 @@ fn for_bitpacked_4k() -> (Vec<u32>, ArrayRef) {
 /// length that pads the last 1024-value block.
 fn delta_bitpacked_5k() -> (Vec<u32>, ArrayRef) {
     let data = sorted_random(11, 5_000, 40);
-    let arr = compress_with(&[&DELTA, &integer::BitPackingScheme], &data);
+    let arr = compress_with(&[&DELTA, &BITPACKING], &data);
     (data, arr)
 }
 
@@ -125,11 +127,13 @@ fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32], expect_kinds: &[Nod
 /// array's type; `None` for a needle that type cannot hold.
 fn generic_bounds(arr: &ArrayRef, needle: u32) -> Option<(usize, usize)> {
     let probe = Scalar::from(needle).cast(arr.dtype()).ok()?;
-    let lo = arr
+    let mut ctx = ctx();
+    let sorted = SearchSortedArray::new(arr, &mut ctx);
+    let lo = sorted
         .search_sorted(&probe, SearchSortedSide::Left)
         .unwrap()
         .to_index();
-    let hi = arr
+    let hi = sorted
         .search_sorted(&probe, SearchSortedSide::Right)
         .unwrap()
         .to_index();
@@ -264,7 +268,7 @@ fn probes_bitpacked_with_patches() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(sliced.encoding_id().as_str(), "fastlanes.bitpacked");
+        assert!(sliced.is::<vortex_fastlanes::BitPacked>(), "{range:?}");
         assert_probe(
             &sliced,
             &data[range],
@@ -297,7 +301,7 @@ fn probes_delta_bitpacked() {
             PrimitiveArray::from_iter(words.iter().copied()).into_array(),
         ),
     ] {
-        let arr = compress_array_with(&[&DELTA, &integer::BitPackingScheme], canonical);
+        let arr = compress_array_with(&[&DELTA, &BITPACKING], canonical);
         assert_probe_with_budget(&arr, &data, &[NodeKind::Delta], CASCADE_ORACLE_NEEDLES);
     }
 }
@@ -505,7 +509,7 @@ fn probes_chunked_mixed_encodings() {
     let chunks: Vec<ArrayRef> = vec![
         compress_with(&[&integer::RunEndScheme, &integer::SequenceScheme], &c1),
         PrimitiveArray::from_iter(std::iter::empty::<u32>()).into_array(),
-        compress_with(&[&integer::BitPackingScheme], &c2),
+        compress_with(&[&BITPACKING], &c2),
         compress_with(&[&FOR, &integer::SequenceScheme], &c3),
     ];
     let dtype = chunks[0].dtype().clone();
@@ -592,7 +596,7 @@ fn probes_per_chunk_for_references() {
         .into_array();
     let view = arr.as_opt::<FoR>().unwrap();
     assert!(
-        view.constant_reference().is_none(),
+        !view.references().is_global(),
         "fixture must carry per-chunk references"
     );
     assert_probe_with_budget(&arr, &data, &[NodeKind::FoR], GENERIC_ORACLE_NEEDLES);
@@ -700,7 +704,7 @@ fn probes_through_shared_wrapper() {
     let codes: Vec<u16> = vec![0, 0, 1, 2, 2, 2, 3, 4];
     let data: Vec<u32> = codes.iter().map(|&c| values[c as usize]).collect();
     let shared =
-        vortex_array::arrays::SharedArray::new(PrimitiveArray::from_iter(values).into_array())
+        vortex_layout::arrays::shared::Shared::new(PrimitiveArray::from_iter(values).into_array())
             .into_array();
     assert_eq!(shared.encoding_id().as_str(), "vortex.shared");
     let arr = vortex_array::arrays::DictArray::try_new(
@@ -751,8 +755,8 @@ fn probes_slice_of_piecewise_sorted() {
         data.extend((0..run_len as u32).map(|i| i / 3 + (run % 5) * 40));
     }
     let encodings = [
-        compress_with(&[&integer::RunEndScheme, &integer::BitPackingScheme], &data),
-        compress_with(&[&integer::BitPackingScheme], &data),
+        compress_with(&[&integer::RunEndScheme, &BITPACKING], &data),
+        compress_with(&[&BITPACKING], &data),
         compress_with(&[&integer::IntDictScheme], &data),
     ];
     for arr in &encodings {

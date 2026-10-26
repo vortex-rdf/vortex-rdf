@@ -27,7 +27,7 @@ use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
-use vortex_btrblocks::schemes::integer::{BitPackingScheme, RunEndScheme, SequenceScheme};
+use vortex_btrblocks::schemes::integer::{RunEndScheme, SequenceScheme};
 use vortex_rdf_encoded_search::SortedProbe;
 use vortex_session::VortexSession;
 
@@ -38,13 +38,12 @@ let mut ctx = session.create_execution_ctx();
 let compressor = BtrBlocksCompressorBuilder::empty()
     .with_new_scheme(&RunEndScheme)
     .with_new_scheme(&SequenceScheme)
-    .with_new_scheme(&BitPackingScheme)
     .build();
 
 // A sorted column with 11-row runs, compressed into whatever encoding the
 // cascade picks for it (here: run-end, with its values a sequence and its
-// run ends bit-packed at 21 bits with one patch: the last run holds only two
-// rows, so the ends are no sequence, and the final end needs a 22nd bit).
+// run ends left plain: the last run holds only two rows, so the ends are no
+// sequence).
 let data: Vec<u32> = (0..2_097_152).map(|i| (i / 11) as u32).collect();
 let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
 let encoded = compressor.compress(&canonical, &mut ctx)?;
@@ -80,8 +79,12 @@ form), `BitPacked` (with one bit width, including its patches), `Delta`
 `Slice`, `Chunked`, `Dict`, `Sparse` (a fill value with patches) and FastLanes
 run-length (`fastlanes.rle`: per 1,024-value chunk, run values and an index
 per position into them), composed arbitrarily; the transparent `Shared`
-wrapper resolves to whatever it wraps. `NodeKind` reports the resolved tree's
-shape for tests and diagnostics. Bit-packing with a width per block declines.
+wrapper (which Vortex keeps in `vortex-layout`) resolves to whatever it
+wraps. `NodeKind` reports the resolved tree's shape for tests and
+diagnostics. Bit-packing with a width per block (the `fastlanes.bitpacked.v2`
+wire form) declines: BtrBlocks' bit-packing scheme picks a width per 1,024-value
+block wherever the blocks' best widths differ when its builder allows that form,
+as `empty()` does, and no Vortex core edition includes it.
 A frame of reference per chunk, a sparse array and a run-length array have no
 order-preserving map from a needle to their children, so their bounds searches
 probe the composed values. When its
@@ -158,7 +161,7 @@ cargo bench -p vortex-rdf-encoded-search --bench probe
 
 ## Compatibility
 
-Built against Vortex `0.88`.
+Built against Vortex `0.90`.
 
 Minimum supported Rust version: 1.95 (edition 2024).
 

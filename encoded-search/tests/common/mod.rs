@@ -22,8 +22,9 @@ use vortex_session::VortexSession;
 /// outside core the probe reads, which the forced delta fixtures compress
 /// to. The file writer refuses components outside an enabled edition, and a
 /// compressor built `from_session` only produces the wire forms they allow,
-/// so frame-of-reference keeps the single reference the probe reads in place
-/// (per-chunk references, `fastlanes.for.v2`, are in no core edition).
+/// so frame-of-reference keeps the single reference and bit-packing the single
+/// width the probe reads in place (per-chunk references, `fastlanes.for.v2`,
+/// and per-block widths, `fastlanes.bitpacked.v2`, are in no core edition).
 pub fn session() -> VortexSession {
     let session = VortexSession::empty()
         .with::<ArraySession>()
@@ -80,6 +81,9 @@ fn enable_test_editions(session: &VortexSession) {
 /// The frame-of-reference scheme; the session's edition refines it to a
 /// single reference.
 pub static FOR: integer::FoRScheme = integer::FoRScheme::v1();
+
+/// The bit-packing scheme with one bit width per array (`fastlanes.bitpacked`).
+pub static BITPACKING: integer::BitPackingScheme = integer::BitPackingScheme::v1();
 
 /// `data` compressed through exactly `schemes`, with the wire forms the
 /// session's edition allows.

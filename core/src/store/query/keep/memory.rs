@@ -376,9 +376,9 @@ impl PieceRows<'_> {
 /// it never fills the wrapper's cache, which would keep the whole column
 /// decoded for the base's lifetime.
 fn code_chunks(column: &ArrayRef) -> Vec<(usize, ArrayRef)> {
+    use vortex_array::arrays::Chunked;
     use vortex_array::arrays::chunked::ChunkedArrayExt as _;
-    use vortex_array::arrays::shared::SharedArrayExt as _;
-    use vortex_array::arrays::{Chunked, Shared};
+    use vortex_layout::arrays::shared::{Shared, SharedArrayExt as _};
 
     let source = match column.as_opt::<Shared>() {
         Some(shared) => shared.current_array_ref().clone(),

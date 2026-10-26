@@ -15,10 +15,10 @@ license = "MIT"
 
 [dependencies]
 vortex-rdf-core = { path = "../core" }
-vortex-datafusion = "0.88.0"
-vortex-arrow = "0.88.0"
-vortex-array = "0.88.0"
-vortex-buffer = { version = "0.88.0", features = ["arrow"] }
+vortex-datafusion = "0.90.0"
+vortex-arrow = "0.90.0"
+vortex-array = "0.90.0"
+vortex-buffer = { version = "0.90.0", features = ["arrow"] }
 datafusion = { version = "55.0.0", default-features = false, features = ["sql", "nested_expressions"] }
 futures = "0.3.33"
 oxrdf = "0.3.3"

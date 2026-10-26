@@ -68,7 +68,8 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// cache (`shared_code_primitive`) and is zero-copy on every later call. Pass
 /// it for the primary base, the only array the payload path reads.
 pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -> Result<ArrayRef> {
-    use vortex_array::arrays::{Primitive, SharedArray};
+    use vortex_array::arrays::Primitive;
+    use vortex_layout::arrays::shared::Shared;
 
     map_struct_children(rows, |child, ctx| {
         let sorted = column_is_sorted(child);
@@ -76,7 +77,7 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
             return Ok(None);
         };
         if payload_lazy && !encoded.is::<Primitive>() {
-            encoded = SharedArray::new(encoded).into_array();
+            encoded = Shared::new(encoded).into_array();
         }
         if sorted {
             stamp_is_sorted(&encoded);
@@ -129,8 +130,8 @@ pub(crate) fn shared_code_primitive(
     child: &ArrayRef,
 ) -> Option<vortex_array::arrays::PrimitiveArray> {
     use vortex_array::Canonical;
-    use vortex_array::arrays::shared::SharedArrayExt as _;
-    use vortex_array::arrays::{Primitive, PrimitiveArray, Shared};
+    use vortex_array::arrays::{Primitive, PrimitiveArray};
+    use vortex_layout::arrays::shared::{Shared, SharedArrayExt as _};
 
     if let Some(prim) = canonical_code(child) {
         return Some(prim);
@@ -157,8 +158,7 @@ pub(crate) fn shared_code_primitive(
 pub(crate) fn cached_code_primitive(
     child: &ArrayRef,
 ) -> Option<vortex_array::arrays::PrimitiveArray> {
-    use vortex_array::arrays::Shared;
-    use vortex_array::arrays::shared::SharedArrayExt as _;
+    use vortex_layout::arrays::shared::{Shared, SharedArrayExt as _};
 
     if let Some(prim) = canonical_code(child) {
         return Some(prim);

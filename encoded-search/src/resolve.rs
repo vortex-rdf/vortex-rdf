@@ -6,15 +6,15 @@
 use vortex_array::ArrayRef;
 use vortex_array::arrays::chunked::ChunkedArrayExt as _;
 use vortex_array::arrays::dict::DictSlots;
-use vortex_array::arrays::shared::SharedSlots;
 use vortex_array::arrays::slice::SliceSlots;
-use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Shared, Slice};
+use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Slice};
 use vortex_array::dtype::PType;
 use vortex_array::scalar::PValue;
 use vortex_fastlanes::{
     BitPacked, BitPackedArrayExt as _, BitPackedSlots, BitWidthsView, Delta, DeltaArrayExt as _,
-    DeltaSlots, FoR, FoRArrayExt as _, FoRSlots, RLE, RLESlots,
+    DeltaSlots, FoR, FoRArrayExt as _, FoRReferences, FoRSlots, RLE, RLESlots,
 };
+use vortex_layout::arrays::shared::{Shared, SharedSlots};
 use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
 use vortex_sparse::{Sparse, SparseSlots};
@@ -85,15 +85,20 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
 
     if let Some(view) = arr.as_opt::<FoR>() {
         let child = Box::new(resolve_node(slot(view.slots(), FoRSlots::ENCODED)?)?);
-        // One reference for the whole array (the `fastlanes.for` wire form),
-        // or one per 1024-value chunk (`fastlanes.for.v2`).
-        return Some(match view.constant_reference() {
-            Some(reference) => Node::FoR {
-                reference: u64::try_from(&reference).ok()?,
+        // One reference for the whole array, held in its metadata (the
+        // `fastlanes.for` wire form), or one per 1024-value chunk, a child
+        // (`fastlanes.for.v2`) read through the slots, which borrow from
+        // `arr` rather than from this view.
+        return Some(match view.references() {
+            FoRReferences::Global(reference) => Node::FoR {
+                reference: u64::try_from(reference).ok()?,
                 child,
             },
-            None => Node::ChunkedFoR {
-                references: Box::new(resolve_node(slot(view.slots(), FoRSlots::REFERENCES)?)?),
+            FoRReferences::Blocked(_) => Node::ChunkedFoR {
+                references: Box::new(resolve_node(slot(
+                    view.slots(),
+                    FoRSlots::BLOCKED_REFERENCES,
+                )?)?),
                 offset: usize::from(view.offset()),
                 child,
             },
@@ -137,9 +142,9 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
     }
 
     if let Some(view) = arr.as_opt::<BitPacked>() {
-        // One bit width for every block; per-block widths (which have no wire
-        // form) decline, since a block's words no longer sit at a fixed
-        // stride.
+        // One bit width for every block; per-block widths (the
+        // `fastlanes.bitpacked.v2` wire form) decline, since a block's words
+        // no longer sit at a fixed stride.
         let BitWidthsView::Global(bit_width) = view.bit_widths() else {
             return None;
         };

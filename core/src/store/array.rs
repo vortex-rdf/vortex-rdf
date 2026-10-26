@@ -190,7 +190,9 @@ pub(crate) fn search_sorted_bounds(
     arr: &ArrayRef,
     probe: &vortex_array::scalar::Scalar,
 ) -> Result<(usize, usize)> {
-    use vortex_array::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
+    use vortex_array::search_sorted::{
+        SearchResult, SearchSorted, SearchSortedArray, SearchSortedSide,
+    };
 
     // Encoded fast path: probe the column's representation directly, canonical
     // or wire-encoded (`from_bytes` adoption, sliced index runs), without
@@ -206,8 +208,11 @@ pub(crate) fn search_sorted_bounds(
     let index_of = |result: SearchResult| match result {
         SearchResult::Found(i) | SearchResult::NotFound(i) => i,
     };
-    let lo = arr.search_sorted(probe, SearchSortedSide::Left)?;
-    let hi = arr.search_sorted(probe, SearchSortedSide::Right)?;
+    // One probe and one execution context serve both searches.
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let sorted = SearchSortedArray::new(arr, &mut ctx);
+    let lo = sorted.search_sorted(probe, SearchSortedSide::Left)?;
+    let hi = sorted.search_sorted(probe, SearchSortedSide::Right)?;
     Ok((index_of(lo), index_of(hi)))
 }
 

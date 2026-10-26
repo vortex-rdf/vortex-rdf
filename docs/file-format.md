@@ -80,13 +80,15 @@ of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
 The writer is limited to two editions: Vortex's frozen `core` edition
-`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L62)) — every
+`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L63)) — every
 encoding, layout, extension dtype and zone-map aggregate a store file may hold
-— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L73)), whose
+— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L74)), whose
 one member is the root layout. A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
-per-chunk frame-of-reference (`fastlanes.for.v2`), is never written. Files
-from earlier writers can hold it; the chunk probes read it.
+per-chunk frame-of-reference (`fastlanes.for.v2`) or bit-packing with a width
+per block (`fastlanes.bitpacked.v2`), is never written. Files from earlier
+writers can hold per-chunk frame-of-reference, which the chunk probes read; no
+store writer ever wrote per-block widths, which the probes decline.
 
 ---
 

@@ -62,6 +62,7 @@ where
         array.codes_bytes().clone(),
         DType::Binary(Nullability::NonNullable),
         Validity::NonNullable,
+        ctx,
     );
     FSST::try_new_with_symbol_table(
         array.dtype().clone(),
