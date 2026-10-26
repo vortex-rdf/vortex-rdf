@@ -68,8 +68,9 @@ jobs:
     name: Docs
     uses: ./.github/workflows/docs.yml
 
-  # Two files declare the version: the workspace Cargo.toml (which the PyPI
-  # package inherits through maturin's dynamic version) and js/package.json.
+  # Three files declare the version: the workspace Cargo.toml (which the PyPI
+  # package inherits through maturin's dynamic version), js/package.json and
+  # java/pom.xml.
   # This job fails before any registry is touched when they disagree with the
   # tag being pushed (or, on workflow_dispatch, with each other).
   verify-versions:
@@ -86,6 +87,7 @@ jobs:
           cargo_version="$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "vortex-rdf-core") | .version')"
           npm_version="$(node -p "require('./js/package.json').version")"
+          java_version="$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' java/pom.xml | head -n 1)"
 
           if [ "${{ github.event_name }}" = "push" ]; then
             expected="${GITHUB_REF_NAME#v}"
@@ -105,6 +107,7 @@ jobs:
           }
           check "Cargo.toml (workspace)" "$cargo_version"
           check "js/package.json" "$npm_version"
+          check "java/pom.xml" "$java_version"
           exit "$fail"
 
   # A tag push publishes everywhere: the inputs.* context is empty on push

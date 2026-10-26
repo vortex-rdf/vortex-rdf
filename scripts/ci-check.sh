@@ -7,13 +7,14 @@
 #   scripts/ci-check.sh                  # every job, in this order
 #   scripts/ci-check.sh lint rust-tests  # only the named jobs
 #
-# Jobs: docs, lint, rust-tests, interface-tests, python-tests, js-tests.
+# Jobs: docs, lint, rust-tests, interface-tests, python-tests, js-tests, java-tests.
 #
 # Under CI=true (GitHub Actions sets it) every job runs in full and a missing
 # tool fails it. A local run differs in three ways:
 #   * A step whose tool is missing is skipped with a warning, and the summary
 #     names it: the wasm32 clippy and js-tests need the wasm32-unknown-unknown
-#     target, python-tests needs uv, js-tests needs npm and js/node_modules.
+#     target, python-tests needs uv, js-tests needs npm and js/node_modules,
+#     java-tests needs a JDK and Maven.
 #   * js-tests builds with `npm run build:fast` (wasm-pack without wasm-opt,
 #     which dominates the full build's wall clock and buys no memory headroom)
 #     in the installed js/node_modules, where CI runs `npm ci` and
@@ -25,7 +26,7 @@
 #     machine's memory. CI sets no cap.
 set -euo pipefail
 
-JOBS=(docs lint rust-tests interface-tests python-tests js-tests)
+JOBS=(docs lint rust-tests interface-tests python-tests js-tests java-tests)
 
 case "${1:-}" in
   -h | --help)
@@ -165,6 +166,22 @@ job_js_tests() {
   # pkg/web/vortex_rdf.d.ts.
   run -C js npm run typecheck
   run -C js npm test
+}
+
+# The Java bindings: the crate's own Rust tests run under rust-tests; this job
+# builds the JNI library and the stores and oracle the JUnit suite reads (the
+# crate's `fixtures` example), then runs Maven.
+job_java_tests() {
+  if ! command -v java >/dev/null 2>&1 || ! command -v mvn >/dev/null 2>&1; then
+    skip_job "no JDK or Maven" "install JDK 11 or later and Maven"
+    return 0
+  fi
+  local target="${CARGO_TARGET_DIR:-target}" lib
+  case $target in /*) ;; *) target="$PWD/$target" ;; esac
+  run cargo build -p vortex-rdf-java
+  run cargo run -p vortex-rdf-java --example fixtures -- java/target/fixtures
+  lib=$(compgen -G "$target/debug/libvortex_rdf_jni.*" | grep -E '\.(so|dylib)$' | head -n 1)
+  run -C java mvn -B test "-Dvortexrdf.library=$lib" "-Dvortexrdf.fixtures=$PWD/java/target/fixtures"
 }
 
 join_list() {
