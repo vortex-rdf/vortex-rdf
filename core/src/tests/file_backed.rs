@@ -623,6 +623,109 @@ async fn test_locate_codes_matches_the_term_path() {
     for (tag, fixture, quads, step) in stores {
         check_locate_codes(&tag, &fixture, &quads, step).await;
     }
+    for fixture in file_stores().await {
+        check_code_patterns(&fixture).await;
+    }
+    // A store without a term dictionary has no code patterns.
+    let (_dir, path) = write_store_file(fixture_quads(), LayoutStrategy::Default, vec![]).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let error = store
+        .count_code_pattern(crate::CodePattern::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("no term dictionary"), "{error}");
+}
+
+/// `count_code_pattern` and `match_code_pattern` answer every shape of a
+/// store's own codes as the term path does, whether a located run answers it
+/// or the general match: the count is the match's size, and pages cover its
+/// rows once. A code in a position its term kind cannot take, or past the
+/// dictionary, matches nothing.
+async fn check_code_patterns(fixture: &FixtureStore) {
+    use crate::{CodePattern, Probe};
+    let tag = fixture.tag();
+    let store = &fixture.store;
+    let dict = store.dict_reader().unwrap();
+    let all = row_list(store).await;
+    let mut patterns = vec![CodePattern::default()];
+    // Every bound subset of four quads spread over the store.
+    for quad in all.iter().step_by(all.len() / 4) {
+        for mask in 1..16u8 {
+            let slot = |i: usize| (mask & (1 << i) != 0).then_some(quad[i]);
+            patterns.push(CodePattern::new(slot(0), slot(1), slot(2), slot(3)));
+        }
+    }
+    for pattern in patterns {
+        let mut terms = Vec::new();
+        for code in [
+            pattern.subject,
+            pattern.predicate,
+            pattern.object,
+            pattern.graph,
+        ] {
+            terms.push(match code {
+                Some(code) => Some(dict.decode(code).await.unwrap().unwrap()),
+                None => None,
+            });
+        }
+        let probe = Probe::parse(
+            terms[0].as_deref(),
+            terms[1].as_deref(),
+            terms[2].as_deref(),
+            terms[3].as_deref(),
+        )
+        .unwrap();
+        let want = sorted_rows(&store.run_probe(&probe).await.unwrap()).await;
+        let tag = format!("{tag} {pattern:?}");
+        assert_eq!(
+            store.count_code_pattern(pattern).await.unwrap(),
+            want.len() as u64,
+            "{tag}: count"
+        );
+        // About five pages, the last one short.
+        let page = want.len() / 4 + 1;
+        let mut seen = Vec::new();
+        let mut offset = 0;
+        loop {
+            let got = store
+                .match_code_pattern(pattern, offset, Some(page))
+                .await
+                .unwrap();
+            let n = got[0].len();
+            seen.extend(code_rows::<4>(&got));
+            if n < page {
+                break;
+            }
+            offset += page;
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, want, "{tag}: pages of {page}");
+    }
+    let kinds = dict.kind_ranges().await.unwrap();
+    let mut nothing = vec![CodePattern::new(
+        Some(dict.len() as TermCode + 7),
+        None,
+        None,
+        None,
+    )];
+    if !kinds.literals.is_empty() {
+        let literal = Some(kinds.literals.start);
+        nothing.push(CodePattern::new(literal, None, None, None));
+        nothing.push(CodePattern::new(None, literal, None, None));
+        nothing.push(CodePattern::new(None, None, None, literal));
+    }
+    if !kinds.blanks.is_empty() {
+        nothing.push(CodePattern::new(None, Some(kinds.blanks.start), None, None));
+    }
+    if let Some(default_graph) = kinds.default_graph {
+        nothing.push(CodePattern::new(Some(default_graph), None, None, None));
+    }
+    for pattern in nothing {
+        let tag = format!("{tag} {pattern:?}");
+        assert_eq!(store.count_code_pattern(pattern).await.unwrap(), 0, "{tag}");
+        let got = store.match_code_pattern(pattern, 0, None).await.unwrap();
+        assert!(got.iter().all(|column| column.is_empty()), "{tag}");
+    }
 }
 
 async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], step: usize) {

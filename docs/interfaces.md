@@ -283,19 +283,25 @@ and one in neither set fails. An engine keeps `passed` (as a `keep`),
 evaluates `undecided` itself, and drops the rest.
 
 An engine that already holds term codes, as a nested-loop join's
-per-binding probe does, can ask `locate_codes(CodePattern, offset, limit)`
-first: when the bound codes are a prefix of a sorted table's key order (the
-quad table's `(s, p, o, g)`, the copy index's `index:posg` `(p, o, s, g)`
-or `index:ospg` `(o, s, p, g)`), it answers the match's size and the
-window's code columns from one located run, with no dictionary search, view
-or gather, in that table's order. With the reference index, a bound `p` or
-`o` is a run of `index:ref-p` or `index:ref-o` listing quad-table rows: the
-shorter one answers, in quad-table order, and any other bound slot is checked
-at its rows (for runs of at most 16,384 rows). A bound subject's run of a
-subject-sorted quad table is checked instead when it is no longer, so `s?o`
-reads the subject's few rows, not a common object's many. It answers only a
-whole file-backed Dictionary store (no tail, tombstones or narrowing) and
-returns `None` otherwise, for the engine to `run_probe` instead.
+per-binding probe does, asks `count_code_pattern(CodePattern)` and
+`match_code_pattern(CodePattern, offset, limit)`. When the bound codes are a
+prefix of a sorted table's key order (the quad table's `(s, p, o, g)`, the
+copy index's `index:posg` `(p, o, s, g)` or `index:ospg` `(o, s, p, g)`),
+one located run answers the match's size and the window's code columns, with
+no dictionary search, view or gather, in that table's order. With the
+reference index, a bound `p` or `o` is a run of `index:ref-p` or
+`index:ref-o` listing quad-table rows: the shorter one answers, in
+quad-table order, and any other bound slot is checked at its rows (for runs
+of at most 16,384 rows). A bound subject's run of a subject-sorted quad
+table is checked instead when it is no longer, so `s?o` reads the subject's
+few rows, not a common object's many. Any other pattern goes through the
+general match of the codes' terms. Which of the two answers depends on the
+store and the pattern alone, so every window of one pattern comes in the
+same order. A code in a position its term kind cannot take matches nothing.
+
+`locate_codes(CodePattern, offset, limit)` is the located run alone: it
+answers only a whole file-backed Dictionary store (no tail, tombstones or
+narrowing) and returns `None` otherwise.
 
 ## 7. Snapshots and mutation
 
@@ -382,7 +388,7 @@ stays out of `cargo test --workspace`. The `interface-tests` job of
 | Concern | File |
 |---|---|
 | `DataSource` over a view, component tables, the request plan | [`core/src/store/read/data_source.rs`](../core/src/store/read/data_source.rs) |
-| `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
+| `count_code_pattern`, `match_code_pattern`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
 | `row_chunks`, `code_chunks` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
 | `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
 | The scan driver of a file view's reads | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs) |

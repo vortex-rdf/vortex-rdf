@@ -213,43 +213,15 @@ impl Store {
         Ok(self.rt.block_on(self.dict()?.decode_many(codes))?)
     }
 
-    /// The probe of a code pattern, spelled out, or `None` when it can match nothing: a code outside the
-    /// dictionary, or a term in a position it cannot take (a literal subject, a non-IRI predicate).
-    fn probe(&self, pattern: Codes) -> Result<Option<Probe>> {
-        let dict = self.dict()?;
-        let mut spelled: [Option<String>; 4] = [None, None, None, None];
-        for (slot, code) in spelled.iter_mut().zip(pattern) {
-            if let Some(code) = code {
-                match self.rt.block_on(dict.decode(code))? {
-                    Some(term) => *slot = Some(term),
-                    None => return Ok(None),
-                }
-            }
-        }
-        let [s, p, o, g] = &spelled;
-        Ok(Probe::parse(s.as_deref(), p.as_deref(), o.as_deref(), g.as_deref()).ok())
-    }
-
     fn code_pattern(pattern: Codes) -> CodePattern {
         CodePattern::new(pattern[0], pattern[1], pattern[2], pattern[3])
     }
 
     /// The number of quads matching a code pattern, exact and without reading rows.
     pub fn count_codes(&self, pattern: Codes) -> Result<u64> {
-        self.dict()?;
-        // A point lookup in a sorted table of a file store is one located run; anything else takes the
-        // general path through the pattern's terms.
-        if let Some(found) = self.rt.block_on(self.store.locate_codes(
-            Self::code_pattern(pattern),
-            0,
-            Some(0),
-        ))? {
-            return Ok(found.total);
-        }
-        let Some(probe) = self.probe(pattern)? else {
-            return Ok(0);
-        };
-        Ok(self.rt.block_on(self.store.count_probe(&probe))? as u64)
+        Ok(self
+            .rt
+            .block_on(self.store.count_code_pattern(Self::code_pattern(pattern)))?)
     }
 
     /// Up to `limit` quads matching a code pattern after `offset`, written into `out` as [`ROW_BYTES`] per
@@ -263,29 +235,11 @@ impl Store {
         out: &mut [u8],
     ) -> Result<usize> {
         assert!(out.len() >= ROW_BYTES * limit, "output buffer too small");
-        self.dict()?;
-        // `locate_codes` answers or declines by the pattern alone, so every window of one pattern takes the
-        // same path, in the same row order.
-        let columns = if let Some(found) = self.rt.block_on(self.store.locate_codes(
+        let columns = self.rt.block_on(self.store.match_code_pattern(
             Self::code_pattern(pattern),
             offset as usize,
             Some(limit),
-        ))? {
-            found.columns
-        } else {
-            let Some(probe) = self.probe(pattern)? else {
-                return Ok(0);
-            };
-            let view = self.rt.block_on(
-                self.store
-                    .run_probe(&probe.window(offset as usize, Some(limit))),
-            )?;
-            self.rt
-                .block_on(view.code_columns_gathered())?
-                .ok_or_else(|| {
-                    Error("the store did not serve term codes for this pattern".into())
-                })?
-        };
+        ))?;
         let rows = columns[0].len().min(limit);
         for (row, bytes) in out.as_chunks_mut::<ROW_BYTES>().0[..rows]
             .iter_mut()
