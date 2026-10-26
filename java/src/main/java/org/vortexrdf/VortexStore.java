@@ -46,7 +46,7 @@ public final class VortexStore implements AutoCloseable {
 
 	private VortexStore(long handle) {
 		this.handle = handle;
-		this.dictionary = Native.termCount(handle) >= 0 ? new TermDictionary(this) : null;
+		this.dictionary = Native.hasDictionary(handle) ? new TermDictionary(this) : null;
 	}
 
 	/** Opens a store memory-mapped: the operating system's page cache holds what queries touch. */

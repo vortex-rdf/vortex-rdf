@@ -6,7 +6,7 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::{Quad, builds, quads as make_quads, write};
-use vortex_rdf_core::LayoutStrategy;
+use vortex_rdf_core::{CodePattern, LayoutStrategy};
 use vortex_rdf_jni::engine::{ROW_BYTES, Store};
 
 fn quads() -> Vec<Quad> {
@@ -56,10 +56,9 @@ fn as_refs(pattern: &[Option<String>; 4]) -> [Option<&str>; 4] {
     std::array::from_fn(|i| pattern[i].as_deref())
 }
 
-/// The code at `position` of `row` in rows [`Store::match_codes`] wrote.
-fn code_at(out: &[u8], row: usize, position: usize) -> u64 {
-    let at = ROW_BYTES * row + 8 * position;
-    u64::from_ne_bytes(out[at..at + 8].try_into().unwrap())
+/// The code at `position` of a row [`Store::match_codes`] wrote.
+fn code_at(row: &[u8; ROW_BYTES], position: usize) -> u64 {
+    u64::from_ne_bytes(row.as_chunks::<8>().0[position])
 }
 
 #[test]
@@ -174,9 +173,9 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
                 "{tag}: default graph code"
             );
             // The kind ranges and the default graph's name tile the codes.
-            let kinds: u64 = [ranges.literals, ranges.iris, ranges.blanks]
+            let kinds: u64 = [&ranges.literals, &ranges.iris, &ranges.blanks]
                 .iter()
-                .map(|r| r.1 - r.0)
+                .map(|r| r.end - r.start)
                 .sum();
             assert_eq!(
                 kinds + u64::from(default_graph.is_some()),
@@ -209,9 +208,9 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
             for pattern in patterns(&quads) {
                 let r = as_refs(&pattern);
                 let want = scan(&quads, &r);
-                let code_pattern: [Option<u64>; 4] = std::array::from_fn(|i| {
-                    r[i].map(|t| store.encode(t).unwrap().unwrap_or(terms + 7)) // an absent term: a code past the dictionary
-                });
+                // An absent term: a code past the dictionary.
+                let code = |i: usize| r[i].map(|t| store.encode(t).unwrap().unwrap_or(terms + 7));
+                let code_pattern = CodePattern::new(code(0), code(1), code(2), code(3));
                 let tag = format!("{tag} {pattern:?}");
                 assert_eq!(
                     store.count_codes(code_pattern).unwrap(),
@@ -221,29 +220,15 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
                 let mut seen = BTreeSet::new();
                 let mut offset = 0u64;
                 let page = 5usize;
-                let mut out = vec![0u8; ROW_BYTES * page];
+                let mut out = vec![[0u8; ROW_BYTES]; page];
                 loop {
-                    let n = store
-                        .match_codes(code_pattern, offset, page, &mut out)
-                        .unwrap();
-                    for row in 0..n {
-                        let spelled: Vec<String> = (0..4)
-                            .map(|i| {
-                                store
-                                    .decode(code_at(&out, row, i))
-                                    .unwrap()
-                                    .expect("a stored code decodes")
-                            })
-                            .collect();
-                        assert!(
-                            seen.insert([
-                                spelled[0].clone(),
-                                spelled[1].clone(),
-                                spelled[2].clone(),
-                                spelled[3].clone()
-                            ]),
-                            "{tag}: repeated row"
-                        );
+                    let n = store.match_codes(code_pattern, offset, &mut out).unwrap();
+                    for row in &out[..n] {
+                        let spelled: Quad = std::array::from_fn(|i| {
+                            let code = code_at(row, i);
+                            store.decode(code).unwrap().expect("a stored code decodes")
+                        });
+                        assert!(seen.insert(spelled), "{tag}: repeated row");
                     }
                     if n < page {
                         break;
@@ -267,13 +252,13 @@ fn code_patterns_that_cannot_match_are_empty_not_errors() {
         .unwrap()
         .unwrap();
     let blank = store.encode("_:b0").unwrap().unwrap();
-    let mut out = [0u8; 2 * ROW_BYTES];
+    let mut out = [[0u8; ROW_BYTES]; 2];
     for pattern in [
-        [Some(literal), None, None, None],
-        [None, Some(blank), None, None],
+        CodePattern::new(Some(literal), None, None, None),
+        CodePattern::new(None, Some(blank), None, None),
     ] {
         assert_eq!(store.count_codes(pattern).unwrap(), 0);
-        assert_eq!(store.match_codes(pattern, 0, 2, &mut out).unwrap(), 0);
+        assert_eq!(store.match_codes(pattern, 0, &mut out).unwrap(), 0);
     }
 }
 
@@ -287,7 +272,7 @@ fn a_store_without_a_dictionary_refuses_code_calls_only() {
     for result in [
         store.term_count().map(|_| ()),
         store.encode("<http://example.org/s1>").map(|_| ()),
-        store.count_codes([None; 4]).map(|_| ()),
+        store.count_codes(CodePattern::default()).map(|_| ()),
     ] {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("no term dictionary"), "{error}");

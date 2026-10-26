@@ -20,7 +20,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 vortex-rdf-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-jni-sys = "0.4"
+jni = "0.22"
 
 [dev-dependencies]
 futures = { workspace = true }

@@ -50,7 +50,9 @@ final class Native {
 	/** The matching quads, four terms each, flat; a negative limit takes every row. */
 	static native String[] quads(long handle, String s, String p, String o, String g, long offset, int limit);
 
-	/** The number of terms, or -1 for a store without a term dictionary. */
+	static native boolean hasDictionary(long handle);
+
+	/** The number of terms of a store with a term dictionary. */
 	static native long termCount(long handle);
 
 	/** {defaultGraph or -1, literals start, end, iris start, end, blanks start, end}; null without a dictionary. */

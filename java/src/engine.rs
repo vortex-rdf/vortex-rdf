@@ -5,60 +5,25 @@
 //! default graph is spelled `""`, which is also how a pattern selects it. A term code is the store's own,
 //! starting at 0.
 
-use std::fmt;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
-use vortex_rdf_core::{CodePattern, DictReader, Probe, VortexRdfStore};
-
-#[derive(Debug)]
-pub struct Error(pub String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl<E: std::error::Error> From<E> for Error {
-    fn from(e: E) -> Self {
-        Error(e.to_string())
-    }
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// A code pattern: one optional term code per position of `(s, p, o, g)`.
-pub type Codes = [Option<u64>; 4];
+use vortex_rdf_core::{
+    CodePattern, DictReader, KindRanges, Probe, Result, VortexRdfError, VortexRdfStore,
+};
 
 /// Bytes per row [`Store::match_codes`] writes: four codes of eight bytes.
 pub const ROW_BYTES: usize = 32;
 
 /// One runtime for every store of the process, as in the Python bindings: a store's reads are async, the
 /// caller's threads block on them.
-fn runtime() -> Result<&'static tokio::runtime::Runtime> {
-    static RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-        })
-        .as_ref()
-        .map_err(|e| Error(format!("cannot start the async runtime: {e}")))
-}
-
-/// The code ranges of the dictionary's term kinds, ends exclusive.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ranges {
-    /// The code of `""`, the default graph's name, when the dictionary holds it.
-    pub default_graph: Option<u64>,
-    pub literals: (u64, u64),
-    pub iris: (u64, u64),
-    pub blanks: (u64, u64),
-}
+static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("start the vortex-rdf native library's async runtime")
+});
 
 pub struct Store {
-    rt: &'static tokio::runtime::Runtime,
     store: VortexRdfStore,
     dict: Option<DictReader>,
     size: u64,
@@ -67,22 +32,16 @@ pub struct Store {
 impl Store {
     /// Opens a `.vortex` file: memory-mapped and read in place, or with `in_memory` loaded whole.
     pub fn open(path: &str, in_memory: bool) -> Result<Store> {
-        let rt = runtime()?;
-        let store = rt.block_on(async {
+        let store = RUNTIME.block_on(async {
             if in_memory {
                 VortexRdfStore::from_file_in_memory(path).await
             } else {
                 VortexRdfStore::from_file(path).await
             }
         })?;
-        let size = rt.block_on(store.size())? as u64;
+        let size = RUNTIME.block_on(store.size())? as u64;
         let dict = store.dict_reader();
-        Ok(Store {
-            rt,
-            store,
-            dict,
-            size,
-        })
+        Ok(Store { store, dict, size })
     }
 
     /// The number of quads.
@@ -115,11 +74,12 @@ impl Store {
         g: Option<&str>,
     ) -> Result<u64> {
         let probe = Probe::parse(s, p, o, g)?;
-        Ok(self.rt.block_on(self.store.count_probe(&probe))? as u64)
+        Ok(RUNTIME.block_on(self.store.count_probe(&probe))? as u64)
     }
 
     /// The quads matching a pattern as `(s, p, o, g)` N-Triples spellings, `limit` rows after `offset` in the
-    /// store's row order.
+    /// store's row order: a Dictionary store's matched codes decoded a column at a time, the matched quads'
+    /// terms otherwise.
     pub fn quads(
         &self,
         s: Option<&str>,
@@ -130,31 +90,21 @@ impl Store {
         limit: Option<usize>,
     ) -> Result<Vec<[String; 4]>> {
         let probe = Probe::parse(s, p, o, g)?.window(offset as usize, limit);
-        let view = self.rt.block_on(self.store.run_probe(&probe))?;
+        let view = RUNTIME.block_on(self.store.run_probe(&probe))?;
         if let Some(dict) = &self.dict
-            && let Some(columns) = self.rt.block_on(view.code_columns_gathered())?
+            && let Some([s, p, o, g]) = RUNTIME.block_on(view.code_columns_gathered())?
         {
-            let mut decoded: Vec<Vec<String>> = Vec::with_capacity(4);
-            for column in &columns {
-                let terms = self.rt.block_on(dict.decode_many(column))?;
-                decoded.push(
-                    terms
-                        .into_iter()
-                        .map(|t| {
-                            t.ok_or_else(|| {
-                                Error("a matched row holds a code outside the dictionary".into())
-                            })
-                        })
-                        .collect::<Result<_>>()?,
-                );
-            }
-            let rows = decoded[0].len();
-            let mut columns = decoded.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
-            return Ok((0..rows)
-                .map(|_| std::array::from_fn(|i| columns[i].next().expect("equal column lengths")))
-                .collect());
+            let decode = |column| RUNTIME.block_on(dict.decode_many(column));
+            let rows = decode(&s)?
+                .into_iter()
+                .zip(decode(&p)?)
+                .zip(decode(&o)?)
+                .zip(decode(&g)?);
+            return rows
+                .map(|(((s, p), o), g)| Ok([spelled(s)?, spelled(p)?, spelled(o)?, spelled(g)?]))
+                .collect();
         }
-        let rows = self.rt.block_on(view.shared_quads_vec())?;
+        let rows = RUNTIME.block_on(view.shared_quads_vec())?;
         Ok(rows
             .iter()
             .map(|q| {
@@ -171,9 +121,12 @@ impl Store {
     // ---- term codes, Dictionary layout ----
 
     fn dict(&self) -> Result<&DictReader> {
-        self.dict
-            .as_ref()
-            .ok_or_else(|| Error(format!("a {} store has no term dictionary", self.layout())))
+        self.dict.as_ref().ok_or_else(|| {
+            VortexRdfError::InvalidOperation(format!(
+                "a {} store has no term dictionary",
+                self.layout()
+            ))
+        })
     }
 
     /// Whether the store has a term dictionary (Dictionary layout).
@@ -187,68 +140,57 @@ impl Store {
     }
 
     /// The code ranges of the term kinds.
-    pub fn ranges(&self) -> Result<Ranges> {
-        let k = self.rt.block_on(self.dict()?.kind_ranges())?;
-        Ok(Ranges {
-            default_graph: k.default_graph,
-            literals: (k.literals.start, k.literals.end),
-            iris: (k.iris.start, k.iris.end),
-            blanks: (k.blanks.start, k.blanks.end),
-        })
+    pub fn ranges(&self) -> Result<KindRanges> {
+        RUNTIME.block_on(self.dict()?.kind_ranges())
     }
 
     /// The code of a term, or `None` when the dictionary lacks it. The spelling is tolerated as in the Python
     /// bindings (an IRI with or without angle brackets, the default graph as `""`).
     pub fn encode(&self, term: &str) -> Result<Option<u64>> {
-        Ok(self.rt.block_on(self.dict()?.encode(term))?)
+        RUNTIME.block_on(self.dict()?.encode(term))
     }
 
     /// The N-Triples spelling of a code, or `None` for a code outside the dictionary.
     pub fn decode(&self, code: u64) -> Result<Option<String>> {
-        Ok(self.rt.block_on(self.dict()?.decode(code))?)
+        RUNTIME.block_on(self.dict()?.decode(code))
     }
 
     /// [`decode`](Self::decode) of each code, in order, for codes in any order and with repeats.
     pub fn decode_many(&self, codes: &[u64]) -> Result<Vec<Option<String>>> {
-        Ok(self.rt.block_on(self.dict()?.decode_many(codes))?)
-    }
-
-    fn code_pattern(pattern: Codes) -> CodePattern {
-        CodePattern::new(pattern[0], pattern[1], pattern[2], pattern[3])
+        RUNTIME.block_on(self.dict()?.decode_many(codes))
     }
 
     /// The number of quads matching a code pattern, exact and without reading rows.
-    pub fn count_codes(&self, pattern: Codes) -> Result<u64> {
-        Ok(self
-            .rt
-            .block_on(self.store.count_code_pattern(Self::code_pattern(pattern)))?)
+    pub fn count_codes(&self, pattern: CodePattern) -> Result<u64> {
+        RUNTIME.block_on(self.store.count_code_pattern(pattern))
     }
 
-    /// Up to `limit` quads matching a code pattern after `offset`, written into `out` as [`ROW_BYTES`] per
-    /// row: the `(s, p, o, g)` codes, eight native-endian bytes each. `out` must hold `limit` rows. Returns the
-    /// rows written.
+    /// Up to `out.len()` quads matching a code pattern after `offset`, one row of `out` each: the
+    /// `(s, p, o, g)` codes, eight native-endian bytes apiece. Returns the rows written.
     pub fn match_codes(
         &self,
-        pattern: Codes,
+        pattern: CodePattern,
         offset: u64,
-        limit: usize,
-        out: &mut [u8],
+        out: &mut [[u8; ROW_BYTES]],
     ) -> Result<usize> {
-        assert!(out.len() >= ROW_BYTES * limit, "output buffer too small");
-        let columns = self.rt.block_on(self.store.match_code_pattern(
-            Self::code_pattern(pattern),
+        let columns = RUNTIME.block_on(self.store.match_code_pattern(
+            pattern,
             offset as usize,
-            Some(limit),
+            Some(out.len()),
         ))?;
-        let rows = columns[0].len().min(limit);
-        for (row, bytes) in out.as_chunks_mut::<ROW_BYTES>().0[..rows]
-            .iter_mut()
-            .enumerate()
-        {
+        let rows = columns[0].len();
+        for (row, bytes) in out[..rows].iter_mut().enumerate() {
             for (code, column) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&columns) {
                 *code = column[row].to_ne_bytes();
             }
         }
         Ok(rows)
     }
+}
+
+/// A matched row's decoded term; `None` is a code outside the dictionary.
+fn spelled(term: Option<String>) -> Result<String> {
+    term.ok_or_else(|| {
+        VortexRdfError::Deserialization("a matched row holds a code outside the dictionary".into())
+    })
 }
