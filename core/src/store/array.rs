@@ -168,6 +168,20 @@ pub(crate) fn field_as<T: Executable>(
         .map_err(VortexRdfError::Vortex)
 }
 
+/// `arr` decoded to a primitive array, for the `VORTEX_RDF_ENCODED_SEARCH=0` ablation: the search then reads
+/// decoded values (see `vortex_rdf_encoded_search::encoded_search_enabled`).
+pub(crate) fn decoded_for_search(arr: &ArrayRef) -> Result<ArrayRef> {
+    if !arr.dtype().is_unsigned_int() || arr.dtype().is_nullable() {
+        return Ok(arr.clone()); // only code columns are searched
+    }
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    Ok(arr
+        .clone()
+        .execute::<vortex_array::arrays::PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?
+        .into_array())
+}
+
 /// Binary-search a sorted column for the `[lo, hi)` run of rows equal to
 /// `probe` (empty, at the insertion point, when the value is absent). Only
 /// meaningful on columns [`column_is_sorted`] reports as sorted.
@@ -183,9 +197,18 @@ pub(crate) fn search_sorted_bounds(
     if arr.dtype().is_unsigned_int()
         && !arr.dtype().is_nullable()
         && let Ok(needle) = u64::try_from(probe)
-        && let Some(encoded) = vortex_rdf_encoded_search::SortedProbe::resolve(arr)
     {
-        return Ok(encoded.bounds(needle));
+        // VORTEX_RDF_ENCODED_SEARCH=0: the column is decoded first and its decoded values searched.
+        let decoded;
+        let searched = if vortex_rdf_encoded_search::encoded_search_enabled() {
+            arr
+        } else {
+            decoded = decoded_for_search(arr)?;
+            &decoded
+        };
+        if let Some(encoded) = vortex_rdf_encoded_search::SortedProbe::resolve(searched) {
+            return Ok(encoded.bounds(needle));
+        }
     }
 
     let index_of = |result: SearchResult| match result {

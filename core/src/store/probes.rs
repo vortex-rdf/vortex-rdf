@@ -82,7 +82,15 @@ impl StructProbes {
                 let probe = struct_arr
                     .unmasked_field_by_name(name.as_ref())
                     .ok()
-                    .and_then(|c| OwnedSortedProbe::resolve(c.clone()).map(Arc::new));
+                    .and_then(|c| {
+                        // VORTEX_RDF_ENCODED_SEARCH=0: the probe searches the decoded column.
+                        let c = if vortex_rdf_encoded_search::encoded_search_enabled() {
+                            c.clone()
+                        } else {
+                            crate::store::array::decoded_for_search(c).ok()?
+                        };
+                        OwnedSortedProbe::resolve(c).map(Arc::new)
+                    });
                 (name.clone(), probe)
             })
             .collect()
