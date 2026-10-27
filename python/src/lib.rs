@@ -150,6 +150,13 @@ impl CancelToken {
     }
 }
 
+/// The encoded-search work counters (`VORTEX_RDF_COUNTERS=1`; all zero otherwise), by name.
+#[pyfunction]
+fn engine_counters() -> std::collections::HashMap<&'static str, u64> {
+    use vortex_rdf_encoded_search::counters::{NAMES, snapshot};
+    NAMES.into_iter().zip(snapshot()).collect()
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     keep_freed_heap();
@@ -161,6 +168,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<kernels::U64Column>()?;
     m.add_class::<kernels::CodeGroups>()?;
     m.add_function(wrap_pyfunction!(serialize::serialize_rdf, m)?)?;
+    m.add_function(wrap_pyfunction!(engine_counters, m)?)?;
     m.add("VortexRdfError", m.py().get_type::<VortexRdfError>())?;
     m.add("JoinTooLarge", m.py().get_type::<JoinTooLarge>())?;
     m.add("Cancelled", m.py().get_type::<Cancelled>())?;

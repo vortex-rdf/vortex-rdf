@@ -138,6 +138,8 @@ pub(crate) fn shared_code_primitive(
     let shared = child.as_opt::<Shared>()?;
     let cached = shared
         .get_or_compute(|source| {
+            use vortex_rdf_encoded_search::counters::{SHARED_DECODED, note};
+            note(SHARED_DECODED, source.len());
             let mut ctx = VORTEX_SESSION.create_execution_ctx();
             source
                 .clone()

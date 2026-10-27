@@ -534,12 +534,15 @@ impl ColumnChunks {
                 }
             };
             // VORTEX_RDF_ENCODED_SEARCH=0: the leaf is decoded first and its decoded values searched.
+            use crate::counters::{LEAF_DECODED, LEAF_ENCODED, note};
             let array = if crate::encoded_search_enabled()
                 || !array.dtype().is_unsigned_int()
                 || array.dtype().is_nullable()
             {
+                note(LEAF_ENCODED, array.len());
                 array
             } else {
+                note(LEAF_DECODED, array.len());
                 let mut ctx = session.create_execution_ctx();
                 array.execute::<PrimitiveArray>(&mut ctx)?.into_array()
             };
