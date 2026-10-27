@@ -131,9 +131,14 @@ impl<'a> TypedEq<'a> {
                         true => shared_code_primitive(col),
                         false => cached_code_primitive(col),
                     };
+                use vortex_rdf_encoded_search::counters::{
+                    TYPED_EQ_PRIMITIVE, TYPED_EQ_PROBE, note,
+                };
                 if let Some(prim) = canonical {
+                    note(TYPED_EQ_PRIMITIVE, col.len());
                     return Some(TypedEq::Code(prim, *code));
                 }
+                note(TYPED_EQ_PROBE, col.len());
                 if let Some(probe) = cached {
                     #[cfg(test)]
                     probe_hooks::note(true);
@@ -458,6 +463,20 @@ mod tests {
         let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
         assert!(crate::store::resident::cached_code_primitive(&o).is_none());
+    }
+
+    /// With `VORTEX_RDF_COUNTERS=1`, an equality scan is counted where it binds (a no-op without the variable).
+    #[test]
+    fn typed_eq_binds_are_counted() {
+        use vortex_rdf_encoded_search::counters::{TYPED_EQ_PRIMITIVE, TYPED_EQ_PROBE, on, snapshot};
+        if !on() {
+            return;
+        }
+        let bound = |c: [u64; 18]| c[TYPED_EQ_PRIMITIVE] + c[TYPED_EQ_PROBE];
+        let before = bound(snapshot());
+        let sa = wrapped_struct(1000);
+        typed_residual_ids(&sa, &RowSelection::All, 1000, &eqs(&[("p", 3)]), None).unwrap();
+        assert!(bound(snapshot()) > before);
     }
 
     /// A canonical narrower unsigned column (TypedObject's kind byte) binds

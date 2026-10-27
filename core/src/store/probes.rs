@@ -84,9 +84,14 @@ impl StructProbes {
                     .ok()
                     .and_then(|c| {
                         // VORTEX_RDF_ENCODED_SEARCH=0: the probe searches the decoded column.
+                        use vortex_rdf_encoded_search::counters::{
+                            PROBE_DECODED, PROBE_ENCODED, note,
+                        };
                         let c = if vortex_rdf_encoded_search::encoded_search_enabled() {
+                            note(PROBE_ENCODED, c.len());
                             c.clone()
                         } else {
+                            note(PROBE_DECODED, c.len());
                             crate::store::array::decoded_for_search(c).ok()?
                         };
                         OwnedSortedProbe::resolve(c).map(Arc::new)

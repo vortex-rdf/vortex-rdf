@@ -24,6 +24,7 @@ doctest = false
 
 [dependencies]
 vortex-rdf-core = { workspace = true }
+vortex-rdf-encoded-search.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 futures = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }

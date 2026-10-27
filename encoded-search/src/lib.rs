@@ -25,6 +25,74 @@ pub fn encoded_search_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("VORTEX_RDF_ENCODED_SEARCH").as_deref() != Ok("0"))
 }
 
+/// Work counters of the encoded search, for the ablation study: `VORTEX_RDF_COUNTERS=1`, read once per process.
+/// Off, a note costs one relaxed load. Each site has a pair: arrays (leaves, columns) and their values.
+pub mod counters {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Names in [`snapshot`] order.
+    pub const NAMES: [&str; 18] = [
+        "leaf_encoded",
+        "leaf_encoded_values",
+        "leaf_decoded",
+        "leaf_decoded_values",
+        "probe_encoded",
+        "probe_encoded_values",
+        "probe_decoded",
+        "probe_decoded_values",
+        "gather_encoded",
+        "gather_encoded_values",
+        "gather_decoded",
+        "gather_decoded_values",
+        "shared_decoded",
+        "shared_decoded_values",
+        "typed_eq_probe",
+        "typed_eq_probe_values",
+        "typed_eq_primitive",
+        "typed_eq_primitive_values",
+    ];
+    /// A chunk leaf loaded and resolved as it is encoded.
+    pub const LEAF_ENCODED: usize = 0;
+    /// A chunk leaf loaded and decoded before its probe resolves (`VORTEX_RDF_ENCODED_SEARCH=0`).
+    pub const LEAF_DECODED: usize = 2;
+    /// A resident column probe resolved on the encoded column.
+    pub const PROBE_ENCODED: usize = 4;
+    /// A resident column probe resolved on the decoded column.
+    pub const PROBE_DECODED: usize = 6;
+    /// A point gather read through the encoded column (no cached probe).
+    pub const GATHER_ENCODED: usize = 8;
+    /// A point gather that decoded the column first.
+    pub const GATHER_DECODED: usize = 10;
+    /// A shared column's canonical form computed (decoded once, then cached).
+    pub const SHARED_DECODED: usize = 12;
+    /// An equality scan offered an encoded-search probe (it falls back to the generic scan if the probe declines).
+    pub const TYPED_EQ_PROBE: usize = 14;
+    /// An equality scan bound to a primitive (decoded) column.
+    pub const TYPED_EQ_PRIMITIVE: usize = 16;
+
+    static C: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+
+    /// Whether the counters are on.
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VORTEX_RDF_COUNTERS").as_deref() == Ok("1"))
+    }
+
+    /// One array of `values` values at `site`.
+    pub fn note(site: usize, values: usize) {
+        if on() {
+            C[site].fetch_add(1, Ordering::Relaxed);
+            C[site + 1].fetch_add(values as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// The counters, in [`NAMES`] order.
+    pub fn snapshot() -> [u64; 18] {
+        std::array::from_fn(|i| C[i].load(Ordering::Relaxed))
+    }
+}
+
 /// A resolved, borrowed probe over one encoded (or canonical) array.
 ///
 /// Bounds queries require the array to be sorted ascending, a caller
