@@ -263,9 +263,9 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:207-232`](../core/src/store/query/matching.rs#L207-L232 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L342), [`search_sorted_bounds`](../core/src/store/array.rs#L189) | [§6.1](#61-prefix-probe) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L342), [`search_sorted_bounds`](../core/src/store/array.rs#L203) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:236-289`](../core/src/store/query/matching.rs#L236-L289 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L658), [`fold_row_ids`](../core/src/store/query/matching.rs#L779) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:291-308`](../core/src/store/query/matching.rs#L291-L308 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L423), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L249), [`mask_for`](../core/src/store/query/matching.rs#L728) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`matching.rs:291-308`](../core/src/store/query/matching.rs#L291-L308 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L423), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L256), [`mask_for`](../core/src/store/query/matching.rs#L728) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:310-317`](../core/src/store/query/matching.rs#L310-L317 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -288,7 +288,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L189), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L203), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -997,7 +997,7 @@ file run) and a rid-only scan of the index child otherwise.
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
 | `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L798) | an already-narrowed view below this skips index routing |
-| `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L237) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
+| `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L244) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
 `POINT_IDS_PER_SPLIT`, `TAKE_ROWS`) are in [file-format.md §11](file-format.md#11-constants).
