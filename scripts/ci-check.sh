@@ -135,7 +135,7 @@ job_python_tests() {
     return 0
   fi
   run -C python uv sync --locked
-  run -C python uv run --no-sync pytest tests bench/test_codspeed.py -q
+  run -C python uv run --no-sync pytest tests bench/test_codspeed.py bench/test_suite.py -q
 }
 
 job_js_tests() {

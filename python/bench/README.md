@@ -8,7 +8,7 @@ BENCH_DIM=32 python3 python/bench/run.py    # quick pilot
 cd python && uv run pytest bench/test_codspeed.py --codspeed
 ```
 
-Harness design (per-library virtualenvs, dataset parity with `js/bench/datasets.ts`, `unsupported` cells where a library lacks the operation, matched-row counts cross-checked and any disagreement recorded in `config.countWarnings`) is documented in `run.py`, `worker.py` and `adapters.py`.
+Harness design (per-library virtualenvs, dataset parity with `js/bench/datasets.ts`, `unsupported` cells where a library lacks the operation, matched-row counts cross-checked and any disagreement recorded in `config.countWarnings`) is documented in `run.py`, `worker.py` and `adapters.py`; `suite.py` holds the orchestration this suite shares with the Java one (`java/bench/run.py`).
 
 The knobs this suite shares with the JS and Rust ones (`BENCH_SIZE`, `BENCH_DIM`, `BENCH_GRAPHS_QUADS`, `MUT_BATCH`, `BENCH_SLOW_PHASE_MS`, the dataset shape and the CodSpeed sizes) are in [the shared table](../../js/bench/README.md#shared-knobs), with the suites that read each. This suite's own:
 
