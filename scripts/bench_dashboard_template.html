@@ -753,7 +753,9 @@
       dataset; an RDF4J connection's <code>add</code> in one transaction. <strong>Open</strong> is what
       a fresh process pays to query an already-built artifact. Jena's in-memory dataset and RDF4J's
       MemoryStore hold their store in memory and have no artifact to open, so those cells read
-      <span class="mono">unsupported</span>.
+      <span class="mono">unsupported</span>. RDF4J 6.1's NativeStore keeps a write-ahead log of its
+      value store and reads it back each time it opens, so its Open cell includes that read, and the log
+      is part of its on-disk size.
     </p>
     <div class="panel-grid" id="java-ingest-panels"></div>
   </section>
@@ -788,9 +790,12 @@
       <h2>Add &amp; delete</h2>
     </div>
     <p class="group-desc">
-      Per-quad addition and deletion of a fixed batch, the batch in one transaction. Five of the eight
-      stores support mutations: the Vortex <em>Java</em> bindings are read-only, and an HDT file
-      cannot change — qEndpoint's updates live in its store layer, which this tab does not measure.
+      Per-quad addition and deletion of a fixed batch, the batch in one transaction, each store
+      committing with its library's default durability: TDB2's commits are durable, RDF4J's NativeStore
+      and LMDB store do not force a sync at commit, and Jena's in-memory dataset and the MemoryStore keep
+      nothing on disk. Five of the eight stores support mutations: the Vortex <em>Java</em> bindings are
+      read-only, and an HDT file cannot change — qEndpoint's updates live in its store layer, which this
+      tab does not measure.
     </p>
     <div class="panel-grid" id="java-mut-panels"></div>
   </section>
@@ -803,9 +808,12 @@
     <p class="group-desc">
       Each adapter runs in its own JVM <em>and on its own classpath</em>, so peak RSS is one library's
       alone: the kernel's high-water mark for the worker and every process it ran. Every worker runs
-      with the same JVM flags, which the provenance line lists; a JVM's resident memory follows its heap
-      sizing as well as the store it holds. On-disk size is the artifact the build left, counted in
-      allocated blocks, listed only for the stores that write one. Lower is better in both tables.
+      with the same heap limit and collector, which the provenance line lists. A store kept in the Java
+      heap peaks near that limit whatever its live data, because the collector lets the heap grow toward
+      it, so read those peaks as bounded by the limit more than by the store; Vortex keeps its data
+      outside the heap, and the HDT files are memory-mapped. On-disk size is the artifact the build left,
+      counted in allocated blocks, listed only for the stores that write one. Lower is better in both
+      tables.
     </p>
     <div class="panel-grid" id="java-footprint-panels"></div>
   </section>
