@@ -29,6 +29,7 @@
     <module>vortex</module>
     <module>jena</module>
     <module>rdf4j</module>
+    <module>hdt-java</module>
   </modules>
 
   <dependencyManagement>
