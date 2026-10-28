@@ -28,6 +28,7 @@
     <module>harness</module>
     <module>vortex</module>
     <module>jena</module>
+    <module>rdf4j</module>
   </modules>
 
   <dependencyManagement>
