@@ -58,11 +58,14 @@ has() { case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 # The java stage's tools, checked before the first stage runs rather than when
 # the stage starts, after the stages before it. Maven compiles with the JDK it
-# reports running on, and the suite's workers run on that JDK too.
+# reports running on, which must hold javac (a runtime-only Java 25 does not),
+# and the suite's workers run on that JDK too.
 if has java; then
-  java_major=$(mvn -v 2>/dev/null | sed -n 's/^Java version: \([0-9]*\).*/\1/p' || true)
-  if [ -z "$java_major" ] || [ "$java_major" -lt 25 ]; then
-    echo "the java stage needs Maven running on JDK 25 or newer (found: ${java_major:-no mvn on PATH}); install them or leave java out of --only" >&2
+  mvn_version=$(mvn -v 2>/dev/null || true)
+  java_major=$(printf '%s\n' "$mvn_version" | sed -n 's/^Java version: \([0-9]*\).*/\1/p')
+  java_home=$(printf '%s\n' "$mvn_version" | sed -n 's/^Java version: .*runtime: \(.*\)$/\1/p')
+  if [ -z "$java_major" ] || [ "$java_major" -lt 25 ] || [ ! -x "$java_home/bin/javac" ]; then
+    echo "the java stage needs Maven running on a JDK 25 or newer, with javac (found: ${java_major:-no mvn on PATH}${java_home:+ at $java_home}); install them or leave java out of --only" >&2
     exit 2
   fi
 fi
