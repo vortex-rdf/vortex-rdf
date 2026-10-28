@@ -10,6 +10,13 @@
 use vortex_buffer::Buffer;
 
 use crate::error::Result;
+
+/// Whether [`VortexRdfStore::locate_codes`] answers at all: `VORTEX_RDF_LOCATE=0` (an ablation switch, read once)
+/// makes it decline every pattern, so callers take the general match. Unset is on.
+pub fn locate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VORTEX_RDF_LOCATE").as_deref() != Ok("0"))
+}
 use crate::store::VortexRdfStore;
 use crate::store::schema::TermCode;
 
@@ -75,7 +82,8 @@ impl VortexRdfStore {
     /// checked instead when no longer. A code past the dictionary, or one in
     /// a position no quad holds, matches nothing. Whether it answers depends
     /// on the store and `pattern` alone, never on the window, so every window
-    /// of one pattern comes from the same table, in the same order.
+    /// of one pattern comes from the same table, in the same order. With the
+    /// ablation switch `VORTEX_RDF_LOCATE=0` ([`locate_enabled`]) it declines every pattern.
     ///
     /// [`match_pattern`]: VortexRdfStore::match_pattern
     /// [`run_probe`]: VortexRdfStore::run_probe
@@ -85,6 +93,9 @@ impl VortexRdfStore {
         offset: usize,
         limit: Option<usize>,
     ) -> Result<Option<LocatedCodes>> {
+        if !locate_enabled() {
+            return Ok(None);
+        }
         #[cfg(feature = "file-io")]
         {
             self.locate_codes_in_file(pattern, offset, limit).await

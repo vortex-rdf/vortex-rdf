@@ -450,6 +450,9 @@ async fn column_chunks_empty_column() {
 /// column itself still resolves and a take reads the leaf all the same.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_decline_unsupported_leaf() {
+    if !vortex_rdf_encoded_search::encoded_search_enabled() {
+        return; // VORTEX_RDF_ENCODED_SEARCH=0 decodes the leaf first, so it is searched, not declined
+    }
     use vortex_array::VortexSessionExecute as _;
     use vortex_pco::Pco;
 
