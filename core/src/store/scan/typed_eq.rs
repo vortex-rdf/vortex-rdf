@@ -453,6 +453,9 @@ mod tests {
     /// on point reads, leaving the wrapper holding only its compressed form.
     #[test]
     fn wrapped_column_stays_compressed_for_narrow_scan() {
+        if !vortex_rdf_encoded_search::encoded_search_enabled() {
+            return; // VORTEX_RDF_ENCODED_SEARCH=0 decodes the column by design
+        }
         let n = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
         let sa = wrapped_struct(n);
         let o = sa.unmasked_field_by_name("o").unwrap().clone();
@@ -468,7 +471,9 @@ mod tests {
     /// With `VORTEX_RDF_COUNTERS=1`, an equality scan is counted where it binds (a no-op without the variable).
     #[test]
     fn typed_eq_binds_are_counted() {
-        use vortex_rdf_encoded_search::counters::{TYPED_EQ_PRIMITIVE, TYPED_EQ_PROBE, on, snapshot};
+        use vortex_rdf_encoded_search::counters::{
+            TYPED_EQ_PRIMITIVE, TYPED_EQ_PROBE, on, snapshot,
+        };
         if !on() {
             return;
         }

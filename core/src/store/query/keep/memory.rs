@@ -676,10 +676,12 @@ mod tests {
                     }
                 }
             }
+            // VORTEX_RDF_ENCODED_SEARCH=0 decodes searched columns into the cache by design.
             for column in ["s", "p", "o"] {
                 let col = struct_arr.unmasked_field_by_name(column).unwrap();
                 assert!(
-                    cached_code_primitive(col).is_none(),
+                    !vortex_rdf_encoded_search::encoded_search_enabled()
+                        || cached_code_primitive(col).is_none(),
                     "{chunk_rows}-row chunks, {column}: the shared cache stays empty"
                 );
             }
@@ -695,6 +697,9 @@ mod tests {
     /// The column's shared cache stays empty.
     #[test]
     fn the_pass_decodes_dense_pieces_and_probes_sparse_ones() {
+        if !vortex_rdf_encoded_search::encoded_search_enabled() {
+            return; // VORTEX_RDF_ENCODED_SEARCH=0 decodes every leaf whole: no pieces to count
+        }
         use super::keep_hooks::{decoded_pieces, probed_rows};
         const ROWS: usize = 6_000;
         let codes = base_codes(ROWS as u64);
