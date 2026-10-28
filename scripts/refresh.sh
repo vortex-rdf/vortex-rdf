@@ -168,7 +168,7 @@ fi
 if has render; then
   stage "Render ($OUT/public/index.html)"
   args=("$OUT/rust.txt" "$OUT/public/index.html")
-  for suite in rust-compare js python; do
+  for suite in rust-compare js python java; do
     if [ -f "$OUT/$suite.json" ]; then args+=("--$suite" "$OUT/$suite.json"); fi
   done
   python3 scripts/render_bench_dashboard.py "${args[@]}"

@@ -288,6 +288,7 @@
         <button class="tab" data-tab="rust" role="tab" type="button">Rust · core</button>
         <button class="tab" data-tab="js" role="tab" type="button">JavaScript · WASM</button>
         <button class="tab" data-tab="py" role="tab" type="button">Python · bindings</button>
+        <button class="tab" data-tab="java" role="tab" type="button">Java · bindings</button>
       </nav>
       <div class="theme-switch" role="radiogroup" aria-label="Color theme">
         <label title="Light">
@@ -711,6 +712,131 @@
 
   <footer class="prov mono" id="py-provenance"></footer>
   </div><!-- /tab-py -->
+
+  <div id="tab-java" class="tabpane">
+  <nav class="seclinks">
+    <a href="#java-overview">Overview</a>
+    <a href="#java-ingest">Build &amp; open</a>
+    <a href="#java-query">Query</a>
+    <a href="#java-mutations">Mutations</a>
+    <a href="#java-footprint">Footprint</a>
+    <a href="#java-data">Raw data</a>
+  </nav>
+
+  <section id="java-overview" class="group">
+    <p class="lede">
+      One <code>java/bench/run.py</code> run — the <code>org.vortexrdf</code> Java bindings compared
+      against <a href="https://github.com/rdfhdt/hdt-java">hdt-java</a>,
+      <a href="https://github.com/the-qa-company/qEndpoint">qEndpoint</a>'s HDT library,
+      <a href="https://jena.apache.org/">Apache Jena</a> (its in-memory dataset and TDB2) and
+      <a href="https://rdf4j.org/">Eclipse RDF4J</a> (MemoryStore, NativeStore and LMDB), across
+      build, open, query in both cache regimes, full scan, add and delete.
+      Vortex appears with the Python tab's six build configurations, all using the <em>Dictionary</em>
+      layout. Each adapter runs in its own JVM, on its own library's classpath.
+    </p>
+    <div class="kpi-row" id="java-kpi-row"></div>
+    <p class="lede mono" id="java-matched-rows"></p>
+    <p class="lede" id="java-count-warnings"></p>
+    <p class="lede" id="java-failures"></p>
+  </section>
+
+  <section id="java-ingest" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">BUILD</span>
+      <h2>Build &amp; open</h2>
+    </div>
+    <p class="group-desc">
+      <strong>Build</strong> is each library's idiomatic path from a shared N-Quads file
+      to a queryable store: <code>vortex-rdf-cli serialize</code> for Vortex, whose Java bindings
+      only read; HDT generation, then its index, for the two HDT libraries (hdt-java from the triples
+      projection, since its HDT has no graphs); Jena's TDB2 bulk loader, or a parse into its in-memory
+      dataset; an RDF4J connection's <code>add</code> in one transaction. <strong>Open</strong> is what
+      a fresh process pays to query an already-built artifact. Jena's in-memory dataset and RDF4J's
+      MemoryStore hold their store in memory and have no artifact to open, so those cells read
+      <span class="mono">unsupported</span>.
+    </p>
+    <div class="panel-grid" id="java-ingest-panels"></div>
+  </section>
+
+  <section id="java-query" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">QUERY</span>
+      <h2>Match — cross-library</h2>
+    </div>
+    <p class="group-desc">
+      Resolving each pattern:
+      <span class="mono">S</span>/<span class="mono">P</span>/<span class="mono">O</span>/<span class="mono">G</span>/<span class="mono">SP</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">SPOG</span>/<span class="mono">full</span>,
+      all on the one dataset — in two units per cache regime.
+      <strong>Materialized</strong> iterates the matches in each library's own result form and reads
+      every term as a Java <code>String</code> (Vortex's N-Triples spellings built in Rust, HDT's term
+      strings, Jena's nodes, RDF4J's values). <strong>Count-only</strong> resolves the same pattern and
+      counts the rows without reading a term. Before any pattern is timed, every pattern runs for a fixed
+      warm-up budget, discarded, so each library is measured with its query path JIT-compiled.
+      Residency differs too: the Vortex <em>(file)</em> rows, both HDT files, TDB2, the NativeStore and
+      LMDB read from disk, while the Vortex <em>(memory)</em> rows, Jena's in-memory dataset and the
+      MemoryStore answer from memory. RDF4J's two on-disk stores carry the spoc, posc, ospc and cspo
+      indexes, so object- and graph-bound patterns are served from an index, as in every other store
+      here. hdt-java has no graphs, so its <span class="mono">G</span> and
+      <span class="mono">SPOG</span> cells read <span class="mono">unsupported</span>.
+    </p>
+    <div class="panel-grid" id="java-query-panels"></div>
+  </section>
+
+  <section id="java-mutations" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">MUTATE</span>
+      <h2>Add &amp; delete</h2>
+    </div>
+    <p class="group-desc">
+      Per-quad addition and deletion of a fixed batch, the batch in one transaction. Five of the eight
+      stores support mutations: the Vortex <em>Java</em> bindings are read-only, and an HDT file
+      cannot change — qEndpoint's updates live in its store layer, which this tab does not measure.
+    </p>
+    <div class="panel-grid" id="java-mut-panels"></div>
+  </section>
+
+  <section id="java-footprint" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">FOOTPRINT</span>
+      <h2>Peak memory &amp; on-disk size</h2>
+    </div>
+    <p class="group-desc">
+      Each adapter runs in its own JVM <em>and on its own classpath</em>, so peak RSS is one library's
+      alone: the kernel's high-water mark for the worker and every process it ran. Every worker runs
+      with the same JVM flags, which the provenance line lists; a JVM's resident memory follows its heap
+      sizing as well as the store it holds. On-disk size is the artifact the build left, counted in
+      allocated blocks, listed only for the stores that write one. Lower is better in both tables.
+    </p>
+    <div class="panel-grid" id="java-footprint-panels"></div>
+  </section>
+
+  <section id="java-data" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DATA</span>
+      <h2>Every measured configuration</h2>
+    </div>
+    <p class="group-desc">Every leaf benchmark from this run. Click a column to sort.</p>
+    <div class="table-toolbar">
+      <input id="java-table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
+      <span class="count" id="java-table-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="java-data-table">
+        <thead><tr>
+          <th data-key="id" tabindex="0" role="button" aria-label="Sort by benchmark name">Benchmark</th>
+          <th data-key="fastest_ns" tabindex="0" role="button" aria-label="Sort by fastest">Fastest</th>
+          <th data-key="slowest_ns" tabindex="0" role="button" aria-label="Sort by slowest">Slowest</th>
+          <th data-key="median_ns" tabindex="0" role="button" aria-label="Sort by median">Median</th>
+          <th data-key="mean_ns" tabindex="0" role="button" aria-label="Sort by mean">Mean</th>
+          <th data-key="samples" tabindex="0" role="button" aria-label="Sort by sample count">Samples</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="prov mono" id="java-provenance"></footer>
+  </div><!-- /tab-java -->
 </main>
 
 <script>
@@ -731,6 +857,12 @@ const PY_MEMORY = __PY_MEMORY_DATA__;
 const PY_SIZES = __PY_SIZE_DATA__;
 const PY_CONFIG = __PY_CONFIG_DATA__;
 const PY_PROVENANCE = __PY_PROVENANCE__;
+const JAVA_DATA = __JAVA_BENCH_DATA__;
+const JAVA_MEMORY = __JAVA_MEMORY_DATA__;
+const JAVA_SIZES = __JAVA_SIZE_DATA__;
+const JAVA_CONFIG = __JAVA_CONFIG_DATA__;
+const JAVA_PROVENANCE = __JAVA_PROVENANCE__;
+const JAVA_FAILURES = __JAVA_FAILURE_DATA__;
 // Cold and warm measurements of one pattern share an id and differ only by
 // `regime`, so the key carries it. The Rust tab needs no suffix: its regimes are
 // separate bench groups (match_cold_* / match_warm_*), so its ids already differ.
@@ -1581,11 +1713,39 @@ const PY_TAB = {
   },
 };
 
+// ---- Java tab ----
+// Mirrors java/bench/run.py's ADAPTERS: the Python tab's six Vortex builds,
+// under the same slugs so a Vortex row reads the same on both tabs, then the
+// Java stores Vortex is measured against.
+const JAVA_OTHER_LIBS = [
+  { slug:"hdt_java",      label:"hdt-java (file)" },
+  { slug:"qendpoint_hdt", label:"qEndpoint HDT (file)" },
+  { slug:"jena_tim",      label:"Jena TIM (memory)" },
+  { slug:"jena_tdb2",     label:"Jena TDB2 (file)" },
+  { slug:"rdf4j_memory",  label:"RDF4J MemoryStore (memory)" },
+  { slug:"rdf4j_native",  label:"RDF4J NativeStore (file)" },
+  { slug:"rdf4j_lmdb",    label:"RDF4J LMDB (file)" },
+];
+const JAVA_TAB = {
+  key:"java", data:JAVA_DATA, memory:JAVA_MEMORY, sizes:JAVA_SIZES, config:JAVA_CONFIG,
+  provenance:JAVA_PROVENANCE, failures:JAVA_FAILURES, vortex:PY_VORTEX, others:JAVA_OTHER_LIBS,
+  // One row per store for the mutation panel: each Java store is its own library here.
+  libraries:[{ slug:PY_VORTEX[0].slug, label:"vortex-rdf" }, ...JAVA_OTHER_LIBS],
+  libraryCount:5, librariesSub:"vortex · hdt-java · qEndpoint · Jena · RDF4J",
+  emptyLabel:"No Java results",
+  emptyHint:"run <code>scripts/refresh.sh --only java,render</code>",
+  notes:{
+    rss:`Peak resident set size of each adapter's own JVM and the processes it ran (a Vortex build runs the CLI): build + open + every pattern. An empty worker JVM peaks at ${JAVA_CONFIG.jvmBaselineRssMb ?? "?"} MB, the floor under every row. Smallest first; <span class="best-key">green</span> = smallest footprint, the multiplier is vs it.`,
+    size:"Bytes the build left on disk, counted in allocated blocks, so a store's sparse preallocated files count what they hold. Only the stores that write an artifact are listed — one that lives only in memory has none. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
+  },
+};
+
 // ---- tabs ----
 const panes = {
   rust: document.getElementById("tab-rust"),
   js: document.getElementById("tab-js"),
   py: document.getElementById("tab-py"),
+  java: document.getElementById("tab-java"),
 };
 const tabButtons = document.querySelectorAll(".tab");
 function showTab(name){
@@ -1635,5 +1795,6 @@ applyTheme(document.documentElement.dataset.theme || "auto");
 renderRust();
 renderJs();
 renderBindingsTab(PY_TAB);
+renderBindingsTab(JAVA_TAB);
 showTab(location.hash.replace("#", "") || "rust");
 </script>

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Turn the four benchmark suites' results into the static HTML dashboard.
+"""Turn the five benchmark suites' results into the static HTML dashboard.
 
 Usage (`scripts/refresh.sh` runs the suites, then this over their outputs):
     python3 scripts/render_bench_dashboard.py target/bench/rust.txt target/bench/public/index.html
         [--rust-compare target/bench/rust-compare.json] [--js target/bench/js.json]
-        [--python target/bench/python.json]
+        [--python target/bench/python.json] [--java target/bench/java.json]
 
 The first argument is the log of `cargo bench --bench benchmark` and
 `--bench match_lazy`, whose `#dataset` line gives the run's dataset; the
-other three suites write dashboard-shaped JSON (see `load_suite`), and a
+other four suites write dashboard-shaped JSON (see `load_suite`), and a
 suite left out renders as its tab's placeholder.
 
 Divan (via codspeed-divan-compat) has no machine-readable output mode, so this
@@ -321,18 +321,18 @@ class SuiteError(Exception):
 def load_suite(path, stage):
     """One comparative suite's results, with every key the page reads.
 
-    `bench-compare/benches/compare.rs`, `js/bench/compare.bench.ts` and
-    `python/bench/run.py` each write one dashboard-shaped JSON object, with the
-    keys that suite has:
+    `bench-compare/benches/compare.rs`, `js/bench/compare.bench.ts`,
+    `python/bench/run.py` and `java/bench/run.py` each write one
+    dashboard-shaped JSON object, with the keys that suite has:
       - `results`: the rows. A row for an operation a library's API does not
         offer carries `"unsupported": true`, a `reason` and `median_ns: null`,
         so the panels leave it out of the column's best/ratio arithmetic.
       - `memory`: one `{slug, label, role, peakRssMb}` entry per library process.
-      - `sizes` (Rust cross-library, Python): one `{slug, label, bytes}` entry
+      - `sizes` (Rust cross-library, Python, Java): one `{slug, label, bytes}` entry
         per library's on-disk artifact; `bytes` is null for a store that lives
         only in memory.
-      - `provenance` (JavaScript, Python): the suite's own provenance line.
-      - `failures` (JavaScript): the phases a worker could not measure.
+      - `provenance` (JavaScript, Python, Java): the suite's own provenance line.
+      - `failures` (JavaScript, Java): the phases a worker could not measure.
       - `config`: the dataset sizes and iteration counts the run used.
 
     A suite with no file gets every default, and the page renders that tab's
@@ -359,6 +359,7 @@ def main():
     parser.add_argument("--rust-compare", type=Path, help="bench-compare/benches/compare.rs's results")
     parser.add_argument("--js", type=Path, help="js/bench/compare.bench.ts's results")
     parser.add_argument("--python", type=Path, help="python/bench/run.py's results")
+    parser.add_argument("--java", type=Path, help="java/bench/run.py's results")
     args = parser.parse_args()
 
     try:
@@ -384,17 +385,19 @@ def main():
         compare = load_suite(args.rust_compare, "compare")
         js = load_suite(args.js, "js")
         py = load_suite(args.python, "python")
+        java = load_suite(args.java, "java")
     except SuiteError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
     if args.rust_compare:
         compare["config"]["measuredAt"] = measured_at(args.rust_compare)
     check_scale_agreement(
-        quads, [("Rust cross-library", compare["config"]), ("JavaScript", js["config"]), ("Python", py["config"])],
+        quads, [("Rust cross-library", compare["config"]), ("JavaScript", js["config"]), ("Python", py["config"]),
+                ("Java", java["config"])],
     )
 
     # One duration format across all four sources (see `fmt_duration`).
-    for rows in (results, compare["results"], js["results"], py["results"]):
+    for rows in (results, compare["results"], js["results"], py["results"], java["results"]):
         normalize_durations(rows)
 
     # The template's placeholders, each filled with its value as JSON.
@@ -416,6 +419,12 @@ def main():
         "__PY_MEMORY_DATA__": py["memory"],
         "__PY_SIZE_DATA__": py["sizes"],
         "__PY_CONFIG_DATA__": py["config"],
+        "__JAVA_BENCH_DATA__": java["results"],
+        "__JAVA_PROVENANCE__": java["provenance"],
+        "__JAVA_MEMORY_DATA__": java["memory"],
+        "__JAVA_SIZE_DATA__": java["sizes"],
+        "__JAVA_CONFIG_DATA__": java["config"],
+        "__JAVA_FAILURE_DATA__": java["failures"],
     }
     out = re.sub(r"__[A-Z_]+__", lambda m: json.dumps(values[m.group(0)]),
                  TEMPLATE.read_text(encoding="utf-8"))
@@ -426,8 +435,9 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(out, encoding="utf-8")
     print(f"parsed {len(results)} Rust + {len(compare['results'])} Rust-compare + {len(js['results'])} JS + "
-          f"{len(py['results'])} Python benchmark results ({len(js['memory']) + len(py['memory'])} memory "
-          f"readings, {len(py['sizes'])} artifact sizes) -> {args.out}")
+          f"{len(py['results'])} Python + {len(java['results'])} Java benchmark results "
+          f"({len(js['memory']) + len(py['memory']) + len(java['memory'])} memory readings, "
+          f"{len(py['sizes']) + len(java['sizes'])} artifact sizes) -> {args.out}")
     return 0
 
 
