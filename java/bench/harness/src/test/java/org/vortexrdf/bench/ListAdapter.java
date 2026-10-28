@@ -4,14 +4,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * A test store: the rows of the file it is built from, in a list. Its flags make it behave like the kinds of
  * library the harness meets: persistent (it writes a copy of its source into the store location and reopens from
  * it), triples-only, failing on one pattern, chatty on stdout, unable to mutate, or locking its files so that a
- * second handle cannot open while one is open, as RDF4J's on-disk stores do.
+ * second handle cannot open while one is open, as RDF4J's on-disk stores do. {@link #throwing} and {@link #slowOn}
+ * add a chosen error or a delay at one pattern (or at {@code add} / {@code delete}), and {@link #calls} counts how
+ * often each pattern was materialized.
  */
 public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	/** The store a handle reads: its rows. */
@@ -26,6 +31,9 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	private final boolean immutable;
 	private final boolean exclusive;
 	private int openHandles;
+	private final Map<String, Supplier<? extends Throwable>> errors = new HashMap<>();
+	private final Map<String, Long> delays = new HashMap<>();
+	private final Map<String, Integer> calls = new HashMap<>();
 
 	private ListAdapter(String slug, boolean persistent, boolean triplesOnly, String failOn, boolean printsToStdout,
 			boolean immutable, boolean exclusive) {
@@ -61,6 +69,23 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 
 	public static ListAdapter immutable(String slug) {
 		return new ListAdapter(slug, true, false, null, false, true, false);
+	}
+
+	/** Throw what {@code error} makes whenever {@code what} (a pattern's name, {@code add} or {@code delete}) runs. */
+	public ListAdapter throwing(String what, Supplier<? extends Throwable> error) {
+		errors.put(what, error);
+		return this;
+	}
+
+	/** Sleep {@code millis} in every count of pattern {@code name}. */
+	public ListAdapter slowOn(String name, long millis) {
+		delays.put(name, millis);
+		return this;
+	}
+
+	/** How many times pattern {@code name} was materialized. */
+	public int calls(String name) {
+		return calls.getOrDefault(name, 0);
 	}
 
 	/** Persistent, and refusing a second open handle, as a store that locks its directory does. */
@@ -114,8 +139,9 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	}
 
 	@Override
-	public long count(Store store, Pattern p) {
-		check(p);
+	public long count(Store store, Pattern p) throws Exception {
+		check(p.name());
+		calls.merge(p.name(), 1, Integer::sum);
 		if (printsToStdout) {
 			System.out.println("noise from the adapter");
 		}
@@ -131,18 +157,20 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	}
 
 	@Override
-	public long countOnly(Store store, Pattern p) {
-		check(p);
+	public long countOnly(Store store, Pattern p) throws Exception {
+		check(p.name());
 		return store.rows().stream().filter(q -> matches(q, p)).count();
 	}
 
 	@Override
-	public void add(Store store, List<Quad> quads) {
+	public void add(Store store, List<Quad> quads) throws Exception {
+		check("add");
 		store.rows().addAll(quads);
 	}
 
 	@Override
-	public void delete(Store store, List<Quad> quads) {
+	public void delete(Store store, List<Quad> quads) throws Exception {
+		check("delete");
 		store.rows().removeAll(new HashSet<>(quads));
 	}
 
@@ -158,9 +186,21 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 		openHandles++;
 	}
 
-	private void check(Pattern p) {
-		if (p.name().equals(failOn)) {
-			throw new IllegalStateException("failing on purpose at " + p.name());
+	private void check(String what) throws Exception {
+		if (what.equals(failOn)) {
+			throw new IllegalStateException("failing on purpose at " + what);
+		}
+		Supplier<? extends Throwable> error = errors.get(what);
+		if (error != null) {
+			Throwable t = error.get();
+			if (t instanceof Exception e) {
+				throw e;
+			}
+			throw (Error) t;
+		}
+		Long delay = delays.get(what);
+		if (delay != null) {
+			Thread.sleep(delay);
 		}
 	}
 

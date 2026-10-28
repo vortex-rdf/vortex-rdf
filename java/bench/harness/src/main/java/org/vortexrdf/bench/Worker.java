@@ -33,11 +33,24 @@ public final class Worker {
 	}
 
 	public static Map<String, Object> query(Adapter<?, ?> a, WorkerFiles f, Path workdir, Knobs k) {
-		return new Query<>(a, f, workdir, k).run();
+		Query<?, ?> q = new Query<>(a, f, workdir, k);
+		try {
+			return q.run();
+		} catch (Throwable t) {
+			// An error no phase expects ends the role, but not the rows it already measured.
+			return q.ended(t);
+		}
 	}
 
 	public static Map<String, Object> mutate(Adapter<?, ?> a, WorkerFiles f, Path workdir, Knobs k) {
-		return runMutate(a, f, workdir, k);
+		List<Map<String, Object>> rows = new ArrayList<>();
+		List<Map<String, Object>> failures = new ArrayList<>();
+		try {
+			return runMutate(a, f, workdir, k, rows, failures);
+		} catch (Throwable t) {
+			failures.add(failure("worker", List.of(), t));
+			return result(a, "mutate", rows, Map.of(), failures, false, k, null);
+		}
 	}
 
 	/** What an empty worker JVM reports: which JDK it ran on, with no library loaded. */
@@ -198,6 +211,12 @@ public final class Worker {
 			return cold ? location.toString() : null;
 		}
 
+		/** The result of a role that {@code t} ended: what it measured, and the error. */
+		Map<String, Object> ended(Throwable t) {
+			failures.add(failure("worker", List.of(), t));
+			return result(a, "query", rows, counts, failures, false, k, artifact());
+		}
+
 		/** Every pattern and the full scan on the open handle: their counts, then their warm readings. */
 		private void measureWarm(H handle, List<Pattern> patterns, Pattern full, Map<String, Q> prepared,
 				Set<String> failed) {
@@ -210,24 +229,23 @@ public final class Worker {
 				}
 			}
 			// The JIT compiles each library's query path before anything is timed, so no library is measured in
-			// the interpreter. A pattern that throws here throws again below, where it is recorded.
-			try {
-				m.warmJit(() -> {
-					for (Pattern p : patterns) {
-						Q q = prepared.get(p.name());
-						if (q == null) {
-							continue;
-						}
-						try {
-							a.count(handle, q);
-							a.countOnly(handle, q);
-						} catch (Exception e) {
-							// recorded when the pattern is measured
-						}
-					}
-				});
-			} catch (Exception e) {
-				throw new IllegalStateException(e);
+			// the interpreter. Each pattern gets its own share of the budget, so a pattern that answers in
+			// microseconds is compiled as surely as one that takes milliseconds. A pattern that throws here throws
+			// again below, where it is recorded.
+			long share = k.jitWarmupMs() <= 0 ? 0 : Math.max(1, k.jitWarmupMs() / Math.max(1, patterns.size()));
+			for (Pattern p : patterns) {
+				Q q = prepared.get(p.name());
+				if (q == null) {
+					continue;
+				}
+				try {
+					m.warmJit(share, () -> {
+						a.count(handle, q);
+						a.countOnly(handle, q);
+					});
+				} catch (Exception | OutOfMemoryError e) {
+					// recorded when the pattern is measured
+				}
 			}
 
 			for (Pattern p : Stream.concat(patterns.stream(), Stream.of(full)).toList()) {
@@ -294,10 +312,9 @@ public final class Worker {
 		}
 	}
 
-	private static <H, Q> Map<String, Object> runMutate(Adapter<H, Q> a, WorkerFiles f, Path workdir, Knobs k) {
+	private static <H, Q> Map<String, Object> runMutate(Adapter<H, Q> a, WorkerFiles f, Path workdir, Knobs k,
+			List<Map<String, Object>> rows, List<Map<String, Object>> failures) {
 		String slug = a.slug();
-		List<Map<String, Object>> rows = new ArrayList<>();
-		List<Map<String, Object>> failures = new ArrayList<>();
 		String reason = a.mutationUnsupported();
 		if (reason != null) {
 			rows.add(Measure.unsupported("add::" + slug, reason));

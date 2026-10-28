@@ -145,6 +145,60 @@ class WorkerTest {
 				"lock::full#cold", "lock::SPOG#cold")));
 	}
 
+	@SuppressWarnings("unchecked")
+	private static List<Map<String, Object>> failures(Map<String, Object> result) {
+		return (List<Map<String, Object>>) result.get("failures");
+	}
+
+	/** A heap exhausted by one pattern, during the JIT warm-up or after it, fails that pattern and nothing else. */
+	@Test
+	void anOutOfMemoryErrorInOnePatternFailsOnlyThatPattern() {
+		ListAdapter a = ListAdapter.persistent("oom").throwing("O", () -> new OutOfMemoryError("test heap"));
+
+		Map<String, Object> result = Worker.query(a, files, tmp.resolve("work"), QUICK);
+
+		assertEquals(List.of("O"), failures(result).stream().map(f -> f.get("phase")).toList());
+		assertTrue(keys(result).containsAll(Set.of("ingest::oom", "open::oom", "oom::S", "oom::S#cold", "oom::full#cold")));
+	}
+
+	/** An error no phase expects ends the role, but what the role measured before it stays, with the error. */
+	@Test
+	void anUnexpectedErrorKeepsTheRowsAlreadyMeasured() {
+		ListAdapter a = ListAdapter.persistent("err").throwing("O", () -> new AssertionError("unexpected"));
+
+		Map<String, Object> result = Worker.query(a, files, tmp.resolve("work"), QUICK);
+
+		assertTrue(keys(result).containsAll(Set.of("ingest::err", "open::err")));
+		Map<String, Object> last = failures(result).get(failures(result).size() - 1);
+		assertEquals("worker", last.get("phase"));
+		assertEquals(List.of(), last.get("keys"));
+		assertTrue(((String) last.get("error")).contains("unexpected"));
+	}
+
+	@Test
+	void anUnexpectedErrorInAMutationKeepsTheAddRow() {
+		ListAdapter a = ListAdapter.persistent("mut").throwing("delete", () -> new AssertionError("unexpected"));
+
+		Map<String, Object> result = Worker.mutate(a, files, tmp.resolve("work"), QUICK);
+
+		assertTrue(keys(result).contains("add::mut"));
+		assertEquals("worker", failures(result).get(failures(result).size() - 1).get("phase"));
+	}
+
+	/**
+	 * The warm-up budget is split between the patterns, so a pattern that answers in microseconds is compiled by
+	 * the JIT as surely as one that takes milliseconds. A round over every pattern would give S one call for each
+	 * of P's slow ones.
+	 */
+	@Test
+	void everyPatternGetsItsShareOfTheWarmUp() {
+		ListAdapter a = ListAdapter.persistent("warm").slowOn("P", 20);
+
+		Worker.query(a, files, tmp.resolve("work"), new Knobs(2, 1, 1, 1, 0, 400));
+
+		assertTrue(a.calls("S") >= 100, "S was materialized " + a.calls("S") + " times");
+	}
+
 	@Test
 	void unsupportedMutationSkipsTheRole() {
 		Map<String, Object> result = Worker.mutate(ListAdapter.immutable("ro"), files, tmp.resolve("work"), QUICK);

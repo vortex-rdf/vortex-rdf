@@ -5,7 +5,8 @@ package org.vortexrdf.bench;
  * a build or a full materialization is not.
  *
  * @param slowPhaseNs a phase whose single run already exceeds this keeps one sample; 0 disables the rule
- * @param jitWarmupMs how long every pattern runs, discarded, before any pattern is timed
+ * @param jitWarmupMs the JIT warm-up budget, split evenly between the patterns: each runs, discarded, for its share
+ *        before any pattern is timed
  */
 public record Knobs(int queryIters, int queryWarmup, int heavyIters, int fullScanIters, long slowPhaseNs,
 		long jitWarmupMs) {

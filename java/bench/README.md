@@ -33,5 +33,5 @@ The knobs this suite shares with the others (`BENCH_SIZE`, `BENCH_DIM`, `BENCH_G
 | --- | --- | --- |
 | `JAVA_BENCH_QUERY_ITERS` / `JAVA_BENCH_QUERY_WARMUP` | 10 / 5 | measured / warmup iterations per query |
 | `JAVA_BENCH_HEAVY_ITERS` / `JAVA_BENCH_FULL_SCAN_ITERS` | 3 / 3 | iterations for the heavy and full-scan phases |
-| `JAVA_BENCH_JIT_WARMUP_MS` | 2000 | how long every pattern runs, discarded, before any is timed |
+| `JAVA_BENCH_JIT_WARMUP_MS` | 2000 | the JIT warm-up budget, split evenly between the patterns: each runs, discarded, for its share before any is timed |
 | `JAVA_BENCH_XMX` | 6g | every worker JVM's `-Xmx` |

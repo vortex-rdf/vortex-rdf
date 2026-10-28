@@ -46,7 +46,8 @@ public final class Measure {
 	/**
 	 * Run {@code body} {@code warmup + iters} times, each on the state {@code setup} returns (null when there is no
 	 * setup), with {@code teardown} given that state and the body's result, and append one row for {@code id}.
-	 * {@code regime} ({@code warm} or {@code cold}) is written only when not null.
+	 * {@code regime} ({@code warm} or {@code cold}) is written only when not null. A body that throws still has its
+	 * state torn down (with a null result) before the throw goes on, so a store its setup opened is closed.
 	 */
 	public <S> void time(String id, String regime, int iters, int warmup, ThrowingSupplier<S> setup,
 			ThrowingFunction<S, Object> body, ThrowingBiConsumer<S, Object> teardown, List<Map<String, Object>> rows)
@@ -58,7 +59,19 @@ public final class Measure {
 		while (samples.size() < iters) {
 			S state = setup == null ? null : setup.get();
 			long t0 = System.nanoTime();
-			Object out = body.apply(state);
+			Object out;
+			try {
+				out = body.apply(state);
+			} catch (Throwable t) {
+				if (teardown != null && state != null) {
+					try {
+						teardown.accept(state, null);
+					} catch (Throwable suppressed) {
+						t.addSuppressed(suppressed);
+					}
+				}
+				throw t;
+			}
 			long elapsed = System.nanoTime() - t0;
 			if (teardown != null) {
 				teardown.accept(state, out);
@@ -115,12 +128,12 @@ public final class Measure {
 		return row;
 	}
 
-	/** Repeat {@code round} until the JIT warm-up budget has passed; nothing is recorded. */
-	public void warmJit(ThrowingRunnable round) throws Exception {
-		if (knobs.jitWarmupMs() <= 0) {
+	/** Repeat {@code round} for {@code budgetMs}, at least once unless the budget is 0; nothing is recorded. */
+	public void warmJit(long budgetMs, ThrowingRunnable round) throws Exception {
+		if (budgetMs <= 0) {
 			return;
 		}
-		long end = System.nanoTime() + knobs.jitWarmupMs() * 1_000_000;
+		long end = System.nanoTime() + budgetMs * 1_000_000;
 		do {
 			round.run();
 		} while (System.nanoTime() < end);

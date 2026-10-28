@@ -2,6 +2,7 @@ package org.vortexrdf.bench;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -56,6 +57,21 @@ class MeasureTest {
 		}, s -> null, (s, out) -> Thread.sleep(50), rows);
 
 		assertTrue((double) rows.get(0).get("median_ns") < 25_000_000, "median " + rows.get(0).get("median_ns"));
+	}
+
+	/** A cold reading's body that throws must still dispose the store its setup opened. */
+	@Test
+	void aThrowingBodyStillTearsItsStateDown() {
+		Object state = new Object();
+		List<Object> tornDown = new ArrayList<>();
+
+		IllegalStateException thrown = assertThrows(IllegalStateException.class,
+				() -> new Measure(slowPhaseNs(0)).time("list::S", "cold", 3, 0, () -> state, s -> {
+					throw new IllegalStateException("boom");
+				}, (s, out) -> tornDown.add(s), new ArrayList<>()));
+
+		assertEquals("boom", thrown.getMessage());
+		assertEquals(List.of(state), tornDown);
 	}
 
 	@Test
