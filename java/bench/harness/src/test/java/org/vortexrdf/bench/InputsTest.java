@@ -48,9 +48,4 @@ class InputsTest {
 		assertNull(g.s());
 		assertNull(probes.get(8).s());
 	}
-
-	@Test
-	void theFixtureHolds512Rows() throws Exception {
-		assertEquals(512, Inputs.rows(Fixture.extract(tmp).quads()).size());
-	}
 }

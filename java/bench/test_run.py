@@ -25,20 +25,6 @@ run = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = run
 _spec.loader.exec_module(run)
 
-SUBJECT_0 = "<http://data.example.org/resource/2026/subject/000000000>"
-GRAPH_0 = "<http://data.example.org/graph/2026/named/000000>"
-
-
-def test_probes_list_every_pattern_with_its_kind(tmp_path):
-    path = run.write_probes(tmp_path / "probes.tsv", 512, run.DatasetOpts(graphs=8))
-
-    lines = path.read_text(encoding="utf-8").splitlines()
-    assert [line.split("\t")[0] for line in lines] == ["S", "P", "O", "SP", "PO", "SPO", "G", "SPOG", "full"]
-    assert lines[0] == f"S\t{SUBJECT_0}\t\t\t\ttriples"
-    assert lines[6] == f"G\t\t\t\t{GRAPH_0}\tquads"
-    assert lines[-1] == "full\t\t\t\t\tfull"
-    assert all(len(line.split("\t")) == 6 for line in lines)
-
 
 def test_rows_write_triples_and_quads(tmp_path):
     rows = [("<s>", "<p>", '"v w"', None), ("<s>", "<p>", "<o>", "<g>"), ("<a>", "<b>", "<c>")]

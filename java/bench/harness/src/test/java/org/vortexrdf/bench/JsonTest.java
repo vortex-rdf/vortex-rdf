@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.Arrays;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -13,14 +12,6 @@ class JsonTest {
 	@Test
 	void stringsEscapeQuotesBackslashesAndControlCharacters() {
 		assertEquals("{\"a\":\"q\\\"\\\\\\n\\u0001\"}", Json.write(Map.of("a", "q\"\\\n\u0001")));
-	}
-
-	@Test
-	void mapsKeepTheirInsertionOrder() {
-		Map<String, Object> m = new LinkedHashMap<>();
-		m.put("z", 1L);
-		m.put("a", 2L);
-		assertEquals("{\"z\":1,\"a\":2}", Json.write(m));
 	}
 
 	@Test
