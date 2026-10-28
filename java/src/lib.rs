@@ -229,6 +229,33 @@ pub extern "system" fn Java_org_vortexrdf_Native_hasDictionary<'local>(
     call(&mut env, |_| Ok(store(h).has_dictionary()))
 }
 
+/// vortex-rdf's encoded-search work counters (`VORTEX_RDF_COUNTERS=1`; all zero otherwise), cumulative in this
+/// process, in [`Java_org_vortexrdf_Native_engineCounterNames`] order.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_engineCounters<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+) -> JLongArray<'local> {
+    call(&mut env, |env| {
+        let values = vortex_rdf_encoded_search::counters::snapshot().map(|v| v as i64);
+        let array = JLongArray::new(env, values.len())?;
+        array.set_region(env, 0, &values)?;
+        Ok(array)
+    })
+}
+
+/// The names of [`Java_org_vortexrdf_Native_engineCounters`]'s values.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_engineCounterNames<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+) -> JObjectArray<'local, JString<'local>> {
+    call(&mut env, |env| {
+        let names = vortex_rdf_encoded_search::counters::NAMES;
+        java_strings(env, names.iter().map(|&n| Some(n)))
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_vortexrdf_Native_termCount<'local>(
     mut env: EnvUnowned<'local>,

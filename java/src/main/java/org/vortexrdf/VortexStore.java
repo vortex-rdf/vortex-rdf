@@ -4,7 +4,10 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -134,6 +137,22 @@ public final class VortexStore implements AutoCloseable {
 	}
 
 	/** The term dictionary, present for a store of the {@code dictionary} layout. */
+	/**
+	 * vortex-rdf's encoded-search work counters by name, cumulative in this process: the chunk leaves searched
+	 * encoded or decoded, resident probes, gathers, shared canonical decodes and equality-scan binds, each also by the
+	 * number of values. They count only with {@code VORTEX_RDF_COUNTERS=1} set when the native library loads; otherwise
+	 * every value is 0. Meant for measurements, not for applications.
+	 */
+	public static Map<String, Long> engineCounters() {
+		String[] names = Native.engineCounterNames();
+		long[] values = Native.engineCounters();
+		Map<String, Long> counters = new LinkedHashMap<>();
+		for (int i = 0; i < names.length; i++) {
+			counters.put(names[i], values[i]);
+		}
+		return Collections.unmodifiableMap(counters);
+	}
+
 	public Optional<TermDictionary> dictionary() {
 		return Optional.ofNullable(dictionary);
 	}

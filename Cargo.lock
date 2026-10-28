@@ -3687,6 +3687,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "vortex-rdf-core",
+ "vortex-rdf-encoded-search",
 ]
 
 [[package]]
