@@ -67,6 +67,7 @@ def test_run_roles_runs_queries_then_mutations():
         ("a", "query"): {
             "rows": [{"id": "a1"}], "label": "A", "counts": {"S": 1}, "iters": {"query": 10},
             "peak_rss_mb": 50, "artifact_bytes": 123, "failures": [{"slug": "a", "error": "x"}],
+            "memory_extra": {"retainedHeapMb": 2.5, "retainedNativeMb": 0.5},
         },
         ("b", "query"): {
             "rows": [{"id": "b1"}], "label": "B", "counts": {"S": 1}, "iters": {"query": 99},
@@ -86,7 +87,7 @@ def test_run_roles_runs_queries_then_mutations():
     assert calls == [("a", "query"), ("b", "query"), ("a", "mutate"), ("b", "mutate")]
     assert [r["id"] for r in run.rows] == ["a1", "b1", "b2"]
     assert run.memory == [
-        {"slug": "a", "label": "A", "role": "query", "peakRssMb": 50},
+        {"slug": "a", "label": "A", "role": "query", "peakRssMb": 50, "retainedHeapMb": 2.5, "retainedNativeMb": 0.5},
         {"slug": "b", "label": "B", "role": "mutate", "peakRssMb": 70},
     ]
     assert run.sizes == [{"slug": "a", "label": "A", "bytes": 123}, {"slug": "b", "label": "B", "bytes": None}]

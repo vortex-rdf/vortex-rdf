@@ -199,6 +199,37 @@ class WorkerTest {
 		assertTrue(a.calls("S") >= 100, "S was materialized " + a.calls("S") + " times");
 	}
 
+	@SuppressWarnings("unchecked")
+	private long retained(ListAdapter a, String part) {
+		Map<String, Object> r = (Map<String, Object>) Worker.query(a, files, tmp.resolve("work"), QUICK).get("retained");
+		assertNotNull(r, "the query result has no retained figure");
+		return ((Number) r.get(part)).longValue();
+	}
+
+	/**
+	 * What an open store retains outside the heap is the native memory that disposing it releases, to within the
+	 * JVM's own bookkeeping: the per-allocation overhead its tracking does not count moves by about a megabyte.
+	 */
+	@Test
+	void theRetainedFigureCountsTheNativeMemoryTheStoreHolds() {
+		long offHeap = retained(ListAdapter.inMemory("native").holding(0, 32L << 20), "nativeBytes");
+
+		assertTrue(Math.abs(offHeap - (32L << 20)) < 2L << 20, "native " + offHeap);
+	}
+
+	/**
+	 * A store kept in the heap retains what it holds there, so its figure does not follow the heap limit as its peak
+	 * does. That includes data its library leaves reachable from the querying thread after the store is gone, as
+	 * Jena's in-memory dataset does through a thread-local it never clears.
+	 */
+	@Test
+	void heapDataPinnedToTheQueryingThreadStillCountsAsTheStores() {
+		long heap = retained(ListAdapter.inMemory("pinned").holding(64 << 20, 0).pinnedToTheQueryingThread(),
+				"heapBytes");
+
+		assertTrue(heap >= 64L << 20 && heap < 80L << 20, "heap " + heap);
+	}
+
 	@Test
 	void unsupportedMutationSkipsTheRole() {
 		Map<String, Object> result = Worker.mutate(ListAdapter.immutable("ro"), files, tmp.resolve("work"), QUICK);

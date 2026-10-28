@@ -169,11 +169,14 @@ def java_executable() -> str:
 
 def jvm_flags() -> list[str]:
     """The flags every worker JVM gets, whichever library it runs: one heap
-    limit, the default collector, native access for the libraries that load
-    native code, and a temporary directory on disk rather than tmpfs."""
+    limit, the default collector, native memory tracking (the retained
+    figure leaves the JVM's own allocations out by it), native access for
+    the libraries that load native code, and a temporary directory on disk
+    rather than tmpfs."""
     return [
         f"-Xmx{os.environ.get('JAVA_BENCH_XMX') or '6g'}",
         "-XX:+UseG1GC",
+        "-XX:NativeMemoryTracking=summary",
         "--enable-native-access=ALL-UNNAMED",
         f"-Djava.io.tmpdir={DATA_DIR / 'tmp'}",
         f"-Dvortexrdf.library={NATIVE_LIB}",
@@ -241,6 +244,13 @@ def run_java_worker(slug: str, role: str, files: Optional[RunFiles] = None) -> O
     # would be a bare-JVM figure posing as a measurement.
     res["peak_rss_mb"] = None if res.get("skippedRole") else peak_mb
     res["artifact_bytes"] = allocated_bytes(Path(res["artifact"])) if res.get("artifact") else None
+    # What the open store held, in the Java heap and outside it: what disposing
+    # its warm handle released, for the query phase's memory row.
+    retained = res.get("retained")
+    res["memory_extra"] = {
+        "retainedHeapMb": round(retained["heapBytes"] / 2**20, 1),
+        "retainedNativeMb": round(retained["nativeBytes"] / 2**20, 1),
+    } if retained else {}
     res["failures"] = [{**f, "slug": slug, "label": res["label"], "role": role} for f in res.get("failures", [])]
     return res
 

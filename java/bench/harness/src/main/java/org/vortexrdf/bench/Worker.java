@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 /**
@@ -89,7 +90,10 @@ public final class Worker {
 		Files.writeString(path(opt, "out"), Json.write(result), StandardCharsets.UTF_8);
 	}
 
-	/** The query role: build, open, then every pattern warm, cold, and the full scan. */
+	/**
+	 * The query role: build, open, then every pattern warm, cold, and the full scan, and what the open store retains:
+	 * the memory, in the heap and outside it, that disposing the warm handle releases.
+	 */
 	private static final class Query<H, Q> {
 		private final Adapter<H, Q> a;
 		private final WorkerFiles f;
@@ -102,6 +106,7 @@ public final class Worker {
 		private final List<Map<String, Object>> rows = new ArrayList<>();
 		private final Map<String, Object> counts = new LinkedHashMap<>();
 		private final List<Map<String, Object>> failures = new ArrayList<>();
+		private Footprint retained;
 
 		Query(Adapter<H, Q> a, WorkerFiles f, Path workdir, Knobs k) {
 			this.a = a;
@@ -143,7 +148,7 @@ public final class Worker {
 				}
 				lost.addAll(keys(full.name()));
 				failures.add(failure("ingest", lost, e));
-				return result(a, "query", rows, counts, failures, false, k, null);
+				return queryResult(null);
 			}
 
 			// A store that lives only in memory has no artifact to open: opening it is re-parsing the source,
@@ -173,6 +178,39 @@ public final class Worker {
 				}
 			}
 
+			// Term parsing happens once per pattern, outside every timed region.
+			Map<String, Q> prepared = new LinkedHashMap<>();
+			Set<String> failed = new HashSet<>();
+			// The warm handle lives its whole life on a thread of its own, so what its library keeps per thread ends
+			// with it: Jena's in-memory dataset leaves its data reachable from the thread that queried it, through a
+			// thread-local it never clears.
+			Footprint held = onItsOwnThread(() -> warm(patterns, full, prepared, failed));
+			if (held == null) {
+				return queryResult(artifact());
+			}
+			// The store is unreachable now, so what it held is what this sample no longer finds.
+			retained = held.minus(Footprint.sample());
+			// A cold reading opens a store of its own, so it starts only once the warm handle is gone: a store that
+			// locks its files refuses a second handle, and one that hands every open the same connection would shut
+			// the warm handle down under it.
+			if (cold) {
+				measureCold(patterns, full, prepared, failed);
+			}
+			return queryResult(artifact());
+		}
+
+		/** The role's result, with what the open store retained when the role got that far. */
+		private Map<String, Object> queryResult(String artifact) {
+			Map<String, Object> out = result(a, "query", rows, counts, failures, false, k, artifact);
+			out.put("retained", retained == null ? null : retained.toJson());
+			return out;
+		}
+
+		/**
+		 * Open the warm handle, take every pattern's counts and warm readings on it, sample what the process holds
+		 * with it open, then dispose it. Null when the store does not open.
+		 */
+		private Footprint warm(List<Pattern> patterns, Pattern full, Map<String, Q> prepared, Set<String> failed) {
 			H handle;
 			try {
 				handle = a.open(src, location);
@@ -183,13 +221,11 @@ public final class Worker {
 				}
 				lost.addAll(keys(full.name()));
 				failures.add(failure("open", lost, e));
-				return result(a, "query", rows, counts, failures, false, k, artifact());
+				return null;
 			}
-			// Term parsing happens once per pattern, outside every timed region.
-			Map<String, Q> prepared = new LinkedHashMap<>();
-			Set<String> failed = new HashSet<>();
 			try {
 				measureWarm(handle, patterns, full, prepared, failed);
+				return Footprint.sample();
 			} finally {
 				try {
 					a.dispose(handle);
@@ -197,13 +233,6 @@ public final class Worker {
 					failures.add(failure("dispose", List.of(), e));
 				}
 			}
-			// A cold reading opens a store of its own, so it starts only once the warm handle is gone: a store that
-			// locks its files refuses a second handle, and one that hands every open the same connection would shut
-			// the warm handle down under it.
-			if (cold) {
-				measureCold(patterns, full, prepared, failed);
-			}
-			return result(a, "query", rows, counts, failures, false, k, artifact());
 		}
 
 		/** The store this role built, when the adapter keeps one. */
@@ -214,7 +243,7 @@ public final class Worker {
 		/** The result of a role that {@code t} ended: what it measured, and the error. */
 		Map<String, Object> ended(Throwable t) {
 			failures.add(failure("worker", List.of(), t));
-			return result(a, "query", rows, counts, failures, false, k, artifact());
+			return queryResult(artifact());
 		}
 
 		/** Every pattern and the full scan on the open handle: their counts, then their warm readings. */
@@ -380,6 +409,32 @@ public final class Worker {
 		out.put("supportsQuads", a.supportsQuads());
 		out.put("jdk", jdk());
 		return out;
+	}
+
+	/** {@code body}'s result, computed on a thread that has ended by the time this returns; what it throws, thrown. */
+	static <T> T onItsOwnThread(Supplier<T> body) {
+		List<T> result = new ArrayList<>(1);
+		Throwable[] thrown = new Throwable[1];
+		Thread thread = Thread.ofPlatform().name("warm-handle").start(() -> {
+			try {
+				result.add(body.get());
+			} catch (Throwable t) {
+				thrown[0] = t;
+			}
+		});
+		try {
+			thread.join();
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new IllegalStateException("interrupted waiting for the warm handle's thread", e);
+		}
+		if (thrown[0] instanceof Error e) {
+			throw e;
+		}
+		if (thrown[0] != null) {
+			throw thrown[0] instanceof RuntimeException e ? e : new IllegalStateException(thrown[0]);
+		}
+		return result.get(0);
 	}
 
 	private static Map<String, Object> failure(String phase, List<String> keys, Throwable e) {

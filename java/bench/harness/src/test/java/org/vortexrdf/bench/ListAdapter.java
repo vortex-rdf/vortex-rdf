@@ -1,5 +1,6 @@
 package org.vortexrdf.bench;
 
+import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -15,12 +16,16 @@ import java.util.function.Supplier;
  * library the harness meets: persistent (it writes a copy of its source into the store location and reopens from
  * it), triples-only, failing on one pattern, chatty on stdout, unable to mutate, or locking its files so that a
  * second handle cannot open while one is open, as RDF4J's on-disk stores do. {@link #throwing} and {@link #slowOn}
- * add a chosen error or a delay at one pattern (or at {@code add} / {@code delete}), and {@link #calls} counts how
- * often each pattern was materialized.
+ * add a chosen error or a delay at one pattern (or at {@code add} / {@code delete}), {@link #calls} counts how
+ * often each pattern was materialized, and {@link #holding} has every store keep a known amount of memory, which
+ * {@link #pinnedToTheQueryingThread} leaves reachable from the thread that queried it.
  */
 public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
-	/** The store a handle reads: its rows. */
-	public record Store(List<Quad> rows) {
+	/**
+	 * The store a handle reads: its rows, the memory {@link #holding} has it keep until it is disposed, and the
+	 * thread-local {@link #pinnedToTheQueryingThread} parks that memory in.
+	 */
+	public record Store(List<Quad> rows, byte[] heap, Arena offHeap, ThreadLocal<byte[]> pin) {
 	}
 
 	private final String slug;
@@ -31,6 +36,9 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	private final boolean immutable;
 	private final boolean exclusive;
 	private int openHandles;
+	private int heldHeap;
+	private long heldNative;
+	private boolean pinned;
 	private final Map<String, Supplier<? extends Throwable>> errors = new HashMap<>();
 	private final Map<String, Long> delays = new HashMap<>();
 	private final Map<String, Integer> calls = new HashMap<>();
@@ -88,6 +96,24 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 		return calls.getOrDefault(name, 0);
 	}
 
+	/** Every store this adapter builds or opens keeps {@code heapBytes} in the Java heap and {@code nativeBytes}
+	 * outside it until it is disposed. */
+	public ListAdapter holding(int heapBytes, long nativeBytes) {
+		heldHeap = heapBytes;
+		heldNative = nativeBytes;
+		return this;
+	}
+
+	/**
+	 * Every count parks the store's heap memory in a thread-local of the store's that is never cleared, as Jena's
+	 * in-memory dataset does with its data: once the store is unreachable, that memory stays reachable from the
+	 * querying thread until the thread ends.
+	 */
+	public ListAdapter pinnedToTheQueryingThread() {
+		pinned = true;
+		return this;
+	}
+
 	/** Persistent, and refusing a second open handle, as a store that locks its directory does. */
 	public static ListAdapter exclusive(String slug) {
 		return new ListAdapter(slug, true, false, null, false, false, true);
@@ -124,13 +150,13 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 		if (persistent) {
 			Files.copy(src, location.resolve("store.nq"), StandardCopyOption.REPLACE_EXISTING);
 		}
-		return new Store(new ArrayList<>(Inputs.rows(src)));
+		return store(new ArrayList<>(Inputs.rows(src)));
 	}
 
 	@Override
 	public Store open(Path src, Path location) throws Exception {
 		lock();
-		return new Store(new ArrayList<>(Inputs.rows(persistent ? location.resolve("store.nq") : src)));
+		return store(new ArrayList<>(Inputs.rows(persistent ? location.resolve("store.nq") : src)));
 	}
 
 	@Override
@@ -142,6 +168,9 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	public long count(Store store, Pattern p) throws Exception {
 		check(p.name());
 		calls.merge(p.name(), 1, Integer::sum);
+		if (store.pin() != null) {
+			store.pin().set(store.heap());
+		}
 		if (printsToStdout) {
 			System.out.println("noise from the adapter");
 		}
@@ -177,6 +206,18 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	@Override
 	public void dispose(Store store) {
 		openHandles--;
+		if (store.offHeap() != null) {
+			store.offHeap().close();
+		}
+	}
+
+	private Store store(List<Quad> rows) {
+		Arena offHeap = null;
+		if (heldNative > 0) {
+			offHeap = Arena.ofShared();
+			offHeap.allocate(heldNative);
+		}
+		return new Store(rows, heldHeap > 0 ? new byte[heldHeap] : null, offHeap, pinned ? new ThreadLocal<>() : null);
 	}
 
 	private void lock() {
