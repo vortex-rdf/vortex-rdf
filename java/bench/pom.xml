@@ -26,6 +26,7 @@
 
   <modules>
     <module>harness</module>
+    <module>vortex</module>
   </modules>
 
   <dependencyManagement>
