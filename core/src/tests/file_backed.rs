@@ -546,6 +546,9 @@ fn hub_quads() -> Vec<Quad> {
 /// narrowed view or a non-prefix shape; a code no quad holds matches nothing.
 #[tokio::test]
 async fn test_locate_codes_matches_the_term_path() {
+    if !crate::store::query::located::locate_enabled() {
+        return; // VORTEX_RDF_LOCATE=0: locate_codes declines every pattern by design
+    }
     /// The store file at `path`, written under `index`, opened mapped, its
     /// dir guard kept beside it.
     async fn mapped(

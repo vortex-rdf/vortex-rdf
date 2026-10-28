@@ -17,6 +17,7 @@ from ._native import (
     VortexRdfError,
     VortexRdfStore,
     __version__,
+    engine_counters,
     serialize_rdf,
 )
 
@@ -35,5 +36,6 @@ __all__ = [
     "VortexRdfError",
     "VortexRdfStore",
     "__version__",
+    "engine_counters",
     "serialize_rdf",
 ]

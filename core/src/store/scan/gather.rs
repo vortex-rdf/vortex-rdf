@@ -98,7 +98,16 @@ fn point_read_columns<'n>(
                     parts = Some(array.clone().try_downcast::<Struct>().ok()?);
                 }
                 let child = parts.as_ref()?.unmasked_field_by_name(name).ok()?;
-                read_points(&SortedProbe::resolve(child)?, child, positions)
+                use vortex_rdf_encoded_search::counters::{GATHER_DECODED, GATHER_ENCODED, note};
+                if vortex_rdf_encoded_search::encoded_search_enabled() {
+                    note(GATHER_ENCODED, child.len());
+                    read_points(&SortedProbe::resolve(child)?, child, positions)
+                } else {
+                    note(GATHER_DECODED, child.len());
+                    // VORTEX_RDF_ENCODED_SEARCH=0: decoded first, then read.
+                    let decoded = crate::store::array::decoded_for_search(child).ok()?;
+                    read_points(&SortedProbe::resolve(&decoded)?, &decoded, positions)
+                }
             }
         };
         children.push(column?);

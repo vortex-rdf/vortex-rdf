@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
@@ -205,6 +206,16 @@ class VortexStoreTest {
 			long code = store.dictionary().get().encode(emoji);
 			assertNotEquals(VortexStore.NONE, code);
 			assertEquals(emoji, store.dictionary().get().decode(code));
+		}
+	}
+
+	@Test
+	void engineCountersNameEveryValueAndStayZeroWhenOff() {
+		Map<String, Long> counters = VortexStore.engineCounters();
+		assertEquals(18, counters.size());
+		assertTrue(counters.containsKey("leaf_decoded") && counters.containsKey("typed_eq_probe_values"));
+		if (!"1".equals(System.getenv("VORTEX_RDF_COUNTERS"))) {
+			assertTrue(counters.values().stream().allMatch(v -> v == 0), "nothing counts without the switch");
 		}
 	}
 
