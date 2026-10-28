@@ -30,6 +30,7 @@
     <module>jena</module>
     <module>rdf4j</module>
     <module>hdt-java</module>
+    <module>qendpoint</module>
   </modules>
 
   <dependencyManagement>
