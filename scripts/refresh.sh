@@ -2,24 +2,27 @@
 # One-command dashboard refresh, whole or partial. The dashboard workflow
 # (.github/workflows/bench-dashboard.yml) runs it too.
 #
-#   scripts/refresh.sh                     # all five stages (~1 h at full scale)
+#   scripts/refresh.sh                     # all six stages (over an hour at full scale)
 #   scripts/refresh.sh --only js,render    # re-measure one surface, re-render
 #   scripts/refresh.sh --only render       # template-only changes: no re-measurement
 #   scripts/refresh.sh --force-build       # rebuild the bindings even if their stamps match
 #
 # Stages, in the order they run: rust (the internals targets, benchmark +
 # match_lazy), compare (the cross-library suite: bench-compare/, a workspace of
-# its own that this script formats, lints and benches), js, python, render.
-# Every output lands in target/bench/: the suites' results (rust.txt,
-# rust-compare.json, js.json, python.json) and the page, public/index.html.
+# its own that this script formats, lints and benches), js, python, java,
+# render. Every output lands in target/bench/: the suites' results (rust.txt,
+# rust-compare.json, js.json, python.json, java.json) and the page,
+# public/index.html. The java stage needs Maven running on JDK 25 or newer;
+# that is checked before the first stage, so a missing tool fails in seconds.
 #
 # Measurement stages run strictly sequentially on purpose: parallel stages
 # contend for CPU and memory and contaminate each other's timings — the
 # process-per-adapter isolation inside each suite exists for the same reason.
 #
-# The wasm and Python bindings are rebuilt only when their stamp no longer
-# matches (see stamp()); wasm-pack alone costs ~10 minutes, which a harness-
-# or template-only iteration should never pay.
+# The wasm, Python and Java bindings, and the CLI the Java suite builds its
+# Vortex stores with, are rebuilt only when their stamp no longer matches (see
+# stamp()); wasm-pack alone costs ~10 minutes, which a harness- or
+# template-only iteration should never pay.
 #
 # Needs GNU coreutils for the stamps (sha256sum, sort -z).
 set -euo pipefail
@@ -33,7 +36,7 @@ export BENCH_SIZE="${BENCH_SIZE:-1048576}"
 export MUT_BATCH="${MUT_BATCH:-10000}"
 OUT=target/bench
 
-ONLY="rust,compare,js,python,render"
+ONLY="rust,compare,js,python,java,render"
 FORCE_BUILD=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -46,12 +49,23 @@ while [ $# -gt 0 ]; do
 done
 
 for s in ${ONLY//,/ }; do
-  case "$s" in rust|compare|js|python|render) ;; *)
-    echo "unknown stage: $s (stages: rust, compare, js, python, render)" >&2; exit 2 ;;
+  case "$s" in rust|compare|js|python|java|render) ;; *)
+    echo "unknown stage: $s (stages: rust, compare, js, python, java, render)" >&2; exit 2 ;;
   esac
 done
 
 has() { case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+# The java stage's tools, checked before the first stage runs rather than when
+# the stage starts, after the stages before it. Maven compiles with the JDK it
+# reports running on, and the suite's workers run on that JDK too.
+if has java; then
+  java_major=$(mvn -v 2>/dev/null | sed -n 's/^Java version: \([0-9]*\).*/\1/p' || true)
+  if [ -z "$java_major" ] || [ "$java_major" -lt 25 ]; then
+    echo "the java stage needs Maven running on JDK 25 or newer (found: ${java_major:-no mvn on PATH}); install them or leave java out of --only" >&2
+    exit 2
+  fi
+fi
 t_start=$(date +%s)
 stage() { echo; echo "══ $1 · $(date +%H:%M:%S) ══"; }
 
@@ -139,6 +153,16 @@ if has python; then
       vortex_rdf/_native.abi3.so "${BINDING_DEPS[@]}" pyproject.toml
     python3 bench/run.py
   )
+fi
+
+if has java; then
+  stage "Java comparative (→ $OUT/java.json, BENCH_SIZE=$BENCH_SIZE)"
+  # Two cargo invocations, not one: building both packages together would
+  # unify core's features, and the CLI's mimalloc would reach the JNI library.
+  (cd java && build "cargo build --release -p vortex-rdf-java" ../target/release/libvortex_rdf_jni.so "${BINDING_DEPS[@]}")
+  (cd cli && build "cargo build --release -p vortex-rdf-cli" ../target/release/vortex-rdf-cli "${BINDING_DEPS[@]}")
+  mvn -B -q -f java/bench/pom.xml package -DskipTests
+  python3 java/bench/run.py
 fi
 
 if has render; then

@@ -28,24 +28,24 @@ Both JSON files are generated and git-ignored. `scripts/refresh.sh` runs every s
 
 ### Shared knobs
 
-These knobs mean the same in every suite that reads one, in all three languages. The suites, by the names the table uses: JS compare (`compare.bench.ts`), JS CodSpeed (`codspeed.bench.ts`), JS dict-memory (`dict-memory.bench.ts`), Python compare (`python/bench/run.py`), Python CodSpeed (`python/bench/test_codspeed.py`), Rust compare (`bench-compare/benches/compare.rs`) and the Rust internals (`core/benches/benchmark.rs`, `match_lazy.rs`). Each suite's own knobs follow the table.
+These knobs mean the same in every suite that reads one, in all four languages. The suites, by the names the table uses: JS compare (`compare.bench.ts`), JS CodSpeed (`codspeed.bench.ts`), JS dict-memory (`dict-memory.bench.ts`), Python compare (`python/bench/run.py`), Python CodSpeed (`python/bench/test_codspeed.py`), Java compare (`java/bench/run.py`), Rust compare (`bench-compare/benches/compare.rs`) and the Rust internals (`core/benches/benchmark.rs`, `match_lazy.rs`). Each suite's own knobs follow the table.
 
 | Var | Default | Read by | Meaning |
 | --- | --- | --- | --- |
-| `BENCH_SIZE` | 1,048,576; 32,768 in the Rust internals | JS, Python and Rust compare; the Rust internals | rows |
-| `BENCH_DIM` | unset | JS and Python compare | optional cube shorthand, `D³` rows; an explicit `BENCH_SIZE` wins |
-| `BENCH_GRAPHS_QUADS` | 8 | JS and Python compare | named graphs the comparative bench asks for, before the generator's coprimality nudge |
-| `MUT_BATCH` | 10000; 512 in `benchmark.rs`, which clamps it to 1-4,095 | JS, Python and Rust compare; `benchmark.rs` | quads per add/delete batch |
-| `BENCH_SLOW_PHASE_MS` | 30000 | JS, Python and Rust compare | a phase slower than this is measured once, without warmup (`samples: 1` in the row) |
-| `BENCH_SUBJ_RATIO` | 0.1 | JS and Python compare and CodSpeed | distinct subjects / rows — the reciprocal of triples per subject |
-| `BENCH_OBJ_RATIO` | 0.5 | JS and Python compare and CodSpeed | distinct objects / rows |
-| `BENCH_PREDICATES` | 32 | JS and Python compare and CodSpeed; JS dict-memory | distinct predicates (a closed vocabulary) |
+| `BENCH_SIZE` | 1,048,576; 32,768 in the Rust internals | JS, Python, Java and Rust compare; the Rust internals | rows |
+| `BENCH_DIM` | unset | JS, Python and Java compare | optional cube shorthand, `D³` rows; an explicit `BENCH_SIZE` wins |
+| `BENCH_GRAPHS_QUADS` | 8 | JS, Python and Java compare | named graphs the comparative bench asks for, before the generator's coprimality nudge |
+| `MUT_BATCH` | 10000; 512 in `benchmark.rs`, which clamps it to 1-4,095 | JS, Python, Java and Rust compare; `benchmark.rs` | quads per add/delete batch |
+| `BENCH_SLOW_PHASE_MS` | 30000 | JS, Python, Java and Rust compare | a phase slower than this is measured once, without warmup (`samples: 1` in the row) |
+| `BENCH_SUBJ_RATIO` | 0.1 | JS and Python compare and CodSpeed; Java compare | distinct subjects / rows — the reciprocal of triples per subject |
+| `BENCH_OBJ_RATIO` | 0.5 | JS and Python compare and CodSpeed; Java compare | distinct objects / rows |
+| `BENCH_PREDICATES` | 32 | JS and Python compare and CodSpeed; JS dict-memory; Java compare | distinct predicates (a closed vocabulary) |
 | `BENCH_GRAPHS` | 1 | JS and Python CodSpeed; JS dict-memory; JS compare for triple-only stores | distinct named graphs in the generator; 1 means default graph only (the comparative quad stores take `BENCH_GRAPHS_QUADS`) |
-| `BENCH_LITERAL_FRAC` | 0.4 | JS and Python compare and CodSpeed; JS dict-memory | fraction of objects that are literals |
+| `BENCH_LITERAL_FRAC` | 0.4 | JS and Python compare and CodSpeed; JS dict-memory; Java compare | fraction of objects that are literals |
 | `CODSPEED_BENCH_DIM` | 32 | JS and Python CodSpeed | triples dataset is `D³` rows |
 | `CODSPEED_BENCH_DIM_QUADS` | 13 | JS and Python CodSpeed | quads dataset is `D⁴` rows |
 
-The dataset knobs, `BENCH_SUBJ_RATIO` through `BENCH_LITERAL_FRAC`, are read by the generator `datasets.ts` and its Python port `python/bench/datasets.py`, so the suites built on them describe the same data; JS dict-memory sets both ratios itself, per point. The two ratios decide how much of the dataset is *terms*: the dictionary holds `subjectRatio + objectRatio` of them per quad. `BENCH_SUBJ_RATIO=1.0` gives every row its own subject — a dictionary-stress configuration (what `bench:dict-memory` uses) but a poor default for the comparison, since most probes then match two rows or fewer and the timings become query setup with the decode path barely exercised.
+The dataset knobs, `BENCH_SUBJ_RATIO` through `BENCH_LITERAL_FRAC`, are read by the generator `datasets.ts` and its Python port `python/bench/datasets.py` (which the Java suite writes its data through too), so the suites built on them describe the same data; JS dict-memory sets both ratios itself, per point. The two ratios decide how much of the dataset is *terms*: the dictionary holds `subjectRatio + objectRatio` of them per quad. `BENCH_SUBJ_RATIO=1.0` gives every row its own subject — a dictionary-stress configuration (what `bench:dict-memory` uses) but a poor default for the comparison, since most probes then match two rows or fewer and the timings become query setup with the decode path barely exercised.
 
 ### Comparative suite (`compare.bench.ts`)
 
