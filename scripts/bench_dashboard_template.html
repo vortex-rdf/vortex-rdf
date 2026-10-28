@@ -754,20 +754,6 @@ const jsMemById = new Map(JS_MEMORY.map(m => [`${m.slug}::${m.role}`, {
   median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
 }]));
 
-const pyById = new Map(PY_DATA.map(d => [byKey(d), d]));
-const pyMemById = new Map(PY_MEMORY.map(m => [`${m.slug}::${m.role}`, {
-  median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
-}]));
-// On-disk artifact size, reshaped into the same {median, median_ns} contract so
-// the size table is the same renderer as every other panel. A library that
-// writes no file carries a null size, which keeps it out of the table entirely
-// (see the panel) and, wherever a null does render, out of the "smallest"
-// comparison rather than at the top of it.
-const pySizeById = new Map(PY_SIZES.map(s => [`${s.slug}::size`,
-  s.bytes == null
-    ? { median: "unsupported", median_ns: null, reason: "this library writes no artifact of its own" }
-    : { median: fmtBytes(s.bytes), median_ns: s.bytes }]));
-
 function fmtBytes(n){
   if (n < 1024) return `${n} B`;
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
@@ -1405,6 +1391,160 @@ function renderJs(){
     : JS_PROVENANCE;
 }
 
+// ---- binding tabs (Python, Java) ----
+// One renderer for the tabs that measure a language's bindings against that
+// language's libraries: the same panels, each tab with its own rows and words.
+// t: { key (the pane's id prefix), data, memory, sizes, config, provenance,
+//      failures, vortex / others / libraries: [{slug, label}], libraryCount,
+//      librariesSub, emptyLabel, emptyHint, notes: { rss, size } }
+function renderBindingsTab(t){
+  const byId = new Map(t.data.map(d => [byKey(d), d]));
+  // A phase a worker attempted and could not complete is a result, not a gap:
+  // its cells read "failed", with the error as the tooltip, as on the JS tab.
+  for (const f of t.failures){
+    for (const id of f.keys ?? []){
+      if (!byId.has(id))
+        byId.set(id, { median:"failed", median_ns:null, unsupported:true,
+          reason:`could not complete this phase: ${f.error}` });
+    }
+  }
+  // Reshaped to the same {median, median_ns} shape renderMatrixPanel reads.
+  const memById = new Map(t.memory.map(m => [`${m.slug}::${m.role}`, {
+    median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
+  }]));
+  // On-disk artifact size, reshaped into the same {median, median_ns} contract so
+  // the size table is the same renderer as every other panel. A library that
+  // writes no file carries a null size, which keeps it out of the table entirely
+  // (see the panel) and, wherever a null does render, out of the "smallest"
+  // comparison rather than at the top of it.
+  const sizeById = new Map(t.sizes.map(s => [`${s.slug}::size`,
+    s.bytes == null
+      ? { median: "unsupported", median_ns: null, reason: "this library writes no artifact of its own" }
+      : { median: fmtBytes(s.bytes), median_ns: s.bytes }]));
+  const adapters = [...t.vortex, ...t.others];
+  const pane = id => document.getElementById(`${t.key}-${id}`);
+
+  if (!t.data.length){
+    pane("kpi-row").innerHTML =
+      `<div class="kpi"><span class="label">${t.emptyLabel}</span><span class="value">—</span><span class="sub mono">${t.emptyHint}</span></div>`;
+    return;
+  }
+
+  // Build & open — the two costs of getting a library queryable. Every Vortex
+  // variant is its own row here and in the panels below: the build knobs move
+  // these numbers as much as the choice of library does, so a single "vortex"
+  // row would be picking one configuration and calling it the library.
+  renderMatrixPanel(pane("ingest-panels"), {
+    title:"Build and open",
+    note:"<b>Build</b>: the shared N-Quads file to a queryable store, each library's idiomatic path. <b>Open</b>: what a fresh process pays to query an artifact the build already wrote. <span class=\"best-key\">Green</span> = fastest per column.",
+    rowHeaders:["Configuration"], columns:["Build","Open"],
+    rows: adapters.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
+  }, byId);
+
+  // Query — every configuration against every routing shape.
+  renderMatrixPanel(pane("query-panels"), {
+    title:"Match by pattern and cache regime",
+    wide:true, rowHeaders:["Configuration"], columns:BINDING_PATTERNS, subColumns:["cold","warm"],
+    subSubColumns:["count-only","materialized"],
+    note:"Median time to resolve each pattern (and materialize the results). <b>Warm</b> is a repeat query on an open store; <b>cold</b> is the first query on a freshly reopened artifact. <span class=\"best-key\">Green</span> = fastest configuration in each leaf column.",
+    rows: adapters.map(a => ({ labels:[a.label], ids:patternCellIds(a.slug, BINDING_PATTERNS) })),
+  }, byId);
+
+  // Mutations — one row per library, not per configuration: whether an
+  // add/delete API exists is a property of the bindings, so every Vortex build
+  // reports the same absence.
+  renderMatrixPanel(pane("mut-panels"), {
+    title:"Mutations: add & delete",
+    note:`Per-quad add and delete of ${(t.config.mutBatch||0).toLocaleString()} quads.`,
+    rowHeaders:["Library"], columns:["Add","Delete"],
+    rows: t.libraries.map(a => ({ labels:[a.label], ids:[`add::${a.slug}`, `delete::${a.slug}`] })),
+  }, byId);
+
+  // Footprint — peak RSS per phase, then on-disk artifact size.
+  const footHost = pane("footprint-panels");
+  renderMatrixPanel(footHost, {
+    title:"Query phase — peak RSS",
+    note:t.notes.rss,
+    rowHeaders:["Configuration"], columns:["Peak RSS"], sortByColumn:0,
+    rows: adapters.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
+  }, memById);
+  // A peak RSS that approached the memory the machine actually had free means
+  // that library was measured under swap pressure, so its *timings* are partly
+  // a property of this machine. Say so next to the numbers rather than letting
+  // them be read as clean measurements.
+  const availMb = t.config.availableMemoryMb;
+  if (availMb){
+    const strained = t.memory.filter(m => m.peakRssMb != null && m.peakRssMb > availMb * 0.8);
+    if (strained.length){
+      const p = document.createElement("p");
+      p.className = "note";
+      p.innerHTML = `<strong>⚠ Measured under memory pressure:</strong> ` +
+        strained.map(m => `${m.label} peaked at ${m.peakRssMb.toLocaleString()} MB`).join("; ") +
+        `, against ${availMb.toLocaleString()} MB available when the run started. ` +
+        `Those libraries' timings include paging and should be read as an upper bound.`;
+      footHost.appendChild(p);
+    }
+  }
+
+  renderMatrixPanel(footHost, {
+    title:"On-disk artifact size",
+    note:t.notes.size,
+    rowHeaders:["Configuration"], columns:["Size"], sortByColumn:0,
+    rows: adapters
+      .filter(a => !a.slug.endsWith("_mem")
+        && sizeById.get(`${a.slug}::size`)?.median_ns != null)
+      .map(a => ({ labels:[a.label], ids:[`${a.slug}::size`] })),
+  }, sizeById);
+
+  renderKpis(`#${t.key}-kpi-row`, [
+    { label:"Libraries", value:String(t.libraryCount), sub:t.librariesSub },
+    { label:"Vortex variants", value:String(t.vortex.length), sub:"Dictionary layout, index × residency" },
+    { label:"Benchmarks", value:String(t.data.length), sub:"leaf measurements" },
+    { label:"Quads", value:(t.config.triplesCount||0).toLocaleString(),
+      sub:`one dataset, ${t.config.cardinality?.n_graph ?? "?"} named graphs` },
+    { label:"Distinct terms", value:(t.config.cardinality?.terms||0).toLocaleString(),
+      sub:"in the dataset every store builds from" },
+    ...fastestPointTile(byId, adapters.map(a => ({ id:`${a.slug}::S`, desc:a.label }))),
+    ...fastestVortexTile(byId, t.vortex.map(a => ({ id:`${a.slug}::S`, desc:a.label }))),
+    // As on the other tabs: the `full` pattern, over the rows the run reports it
+    // matched rather than an assumed dataset size.
+    ...fullScanTile(byId, t.vortex.map(a => ({ id:`${a.slug}::full`, desc:a.label })),
+      t.config.matchedRows?.full ?? t.config.triplesCount, "full"),
+    ...fileOpenTile(byId, t.vortex.map(a => ({ id:`open::${a.slug}`, desc:a.label })), "open"),
+  ]);
+  renderMatchedRows(t.config.matchedRows, `${t.key}-matched-rows`);
+
+  // The harness cross-checks every library's matched-row counts against the
+  // others; a disagreement means at least one was queried wrongly and its
+  // timings measure the wrong work. Surface that on the page rather than
+  // leaving it in the run log.
+  const warnHost = pane("count-warnings");
+  const warnings = t.config.countWarnings || [];
+  if (warnings.length){
+    warnHost.innerHTML = `<strong>⚠ ${warnings.length} pattern count disagreement(s):</strong> ` +
+      warnings.map(w => `<span class="mono">${w}</span>`).join("; ") +
+      ` — timings for those patterns are not comparable across libraries.`;
+  } else {
+    warnHost.innerHTML = `<span class="mono">✓ All libraries returned identical row counts for every pattern.</span>`;
+  }
+  // A worker that died names no cells; say which ones, beside the count check.
+  const crashHost = pane("failures");
+  const crashes = t.failures.filter(f => !(f.keys ?? []).length);
+  if (crashHost && crashes.length){
+    crashHost.innerHTML = `<strong>⚠ ${crashes.length} worker(s) did not finish:</strong> ` +
+      crashes.map(f => `<span class="mono">${f.label} (${f.role}): ${f.error}</span>`).join("; ") +
+      ` — their cells are empty.`;
+  }
+
+  makeTable(t.data, `#${t.key}-data-table`, `#${t.key}-table-filter`, `#${t.key}-table-count`);
+  // Only from a run that recorded them: stating a repetition count the run did
+  // not report is how the Rust tab came to claim a stale one.
+  pane("provenance").textContent = t.config.queryIterations
+    ? `${t.provenance} · ${t.config.queryIterations}/${t.config.heavyIterations ?? "?"} iterations (query/heavy)`
+    : t.provenance;
+}
+const BINDING_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG","full"];
+
 // ---- Python tab ----
 // Mirrors python/bench/adapters.py's registry. The first Vortex entry is the
 // one that stands for Vortex in the cross-library panels; the in-memory entries
@@ -1426,125 +1566,20 @@ const PY_OTHER_LIBS = [
   { slug:"rdflib",     label:"rdflib (memory)" },
   { slug:"lightrdf",   label:"lightrdf (no index)" },
 ];
-// Every measured configuration — what the timing and footprint panels render.
-const PY_ADAPTERS = [...PY_VORTEX, ...PY_OTHER_LIBS];
 // One row per library, for the facts that are about a library rather than a
 // build: whether it has a mutation API, and how many libraries there are.
 const PY_LIBRARIES = [{ slug:PY_VORTEX[0].slug, label:"vortex-rdf" }, ...PY_OTHER_LIBS];
-const PY_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG","full"];
-
-function renderPy(){
-  if (!PY_DATA.length){
-    document.getElementById("py-kpi-row").innerHTML =
-      `<div class="kpi"><span class="label">No Python results</span><span class="value">—</span><span class="sub mono">run <code>python3 python/bench/run.py</code>, then re-render with <code>--python</code></span></div>`;
-    return;
-  }
-
-  // Build & open — the two costs of getting a library queryable. Every Vortex
-  // variant is its own row here and in the panels below: the build knobs move
-  // these numbers as much as the choice of library does, so a single "vortex"
-  // row would be picking one configuration and calling it the library.
-  renderMatrixPanel(document.getElementById("py-ingest-panels"), {
-    title:"Build and open",
-    note:"<b>Build</b>: the shared N-Quads file to a queryable store, each library's idiomatic path. <b>Open</b>: what a fresh process pays to query an artifact the build already wrote. <span class=\"best-key\">Green</span> = fastest per column.",
-    rowHeaders:["Configuration"], columns:["Build","Open"],
-    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
-  }, pyById);
-
-  // Query — every configuration against every routing shape.
-  renderMatrixPanel(document.getElementById("py-query-panels"), {
-    title:"Match by pattern and cache regime",
-    wide:true, rowHeaders:["Configuration"], columns:PY_PATTERNS, subColumns:["cold","warm"],
-    subSubColumns:["count-only","materialized"],
-    note:"Median time to resolve each pattern (and materialize the results). <b>Warm</b> is a repeat query on an open store; <b>cold</b> is the first query on a freshly reopened artifact. <span class=\"best-key\">Green</span> = fastest configuration in each leaf column.",
-    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:patternCellIds(a.slug, PY_PATTERNS) })),
-  }, pyById);
-
-  // Mutations — two of the five libraries can do this at all. One row per
-  // library, not per configuration: whether an add/delete API exists is a
-  // property of the bindings, so every Vortex build reports the same absence.
-  renderMatrixPanel(document.getElementById("py-mut-panels"), {
-    title:"Mutations: add & delete",
-    note:`Per-quad add and delete of ${(PY_CONFIG.mutBatch||0).toLocaleString()} quads.`,
-    rowHeaders:["Library"], columns:["Add","Delete"],
-    rows: PY_LIBRARIES.map(a => ({ labels:[a.label], ids:[`add::${a.slug}`, `delete::${a.slug}`] })),
-  }, pyById);
-
-  // Footprint — peak RSS per phase, then on-disk artifact size.
-  const footHost = document.getElementById("py-footprint-panels");
-  renderMatrixPanel(footHost, {
-    title:"Query phase — peak RSS",
-    note:"Peak resident set size of each adapter's own process and virtualenv: build + open + every pattern. Smallest first; <span class=\"best-key\">green</span> = smallest footprint, the multiplier is vs it.",
-    rowHeaders:["Configuration"], columns:["Peak RSS"], sortByColumn:0,
-    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
-  }, pyMemById);
-  // A peak RSS that approached the memory the machine actually had free means
-  // that library was measured under swap pressure, so its *timings* are partly
-  // a property of this machine. Say so next to the numbers rather than letting
-  // them be read as clean measurements.
-  const availMb = PY_CONFIG.availableMemoryMb;
-  if (availMb){
-    const strained = PY_MEMORY.filter(m => m.peakRssMb != null && m.peakRssMb > availMb * 0.8);
-    if (strained.length){
-      const p = document.createElement("p");
-      p.className = "note";
-      p.innerHTML = `<strong>⚠ Measured under memory pressure:</strong> ` +
-        strained.map(m => `${m.label} peaked at ${m.peakRssMb.toLocaleString()} MB`).join("; ") +
-        `, against ${availMb.toLocaleString()} MB available when the run started. ` +
-        `Those libraries' timings include paging and should be read as an upper bound.`;
-      footHost.appendChild(p);
-    }
-  }
-
-  renderMatrixPanel(footHost, {
-    title:"On-disk artifact size",
-    note:"Bytes the build wrote. Only the libraries that write an artifact are listed — a store that lives only in memory has none; for lightrdf it is the triples projection it re-reads, since that re-read is its query path. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
-    rowHeaders:["Configuration"], columns:["Size"], sortByColumn:0,
-    rows: PY_ADAPTERS
-      .filter(a => !a.slug.endsWith("_mem")
-        && pySizeById.get(`${a.slug}::size`)?.median_ns != null)
-      .map(a => ({ labels:[a.label], ids:[`${a.slug}::size`] })),
-  }, pySizeById);
-
-  renderKpis("#py-kpi-row", [
-    { label:"Libraries", value:String(PY_LIBRARIES.length), sub:"vortex · pyoxigraph · pycottas · rdflib · lightrdf" },
-    { label:"Vortex variants", value:String(PY_VORTEX.length), sub:"Dictionary layout, index × residency" },
-    { label:"Benchmarks", value:String(PY_DATA.length), sub:"leaf measurements" },
-    { label:"Quads", value:(PY_CONFIG.triplesCount||0).toLocaleString(),
-      sub:`one dataset, ${PY_CONFIG.cardinality?.n_graph ?? "?"} named graphs` },
-    { label:"Distinct terms", value:(PY_CONFIG.cardinality?.terms||0).toLocaleString(),
-      sub:"in the dataset every store builds from" },
-    ...fastestPointTile(pyById, PY_ADAPTERS.map(a => ({ id:`${a.slug}::S`, desc:a.label }))),
-    ...fastestVortexTile(pyById, PY_VORTEX.map(a => ({ id:`${a.slug}::S`, desc:a.label }))),
-    // As on the other tabs: the `full` pattern, over the rows the run reports it
-    // matched rather than an assumed dataset size.
-    ...fullScanTile(pyById, PY_VORTEX.map(a => ({ id:`${a.slug}::full`, desc:a.label })),
-      PY_CONFIG.matchedRows?.full ?? PY_CONFIG.triplesCount, "full"),
-    ...fileOpenTile(pyById, PY_VORTEX.map(a => ({ id:`open::${a.slug}`, desc:a.label })), "open"),
-  ]);
-  renderMatchedRows(PY_CONFIG.matchedRows, "py-matched-rows");
-
-  // The harness cross-checks every library's matched-row counts against the
-  // others; a disagreement means at least one was queried wrongly and its
-  // timings measure the wrong work. Surface that on the page rather than
-  // leaving it in the run log.
-  const warnHost = document.getElementById("py-count-warnings");
-  const warnings = PY_CONFIG.countWarnings || [];
-  if (warnings.length){
-    warnHost.innerHTML = `<strong>⚠ ${warnings.length} pattern count disagreement(s):</strong> ` +
-      warnings.map(w => `<span class="mono">${w}</span>`).join("; ") +
-      ` — timings for those patterns are not comparable across libraries.`;
-  } else {
-    warnHost.innerHTML = `<span class="mono">✓ All libraries returned identical row counts for every pattern.</span>`;
-  }
-
-  makeTable(PY_DATA, "#py-data-table", "#py-table-filter", "#py-table-count");
-  // Only from a run that recorded them: stating a repetition count the run did
-  // not report is how the Rust tab came to claim a stale one.
-  document.getElementById("py-provenance").textContent = PY_CONFIG.queryIterations
-    ? `${PY_PROVENANCE} · ${PY_CONFIG.queryIterations}/${PY_CONFIG.heavyIterations ?? "?"} iterations (query/heavy)`
-    : PY_PROVENANCE;
-}
+const PY_TAB = {
+  key:"py", data:PY_DATA, memory:PY_MEMORY, sizes:PY_SIZES, config:PY_CONFIG, provenance:PY_PROVENANCE,
+  failures:[], vortex:PY_VORTEX, others:PY_OTHER_LIBS, libraries:PY_LIBRARIES,
+  libraryCount:PY_LIBRARIES.length, librariesSub:"vortex · pyoxigraph · pycottas · rdflib · lightrdf",
+  emptyLabel:"No Python results",
+  emptyHint:"run <code>python3 python/bench/run.py</code>, then re-render with <code>--python</code>",
+  notes:{
+    rss:"Peak resident set size of each adapter's own process and virtualenv: build + open + every pattern. Smallest first; <span class=\"best-key\">green</span> = smallest footprint, the multiplier is vs it.",
+    size:"Bytes the build wrote. Only the libraries that write an artifact are listed — a store that lives only in memory has none; for lightrdf it is the triples projection it re-reads, since that re-read is its query path. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
+  },
+};
 
 // ---- tabs ----
 const panes = {
@@ -1599,6 +1634,6 @@ applyTheme(document.documentElement.dataset.theme || "auto");
 // ---- render every tab (hidden panes still populate their DOM) ----
 renderRust();
 renderJs();
-renderPy();
+renderBindingsTab(PY_TAB);
 showTab(location.hash.replace("#", "") || "rust");
 </script>
