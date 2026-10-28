@@ -18,10 +18,10 @@
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-use vortex_array::arrays::Dict;
+use vortex_array::arrays::{Dict, PrimitiveArray};
 use vortex_array::dtype::DType;
 use vortex_array::serde::SerializedArray;
-use vortex_array::{Array, ArrayRef, IntoArray};
+use vortex_array::{Array, ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_error::{VortexExpect as _, VortexResult};
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
 use vortex_layout::layouts::dict::Dict as DictLayout;
@@ -532,6 +532,19 @@ impl ColumnChunks {
                     let values = dict.array(source, session).await?;
                     Array::<Dict>::try_new(array, values)?.into_array()
                 }
+            };
+            // VORTEX_RDF_ENCODED_SEARCH=0: the leaf is decoded first and its decoded values searched.
+            use crate::counters::{LEAF_DECODED, LEAF_ENCODED, note};
+            let array = if crate::encoded_search_enabled()
+                || !array.dtype().is_unsigned_int()
+                || array.dtype().is_nullable()
+            {
+                note(LEAF_ENCODED, array.len());
+                array
+            } else {
+                note(LEAF_DECODED, array.len());
+                let mut ctx = session.create_execution_ctx();
+                array.execute::<PrimitiveArray>(&mut ctx)?.into_array()
             };
             let fetched = match OwnedSortedProbe::resolve(array.clone()) {
                 Some(probe) => FetchedLeaf::Probe(probe),
