@@ -172,14 +172,23 @@ public final class Worker {
 				failures.add(failure("open", lost, e));
 				return result(a, "query", rows, counts, failures, false, k, artifact());
 			}
+			// Term parsing happens once per pattern, outside every timed region.
+			Map<String, Q> prepared = new LinkedHashMap<>();
+			Set<String> failed = new HashSet<>();
 			try {
-				measurePatterns(handle, patterns, full);
+				measureWarm(handle, patterns, full, prepared, failed);
 			} finally {
 				try {
 					a.dispose(handle);
 				} catch (Exception | OutOfMemoryError e) {
 					failures.add(failure("dispose", List.of(), e));
 				}
+			}
+			// A cold reading opens a store of its own, so it starts only once the warm handle is gone: a store that
+			// locks its files refuses a second handle, and one that hands every open the same connection would shut
+			// the warm handle down under it.
+			if (cold) {
+				measureCold(patterns, full, prepared, failed);
 			}
 			return result(a, "query", rows, counts, failures, false, k, artifact());
 		}
@@ -189,10 +198,9 @@ public final class Worker {
 			return cold ? location.toString() : null;
 		}
 
-		private void measurePatterns(H handle, List<Pattern> patterns, Pattern full) {
-			// Term parsing happens once per pattern, outside every timed region.
-			Map<String, Q> prepared = new LinkedHashMap<>();
-			Set<String> failed = new HashSet<>();
+		/** Every pattern and the full scan on the open handle: their counts, then their warm readings. */
+		private void measureWarm(H handle, List<Pattern> patterns, Pattern full, Map<String, Q> prepared,
+				Set<String> failed) {
 			for (Pattern p : Stream.concat(patterns.stream(), Stream.of(full)).toList()) {
 				try {
 					prepared.put(p.name(), a.prepare(p));
@@ -222,44 +230,44 @@ public final class Worker {
 				throw new IllegalStateException(e);
 			}
 
-			for (Pattern p : patterns) {
+			for (Pattern p : Stream.concat(patterns.stream(), Stream.of(full)).toList()) {
 				if (failed.contains(p.name())) {
 					continue;
 				}
+				boolean scan = p == full;
 				try {
 					Q q = prepared.get(p.name());
 					counts.put(p.name(), counted(handle, p.name(), q));
-					measureBoth(handle, p.name(), q, k.queryIters(), k.queryWarmup(), "warm");
+					String id = slug + "::" + p.name();
+					int iters = scan ? k.fullScanIters() : k.queryIters(), warmup = scan ? 0 : k.queryWarmup();
+					m.time(id, "warm", iters, warmup, null, s -> a.count(handle, q), null, rows);
+					m.time(id + "::count", "warm", iters, warmup, null, s -> a.countOnly(handle, q), null, rows);
 				} catch (Exception | OutOfMemoryError e) {
 					// A pattern that fails warm fails cold too: its cold cells go with it.
 					failures.add(failure(p.name(), keys(p.name()), e));
 					failed.add(p.name());
 				}
 			}
-			if (cold) {
-				for (Pattern p : patterns) {
-					if (failed.contains(p.name())) {
-						continue;
-					}
-					try {
-						measureBoth(handle, p.name(), prepared.get(p.name()), k.queryIters(), k.queryWarmup(), "cold");
-					} catch (Exception | OutOfMemoryError e) {
-						failures.add(failure(p.name(), coldKeys(p.name()), e));
-					}
+		}
+
+		/** Every pattern and the full scan again, each reading on a store opened in its setup and disposed after. */
+		private void measureCold(List<Pattern> patterns, Pattern full, Map<String, Q> prepared, Set<String> failed) {
+			for (Pattern p : Stream.concat(patterns.stream(), Stream.of(full)).toList()) {
+				if (failed.contains(p.name())) {
+					continue;
 				}
-			}
-			if (failed.contains(full.name())) {
-				return;
-			}
-			try {
-				Q q = prepared.get(full.name());
-				counts.put(full.name(), counted(handle, full.name(), q));
-				measureBoth(handle, full.name(), q, k.fullScanIters(), 0, "warm");
-				if (cold) {
-					measureBoth(handle, full.name(), q, k.fullScanIters(), 0, "cold");
+				boolean scan = p == full;
+				Q q = prepared.get(p.name());
+				String id = slug + "::" + p.name();
+				int iters = scan ? k.fullScanIters() : k.queryIters(), warmup = scan ? 0 : k.queryWarmup();
+				try {
+					m.<H>time(id, "cold", iters, warmup, () -> a.open(src, location), h -> a.count(h, q),
+							(h, out) -> a.dispose(h), rows);
+					m.<H>time(id + "::count", "cold", iters, warmup, () -> a.open(src, location),
+							h -> a.countOnly(h, q), (h, out) -> a.dispose(h), rows);
+				} catch (Exception | OutOfMemoryError e) {
+					failures.add(failure(p.name(), coldKeys(p.name()), e));
 				}
-			} catch (Exception | OutOfMemoryError e) {
-				failures.add(failure(full.name(), keys(full.name()), e));
 			}
 		}
 
@@ -270,24 +278,6 @@ public final class Worker {
 				throw new IllegalStateException("countOnly disagrees for " + name + ": " + only + " != " + count);
 			}
 			return count;
-		}
-
-		/**
-		 * Time the materializing count and the count-only twin of one pattern: warm on the open handle, or cold, each
-		 * run on a store opened in its setup and disposed in its teardown.
-		 */
-		@SuppressWarnings("unchecked")
-		private void measureBoth(H handle, String name, Q q, int iters, int warmup, String regime) throws Exception {
-			String id = slug + "::" + name;
-			if (regime.equals("warm")) {
-				m.time(id, regime, iters, warmup, null, s -> a.count(handle, q), null, rows);
-				m.time(id + "::count", regime, iters, warmup, null, s -> a.countOnly(handle, q), null, rows);
-			} else {
-				m.<H>time(id, regime, iters, warmup, () -> a.open(src, location), h -> a.count(h, q),
-						(h, out) -> a.dispose(h), rows);
-				m.<H>time(id + "::count", regime, iters, warmup, () -> a.open(src, location), h -> a.countOnly(h, q),
-						(h, out) -> a.dispose(h), rows);
-			}
 		}
 
 		/** A pattern's cells as the dashboard keys them: warm, then cold when the store has a cold regime. */

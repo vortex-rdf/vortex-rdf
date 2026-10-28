@@ -132,6 +132,19 @@ class WorkerTest {
 		assertTrue(json.endsWith("}"));
 	}
 
+	/**
+	 * A store that locks its files, or one whose reopen hands back a shared connection, cannot have a cold reading
+	 * open beside the warm handle: every cold cell would fail, or shut the warm handle down under it.
+	 */
+	@Test
+	void aStoreThatLocksItsFilesIsOpenedOneHandleAtATime() {
+		Map<String, Object> result = Worker.query(ListAdapter.exclusive("lock"), files, tmp.resolve("work"), QUICK);
+
+		assertEquals(List.of(), result.get("failures"));
+		assertTrue(keys(result).containsAll(Set.of("lock::S#cold", "lock::S::count#cold", "lock::full",
+				"lock::full#cold", "lock::SPOG#cold")));
+	}
+
 	@Test
 	void unsupportedMutationSkipsTheRole() {
 		Map<String, Object> result = Worker.mutate(ListAdapter.immutable("ro"), files, tmp.resolve("work"), QUICK);

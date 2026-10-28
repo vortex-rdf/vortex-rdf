@@ -10,7 +10,8 @@ import java.util.List;
 /**
  * A test store: the rows of the file it is built from, in a list. Its flags make it behave like the kinds of
  * library the harness meets: persistent (it writes a copy of its source into the store location and reopens from
- * it), triples-only, failing on one pattern, chatty on stdout, or unable to mutate.
+ * it), triples-only, failing on one pattern, chatty on stdout, unable to mutate, or locking its files so that a
+ * second handle cannot open while one is open, as RDF4J's on-disk stores do.
  */
 public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	/** The store a handle reads: its rows. */
@@ -23,40 +24,48 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	private final String failOn;
 	private final boolean printsToStdout;
 	private final boolean immutable;
+	private final boolean exclusive;
+	private int openHandles;
 
 	private ListAdapter(String slug, boolean persistent, boolean triplesOnly, String failOn, boolean printsToStdout,
-			boolean immutable) {
+			boolean immutable, boolean exclusive) {
 		this.slug = slug;
 		this.persistent = persistent;
 		this.triplesOnly = triplesOnly;
 		this.failOn = failOn;
 		this.printsToStdout = printsToStdout;
 		this.immutable = immutable;
+		this.exclusive = exclusive;
 	}
 
 	public static ListAdapter persistent(String slug) {
-		return new ListAdapter(slug, true, false, null, false, false);
+		return new ListAdapter(slug, true, false, null, false, false, false);
 	}
 
 	public static ListAdapter inMemory(String slug) {
-		return new ListAdapter(slug, false, false, null, false, false);
+		return new ListAdapter(slug, false, false, null, false, false, false);
 	}
 
 	/** Triples-only, and immutable as the triples-only libraries are. */
 	public static ListAdapter triplesOnly(String slug) {
-		return new ListAdapter(slug, true, true, null, false, true);
+		return new ListAdapter(slug, true, true, null, false, true, false);
 	}
 
 	public static ListAdapter failingOn(String slug, String pattern) {
-		return new ListAdapter(slug, true, false, pattern, false, false);
+		return new ListAdapter(slug, true, false, pattern, false, false, false);
 	}
 
 	public static ListAdapter printingToStdout(String slug) {
-		return new ListAdapter(slug, true, false, null, true, false);
+		return new ListAdapter(slug, true, false, null, true, false, false);
 	}
 
 	public static ListAdapter immutable(String slug) {
-		return new ListAdapter(slug, true, false, null, false, true);
+		return new ListAdapter(slug, true, false, null, false, true, false);
+	}
+
+	/** Persistent, and refusing a second open handle, as a store that locks its directory does. */
+	public static ListAdapter exclusive(String slug) {
+		return new ListAdapter(slug, true, false, null, false, false, true);
 	}
 
 	@Override
@@ -86,6 +95,7 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 
 	@Override
 	public Store build(Path src, Path location) throws Exception {
+		lock();
 		if (persistent) {
 			Files.copy(src, location.resolve("store.nq"), StandardCopyOption.REPLACE_EXISTING);
 		}
@@ -94,6 +104,7 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 
 	@Override
 	public Store open(Path src, Path location) throws Exception {
+		lock();
 		return new Store(new ArrayList<>(Inputs.rows(persistent ? location.resolve("store.nq") : src)));
 	}
 
@@ -137,6 +148,14 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 
 	@Override
 	public void dispose(Store store) {
+		openHandles--;
+	}
+
+	private void lock() {
+		if (exclusive && openHandles > 0) {
+			throw new IllegalStateException("the store is locked by an open handle");
+		}
+		openHandles++;
 	}
 
 	private void check(Pattern p) {
