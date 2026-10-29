@@ -5,6 +5,7 @@
 //! search can address opens nothing, and the caller lifts it resident;
 //! windows out of term order fail the open.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vortex_array::arrays::VarBinViewArray;
@@ -47,9 +48,29 @@ impl FileBackedDict {
     }
 
     /// [`open`](Self::open) with a window cache of `budget` bytes.
-    pub(super) async fn open_with_budget(
+    pub(in crate::store::layouts::dictionary) async fn open_with_budget(
         native: &NativeStoreFile,
         budget: usize,
+    ) -> Result<Option<Self>> {
+        Self::open_over(native, budget, native.segment_source()).await
+    }
+
+    /// [`open`](Self::open) over a source whose every segment read waits
+    /// once before it completes, as a read of storage not in memory would.
+    #[cfg(test)]
+    pub(in crate::store::layouts::dictionary) async fn open_with_waiting_reads(
+        native: &NativeStoreFile,
+    ) -> Result<Option<Self>> {
+        let source = Arc::new(super::fixtures::WaitingSource(native.segment_source()));
+        Self::open_over(native, WINDOW_CACHE_BYTES, source).await
+    }
+
+    /// [`open_with_budget`](Self::open_with_budget) reading the file's
+    /// segments through `source`.
+    async fn open_over(
+        native: &NativeStoreFile,
+        budget: usize,
+        source: Arc<dyn SegmentSource>,
     ) -> Result<Option<Self>> {
         let Some(reader) = native.component_reader(DICT_COMPONENT_NAME)? else {
             return Ok(None);
@@ -60,7 +81,6 @@ impl FileBackedDict {
         let Some((leaves, zones)) = term_column(&child) else {
             return Ok(None);
         };
-        let source = native.segment_source();
         let zoned = match &zones {
             Some(zones) => zone_bounds(zones, &leaves, &source).await?,
             None => None,
@@ -99,6 +119,7 @@ impl FileBackedDict {
             source,
             kinds: OnceLock::new(),
             cache: Mutex::new(WindowCache::new(budget)),
+            reads_wait: AtomicBool::new(false),
             #[cfg(test)]
             rebuilt: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]

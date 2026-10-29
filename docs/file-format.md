@@ -270,7 +270,7 @@ the dtype alone decides the layout ([§4](#4-the-quad-table)).
 | schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage/mod.rs#L30): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
-| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage/mod.rs#L193)), not of the format |
+| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage/mod.rs#L201)), not of the format |
 
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36))
@@ -287,7 +287,7 @@ written without the zone map; readers inspect the layout for it.
 **Reading it from a file.** A file store is memory-mapped
 ([`from_file`](../core/src/store/persist/open.rs#L237)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L132)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L176)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
@@ -298,10 +298,21 @@ the bounds from the leaves.
   order-preserving). A window's first or last term, and a term falling between
   windows, read no leaf. A match resolves its bound terms concurrently
   ([matching.md §3](matching.md#3-stage-a--prepare_pattern)).
-- **code → term** (`decode`, `decode_many`, a chunk's distinct codes): the
-  codes are grouped by window; each touched window comes from the window cache
-  and only the asked rows are decompressed. A batch in any order, with
-  repeats, reads each distinct code once.
+- **code → term** (`decode`, `decode_many`): the codes are grouped by
+  window; each touched window comes from the window cache and only the asked
+  rows are decompressed. A batch in any order, with repeats, reads each
+  distinct code once.
+- **A chunk's rows** decode in place, as against a resident dictionary
+  ([`decode_file_backed`](../core/src/store/layouts/dictionary/codec.rs#L576)):
+  each window the chunk's codes fall in is taken once from the window cache,
+  rebuilt on a miss by a segment read that completes at once over a mapping,
+  and held until the chunk is decoded, and each row's terms are decompressed
+  from it, a column's repeated codes remembered as a resident decode
+  remembers them. The held windows stay
+  within the window cache's budget. A chunk whose codes span more windows
+  than that decodes as a code → term batch instead: its distinct codes,
+  sorted, read window by window. So does every chunk of a dictionary whose
+  segment reads have had to wait, which a mapped file's never do.
 - **The window cache** holds the windows a file-backed dictionary rebuilt. A
   window missing from it is rebuilt over its mapped segment (metadata over the
   bytes, nothing decompressed), its FSST code offsets are read once as 32-bit
@@ -478,7 +489,7 @@ kernel's decision; no segment cache sits in between.
 What a file store keeps for its lifetime, and what bounds it. The opened handle
 ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L36)) and the file-backed
 dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L132))
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L176))
 keep:
 
 | Kept | Bound |
@@ -516,8 +527,8 @@ rows they keep point by point, by a take, or by projecting each split at its
 mask
 ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
 Streaming reads (`quads()` and its twins) decode inside the per-split tasks
-Vortex's scan stream spawns; under a file-backed dictionary the decode awaits
-the dictionary's own reads, so it runs at the stream's consumer instead.
+Vortex's scan stream spawns; under a file-backed dictionary the decode may
+await the dictionary's own reads, so it runs at the stream's consumer instead.
 
 **Platforms and limits.** Mapping works on Linux, macOS and Windows. A store
 file is read in place while open: truncating or rewriting it in place is
@@ -612,7 +623,7 @@ open rather than being read around.
 | row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L115) |
 | data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L111), [`child_strategy`](../core/src/io/container/sources.rs#L156) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs#L36) |
-| `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |
+| `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, and a chunk decode hold in place, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L47) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L51) |

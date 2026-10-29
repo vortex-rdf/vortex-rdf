@@ -18,6 +18,8 @@ use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+#[cfg(feature = "file-io")]
+use crate::store::array::trusted_str;
 use crate::store::array::{field_as, named_struct, stamp_is_sorted};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TermCode};
 use crate::store::{RawQuad, SharedQuad};
@@ -26,6 +28,8 @@ use crate::store::{RawQuad, SharedQuad};
 use super::file_backed::FileBackedDict;
 use super::ingest::BorrowedTermCodeMap;
 use super::storage::DictCursor;
+#[cfg(feature = "file-io")]
+use super::storage::TermChunk;
 use super::term_dict::{CodeSpace, TermDictionary, check_code};
 
 /// Dictionary-encoded quad columns: every term replaced by its code. Code
@@ -160,6 +164,13 @@ trait TermSource {
 
     /// [`str_at`](Self::str_at) as a [`Shared`](Self::Shared) term.
     fn shared_at(&mut self, role: usize, code: TermCode) -> Result<Self::Shared>;
+
+    /// Whether the source gave up on the chunk ([`FileTerms`]): the decode
+    /// then ends at the row that failed, and its caller decodes the chunk
+    /// another way. Asked only after a failed read.
+    fn gave_up(&self) -> bool {
+        false
+    }
 }
 
 /// A term [`decode_rows_shared`] holds: a shared string, or a borrow of one.
@@ -270,6 +281,92 @@ impl<'a> TermSource for MappedTerms<'a> {
     }
 }
 
+/// Term strings read in place from a file-backed dictionary's windows, as
+/// [`DictTerms`] reads a resident dictionary's chunks: each window the
+/// chunk's codes fall in is taken once ([`FileBackedDict::window_chunk_now`])
+/// and held until the decode ends, and a term is decompressed into its
+/// role's scratch. The held windows are charged as the window cache charges
+/// them, within its budget. The source gives up ([`TermSource::gave_up`])
+/// when a window's read would wait, or would take the held windows past the
+/// budget: a chunk whose codes scatter over more windows than the cache
+/// holds decodes the resolved way ([`resolve_chunk_terms`]), which holds one
+/// window at a time.
+#[cfg(feature = "file-io")]
+struct FileTerms<'a> {
+    fb: &'a FileBackedDict,
+    code_space: CodeSpace,
+    /// The windows taken so far, by window index.
+    windows: Vec<Option<Arc<TermChunk>>>,
+    /// What the held windows are charged, and the most they may be.
+    held: usize,
+    budget: usize,
+    scratch: [Vec<u8>; 4],
+    gave_up: bool,
+}
+
+#[cfg(feature = "file-io")]
+impl<'a> FileTerms<'a> {
+    fn new(fb: &'a FileBackedDict) -> Self {
+        Self {
+            fb,
+            code_space: fb.code_space(),
+            windows: vec![None; fb.window_count()],
+            held: 0,
+            budget: fb.window_budget(),
+            scratch: Default::default(),
+            gave_up: false,
+        }
+    }
+
+    /// Take window `w` and hold it; an error, the source given up, when its
+    /// read would wait or the held windows would outgrow the budget.
+    fn take(&mut self, w: usize) -> Result<()> {
+        let Some(chunk) = self.fb.window_chunk_now(w) else {
+            return Err(self.give_up("a window read would wait"));
+        };
+        let chunk = chunk?;
+        let held = self
+            .held
+            .saturating_add(FileBackedDict::window_charge(&chunk));
+        if held > self.budget {
+            return Err(self.give_up("the chunk's windows outgrow the window cache"));
+        }
+        self.held = held;
+        self.windows[w] = Some(chunk);
+        Ok(())
+    }
+
+    fn give_up(&mut self, why: &str) -> VortexRdfError {
+        self.gave_up = true;
+        VortexRdfError::InvalidOperation(format!("in-place decode given up: {why}"))
+    }
+}
+
+#[cfg(feature = "file-io")]
+impl TermSource for FileTerms<'_> {
+    type Shared = Arc<str>;
+
+    fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str> {
+        let rank = check_code(code, self.code_space)?;
+        let (w, local) = self.fb.window_of(rank);
+        if self.windows[w].is_none() {
+            self.take(w)?;
+        }
+        let chunk = self.windows[w].as_deref().expect("window taken above");
+        Ok(trusted_str(
+            chunk.bytes_into(local, &mut self.scratch[role]),
+        ))
+    }
+
+    fn shared_at(&mut self, role: usize, code: TermCode) -> Result<Arc<str>> {
+        self.str_at(role, code).map(Arc::from)
+    }
+
+    fn gave_up(&self) -> bool {
+        self.gave_up
+    }
+}
+
 /// Most slots of a role memo, so a memo never grows with the data.
 const MEMO_MAX_SLOTS: usize = 1024;
 
@@ -323,7 +420,8 @@ impl<T: Clone> TermMemo<T> {
 /// A chunk's `[s, p, o, g]` code columns decoded into quads through `src`,
 /// each distinct code's term read and parsed at most once per role
 /// ([`TermMemo`]). A row whose terms fail to read or parse is an `Err` at
-/// that row's position; the other rows decode normally.
+/// that row's position; the other rows decode normally, unless `src` gave
+/// up ([`TermSource::gave_up`]): the rows then end before that row.
 fn decode_rows(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Quad>> {
     let [s_codes, p_codes, o_codes, g_codes] = cols;
     let n = s_codes.len();
@@ -333,9 +431,9 @@ fn decode_rows(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<
         TermMemo::new(n),
         TermMemo::new(n),
     );
-
-    (0..n)
-        .map(|i| {
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let row = (|| {
             let subject = sm.get_or_insert(s_codes[i], || {
                 subject(src.str_at(0, s_codes[i])?, Trust::Stored)
             })?;
@@ -349,8 +447,13 @@ fn decode_rows(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<
                 graph_name(src.str_at(3, g_codes[i])?, Trust::Stored)
             })?;
             Ok(Quad::new(subject, predicate, object, graph))
-        })
-        .collect()
+        })();
+        if row.is_err() && src.gave_up() {
+            break;
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// The code columns decoded into rows of term strings ([`StringRow`])
@@ -454,60 +557,93 @@ fn distinct_codes(columns: [&[TermCode]; 4]) -> Vec<TermCode> {
 /// that hold them, each window once.
 #[cfg(feature = "file-io")]
 async fn resolve_chunk_terms(fb: &FileBackedDict, columns: [&[TermCode]; 4]) -> Result<ChunkTerms> {
+    #[cfg(test)]
+    tests::RESOLVED_CHUNKS.with(|resolved| resolved.set(resolved.get() + 1));
     let codes = distinct_codes(columns);
     let terms = fb.decode_many(&codes).await?;
     Ok(codes.into_iter().zip(terms).collect())
 }
 
-/// A chunk decoded against a file-backed dictionary: the code columns are
-/// read once, their distinct codes resolved to terms
-/// ([`resolve_chunk_terms`]), and `rows` decodes the same columns against
-/// that map. A failure to read the columns or to resolve their codes is the
-/// chunk's one `Err`.
+/// A chunk decoded against a file-backed dictionary, its code columns read
+/// once. The rows decode in place first ([`FileTerms`], through
+/// `in_place`), as against a resident dictionary; when that gives up, or
+/// once the handle's window reads have had to wait, they decode through
+/// `resolved` against their distinct codes' terms ([`resolve_chunk_terms`]).
+/// `in_place` and `resolved` are the same decode over the two sources. A
+/// failure to read the columns or to resolve their codes is the chunk's one
+/// `Err`; in place, a code outside the dictionary fails as it does against a
+/// resident dictionary.
 #[cfg(feature = "file-io")]
-async fn decode_resolved<T>(
+async fn decode_file_backed<T>(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
-    rows: impl FnOnce([&[TermCode]; 4], &mut MappedTerms<'_>) -> Vec<Result<T>>,
+    in_place: impl FnOnce([&[TermCode]; 4], &mut FileTerms<'_>) -> Vec<Result<T>>,
+    resolved: impl FnOnce([&[TermCode]; 4], &mut MappedTerms<'_>) -> Vec<Result<T>>,
 ) -> Vec<Result<T>> {
     let columns = match code_columns(chunk) {
         Ok(columns) => columns,
         Err(e) => return vec![Err(e)],
     };
     let cols = code_slices(&columns);
+    if !fb.reads_wait() {
+        let mut terms = FileTerms::new(fb);
+        let rows = in_place(cols, &mut terms);
+        if !terms.gave_up {
+            return rows;
+        }
+    }
     match resolve_chunk_terms(fb, cols).await {
-        Ok(terms) => rows(cols, &mut MappedTerms(&terms)),
+        Ok(terms) => resolved(cols, &mut MappedTerms(&terms)),
         Err(e) => vec![Err(e)],
     }
 }
 
-/// [`decode_chunk`] against a file-backed dictionary ([`decode_resolved`]).
+/// [`decode_chunk`] against a file-backed dictionary
+/// ([`decode_file_backed`]).
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<Quad>> {
-    decode_resolved(fb, chunk, |cols, terms| decode_rows(cols, terms)).await
+    decode_file_backed(
+        fb,
+        chunk,
+        |cols, terms| decode_rows(cols, terms),
+        |cols, terms| decode_rows(cols, terms),
+    )
+    .await
 }
 
-/// [`decode_chunk_file_backed`] with shared-string terms: every row's term
-/// is a lookup in the resolved map and a reference-count bump.
+/// [`decode_chunk_file_backed`] with shared-string terms (see
+/// [`decode_rows_shared`]).
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_shared_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<SharedQuad>> {
-    decode_resolved(fb, chunk, |cols, terms| decode_rows_shared(cols, terms)).await
+    decode_file_backed(
+        fb,
+        chunk,
+        |cols, terms| decode_rows_shared(cols, terms),
+        |cols, terms| decode_rows_shared(cols, terms),
+    )
+    .await
 }
 
 /// [`decode_chunk_file_backed`] into [`RawQuad`]s, every row's terms copied
-/// out of the resolved map as owned N-Triples strings.
+/// out as owned N-Triples strings.
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_raw_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<RawQuad>> {
-    decode_resolved(fb, chunk, |cols, terms| decode_rows_shared(cols, terms)).await
+    decode_file_backed(
+        fb,
+        chunk,
+        |cols, terms| decode_rows_shared(cols, terms),
+        |cols, terms| decode_rows_shared(cols, terms),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -526,6 +662,10 @@ mod tests {
         /// Executions of [`code_columns`] on this thread — what the tests
         /// read to pin that a chunk's columns are read once per decode.
         pub(super) static CODE_COLUMN_READS: Cell<usize> = const { Cell::new(0) };
+        /// Chunks whose distinct codes were resolved
+        /// ([`resolve_chunk_terms`]) on this thread: a file-backed decode
+        /// that did not decode in place.
+        pub(super) static RESOLVED_CHUNKS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// 120 quads whose columns have the shapes a store's chunks have: `s`
@@ -585,63 +725,205 @@ mod tests {
             .expect("the written dictionary child must be window-searchable")
     }
 
-    /// Reads of the code columns while `decode` runs.
-    async fn code_column_reads<T>(decode: impl std::future::Future<Output = T>) -> (T, usize) {
-        let before = CODE_COLUMN_READS.with(Cell::get);
+    /// Reads of the code columns, and chunks resolved, while `decode` runs.
+    async fn decode_counts<T>(decode: impl std::future::Future<Output = T>) -> (T, usize, usize) {
+        let (reads, resolved) = (
+            CODE_COLUMN_READS.with(Cell::get),
+            RESOLVED_CHUNKS.with(Cell::get),
+        );
         let out = decode.await;
-        (out, CODE_COLUMN_READS.with(Cell::get) - before)
+        (
+            out,
+            CODE_COLUMN_READS.with(Cell::get) - reads,
+            RESOLVED_CHUNKS.with(Cell::get) - resolved,
+        )
     }
 
-    /// A file-backed chunk decode executes the chunk's code columns once,
-    /// whichever row representation it produces, lifts no dictionary, and
-    /// decodes the rows the resident dictionary decodes — for a chunk long
-    /// enough to memoize its roles and for one too short to.
-    #[tokio::test]
-    async fn a_file_backed_chunk_decode_reads_the_code_columns_once() {
+    /// `chunk` decoded against `fb` into quads, shared quads and raw quads,
+    /// each as the resident `dict` decodes it, each reading the code columns
+    /// once and lifting no dictionary; `resolved` is whether each decode
+    /// resolves the chunk's distinct codes rather than decoding in place.
+    async fn assert_file_backed_decodes(
+        fb: &FileBackedDict,
+        dict: &Arc<TermDictionary>,
+        chunk: &ArrayRef,
+        resolved: bool,
+        case: &str,
+    ) {
         use crate::store::layouts::ChunkDecode;
 
+        let layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(fb.clone()));
+        let counts = (1, usize::from(resolved));
+
+        let (decoded, reads, resolves) = decode_counts(Quad::decode_async(&layout, chunk)).await;
+        assert_eq!((reads, resolves), counts, "{case}: quads");
+        let decoded: Vec<Quad> = decoded.into_iter().map(|row| row.unwrap()).collect();
+        let want: Vec<Quad> = decode_chunk(chunk, dict)
+            .into_iter()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(decoded.len(), chunk.len(), "{case}: quads");
+        assert_eq!(decoded, want, "{case}: quads");
+
+        let (shared, reads, resolves) =
+            decode_counts(SharedQuad::decode_async(&layout, chunk)).await;
+        assert_eq!((reads, resolves), counts, "{case}: shared quads");
+        let shared: Vec<SharedQuad> = shared.into_iter().map(|row| row.unwrap()).collect();
+        let want: Vec<SharedQuad> = decode_chunk_shared(chunk, dict)
+            .into_iter()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(shared, want, "{case}: shared quads");
+
+        let (raw, reads, resolves) = decode_counts(RawQuad::decode_async(&layout, chunk)).await;
+        assert_eq!((reads, resolves), counts, "{case}: raw quads");
+        let terms = |q: RawQuad| [q.s, q.p, q.o, q.g];
+        let raw: Vec<[String; 4]> = raw.into_iter().map(|row| terms(row.unwrap())).collect();
+        let want: Vec<[String; 4]> =
+            ResolvedLayout::Dictionary(DictAccess::Resident(Arc::clone(dict)))
+                .raw_quads(chunk)
+                .unwrap()
+                .into_iter()
+                .map(terms)
+                .collect();
+        assert_eq!(raw, want, "{case}: raw quads");
+
+        assert_eq!(fb.debug_lifts(), 0, "{case}");
+    }
+
+    /// A file-backed chunk decode over in-memory reads (a buffer here, as a
+    /// mapped file) decodes in place, resolving no codes, and decodes the
+    /// rows the resident dictionary decodes — for a chunk long enough to
+    /// memoize its roles and for one too short to.
+    #[tokio::test]
+    async fn a_file_backed_chunk_decode_reads_its_windows_in_place() {
         let all = skewed_quads();
         for quads in [&all[..], &all[..7]] {
-            let n = quads.len();
             let (dict, chunk) = skewed_chunk(quads);
+            let dict = Arc::new(dict);
             let fb = file_backed(&dict).await;
-            let layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(fb.clone()));
+            let case = format!("{} quads", quads.len());
+            assert_file_backed_decodes(&fb, &dict, &chunk, false, &case).await;
+            assert!(!fb.reads_wait(), "{case}");
+        }
+    }
 
-            let (decoded, reads) = code_column_reads(Quad::decode_async(&layout, &chunk)).await;
-            assert_eq!(reads, 1, "{n} quads");
-            assert_eq!(fb.debug_lifts(), 0, "{n} quads");
-            let decoded: Vec<Quad> = decoded.into_iter().map(|row| row.unwrap()).collect();
-            let want: Vec<Quad> = decode_chunk(&chunk, &dict)
-                .into_iter()
-                .map(|row| row.unwrap())
-                .collect();
-            assert_eq!(decoded.len(), n);
-            assert_eq!(decoded, want, "{n} quads");
+    /// Over reads that wait, the first decode gives up in place at its
+    /// first window and resolves the chunk's codes, without reading its code
+    /// columns again; the handle then knows its reads wait, and later decodes
+    /// resolve without trying.
+    #[tokio::test]
+    async fn a_chunk_decode_over_reads_that_wait_resolves_its_codes() {
+        let quads = skewed_quads();
+        let (dict, chunk) = skewed_chunk(&quads);
+        let dict = Arc::new(dict);
+        let native =
+            crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&dict).await);
+        let fb = FileBackedDict::open_with_waiting_reads(&native)
+            .await
+            .unwrap()
+            .expect("the written dictionary child must be window-searchable");
+        assert!(!fb.reads_wait());
+        assert_file_backed_decodes(&fb, &dict, &chunk, true, "waiting reads").await;
+        assert!(fb.reads_wait());
+        // Every window the chunk touches is cached now, yet a decode still
+        // resolves: once reads wait, none is tried in place.
+        assert!(!fb.debug_cached_windows().is_empty());
+        assert_file_backed_decodes(&fb, &dict, &chunk, true, "cached windows").await;
+    }
 
-            let (shared, reads) =
-                code_column_reads(SharedQuad::decode_async(&layout, &chunk)).await;
-            assert_eq!(reads, 1, "{n} shared quads");
-            assert_eq!(fb.debug_lifts(), 0, "{n} shared quads");
-            let shared: Vec<SharedQuad> = shared.into_iter().map(|row| row.unwrap()).collect();
-            let want: Vec<SharedQuad> = decode_chunk_shared(&chunk, &dict)
-                .into_iter()
-                .map(|row| row.unwrap())
-                .collect();
-            assert_eq!(shared, want, "{n} shared quads");
+    /// An in-place decode holds its windows within the window cache's
+    /// budget: a budget of exactly the charge of the windows the chunk
+    /// touches decodes in place, one byte less gives up and resolves the
+    /// chunk's codes, decoding the same rows.
+    #[tokio::test]
+    async fn an_in_place_decode_holds_its_windows_within_the_cache_budget() {
+        let quads = skewed_quads();
+        let (dict, chunk) = skewed_chunk(&quads);
+        let dict = Arc::new(dict);
+        let native =
+            crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&dict).await);
+        // What the touched windows are charged: what a roomy cache holds once
+        // an in-place decode has taken each of them.
+        let roomy = FileBackedDict::open(&native).await.unwrap().unwrap();
+        assert_file_backed_decodes(&roomy, &dict, &chunk, false, "roomy").await;
+        let touched = roomy.debug_cached_bytes();
+        assert!(roomy.debug_cached_windows().len() > 2);
+        for (budget, resolved) in [(touched, false), (touched - 1, true)] {
+            let fb = FileBackedDict::open_with_budget(&native, budget)
+                .await
+                .unwrap()
+                .unwrap();
+            let case = format!("budget {budget} of {touched}");
+            assert_file_backed_decodes(&fb, &dict, &chunk, resolved, &case).await;
+            assert!(!fb.reads_wait(), "{case}");
+        }
+    }
 
-            let (raw, reads) = code_column_reads(RawQuad::decode_async(&layout, &chunk)).await;
-            assert_eq!(reads, 1, "{n} raw quads");
-            assert_eq!(fb.debug_lifts(), 0, "{n} raw quads");
-            let terms = |q: RawQuad| [q.s, q.p, q.o, q.g];
-            let raw: Vec<[String; 4]> = raw.into_iter().map(|row| terms(row.unwrap())).collect();
-            let want: Vec<[String; 4]> =
-                ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(dict)))
-                    .raw_quads(&chunk)
-                    .unwrap()
-                    .into_iter()
-                    .map(terms)
-                    .collect();
-            assert_eq!(raw, want, "{n} raw quads");
+    /// A source that fails on one code, giving up on the chunk or not.
+    struct FailingTerms<'a> {
+        inner: DictTerms<'a>,
+        code: TermCode,
+        gives_up: bool,
+        gave_up: bool,
+    }
+
+    impl TermSource for FailingTerms<'_> {
+        type Shared = Arc<str>;
+
+        fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str> {
+            if code == self.code {
+                self.gave_up = self.gives_up;
+                return Err(VortexRdfError::InvalidOperation("unreadable".into()));
+            }
+            self.inner.str_at(role, code)
+        }
+
+        fn shared_at(&mut self, role: usize, code: TermCode) -> Result<Arc<str>> {
+            self.str_at(role, code).map(Arc::from)
+        }
+
+        fn gave_up(&self) -> bool {
+            self.gave_up
+        }
+    }
+
+    /// A quad decode whose source gives up ends at the row that failed, the
+    /// rows before it decoded; a failed read of a source that has not given
+    /// up is that row's `Err`, and the rows after it decode.
+    #[test]
+    fn a_quad_decode_ends_where_its_source_gives_up() {
+        let quads = skewed_quads();
+        let (dict, chunk) = skewed_chunk(&quads);
+        let arrays = code_columns(&chunk).unwrap();
+        let columns = code_slices(&arrays);
+        // Rows 30..40 share their subject, which no row before them has.
+        let code = columns[0][30];
+        assert!(columns[0][..30].iter().all(|&c| c != code));
+        let want = decode_chunk(&chunk, &dict);
+
+        for gives_up in [true, false] {
+            let mut src = FailingTerms {
+                inner: DictTerms::new(&dict),
+                code,
+                gives_up,
+                gave_up: false,
+            };
+            let rows = decode_rows(columns, &mut src);
+            if gives_up {
+                assert_eq!(rows.len(), 30);
+            } else {
+                assert_eq!(rows.len(), quads.len());
+                assert!(rows[30..40].iter().all(Result::is_err));
+                assert!(rows[40..].iter().all(Result::is_ok));
+            }
+            for (i, row) in rows
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !(30..40).contains(i))
+            {
+                assert_eq!(row.as_ref().unwrap(), want[i].as_ref().unwrap(), "row {i}");
+            }
         }
     }
 

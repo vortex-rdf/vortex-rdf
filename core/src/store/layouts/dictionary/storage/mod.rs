@@ -73,6 +73,16 @@ impl TermChunk {
         }
     }
 
+    /// Term `local`'s bytes: borrowed from a canonical chunk, or decoded into
+    /// `scratch` from an FSST one. Unlike a [`cursor`](Self::cursor), the
+    /// scratch is the caller's, so one scratch serves every chunk it reads.
+    pub(super) fn bytes_into<'a>(&'a self, local: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        match self {
+            TermChunk::Canonical(a) => StrColReader::new(a).bytes_at(local),
+            TermChunk::Fsst(f) => f.decode_into(local, scratch),
+        }
+    }
+
     /// The chunk as an array, in its stored encoding.
     fn array(&self) -> ArrayRef {
         match self {
@@ -153,10 +163,8 @@ impl ResidentChunks {
     /// `scratch` from an FSST one. A single-term read passes one scratch
     /// through all its probes, where a cursor holds one per chunk.
     pub(super) fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
-        match self.locate(i) {
-            (TermChunk::Canonical(a), local) => StrColReader::new(a).bytes_at(local),
-            (TermChunk::Fsst(f), local) => f.decode_into(local, scratch),
-        }
+        let (chunk, local) = self.locate(i);
+        chunk.bytes_into(local, scratch)
     }
 
     /// A cursor over the terms: one chunk cursor per chunk, each with its own
