@@ -423,7 +423,6 @@ impl RowSelection {
     /// run is a [`Range`](RowSelection::Range) however many were offered, so
     /// a keep admitting one contiguous run builds no id list; several become
     /// an id list, and an id list stays one.
-    #[cfg(feature = "file-io")]
     pub(crate) fn intersect_runs(self, runs: &[Range<u64>]) -> Self {
         match self {
             RowSelection::Ids(ids) => {

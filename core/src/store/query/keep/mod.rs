@@ -228,7 +228,9 @@ impl VortexRdfStore {
     /// In memory the keep is a binary search when the selected rows are a
     /// run of the sorted base that `column` orders (a bound prefix of the
     /// `(s, p, o, g)` order, as a subject-bound match leaves, or every row of
-    /// a base sorted by subject for a keep on `s`), else one pass over the
+    /// a base sorted by subject for a keep on `s`), or when it is a keep on
+    /// `s` of a base sorted by subject over an id list (the admitted runs are
+    /// found in the whole base and intersected with the ids), else one pass over the
     /// column's selected rows: read in place from a canonical column, else a
     /// piece of a chunk at a time, decoded and compared where the selected
     /// rows are dense and read row by row through the column's probe where

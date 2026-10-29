@@ -78,7 +78,9 @@ impl VortexRdfStore {
     /// base that `column` orders (every earlier column of the `(s, p, o, g)`
     /// order is constant over the run), every row of the base counting as
     /// one run. A range keep is two lower bounds; a small set is one bounded
-    /// sub-run per code. `None` declines to the row pass.
+    /// sub-run per code. A keep on `s` over an id list searches the whole
+    /// base instead ([`keep_located_subject`](Self::keep_located_subject)).
+    /// `None` declines to the row pass.
     fn keep_sorted_run(
         struct_arr: &vortex_array::arrays::StructArray,
         base: &ArrayRef,
@@ -87,13 +89,17 @@ impl VortexRdfStore {
         column: QuadColumn,
         keep: &Keep,
     ) -> Option<RowSelection> {
-        let SelectedRows::Run(run) = selection.as_rows(base.len()) else {
-            return None;
-        };
         let s_col = struct_arr.unmasked_field_by_name(schema::COL_S).ok()?;
         if !column_is_sorted(s_col) {
             return None;
         }
+        let run = match selection.as_rows(base.len()) {
+            SelectedRows::Run(run) => run,
+            SelectedRows::Ids(ids) if column == QuadColumn::S => {
+                return Self::keep_located_subject(base, probes, selection, ids.len(), keep);
+            }
+            SelectedRows::Ids(_) => return None,
+        };
         if run.is_empty() {
             return None;
         }
@@ -136,6 +142,56 @@ impl VortexRdfStore {
                     }
                 }
                 Some(RowSelection::Ids(Buffer::from(ids)))
+            }
+        }
+    }
+
+    /// A keep on the sorted `s` column over an id list of `selected` rows. The
+    /// rows it admits are runs of the whole base whatever the selection, so
+    /// they are located there by binary search through the column's probe,
+    /// as the file backend locates them in a file sorted by `s`, and
+    /// intersected with the ids: a range is two lower bounds, a set one
+    /// bounded run per code while those searches beat a pass over the
+    /// selected rows. `None` declines to the pass.
+    fn keep_located_subject(
+        base: &ArrayRef,
+        probes: &StructProbes,
+        selection: &RowSelection,
+        selected: usize,
+        keep: &Keep,
+    ) -> Option<RowSelection> {
+        let probe = probes.by_name(base, schema::COL_S).flatten()?.probe();
+        let len = probe.len();
+        match keep {
+            Keep::Range(lo, hi) => {
+                let (start, _) = probe.bounds_in(0..len, *lo);
+                let (end, _) = probe.bounds_in(start..len, *hi);
+                Some(selection.clone().intersect_range(start as u64..end as u64))
+            }
+            Keep::Set(codes) => {
+                // In probe reads, as `keep_sorted_run` weighs a set.
+                let searches = codes.len().saturating_mul(len.max(2).ilog2() as usize + 1);
+                let pass = if point_sized(selected as u64) {
+                    selected
+                } else {
+                    selected / KEEP_DECODE_ROWS_PER_ID
+                };
+                if searches >= pass {
+                    return None;
+                }
+                let mut runs: Vec<Range<u64>> = Vec::new();
+                let mut from = 0;
+                for &code in codes.as_slice() {
+                    let (lo, hi) = probe.bounds_in(from..len, code);
+                    if lo < hi {
+                        runs.push(lo as u64..hi as u64);
+                    }
+                    from = hi;
+                    if from >= len {
+                        break;
+                    }
+                }
+                Some(selection.clone().intersect_runs(&runs))
             }
         }
     }
