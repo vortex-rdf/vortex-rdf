@@ -12,10 +12,11 @@ mvn -f java/bench/pom.xml test -Dvortexrdf.library=$PWD/target/release/libvortex
 
 Requirements:
 - JDK 25 or newer, with `javac`. RDF4J 6 needs it, and the same JDK runs every worker.
+- Linux with glibc: the retained-memory figure reads glibc's allocator statistics.
 - Maven.
 - `scripts/refresh.sh` checks both before its first stage. A run of `run.py` alone needs three builds first:
   - `cargo build --release -p vortex-rdf-java`;
-  - `cargo build --release -p vortex-rdf-cli`, a separate invocation, so the CLI's allocator feature stays out of the JNI library;
+  - `cargo build --release -p vortex-rdf-cli`, a separate invocation, so the CLI's allocator feature stays out of the JNI library, whose native memory the retained figure reads through glibc;
   - `mvn -f java/bench/pom.xml package -DskipTests`.
 
 Harness design:
@@ -24,6 +25,7 @@ Harness design:
 - **The worker.** `harness/.../Worker.java` holds the phases, including a JIT warm-up before any pattern is timed. It writes its result to a file, never to stdout, which some libraries log to.
 - **Memory and size.**
   - Each worker's peak memory comes from `wait4`, so the Vortex CLI that a build runs counts too.
+  - What the open store retains is what disposing its warm handle releases, sampled after a full collection on either side: the live heap, and glibc's bytes in use less the JVM's own allocations, which its native memory tracking (`-XX:NativeMemoryTracking=summary`) reports. The warm handle lives on a thread of its own, since a library may leave a store's data reachable from the querying thread's thread-locals, as Jena's in-memory dataset does.
   - Store sizes are allocated blocks.
 - **The fixture and the adapters.** Every adapter must pass `AdapterContract` on the committed 512-row fixture, which `run.py --fixture` regenerates. Each library's setup is in its module's adapter.
 

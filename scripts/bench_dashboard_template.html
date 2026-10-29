@@ -810,10 +810,12 @@
       alone: the kernel's high-water mark for the worker and every process it ran. Every worker runs
       with the same heap limit and collector, which the provenance line lists. A store kept in the Java
       heap peaks near that limit whatever its live data, because the collector lets the heap grow toward
-      it, so read those peaks as bounded by the limit more than by the store; Vortex keeps its data
-      outside the heap, and the HDT files are memory-mapped. On-disk size is the artifact the build left,
-      counted in allocated blocks, listed only for the stores that write one. Lower is better in both
-      tables.
+      it, so its peak says more about the limit than about the store. <em>Retained</em> is what the open
+      store itself holds, in the Java heap and outside it, and does not follow the limit: Jena's in-memory
+      dataset and the MemoryStore hold their data in the heap, Vortex keeps what it holds in native memory,
+      and a memory-mapped file (the HDT files, LMDB's and TDB2's databases) is the kernel's page cache
+      rather than the store's memory. On-disk size is the artifact the build left, counted in allocated
+      blocks, listed only for the stores that write one. Lower is better in both tables.
     </p>
     <div class="panel-grid" id="java-footprint-panels"></div>
   </section>
@@ -1031,7 +1033,8 @@ function renderMatrixPanel(container, cfg, map){
         const mult = rec.median_ns / best[i];
         const multStr = mult >= 100 ? Math.round(mult).toLocaleString() : mult.toFixed(1);
         const ratio = isBest ? "" : `<span class="ratio">${multStr}×</span>`;
-        return `<td class="num${isBest ? " best" : ""}${sep}">${rec.median}${ratio}</td>`;
+        const tip = rec.title ? ` title="${rec.title.replace(/"/g, "&quot;")}"` : "";
+        return `<td class="num${isBest ? " best" : ""}${sep}"${tip}>${rec.median}${ratio}</td>`;
       }).join("");
     tbody.appendChild(tr);
   }
@@ -1552,6 +1555,19 @@ function renderBindingsTab(t){
   const memById = new Map(t.memory.map(m => [`${m.slug}::${m.role}`, {
     median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
   }]));
+  // What each open store retained, where the tab's workers measure it (the Java
+  // tab's do): the heap and native memory that disposing the store released.
+  // Under a megabyte it reads and ranks as that, the native part's resolution.
+  const fmtMb = v => (v >= 10 ? Math.round(v) : v.toFixed(1)) + " MB";
+  for (const m of t.memory){
+    if (m.retainedHeapMb == null) continue;
+    const held = m.retainedHeapMb + m.retainedNativeMb;
+    memById.set(`${m.slug}::retained`, {
+      median: held < 1 ? "&lt; 1 MB" : fmtMb(held), median_ns: Math.max(held, 1),
+      title: `${fmtMb(m.retainedHeapMb)} in the Java heap, ${fmtMb(m.retainedNativeMb)} native`,
+    });
+  }
+  const retained = t.memory.some(m => m.retainedHeapMb != null);
   // On-disk artifact size, reshaped into the same {median, median_ns} contract so
   // the size table is the same renderer as every other panel. A library that
   // writes no file carries a null size, which keeps it out of the table entirely
@@ -1603,10 +1619,11 @@ function renderBindingsTab(t){
   // Footprint — peak RSS per phase, then on-disk artifact size.
   const footHost = pane("footprint-panels");
   renderMatrixPanel(footHost, {
-    title:"Query phase — peak RSS",
+    title: retained ? "Query phase — peak RSS and retained memory" : "Query phase — peak RSS",
     note:t.notes.rss,
-    rowHeaders:["Configuration"], columns:["Peak RSS"], sortByColumn:0,
-    rows: adapters.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
+    rowHeaders:["Configuration"], columns: retained ? ["Peak RSS", "Retained"] : ["Peak RSS"], sortByColumn:0,
+    rows: adapters.map(a => ({ labels:[a.label],
+      ids: retained ? [`${a.slug}::query`, `${a.slug}::retained`] : [`${a.slug}::query`] })),
   }, memById);
   // A peak RSS that approached the memory the machine actually had free means
   // that library was measured under swap pressure, so its *timings* are partly
@@ -1743,7 +1760,7 @@ const JAVA_TAB = {
   emptyLabel:"No Java results",
   emptyHint:"run <code>scripts/refresh.sh --only java,render</code>",
   notes:{
-    rss:`Peak resident set size of each adapter's own JVM and the processes it ran (a Vortex build runs the CLI): build + open + every pattern. An empty worker JVM peaks at ${JAVA_CONFIG.jvmBaselineRssMb ?? "?"} MB, the floor under every row. Smallest first; <span class="best-key">green</span> = smallest footprint, the multiplier is vs it.`,
+    rss:`<b>Peak RSS</b>: the high-water mark of each adapter's own JVM and the processes it ran (a Vortex build runs the CLI), over build, open and every pattern. An empty worker JVM peaks at ${JAVA_CONFIG.jvmBaselineRssMb ?? "?"} MB, the floor under every row. <b>Retained</b>: what the open store holds once it has answered every pattern, read as what disposing it releases after a full collection: Java heap plus native memory, without the JVM's own allocations or the kernel's page cache, so a memory-mapped file is not in it. Hover a cell for the two parts. The native part is good to about a megabyte, so a store that holds less reads &lt; 1 MB and ranks as 1 MB. Smallest peak first; <span class="best-key">green</span> = smallest in each column, the multiplier is vs it.`,
     size:"Bytes the build left on disk, counted in allocated blocks, so a store's sparse preallocated files count what they hold. Only the stores that write an artifact are listed — one that lives only in memory has none. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
   },
 };
