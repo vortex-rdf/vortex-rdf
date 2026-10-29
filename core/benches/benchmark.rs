@@ -581,6 +581,64 @@ fn narrow_keep_range(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
+/// A `VALUES` list on the object position over the whole store: every row
+/// kept to 256 object codes spread over the dataset's objects, no pattern
+/// bound, then gathered. On file one pass over the object column, each code
+/// tested against the set; resident, a pass over the in-memory column.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_keep_object_set(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::Keep;
+    let store = open_dict_store(*residency, bench_size());
+    let keep = rt().block_on(async {
+        let dict = store.dict_reader().expect("dictionary handle");
+        let objects = bench_moduli().n_obj;
+        let mut codes = Vec::new();
+        for i in (0..objects).step_by((objects / 256).max(1)).take(256) {
+            let term = dataset::object_term(i).to_ntriples();
+            codes.extend(dict.encode(&term).await.unwrap());
+        }
+        assert!(!codes.is_empty(), "no object code found");
+        Keep::set(codes)
+    });
+    bencher.bench(|| {
+        rt().block_on(async {
+            let kept = store.keep(QuadColumn::O, &keep).await.expect("keep");
+            let columns = kept.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
+/// `FILTER(isLiteral(?o))` under a predicate-bound pattern: the view kept to
+/// the dictionary's literal codes, one range, then gathered. On file the
+/// pending predicate filter is evaluated in the same pass that reads and
+/// tests the object column.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_keep_literal_objects(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::Keep;
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
+    let keep = rt().block_on(async {
+        let dict = store.dict_reader().expect("dictionary handle");
+        let (lo, hi) = dict.prefix_range("\"").await.unwrap();
+        Keep::range(lo..hi)
+    });
+    bencher.bench(|| {
+        rt().block_on(async {
+            let kept = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P")
+                .keep(QuadColumn::O, &keep)
+                .await
+                .expect("keep");
+            let columns = kept.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
 /// `LIMIT 64` over a predicate-bound file view: the filter's splits are
 /// evaluated in file order and the window stops at the first that fills —
 /// against the full match's gather, this is what `LIMIT` saves.

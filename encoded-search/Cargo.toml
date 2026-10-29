@@ -23,12 +23,13 @@ vortex-fastlanes = { workspace = true }
 vortex-runend = { workspace = true }
 vortex-sequence = { workspace = true }
 vortex-sparse = { workspace = true }
-vortex-layout = { workspace = true, optional = true }
+# The transparent `Shared` array the resolver looks through lives here.
+vortex-layout = { workspace = true }
 vortex-session = { workspace = true, optional = true }
 
 [features]
 default = []
-layout = ["dep:vortex-layout", "dep:vortex-session"]
+layout = ["dep:vortex-session"]
 
 [dev-dependencies]
 divan = { workspace = true }

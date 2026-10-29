@@ -362,7 +362,7 @@ async fn test_written_frame_of_reference_keeps_one_reference() {
     /// tree with one reference, and with a reference per chunk.
     fn for_nodes(array: &ArrayRef, counts: &mut (usize, usize)) {
         if let Some(view) = array.as_opt::<FoR>() {
-            if view.constant_reference().is_some() {
+            if view.references().is_global() {
                 counts.0 += 1;
             } else {
                 counts.1 += 1;

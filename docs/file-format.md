@@ -80,13 +80,15 @@ of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
 The writer is limited to two editions: Vortex's frozen `core` edition
-`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L62)) — every
+`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L63)) — every
 encoding, layout, extension dtype and zone-map aggregate a store file may hold
-— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L73)), whose
+— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L74)), whose
 one member is the root layout. A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
-per-chunk frame-of-reference (`fastlanes.for.v2`), is never written. Files
-from earlier writers can hold it; the chunk probes read it.
+per-chunk frame-of-reference (`fastlanes.for.v2`) or bit-packing with a width
+per block (`fastlanes.bitpacked.v2`), is never written. Files from earlier
+writers can hold per-chunk frame-of-reference, which the chunk probes read; no
+store writer ever wrote per-block widths, which the probes decline.
 
 ---
 
@@ -503,7 +505,7 @@ A row scan — the reads that
 materialize a view's rows: serialization and the `from_file_in_memory` load, a
 compaction's gather, and the one-shot reads (`code_columns_gathered`,
 `quads_vec`, `shared_quads_vec`) the reads by id decline — filters and decodes
-per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L57)
+per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L51)
 (42) splits runs inline, a larger one is spawned across the runtime's workers.
 Without a Tokio runtime these scans run inline. A one-shot read under a
 pending filter of code equalities over columns with chunk probes evaluates
@@ -618,7 +620,7 @@ open rather than being read around.
 | `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L24) |
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L35) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L30) |
-| `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scans.rs`](../core/src/store/scan/file_scans.rs#L57) |
+| `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scans.rs`](../core/src/store/scan/file_scans.rs#L51) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: an emitted chunk's size, an index child chunk's size and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L46) |
 | `DEFAULT_RUN_ROWS` | 1,048,576 entries per out-of-core spill run: quads per quad run, entries per index-family run (whose `u32` row offsets this bounds) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L54) |
 

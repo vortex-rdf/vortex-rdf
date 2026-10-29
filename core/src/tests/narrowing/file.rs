@@ -726,6 +726,75 @@ async fn test_s_keeps_bind_no_expressions_and_stream_nothing() {
     assert_eq!(store.debug_column_streams().unwrap(), streams + 1);
 }
 
+/// A keep on another column reads the column in one pass and binds no
+/// expression of its own: past a first round, however many distinct object
+/// and predicate ranges and sets are kept, over the whole store or a pending
+/// filter, the file handle binds nothing new, each keep reads the column
+/// once, and every result agrees with brute force.
+#[tokio::test]
+async fn test_other_column_keeps_bind_nothing_per_keep() {
+    let quads = fixture_quads();
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let dict = store.dict_reader().unwrap();
+    let (o_lo, o_hi) = dict.prefix_range("\"o").await.unwrap();
+    let (p_lo, p_hi) = dict.prefix_range("<http://example.org/p").await.unwrap();
+    // The fixture's seven objects and five predicates.
+    assert_eq!((o_hi - o_lo, p_hi - p_lo), (7, 5));
+    let p1 = iri("p1");
+    let pending = matched_view(&store, None, Some(&p1), None, None).await;
+    let whole_rows = row_list(&store).await;
+    let pending_rows = row_list(&pending).await;
+
+    // Round `i`'s keeps: a range and a set on each column, over each view.
+    let columns = [(QuadColumn::O, o_lo, o_hi), (QuadColumn::P, p_lo, p_hi)];
+    let views = [(&store, &whole_rows[..]), (&pending, &pending_rows[..])];
+    async fn round(
+        i: u64,
+        columns: &[(QuadColumn, TermCode, TermCode)],
+        views: &[(&VortexRdfStore, &[[TermCode; 4]])],
+    ) -> usize {
+        let mut kept = 0usize;
+        for &(column, lo, hi) in columns {
+            let span = hi - lo;
+            let from = lo + (i * 7) % span;
+            let range = Keep::range(from..(from + 3 + i).min(hi));
+            let set = Keep::set([from, lo + (i * 13) % span, hi - 1]);
+            for &(view, rows) in views {
+                for keep in [&range, &set] {
+                    let narrowed = view.keep(column, keep).await.unwrap();
+                    let want = brute_keep(rows, column, keep);
+                    assert_eq!(
+                        row_list(&narrowed).await,
+                        want,
+                        "round {i}: {column:?} {keep:?}"
+                    );
+                    kept += 1;
+                }
+            }
+        }
+        kept
+    }
+    // The first round binds each column's projection and the reads' shapes.
+    round(0, &columns, &views).await;
+    let bound = store.debug_bound_exprs().unwrap();
+    let streams = store.debug_column_streams().unwrap();
+    let mut kept = 0;
+    for i in 1..16 {
+        kept += round(i, &columns, &views).await;
+    }
+    assert_eq!(
+        store.debug_bound_exprs().unwrap(),
+        bound,
+        "a keep bound an expression of its own"
+    );
+    assert_eq!(
+        store.debug_column_streams().unwrap(),
+        streams + kept,
+        "each keep reads its column once"
+    );
+}
+
 /// A file that is not stamped sorted declines the located kernel whatever
 /// the range, and its keeps answer through the stream instead — still
 /// agreeing with brute force, and keeping a contiguous result a range.

@@ -15,7 +15,7 @@ use divan::Bencher;
 use divan::counter::ItemsCount;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::scalar::Scalar;
-use vortex_array::search_sorted::{SearchSorted, SearchSortedSide};
+use vortex_array::search_sorted::{SearchSorted, SearchSortedArray, SearchSortedSide};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
 use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme};
@@ -120,18 +120,19 @@ fn bounds_encoded(bencher: Bencher, shape: &str) {
 fn bounds_generic_search_sorted(bencher: Bencher, shape: &str) {
     let fixture = fixture(shape);
     let probes: Vec<u32> = needles(&fixture.data).into_iter().take(20).collect();
+    let session = common::session();
     bencher.counter(ItemsCount::new(probes.len())).bench(|| {
+        let mut ctx = session.create_execution_ctx();
         probes
             .iter()
             .map(|&c| {
                 let scalar = Scalar::from(c);
-                let lo = fixture
-                    .encoded
+                let sorted = SearchSortedArray::new(&fixture.encoded, &mut ctx);
+                let lo = sorted
                     .search_sorted(&scalar, SearchSortedSide::Left)
                     .unwrap()
                     .to_index();
-                let hi = fixture
-                    .encoded
+                let hi = sorted
                     .search_sorted(&scalar, SearchSortedSide::Right)
                     .unwrap()
                     .to_index();

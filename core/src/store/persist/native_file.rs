@@ -139,8 +139,8 @@ pub(crate) struct LocatedTables {
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum FileCounter {
-    /// Quad columns streamed through a scan for a keep: pins which keeps
-    /// were served without reading a column.
+    /// Quad columns read for a keep, one pass each: pins which keeps were
+    /// served without reading a column.
     ColumnStreams,
     /// Row ids that reads of located index-child runs asked for: pins that a
     /// count reads none and a window only its own rows.

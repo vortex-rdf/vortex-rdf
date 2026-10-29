@@ -199,7 +199,7 @@ pub(crate) fn child_strategy_with(
 }
 
 /// An id column's leaf pipeline: the per-column pipeline
-/// `WriteStrategyBuilder::build` assembles (vortex-file 0.88, `strategy.rs`)
+/// `WriteStrategyBuilder::build` assembles (vortex-file 0.90, `strategy.rs`)
 /// step for step (repartition into 8 Ki-row blocks, zone statistics per block,
 /// dictionary encoding or its fallback, coalescing, compression, buffering,
 /// one flat leaf per chunk), with the coalescing target split in two:

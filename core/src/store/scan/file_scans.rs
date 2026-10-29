@@ -1,7 +1,6 @@
-//! Row scans of a [`NativeStoreFile`]: the driver a scan's splits run
-//! under, a scan read whole or streamed, an index child's row-id scan,
-//! [`RowSelection::restrict_scan`], and the projected column stream a keep
-//! tests.
+//! Row scans of a store file: the driver a scan's splits run under, a scan
+//! read whole or streamed, an index child's row-id scan, and
+//! [`RowSelection::restrict_scan`].
 
 use std::future::Future;
 
@@ -9,7 +8,6 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, future};
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
-use vortex_array::expr::{root, select};
 use vortex_buffer::Buffer;
 use vortex_error::{VortexExpect as _, VortexResult};
 use vortex_layout::scan::scan_builder::ScanBuilder;
@@ -22,11 +20,7 @@ use crate::io::read::{
     available_parallelism, collect_scan, collect_scan_spawned, collect_whole_scan, inline_splits,
     spawned_splits,
 };
-#[cfg(test)]
-use crate::store::persist::native_file::FileCounter;
-use crate::store::persist::native_file::NativeStoreFile;
-use crate::store::scan::file_exprs::QUAD_SCOPE;
-use crate::store::schema::{RowId, TermCode};
+use crate::store::schema::RowId;
 use crate::store::view::selection::RowSelection;
 
 /// How a scan's split futures are driven.
@@ -271,51 +265,14 @@ pub(super) fn strict_ids(ids: &Buffer<RowId>) -> StrictSortedBuffer<RowId> {
         .vortex_expect("a RowSelection id list is ascending and unique")
 }
 
-/// The positions within the rows `selection` covers (in file order, as
-/// `selection.apply` aligns them) whose code in `column` passes `admit`. The
-/// column is streamed through a projected scan, which reads a few splits per
-/// worker ahead of this loop, so a few chunks of codes are in flight at once,
-/// never the whole column. Tombstones are not applied (the reads apply them).
-pub(crate) async fn column_positions(
-    file: &NativeStoreFile,
-    column: &'static str,
-    selection: &RowSelection,
-    admit: impl Fn(TermCode) -> bool,
-) -> Result<Vec<usize>> {
-    use vortex_array::VortexSessionExecute as _;
-    use vortex_array::arrays::{PrimitiveArray, StructArray};
-
-    #[cfg(test)]
-    file.note(FileCounter::ColumnStreams, 1);
-    let mut scan = file.scan()?;
-    let scope = scan.dtype()?;
-    scan = scan.with_projection(file.bound_exprs().bind(
-        QUAD_SCOPE,
-        &select(&[column][..], root()),
-        &scope,
-    )?);
-    let mut chunks = Box::pin(selection.restrict_scan(scan, None).into_array_stream()?);
-    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-    let mut positions = Vec::new();
-    let mut offset = 0usize;
-    while let Some(chunk) = chunks.next().await {
-        let chunk = chunk?;
-        let struct_arr = chunk.execute::<StructArray>(&mut ctx)?;
-        let prim = crate::store::array::field_as::<PrimitiveArray>(&struct_arr, column, &mut ctx)?;
-        let codes = prim.as_slice::<TermCode>();
-        positions.extend(
-            (0..codes.len())
-                .filter(|&i| admit(codes[i]))
-                .map(|i| offset + i),
-        );
-        offset += codes.len();
-    }
-    Ok(positions)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vortex_array::expr::root;
+
+    use crate::store::persist::native_file::NativeStoreFile;
+    use crate::store::scan::file_exprs::QUAD_SCOPE;
+    use crate::store::schema::TermCode;
     use std::ops::Range;
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::{PrimitiveArray, StructArray};

@@ -347,10 +347,11 @@ pub(crate) fn typed_positions(
 mod tests {
     use super::*;
     use crate::store::view::selection::RowSelection;
-    use vortex_array::arrays::{Primitive, SharedArray};
+    use vortex_array::arrays::Primitive;
     use vortex_array::validity::Validity;
     use vortex_array::{IntoArray, VortexSessionExecute};
     use vortex_buffer::Buffer;
+    use vortex_layout::arrays::shared::Shared;
 
     /// A struct of {canonical code `p`, bit-packed code `o`} — one slice-bound
     /// and one probe-bound column.
@@ -387,7 +388,7 @@ mod tests {
         let o = plain.unmasked_field_by_name("o").unwrap().clone();
         StructArray::try_new(
             ["p", "o"].into(),
-            vec![p, SharedArray::new(o).into_array()],
+            vec![p, Shared::new(o).into_array()],
             n as usize,
             Validity::NonNullable,
         )

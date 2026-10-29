@@ -56,9 +56,10 @@ fn registries() -> VortexSession {
 /// encoding, layout, extension dtype and zone-map aggregate a store file may
 /// hold, apart from the store's root layout. A frozen edition never changes,
 /// so a Vortex upgrade cannot widen what the store writes: a wire form outside
-/// it, such as per-chunk frame-of-reference (`fastlanes.for.v2`) or the
-/// experimental patched array (`vortex.patched`), stays out of store files
-/// until this pin moves, whatever the session registers.
+/// it, such as per-chunk frame-of-reference (`fastlanes.for.v2`), bit-packing
+/// with a width per block (`fastlanes.bitpacked.v2`) or the experimental
+/// patched array (`vortex.patched`), stays out of store files until this pin
+/// moves, whatever the session registers.
 const CORE_EDITION: EditionId = vortex_edition::declarations::core::CORE_2026_08_3;
 
 /// The family of the components vortex-rdf adds to a Vortex file.
@@ -158,7 +159,11 @@ mod tests {
         }
         assert!(ids(ComponentKind::Layout).contains(&STORE_LAYOUT_ID.to_string()));
         let arrays = ids(ComponentKind::Array);
-        for id in ["fastlanes.for.v2", "vortex.patched"] {
+        for id in [
+            "fastlanes.for.v2",
+            "fastlanes.bitpacked.v2",
+            "vortex.patched",
+        ] {
             assert!(!arrays.contains(&id.to_string()), "{id} is admitted");
         }
         editions.validate().unwrap();
