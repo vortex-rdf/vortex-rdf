@@ -680,6 +680,36 @@ fn narrow_exists(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
+/// `ASK` through the probe API the bindings call: `count_probe` of a
+/// predicate-bound pattern with a limit of one.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn probe_exists(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let mut probe = Probe::new(None, p, None, None);
+    probe.limit = Some(1);
+    bencher.bench(|| {
+        rt().block_on(async { black_box(store.count_probe(&probe).await.expect("count_probe")) })
+    });
+}
+
+/// `LIMIT 64` through the probe API: `run_probe` of a predicate-bound
+/// pattern windowed to 64 rows, its codes gathered.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn probe_window(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let mut probe = Probe::new(None, p, None, None);
+    probe.limit = Some(64);
+    bencher.bench(|| {
+        rt().block_on(async {
+            let view = store.run_probe(&probe).await.expect("run_probe");
+            let columns = view.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
 /// A term predicate over 4,096 candidate codes spread across the dictionary:
 /// the per-query FILTER evaluation (resident: a cursor read per code;
 /// file-backed: the windows holding them).
