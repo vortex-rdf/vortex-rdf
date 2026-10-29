@@ -296,6 +296,28 @@ impl VortexRdfStore {
         // pending selection never gets here, as its deferral left nothing
         // bound.
         let (selection, residual_narrowed) = match selection {
+            // PROTOTYPE (item 3): a view only counted or windowed leaves a
+            // wide residual pending, evaluated piece by piece as far as the
+            // count or the window reaches.
+            ViewSelection::Exact(exact)
+                if need == IdsNeed::CountOrWindow
+                    && exact.len(base_len) > RESIDUAL_FIRST_PIECE
+                    && pat.any_bound() =>
+            {
+                let eqs = match codes.constraints(pat)? {
+                    Constraints::AlwaysFalse => return Ok(self.empty_view()),
+                    Constraints::Eq(eqs) => eqs,
+                };
+                let lazy = crate::store::indexes::LazyRowIds::from_residual(
+                    crate::store::indexes::PendingResidual {
+                        base: base.clone(),
+                        probes: std::sync::Arc::clone(probes),
+                        selection: exact,
+                        eqs,
+                    },
+                );
+                (ViewSelection::Pending(lazy), true)
+            }
             ViewSelection::Exact(exact) if !exact.is_empty(base_len) && pat.any_bound() => {
                 let Some(narrowed) =
                     Self::residual_narrow(&struct_arr, base, probes, exact, pat, codes, t)?
@@ -484,6 +506,103 @@ impl VortexRdfStore {
                 }
             },
         ))
+    }
+
+    /// PROTOTYPE (item 3): the rows of `selection` (of `base`) that satisfy
+    /// `eqs`, as [`residual_narrow`](Self::residual_narrow) compares them.
+    pub(crate) fn residual_selection(
+        base: &ArrayRef,
+        probes: &StructProbes,
+        selection: RowSelection,
+        eqs: &[(&'static str, Scalar)],
+    ) -> Result<RowSelection> {
+        let struct_arr = into_struct_array(base.clone())?;
+        let selection = match Self::zone_runs(base, probes, &selection, eqs) {
+            None => selection,
+            Some(runs) => match selection {
+                RowSelection::Ids(_) => selection.intersect_runs(&runs),
+                selection => {
+                    let ids = Self::runs_matching(base, &selection, &runs, eqs)?;
+                    return Ok(RowSelection::from_ids(vortex_buffer::Buffer::from(ids)));
+                }
+            },
+        };
+        if selection.is_empty(base.len()) {
+            return Ok(selection);
+        }
+        Ok(
+            match typed_residual_ids(
+                &struct_arr,
+                &selection,
+                base.len(),
+                eqs,
+                Some((base, probes)),
+            ) {
+                Some(ids) => RowSelection::Ids(ids),
+                None => {
+                    let mask = Self::mask_for(&selection.apply(base)?, eqs)?;
+                    selection.refine(&bool_array_to_mask(mask)?)
+                }
+            },
+        )
+    }
+
+    /// PROTOTYPE (item 3): the first rows of `selection` that satisfy `eqs`,
+    /// in base row order, at least `want` of them when there are: the
+    /// selection is compared in pieces ([`RESIDUAL_FIRST_PIECE`] rows, then
+    /// fourfold) until `want` rows are found. `true` when every piece was
+    /// compared, so the rows are all of them.
+    pub(crate) fn residual_prefix(
+        base: &ArrayRef,
+        probes: &StructProbes,
+        selection: &RowSelection,
+        eqs: &[(&'static str, Scalar)],
+        want: usize,
+    ) -> Result<(Vec<u64>, bool)> {
+        use crate::store::view::selection::SelectedRows;
+        let base_len = base.len();
+        let mut found: Vec<u64> = Vec::new();
+        let push = |found: &mut Vec<u64>, piece: RowSelection| -> Result<()> {
+            match Self::residual_selection(base, probes, piece, eqs)?.as_rows(base_len) {
+                SelectedRows::Run(run) => found.extend(run.start as u64..run.end as u64),
+                SelectedRows::Ids(ids) => found.extend(ids.iter().copied()),
+            }
+            Ok(())
+        };
+        // A selection of no more rows than wanted cannot stop early: one
+        // piece.
+        let mut size = if selection.len(base_len) <= want {
+            usize::MAX
+        } else {
+            RESIDUAL_FIRST_PIECE
+        };
+        match selection.as_rows(base_len) {
+            SelectedRows::Run(run) => {
+                let mut start = run.start;
+                while start < run.end {
+                    let end = start.saturating_add(size).min(run.end);
+                    push(&mut found, RowSelection::Range(start as u64..end as u64))?;
+                    start = end;
+                    size = size.saturating_mul(4);
+                    if found.len() >= want {
+                        return Ok((found, start == run.end));
+                    }
+                }
+            }
+            SelectedRows::Ids(ids) => {
+                let mut start = 0;
+                while start < ids.len() {
+                    let end = start.saturating_add(size).min(ids.len());
+                    push(&mut found, RowSelection::Ids(ids.slice(start..end)))?;
+                    start = end;
+                    size = size.saturating_mul(4);
+                    if found.len() >= want {
+                        return Ok((found, start == ids.len()));
+                    }
+                }
+            }
+        }
+        Ok((found, true))
     }
 
     /// The row runs of the zones whose code bounds
@@ -900,6 +1019,11 @@ fn fold_row_ids(
 /// `match_base`): a lookup costs the rows matching the component it resolves,
 /// not the rows the view still holds. An unrefined view never skips.
 const INDEX_ROUTING_MIN_ROWS: usize = 4_096;
+
+/// PROTOTYPE (item 3): the rows of a pending residual's first piece: a zone,
+/// above the typed residual's cap, so a piece is a mask scan and never the
+/// per-row probe reads the typed loop makes over a probe-bound column.
+pub(crate) const RESIDUAL_FIRST_PIECE: usize = 8_192;
 
 /// Test hook: how many in-memory residual filters this thread narrowed to
 /// the zones their codes' bounds hold.

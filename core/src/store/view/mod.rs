@@ -294,6 +294,11 @@ impl QuadsSource {
         let (ViewSelection::Pending(lazy), None) = (&self.selection, &self.deleted) else {
             return Ok(None);
         };
+        // PROTOTYPE (item 3): a pending residual compares only as far as the
+        // window reaches.
+        if let Some((ids, live)) = lazy.residual_window(offset, limit)? {
+            return Ok(Some((RowSelection::from_ids(ids), live)));
+        }
         let Some(live) = lazy.len_if_known().filter(|_| !self.has_filter()) else {
             return Ok(None);
         };

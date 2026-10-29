@@ -475,9 +475,96 @@ enum LazyRowIdSource {
         child: ChildReader,
         range: Range<u64>,
     },
+    /// PROTOTYPE (item 3): an in-memory residual compare left pending for a
+    /// view only counted or windowed.
+    Residual(Arc<PendingResidual>),
+}
+
+/// PROTOTYPE (item 3): a residual compare a count or a window evaluates only
+/// as far as it reaches: the rows of `selection` (of `base`) where `eqs`
+/// hold.
+pub(crate) struct PendingResidual {
+    pub(crate) base: ArrayRef,
+    pub(crate) probes: Arc<crate::store::probes::StructProbes>,
+    pub(crate) selection: crate::store::view::selection::RowSelection,
+    pub(crate) eqs: Vec<(&'static str, Scalar)>,
+}
+
+impl PendingResidual {
+    fn all_ids(&self) -> Result<Buffer<RowId>> {
+        use crate::store::view::selection::SelectedRows;
+        let matched = crate::store::VortexRdfStore::residual_selection(
+            &self.base,
+            &self.probes,
+            self.selection.clone(),
+            &self.eqs,
+        )?;
+        Ok(match matched.as_rows(self.base.len()) {
+            SelectedRows::Run(run) => Buffer::from_iter(run.start as RowId..run.end as RowId),
+            SelectedRows::Ids(ids) => ids.clone(),
+        })
+    }
 }
 
 impl LazyRowIds {
+    /// PROTOTYPE (item 3): lazy ids of a pending residual compare.
+    pub(crate) fn from_residual(residual: PendingResidual) -> Self {
+        Self {
+            cell: Arc::new(OnceLock::new()),
+            source: LazyRowIdSource::Residual(Arc::new(residual)),
+        }
+    }
+
+    /// PROTOTYPE (item 3): a pending residual's first matches, at least
+    /// `want` when there are, and whether they are all of them (then cached
+    /// as the ids). `None` for any other source.
+    fn residual_prefix(&self, want: usize) -> Result<Option<(Buffer<RowId>, bool)>> {
+        let LazyRowIdSource::Residual(residual) = &self.source else {
+            return Ok(None);
+        };
+        if let Some(ids) = self.cell.get() {
+            return Ok(Some((ids.clone(), true)));
+        }
+        let (found, complete) = crate::store::VortexRdfStore::residual_prefix(
+            &residual.base,
+            &residual.probes,
+            &residual.selection,
+            &residual.eqs,
+            want,
+        )?;
+        let found = Buffer::from(found);
+        if complete {
+            return Ok(Some((self.cell.get_or_init(|| found).clone(), true)));
+        }
+        Ok(Some((found, false)))
+    }
+
+    /// PROTOTYPE (item 3): `min(rows, limit)` of a pending residual, compared
+    /// only until `limit` rows are found. `None` for any other source.
+    pub(crate) fn residual_count_capped(&self, limit: usize) -> Result<Option<usize>> {
+        Ok(self
+            .residual_prefix(limit)?
+            .map(|(found, _)| found.len().min(limit)))
+    }
+
+    /// PROTOTYPE (item 3): rows `offset..offset + limit` of a pending
+    /// residual's matches, beside the base's live rows as far as they are
+    /// known: all of them when the compare ran to the end, else the rows
+    /// found, at least `offset + limit`. `None` for any other source.
+    pub(crate) fn residual_window(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<(Buffer<RowId>, usize)>> {
+        Ok(self
+            .residual_prefix(offset.saturating_add(limit))?
+            .map(|(found, _)| {
+                let rows = window_rows(offset, limit, found.len() as u64)
+                    .map_or(0..0, |rows| rows.start as usize..rows.end as usize);
+                (found.slice(rows), found.len())
+            }))
+    }
+
     /// Test-only hook: whether the ids have been computed, so a test can pin
     /// a read answered without them.
     #[cfg(test)]
@@ -584,6 +671,7 @@ impl LazyRowIds {
                 .or_else(|| located.as_ref().map(|run| (run.end - run.start) as usize)),
             #[cfg(feature = "file-io")]
             LazyRowIdSource::LocatedRun { range, .. } => Some((range.end - range.start) as usize),
+            LazyRowIdSource::Residual(_) => self.cell.get().map(Buffer::len),
         }
     }
 
@@ -592,7 +680,9 @@ impl LazyRowIds {
     /// child's once read. `None` for a file child's ids not read yet.
     pub(crate) fn ids_without_io(&self) -> Result<Option<Buffer<RowId>>> {
         match &self.source {
-            LazyRowIdSource::Component { .. } => self.materialized().map(Some),
+            LazyRowIdSource::Component { .. } | LazyRowIdSource::Residual(_) => {
+                self.materialized().map(Some)
+            }
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 Ok(self.cell.get().cloned())
@@ -608,7 +698,9 @@ impl LazyRowIds {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component { .. } => return self.materialized(),
+            LazyRowIdSource::Component { .. } | LazyRowIdSource::Residual(_) => {
+                return self.materialized();
+            }
             LazyRowIdSource::IndexChild {
                 child, constraints, ..
             } => scan_index_row_ids(child, constraints).await?,
@@ -631,6 +723,7 @@ impl LazyRowIds {
         }
         let ids = match &self.source {
             LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
+            LazyRowIdSource::Residual(residual) => residual.all_ids()?,
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 unreachable!(

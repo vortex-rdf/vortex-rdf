@@ -72,6 +72,14 @@ impl VortexRdfStore {
         if let Some(live) = self.quads.evaluated_len() {
             return Ok(live.min(limit));
         }
+        // PROTOTYPE (item 3): a pending residual compares only until `limit`
+        // rows are found.
+        if let (crate::store::view::selection::ViewSelection::Pending(lazy), None) =
+            (&self.quads.selection, &self.quads.deleted)
+            && let Some(count) = lazy.residual_count_capped(limit)?
+        {
+            return Ok(count);
+        }
         #[cfg(feature = "file-io")]
         if let Some((file, filter)) = self.quads.pending_filter() {
             // The selection resolves first (a served view's ids come from its
