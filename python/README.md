@@ -95,6 +95,7 @@ s.distinct(); o.value_counts()
 left_idx, right_idx = o.join_indices(s)     # rows where o == s, as index pairs
 o.take(left_idx)                            # gather a joined column
 o.join_count(s)                             # the number of pairs, none built
+s.run_starts(p, o)                          # one row of each run of equal (s, p, o): a union's distinct triples
 o.join_indices(s, max_pairs=1_000_000)      # JoinTooLarge (.pairs is the count) rather than more pairs
 groups = s.groups()                         # the join's right side, built once
 x, z = groups.gather(o, [s], [o])           # rows where o == s: the left s, the right o, no index pairs

@@ -2,6 +2,8 @@
 residencies, spelling-tolerant encoding, byte-order ranges and term
 predicates."""
 
+import itertools
+import random
 import re
 import time
 import warnings
@@ -9,7 +11,7 @@ from array import array
 
 import pytest
 
-from vortex_rdf import JoinTooLarge, U64Column, VortexRdfError, VortexRdfStore
+from vortex_rdf import JoinTooLarge, U64Column, VortexRdfError, VortexRdfStore, serialize_rdf
 
 from conftest import INDEXES, NAME, PATTERNS, one_shot, serialized, u64_rows, u64s
 
@@ -773,3 +775,46 @@ def test_an_empty_code_set_keep_matches_nothing(vortex_files, indexed_files, ind
     assert store.count_quads(p=NAME, keep=empty) == 0
     assert u64_rows(store.match_codes(p=NAME, keep=empty)) == []
     assert store.count_quads_many([{"p": NAME, "keep": empty}]) == [0]
+
+
+def test_run_starts_marks_where_runs_of_equal_rows_start():
+    s = U64Column([1, 1, 1, 2, 2, 3])
+    p = [5, 5, 6, 6, 6, 6]
+    assert u64s(s.run_starts(p)) == [0, 2, 3, 5]
+    assert u64s(s.run_starts()) == [0, 3, 5]
+    assert u64s(U64Column([]).run_starts([])) == []
+    with pytest.raises(ValueError):
+        s.run_starts([1, 2])
+
+
+@pytest.mark.parametrize("index", [None, *INDEXES])
+@pytest.mark.parametrize("in_memory", [False, True])
+def test_a_union_match_holds_each_triples_graphs_together(tmp_path, index, in_memory):
+    """Every order a store holds ends in the graph, so in any match over all
+    graphs the rows of one triple are adjacent, and `run_starts` over
+    `(s, p, o)` keeps each triple once: the union of the graphs as a set."""
+    rng = random.Random(7)
+    graphs = ["", *(f"<http://ex.org/g{i}>" for i in range(4))]
+    objects = [*(f"<http://ex.org/o{i}>" for i in range(6)), '"x"', '"y"@en']
+    quads = {
+        (f"<http://ex.org/s{rng.randrange(12)}>", f"<http://ex.org/p{rng.randrange(3)}>", rng.choice(objects),
+         rng.choice(graphs))
+        for _ in range(400)
+    }
+    source = tmp_path / "union.nq"
+    source.write_text("".join(f"{s} {p} {o} {g} .\n".replace("  .", " .") for s, p, o, g in quads), encoding="utf-8")
+    out = tmp_path / "union.vortex"
+    serialize_rdf(source, out, format="nquads", layout="dictionary", **({} if index is None else {"indexes": [index]}))
+    store = VortexRdfStore(out, in_memory=in_memory)
+    term_dict = store.term_dict()
+    s0, p0, o0, _ = next(iter(quads))
+    for bound in itertools.product((False, True), repeat=3):
+        pattern = dict(zip("spo", (t if b else None for t, b in zip((s0, p0, o0), bound))))
+        cols = store.match_codes(**pattern)
+        triples = [tuple(row[:3]) for row in u64_rows(cols)]
+        runs = [key for key, _ in itertools.groupby(triples)]
+        assert len(runs) == len(set(triples)), (index, pattern)
+        kept = cols[0].run_starts(cols[1], cols[2])
+        distinct = {tuple(term_dict.decode(c) for c in row) for row in u64_rows([col.take(kept) for col in cols[:3]])}
+        want = {(s, p, o) for s, p, o, _ in quads if all(v is None or v == t for v, t in zip(pattern.values(), (s, p, o)))}
+        assert distinct == want, (index, pattern)
