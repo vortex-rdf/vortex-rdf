@@ -69,7 +69,7 @@ TermDictionary dict = store.dictionary().orElseThrow();       // absent for othe
 long name = dict.encode("<http://xmlns.com/foaf/0.1/name>");  // code of a term, or NONE
 dict.decode(name);                                            // N-Triples spelling, or null past the dictionary
 dict.decodeMany(codes);                                       // one native call for a whole column
-dict.ranges();                                                // literals, IRIs, blank nodes and the default graph's code
+dict.ranges().literals().contains(code);                      // a code's term kind: literals, IRIs or blank nodes
 
 if (name != VortexStore.NONE) {                               // the store holds the term
     long n = store.countCodes(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE);
@@ -89,6 +89,8 @@ if (name != VortexStore.NONE) {                               // the store holds
 - The `long[]`-returning overload is the same call for callers that do not mind an allocation.
 
 When a file store can locate the pattern's rows by binary search (a prefix of the quad table's `(s, p, o, g)` order, or with `secondary-by-copy` the predicate- and object-led orders), a code lookup is one located run with no dictionary search; it takes the general path otherwise, and returns the same rows.
+
+For measurements, two switches are read once when the native library loads: `VORTEX_RDF_LOCATE=0` makes every code lookup take the general path, and `VORTEX_RDF_COUNTERS=1` makes `VortexStore.engineCounters()` count the encoded-search work (leaves searched encoded or decoded, probes, gathers, equality scans; all zero without it).
 
 ## Threads, memory and lifetime
 

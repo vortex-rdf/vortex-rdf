@@ -17,87 +17,95 @@ public final class TermDictionary {
 
 	/** The number of terms; codes are {@code 0} to {@code size() - 1}. */
 	public long size() {
-		long h = store.enter();
-		try {
-			return Native.termCount(h);
-		} finally {
-			store.exit();
-		}
+		return store.callLong(Native::termCount);
 	}
 
 	/**
 	 * The code of a term, or {@link VortexStore#NONE} when the dictionary lacks it, which in a code pattern is a free
-	 * position: check for it before putting the code into one. The spelling is tolerated: an
-	 * IRI with or without angle brackets, a literal with an explicit {@code xsd:string} type or an upper-case
-	 * language tag, and the default graph as {@code ""} all resolve to the stored form's code.
+	 * position: check for it before putting the code into one. The spelling is tolerated: an IRI with or without
+	 * angle brackets, a literal with an explicit {@code xsd:string} type or an upper-case language tag, and the
+	 * default graph as {@code ""} all resolve to the stored form's code.
 	 */
 	public long encode(String term) {
 		Objects.requireNonNull(term, "term");
-		long h = store.enter();
-		try {
-			return Native.encode(h, term);
-		} finally {
-			store.exit();
-		}
+		return store.callLong(h -> Native.encode(h, term));
 	}
 
 	/** The N-Triples spelling of a code; {@code null} for a code outside the dictionary. */
 	public String decode(long code) {
-		long h = store.enter();
-		try {
-			return Native.decode(h, code);
-		} finally {
-			store.exit();
-		}
+		return store.call(h -> Native.decode(h, code));
 	}
 
 	/** {@link #decode} of each code, in order, for codes in any order and with repeats; one native call. */
 	public String[] decodeMany(long[] codes) {
 		Objects.requireNonNull(codes, "codes");
-		long h = store.enter();
-		try {
-			return Native.decodeMany(h, codes);
-		} finally {
-			store.exit();
-		}
+		return store.call(h -> Native.decodeMany(h, codes));
 	}
 
-	/** The code ranges of the term kinds. Terms of a kind are contiguous, so a code's kind is a comparison. */
+	/** The code ranges of the term kinds. Terms of a kind are contiguous, so a code's kind is a range check. */
 	public Ranges ranges() {
-		long h = store.enter();
-		try {
-			return new Ranges(Native.ranges(h));
-		} finally {
-			store.exit();
-		}
+		return new Ranges(store.call(Native::ranges));
 	}
 
-	/** Code ranges, ends exclusive. */
+	/** The code ranges of the term kinds, and the default graph's code. */
 	public static final class Ranges {
-		private final long[] r;
+		private final long defaultGraph;
+		private final CodeRange literals;
+		private final CodeRange iris;
+		private final CodeRange blanks;
 
+		/** From the native layout {@code {defaultGraph or -1, literals, iris, blanks}}, each range start then end. */
 		private Ranges(long[] r) {
-			this.r = r;
+			defaultGraph = r[0];
+			literals = new CodeRange(r[1], r[2]);
+			iris = new CodeRange(r[3], r[4]);
+			blanks = new CodeRange(r[5], r[6]);
 		}
 
 		/** The code of {@code ""}, the default graph's name, or {@link VortexStore#NONE} when it is not a term. */
 		public long defaultGraph() {
-			return r[0];
+			return defaultGraph;
 		}
 
-		/** {@code {start, end}} of the literals' codes. */
-		public long[] literals() {
-			return new long[] { r[1], r[2] };
+		/** The literals' codes. */
+		public CodeRange literals() {
+			return literals;
 		}
 
-		/** {@code {start, end}} of the IRIs' codes. */
-		public long[] iris() {
-			return new long[] { r[3], r[4] };
+		/** The IRIs' codes. */
+		public CodeRange iris() {
+			return iris;
 		}
 
-		/** {@code {start, end}} of the blank nodes' codes. */
-		public long[] blanks() {
-			return new long[] { r[5], r[6] };
+		/** The blank nodes' codes. */
+		public CodeRange blanks() {
+			return blanks;
+		}
+	}
+
+	/** The codes {@code start} (inclusive) to {@code end} (exclusive). */
+	public static final class CodeRange {
+		private final long start;
+		private final long end;
+
+		private CodeRange(long start, long end) {
+			this.start = start;
+			this.end = end;
+		}
+
+		/** The first code. */
+		public long start() {
+			return start;
+		}
+
+		/** One past the last code. */
+		public long end() {
+			return end;
+		}
+
+		/** Whether {@code code} is in the range. */
+		public boolean contains(long code) {
+			return start <= code && code < end;
 		}
 	}
 }

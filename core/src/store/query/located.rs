@@ -6,10 +6,16 @@
 //! a reference index, `index:ref-p` or `index:ref-o`, whose `rid`s are the
 //! quad-table rows to read. A nested-loop join's per-binding probe is the
 //! caller: it holds codes, and its result is a few rows.
+//!
+//! [`count_code_pattern`](VortexRdfStore::count_code_pattern) and
+//! [`match_code_pattern`](VortexRdfStore::match_code_pattern) answer any
+//! pattern of codes: from a located run when one answers it, through the
+//! general match of the codes' terms otherwise.
 
 use vortex_buffer::Buffer;
 
-use crate::error::Result;
+use crate::common::terms::{self, Trust};
+use crate::error::{Result, VortexRdfError};
 
 /// Whether [`VortexRdfStore::locate_codes`] answers at all: `VORTEX_RDF_LOCATE=0` (an ablation switch, read once)
 /// makes it decline every pattern, so callers take the general match. Unset is on.
@@ -19,9 +25,12 @@ pub fn locate_enabled() -> bool {
 }
 use crate::store::VortexRdfStore;
 use crate::store::schema::TermCode;
+use crate::{DictReader, KindRanges, Probe};
 
 /// A quad pattern of term codes, as
-/// [`locate_codes`](VortexRdfStore::locate_codes) takes it; `None` is free.
+/// [`count_code_pattern`](VortexRdfStore::count_code_pattern),
+/// [`match_code_pattern`](VortexRdfStore::match_code_pattern) and
+/// [`locate_codes`](VortexRdfStore::locate_codes) take it; `None` is free.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodePattern {
     pub subject: Option<TermCode>,
@@ -46,7 +55,6 @@ impl CodePattern {
         }
     }
 
-    #[cfg(feature = "file-io")]
     fn slots(&self) -> [Option<TermCode>; 4] {
         [self.subject, self.predicate, self.object, self.graph]
     }
@@ -64,10 +72,71 @@ pub struct LocatedCodes {
 }
 
 impl VortexRdfStore {
+    /// The number of quads matching `pattern`, a pattern of a Dictionary-layout
+    /// store's term codes: a located run's length when one answers it
+    /// ([`locate_codes`](Self::locate_codes)), the general match's count
+    /// otherwise. A code past the dictionary, or a term in a position it cannot
+    /// take, matches nothing. An
+    /// [`InvalidOperation`](VortexRdfError::InvalidOperation) on a store
+    /// without a term dictionary.
+    pub async fn count_code_pattern(&self, pattern: CodePattern) -> Result<u64> {
+        let dict = self.code_dictionary()?;
+        if let Some(found) = self.locate_codes(pattern, 0, Some(0)).await? {
+            return Ok(found.total);
+        }
+        match code_probe(&dict, pattern).await? {
+            Some(probe) => Ok(self.count_probe(&probe).await? as u64),
+            None => Ok(0),
+        }
+    }
+
+    /// The `(s, p, o, g)` code columns of the quads matching `pattern`,
+    /// windowed to `limit` rows (`None`: every row) after `offset`: a located
+    /// run's rows, in its table's order, when one answers it
+    /// ([`locate_codes`](Self::locate_codes)), the general match's rows in its
+    /// own order otherwise. Which of the two answers depends on the store and
+    /// `pattern` alone, so every window of one pattern comes in the same order.
+    /// Matches nothing and fails as
+    /// [`count_code_pattern`](Self::count_code_pattern) does.
+    pub async fn match_code_pattern(
+        &self,
+        pattern: CodePattern,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        let dict = self.code_dictionary()?;
+        if let Some(found) = self.locate_codes(pattern, offset, limit).await? {
+            return Ok(found.columns);
+        }
+        let Some(probe) = code_probe(&dict, pattern).await? else {
+            return Ok(Default::default());
+        };
+        self.run_probe(&probe.window(offset, limit))
+            .await?
+            .code_columns_gathered()
+            .await?
+            .ok_or_else(|| {
+                VortexRdfError::InvalidOperation(
+                    "the store's rows are not all in its term dictionary".into(),
+                )
+            })
+    }
+
+    /// The term dictionary a code pattern's codes are drawn from.
+    fn code_dictionary(&self) -> Result<DictReader> {
+        self.dict_reader().ok_or_else(|| {
+            VortexRdfError::InvalidOperation(format!(
+                "a {} store has no term dictionary",
+                self.layout()
+            ))
+        })
+    }
+
     /// The quads matching `pattern`, a run located by binary search, windowed
     /// to `limit` rows (`None`: every row) after `offset`; `Ok(None)` when no
     /// located run answers it, for the caller to [`match_pattern`] or
-    /// [`run_probe`] instead.
+    /// [`run_probe`] instead, as
+    /// [`match_code_pattern`](Self::match_code_pattern) does.
     ///
     /// It answers on a whole, file-backed Dictionary-layout store (no tail,
     /// tombstones or narrowing) when the bound slots are a prefix of a sorted
@@ -189,6 +258,52 @@ impl VortexRdfStore {
             session,
         ))
         .await
+    }
+}
+
+/// The probe of `pattern`, its codes spelled out by `dict`, or `None` when it
+/// can match nothing: a code past the dictionary, or a term in a position it
+/// cannot take ([`holds`]).
+async fn code_probe(dict: &DictReader, pattern: CodePattern) -> Result<Option<Probe>> {
+    let kinds = dict.kind_ranges().await?;
+    let slots = pattern.slots();
+    let mut spelled: [Option<String>; 4] = Default::default();
+    for (slot, (spelling, code)) in spelled.iter_mut().zip(slots).enumerate() {
+        let Some(code) = code else {
+            continue;
+        };
+        if !holds(&kinds, slot, code) {
+            return Ok(None);
+        }
+        *spelling = Some(dict.decode(code).await?.ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "code {code} of a term kind decodes to nothing"
+            ))
+        })?);
+    }
+    // The dictionary's own spellings, each in a position its kind can take.
+    let [s, p, o, g] = spelled;
+    Ok(Some(Probe::new(
+        s.map(|s| terms::subject(&s, Trust::Stored)).transpose()?,
+        p.map(|p| terms::named_node(&p, Trust::Stored))
+            .transpose()?,
+        o.map(|o| terms::term(&o, Trust::Stored)).transpose()?,
+        g.map(|g| terms::graph_name(&g, Trust::Stored))
+            .transpose()?,
+    )))
+}
+
+/// Whether a quad can hold `code` at `slot` of `(s, p, o, g)`, by the term
+/// kind `kinds` puts it in: a subject is an IRI or a blank node, a predicate
+/// an IRI, an object an IRI, a blank node or a literal, and a graph an IRI, a
+/// blank node or the default graph's name.
+fn holds(kinds: &KindRanges, slot: usize, code: TermCode) -> bool {
+    let node = kinds.iris.contains(&code) || kinds.blanks.contains(&code);
+    match slot {
+        0 => node,
+        1 => kinds.iris.contains(&code),
+        2 => node || kinds.literals.contains(&code),
+        _ => node || kinds.default_graph == Some(code),
     }
 }
 
