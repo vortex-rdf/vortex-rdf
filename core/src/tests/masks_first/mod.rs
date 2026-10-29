@@ -222,5 +222,6 @@ async fn read_rows(view: &VortexRdfStore) -> ReadRows {
     }
 }
 
+mod pieces;
 mod reads;
 mod windows;

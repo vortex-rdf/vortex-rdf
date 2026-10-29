@@ -351,6 +351,13 @@ impl VortexRdfStore {
         self.quads.evaluated_len()
     }
 
+    /// The ranges of the filter masks a window kept on this view, in file
+    /// order (see `FileBase::masks`); `None` on a view without them.
+    pub(crate) fn debug_evaluated_ranges(&self) -> Option<Vec<std::ops::Range<u64>>> {
+        let masks = self.quads.file()?.masks.as_ref()?;
+        Some(masks.iter().map(|(_, range)| range.clone()).collect())
+    }
+
     /// Whether this view's one-shot reads take its pending filter by the
     /// masks first, which makes its window evaluate the filter whatever the
     /// bound (see `reads_masks_first`).

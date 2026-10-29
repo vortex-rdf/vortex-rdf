@@ -535,7 +535,7 @@ Each stage in the code, and where the details are below:
 | 1 · subject chunk probe and prefix | [`matching.rs:493-500`](../core/src/store/query/matching.rs#L493-L500 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L672), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`matching.rs:501-514`](../core/src/store/query/matching.rs#L501-L514 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L683) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:527-597`](../core/src/store/query/matching.rs#L527-L597 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L19) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:520-521`](../core/src/store/query/matching.rs#L520-L521 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L779) and [`matching.rs:605-619`](../core/src/store/query/matching.rs#L605-L619 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L701), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L609) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:520-521`](../core/src/store/query/matching.rs#L520-L521 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L779) and [`matching.rs:605-619`](../core/src/store/query/matching.rs#L605-L619 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L701), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L674) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`matching.rs:621-636`](../core/src/store/query/matching.rs#L621-L636 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L208) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -584,7 +584,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L609) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L674) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -1202,12 +1202,19 @@ pending filter it is
 [§7](#7-the-file-path), run *in file order* with a few splits in flight, and
 stopped at the first split that fills `offset + limit` rows — so `LIMIT`
 over a filtered scan costs the matching prefix of the file, not all of it.
-The loop's splits run inline up to 42 splits and are spawned above, as a row
-scan's are. The window's view carries exact ids and no filter.
+A loop that stops at fewer matches than a zone has rows (8,192: an
+`exists`, a small `LIMIT`) evaluates the splits in pieces
+([`early_exit_pieces`](../core/src/store/scan/file_filter.rs#L235)): the
+first zone, then pieces four times the one before inside a split, which
+reach whole splits within the first, so matches in the first rows end the
+loop there; a loop that runs to the end evaluates its first split in a few
+pieces rather than one. The loop's splits run inline up to 42 splits and
+are spawned above, as a row scan's are. The window's view carries exact ids
+and no filter.
 
 With no offset over such a view, an exact selection and no serve plan, the
-loop is the filter's split masks (`split_masks_until`), and the window looks
-at what it found. Enough matches are the window's first `limit` ids. Fewer
+loop is the filter's split masks (`split_masks_until`, a split's pieces
+joined into its one mask), and the window looks at what it found. Enough matches are the window's first `limit` ids. Fewer
 mean it cuts no base row, which no bound could tell before reading: the view
 keeps its rows, its tail windowed to what the base left of the limit, and
 keeps the evaluation. Its filter's masks are kept when the filter is code
