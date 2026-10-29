@@ -122,6 +122,8 @@ def _stub_signature(func):
         params.append(
             (arg.arg, _NO_DEFAULT if default is _NO_DEFAULT else ast.literal_eval(default), False)
         )
+    if args.vararg:
+        params.append((args.vararg.arg, _NO_DEFAULT, False))
     for arg, default in zip(args.kwonlyargs, args.kw_defaults):
         params.append(
             (arg.arg, _NO_DEFAULT if default is None else ast.literal_eval(default), True)

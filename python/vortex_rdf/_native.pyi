@@ -194,6 +194,14 @@ class U64Column:
         """The values at `indices`, in that order; an index past the end
         raises ``IndexError``."""
         ...
+    def run_starts(self, *others: _U64s) -> "U64Column":
+        """The rows where a run of equal rows starts across this column and
+        `others` (each as long as it): row 0 and every row differing from
+        the row before in some column. Taken with `take`, they keep one row
+        of each run — the distinct triples of a match over every graph,
+        whose rows of one triple are adjacent. Unequal lengths raise
+        ``ValueError``."""
+        ...
     def join_count(self, other: _U64s) -> int:
         """The number of row pairs `join_indices` makes with `other`, counted
         without building them."""
