@@ -374,19 +374,45 @@ const MEMO_MAX_SLOTS: usize = 1024;
 /// allocation would cost more than the few repeats it could catch.
 const MEMO_MIN_ROWS: usize = 16;
 
+/// Misses a memo's trial ([`TermMemo::new`]) counts before it decides
+/// whether to keep admitting terms.
+const MEMO_TRIAL_MISSES: u32 = 64;
+
+/// Misses per hit past which a memo's trial ends its admissions: a role
+/// whose codes do not come back within the memo's reach (an object column of
+/// mostly distinct terms) would copy each term into a slot no row reads.
+const MEMO_MISSES_PER_HIT: u32 = 8;
+
+/// Whether a memo keeps the terms it decodes.
+#[derive(Clone, Copy)]
+enum Admission {
+    /// Keeps each one, counting the memo's misses and hits up to the
+    /// [`MEMO_TRIAL_MISSES`]th miss, which decides the rest: at least one
+    /// hit per [`MEMO_MISSES_PER_HIT`] misses keeps admitting.
+    Trial { misses: u32, hits: u32 },
+    /// Keeps each one.
+    Admit,
+    /// Keeps none; the terms already kept still answer.
+    Refuse,
+}
+
 /// A direct-mapped memo of one role's decoded terms, keyed by code: one slot
 /// per masked code, overwritten on collision. Codes repeat down a column (a
 /// predicate or graph on nearly every row), and each repeat would pay the
 /// read (an FSST decompress) and the parse again; the fixed size keeps a
-/// high-cardinality column from piling up entries it never reads again.
+/// high-cardinality column from piling up entries it never reads again, and
+/// the [`Admission`] trial keeps such a column from copying every term into
+/// a slot.
 struct TermMemo<T> {
     slots: Vec<Option<(TermCode, T)>>,
     mask: usize,
+    admission: Admission,
 }
 
 impl<T: Clone> TermMemo<T> {
     /// Sized to `rows`, which bound the chunk's distinct codes: a power of
     /// two, at most [`MEMO_MAX_SLOTS`], and no table below [`MEMO_MIN_ROWS`].
+    /// Its admissions go through a trial ([`Admission::Trial`]).
     fn new(rows: usize) -> Self {
         let slots = if rows < MEMO_MIN_ROWS {
             0
@@ -396,6 +422,16 @@ impl<T: Clone> TermMemo<T> {
         Self {
             slots: vec![None; slots],
             mask: slots.saturating_sub(1),
+            admission: Admission::Trial { misses: 0, hits: 0 },
+        }
+    }
+
+    /// [`new`](Self::new), keeping every term it decodes: for shared terms,
+    /// whose copy is a reference-count bump.
+    fn admitting(rows: usize) -> Self {
+        Self {
+            admission: Admission::Admit,
+            ..Self::new(rows)
         }
     }
 
@@ -409,17 +445,33 @@ impl<T: Clone> TermMemo<T> {
         if let Some((cached, term)) = slot
             && *cached == code
         {
+            if let Admission::Trial { hits, .. } = &mut self.admission {
+                *hits = hits.saturating_add(1);
+            }
             return Ok(term.clone());
         }
         let term = decode()?;
-        *slot = Some((code, term.clone()));
+        if let Admission::Trial { misses, hits } = &mut self.admission {
+            *misses += 1;
+            if *misses == MEMO_TRIAL_MISSES {
+                let keep = hits.saturating_mul(MEMO_MISSES_PER_HIT) >= *misses;
+                self.admission = if keep {
+                    Admission::Admit
+                } else {
+                    Admission::Refuse
+                };
+            }
+        }
+        if !matches!(self.admission, Admission::Refuse) {
+            *slot = Some((code, term.clone()));
+        }
         Ok(term)
     }
 }
 
 /// A chunk's `[s, p, o, g]` code columns decoded into quads through `src`,
-/// each distinct code's term read and parsed at most once per role
-/// ([`TermMemo`]). A row whose terms fail to read or parse is an `Err` at
+/// a code repeated down a column read and parsed once while its role's memo
+/// holds it ([`TermMemo`]). A row whose terms fail to read or parse is an `Err` at
 /// that row's position; the other rows decode normally, unless `src` gave
 /// up ([`TermSource::gave_up`]): the rows then end before that row.
 fn decode_rows(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Quad>> {
@@ -467,10 +519,10 @@ fn decode_rows_shared<S: TermSource, R: StringRow>(
 ) -> Vec<Result<R>> {
     let n = s.len();
     let (mut sm, mut pm, mut om, mut gm) = (
-        TermMemo::new(n),
-        TermMemo::new(n),
-        TermMemo::new(n),
-        TermMemo::new(n),
+        TermMemo::admitting(n),
+        TermMemo::admitting(n),
+        TermMemo::admitting(n),
+        TermMemo::admitting(n),
     );
     let mut row = |i: usize| -> Result<R> {
         Ok(R::from_terms([
@@ -513,8 +565,9 @@ pub(crate) fn decode_chunk_shared(
     decode_rows_shared(code_slices(&columns), &mut DictTerms::new(dict))
 }
 
-/// One role's code column as owned terms, each distinct code's term read at
-/// most once ([`TermMemo`]); a code outside the dictionary is an error.
+/// One role's code column as owned terms, a repeated code read once while
+/// the memo holds it ([`TermMemo`]); a code outside the dictionary is an
+/// error.
 pub(in crate::store::layouts) fn decode_code_column<T: Clone + for<'a> From<&'a str>>(
     dict: &TermDictionary,
     codes: &[TermCode],
@@ -858,6 +911,117 @@ mod tests {
             assert_file_backed_decodes(&fb, &dict, &chunk, resolved, &case).await;
             assert!(!fb.reads_wait(), "{case}");
         }
+    }
+
+    /// `codes` looked up in `memo`, each decoding to itself: how many were
+    /// decoded (missed).
+    fn memo_decodes(
+        memo: &mut TermMemo<TermCode>,
+        codes: impl IntoIterator<Item = TermCode>,
+    ) -> usize {
+        let mut decoded = 0;
+        for code in codes {
+            let term = memo
+                .get_or_insert(code, || {
+                    decoded += 1;
+                    Ok(code)
+                })
+                .unwrap();
+            assert_eq!(term, code);
+        }
+        decoded
+    }
+
+    /// A memo's trial keeps it admitting terms while its hits keep up with
+    /// its misses, at least one per [`MEMO_MISSES_PER_HIT`] at the
+    /// [`MEMO_TRIAL_MISSES`]th miss; with fewer it admits no more, and a
+    /// code met after that is decoded each time, while the terms it kept
+    /// still answer. A memo for shared terms admits every term.
+    #[test]
+    fn a_memo_admits_terms_while_its_hits_keep_up() {
+        let trial = u64::from(MEMO_TRIAL_MISSES);
+        // The trial's misses with `hits` hits among them, spread out.
+        let run = |memo: &mut TermMemo<TermCode>, hits: u64| {
+            let codes = (0..trial).flat_map(|code| {
+                let again = code < hits;
+                std::iter::once(code).chain(again.then_some(code))
+            });
+            assert_eq!(memo_decodes(memo, codes), MEMO_TRIAL_MISSES as usize);
+        };
+        let enough = trial / u64::from(MEMO_MISSES_PER_HIT);
+        for (hits, admits) in [(enough, true), (enough - 1, false), (0, false)] {
+            let mut memo = TermMemo::new(4096);
+            run(&mut memo, hits);
+            // A code past the trial, met twice: kept, or decoded twice.
+            let past = trial + 100;
+            let decoded = memo_decodes(&mut memo, [past, past]);
+            assert_eq!(decoded, if admits { 1 } else { 2 }, "{hits} hits");
+            // A code the trial kept still answers (the miss that ends a
+            // refusing trial is not kept).
+            assert_eq!(memo_decodes(&mut memo, [trial / 2]), 0, "{hits} hits");
+        }
+        let mut shared = TermMemo::admitting(4096);
+        run(&mut shared, 0);
+        assert_eq!(memo_decodes(&mut shared, [trial + 100, trial + 100]), 1);
+    }
+
+    /// Term reads counted by code, over a resident dictionary.
+    struct CountingTerms<'a> {
+        inner: DictTerms<'a>,
+        reads: HashMap<TermCode, usize>,
+    }
+
+    impl TermSource for CountingTerms<'_> {
+        type Shared = Arc<str>;
+
+        fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str> {
+            *self.reads.entry(code).or_default() += 1;
+            self.inner.str_at(role, code)
+        }
+
+        fn shared_at(&mut self, role: usize, code: TermCode) -> Result<Arc<str>> {
+            self.str_at(role, code).map(Arc::from)
+        }
+    }
+
+    /// Past a trial of distinct objects, a quad decode stops keeping the
+    /// object column's terms, so a repeated object is read again; a shared
+    /// decode keeps every term, so it is read once.
+    #[test]
+    fn a_shared_decode_keeps_every_term() {
+        let n = MEMO_TRIAL_MISSES as usize + 8;
+        // One subject, predicate and graph; distinct objects, then the last
+        // one again.
+        let quads: Vec<RawQuad> = (0..n)
+            .map(|i| RawQuad {
+                s: "<http://example.org/s>".to_owned(),
+                p: "<http://example.org/p>".to_owned(),
+                o: format!("\"o{:03}\"", i.min(n - 2)),
+                g: String::new(),
+            })
+            .collect();
+        let (dict, chunk) = skewed_chunk(&quads);
+        let arrays = code_columns(&chunk).unwrap();
+        let columns = code_slices(&arrays);
+        let repeated = columns[2][n - 1];
+        assert_eq!(columns[2][n - 2], repeated);
+        let mut quads_src = CountingTerms {
+            inner: DictTerms::new(&dict),
+            reads: HashMap::new(),
+        };
+        let rows = decode_rows(columns, &mut quads_src);
+        assert!(rows.iter().all(Result::is_ok));
+        assert_eq!(
+            quads_src.reads[&repeated], 2,
+            "a quad decode reads it again"
+        );
+        let mut shared_src = CountingTerms {
+            inner: DictTerms::new(&dict),
+            reads: HashMap::new(),
+        };
+        let rows: Vec<Result<SharedQuad>> = decode_rows_shared(columns, &mut shared_src);
+        assert!(rows.iter().all(Result::is_ok));
+        assert_eq!(shared_src.reads[&repeated], 1, "a shared decode keeps it");
     }
 
     /// A source that fails on one code, giving up on the chunk or not.
