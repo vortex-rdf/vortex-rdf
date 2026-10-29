@@ -102,10 +102,35 @@ jobs:
             ~/.local/share/uv/python
           key: py-bench-venvs-${{ hashFiles('python/bench/adapters.py', 'python/bench/run.py') }}
 
+      # The Java suite compiles and runs on JDK 25, which RDF4J 6 requires;
+      # Maven comes with the runner image. The Maven cache is keyed on the
+      # bench's poms, which pin every library's version.
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: java/bench/**/pom.xml
+
+      # The JNI library and the CLI the Java stage builds, each with the stamp
+      # refresh.sh writes beside it, keyed like the Python extension. This step
+      # comes after the Rust cache on purpose: post steps run in reverse order,
+      # so these files are saved before rust-cache cleans target/.
+      - name: Cache Java native library and CLI
+        uses: actions/cache@v6
+        with:
+          path: |
+            target/release/libvortex_rdf_jni.so
+            target/release/libvortex_rdf_jni.so.sha256
+            target/release/vortex-rdf-cli
+            target/release/vortex-rdf-cli.sha256
+          key: java-native-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'java/src/**', 'java/Cargo.toml', 'cli/src/**', 'cli/Cargo.toml', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
+
       # Every stage of refresh.sh in its order: the Rust internals and
-      # cross-library suites, the JavaScript and Python comparative suites
-      # (wall-clock, never uploaded to CodSpeed), then the render into
-      # target/bench/public. BENCH_SIZE puts all three tabs on the same data:
+      # cross-library suites, the JavaScript, Python and Java comparative
+      # suites (wall-clock, never uploaded to CodSpeed), then the render into
+      # target/bench/public. BENCH_SIZE puts all four tabs on the same data:
       # the JS hdt adapter opens the .hdt artifact the cross-library stage
       # builds from this dataset, and the internals suites' own default is the
       # much smaller CodSpeed size, where instrumented runs measure

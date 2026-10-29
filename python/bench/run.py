@@ -2,7 +2,9 @@
 
 Provisions one virtualenv per library, generates the shared dataset files once,
 runs each adapter in its own subprocess, and aggregates the rows into the shape
-`scripts/render_bench_dashboard.py` feeds to the dashboard's Python tab.
+`scripts/render_bench_dashboard.py` feeds to the dashboard's Python tab. The
+orchestration it shares with the Java suite (`java/bench/run.py`) lives in
+`suite.py`.
 
     python3 python/bench/run.py                    # full run
     BENCH_DIM=32 python3 python/bench/run.py       # quick pilot
@@ -26,35 +28,39 @@ from __future__ import annotations
 
 import json
 import os
-import platform
-import re
 import shutil
 import subprocess
 import sys
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from adapters import ALL_SLUGS, VENV_FOR  # noqa: E402
-from datasets import dataset_opts, moduli, write_dataset  # noqa: E402
+from suite import (  # noqa: E402
+    bench_graphs,
+    bench_rows,
+    check_count_agreement,
+    cpu_model,
+    log,
+    measured_now,
+    meminfo_mb,
+    mut_batch,
+    prepare_dataset,
+    run_roles,
+    suite_output,
+    write_output,
+)
 
 BENCH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BENCH_DIR.parent.parent
 VENV_ROOT = BENCH_DIR / ".venvs"
 DATA_DIR = BENCH_DIR / ".data"
 
-# Scale, as a row count: BENCH_SIZE -- the same env name every suite reads (the
-# Rust benches included), so one knob sets the whole dashboard's scale. BENCH_DIM
-# remains as cube shorthand for quick pilots (BENCH_DIM=16 -> 4,096 rows) and
-# loses to an explicit row count. Default is the indicative-overview scale, 2**20.
-_dim = int(os.environ.get("BENCH_DIM", 0))
 #: One dataset for the whole run: every library that has graphs in its model
 #: builds from it, and the ones that do not read its triples projection.
-N_TRIPLES = int(os.environ.get("BENCH_SIZE", 0)) or (_dim**3 if _dim else 1_048_576)
-GRAPHS = int(os.environ.get("BENCH_GRAPHS_QUADS", 8))
-MUT_BATCH = int(os.environ.get("MUT_BATCH", 10_000))
+N_TRIPLES = bench_rows()
+GRAPHS = bench_graphs()
+MUT_BATCH = mut_batch()
 PYTHON_VERSION = os.environ.get("BENCH_PYTHON", "3.13")
 
 #: Package set per virtualenv. Vortex needs none -- it rides on PYTHONPATH.
@@ -65,10 +71,6 @@ VENV_PACKAGES = {
     "rdflib": ["rdflib"],
     "lightrdf": ["lightrdf"],
 }
-
-
-def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
 
 
 def provision(name: str) -> Path:
@@ -149,30 +151,6 @@ def run_worker(slug: str, role: str, triples: Path, quads: Path) -> dict | None:
         return None
 
 
-def check_count_agreement(counts_by_slug: dict[str, dict[str, int]]) -> list[str]:
-    """Cross-check every adapter's matched-row counts against the others.
-
-    This is the harness's correctness gate. Five libraries with five different
-    term spellings are being asked the same question; if two disagree on how
-    many rows a pattern matches, at least one is being queried wrongly and its
-    timing measures the wrong work. Disagreements are reported into the
-    dashboard's provenance.
-    """
-    warnings: list[str] = []
-    patterns: set[str] = set()
-    for c in counts_by_slug.values():
-        patterns.update(c)
-    for pat in sorted(patterns):
-        seen: dict[int, list[str]] = {}
-        for slug, c in counts_by_slug.items():
-            if pat in c:
-                seen.setdefault(c[pat], []).append(slug)
-        if len(seen) > 1:
-            detail = "; ".join(f"{n} rows: {', '.join(sorted(s))}" for n, s in sorted(seen.items()))
-            warnings.append(f"pattern {pat} -- {detail}")
-    return warnings
-
-
 def main() -> int:
     if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
         print(__doc__)
@@ -188,64 +166,10 @@ def main() -> int:
     # run had, not whatever the last library left behind.
     mem = meminfo_mb()
 
-    opts = dataset_opts(graphs=GRAPHS)
-    qm = moduli(N_TRIPLES, opts)
+    dataset = prepare_dataset(DATA_DIR, N_TRIPLES, GRAPHS)
+    run = run_roles(ALL_SLUGS, lambda slug, role: run_worker(slug, role, dataset.triples, dataset.quads))
 
-    # Keyed on the resolved cardinality as well as the row count: the env knobs
-    # `dataset_opts` reads change the file's contents at the same row count.
-    key = f"{N_TRIPLES}_{qm.n_subj}x{qm.n_pred}x{qm.n_obj}x{qm.n_graph}_{opts.literal_frac:g}"
-    quads = DATA_DIR / f"quads_{key}.nq"
-    triples = DATA_DIR / f"triples_{key}.nt"
-    for path, drop in ((quads, False), (triples, True)):
-        if path.exists():
-            log(f"reusing dataset {path.name} ({path.stat().st_size / 1e6:.1f} MB)")
-        else:
-            log(f"generating {path.name} ({N_TRIPLES:,} rows)…")
-            t0 = time.perf_counter()
-            write_dataset(str(path), N_TRIPLES, opts, drop_graph=drop)
-            log(f"  wrote {path.stat().st_size / 1e6:.1f} MB in {time.perf_counter() - t0:.1f}s")
-
-    rows: list = []
-    memory: list = []
-    sizes: list = []
-    counts_by_slug: dict[str, dict[str, int]] = {}
-    labels: dict[str, str] = {}
-    iters: dict[str, int] = {}
-
-    for slug in ALL_SLUGS:
-        res = run_worker(slug, "query", triples, quads)
-        if not res:
-            continue
-        rows.extend(res["rows"])
-        labels[slug] = res["label"]
-        if res.get("counts"):
-            counts_by_slug[slug] = res["counts"]
-        # Every worker runs the same counts; keep the first that reports them so
-        # the dashboard can state the repetition count the way the JS tab does.
-        iters = iters or res.get("iters") or {}
-        if res.get("peak_rss_mb") is not None:
-            memory.append(
-                {"slug": slug, "label": res["label"], "role": "query", "peakRssMb": res["peak_rss_mb"]}
-            )
-        sizes.append(
-            {"slug": slug, "label": res["label"], "bytes": res.get("artifact_bytes")}
-        )
-
-    # Every adapter, including the ones that cannot mutate: a worker that finds
-    # the operation unsupported exits before building anything, so the sweep is
-    # cheap, and the rows it emits are what the dashboard renders as an
-    # explained `unsupported` cell rather than a blank one.
-    for slug in ALL_SLUGS:
-        res = run_worker(slug, "mutate", triples, quads)
-        if not res:
-            continue
-        rows.extend(res["rows"])
-        if res.get("peak_rss_mb") is not None:
-            memory.append(
-                {"slug": slug, "label": res["label"], "role": "mutate", "peakRssMb": res["peak_rss_mb"]}
-            )
-
-    warnings = check_count_agreement(counts_by_slug)
+    warnings = check_count_agreement(run.counts_by_slug)
     for w in warnings:
         log(f"!! count disagreement: {w}")
 
@@ -270,82 +194,17 @@ def main() -> int:
     lib_str = ", ".join(
         [f"vortex-rdf {vortex_version}"] + [f"{k} {v}" for k, v in sorted(versions.items())]
     )
-    # UTC, to the minute — the format every dashboard tab dates itself in (see
-    # `scripts/render_bench_dashboard.py`, `js/bench/compare.bench.ts`), so one
-    # page never shows three formats or three timezones for one run.
-    measured = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    qm = dataset.moduli
     provenance = (
-        f"Measured {measured} · Python {py_ver} · {cpu_model()}, {os.cpu_count()} threads · "
+        f"Measured {measured_now()} · Python {py_ver} · {cpu_model()}, {os.cpu_count()} threads · "
         f"{N_TRIPLES:,} quads over {qm.n_graph} named graphs ({qm.terms:,} terms; "
         f"lightrdf reads their triples projection), MUT_BATCH={MUT_BATCH:,} · "
         f"wall-clock (perf_counter_ns) · {lib_str} · one adapter per process and per virtualenv, isolated"
     )
 
-    matched = {}
-    for c in counts_by_slug.values():
-        matched.update(c)
-
-    out = {
-        "provenance": provenance,
-        "results": rows,
-        "memory": memory,
-        "sizes": sizes,
-        "config": {
-            "triplesCount": N_TRIPLES,
-            "cardinality": qm.__dict__,
-            "matchedRows": matched,
-            "mutBatch": MUT_BATCH,
-            # Same key names the JS harness emits, so both tabs state their
-            # repetition counts identically.
-            "queryIterations": iters.get("query"),
-            "heavyIterations": iters.get("heavy"),
-            "fullScanIterations": iters.get("fullScan"),
-            "countWarnings": warnings,
-            "systemMemoryMb": mem.get("MemTotal"),
-            "availableMemoryMb": mem.get("MemAvailable"),
-        },
-    }
-    dest = REPO_ROOT / "target" / "bench" / "python.json"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(out, indent=2), encoding="utf-8")
-    log(
-        f"\nWrote {len(rows)} benchmark rows, {len(memory)} memory readings, "
-        f"{len(sizes)} artifact sizes → {dest}"
-    )
-    if warnings:
-        log(f"NOTE: {len(warnings)} pattern count disagreement(s) recorded in config.countWarnings")
+    out = suite_output(run, provenance, dataset, MUT_BATCH, mem, warnings)
+    write_output(REPO_ROOT / "target" / "bench" / "python.json", out)
     return 0
-
-
-def meminfo_mb() -> dict[str, int]:
-    """Total and available system memory at the start of the run.
-
-    Recorded so the dashboard can compare each library's peak RSS against the
-    memory the machine had free at the start: a peak close to that figure means
-    the run was under swap pressure, and its timings describe this machine, not
-    the library. Such cells are labelled machine-bound.
-    """
-    out = {}
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as f:
-            for line in f:
-                m = re.match(r"^(MemTotal|MemAvailable):\s+(\d+) kB", line)
-                if m:
-                    out[m.group(1)] = round(int(m.group(2)) / 1024)
-    except OSError:
-        pass
-    return out
-
-
-def cpu_model() -> str:
-    try:
-        with open("/proc/cpuinfo", encoding="utf-8") as f:
-            for line in f:
-                if line.lower().startswith("model name"):
-                    return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-    return platform.processor() or "unknown CPU"
 
 
 if __name__ == "__main__":

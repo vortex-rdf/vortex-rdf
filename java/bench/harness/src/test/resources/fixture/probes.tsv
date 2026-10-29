@@ -1,0 +1,9 @@
+S	<http://data.example.org/resource/2026/subject/000000000>				triples
+P		<http://data.example.org/ontology/2026/property/0000>			triples
+O			"descriptive object value number 000000000"		triples
+SP	<http://data.example.org/resource/2026/subject/000000000>	<http://data.example.org/ontology/2026/property/0000>			triples
+PO		<http://data.example.org/ontology/2026/property/0000>	"descriptive object value number 000000000"		triples
+SPO	<http://data.example.org/resource/2026/subject/000000000>	<http://data.example.org/ontology/2026/property/0000>	"descriptive object value number 000000000"		triples
+G				<http://data.example.org/graph/2026/named/000000>	quads
+SPOG	<http://data.example.org/resource/2026/subject/000000000>	<http://data.example.org/ontology/2026/property/0000>	"descriptive object value number 000000000"	<http://data.example.org/graph/2026/named/000000>	quads
+full					full
