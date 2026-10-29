@@ -441,7 +441,7 @@ async fn codes_past_u32_round_trip_in_memory() {
 
     // Handed across as parts and adopted.
     let parts = store.to_serializable_parts().await.unwrap();
-    let adopted = VortexRdfStore::from_parts(parts).unwrap();
+    let adopted = VortexRdfStore::from_parts(parts, Default::default()).unwrap();
     check_store(&adopted, &quads, "from_parts").await;
 
     // Serialized and reopened from its bytes.

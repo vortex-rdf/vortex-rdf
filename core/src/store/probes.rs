@@ -9,6 +9,8 @@ use vortex_array::ArrayRef;
 use vortex_array::dtype::FieldName;
 use vortex_rdf_encoded_search::OwnedSortedProbe;
 
+use crate::store::zones::{CodeZones, ZoneTable};
+
 /// Lazily resolved probes for one struct array's children, shared across the
 /// views over that base (`Arc` in `MemoryBase`) and held by the index
 /// components and serve plans for their own struct arrays.
@@ -18,6 +20,9 @@ use vortex_rdf_encoded_search::OwnedSortedProbe;
 #[derive(Default)]
 pub(crate) struct StructProbes {
     cells: OnceLock<(usize, ProbeCells)>,
+    /// The base's code columns' zone bounds, set once at construction
+    /// ([`set_zones`](Self::set_zones)).
+    zones: OnceLock<(usize, ZoneTable)>,
 }
 
 /// One resolved probe (or a decline) per base child, in child order.
@@ -59,6 +64,29 @@ impl StructProbes {
                 .find(|(n, _)| n.as_ref() == name)
                 .and_then(|(_, probe)| probe.as_ref()),
         )
+    }
+
+    /// Record `zones` as `base`'s code columns' zone bounds, each column's
+    /// only if its zones cover the base's rows; a cache that already holds a
+    /// base's keeps them.
+    pub(crate) fn set_zones(&self, base: &ArrayRef, zones: ZoneTable) {
+        let _ = self.zones.set((base.addr(), zones.covering(base.len())));
+    }
+
+    /// `base`'s child `name`'s zone bounds ([`CodeZones`]); `None` for a base
+    /// other than the one they were set for, or a child without them.
+    pub(crate) fn zones(&self, base: &ArrayRef, name: &str) -> Option<&CodeZones> {
+        let (addr, table) = self.zones.get()?;
+        (*addr == base.addr()).then(|| table.get(name)).flatten()
+    }
+
+    /// The columns of `base` with zone bounds (test hook).
+    #[cfg(test)]
+    pub(crate) fn zone_columns(&self, base: &ArrayRef) -> Vec<String> {
+        match self.zones.get() {
+            Some((addr, table)) if *addr == base.addr() => table.columns(),
+            _ => Vec::new(),
+        }
     }
 
     fn cells(&self, base: &ArrayRef) -> Option<&ProbeCells> {

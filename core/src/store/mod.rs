@@ -17,6 +17,7 @@ pub(crate) mod schema;
 pub(crate) mod test_hooks;
 pub(crate) mod view;
 pub(crate) mod write;
+pub(crate) mod zones;
 
 pub use builders::{BuiltArray, SortedInMemoryBuilder, VortexArrayBuilder};
 // The out-of-core builder needs a filesystem to spill to.

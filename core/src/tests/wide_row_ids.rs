@@ -272,7 +272,7 @@ async fn check_adoptions(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     check_store(store, quads, &format!("{label}: built")).await;
     let parts = store.to_serializable_parts().await.unwrap();
     check_children(&parts, BASE, label);
-    let adopted = VortexRdfStore::from_parts(parts).unwrap();
+    let adopted = VortexRdfStore::from_parts(parts, Default::default()).unwrap();
     check_store(&adopted, quads, &format!("{label}: from_parts")).await;
     let bytes = store.to_bytes().await.unwrap();
     let reopened = VortexRdfStore::from_bytes(&bytes).await.unwrap();

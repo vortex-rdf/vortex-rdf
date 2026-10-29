@@ -53,9 +53,9 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L65), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L106) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L66), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L112) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L129) | — (re-serializes a store) | bytes |
-| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L247) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
+| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L248) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -521,9 +521,9 @@ inode stays alive for the mapping.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/construct.rs#L106) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/construct.rs#L112) turns a `BuiltArray` into the
 store's *compressed-resident* form (through
-[`adopt`](../core/src/store/construct.rs#L118), the step it shares with
+[`adopt`](../core/src/store/construct.rs#L129), the step it shares with
 `from_parts`):
 
 - every non-nullable `u64` code child and row-id child of the base and of
@@ -531,19 +531,28 @@ store's *compressed-resident* form (through
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L70)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L76)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
   path decodes the canonical primitive once into the wrapper's cache;
 - the encoded-search probes over every column are resolved up front
-  ([`StructProbes::warm`](../core/src/store/probes.rs#L36)), so no query pays the
-  encoding-tree walk.
+  ([`StructProbes::warm`](../core/src/store/probes.rs#L41)), so no query pays the
+  encoding-tree walk;
+- the smallest and largest code of each 8,192-row zone of every code column
+  is taken in the pass that picks the column's encoding, which reads every
+  code for the column's own bounds anyway
+  ([`ZoneBuilder`](../core/src/store/zones.rs#L74)): the in-memory
+  counterpart of a file's zone maps, so a match's residual equality compares
+  only the zones that may hold its code
+  ([matching.md §6.3](matching.md#63-residual-column-filtering)).
 
-The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L91)
+The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L95)
 (crate-private; `from_file_in_memory` calls it), takes a store's split parts:
 it keeps each integer child's existing encoding wherever a probe binds it and
-decodes only the ones that decline. Opening serialized bytes in memory is
+decodes only the ones that decline. Its zone bounds are the file's own zone
+maps, read at open ([`ZoneTable::read_from_file`](../core/src/store/zones.rs#L145)),
+as `from_bytes` reads them. Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).
 
 ---

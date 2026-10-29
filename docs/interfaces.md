@@ -19,7 +19,7 @@ is the path such an engine takes.
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L156), [`index_components`](../core/src/store/read/metadata.rs#L230), [`partitions`](../core/src/store/read/metadata.rs#L265) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) (from [`dict_reader`](../core/src/store/mod.rs#L193)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L142), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L266) |
 | The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L82), with [`vortex_scan`](../core/src/lib.rs#L76) re-exported |
@@ -331,13 +331,13 @@ valid.
   re-takes the dictionary handle after the compaction.
 - The persisted children ([§2](#2-the-persisted-children-as-tables)) are
   the base's, untouched by tombstones and tails.
-- A store opened by [`from_file`](../core/src/store/persist/open.rs#L237)
+- A store opened by [`from_file`](../core/src/store/persist/open.rs#L238)
   reads its memory-mapped file in place, and so does every view, data
   source, partition and stream derived from it: the file must not be
   truncated or rewritten while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
-  [`from_file_in_memory`](../core/src/store/persist/open.rs#L247) loads the
+  [`from_file_in_memory`](../core/src/store/persist/open.rs#L248) loads the
   file whole instead and never reads it again.
 
 ## 8. Through DataFusion

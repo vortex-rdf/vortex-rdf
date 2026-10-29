@@ -573,7 +573,7 @@ mod tests {
         )
         .unwrap()
         .into_array();
-        let base = with_compressed_int_children(rows, true).unwrap();
+        let base = with_compressed_int_children(rows, true, None).unwrap();
         let probes = StructProbes::new();
         probes.warm(&base);
         (into_struct_array(base.clone()).unwrap(), base, probes)

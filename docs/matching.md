@@ -227,7 +227,7 @@ stage only sees what is left.
 
 Only the *struct* is canonical. Its columns stay in the compressed encodings
 every in-memory construction gives them
-([`adopt`](../core/src/store/construct.rs#L118)), and the stages below
+([`adopt`](../core/src/store/construct.rs#L129)), and the stages below
 search them in place through the cached encoded-search probes. No stage
 decompresses a column; a match decodes nothing but the rows a mask scan has to
 compare ([§6.3](#63-residual-column-filtering)).
@@ -264,8 +264,8 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:207-232`](../core/src/store/query/matching.rs#L207-L232 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L342), [`search_sorted_bounds`](../core/src/store/array.rs#L203) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:236-289`](../core/src/store/query/matching.rs#L236-L289 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L658), [`fold_row_ids`](../core/src/store/query/matching.rs#L779) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:291-308`](../core/src/store/query/matching.rs#L291-L308 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L423), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L256), [`mask_for`](../core/src/store/query/matching.rs#L728) | [§6.3](#63-residual-column-filtering) |
+| 2 · secondary-index routing | [`matching.rs:236-289`](../core/src/store/query/matching.rs#L236-L289 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L658), [`fold_row_ids`](../core/src/store/query/matching.rs#L883) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:291-308`](../core/src/store/query/matching.rs#L291-L308 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L423), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L256), [`mask_for`](../core/src/store/query/matching.rs#L832) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:310-317`](../core/src/store/query/matching.rs#L310-L317 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -400,8 +400,26 @@ Whatever no fast path answered is compiled to constraints ([§3](#3-stage-a--pre
 and compared column-wise, over **only the rows the view still selects**. The
 compile can in principle answer `AlwaysFalse` — an empty view — but not here:
 the residual binds a subset of roles the [stage B gate](#4-stage-b--the-provable-emptiness-gate)
-already resolved, so that arm exists for totality. Two implementations, in
-order:
+already resolved, so that arm exists for totality.
+
+First, **zone bounds** narrow the rows to compare. An in-memory base carries
+the smallest and largest code of each 8,192-row zone of its code columns
+([`CodeZones`](../core/src/store/zones.rs#L23)), the counterpart of a file's
+zone maps: taken in the pass that compresses a build's codes, or read from the
+zone maps of the file a store is loaded from (`from_file_in_memory`,
+`from_bytes`), so no query pays for them. A base without them (the string
+columns of the Default and TypedObject layouts) skips this step. Over a
+selection wider than a zone, the zones whose bounds cannot hold every
+constrained code are left out ([`zone_runs`](../core/src/store/query/matching.rs#L496)),
+when what is left holds at most half the base: a run of rows (every row, or a
+subject's range) is compared zone run by zone run, each a slice of the base
+through the mask scan below
+([`runs_matching`](../core/src/store/query/matching.rs#L545)), and an id list keeps
+only its ids in those runs before the implementations below compare them. A
+code most zones may hold (a predicate or graph spread over every zone) leaves
+everything to compare.
+
+Then two implementations, in order:
 
 1. **Typed residual** ([`scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs))
    — a direct row loop yielding exact base ids, no slice/compare/mask pipeline.
@@ -448,11 +466,13 @@ struct canonicalization — are exactly the per-call cost the gate avoids.
 | `(? p0 ? ?)` on the 1M store | `p = code` | `All` (1,048,576 rows) | **mask scan** — a lone equality over a wide selection declines the typed loop | 31,776 ids |
 | `(? p0 o0 ?)` on the 1M store | `p = code`, `o = code` | `All` | typed: two code columns, the branch-free loop | 1 id |
 | `(? ? o0 ?)` on the 1M store, `TypedObject` | `o_kind = 2u8`, `o_value = "…"` | `All` | mask scan — the `u8` column binds only through a probe, which declines over a wide selection | 2 ids |
+| `(? ? o0 ?)` on the 1M store, `Dictionary` | `o = code` | `All` | zone bounds keep the one zone of 128 that may hold the code (the column's smallest); the mask scan compares its rows | 2 ids |
 
-**Cost.** Both implementations read every selected row, so a wide residual is
-the one stage whose cost tracks the store, not the result; a string column
-costs more per row than a code column. A narrow residual behind a subject run
-compares a handful of rows.
+**Cost.** Both implementations read every row they are handed, so a wide
+residual whose codes every zone may hold is the one stage whose cost tracks
+the store, not the result; a string column costs more per row than a code
+column. A code few zones hold costs those zones' rows, and a narrow residual
+behind a subject run compares a handful of rows.
 
 ### 6.4 Keeping (or dropping) the serve plan
 
@@ -482,7 +502,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/query/matching.rs#L479) composes the same
+[`match_base_file`](../core/src/store/query/matching.rs#L583) composes the same
 restrictions as the in-memory path, but **leaves the rows to the next scan**:
 each stage decides what that scan will do, and the result is a filter
 expression plus a row selection. The match itself reads only what those
@@ -531,12 +551,12 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:487-492`](../core/src/store/query/matching.rs#L487-L492 "FileBase") | — |
-| 1 · subject chunk probe and prefix | [`matching.rs:493-500`](../core/src/store/query/matching.rs#L493-L500 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L672), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:501-514`](../core/src/store/query/matching.rs#L501-L514 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L683) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:527-597`](../core/src/store/query/matching.rs#L527-L597 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L19) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:520-521`](../core/src/store/query/matching.rs#L520-L521 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L779) and [`matching.rs:605-619`](../core/src/store/query/matching.rs#L605-L619 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L701), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L674) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
-| 5 · filter at sparse ids | [`matching.rs:621-636`](../core/src/store/query/matching.rs#L621-L636 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L208) | [§7.3](#73-what-ends-up-on-the-view) |
+| Prelude | [`matching.rs:591-596`](../core/src/store/query/matching.rs#L591-L596 "FileBase") | — |
+| 1 · subject chunk probe and prefix | [`matching.rs:597-604`](../core/src/store/query/matching.rs#L597-L604 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L776), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:605-618`](../core/src/store/query/matching.rs#L605-L618 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L683) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`matching.rs:631-701`](../core/src/store/query/matching.rs#L631-L701 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L19) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:624-625`](../core/src/store/query/matching.rs#L624-L625 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L883) and [`matching.rs:709-723`](../core/src/store/query/matching.rs#L709-L723 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L805), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L674) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 5 · filter at sparse ids | [`matching.rs:725-740`](../core/src/store/query/matching.rs#L725-L740 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L208) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -996,7 +1016,7 @@ file run) and a rid-only scan of the index child otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L798) | an already-narrowed view below this skips index routing |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L902) | an already-narrowed view below this skips index routing |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L244) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,

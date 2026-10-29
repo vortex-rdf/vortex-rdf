@@ -414,6 +414,12 @@ impl NativeStoreFile {
         self.index_child(name).map(|child| child.slot)
     }
 
+    /// The quad child's layout (the root's transparent child): the struct of
+    /// the primary columns.
+    pub(crate) fn quad_layout(&self) -> VortexResult<LayoutRef> {
+        container::quad_source(self.root())
+    }
+
     /// The root layout: the native store root [`try_new`](Self::try_new)
     /// required.
     fn root(&self) -> &Layout<RdfStoreLayoutVTable> {

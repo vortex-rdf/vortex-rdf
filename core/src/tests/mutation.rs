@@ -1020,7 +1020,7 @@ async fn test_dictionary_add_probes_tail_by_string() {
     // Serializing re-encodes base and tail against a fresh dictionary, so
     // the written parts stand alone.
     let parts = added.to_serializable_parts().await.unwrap();
-    let reloaded = VortexRdfStore::from_parts(parts).unwrap();
+    let reloaded = VortexRdfStore::from_parts(parts, Default::default()).unwrap();
     assert_eq!(reloaded.size().await.unwrap(), 13);
     assert_eq!(
         matched_size(&reloaded, None, None, Some(&new_object), None).await,

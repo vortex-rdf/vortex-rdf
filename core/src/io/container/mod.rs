@@ -52,7 +52,6 @@ pub(crate) const INDEX_VERSION: u32 = 1;
 
 #[cfg(feature = "file-io")]
 pub(crate) use layout::newer_root_id_at;
-#[cfg(feature = "file-io")]
 pub(crate) use layout::quad_source;
 #[cfg(test)]
 pub(crate) use layout::store_metadata_of_bytes;

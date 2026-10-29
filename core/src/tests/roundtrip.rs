@@ -10,11 +10,14 @@ use super::*;
 /// says so.
 #[test]
 fn test_from_parts_rejects_bare_dictionary_array() {
-    let err = VortexRdfStore::from_parts(crate::store::BuiltArray {
-        array: bare_code_quad_array(&[1, 2, 3]),
-        components: Vec::new(),
-        dict: None,
-    })
+    let err = VortexRdfStore::from_parts(
+        crate::store::BuiltArray {
+            array: bare_code_quad_array(&[1, 2, 3]),
+            components: Vec::new(),
+            dict: None,
+        },
+        Default::default(),
+    )
     .err()
     .expect("from_parts should fail");
     assert!(
@@ -382,8 +385,11 @@ async fn test_unstamped_base_rebuild_sorts_fully() {
         ),
     ];
     let tailed = base.add_quads(appended.clone()).await.unwrap();
-    let rebuilt =
-        VortexRdfStore::from_parts(tailed.to_serializable_parts().await.unwrap()).unwrap();
+    let rebuilt = VortexRdfStore::from_parts(
+        tailed.to_serializable_parts().await.unwrap(),
+        Default::default(),
+    )
+    .unwrap();
     assert_eq!(
         rebuilt.view_statistics().unwrap().sort_order,
         Some(SortOrder::Spog),

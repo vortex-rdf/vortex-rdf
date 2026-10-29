@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: an in-batch `HashSet` catches the
   latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/query/matching.rs#L758) — one fully bound
+  [`contains`](../core/src/store/query/matching.rs#L862) — one fully bound
   `match_pattern` over base and tail ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
   accumulator; the accreted chunks are folded into the flat first chunk
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L156) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L157) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -249,7 +249,7 @@ flowchart TD
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
   [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L223) and adopts
-  the result through [`from_built`](../core/src/store/construct.rs#L106), in the
+  the result through [`from_built`](../core/src/store/construct.rs#L112), in the
   same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
 
@@ -293,7 +293,7 @@ open of the file and no rebuild (a debug-level log line says so), and every
 later append over the threshold retries the same way, folding the tail as soon
 as the file can be written again. An explicit `compact()` of such a store still
 fails with `PermissionDenied`: it is the call that reports why the tail is not
-being folded, and [`tail_len`](../core/src/store/mod.rs#L156) shows the tail
+being folded, and [`tail_len`](../core/src/store/mod.rs#L157) shows the tail
 growing. The tail then has no bound but memory, and every query mask-scans it,
 so a read-only store is for reading: append to a copy.
 

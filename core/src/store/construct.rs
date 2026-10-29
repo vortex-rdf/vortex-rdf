@@ -10,6 +10,7 @@ use crate::store::builders::SortedStreamBuilder;
 use crate::store::builders::{BuiltArray, VortexArrayBuilder, build_struct_array};
 use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
+use crate::store::zones::ZoneTable;
 use crate::store::{
     Backend, MemoryBase, QuadsSource, RawQuad, VortexRdfStore, next_generation, probes, resident,
 };
@@ -87,11 +88,14 @@ impl VortexRdfStore {
     /// An `IsSorted` stamp on the `s` column is trusted as global
     /// `(s, p, o, g)` order, and the match fast paths search every bound role
     /// on it: rows sorted by subject alone must not carry it.
+    ///
+    /// `zones` are the base's code columns' zone bounds ([`ZoneTable`]): the
+    /// zone maps of the file the parts were read from, or none.
     #[cfg(feature = "file-io")]
-    pub(crate) fn from_parts(parts: BuiltArray) -> Result<Self> {
+    pub(crate) fn from_parts(parts: BuiltArray, zones: ZoneTable) -> Result<Self> {
         Self::adopt(
             parts,
-            resident::with_searchable_int_children,
+            |base| Ok((resident::with_searchable_int_children(base)?, zones)),
             IndexComponent::into_searchable,
         )
     }
@@ -102,32 +106,39 @@ impl VortexRdfStore {
     /// resident: the base's code columns and each component's integer
     /// children are re-encoded into encodings the probes read in place
     /// (`with_compressed_int_children`), the base's also wrapped so the
-    /// code-column read path decodes each once and is zero-copy after.
+    /// code-column read path decodes each once and is zero-copy after. The
+    /// pass that compresses a code column also takes its zone bounds
+    /// ([`ZoneTable`]).
     pub fn from_built(built: BuiltArray) -> Result<Self> {
         Self::adopt(
             built,
-            |base| resident::with_compressed_int_children(base, true),
+            |base| {
+                let mut zones = ZoneTable::default();
+                let base = resident::with_compressed_int_children(base, true, Some(&mut zones))?;
+                Ok((base, zones))
+            },
             IndexComponent::into_compressed,
         )
     }
 
     /// The adoption step of [`from_parts`](Self::from_parts) and
     /// [`from_built`](Self::from_built): resolve the layout from `built`'s
-    /// dictionary and dtype, put the base through `encode_base` and every
-    /// component through `encode_component`, and assemble the store.
+    /// dictionary and dtype, put the base through `encode_base` (which also
+    /// hands back the base's zone bounds) and every component through
+    /// `encode_component`, and assemble the store.
     fn adopt(
         built: BuiltArray,
-        encode_base: impl FnOnce(ArrayRef) -> Result<ArrayRef>,
+        encode_base: impl FnOnce(ArrayRef) -> Result<(ArrayRef, ZoneTable)>,
         encode_component: impl FnMut(IndexComponent) -> Result<IndexComponent>,
     ) -> Result<Self> {
         let layout = resolved_layout(built.dict.map(DictAccess::Resident), built.array.dtype())?;
-        let base = encode_base(built.array)?;
+        let (base, zones) = encode_base(built.array)?;
         let components = built
             .components
             .into_iter()
             .map(encode_component)
             .collect::<Result<Vec<_>>>()?;
-        Self::assemble_resident(base, components, layout)
+        Self::assemble_resident(base, components, layout, zones)
     }
 
     /// Assemble an in-memory store from a primary base and its components,
@@ -142,6 +153,7 @@ impl VortexRdfStore {
         base: ArrayRef,
         components: Vec<IndexComponent>,
         layout: ResolvedLayout,
+        zones: ZoneTable,
     ) -> Result<Self> {
         debug_assert!(
             !matches!(&layout, ResolvedLayout::Dictionary(access) if access.is_file_backed()),
@@ -155,6 +167,7 @@ impl VortexRdfStore {
         // the encoding-tree walk.
         let store_probes = probes::StructProbes::new();
         store_probes.warm(&base);
+        store_probes.set_zones(&base, zones);
         for component in components.iter() {
             component.warm_probes();
         }
@@ -176,7 +189,12 @@ impl VortexRdfStore {
     pub fn empty() -> Self {
         let base = build_struct_array(&[], LayoutStrategy::Default, false)
             .expect("the empty Default-layout chunk builds");
-        Self::assemble_resident(base, Vec::new(), ResolvedLayout::Default)
-            .expect("an empty base assembles")
+        Self::assemble_resident(
+            base,
+            Vec::new(),
+            ResolvedLayout::Default,
+            ZoneTable::default(),
+        )
+        .expect("an empty base assembles")
     }
 }

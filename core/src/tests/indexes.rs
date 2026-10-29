@@ -942,7 +942,7 @@ async fn test_built_store_compresses_resident_form() {
     .unwrap()
     .into_array();
     let passed =
-        crate::store::resident::with_compressed_int_children(nullable.clone(), true).unwrap();
+        crate::store::resident::with_compressed_int_children(nullable.clone(), true, None).unwrap();
     assert_eq!(passed.addr(), nullable.addr());
     for column in [
         VarBinViewArray::from_iter_str(["a", "b"]).into_array(),
