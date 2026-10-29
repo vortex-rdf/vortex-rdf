@@ -7,10 +7,10 @@ use std::ops::{BitAnd, Range};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::future::BoxFuture;
-use futures::{FutureExt as _, StreamExt, stream};
-use vortex_array::MaskFuture;
+use futures::{FutureExt as _, StreamExt, future, stream};
 use vortex_array::expr::forms::conjuncts;
-use vortex_array::expr::{BoundExpression, Expression};
+use vortex_array::expr::{BoundExpression, Expression, get_item, root};
+use vortex_array::{ArrayRef, ExecutionCtx, MaskFuture, VortexSessionExecute as _};
 use vortex_buffer::Buffer;
 use vortex_layout::LayoutReader;
 use vortex_mask::{AllOr, Mask};
@@ -18,6 +18,8 @@ use vortex_scan::selection::Selection;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{available_parallelism, spawned_splits};
+#[cfg(test)]
+use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
 use crate::store::scan::file_scans::{ScanDriver, strict_ids};
@@ -232,17 +234,7 @@ fn filter_split_tasks(
         filter,
         bound_conjuncts(file, reader.as_ref(), filter).collect::<Result<_>>()?,
     ));
-    let (mask_selection, bounds) = split_bounds(selection, file.row_count());
-
-    let splits = file.splits()?;
-    let ranges: Vec<Range<u64>> = splits
-        .iter()
-        .filter_map(|split| {
-            let start = split.start.max(bounds.start);
-            let end = split.end.min(bounds.end);
-            (start < end).then_some(start..end)
-        })
-        .collect();
+    let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
     Ok(ranges
         .into_iter()
         .map(|range| {
@@ -263,6 +255,102 @@ fn filter_split_tasks(
 /// One split's filter evaluation, owning everything it reads: the surviving
 /// split-relative mask with the split's range.
 type SplitTask = BoxFuture<'static, Result<(Mask, Range<u64>)>>;
+
+/// The natural file splits `selection` touches, each clamped to its bounds,
+/// in file order, beside the [`Selection`] that narrows each split's mask
+/// ([`split_bounds`]).
+fn selection_split_ranges(
+    file: &NativeStoreFile,
+    selection: &RowSelection,
+) -> Result<(Selection, Vec<Range<u64>>)> {
+    let (mask_selection, bounds) = split_bounds(selection, file.row_count());
+    let ranges = file
+        .splits()?
+        .iter()
+        .filter_map(|split| {
+            let start = split.start.max(bounds.start);
+            let end = split.end.min(bounds.end);
+            (start < end).then_some(start..end)
+        })
+        .collect();
+    Ok((mask_selection, ranges))
+}
+
+/// The rows of `selection` a test admits, chunk by chunk: given one column's
+/// values at a split's surviving rows, the mask of those it admits (one bit
+/// per value, in order).
+pub(crate) type ChunkTest =
+    Arc<dyn Fn(ArrayRef, &mut ExecutionCtx) -> Result<Mask> + Send + Sync + 'static>;
+
+/// The rows of `selection` (exact) that `filter` keeps, every one of them
+/// when there is none, whose value in `column` passes `test`, as ascending
+/// row ids: one pass, split by split. Each split evaluates the filter
+/// ([`evaluate_filter_split`]: zone pruning, then its conjuncts), reads
+/// `column` at the rows the filter left and tests them, and maps the result
+/// back onto the split by rank, so the column is read only where the filter
+/// kept rows and no id list of the filter's own matches is built. The test
+/// runs on the values, never as an expression bound into the file's readers.
+/// Tombstones are not applied: the reads apply them, as for
+/// [`matching_file_rows`].
+pub(crate) async fn kept_file_rows(
+    file: &NativeStoreFile,
+    filter: Option<&Expression>,
+    selection: &RowSelection,
+    column: &'static str,
+    test: ChunkTest,
+) -> Result<Vec<RowId>> {
+    let tasks = match filter {
+        Some(filter) => filter_split_tasks(file, filter, selection, None)?,
+        None => {
+            let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
+            ranges
+                .into_iter()
+                .map(|range| {
+                    let mask = split_start_mask(&mask_selection, None, &range);
+                    future::ready(Ok((mask, range))).boxed()
+                })
+                .collect()
+        }
+    };
+    let reader = file.layout_reader()?;
+    let projection =
+        file.bound_exprs()
+            .bind(QUAD_SCOPE, &get_item(column, root()), reader.dtype())?;
+    let tasks: Vec<SplitTask> = tasks
+        .into_iter()
+        .map(|task| {
+            let reader = Arc::clone(&reader);
+            let projection = projection.clone();
+            let test = Arc::clone(&test);
+            async move {
+                let (mask, range) = task.await?;
+                if mask.all_false() {
+                    return Ok((mask, range));
+                }
+                let values = reader
+                    .projection_evaluation(&range, &projection, MaskFuture::ready(mask.clone()))?
+                    .await?;
+                let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+                let admitted = test(values, &mut ctx)?;
+                Ok((mask.intersect_by_rank(&admitted), range))
+            }
+            .boxed()
+        })
+        .collect();
+    #[cfg(test)]
+    file.note(FileCounter::ColumnStreams, 1);
+    let window = available_parallelism() * 4;
+    let mut results = match ScanDriver::for_row_scan(tasks.len()) {
+        ScanDriver::Inline => stream::iter(tasks).buffered(window).left_stream(),
+        ScanDriver::Spawned => spawned_splits(tasks, window).right_stream(),
+    };
+    let mut ids = Vec::new();
+    while let Some(result) = results.next().await {
+        let (mask, range) = result?;
+        push_kept_ids(&mut ids, &mask, &range);
+    }
+    Ok(ids)
+}
 
 /// `filter` evaluated over every natural file split the selection touches,
 /// each split's surviving mask mapped through `map`: the split loop behind

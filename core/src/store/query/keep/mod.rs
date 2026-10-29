@@ -9,7 +9,8 @@
 //! apply after the pattern and never as scan expressions: in memory
 //! (`memory.rs`) as a binary search inside a sorted run or a pass over the
 //! column's selected rows, on file (`file.rs`) as the located runs of a sorted
-//! subject column or else a pass over the column streamed for the view's rows.
+//! subject column or else one pass over the view's splits, the column read at
+//! the rows the pending filter leaves.
 
 #[cfg(feature = "file-io")]
 mod file;
@@ -25,6 +26,8 @@ use vortex_buffer::Buffer;
 use crate::error::Result;
 use crate::store::Backend;
 use crate::store::VortexRdfStore;
+#[cfg(feature = "file-io")]
+use crate::store::scan::file_filter::ChunkTest;
 use crate::store::schema::{QuadColumn, TermCode};
 
 /// Which term codes a [`keep`](VortexRdfStore::keep) admits in a column.
@@ -69,21 +72,22 @@ impl Keep {
         }
     }
 
-    /// The keep compiled for a row loop.
-    fn test(&self) -> KeepTest<'_> {
+    /// The keep compiled for a row loop over at most `rows` rows.
+    fn test(&self, rows: usize) -> KeepTest {
         match self {
             Keep::Range(lo, hi) => KeepTest::Range(*lo, *hi),
-            Keep::Set(codes) => {
-                let codes = codes.as_slice();
+            Keep::Set(set) => {
+                let codes = set.as_slice();
                 let (Some(&lo), Some(&hi)) = (codes.first(), codes.last()) else {
                     return KeepTest::Range(0, 0);
                 };
                 // A bitmap, a bit per code of the span, while the span is
-                // within 8 bits per member. A span wider than a `usize` (on a
-                // 32-bit target) takes the sorted test, not a wrapped bitmap.
-                let span = usize::try_from(hi - lo)
-                    .ok()
-                    .filter(|&span| span < codes.len().saturating_mul(8));
+                // within 8 bits per member or within the rows' cap
+                // ([`bitmap_span_cap`]), whichever is wider. A span wider
+                // than a `usize` (on a 32-bit target) takes the sorted test,
+                // not a wrapped bitmap.
+                let widest = codes.len().saturating_mul(8).max(bitmap_span_cap(rows));
+                let span = usize::try_from(hi - lo).ok().filter(|&span| span < widest);
                 match span {
                     Some(span) => {
                         let mut bits = vec![0u64; (span + 1).div_ceil(64)];
@@ -94,8 +98,52 @@ impl Keep {
                         }
                         KeepTest::Bitmap { lo, hi, bits }
                     }
-                    None => KeepTest::Sorted(codes),
+                    None => KeepTest::Sorted(set.clone()),
                 }
+            }
+        }
+    }
+
+    /// The keep as a test of chunks of term codes ([`ChunkTest`]) holding at
+    /// most `rows` rows between them: a range by Vortex's `between` kernel
+    /// over the chunk as it is encoded, a set over the decoded codes, each
+    /// tested as [`test`](Self::test) does.
+    #[cfg(feature = "file-io")]
+    fn chunk_test(&self, rows: usize) -> ChunkTest {
+        use std::sync::Arc;
+
+        use vortex_array::arrays::{BoolArray, PrimitiveArray};
+        use vortex_array::expr::{between, lit, root};
+        use vortex_array::scalar_fn::fns::between::{BetweenOptions, StrictComparison};
+        use vortex_buffer::BitBuffer;
+        use vortex_mask::Mask;
+
+        match self {
+            Keep::Range(lo, hi) => {
+                let expr = if hi <= lo {
+                    lit(false)
+                } else {
+                    let inclusive = BetweenOptions {
+                        lower_strict: StrictComparison::NonStrict,
+                        upper_strict: StrictComparison::NonStrict,
+                    };
+                    between(root(), lit(*lo), lit(*hi - 1), inclusive)
+                };
+                Arc::new(move |chunk, ctx| {
+                    let admitted = chunk.apply(&expr)?.execute::<BoolArray>(ctx)?;
+                    Ok(Mask::from_buffer(admitted.into_bit_buffer()))
+                })
+            }
+            Keep::Set(_) => {
+                let test = self.test(rows);
+                Arc::new(move |chunk, ctx| {
+                    let codes = chunk.execute::<PrimitiveArray>(ctx)?;
+                    let codes = codes.as_slice::<TermCode>();
+                    Ok(Mask::from_buffer(BitBuffer::collect_bool(
+                        codes.len(),
+                        |i| test.admits(codes[i]),
+                    )))
+                })
             }
         }
     }
@@ -113,19 +161,41 @@ impl From<Buffer<TermCode>> for Keep {
     }
 }
 
-/// A [`Keep`] as a per-row test: a range compare, a bitmap over a dense set's
-/// span, or a binary search of a sparse one.
-enum KeepTest<'a> {
+/// The widest code span a set's test takes as a bitmap whatever the set's
+/// size: 2^23 codes, a bitmap of 1 MiB. A wider span takes one only while it
+/// is within 8 bits per member, so a few codes spread over a large
+/// dictionary are binary-searched rather than given a bitmap the size of the
+/// dictionary.
+const BITMAP_SPAN_FLOOR: usize = 1 << 23;
+
+/// The codes of span a set's bitmap may cover per row it tests, past 8 bits
+/// per member: 256 bits, 32 bytes, so zeroing the bitmap costs a row less
+/// than one step of the binary search it replaces.
+const BITMAP_SPAN_PER_ROW: usize = 256;
+
+/// The widest span a set of any size takes as a bitmap when it tests `rows`
+/// rows: [`BITMAP_SPAN_PER_ROW`] codes per row, up to [`BITMAP_SPAN_FLOOR`].
+/// A few rows keep a sparse set's binary search rather than pay for a bitmap
+/// many times their size.
+fn bitmap_span_cap(rows: usize) -> usize {
+    rows.saturating_mul(BITMAP_SPAN_PER_ROW)
+        .min(BITMAP_SPAN_FLOOR)
+}
+
+/// A [`Keep`] as a per-row test: a range compare, a bitmap over a set's span
+/// (see [`bitmap_span_cap`]), or a binary search of a set too sparse for
+/// one.
+enum KeepTest {
     Range(TermCode, TermCode),
     Bitmap {
         lo: TermCode,
         hi: TermCode,
         bits: Vec<u64>,
     },
-    Sorted(&'a [TermCode]),
+    Sorted(Buffer<TermCode>),
 }
 
-impl KeepTest<'_> {
+impl KeepTest {
     #[inline]
     fn admits(&self, code: TermCode) -> bool {
         match self {
@@ -138,7 +208,7 @@ impl KeepTest<'_> {
                 let bit = (code - lo) as usize;
                 bits[bit / 64] & (1u64 << (bit % 64)) != 0
             }
-            KeepTest::Sorted(codes) => codes.binary_search(&code).is_ok(),
+            KeepTest::Sorted(codes) => codes.as_slice().binary_search(&code).is_ok(),
         }
     }
 }
@@ -167,10 +237,12 @@ impl VortexRdfStore {
     /// admits are runs of that column, found in the mapped leaf metadata and
     /// intersected with the view's rows, so nothing is read and a pending
     /// filter stays pending (a set of more than one code per sixteen rows of
-    /// the view streams instead). Any other keep resolves the view's rows,
-    /// streams the column for them and tests the keep in memory, never as a
-    /// scan expression. A pending view's deferred row ids (a served match's,
-    /// or a run held for a count) materialize first.
+    /// the view streams instead). Any other keep is one pass over the splits
+    /// the view's rows touch: each evaluates the view's pending filter, reads
+    /// the column at the rows it left and tests them (a range by Vortex's
+    /// `between` kernel, a set against the decoded codes), never as a scan
+    /// expression. A pending view's deferred row ids (a served match's, or a
+    /// run held for a count) materialize first.
     ///
     /// [`match_pattern`]: Self::match_pattern
     pub async fn keep(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
@@ -233,15 +305,28 @@ mod tests {
     #[test]
     fn keep_test_matches_admits() {
         let dense = Keep::set((100..140).step_by(3));
-        let sparse = Keep::set([1, 1_000, 1_000_000]);
+        // Three codes over a span within the bitmap floor, and over one past
+        // it, where three codes are far from 8 bits per member.
+        let spread = Keep::set([1, 1_000, 1_000_000]);
+        let far = BITMAP_SPAN_FLOOR as TermCode + 2;
+        let sparse = Keep::set([1, 1_000, far]);
         let range = Keep::range(10..20);
-        for keep in [&dense, &sparse, &range] {
-            let test = keep.test();
-            for code in (0..1_100).chain([999_999, 1_000_000, 1_000_001]) {
+        let rows = usize::MAX;
+        for keep in [&dense, &spread, &sparse, &range] {
+            let test = keep.test(rows);
+            let edges = [999_999, 1_000_000, 1_000_001, far - 1, far, far + 1];
+            for code in (0..1_100).chain(edges) {
                 assert_eq!(test.admits(code), keep.admits(code), "{keep:?} at {code}");
             }
         }
-        assert!(matches!(dense.test(), KeepTest::Bitmap { .. }));
-        assert!(matches!(sparse.test(), KeepTest::Sorted(_)));
+        assert!(matches!(dense.test(rows), KeepTest::Bitmap { .. }));
+        assert!(matches!(spread.test(rows), KeepTest::Bitmap { .. }));
+        assert!(matches!(sparse.test(rows), KeepTest::Sorted(_)));
+        // Over fewer rows a sparse set's bitmap is capped by them: the spread
+        // set's span of 999,999 codes takes one from 3,907 rows (256 codes
+        // each), while a dense set takes one however few the rows.
+        assert!(matches!(spread.test(3_906), KeepTest::Sorted(_)));
+        assert!(matches!(spread.test(3_907), KeepTest::Bitmap { .. }));
+        assert!(matches!(dense.test(1), KeepTest::Bitmap { .. }));
     }
 }

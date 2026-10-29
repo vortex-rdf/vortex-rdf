@@ -330,7 +330,7 @@ impl VortexRdfStore {
         self.quads.file()?.file.layout_reader().ok()
     }
 
-    /// How many times a keep has streamed a quad column through a scan on
+    /// How many times a keep has read a quad column (one pass per keep) on
     /// this file handle (shared by every view of the file); `None` off-file.
     pub(crate) fn debug_column_streams(&self) -> Option<usize> {
         self.quads

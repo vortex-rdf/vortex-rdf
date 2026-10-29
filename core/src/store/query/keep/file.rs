@@ -1,14 +1,14 @@
 //! The file backend of [`keep`](VortexRdfStore::keep): on a file sorted by
 //! subject a keep on `s` is located as runs in the mapped leaf metadata, so
 //! nothing is read and a pending filter stays pending; any other keep, and
-//! any the location declines, is tested in memory over the column streamed
-//! for the view's rows.
+//! any the location declines, is one pass over the view's splits: the
+//! pending filter, then the column read at the rows it left and tested.
 
 use super::Keep;
 use crate::debug;
 use crate::error::Result;
 use crate::store::persist::native_file::NativeStoreFile;
-use crate::store::scan::{file_filter, file_scans, subject_runs};
+use crate::store::scan::{file_filter, subject_runs};
 use crate::store::schema::QuadColumn;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{FileBase, VortexRdfStore};
@@ -18,13 +18,16 @@ impl VortexRdfStore {
     /// keep on `s` is first located (see [`keep_located`](Self::keep_located)):
     /// the rows it admits are runs of the sorted column, found in the mapped
     /// leaf metadata, so the selection narrows to them and a pending filter
-    /// stays pending. Every other keep, and any the location declines, is
-    /// tested in memory: the view's rows resolve to exact ids (a pending
-    /// filter evaluated, deferred row ids materialized), the column is
-    /// streamed for them and each code is tested. A keep never becomes a
-    /// filter expression: its code list is per query, and every distinct
-    /// expression would pin new entries in vortex's identity-keyed reader
-    /// caches.
+    /// stays pending. Every other keep, and any the location declines, is one
+    /// pass over the splits the view's rows touch
+    /// ([`kept_file_rows`](file_filter::kept_file_rows)): deferred row ids
+    /// materialize, then each split evaluates the pending filter, reads the
+    /// column at the rows it left and tests them (a range by Vortex's
+    /// `between` kernel over the chunk, a set against the decoded codes),
+    /// and the survivors are the narrowed selection, the filter consumed. A
+    /// keep never becomes a filter expression: its code list is per query,
+    /// and every distinct expression would pin new entries in vortex's
+    /// identity-keyed reader caches; the test runs on the values read.
     #[cfg(feature = "file-io")]
     pub(super) async fn keep_file(
         &self,
@@ -53,22 +56,19 @@ impl VortexRdfStore {
                 (filter.clone(), narrowed)
             }
             None => {
-                let selection = match filter {
-                    Some(f) => RowSelection::All
-                        .refine(&file_filter::matching_file_rows(file, Some(f), &selection).await?),
-                    None => selection,
-                };
-                let test = keep.test();
-                let positions =
-                    file_scans::column_positions(file, column.name(), &selection, |code| {
-                        test.admits(code)
-                    })
-                    .await?;
                 let selected = selection.len(row_count);
-                let narrowed = selection.refine_positions(positions, selected);
+                let ids = file_filter::kept_file_rows(
+                    file,
+                    filter.as_ref(),
+                    &selection,
+                    column.name(),
+                    keep.chunk_test(selected),
+                )
+                .await?;
+                let narrowed = selection.narrow_to_ids(ids, selected);
                 debug::step!(
                     t,
-                    "[keep] {:?} tested in memory over {} file rows",
+                    "[keep] {:?} tested in one pass over {} file rows",
                     column,
                     selected
                 );

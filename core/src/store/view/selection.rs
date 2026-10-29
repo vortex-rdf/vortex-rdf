@@ -396,25 +396,25 @@ impl RowSelection {
         RowSelection::Ids(ids)
     }
 
-    /// [`refine`](Self::refine) by the ascending local `positions` that
-    /// survive, out of this selection's `len` rows. A contiguous stretch of
-    /// every row or of a range stays a range (no id list built); every row
-    /// surviving leaves the selection as it is; other survivors become ids.
+    /// Narrow to `ids`, the ascending base rows of this selection's `len`
+    /// that passed a test: every row passing leaves the selection as it is,
+    /// a contiguous stretch of every row or of a range stays a range (no id
+    /// list kept), and other survivors are an id list; an id list stays one
+    /// even over a contiguous stretch.
     #[cfg(feature = "file-io")]
-    pub(crate) fn refine_positions(self, positions: Vec<usize>, len: usize) -> Self {
-        let (Some(&first), Some(&last)) = (positions.first(), positions.last()) else {
+    pub(crate) fn narrow_to_ids(self, ids: Vec<RowId>, len: usize) -> Self {
+        let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
             return RowSelection::empty();
         };
-        if positions.len() == len {
+        if ids.len() == len {
             return self;
         }
-        let contiguous = last - first + 1 == positions.len();
+        let contiguous = last - first + 1 == ids.len() as u64;
         match self {
-            RowSelection::All if contiguous => RowSelection::Range(first as u64..last as u64 + 1),
-            RowSelection::Range(range) if contiguous => {
-                RowSelection::Range(range.start + first as u64..range.start + last as u64 + 1)
+            RowSelection::All | RowSelection::Range(_) if contiguous => {
+                RowSelection::Range(first..last + 1)
             }
-            selection => selection.refine(&Mask::from_indices(len, positions)),
+            _ => RowSelection::Ids(Buffer::from(ids)),
         }
     }
 
@@ -646,31 +646,30 @@ mod tests {
     }
 
     #[test]
-    fn refine_positions_keeps_a_contiguous_stretch_a_range() {
+    fn narrow_to_ids_keeps_a_contiguous_stretch_a_range() {
         // A contiguous stretch of every row, or of a range, is a range.
-        let stretch = RowSelection::All.refine_positions(vec![3, 4, 5], 10);
+        let stretch = RowSelection::All.narrow_to_ids(vec![3, 4, 5], 10);
         assert!(matches!(stretch, RowSelection::Range(ref r) if *r == (3..6)));
-        let within = RowSelection::Range(10..20).refine_positions(vec![3, 4, 5], 10);
+        let within = RowSelection::Range(10..20).narrow_to_ids(vec![13, 14, 15], 10);
         assert!(matches!(within, RowSelection::Range(ref r) if *r == (13..16)));
         // Gaps make ids; an id list stays one even over a contiguous stretch.
         assert_eq!(
-            as_vec(&RowSelection::Range(10..20).refine_positions(vec![1, 2, 5], 10)),
+            as_vec(&RowSelection::Range(10..20).narrow_to_ids(vec![11, 12, 15], 10)),
             vec![11, 12, 15]
         );
-        assert_eq!(
-            as_vec(&RowSelection::Ids(ids(&[2, 4, 6, 8])).refine_positions(vec![1, 2], 4)),
-            vec![4, 6]
-        );
+        let list = RowSelection::Ids(ids(&[2, 4, 5, 6, 8])).narrow_to_ids(vec![4, 5, 6], 5);
+        assert!(matches!(list, RowSelection::Ids(_)));
+        assert_eq!(as_vec(&list), vec![4, 5, 6]);
         // Every row surviving changes nothing; none survives empties it.
         assert!(matches!(
-            RowSelection::Range(10..14).refine_positions(vec![0, 1, 2, 3], 4),
+            RowSelection::Range(10..14).narrow_to_ids(vec![10, 11, 12, 13], 4),
             RowSelection::Range(ref r) if *r == (10..14)
         ));
         assert!(matches!(
-            RowSelection::All.refine_positions(vec![0, 1, 2], 3),
+            RowSelection::All.narrow_to_ids(vec![0, 1, 2], 3),
             RowSelection::All
         ));
-        assert!(RowSelection::All.refine_positions(vec![], 4).is_empty(4));
+        assert!(RowSelection::All.narrow_to_ids(vec![], 4).is_empty(4));
     }
 
     #[test]

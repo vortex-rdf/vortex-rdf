@@ -156,8 +156,8 @@ impl VortexRdfStore {
         use vortex_array::arrays::PrimitiveArray;
 
         let col = struct_arr.unmasked_field_by_name(column.name())?;
-        let test = keep.test();
         let base_len = base.len();
+        let test = keep.test(selection.len(base_len));
         if let Some(prim) = cached_code_primitive(col) {
             let codes = prim.as_slice::<TermCode>();
             let kept = selection.filter_rows(base_len, |row| test.admits(codes[row]));
@@ -183,7 +183,7 @@ impl VortexRdfStore {
 }
 
 /// The positions of `codes` the keep admits, as a mask over them.
-fn keep_mask(codes: &[TermCode], test: &KeepTest<'_>) -> vortex_mask::Mask {
+fn keep_mask(codes: &[TermCode], test: &KeepTest) -> vortex_mask::Mask {
     vortex_mask::Mask::from_indices(
         codes.len(),
         (0..codes.len()).filter(|&i| test.admits(codes[i])),
@@ -240,7 +240,7 @@ fn keep_by_pieces(
     column: &ArrayRef,
     probe: &SortedProbe<'_>,
     selection: &RowSelection,
-    test: &KeepTest<'_>,
+    test: &KeepTest,
     base_len: usize,
     piece_rows: usize,
 ) -> Result<RowSelection> {
@@ -332,7 +332,7 @@ impl PieceRows<'_> {
     fn admit_decoded(
         &self,
         kept: &mut Vec<RowId>,
-        test: &KeepTest<'_>,
+        test: &KeepTest,
         codes: &[TermCode],
         first: usize,
     ) {
@@ -354,7 +354,7 @@ impl PieceRows<'_> {
 
     /// Push onto `kept` the selected rows whose code the keep's `test`
     /// admits, reading it row by row through `probe`.
-    fn admit_probed(&self, kept: &mut Vec<RowId>, test: &KeepTest<'_>, probe: &SortedProbe<'_>) {
+    fn admit_probed(&self, kept: &mut Vec<RowId>, test: &KeepTest, probe: &SortedProbe<'_>) {
         match self {
             PieceRows::Stretch(rows) => kept.extend(
                 rows.clone()
@@ -542,7 +542,7 @@ mod tests {
             .flatten()
             .expect("the column has a probe")
             .probe();
-        let test = keep.test();
+        let test = keep.test(selection.len(base.len()));
         selection.filter_rows(base.len(), |row| test.admits(probe.value_at(row)))
     }
 
@@ -638,7 +638,7 @@ mod tests {
                     Keep::set([1, top / 2, top - 1]),
                     Keep::range(top..top + 5),
                 ] {
-                    let test = keep.test();
+                    let test = keep.test(ROWS);
                     let brute = |selection: &RowSelection| -> Vec<u64> {
                         rows_of(selection, ROWS)
                             .into_iter()
@@ -702,7 +702,7 @@ mod tests {
         let col = struct_arr.unmasked_field_by_name("p").unwrap();
         let probe = probes.by_name(&base, "p").flatten().unwrap().probe();
         let keep = Keep::range(0..7);
-        let test = keep.test();
+        let test = keep.test(ROWS);
         let run = |selection: &RowSelection, piece_rows: usize| {
             let (pieces, probed) = (decoded_pieces(), probed_rows());
             keep_by_pieces(col, probe, selection, &test, ROWS, piece_rows).unwrap();
