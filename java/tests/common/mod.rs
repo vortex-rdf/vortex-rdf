@@ -50,6 +50,7 @@ pub fn quads(count: usize) -> Vec<Quad> {
 }
 
 pub struct Built {
+    /// The store's name, and its file's: `<name>.vortex`.
     pub name: &'static str,
     pub layout: LayoutStrategy,
     pub indexes: Vec<IndexType>,
@@ -63,12 +64,12 @@ pub fn builds() -> Vec<Built> {
             indexes: vec![],
         },
         Built {
-            name: "dictionary+copy",
+            name: "copy",
             layout: LayoutStrategy::Dictionary,
             indexes: vec![IndexType::SecondaryByCopy],
         },
         Built {
-            name: "dictionary+reference",
+            name: "reference",
             layout: LayoutStrategy::Dictionary,
             indexes: vec![IndexType::SecondaryByReference],
         },
@@ -82,7 +83,7 @@ pub fn builds() -> Vec<Built> {
 
 /// Writes the store and returns its path.
 pub fn write(dir: &std::path::Path, built: &Built, quads: &[Quad]) -> String {
-    let path = dir.join(format!("{}.vortex", built.name.replace('+', "-")));
+    let path = dir.join(format!("{}.vortex", built.name));
     let raw: Vec<_> = quads
         .iter()
         .map(|q| {
