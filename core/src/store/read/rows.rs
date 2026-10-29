@@ -234,13 +234,13 @@ impl VortexRdfStore {
         if let Backend::File(base) = &self.quads.backend {
             if let Some(masks) = &base.masks {
                 let primary = self.layout.strategy().primary_column_names();
-                return Self::masked_codes(&base.file, primary, masks)
+                return Self::masked_codes(&base.file, primary, masks, base.filter.as_ref())
                     .await
                     .map(Some);
             }
             let (scope, read) = self.file_read(base, &schema::PRIMARY_COLUMNS).await?;
             if let Some(masks) = scope.masks_first(&read).await? {
-                return Self::masked_codes(scope.file, scope.by_id_columns, &masks)
+                return Self::masked_codes(scope.file, scope.by_id_columns, &masks, scope.filter)
                     .await
                     .map(Some);
             }
@@ -401,25 +401,67 @@ impl VortexRdfStore {
         file: &Arc<NativeStoreFile>,
         columns: &[&'static str],
         masks: &SplitMasks,
+        filter: Option<&Expression>,
     ) -> Result<[Buffer<TermCode>; 4]> {
+        // PROTO: the columns the filter pins to one code are not read: every
+        // row the masks keep holds that code there.
+        let pinned: Vec<(String, u64)> = filter
+            .and_then(file_exprs::eq_code_pairs)
+            .unwrap_or_default();
+        let read_columns: Vec<&'static str> = columns
+            .iter()
+            .copied()
+            .filter(|c| !pinned.iter().any(|(name, _)| name == c))
+            .collect();
+        let kept = masks.kept();
+        let fill = |codes: Vec<Buffer<TermCode>>| -> Option<[Buffer<TermCode>; 4]> {
+            let mut codes = codes.into_iter();
+            let mut read: Vec<(&'static str, Buffer<TermCode>)> = Vec::new();
+            for &c in &read_columns {
+                read.push((c, codes.next()?));
+            }
+            let mut column = |name: &str| -> Option<Buffer<TermCode>> {
+                if let Some((_, code)) = pinned.iter().find(|(n, _)| n == name) {
+                    return Some(Buffer::full(*code, kept));
+                }
+                let at = read.iter().position(|(c, _)| *c == name)?;
+                Some(std::mem::take(&mut read[at].1))
+            };
+            Some([
+                column(schema::COL_S)?,
+                column(schema::COL_P)?,
+                column(schema::COL_O)?,
+                column(schema::COL_G)?,
+            ])
+        };
+        if read_columns.is_empty()
+            && let Some(codes) = fill(Vec::new())
+        {
+            return Ok(codes);
+        }
         let read = MaskedRead::of(file, masks)?;
         if read != MaskedRead::Project {
             let ids = masks.first_ids(usize::MAX);
             if read == MaskedRead::Points
                 && let Some(codes) =
-                    file_reads::file_point_codes(file, columns, None, ids.clone()).await?
-                && let Some(codes) = primary_order(columns, codes)
+                    file_reads::file_point_codes(file, &read_columns, None, ids.clone()).await?
+                && let Some(codes) = fill(codes)
             {
                 return Ok(codes);
             }
-            if let Some(rows) = file_reads::take_file_rows(file, columns, &ids).await?
-                && let Some(codes) = primary_order(columns, extract_codes(rows, columns)?)
+            if let Some(rows) = file_reads::take_file_rows(file, &read_columns, &ids).await?
+                && let Some(codes) = fill(extract_codes(rows, &read_columns)?)
             {
                 return Ok(codes);
             }
         }
-        let rows = file_reads::masked_projection(file, &schema::PRIMARY_COLUMNS, masks).await?;
-        primary_codes(rows)
+        let rows = file_reads::masked_projection(file, &read_columns, masks).await?;
+        match fill(extract_codes(rows, &read_columns)?) {
+            Some(codes) => Ok(codes),
+            None => Err(crate::error::VortexRdfError::InvalidOperation(
+                "a masked read lost a primary column".into(),
+            )),
+        }
     }
 
     /// Every live quad this view covers, decoded to raw N-Triples term strings

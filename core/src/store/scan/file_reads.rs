@@ -369,6 +369,36 @@ pub(crate) fn masked_split_tasks(
     Ok((dtype, tasks))
 }
 
+/// PROTO: `rows` (a struct of some of `columns`) with every column of
+/// `columns` in that order, a column `pinned` names filled with its code.
+pub(crate) fn with_pinned(
+    rows: ArrayRef,
+    columns: &[&'static str],
+    pinned: &[(String, u64)],
+) -> Result<ArrayRef> {
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::ConstantArray;
+    use vortex_array::arrays::struct_::StructArrayExt;
+    use vortex_array::scalar::Scalar;
+    if pinned.is_empty() {
+        return Ok(rows);
+    }
+    let len = rows.len();
+    let struct_arr = crate::store::array::into_struct_array(rows)?;
+    let mut children = Vec::with_capacity(columns.len());
+    for &name in columns {
+        let child = match pinned.iter().find(|(n, _)| n == name) {
+            Some((_, code)) => ConstantArray::new(Scalar::from(*code), len).into_array(),
+            None => struct_arr
+                .unmasked_field_by_name(name)
+                .map_err(crate::error::VortexRdfError::Vortex)?
+                .clone(),
+        };
+        children.push(child);
+    }
+    Ok(named_struct(columns, children, len)?.into_array())
+}
+
 /// The rows of `columns` that `masks` keep, each split with a match projected
 /// at its mask ([`masked_split_tasks`]), in one array in split order, the
 /// splits driven as [`read_all_rows`](super::file_scans::read_all_rows)

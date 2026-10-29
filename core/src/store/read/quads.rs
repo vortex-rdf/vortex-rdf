@@ -250,14 +250,16 @@ impl VortexRdfStore {
         if mode == QuadRead::Collected
             && let Some(masks) = &base.masks
         {
-            return self.masked_chunks(file, masks, tail).await;
+            return self
+                .masked_chunks(file, masks, base.filter.as_ref(), tail)
+                .await;
         }
         let primary = self.layout.strategy().primary_column_names();
         let (scope, read) = self.file_read(base, primary).await?;
         if mode == QuadRead::Collected
             && let Some(masks) = scope.masks_first(&read).await?
         {
-            return self.masked_chunks(file, &masks, tail).await;
+            return self.masked_chunks(file, &masks, scope.filter, tail).await;
         }
         match scope.rows(read).await? {
             // Rows read by id decode as one chunk, with no scan machinery.
@@ -286,19 +288,47 @@ impl VortexRdfStore {
         &self,
         file: &Arc<NativeStoreFile>,
         masks: &SplitMasks,
+        filter: Option<&vortex_array::expr::Expression>,
         tail: Vec<Result<T>>,
     ) -> Result<Chunks<T>> {
         let primary = self.layout.strategy().primary_column_names();
+        // PROTO: the columns the filter pins are not read, but filled with
+        // their code.
+        let pinned: Arc<[(String, u64)]> = filter
+            .and_then(crate::store::scan::file_exprs::eq_code_pairs)
+            .unwrap_or_default()
+            .into();
+        let read_columns: Vec<&'static str> = primary
+            .iter()
+            .copied()
+            .filter(|c| !pinned.iter().any(|(name, _)| name == c))
+            .collect();
         let read = MaskedRead::of(file, masks)?;
         if read == MaskedRead::Points {
             let ids = masks.first_ids(usize::MAX);
-            if let Some(rows) = file_reads::file_point_rows(file, primary, None, ids).await? {
+            if let Some(rows) = file_reads::file_point_rows(file, &read_columns, None, ids).await? {
+                let rows = file_reads::with_pinned(rows, primary, &pinned)?;
                 let chunk = T::decode_async(&self.layout, &rows).await;
                 return Ok(with_tail(stream::iter([chunk]), tail));
             }
         }
         let take = read != MaskedRead::Project;
-        let (_, tasks) = file_reads::masked_split_tasks(file, primary, masks, take)?;
+        let (_, tasks) = file_reads::masked_split_tasks(file, &read_columns, masks, take)?;
+        let tasks: Vec<file_reads::SplitRead> = tasks
+            .into_iter()
+            .map(|task| {
+                let pinned = Arc::clone(&pinned);
+                async move {
+                    let rows = task.await?;
+                    rows.map(|rows| {
+                        file_reads::with_pinned(rows, primary, &pinned)
+                            .map_err(|e| vortex_error::vortex_err!("{e}"))
+                    })
+                    .transpose()
+                }
+                .boxed()
+            })
+            .collect();
         let spawn = tasks.len() > 1 && tokio::runtime::Handle::try_current().is_ok();
         let window = 4 * available_parallelism();
         let layout = self.layout.clone();
