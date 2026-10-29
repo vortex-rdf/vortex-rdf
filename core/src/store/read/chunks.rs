@@ -241,6 +241,12 @@ impl VortexRdfStore {
         batch_rows: usize,
     ) -> Result<RowChunkStream> {
         let (scope, read) = self.file_read(base, columns).await?;
+        // PROTOTYPE (item 2): a pending filter the reads by id leave to the
+        // restricted scan is evaluated to its split masks first; the rows
+        // they keep then stream split by split, only `columns` read.
+        if let Some(masks) = scope.masks_first(&read).await? {
+            return masked_chunk_stream(&base.file, columns, &masks, batch_rows).await;
+        }
         let ids = match read {
             ExactRead::Take(ids) => ids,
             read => return scope.rows(read).await?.chunks(batch_rows),
@@ -285,6 +291,58 @@ impl VortexRdfStore {
             .into_iter()
             .flat_map(move |rows| rechunk(rows, batch_rows)))
     }
+}
+
+/// PROTOTYPE (item 2): the rows `masks` keep as a chunk stream of `columns`,
+/// read as [`MaskedRead`] chooses: point by point as one chunk, taken one
+/// window of ids per pull, or each split with a match projected at its mask
+/// as its read completes, every chunk cut to `batch_rows`.
+#[cfg(feature = "file-io")]
+async fn masked_chunk_stream(
+    file: &Arc<crate::store::persist::native_file::NativeStoreFile>,
+    columns: &[&'static str],
+    masks: &crate::store::scan::file_filter::SplitMasks,
+    batch_rows: usize,
+) -> Result<RowChunkStream> {
+    use crate::store::scan::file_reads;
+    use crate::store::scan::read_plan::MaskedRead;
+
+    let read = MaskedRead::of(file, masks)?;
+    if read != MaskedRead::Project {
+        let ids = masks.first_ids(usize::MAX);
+        if read == MaskedRead::Points
+            && let Some(rows) =
+                file_reads::file_point_rows(file, columns, None, ids.clone()).await?
+        {
+            return Ok(stream::iter(rechunk(rows, batch_rows)).boxed());
+        }
+        let file = Arc::clone(file);
+        let columns: Arc<[&'static str]> = Arc::from(columns);
+        return Ok(stream::iter(id_windows(Buffer::from(ids), batch_rows))
+            .then(move |window| {
+                let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
+                async move {
+                    take_file_rows(&file, &columns, &window)
+                        .await?
+                        .ok_or_else(|| {
+                            VortexRdfError::Vortex(vortex_error::vortex_err!("a take declined"))
+                        })
+                }
+            })
+            .boxed());
+    }
+    let (_, tasks) = file_reads::masked_split_tasks(file, columns, masks, false)?;
+    Ok(stream::iter(tasks)
+        .buffered(crate::io::read::available_parallelism())
+        .flat_map(move |split| {
+            let chunks: Vec<Result<ArrayRef>> = match split {
+                Ok(Some(rows)) => rechunk(rows, batch_rows).collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => vec![Err(e.into())],
+            };
+            stream::iter(chunks)
+        })
+        .boxed())
 }
 
 /// An in-memory view's base rows as the chunk sources cut them.
