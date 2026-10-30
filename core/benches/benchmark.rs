@@ -839,6 +839,38 @@ fn narrow_filter_codes(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
+/// A language range and a case-folded text test over 4,096 candidate codes
+/// of the literal store's in-memory dictionary, most of them literals:
+/// `lang_matches` compares the tag of every tagged literal it reads,
+/// `contains_lower` the lower-cased text of every string literal.
+#[divan::bench(args = ["lang_matches", "contains_lower"], sample_count = QUERY_SAMPLES)]
+fn narrow_filter_codes_text(bencher: divan::Bencher, kind: &str) {
+    use vortex_rdf_core::{CaseMap, TermPredicate, TextOptions};
+    let store = cached_literal_store(bench_size());
+    let predicate = match kind {
+        "lang_matches" => TermPredicate::parse("lang_matches", "EN").unwrap(),
+        _ => {
+            let options = TextOptions {
+                case: Some(CaseMap::Lower),
+                ..TextOptions::default()
+            };
+            TermPredicate::parse_with("contains", "\"value\"", &options).unwrap()
+        }
+    };
+    let dict = store.dict_reader().expect("dictionary handle");
+    let step = (dict.len() / 4_096).max(1);
+    let codes: Vec<vortex_rdf_core::TermCode> = (0..dict.len() as vortex_rdf_core::TermCode)
+        .step_by(step)
+        .take(4_096)
+        .collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let (passed, undecided) = dict.filter_codes(&predicate, &codes).await.expect("filter");
+            black_box((passed.len(), undecided.len()))
+        })
+    });
+}
+
 /// A batch of 64 subject probes in one `match_many`, gathered: the
 /// nested-loop join's shape, where a file-backed store overlaps the probes'
 /// reads.

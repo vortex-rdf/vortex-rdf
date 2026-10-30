@@ -3,6 +3,7 @@
 //! reads them, and the text of a term each test reads.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 use crate::common::vocab::{XSD, XSD_STRING};
 use crate::error::{Result, VortexRdfError};
@@ -197,6 +198,12 @@ fn rdflib_normalizes(dt: &str) -> bool {
             .is_some_and(|local| RDFLIB_NORMALIZED_XSD.contains(&local))
 }
 
+thread_local! {
+    /// The case-mapped text of the candidate [`TextPredicate::eval`] tests,
+    /// a buffer reused from candidate to candidate.
+    static CASE_MAPPED: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
 impl TextPredicate {
     /// The term's text and language under `string()` (`as_str` off) or
     /// `STR()` (on); `Err(verdict)` when there is no text (`False`: rdflib
@@ -242,25 +249,38 @@ impl TextPredicate {
             Ok(text) => text,
             Err(verdict) => return verdict,
         };
-        let text = match self.case {
-            None => text,
-            Some(_) if !text.is_ascii() => return Verdict::Unknown,
-            Some(CaseMap::Lower) => Cow::Owned(text.to_ascii_lowercase()),
-            Some(CaseMap::Upper) => Cow::Owned(text.to_ascii_uppercase()),
-        };
+        match self.case {
+            None => self.test_text(&text, lang),
+            Some(_) if !text.is_ascii() => Verdict::Unknown,
+            // The case-mapped text goes into one buffer per thread, reused
+            // from candidate to candidate.
+            Some(case) => CASE_MAPPED.with_borrow_mut(|mapped| {
+                mapped.clear();
+                mapped.push_str(&text);
+                match case {
+                    CaseMap::Lower => mapped.make_ascii_lowercase(),
+                    CaseMap::Upper => mapped.make_ascii_uppercase(),
+                }
+                self.test_text(mapped, lang)
+            }),
+        }
+    }
+
+    /// The test over a term's `text` (case-mapped already) and language.
+    fn test_text(&self, text: &str, lang: Option<&str>) -> Verdict {
         let test = |constant: &TextConstant, holds: fn(&str, &str) -> bool| match constant {
             TextConstant::NotAString => Verdict::False,
             TextConstant::Text {
                 lang: Some(tag), ..
             } if lang != Some(tag.as_str()) => Verdict::False,
-            TextConstant::Text { text: c, .. } => Verdict::from(holds(&text, c)),
+            TextConstant::Text { text: c, .. } => Verdict::from(holds(text, c)),
         };
         match &self.test {
             TextTest::Prefix(prefix) => Verdict::from(text.starts_with(prefix.as_str())),
             TextTest::Contains(c) => test(c, |t, c| t.contains(c)),
             TextTest::StartsWith(c) => test(c, |t, c| t.starts_with(c)),
             TextTest::EndsWith(c) => test(c, |t, c| t.ends_with(c)),
-            TextTest::Regex(regex) => regex.eval(&text),
+            TextTest::Regex(regex) => regex.eval(text),
         }
     }
 
