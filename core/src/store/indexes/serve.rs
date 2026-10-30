@@ -220,11 +220,13 @@ impl InMemoryServePlan {
             return Some(None);
         };
         let rid = self.probes.by_name(&self.array, COL_RID).flatten()?.probe();
+        let mut rids = vec![0; self.range.len()];
+        rid.read_into(self.range.start, &mut rids);
         // A row id no `usize` holds declines to the slice path, whose
         // decode reports it.
         let mut live = Vec::with_capacity(self.range.len());
-        for pos in self.range.clone() {
-            let row = super::row_index(super::base_row(rid.value_at(pos))).ok()?;
+        for (pos, rid) in self.range.clone().zip(rids) {
+            let row = super::row_index(super::base_row(rid)).ok()?;
             if !deleted.value(row) {
                 live.push(pos);
             }
@@ -232,21 +234,29 @@ impl InMemoryServePlan {
         Some(Some(live))
     }
 
-    /// A small run's live rows read point by point at the run's global
-    /// positions through the component's cached probes, with no slice: the
-    /// four `(s, p, o, g)` columns, each as the `u64`s its probe reads, which
-    /// are the child's codes (a code column is `u64`, and a probe reads every
-    /// width as one). The point read behind both the decoded and the
-    /// code-payload serve. `None` declines (a wide run, or a column no probe
-    /// resolves, such as a string copy's); the caller keeps its slice or
-    /// gather path.
+    /// A small run's live rows read at the run's global positions through the
+    /// component's cached probes, with no slice: the four `(s, p, o, g)`
+    /// columns, each as the `u64`s its probe reads, which are the child's
+    /// codes (a code column is `u64`, and a probe reads every width as one),
+    /// each run of consecutive live positions in one pass. The point read
+    /// behind both the decoded and the code-payload serve. `None` declines (a
+    /// wide run, or a column no probe resolves, such as a string copy's); the
+    /// caller keeps its slice or gather path.
     fn live_point_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
         let live = self.live_positions(deleted)?;
         let read = |name: &str| -> Option<Buffer<TermCode>> {
             let probe = self.probes.by_name(&self.array, name).flatten()?.probe();
             Some(match &live {
-                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos))),
-                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos))),
+                None => {
+                    let mut codes = vec![0; self.range.len()];
+                    probe.read_into(self.range.start, &mut codes);
+                    Buffer::from(codes)
+                }
+                Some(live) => {
+                    let mut codes = vec![0; live.len()];
+                    probe.read_at(live, &mut codes);
+                    Buffer::from(codes)
+                }
             })
         };
         let [s, p, o, g] = PRIMARY_COLUMNS;

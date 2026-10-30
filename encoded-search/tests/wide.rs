@@ -8,7 +8,10 @@
 
 mod common;
 
-use common::{BITPACKING, FOR, canonical_index_bounds, compress_default, compress_with, session};
+use common::{
+    BITPACKING, FOR, assert_bulk_reads, canonical_index_bounds, compress_default, compress_with,
+    session,
+};
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute as _};
 use vortex_btrblocks::schemes::integer;
@@ -52,6 +55,7 @@ fn assert_probe(arr: &ArrayRef, data: &[u64], expect_kinds: &[NodeKind]) {
     for (i, &v) in data.iter().enumerate() {
         assert_eq!(probe.value_at(i), v, "value_at({i})");
     }
+    assert_bulk_reads(&probe, data);
 }
 
 /// Codes of a sorted column: runs of `run` rows over consecutive codes from

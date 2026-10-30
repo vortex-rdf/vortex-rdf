@@ -84,7 +84,8 @@ async fn rid_point_reads(
         return Ok(None);
     };
     // A point-read run is at most `POINT_GATHER_MAX_ROWS` wide.
-    let Some(mut ids) = values_at(file, &chunks, range).await? else {
+    let rows: Vec<u64> = range.collect();
+    let Some(mut ids) = values_at(file, &chunks, &rows).await? else {
         return Ok(None);
     };
     for id in &mut ids {

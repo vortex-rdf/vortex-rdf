@@ -10,8 +10,8 @@
 mod common;
 
 use common::{
-    BITPACKING, FOR, canonical_index_bounds, compress_array_with, compress_default, compress_with,
-    session,
+    BITPACKING, FOR, assert_bulk_reads, canonical_index_bounds, compress_array_with,
+    compress_default, compress_with, session,
 };
 use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, SliceArray};
 use vortex_array::scalar::Scalar;
@@ -195,6 +195,7 @@ fn assert_probe_with_budget(
     if let Some(last) = data.len().checked_sub(1) {
         assert_eq!(probe.value_at(last), u64::from(data[last]));
     }
+    assert_bulk_reads(&probe, data);
 }
 
 /// Deterministic generator for the randomized sweeps.

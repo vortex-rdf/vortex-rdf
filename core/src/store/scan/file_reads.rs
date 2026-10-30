@@ -148,7 +148,7 @@ impl PointRows {
         for (handle, column) in self.handles.iter().zip(columns) {
             let values = match self.constant(column) {
                 Some(code) => vec![code; self.live.len()],
-                None => match values_at(file, handle, self.live.iter().copied()).await? {
+                None => match values_at(file, handle, &self.live).await? {
                     Some(values) => values,
                     None => return Ok(None),
                 },
@@ -159,26 +159,19 @@ impl PointRows {
     }
 }
 
-/// The values of `handle`'s column at `rows`, in order, read point by point
-/// through its chunk probes (chunk fetches cached on `file`): the one loop
-/// every point read by row runs. `None` when a chunk the reads reach has no
-/// probe.
+/// The values of `handle`'s column at `rows`, in order, read through its
+/// chunk probes (chunk fetches cached on `file`), each leaf found once for
+/// the rows that follow one another in it and each run of consecutive rows
+/// read in one pass: the one read every point read by row makes. `None` when
+/// a chunk the reads reach has no probe.
 pub(crate) async fn values_at(
     file: &NativeStoreFile,
     handle: &vortex_rdf_encoded_search::ColumnChunks,
-    rows: impl IntoIterator<Item = u64>,
+    rows: &[u64],
 ) -> Result<Option<Vec<u64>>> {
-    let source = file.segment_source();
-    let session = file.session();
-    let rows = rows.into_iter();
-    let mut values = Vec::with_capacity(rows.size_hint().0);
-    for row in rows {
-        match handle.value_at(row, &source, session).await? {
-            Some(value) => values.push(value),
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(values))
+    Ok(handle
+        .values_at(rows, &file.segment_source(), file.session())
+        .await?)
 }
 
 /// A column's chunk-probe handle beside the code its rows must read.
@@ -197,7 +190,7 @@ async fn rows_reading(
         if live.is_empty() {
             break;
         }
-        let Some(values) = values_at(file, handle, live.iter().copied()).await? else {
+        let Some(values) = values_at(file, handle, &live).await? else {
             return Ok(None);
         };
         live = (live.into_iter().zip(values))

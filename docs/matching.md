@@ -578,7 +578,7 @@ Each stage in the code, and where the details are below:
 | 2 · secondary-index routing | [`matching.rs:638-651`](../core/src/store/query/matching.rs#L638-L651 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L764) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:664-734`](../core/src/store/query/matching.rs#L664-L734 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L20) | [§7.3](#73-what-ends-up-on-the-view) |
 | 4 · selection and serve plan | [`matching.rs:657-658`](../core/src/store/query/matching.rs#L657-L658 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L916) and [`matching.rs:742-756`](../core/src/store/query/matching.rs#L742-L756 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L838), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L702) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
-| 5 · filter at sparse ids | [`matching.rs:758-773`](../core/src/store/query/matching.rs#L758-L773 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L216) | [§7.3](#73-what-ends-up-on-the-view) |
+| 5 · filter at sparse ids | [`matching.rs:758-773`](../core/src/store/query/matching.rs#L758-L773 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L209) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -658,7 +658,7 @@ read touches one zone rather than the file.
   When the selection is exact row ids at most one per `POINT_READ_ROWS` (256)
   rows of the splits holding them, stage 5 reads the filter's columns at those
   ids through the chunk probes, keeps the ids that pass and leaves no filter
-  ([`point_filter_ids`](../core/src/store/scan/file_reads.rs#L216)) — the
+  ([`point_filter_ids`](../core/src/store/scan/file_reads.rs#L209)) — the
   in-memory residual step ([§6.3](#63-residual-column-filtering)) on file. A
   denser selection, or a filter that is not code equalities, keeps the filter.
 - **Selection** — the first of these that applies: an index's row ids folded
@@ -793,12 +793,12 @@ probe-incompatible.
 **On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L47)
 binary-searches the value column's chunk probes (sorted child + integer probe
 required). A located run's ids are `Lazy`
-([`read_located_rids`](../core/src/store/indexes/file.rs#L164)): a count
+([`read_located_rids`](../core/src/store/indexes/file.rs#L165)): a count
 takes the run's width, a window reads only its own rows, and materialized, a
 run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/file.rs#L78)
 and a wider one a rid-only scan restricted to the range — neither pays filter
 evaluation. Anything the probes decline falls back to
-[`scan_index_row_ids`](../core/src/store/indexes/file.rs#L108), an eager
+[`scan_index_row_ids`](../core/src/store/indexes/file.rs#L109), an eager
 pushed-down `val == probe` scan that answers whatever the order.
 
 **Example.** For the running example `index:ref-o` holds
@@ -823,7 +823,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L609) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::scan`](../core/src/store/indexes/file.rs#L546)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L602) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::scan`](../core/src/store/indexes/file.rs#L547)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -1011,7 +1011,7 @@ than a take, each split projected at its own mask, the filter not evaluated
 again. Each read reads only the columns the filter leaves free: every row
 the masks keep holds the bound code in each column the filter pins, so the
 read fills those in, a constant column of a quad read or a repeated code of
-a code read ([`PinnedCodes`](../core/src/store/scan/file_reads.rs#L395)). A
+a code read ([`PinnedCodes`](../core/src/store/scan/file_reads.rs#L388)). A
 point read of fewer than 64 rows (`PIN_POINT_MIN_ROWS`) reads every column
 instead: filling costs it a few thousand instructions, more than the values
 so few rows skip. `quads_vec` and `shared_quads_vec` read and decode a take
@@ -1021,7 +1021,7 @@ than one and a tokio runtime is current.
 The streams (`quads()` and its twins, `raw_quad_chunks`, `row_chunks`,
 `code_chunks`) read such a view by its masks first too, but a split at a time
 as they are pulled
-([`masks_first_split_reads`](../core/src/store/scan/file_reads.rs#L503)): each
+([`masks_first_split_reads`](../core/src/store/scan/file_reads.rs#L496)): each
 split's future evaluates the filter over the split, then reads the rows its
 mask keeps as `MaskedRead` chooses for that split alone, so a stream stopped
 early has evaluated only the splits it reached. The futures run under the
