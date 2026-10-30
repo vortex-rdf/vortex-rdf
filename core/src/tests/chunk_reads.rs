@@ -4,7 +4,8 @@
 use std::collections::BTreeSet;
 
 use super::*;
-use crate::store::{CodePattern, TermCode};
+use crate::store::read::chunks::chunk_path_hooks::{self, ForceLegacy};
+use crate::store::{CodePattern, QuadColumn, TermCode};
 use oxrdf::BlankNode;
 use vortex_buffer::Buffer;
 
@@ -149,4 +150,136 @@ async fn decode_row_chunk_refuses_a_dictionary_store() {
         error.contains("decode_row_chunk decodes string layouts"),
         "{error}"
     );
+}
+
+/// Drains `view`'s `code_chunks` over `columns` at `batch_rows` as it reads
+/// now and on its pre-fix path ([`ForceLegacy`]): the same rows, in the same
+/// order.
+async fn assert_code_chunks_equal_legacy<const N: usize>(
+    view: &VortexRdfStore,
+    columns: &[QuadColumn; N],
+    batch_rows: usize,
+    tag: &str,
+) {
+    let (rows, _) = collect_code_chunks(view, columns, batch_rows).await;
+    let legacy = {
+        let _legacy = ForceLegacy::set();
+        assert!(chunk_path_hooks::legacy());
+        collect_code_chunks(view, columns, batch_rows).await.0
+    };
+    assert!(!chunk_path_hooks::legacy());
+    assert_eq!(
+        rows, legacy,
+        "{tag}: code_chunks {columns:?} at {batch_rows}"
+    );
+}
+
+/// [`assert_code_chunks_equal_legacy`] for `row_chunks`.
+async fn assert_row_chunks_equal_legacy(view: &VortexRdfStore, batch_rows: usize, tag: &str) {
+    let rows = struct_chunk_codes(&collect_row_chunks(view, batch_rows).await);
+    let legacy = {
+        let _legacy = ForceLegacy::set();
+        struct_chunk_codes(&collect_row_chunks(view, batch_rows).await)
+    };
+    assert_eq!(rows, legacy, "{tag}: row_chunks at {batch_rows}");
+}
+
+/// The patterns the legacy matrix reads on `modular_quads(20_000, 7, 11)`:
+/// one subject, a predicate and an object each bound alone, the default
+/// graph (every row), the predicate and object together, the subject with
+/// its predicate, and nothing bound.
+const LEGACY_PATTERNS: [(&str, [Option<&str>; 4]); 7] = [
+    ("S", [Some("<http://example.org/s1234>"), None, None, None]),
+    ("P", [None, Some("<http://example.org/p2>"), None, None]),
+    ("O", [None, None, Some("\"object 3\""), None]),
+    ("G", [None, None, None, Some("")]),
+    (
+        "PO",
+        [
+            None,
+            Some("<http://example.org/p2>"),
+            Some("\"object 3\""),
+            None,
+        ],
+    ),
+    (
+        "SP",
+        [
+            Some("<http://example.org/s1234>"),
+            Some("<http://example.org/p2>"),
+            None,
+            None,
+        ],
+    ),
+    ("all", [None; 4]),
+];
+
+/// Every chunk stream reads what its pre-fix path reads, row for row, across
+/// the shapes a view takes: each index set, both residencies, bound
+/// positions served or filtered, tombstones, and a window.
+#[tokio::test]
+async fn chunk_reads_equal_the_legacy_paths() {
+    let quads = modular_quads(20_000, 7, 11);
+    for (name, indexes) in [
+        ("no-index", vec![]),
+        ("copy", vec![IndexType::SecondaryByCopy]),
+        ("reference", vec![IndexType::SecondaryByReference]),
+    ] {
+        let (_dir, path) =
+            write_store_file(quads.clone(), LayoutStrategy::Dictionary, indexes).await;
+        for in_memory in [false, true] {
+            let store = if in_memory {
+                VortexRdfStore::from_file_in_memory(&path).await
+            } else {
+                VortexRdfStore::from_file(&path).await
+            }
+            .unwrap();
+            // About a fifth of every view's rows tombstoned: p0's and "object 0"'s.
+            let tombstoned = store
+                .delete_matching(None, Some(&iri("p0")), None, None)
+                .await
+                .unwrap()
+                .delete_matching(None, None, Some(&plain_literal("object 0")), None)
+                .await
+                .unwrap();
+            for (deleted, owner) in [(false, &store), (true, &tombstoned)] {
+                for (pattern, [s, p, o, g]) in LEGACY_PATTERNS {
+                    for window in [None, Some((3, Some(50)))] {
+                        let mut probe = Probe::parse(s, p, o, g).unwrap();
+                        if let Some((offset, limit)) = window {
+                            probe = probe.window(offset, limit);
+                        }
+                        let view = owner.run_probe(&probe).await.unwrap();
+                        let tag = format!(
+                            "{name} in_memory={in_memory} deleted={deleted} {pattern} window={window:?}"
+                        );
+                        let rows = collect_code_chunks(&view, &QuadColumn::ALL, 65_536)
+                            .await
+                            .0
+                            .len();
+                        // One row a chunk is a pull per row: views of at most 256 rows hold the case.
+                        for batch_rows in [1, 256, 65_536] {
+                            if batch_rows > 1 || rows <= 256 {
+                                assert_code_chunks_equal_legacy(
+                                    &view,
+                                    &QuadColumn::ALL,
+                                    batch_rows,
+                                    &tag,
+                                )
+                                .await;
+                            }
+                        }
+                        assert_code_chunks_equal_legacy(
+                            &view,
+                            &[QuadColumn::O, QuadColumn::S],
+                            256,
+                            &tag,
+                        )
+                        .await;
+                        assert_row_chunks_equal_legacy(&view, 256, &tag).await;
+                    }
+                }
+            }
+        }
+    }
 }

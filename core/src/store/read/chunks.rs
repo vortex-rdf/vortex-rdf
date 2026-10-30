@@ -440,3 +440,38 @@ pub(crate) mod run_hooks {
         CUTS.with(Cell::get)
     }
 }
+
+/// Test hook: the chunk streams' choice of path. While a [`ForceLegacy`]
+/// lives, this thread's [`code_chunks`](VortexRdfStore::code_chunks) and
+/// [`row_chunks`](VortexRdfStore::row_chunks) take the paths they took before
+/// the served-run and masked-stream reads, so a test can hold the two to the
+/// same rows.
+#[cfg(test)]
+pub(crate) mod chunk_path_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LEGACY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The pre-fix paths for this thread's chunk streams, until dropped; the
+    /// previous setting returns then.
+    pub(crate) struct ForceLegacy(bool);
+
+    impl ForceLegacy {
+        pub(crate) fn set() -> ForceLegacy {
+            ForceLegacy(LEGACY.with(|legacy| legacy.replace(true)))
+        }
+    }
+
+    impl Drop for ForceLegacy {
+        fn drop(&mut self) {
+            LEGACY.with(|legacy| legacy.set(self.0));
+        }
+    }
+
+    /// Whether this thread's chunk streams take their pre-fix paths.
+    pub(crate) fn legacy() -> bool {
+        LEGACY.with(Cell::get)
+    }
+}
