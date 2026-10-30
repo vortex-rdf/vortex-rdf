@@ -26,7 +26,7 @@ use vortex_mask::Mask;
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
-use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
+use crate::store::layouts::{OwnedQuadPattern, PatternCodes, QuadPattern, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::ChildReader;
 use crate::store::query::residual::{PendingResidual, ResidualPrefix};
@@ -436,10 +436,17 @@ pub(crate) enum ResolvedRowIds {
 /// Two consumers racing on first need may both run the recipe; the source is
 /// immutable, so they compute the same ids, whichever stores first wins and
 /// both return the stored buffer. No lock is held across the computation.
+///
+/// Ids a match left pending over an unrestricted view may also name the
+/// pattern they are the matches of
+/// ([`set_matched_pattern`](Self::set_matched_pattern)), with whatever filter
+/// the match left beside them: a chained match on such a view is one match
+/// of both patterns, which never computes these ids.
 #[derive(Clone)]
 pub(crate) struct LazyRowIds {
     cell: Arc<OnceLock<Buffer<RowId>>>,
     source: LazyRowIdSource,
+    matches: Option<Arc<OwnedQuadPattern>>,
 }
 
 /// Where a [`LazyRowIds`]' ids come from, split by backend as the serve plans
@@ -486,11 +493,26 @@ enum LazyRowIdSource {
 }
 
 impl LazyRowIds {
+    /// Name `pattern` as the pattern these ids are the matches of over
+    /// every base row: they are the pending selection of a match of
+    /// `pattern` on a view that selected every base row and had no filter,
+    /// the filter that match left (on file) holding beside them.
+    pub(crate) fn set_matched_pattern(&mut self, pattern: OwnedQuadPattern) {
+        self.matches = Some(Arc::new(pattern));
+    }
+
+    /// The pattern these ids are the matches of, set by
+    /// [`set_matched_pattern`](Self::set_matched_pattern).
+    pub(crate) fn matched_pattern(&self) -> Option<Arc<OwnedQuadPattern>> {
+        self.matches.clone()
+    }
+
     /// Lazy ids of a residual compare left pending.
     pub(crate) fn from_residual(residual: PendingResidual) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
             source: LazyRowIdSource::Residual(Arc::new(residual)),
+            matches: None,
         }
     }
 
@@ -566,6 +588,7 @@ impl LazyRowIds {
         Self {
             cell: Arc::new(OnceLock::new()),
             source: LazyRowIdSource::Component { rids, ascending },
+            matches: None,
         }
     }
 
@@ -585,6 +608,7 @@ impl LazyRowIds {
                 constraints,
                 located,
             },
+            matches: None,
         }
     }
 
@@ -599,6 +623,7 @@ impl LazyRowIds {
         Self {
             cell: Arc::new(OnceLock::new()),
             source: LazyRowIdSource::LocatedRun { file, child, range },
+            matches: None,
         }
     }
 

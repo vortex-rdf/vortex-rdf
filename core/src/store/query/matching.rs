@@ -13,7 +13,7 @@ use crate::store::indexes::resolve_indexes_file;
 use crate::store::indexes::{
     IndexResolution, LazyRowIds, ResolvedRowIds, resolve_indexes_in_memory,
 };
-use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
+use crate::store::layouts::{Constraints, OwnedQuadPattern, PatternCodes, QuadPattern, TermRef};
 use crate::store::probes::StructProbes;
 use crate::store::query::residual::PendingResidual;
 use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
@@ -210,6 +210,15 @@ impl VortexRdfStore {
     /// narrows it separately). `need` is the caller's use of the view, which
     /// decides whether a resolution's ids may stay deferred.
     async fn match_base(&self, pattern: QuadPattern<'_>, need: IdsNeed) -> Result<Self> {
+        // A view whose base still holds the pending matches of one pattern
+        // over every row is matched as one match of both patterns, which
+        // never computes those ids.
+        if let ViewSelection::Pending(lazy) = &self.quads.selection
+            && let Some(first) = lazy.matched_pattern()
+            && let Some(both) = first.and(pattern)
+        {
+            return self.match_both(both, need).await;
+        }
         let t = debug::timer();
 
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
@@ -218,16 +227,63 @@ impl VortexRdfStore {
         };
         debug::step!(t, "[match_pattern] Prepared pattern codes");
 
-        match &self.quads.backend {
+        let every_row = self.quads.is_unrefined();
+        let mut matched = match &self.quads.backend {
             Backend::InMemory(memory) => {
-                self.match_base_in_memory(memory, pattern, &mut codes, need, t)
+                self.match_base_in_memory(memory, pattern, &mut codes, need, t)?
             }
             #[cfg(feature = "file-io")]
             Backend::File(base) => {
                 self.match_base_file(base, pattern, &mut codes, need, t)
-                    .await
+                    .await?
             }
+        };
+        // Matched over every base row, pending ids are (with the filter the
+        // match left beside them) exactly the pattern's matches. A view built
+        // for its rows, which a caller may chain on, names the pattern where
+        // its run is wide enough that computing the ids costs more than
+        // keeping the pattern.
+        if every_row
+            && need == IdsNeed::Rows
+            && let ViewSelection::Pending(lazy) = &mut matched.quads.selection
+            && lazy
+                .len_if_known()
+                .is_none_or(|rows| rows >= CHAIN_MIN_ROWS)
+        {
+            lazy.set_matched_pattern(OwnedQuadPattern::of(pattern));
         }
+        Ok(matched)
+    }
+
+    /// The base of a chained match whose view still holds the pending
+    /// matches of a pattern over every base row, `both` binding that
+    /// pattern's roles and the chained one's: one match of `both` over every
+    /// base row, which the pending ids never enter. A view built for its rows
+    /// gets the ids in base order with no serve plan, as a chained match
+    /// always leaves them; one only counted or windowed keeps what the match
+    /// left.
+    async fn match_both(&self, both: QuadPattern<'_>, need: IdsNeed) -> Result<Self> {
+        #[cfg(test)]
+        chain_hooks::note_merged();
+        let t = debug::timer();
+        let every_row = self.derived(self.quads.unrestricted(), self.tail.clone());
+        let matched = Box::pin(every_row.match_base(both, need)).await?;
+        if need.counts_or_windows() {
+            debug::step!(
+                t,
+                "[match_pattern] Chained match answered as one match of both patterns"
+            );
+            return Ok(matched);
+        }
+        let ids = matched.quads.materialized_selection().await?;
+        debug::step!(
+            t,
+            "[match_pattern] Chained match answered as one match of both patterns (ids in base order)"
+        );
+        Ok(matched.derived(
+            matched.quads.with_selection(ViewSelection::Exact(ids)),
+            matched.tail.clone(),
+        ))
     }
 
     /// The match prelude: every bound term of `pattern` resolved to its code
@@ -928,11 +984,40 @@ fn fold_row_ids(
     })
 }
 
+/// The narrowest pending run whose match, built for its rows, names its
+/// pattern, so that a match chained on its view is one match of both
+/// patterns ([`VortexRdfStore::match_both`]): copying the pattern's terms
+/// costs about what computing a thousand of the run's ids does (a few
+/// allocations, some 2,000 instructions), and a run of unknown width (a file
+/// run the resolver did not locate) would cost a scan of the index child.
+const CHAIN_MIN_ROWS: usize = 1_024;
+
 /// Selection size below which a view the subject search already narrowed
 /// skips index routing and filters its remaining rows column-wise (see
 /// `match_base`): a lookup costs the rows matching the component it resolves,
 /// not the rows the view still holds. An unrefined view never skips.
 const INDEX_ROUTING_MIN_ROWS: usize = 4_096;
+
+/// Test hook: how many chained matches this thread answered as one match of
+/// both patterns ([`VortexRdfStore::match_both`]).
+#[cfg(test)]
+pub(crate) mod chain_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MERGED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one chained match answered as one match of both patterns.
+    pub(super) fn note_merged() {
+        MERGED.set(MERGED.get() + 1);
+    }
+
+    /// The chained matches answered so on this thread so far.
+    pub(crate) fn merged() -> usize {
+        MERGED.get()
+    }
+}
 
 /// Test hook: how many tail matches this thread answered off the tail's keys,
 /// and how many by comparing the tail's selected rows.

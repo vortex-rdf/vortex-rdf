@@ -370,6 +370,17 @@ impl QuadsSource {
         }
     }
 
+    /// This source over every base row, with no filter and no serve plan:
+    /// the same base (or file), components and tombstones, as an owner holds
+    /// them.
+    pub(crate) fn unrestricted(&self) -> Self {
+        match &self.backend {
+            Backend::InMemory(memory) => self.in_memory_with(memory, ViewSelection::all(), None),
+            #[cfg(feature = "file-io")]
+            Backend::File(base) => self.file_with(base, None, ViewSelection::all(), None),
+        }
+    }
+
     /// This source with its pushed-down filter dropped, and the filter's
     /// masks with it (a no-op in memory).
     pub(crate) fn without_filter(mut self) -> Self {

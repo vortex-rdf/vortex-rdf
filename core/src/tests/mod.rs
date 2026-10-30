@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 mod adoption;
 mod atomic_write;
 mod builders;
+mod chained;
 mod chunks;
 mod dictionary;
 mod dictionary_file_backed;

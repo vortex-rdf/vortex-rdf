@@ -300,6 +300,52 @@ impl<'a> QuadPattern<'a> {
     }
 }
 
+/// A [`QuadPattern`] that owns its terms, so a view can keep it: the pattern
+/// whose matches a pending selection holds (see
+/// [`LazyRowIds::matched_pattern`](crate::store::indexes::LazyRowIds::matched_pattern)).
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedQuadPattern {
+    subject: Option<NamedOrBlankNode>,
+    predicate: Option<NamedNode>,
+    object: Option<Term>,
+    graph: Option<GraphName>,
+}
+
+impl OwnedQuadPattern {
+    /// `pattern`'s terms, owned.
+    pub(crate) fn of(pattern: QuadPattern<'_>) -> Self {
+        Self {
+            subject: pattern.subject.cloned(),
+            predicate: pattern.predicate.cloned(),
+            object: pattern.object.cloned(),
+            graph: pattern.graph.cloned(),
+        }
+    }
+
+    /// One pattern binding what this one and `other` bind: each role bound
+    /// by either, to its term. `None` when the two bind a role to different
+    /// terms: no quad holds both, but whether the layout spells them alike
+    /// is the match's to decide, so the caller matches them one after the
+    /// other.
+    pub(crate) fn and<'a>(&'a self, other: QuadPattern<'a>) -> Option<QuadPattern<'a>> {
+        fn both<'a, T: PartialEq>(
+            mine: &'a Option<T>,
+            theirs: Option<&'a T>,
+        ) -> Option<Option<&'a T>> {
+            match (mine.as_ref(), theirs) {
+                (Some(a), Some(b)) if a != b => None,
+                (a, b) => Some(a.or(b)),
+            }
+        }
+        Some(QuadPattern::new(
+            both(&self.subject, other.subject)?,
+            both(&self.predicate, other.predicate)?,
+            both(&self.object, other.object)?,
+            both(&self.graph, other.graph)?,
+        ))
+    }
+}
+
 /// A bound term of a quad pattern, tagged with the role it occupies.
 ///
 /// Carrying the role with the term is what makes [`PatternCodes`] safe to share

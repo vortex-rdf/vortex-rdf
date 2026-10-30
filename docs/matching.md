@@ -219,7 +219,7 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/query/matching.rs#L262) runs four stages
+[`match_base_in_memory`](../core/src/store/query/matching.rs#L318) runs four stages
 over the base `StructArray`. Each one asks the same two questions — *can I answer
 part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
 `RowSelection` and clearing whatever pattern components it answered, so the next
@@ -234,7 +234,7 @@ compare ([§6.3](#63-residual-column-filtering)).
 
 ```mermaid
 flowchart TD
-    S0["<b>Prelude</b> — take the base as a struct, materialize a chained view's deferred ids, and remember<br/>whether this view started unrestricted"] --> S1
+    S0["<b>Prelude</b> — take the base as a struct, materialize a chained view's deferred ids (those that name<br/>no pattern, §11), and remember whether this view started unrestricted"] --> S1
 
     S1{"<b>Stage 1</b><br/>Is the subject bound?"}
     S1 -- "yes — binary-search its rows, then each further bound role in<br/>(p, o, g) order inside it, and keep only those rows" --> S2
@@ -262,11 +262,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:270-295`](../core/src/store/query/matching.rs#L270-L295 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L404), [`search_sorted_bounds`](../core/src/store/array.rs#L215) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:299-352`](../core/src/store/query/matching.rs#L299-L352 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L739), [`fold_row_ids`](../core/src/store/query/matching.rs#L916) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:354-370`](../core/src/store/query/matching.rs#L354-L370 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L488), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L267), [`mask_for`](../core/src/store/query/matching.rs#L865) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`matching.rs:372-379`](../core/src/store/query/matching.rs#L372-L379 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| Prelude | [`matching.rs:270-295`](../core/src/store/query/matching.rs#L326-L351 "MemoryBase") | — |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L460), [`search_sorted_bounds`](../core/src/store/array.rs#L215) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:299-352`](../core/src/store/query/matching.rs#L355-L408 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L764), [`fold_row_ids`](../core/src/store/query/matching.rs#L972) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:354-370`](../core/src/store/query/matching.rs#L410-L426 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L544), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L267), [`mask_for`](../core/src/store/query/matching.rs#L921) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:372-379`](../core/src/store/query/matching.rs#L428-L435 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -414,7 +414,7 @@ constrained code are left out ([`runs_holding`](../core/src/store/zones.rs#L231)
 when what is left holds at most half the base: a run of rows (every row, or a
 subject's range) is compared zone run by zone run, each a slice of the base
 through the mask scan below
-([`runs_matching`](../core/src/store/query/matching.rs#L587)), and an id list keeps
+([`runs_matching`](../core/src/store/query/matching.rs#L643)), and an id list keeps
 only its ids in those runs before the implementations below compare them. A
 code most zones may hold (a predicate or graph spread over every zone) leaves
 everything to compare.
@@ -517,21 +517,23 @@ started `All` and only the index narrowed it — and its ids stay pending, so
 without ever computing `[0, 2]`. `(? a ? "")` loses it: stage 3 ran
 for `g`, so `residual_narrowed` is set. `(ex:alice a ? ?)` never had one —
 the prefix probe answered, and the indexes were not consulted. A second match
-on the `(? a ? ?)` view loses it too, however it resolves: the view no
+on the `(? a ? ?)` view loses it too, however it resolves: either it is one
+match of both patterns, whose ids are read in base order, or the view no
 longer starts `All` ([§11](#11-chained-matches)).
 
 ---
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/query/matching.rs#L616) composes the same
+[`match_base_file`](../core/src/store/query/matching.rs#L672) composes the same
 restrictions as the in-memory path, but **leaves the rows to the next scan**:
 each stage decides what that scan will do, and the result is a filter
 expression plus a row selection. The match itself reads only what those
 decisions need: the chunk probes that locate a bound subject's run, what an
 index resolution reads (its run's location, and its ids unless they stay
-deferred), a chained view's pending ids, the zone-map statistics that prune,
-and stage 5's point reads.
+deferred), a chained view's pending ids (unless they name their pattern,
+[§11](#11-chained-matches)), the zone-map statistics that prune, and stage
+5's point reads.
 
 ```mermaid
 flowchart TD
@@ -573,12 +575,12 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:624-629`](../core/src/store/query/matching.rs#L624-L629 "FileBase") | — |
-| 1 · subject chunk probe and prefix | [`matching.rs:630-637`](../core/src/store/query/matching.rs#L630-L637 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L809), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:638-651`](../core/src/store/query/matching.rs#L638-L651 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L764) | [§8](#8-the-index-resolvers) |
+| Prelude | [`matching.rs:624-629`](../core/src/store/query/matching.rs#L680-L685 "FileBase") | — |
+| 1 · subject chunk probe and prefix | [`matching.rs:630-637`](../core/src/store/query/matching.rs#L686-L693 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L865), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:638-651`](../core/src/store/query/matching.rs#L694-L707 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L789) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:664-734`](../core/src/store/query/matching.rs#L664-L734 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L20) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:657-658`](../core/src/store/query/matching.rs#L657-L658 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L916) and [`matching.rs:742-756`](../core/src/store/query/matching.rs#L742-L756 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L838), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L711) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
-| 5 · filter at sparse ids | [`matching.rs:758-773`](../core/src/store/query/matching.rs#L758-L773 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L209) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:657-658`](../core/src/store/query/matching.rs#L713-L714 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L972) and [`matching.rs:742-756`](../core/src/store/query/matching.rs#L798-L812 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L894), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L711) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 5 · filter at sparse ids | [`matching.rs:758-773`](../core/src/store/query/matching.rs#L814-L829 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L209) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -826,8 +828,8 @@ over a window of the base, and while that window holds under 64 rows per
 rid they are set as bits of a bitmap over it and read back in order, two
 linear passes where a comparison sort costs `n log n`; only rids spread
 wider than that are compared. Intersecting the ids with a selection far
-smaller than they are (a chained match's few ids) searches the longer list
-for each of the shorter's instead of merging the two.
+smaller than they are (a match chained on a view of a few ids) searches the
+longer list for each of the shorter's instead of merging the two.
 
 ### 8.4 Serve plans, side by side
 
@@ -961,12 +963,26 @@ scan that still supplies a serve plan.
 
 `match_pattern` on an already-derived view composes rather than rebases:
 
-- In memory, a still-`Pending` selection **materializes** at the top of
-  `match_base_in_memory` (`selection.materialized()`) — chaining is one of
-  the consumers the deferral exists for. `unrefined` is then false, so no serve
-  plan can be kept.
-- On file, `existing_filter` is ANDed with the new one and `existing_selection`
-  is intersected; `keep_serve` is false the moment either is non-trivial.
+- A view whose base selection is still the `Pending` ids a match left over
+  every base row is exactly that pattern's matches: the ids, with the filter
+  the match left beside them on file. When the match was built for its rows
+  and its run is at least 1,024 rows wide, or of unknown width (a file run the
+  resolver did not locate), the ids name the pattern
+  (`LazyRowIds::matched_pattern`; a narrower run costs less to compute than
+  the pattern's terms cost to copy, `CHAIN_MIN_ROWS`). A match chained on such
+  a view is **one match of both patterns** over every base row
+  ([`match_both`](../core/src/store/query/matching.rs#L265)): the pending ids
+  are never computed, and two roles one index orders together are one run of
+  it. A view built for its rows gets the ids in base order with no serve plan,
+  as every chained match leaves them; one only counted or windowed keeps what
+  the match left. Two patterns that bind a role to different terms are matched
+  one after the other, as below.
+- Any other view composes. In memory, a still-`Pending` selection
+  **materializes** at the top of `match_base_in_memory`
+  (`selection.materialized()`); `unrefined` is then false, so no serve plan can
+  be kept. On file, `existing_filter` is ANDed with the new one and
+  `existing_selection` is intersected; `keep_serve` is false the moment either
+  is non-trivial.
 - The base array / file handle and the index components are **shared**, not
   rebuilt: the selection names base row ids, which no narrowing renumbers. Only
   a physical gather (compaction) invalidates them, and that rebuilds the index
@@ -974,14 +990,18 @@ scan that still supplies a serve plan.
 - The tail's own selection is tail-local and narrows independently on each call.
 
 **Example.** `(? a ? ?)` on the in-memory `SecondaryByCopy` store gives a
-view whose ids are pending with a plan over `index:posg[0, 2)`. Calling
-`match_pattern(? ? foaf:Person ?)` on that view: the pending ids materialize first
-(`[0, 2]`), so `unrefined` is false; nothing narrowed the view *in this call*,
-so the indexes are consulted and `index:ospg` resolves `o = 5` to rids `0, 2`
-— lazily, but the deferral condition fails (`unrefined`), so they are
-materialized and intersected: `Ids [0, 2]`. Stage 4 drops the plan the second
-index offered. Doing the same on the file view ANDs nothing onto the filter
-(both matches were answered by an index) and intersects the two id sets.
+view whose ids are pending with a plan over `index:posg[0, 2)` (a store this
+small names no pattern, its run being two rows wide; take it as wider).
+Calling `match_pattern(? ? foaf:Person ?)` on that view matches
+`(? a foaf:Person ?)` over every base row: `index:posg` resolves the `(p, o)`
+prefix to its run `[0, 2)`, whose rids are read in base order (`Ids [0, 2]`)
+and whose plan is dropped. The first view's ids are never read. On the file
+view the same happens, the combined match leaving no filter (an index answered
+both roles). Over the four-row store itself, where no pattern is named, the
+pending ids materialize first (`[0, 2]`); nothing narrowed the view *in this
+call*, so the indexes are consulted and `index:ospg` resolves `o = 5` to rids
+`0, 2`, materialized and intersected: `Ids [0, 2]`, the plan the second index
+offered dropped.
 
 ---
 
@@ -1081,10 +1101,11 @@ file run) and a rid-only scan of the index child otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L935) | an already-narrowed view below this skips index routing |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L999) | an already-narrowed view below this skips index routing |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L244) | selection size above which the typed row loop declines to the vectorized mask scan for a lone residual equality |
 | `TYPED_PROBE_MAX_ROWS` | 256 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L253) | the same for any set that binds a column through an encoded-search probe, read a row at a time: the mask scan costs less from about 256 rows of a range and 512 of scattered ids |
 | `FIRST_PIECE_ROWS` | 8192 | [`residual.rs`](../core/src/store/query/residual.rs#L28) | the first piece of a residual compare left pending for a count or a window, each piece after four times the one before; a selection this wide or narrower is compared eagerly |
+| `CHAIN_MIN_ROWS` | 1024 | [`matching.rs`](../core/src/store/query/matching.rs#L993) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
 `POINT_IDS_PER_SPLIT`, `TAKE_ROWS`) are in [file-format.md §11](file-format.md#11-constants).
@@ -1176,6 +1197,7 @@ that installs a `log` logger sees the same lines; what each one means:
 | `File filter checked by point reads` | [§7.3](#73-what-ends-up-on-the-view) — stage 5 read the filter at sparse ids |
 | `File selection proved empty` | [§7.3](#73-what-ends-up-on-the-view) |
 | `In-memory view built (serve, pending ids)` / `File view built (filter, serve, pending ids)` | [§6.4](#64-keeping-or-dropping-the-serve-plan) / [§7.3](#73-what-ends-up-on-the-view) — what the view carries |
+| `Chained match answered as one match of both patterns` (`ids in base order` for a view built for its rows) | [§11](#11-chained-matches) |
 | `Tail matched by typed positions` / `… by mask scan` | [§9](#9-the-tail) |
 
 The same store in memory, timings elided:
@@ -1198,7 +1220,11 @@ compare; `(? a ? "")` resolves `p` by index but the bound graph sends
 it through the residual stage, which costs it the plan. A second match on the
 first view — `(? ? foaf:Person ?)` — logs `index resolved` again but builds its view
 with `serve: false, pending ids: false`: the view it started from was no longer
-unrestricted ([§11](#11-chained-matches)).
+unrestricted ([§11](#11-chained-matches)). On a store wide enough that the
+first view's run names its pattern, the second match logs the combined
+match's lines instead, the view built with `serve: true, pending ids: true`,
+then `Chained match answered as one match of both patterns (ids in base
+order)`.
 
 ---
 
