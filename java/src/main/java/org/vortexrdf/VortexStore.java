@@ -240,8 +240,8 @@ public final class VortexStore implements AutoCloseable {
 	/**
 	 * The quads matching a pattern of terms, read at most {@code batchRows} rows at a time, in base row order
 	 * ({@code (s, p, o, g)}): the rows of {@link #quads(String, String, String, String)}, which on a pattern a
-	 * {@code secondary-by-copy} index serves returns them in the index's order instead. The pattern is checked and
-	 * matched now; the rows are read as the iterator is pulled. Close the iterator, or drain it, when done.
+	 * {@code secondary-by-copy} index serves may return them in the index's order instead. The pattern is checked
+	 * and matched now; the rows are read as the iterator is pulled. Close the iterator, or drain it, when done.
 	 *
 	 * @param batchRows the most rows read at a time, at least 1
 	 */
@@ -270,8 +270,8 @@ public final class VortexStore implements AutoCloseable {
 	/**
 	 * The quads matching a pattern of codes (negative is free) as their codes, read at most {@code batchRows} rows at
 	 * a time, in base row order: the rows of {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)}, which
-	 * on a pattern a {@code secondary-by-copy} index serves returns them in the index's order instead. A code that
-	 * cannot match gives no rows. Close the chunks, or drain them, when done.
+	 * on a pattern a {@code secondary-by-copy} index serves may return them in the index's order instead. A code
+	 * that cannot match gives no rows. Close the chunks, or drain them, when done.
 	 *
 	 * @param batchRows the most rows read at a time, at least 1
 	 */

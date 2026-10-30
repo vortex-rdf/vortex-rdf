@@ -4,7 +4,7 @@ Java bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a colu
 
 They are a thin layer over the Rust core, for any JVM program that wants to query a store: a JNI library (`libvortex_rdf_jni`, this crate) and the small `org.vortexrdf` API on top of it. They are not tied to a query engine; `vortex-qendpoint`, a separate repository, is one integration built on them: it serves a store through qEndpoint (RDF4J) in place of an HDT file.
 
-Requires Java 11 or later. The API is `org.vortexrdf.VortexStore` and `org.vortexrdf.TermDictionary`; every class is documented in its Javadoc.
+Requires Java 11 or later. The API is `org.vortexrdf.VortexStore`, with `TermDictionary` for term codes and `QuadIterator` and `CodeChunks` for streaming a match; every class is documented in its Javadoc.
 
 ## Build
 
@@ -98,13 +98,35 @@ When a file store can locate the pattern's rows by binary search (a prefix of th
 
 For measurements, two switches are read once when the native library loads: `VORTEX_RDF_LOCATE=0` makes every code lookup take the general path, and `VORTEX_RDF_COUNTERS=1` makes `VortexStore.engineCounters()` count the encoded-search work (leaves searched encoded or decoded, probes, gathers, equality scans; all zero without it).
 
+## Streaming a match
+
+`quads` returns a whole match at once. `iterateQuads` reads it a chunk at a time instead, so a long match never sits in memory whole and a caller that stops early reads no more of it:
+
+```java
+try (QuadIterator rows = store.iterateQuads(null, "<http://xmlns.com/foaf/0.1/name>", null, null)) {
+    while (rows.hasNext()) {
+        String[] quad = rows.next();                                     // {s, p, o, g}, a fresh array
+    }
+}
+
+try (Stream<String[]> rows = store.iterateQuads(s, p, o, g, 4096).stream()) {  // 4,096 rows a chunk, 65,536 by default
+    rows.limit(10).forEach(quad -> System.out.println(quad[2]));                // closing the stream closes the iterator
+}
+```
+
+The pattern is checked and matched when `iterateQuads` is called, so a malformed term raises there; the rows are read as the iterator is pulled, at most `batchRows` at a time: a smaller batch brings the first rows sooner, at the cost of more native calls over the whole match. `matchCodeChunks`, shown under [Term codes](#term-codes-low-level), does the same for a pattern of codes: each `next(out, maxRows)` writes the next rows into the buffer as `matchCodes` writes them, and returns 0 once the match is spent.
+
+Both read a match in base row order, `(s, p, o, g)`. `quads` and `matchCodes` return the same rows in the same order, except on a pattern a `secondary-by-copy` index serves, where they may come in that index's order.
+
 ## Threads, memory and lifetime
 
 A store is safe to query from any number of threads. `close()` waits for the calls in progress, and later calls raise `IllegalStateException`. A file store is memory-mapped: what stays in RAM is the operating system's page cache plus a few MiB of rebuilt dictionary windows, and the file must not be modified while open (replace it by renaming a new file over it). `VortexStore.open(path, true)` loads the whole store instead. Besides its result, a read holds one chunk of terms in transit: at most 16 MiB of them, or one row when that row's terms are larger.
 
+An iterator (`QuadIterator` or `CodeChunks`) holds a native stream of its match until it ends: drain it or close it, best with try-with-resources. An open iterator holds one chunk of the match, at most `batchRows` rows, besides the rows it has handed out. Closing the store ends its iterators: one that has not ended then raises `IllegalStateException`, and one that has ended answers no more rows. An iterator left unreachable without being closed is freed by a cleaner, when the garbage collector finds it. An iterator is not thread-safe; give each thread its own.
+
 ## Development
 
-The Rust side (`src/engine.rs`, the logic, and `src/lib.rs`, the JNI glue) is tested by `tests/engine.rs` against a scan of the quads it was built from, for every pattern shape, layout and index set, by terms and by codes. The JUnit suite checks the same through the real library; it reads stores and an oracle file that the crate's `fixtures` example writes:
+The Rust side (`src/engine.rs` and the modules beside it, the logic, and `src/lib.rs`, the JNI glue) is tested by `tests/engine.rs`, `tests/payload.rs` and `tests/streams.rs` against a scan of the quads it was built from, for every pattern shape, layout and index set, by terms and by codes. The JUnit suite checks the same through the real library; it reads stores and an oracle file that the crate's `fixtures` example writes:
 
 ```bash
 cargo build -p vortex-rdf-java

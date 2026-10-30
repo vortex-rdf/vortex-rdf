@@ -67,7 +67,8 @@ only the rows they keep, point by point, by one take, or by projecting each
 split at its mask, as the chunk streams do a few splits at a time. The chunk
 stream is the form for a match consumed
 incrementally or of unknown size, and the bindings reach it through
-`match_code_chunks` (Python) and `matchCodeChunks` (JS). A Python
+`match_code_chunks` (Python) and `matchCodeChunks` (JS and Java), and
+Java's `iterateQuads` as terms, a chunk decoded at a time. A Python
 `match_codes` call given a cancel token returns its result when its gather
 completes before the cancel is observed, and raises `Cancelled` when the
 token is cancelled before the call or while the call waits for data.
@@ -79,7 +80,9 @@ the `Probe` that `match_code_pattern` runs when no located run answers it
 and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L94) decodes one of
 a string layout's `row_chunks` into `SharedQuad`s, each distinct term of the
 chunk once, as `shared_quads_vec` decodes it (a Dictionary store's chunks
-hold codes, which `dict_reader` decodes).
+hold codes, which `dict_reader` decodes). Java's `matchCodeChunks` is built
+on the first, and its `iterateQuads` on the second for a store without a
+dictionary.
 
 **To Arrow.** vortex converts a chunk through its own session:
 `vortex_session().arrow().execute_arrow(chunk, None, &mut ctx)` (the
