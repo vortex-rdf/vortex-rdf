@@ -254,7 +254,7 @@ it.
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229)):
 every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
-([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L106)) or,
+([`build_code_chunk`](../core/src/store/layouts/dictionary/codec/mod.rs#L106)) or,
 under the string layouts, as their terms again
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L172)). With indexes a
 first merge runs to completion
@@ -622,7 +622,7 @@ the segment target) are constants, tabulated in [file-format.md §11](file-forma
 | Builder contract, `BuiltArray`/`BuiltStream`, `build_struct_array`, `build_components` | [`core/src/store/builders/mod.rs`](../core/src/store/builders/mod.rs) |
 | In-memory sort | [`core/src/store/builders/sorted_in_memory.rs`](../core/src/store/builders/sorted_in_memory.rs) |
 | External merge sort, index spill mergers and their pull-based component source | [`core/src/store/builders/sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`stream_indexes.rs`](../core/src/store/builders/stream_indexes.rs), [`spill.rs`](../core/src/store/builders/spill.rs) |
-| Layout columns | [`core/src/store/layouts/default.rs`](../core/src/store/layouts/default.rs), [`typed_object.rs`](../core/src/store/layouts/typed_object.rs), [`dictionary/codec.rs`](../core/src/store/layouts/dictionary/codec.rs) |
+| Layout columns | [`core/src/store/layouts/default.rs`](../core/src/store/layouts/default.rs), [`typed_object.rs`](../core/src/store/layouts/typed_object.rs), [`dictionary/codec/mod.rs`](../core/src/store/layouts/dictionary/codec/mod.rs) |
 | Dictionary construction, interning, FSST windows | [`core/src/store/layouts/dictionary/ingest.rs`](../core/src/store/layouts/dictionary/ingest.rs), [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs) |
 | Index children | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Write driver and entry points, a store file's atomic replacement at its path | [`core/src/io/write.rs`](../core/src/io/write.rs), [`pending.rs`](../core/src/io/pending.rs) |

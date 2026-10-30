@@ -303,7 +303,7 @@ the bounds from the leaves.
   rows are decompressed. A batch in any order, with repeats, reads each
   distinct code once.
 - **A chunk's rows** decode in place, as against a resident dictionary
-  ([`decode_file_backed`](../core/src/store/layouts/dictionary/codec.rs#L593)):
+  ([`decode_file_backed`](../core/src/store/layouts/dictionary/codec/mod.rs#L593)):
   each window the chunk's codes fall in is taken once from the window cache,
   rebuilt on a miss by a segment read that completes at once over a mapping,
   and held until the chunk is decoded, and each row's terms are decompressed
