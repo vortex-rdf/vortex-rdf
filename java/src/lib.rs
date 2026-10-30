@@ -14,6 +14,7 @@
 pub mod cursor;
 pub mod engine;
 pub mod payload;
+pub mod streams;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 

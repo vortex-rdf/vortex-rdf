@@ -260,3 +260,46 @@ pub fn drain(mut cursor: QuadCursor) -> Vec<Quad> {
     assert_eq!(rows.len(), cursor.rows(), "the chunks hold the read's rows");
     rows
 }
+
+/// The quads matching a pattern of spellings, by scan.
+pub fn scan(quads: &[Quad], pattern: &[Option<&str>; 4]) -> BTreeSet<Quad> {
+    quads
+        .iter()
+        .filter(|q| {
+            pattern
+                .iter()
+                .zip(q.iter())
+                .all(|(want, have)| want.is_none_or(|w| w == have))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Patterns: every subset of positions bound to a stored quad's own terms, for a spread of stored quads, plus
+/// a pattern per position bound to a well-formed term no quad holds.
+pub fn patterns(quads: &[Quad]) -> Vec<[Option<String>; 4]> {
+    let mut out = Vec::new();
+    for quad in quads.iter().step_by(29) {
+        for mask in 0..16u8 {
+            out.push(std::array::from_fn(|i| {
+                (mask & (1 << i) != 0).then(|| quad[i].clone())
+            }));
+        }
+    }
+    let absent = [
+        "<http://example.org/absent>",
+        "<http://example.org/absent>",
+        "<http://example.org/absent>",
+        "<http://example.org/absent>",
+    ];
+    for i in 0..4 {
+        out.push(std::array::from_fn(|j| {
+            (i == j).then(|| absent[j].to_string())
+        }));
+    }
+    out
+}
+
+pub fn as_refs(pattern: &[Option<String>; 4]) -> [Option<&str>; 4] {
+    std::array::from_fn(|i| pattern[i].as_deref())
+}
