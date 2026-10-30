@@ -486,6 +486,43 @@ async fn masked_streams_of_rare_and_absent_codes() {
     let mut chunks = absent.code_chunks(&QuadColumn::ALL, 256).unwrap();
     assert!(chunks.next().await.is_none(), "no chunk");
     assert_eq!(masked_read_hooks::reads(), reads, "no read of kept rows");
+    // Every row the filter keeps deleted: the masked streams are taken and
+    // their masks keep nothing, so no batch yields a chunk or reads a row.
+    let tombstoned = store
+        .delete_matching(None, None, Some(&plain_literal("rare")), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        tombstoned.size().await.unwrap(),
+        store.size().await.unwrap() - 3
+    );
+    let gone = probe_view(&tombstoned, [None, None, Some("\"rare\""), None]).await;
+    for batch_rows in [1, 256, 65_536] {
+        let (streams, reads) = (
+            chunk_path_hooks::masked_streams(),
+            masked_read_hooks::reads(),
+        );
+        let mut codes = gone.code_chunks(&QuadColumn::ALL, batch_rows).unwrap();
+        assert!(
+            codes.next().await.is_none(),
+            "no code chunk, batch {batch_rows}"
+        );
+        let mut rows = gone.row_chunks(batch_rows).unwrap();
+        assert!(
+            rows.next().await.is_none(),
+            "no row chunk, batch {batch_rows}"
+        );
+        assert_eq!(
+            chunk_path_hooks::masked_streams(),
+            streams + 2,
+            "both streams masked, batch {batch_rows}"
+        );
+        assert_eq!(
+            masked_read_hooks::reads(),
+            reads,
+            "no read of kept rows, batch {batch_rows}"
+        );
+    }
 }
 
 #[tokio::test]
