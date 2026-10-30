@@ -84,7 +84,7 @@ impl VortexRdfStore {
         if let Some(found) = self.locate_codes(pattern, 0, Some(0)).await? {
             return Ok(found.total);
         }
-        match code_probe(&dict, pattern).await? {
+        match probe_of_codes(&dict, pattern).await? {
             Some(probe) => Ok(self.count_probe(&probe).await? as u64),
             None => Ok(0),
         }
@@ -108,7 +108,7 @@ impl VortexRdfStore {
         if let Some(found) = self.locate_codes(pattern, offset, limit).await? {
             return Ok(found.columns);
         }
-        let Some(probe) = code_probe(&dict, pattern).await? else {
+        let Some(probe) = probe_of_codes(&dict, pattern).await? else {
             return Ok(Default::default());
         };
         self.run_probe(&probe.window(offset, limit))
@@ -120,6 +120,16 @@ impl VortexRdfStore {
                     "the store's rows are not all in its term dictionary".into(),
                 )
             })
+    }
+
+    /// The probe of `pattern`'s terms, spelled by the store's own dictionary: what
+    /// [`match_code_pattern`](Self::match_code_pattern) runs when no located run answers it, for a caller that
+    /// reads the match its own way ([`run_probe`](Self::run_probe), then
+    /// [`code_chunks`](Self::code_chunks) or [`code_columns_gathered`](Self::code_columns_gathered)).
+    /// `None` when nothing can match: a code past the dictionary, or one in a position its term's kind cannot
+    /// take. Fails as [`count_code_pattern`](Self::count_code_pattern) does.
+    pub async fn code_probe(&self, pattern: CodePattern) -> Result<Option<Probe>> {
+        probe_of_codes(&self.code_dictionary()?, pattern).await
     }
 
     /// The term dictionary a code pattern's codes are drawn from.
@@ -264,7 +274,7 @@ impl VortexRdfStore {
 /// The probe of `pattern`, its codes spelled out by `dict`, or `None` when it
 /// can match nothing: a code past the dictionary, or a term in a position it
 /// cannot take ([`holds`]).
-async fn code_probe(dict: &DictReader, pattern: CodePattern) -> Result<Option<Probe>> {
+async fn probe_of_codes(dict: &DictReader, pattern: CodePattern) -> Result<Option<Probe>> {
     let kinds = dict.kind_ranges().await?;
     let slots = pattern.slots();
     let mut spelled: [Option<String>; 4] = Default::default();
