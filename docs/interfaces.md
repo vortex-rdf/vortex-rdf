@@ -34,7 +34,9 @@ most `batch_rows` rows:
   under a string layout the tail's live rows follow the base.
 - `code_chunks(columns, batch_rows)` — `u64` code columns
   (`Buffer<TermCode>`), one buffer per requested `QuadColumn` in the
-  requested order; Dictionary layout, empty tail.
+  requested order; Dictionary layout, empty tail. In memory only the
+  requested columns are read: decoded into their shared caches, or gathered
+  from the base cut to them.
 
 In memory, chunks are exactly `batch_rows` long but the last of the base
 (and of the tail); a file-backed view's scan chunks follow the file's

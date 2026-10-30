@@ -24,7 +24,7 @@ use crate::store::scan::gather::gather_live;
 use crate::store::scan::read_plan::{ExactRead, MaskedRead};
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_exprs, file_reads, file_scans};
-use crate::store::schema::{self, RowId, TermCode};
+use crate::store::schema::{self, QuadColumn, RowId, TermCode};
 use crate::store::view::selection::SelectedRows;
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::{RowSelection, ViewSelection};
@@ -185,16 +185,29 @@ impl VortexRdfStore {
     /// cache cannot hand out as a non-nullable code primitive (chunked or
     /// wire-encoded).
     pub(in crate::store) fn base_code_primitives(&self) -> Option<[PrimitiveArray; 4]> {
+        let [s, p, o, g] = QuadColumn::ALL;
+        Some([
+            self.base_code_primitive(s)?,
+            self.base_code_primitive(p)?,
+            self.base_code_primitive(o)?,
+            self.base_code_primitive(g)?,
+        ])
+    }
+
+    /// The base's `column` code column as a canonical primitive, as
+    /// [`base_code_primitives`](Self::base_code_primitives) reads each of
+    /// the four: a builder-compressed column is decoded into its own shared
+    /// cache, the other columns' caches left as they are.
+    pub(in crate::store) fn base_code_primitive(
+        &self,
+        column: QuadColumn,
+    ) -> Option<PrimitiveArray> {
         use vortex_array::arrays::Struct;
         let base = &self.quads.in_memory()?.base;
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
-        let primitive = |name: &str| {
-            crate::store::resident::shared_code_primitive(
-                struct_arr.unmasked_field_by_name(name).ok()?,
-            )
-        };
-        let [s, p, o, g] = schema::PRIMARY_COLUMNS;
-        Some([primitive(s)?, primitive(p)?, primitive(o)?, primitive(g)?])
+        crate::store::resident::shared_code_primitive(
+            struct_arr.unmasked_field_by_name(column.name()).ok()?,
+        )
     }
 
     /// The rows this view selects as four [`TermCode`] columns (`s`, `p`,

@@ -137,18 +137,28 @@ impl VortexRdfStore {
         batch_rows: usize,
     ) -> Result<CodeChunkStream> {
         // In memory over the base's own code columns: a contiguous run is
-        // sliced and a window of live ids gathered, one chunk per pull.
-        if let Some(prims) = self.base_code_primitives() {
+        // sliced and a window of live ids gathered, one chunk per pull. Only
+        // the columns asked for are decoded into their shared caches.
+        let every = QuadColumn::ALL.iter().all(|c| columns.contains(c));
+        let all = if every {
+            self.base_code_primitives()
+        } else {
+            None
+        };
+        let asked: Option<Vec<PrimitiveArray>> = match &all {
+            Some(all) => Some(columns.iter().map(|c| all[c.index()].clone()).collect()),
+            None if every => None,
+            None => columns
+                .iter()
+                .map(|&c| self.base_code_primitive(c))
+                .collect(),
+        };
+        if let Some(asked) = asked {
             return Ok(match self.memory_rows(batch_rows)? {
                 MemoryRows::Run(run) => {
-                    let picked: Vec<Buffer<TermCode>> = columns
-                        .iter()
-                        .map(|c| {
-                            prims[c.index()]
-                                .clone()
-                                .into_buffer::<TermCode>()
-                                .slice(run.clone())
-                        })
+                    let picked: Vec<Buffer<TermCode>> = asked
+                        .into_iter()
+                        .map(|prim| prim.into_buffer::<TermCode>().slice(run.clone()))
                         .collect();
                     let rows = run.len();
                     stream::iter((0..rows).step_by(batch_rows).map(move |start| {
@@ -160,21 +170,19 @@ impl VortexRdfStore {
                     .boxed()
                 }
                 MemoryRows::Windows(windows) => {
-                    // Every column asked for: the four gathered in one pass;
-                    // a subset: only its columns.
-                    let every = QuadColumn::ALL.iter().all(|c| columns.contains(c));
                     let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
                     stream::iter(windows.map(move |ids| {
                         #[cfg(test)]
                         gather_hooks::note();
-                        Ok(if every {
-                            let codes = gather_codes(&prims, &ids);
-                            picked.iter().map(|&k| codes[k].clone()).collect()
-                        } else {
-                            picked
-                                .iter()
-                                .map(|&k| gather_column(&prims[k], &ids))
-                                .collect()
+                        Ok(match &all {
+                            // Every column asked for: the four gathered in
+                            // one pass.
+                            Some(all) => {
+                                let codes = gather_codes(all, &ids);
+                                picked.iter().map(|&k| codes[k].clone()).collect()
+                            }
+                            // A subset: only its columns.
+                            None => asked.iter().map(|prim| gather_column(prim, &ids)).collect(),
                         })
                     }))
                     .boxed()
@@ -202,11 +210,20 @@ impl VortexRdfStore {
         if let Some(memory) = self.quads.in_memory()
             && let MemoryRows::Windows(windows) = self.memory_rows(batch_rows)?
         {
-            let base = memory.base.clone();
+            // Only the columns asked for are gathered.
+            let base = projected(&memory.base, columns)?;
+            #[cfg(test)]
+            let width = base
+                .dtype()
+                .as_struct_fields_opt()
+                .map_or(0, |f| f.nfields());
             let probes = Arc::clone(&memory.probes);
             return Ok(stream::iter(windows.map(move |ids| {
                 #[cfg(test)]
-                gather_hooks::note();
+                {
+                    gather_hooks::note();
+                    gather_hooks::note_width(width);
+                }
                 gather_live(&base, &RowSelection::Ids(ids), None, Some(&probes))
             }))
             .boxed());
@@ -384,6 +401,26 @@ fn filtered_windows(
 
 /// The [`InvalidInput`](VortexRdfError::InvalidInput) error for a zero batch
 /// size.
+/// `base`, a struct of primary columns, cut to `columns` (each once, in the
+/// order first asked for) without copying them; a base of any other shape as
+/// it is.
+fn projected(base: &ArrayRef, columns: &[&'static str]) -> Result<ArrayRef> {
+    use vortex_array::IntoArray as _;
+    use vortex_array::arrays::Struct;
+    use vortex_array::dtype::FieldName;
+
+    let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
+        return Ok(base.clone());
+    };
+    let mut names: Vec<FieldName> = Vec::with_capacity(columns.len());
+    for &name in columns {
+        if !names.iter().any(|held| held.as_ref() == name) {
+            names.push(FieldName::from(name));
+        }
+    }
+    Ok(struct_arr.project(&names)?.into_array())
+}
+
 fn check_batch(batch_rows: usize) -> Result<()> {
     if batch_rows == 0 {
         return Err(VortexRdfError::InvalidInput(
@@ -417,6 +454,7 @@ pub(crate) mod gather_hooks {
 
     thread_local! {
         static GATHERS: Cell<usize> = const { Cell::new(0) };
+        static WIDTH: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Record one window gathered.
@@ -427,6 +465,16 @@ pub(crate) mod gather_hooks {
     /// The windows gathered on this thread so far.
     pub(crate) fn gathers() -> usize {
         GATHERS.with(Cell::get)
+    }
+
+    /// Record the columns a window gathered from the base itself read.
+    pub(crate) fn note_width(columns: usize) {
+        WIDTH.set(columns);
+    }
+
+    /// The columns the last window gathered from the base itself read.
+    pub(crate) fn last_width() -> usize {
+        WIDTH.get()
     }
 }
 

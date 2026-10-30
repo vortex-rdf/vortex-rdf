@@ -1136,6 +1136,32 @@ fn chunks_codes(bencher: divan::Bencher, columns: &ChunkColumns) {
     bencher.bench(|| black_box(drain()));
 }
 
+/// [`chunks_codes`] on a store just built, each sample its own: the drain
+/// also decodes the base's compressed code columns it reads into their
+/// shared caches, `o` alone its one column, all four every column. The build
+/// and the match are untimed.
+#[divan::bench(args = CHUNK_COLUMNS, sample_count = QUERY_SAMPLES)]
+fn chunks_codes_cold(bencher: divan::Bencher, columns: &ChunkColumns) {
+    let columns = columns.columns();
+    let (_, p, ..) = terms_for(Pattern::P);
+    bencher
+        .with_inputs(|| {
+            let store = cached_store(Layout::Dictionary, Index::None, bench_size());
+            rt().block_on(store.match_pattern(None, p.as_ref(), None, None))
+                .expect("match P")
+        })
+        .bench_values(|view| {
+            rt().block_on(async {
+                let mut chunks = view.code_chunks(columns, 65_536).expect("code_chunks");
+                let mut rows = 0;
+                while let Some(chunk) = chunks.next().await {
+                    rows += chunk.expect("code chunk")[0].len();
+                }
+                black_box(rows)
+            })
+        });
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Group 5 — MUTATE (append / delete / compact)
 //

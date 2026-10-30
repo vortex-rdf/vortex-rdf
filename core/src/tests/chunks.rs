@@ -148,6 +148,81 @@ async fn drain_counted<T>(
     (items, first, counter() - start)
 }
 
+/// A code-chunk read of an in-memory store decodes into the base's shared
+/// caches only the columns it asks for: `o` alone, over the whole store's run
+/// or over a matched view's windows, fills `o`'s cache and no other; a read
+/// of all four then fills the rest, so the whole store's four columns are
+/// decoded once each.
+#[tokio::test]
+async fn test_code_chunks_decode_only_the_columns_asked_for() {
+    use crate::store::resident::shared_hooks;
+
+    let quads = modular_quads(4_096, 3, 4);
+    let p0 = iri("p0");
+    for whole in [true, false] {
+        let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+        let view = if whole {
+            store
+        } else {
+            matched_view(&store, None, Some(&p0), None, None).await
+        };
+        let decoded = shared_hooks::decoded();
+        let codes = view.code_chunks(&[QuadColumn::O], 1_000).unwrap();
+        let (o_chunks, ..) = drain_counted(codes, gather_hooks::gathers).await;
+        assert_eq!(
+            shared_hooks::decoded() - decoded,
+            1,
+            "whole: {whole}: `o` alone"
+        );
+        let codes = view.code_chunks(&QuadColumn::ALL, 1_000).unwrap();
+        let (chunks, ..) = drain_counted(codes, gather_hooks::gathers).await;
+        let all_four = shared_hooks::decoded() - decoded;
+        if whole {
+            assert_eq!(all_four, 4, "then all four");
+        } else {
+            // The match may have decoded `p` already.
+            assert!((3..=4).contains(&all_four), "then all four: {all_four}");
+        }
+        let expected = base_ordered_codes(&view).await;
+        assert_eq!(drained_code_rows::<4>(&chunks), expected, "whole: {whole}");
+        assert_eq!(
+            drained_code_rows::<1>(&o_chunks),
+            expected.iter().map(|r| [r[2]]).collect::<Vec<_>>(),
+            "whole: {whole}"
+        );
+    }
+}
+
+/// A code-chunk read over an in-memory base whose code columns the shared
+/// caches cannot hand out (a store opened from bytes, its columns in their
+/// stored encodings) gathers each window of the base cut to the columns it
+/// asks for: `o` alone one column, a row read every primary column.
+#[tokio::test]
+async fn test_code_chunks_gather_the_base_cut_to_the_asked_columns() {
+    let quads = modular_quads(4_096, 3, 4);
+    let built = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let store = VortexRdfStore::from_bytes(&built.to_bytes().await.unwrap())
+        .await
+        .unwrap();
+    let view = matched_view(&store, None, Some(&iri("p0")), None, None).await;
+    let expected = base_ordered_codes(&view).await;
+    let gathers = gather_hooks::gathers();
+    let codes = view.code_chunks(&[QuadColumn::O], 1_000).unwrap();
+    let (chunks, ..) = drain_counted(codes, gather_hooks::gathers).await;
+    assert!(
+        gather_hooks::gathers() > gathers,
+        "a window gathered from the base"
+    );
+    assert_eq!(gather_hooks::last_width(), 1);
+    assert_eq!(
+        drained_code_rows::<1>(&chunks),
+        expected.iter().map(|r| [r[2]]).collect::<Vec<_>>()
+    );
+    let rows = view.row_chunks(1_000).unwrap();
+    let _: Vec<_> = rows.collect().await;
+    assert_eq!(gather_hooks::last_width(), 4);
+}
+
 /// Both exports of the in-memory `view` at `batch` rows a chunk answer its
 /// base-ordered codes through `gathers` window gathers, one per pull: the
 /// first pull gathers one window, or none when the view gathers none. A read
