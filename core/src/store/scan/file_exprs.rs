@@ -58,7 +58,7 @@ pub(crate) fn eq_code_pairs(filter: &Expression) -> Option<Vec<(String, u64)>> {
             }
             let field = c.child(0).as_opt::<GetItem>()?;
             let scalar = c.child(1).as_opt::<Literal>()?;
-            let code = u64::try_from(scalar).ok()?;
+            let code = crate::store::array::unsigned_value(scalar)?;
             Some((field.to_string(), code))
         })
         .collect()

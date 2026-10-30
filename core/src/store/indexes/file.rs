@@ -54,7 +54,7 @@ async fn locate_component_run(
     if !child.sorted {
         return Ok(None);
     }
-    let Ok(needle) = u64::try_from(native) else {
+    let Some(needle) = crate::store::array::unsigned_value(native) else {
         return Ok(None);
     };
     let Some(chunks) = file.component_column_chunks(child.name, column) else {

@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::io::zone_map::ZONE_ROWS;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{
-    bool_array_to_mask, column_is_sorted, into_struct_array, search_sorted_bounds,
+    bool_array_to_mask, column_is_sorted, into_struct_array, search_sorted_bounds, unsigned_value,
 };
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
@@ -375,8 +375,8 @@ impl VortexRdfStore {
             // per-call search, which also serves the string layouts'
             // `VarBinView` subjects.
             let cached = probes.by_name(base, schema::COL_S).flatten();
-            let (lo, hi) = match (cached, u64::try_from(&scalar)) {
-                (Some(owned), Ok(needle)) => {
+            let (lo, hi) = match (cached, unsigned_value(&scalar)) {
+                (Some(owned), Some(needle)) => {
                     #[cfg(test)]
                     crate::store::scan::typed_eq::probe_hooks::note(true);
                     owned.probe().bounds(needle)

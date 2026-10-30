@@ -197,6 +197,18 @@ pub(crate) fn decoded_for_search(arr: &ArrayRef) -> Result<ArrayRef> {
         .into_array())
 }
 
+/// `scalar` as a `u64` when it is a non-null unsigned integer; `None` for
+/// any other scalar, decided on its type before any conversion is tried. A
+/// failed conversion builds an error, and an error captures a backtrace when
+/// `RUST_BACKTRACE` is set: tried on every probe of a string layout, that
+/// made a warm in-memory Default-layout match cost several times its work.
+pub(crate) fn unsigned_value(scalar: &vortex_array::scalar::Scalar) -> Option<u64> {
+    if !scalar.dtype().is_unsigned_int() || scalar.is_null() {
+        return None;
+    }
+    u64::try_from(scalar).ok()
+}
+
 /// Binary-search a sorted column for the `[lo, hi)` run of rows equal to
 /// `probe` (empty, at the insertion point, when the value is absent). Only
 /// meaningful on columns [`column_is_sorted`] reports as sorted.
@@ -213,7 +225,7 @@ pub(crate) fn search_sorted_bounds(
     // decoding it; declines fall through to the generic kernel.
     if arr.dtype().is_unsigned_int()
         && !arr.dtype().is_nullable()
-        && let Ok(needle) = u64::try_from(probe)
+        && let Some(needle) = unsigned_value(probe)
     {
         // VORTEX_RDF_ENCODED_SEARCH=0: the column is decoded first and its decoded values searched.
         let decoded;
@@ -312,5 +324,27 @@ pub(crate) mod rechunk_hooks {
                 _guard: Override::set(&FAILING, cuts() + n),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsigned_value;
+    use vortex_array::dtype::{DType, Nullability, PType};
+    use vortex_array::scalar::Scalar;
+
+    /// An unsigned integer of every width converts, a valid nullable one
+    /// too; a string, a signed integer and a null are refused on their type.
+    #[test]
+    fn unsigned_value_takes_only_unsigned_integers() {
+        assert_eq!(unsigned_value(&Scalar::from(7u8)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(7u16)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(7u32)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(u64::MAX)), Some(u64::MAX));
+        assert_eq!(unsigned_value(&Scalar::from(7u64).into_nullable()), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from("7")), None);
+        assert_eq!(unsigned_value(&Scalar::from(7i64)), None);
+        let null = Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable));
+        assert_eq!(unsigned_value(&null), None);
     }
 }

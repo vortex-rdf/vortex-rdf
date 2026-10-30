@@ -341,7 +341,7 @@ impl IndexComponent {
         use crate::store::array::search_sorted_bounds;
 
         if let Some(owned) = self.probe(column)
-            && let Ok(needle) = u64::try_from(native)
+            && let Some(needle) = crate::store::array::unsigned_value(native)
         {
             #[cfg(test)]
             crate::store::scan::typed_eq::probe_hooks::note(true);

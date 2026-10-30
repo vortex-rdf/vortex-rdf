@@ -10,6 +10,7 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinView, VarBinViewArray};
 use vortex_array::scalar::Scalar;
 
+use crate::store::array::unsigned_value;
 use crate::store::probes::StructProbes;
 use crate::store::schema::TermCode;
 use crate::store::view::selection::RowSelection;
@@ -25,7 +26,7 @@ enum Needle {
 
 impl Needle {
     fn from_scalar(scalar: &Scalar) -> Option<Self> {
-        if let Ok(code) = TermCode::try_from(scalar) {
+        if let Some(code) = unsigned_value(scalar) {
             return Some(Needle::Code(code));
         }
         Some(Needle::Str(scalar.as_utf8_opt()?.value()?.to_string()))

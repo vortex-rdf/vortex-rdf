@@ -263,9 +263,9 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:223-248`](../core/src/store/query/matching.rs#L223-L248 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L357), [`search_sorted_bounds`](../core/src/store/array.rs#L203) | [§6.1](#61-prefix-probe) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L357), [`search_sorted_bounds`](../core/src/store/array.rs#L215) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:252-305`](../core/src/store/query/matching.rs#L252-L305 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L739), [`fold_row_ids`](../core/src/store/query/matching.rs#L869) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:307-323`](../core/src/store/query/matching.rs#L307-L323 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L441), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L256), [`mask_for`](../core/src/store/query/matching.rs#L818) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`matching.rs:307-323`](../core/src/store/query/matching.rs#L307-L323 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L441), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L257), [`mask_for`](../core/src/store/query/matching.rs#L818) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:325-332`](../core/src/store/query/matching.rs#L325-L332 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -288,7 +288,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L203), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L215), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -404,13 +404,13 @@ already resolved, so that arm exists for totality.
 
 First, **zone bounds** narrow the rows to compare. An in-memory base carries
 the smallest and largest code of each 8,192-row zone of its code columns
-([`CodeZones`](../core/src/store/zones.rs#L27)), the counterpart of a file's
+([`CodeZones`](../core/src/store/zones.rs#L28)), the counterpart of a file's
 zone maps: taken in the pass that compresses a build's codes, or read from the
 zone maps of the file a store is loaded from (`from_file_in_memory`,
 `from_bytes`), so no query pays for them. A base without them (the string
 columns of the Default and TypedObject layouts) skips this step. Over a
 selection wider than a zone, the zones whose bounds cannot hold every
-constrained code are left out ([`runs_holding`](../core/src/store/zones.rs#L230)),
+constrained code are left out ([`runs_holding`](../core/src/store/zones.rs#L231)),
 when what is left holds at most half the base: a run of rows (every row, or a
 subject's range) is compared zone run by zone run, each a slice of the base
 through the mask scan below
@@ -1049,7 +1049,7 @@ file run) and a rid-only scan of the index child otherwise.
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
 | `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L888) | an already-narrowed view below this skips index routing |
-| `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L244) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
+| `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L245) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
 | `FIRST_PIECE_ROWS` | 8192 | [`residual.rs`](../core/src/store/query/residual.rs#L28) | the first piece of a residual compare left pending for a count or a window, each piece after four times the one before; a selection this wide or narrower is compared eagerly |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
