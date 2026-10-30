@@ -44,6 +44,19 @@ impl ScanDriver {
             ScanDriver::Spawned
         }
     }
+
+    /// The driver for a filter evaluated over every one of `splits` splits
+    /// (a count, a delete's rows, a `keep`'s pass): spawned from two splits
+    /// up, where a runtime runs, since each split's evaluation decodes and
+    /// compares its rows, work that keeps a worker busy for longer than
+    /// waking it takes; inline for one split, or with no runtime.
+    pub(crate) fn for_filter_evaluation(splits: usize) -> Self {
+        if splits < 2 || tokio::runtime::Handle::try_current().is_err() {
+            ScanDriver::Inline
+        } else {
+            ScanDriver::Spawned
+        }
+    }
 }
 
 /// Row scans of up to this many splits run inline: at that size, waking the

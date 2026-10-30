@@ -516,7 +516,7 @@ A row scan — the reads that
 materialize a view's rows: serialization and the `from_file_in_memory` load, a
 compaction's gather, and the one-shot reads (`code_columns_gathered`,
 `quads_vec`, `shared_quads_vec`) the reads by id decline — filters and decodes
-per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L51)
+per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L64)
 (42) splits runs inline, a larger one is spawned across the runtime's workers.
 Without a Tokio runtime these scans run inline. A one-shot read under a
 pending filter of code equalities over columns with chunk probes evaluates
@@ -526,6 +526,11 @@ prior of `s`, `o`, `p`, `g` until every one has been tested), then reads the
 rows they keep point by point, by a take, or by projecting each split at its
 mask
 ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
+A filter evaluated over every split it touches, with no order to stop in —
+an uncapped count of a filtered view, the rows a delete tombstones, a
+`keep`'s pass over a column — spawns its splits from two up: each split's
+evaluation decodes and compares its rows, work that outlasts waking a
+worker.
 Streaming reads (`quads()` and its twins) decode inside the per-split tasks
 Vortex's scan stream spawns, or, over such a filter, inside the split reads
 that evaluate its masks a split at a time; under a file-backed dictionary the
@@ -634,7 +639,7 @@ open rather than being read around.
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L35) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L30) |
 | `PIN_POINT_MIN_ROWS` | 64 rows — a point read of the rows a filter's masks keep leaves out the columns the filter pins, as a take or a projection always does, only from this many rows ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L380) |
-| `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scans.rs`](../core/src/store/scan/file_scans.rs#L51) |
+| `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scans.rs`](../core/src/store/scan/file_scans.rs#L64) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: an emitted chunk's size, an index child chunk's size and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L46) |
 | `DEFAULT_RUN_ROWS` | 1,048,576 entries per out-of-core spill run: quads per quad run, entries per index-family run (whose `u32` row offsets this bounds) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L54) |
 

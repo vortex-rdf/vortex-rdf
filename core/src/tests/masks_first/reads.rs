@@ -669,3 +669,63 @@ async fn test_masked_reads_skip_the_columns_the_filter_pins() {
         }
     }
 }
+
+/// A count, a delete and a `keep` on the object column evaluate their
+/// pattern's filter over every split of the file, the splits spawned onto the
+/// runtime's workers rather than all evaluated on the calling thread, and
+/// answer as the in-memory store over the same quads does.
+#[tokio::test]
+async fn test_whole_file_filter_evaluations_spawn_their_splits() {
+    use crate::store::scan::file_scans::driver_hooks;
+
+    let (_dir, path) = masks_file().await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = built_store(masks_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    for MasksProbe { shape, probe, .. } in masks_probes() {
+        let (s, p, o, g) = (
+            probe.subject.as_ref(),
+            probe.predicate.as_ref(),
+            probe.object.as_ref(),
+            probe.graph.as_ref(),
+        );
+        driver_hooks::take_spawned();
+        let count = file.count_probe(&probe).await.unwrap();
+        assert!(driver_hooks::take_spawned() > 1, "{shape}: count spawns");
+        assert_eq!(count, memory.count_probe(&probe).await.unwrap(), "{shape}");
+
+        let view = matched_view(&file, s, p, o, g).await;
+        let objects = object_keep(&file).await;
+        driver_hooks::take_spawned();
+        let kept = view.keep(QuadColumn::O, &objects).await.unwrap();
+        assert!(driver_hooks::take_spawned() > 1, "{shape}: keep spawns");
+        let memory_kept = matched_view(&memory, s, p, o, g)
+            .await
+            .keep(QuadColumn::O, &object_keep(&memory).await)
+            .await
+            .unwrap();
+        let kept_rows = sorted_rows(&kept).await;
+        assert!(!kept_rows.is_empty(), "{shape}: keep");
+        assert_eq!(kept_rows, sorted_rows(&memory_kept).await, "{shape}: keep");
+
+        let deleted = file.delete_matching(s, p, o, g).await.unwrap();
+        assert!(driver_hooks::take_spawned() > 1, "{shape}: delete spawns");
+        let kept = memory.delete_matching(s, p, o, g).await.unwrap();
+        assert_eq!(
+            deleted.size().await.unwrap(),
+            kept.size().await.unwrap(),
+            "{shape}"
+        );
+    }
+}
+
+/// A keep of the objects `"o0"`, `"o1"` and `"sparse"`, in `store`'s codes.
+async fn object_keep(store: &VortexRdfStore) -> Keep {
+    let dict = store.dict_reader().unwrap();
+    let mut codes = Vec::new();
+    for object in ["o0", "o1", "sparse"] {
+        let term = plain_literal(object).to_string();
+        codes.extend(dict.encode(&term).await.unwrap());
+    }
+    assert_eq!(codes.len(), 3, "every object has a code");
+    Keep::set(codes)
+}

@@ -705,6 +705,19 @@ fn probe_exists(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
+/// `COUNT` through the probe API: `count_probe` of a predicate-bound pattern
+/// with no limit, every matching row counted; on file, the pattern's filter
+/// evaluated over every split of the file.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn probe_count(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let probe = Probe::new(None, p, None, None);
+    bencher.bench(|| {
+        rt().block_on(async { black_box(store.count_probe(&probe).await.expect("count_probe")) })
+    });
+}
+
 /// `LIMIT 64` through the probe API: `run_probe` of a predicate-bound
 /// pattern windowed to 64 rows, its codes gathered.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]

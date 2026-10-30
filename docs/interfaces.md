@@ -98,7 +98,7 @@ Every read is lazy, and a stream's first poll decides how it runs:
   the polling task, and need no runtime.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
-  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L51)), and a
+  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L64)), and a
   scan first polled where no tokio runtime is current run inline on the
   polling task. Any other scan spawns its splits
   ([`ScanDriver`](../core/src/store/scan/file_scans.rs#L28)) onto the tokio
@@ -106,9 +106,11 @@ Every read is lazy, and a stream's first poll decides how it runs:
   (`Handle::current()`) at every spawn, so every later poll of the stream
   must run inside a tokio runtime too. A filtered file view's capped count,
   window and one-shot reads evaluate the filter split by split under the
-  same rule, and `quads_vec` and `shared_quads_vec` spawn their split reads
-  whenever there is more than one and a runtime is current: each such call,
-  once it has spawned, must be polled to completion inside that runtime.
+  same rule. Its uncapped count, a delete's search for the rows it
+  tombstones and a `keep`'s pass spawn their splits, as `quads_vec` and
+  `shared_quads_vec` spawn their split reads, whenever there is more than
+  one and a runtime is current: each such call, once it has spawned, must
+  be polled to completion inside that runtime.
 
 An engine that polls on tokio, as DataFusion does, meets every one of
 these. A consumer polling outside tokio gets the inline driver on a view's

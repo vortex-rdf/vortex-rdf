@@ -341,6 +341,8 @@ pub(crate) type ChunkTest =
 /// back onto the split by rank, so the column is read only where the filter
 /// kept rows and no id list of the filter's own matches is built. The test
 /// runs on the values, never as an expression bound into the file's readers.
+/// The splits are spawned onto the runtime's workers from two up, as
+/// [`map_filter_splits`] spawns its own, and answer in file order.
 /// Tombstones are not applied: the reads apply them, as for
 /// [`matching_file_rows`].
 pub(crate) async fn kept_file_rows(
@@ -389,7 +391,7 @@ pub(crate) async fn kept_file_rows(
     #[cfg(test)]
     file.note(FileCounter::ColumnStreams, 1);
     let window = available_parallelism() * 4;
-    let mut results = match ScanDriver::for_row_scan(tasks.len()) {
+    let mut results = match ScanDriver::for_filter_evaluation(tasks.len()) {
         ScanDriver::Inline => stream::iter(tasks).buffered(window).left_stream(),
         ScanDriver::Spawned => spawned_splits(tasks, window).right_stream(),
     };
@@ -403,9 +405,10 @@ pub(crate) async fn kept_file_rows(
 
 /// `filter` evaluated over every natural file split the selection touches,
 /// each split's surviving mask mapped through `map`: the split loop behind
-/// [`count_matching_rows`] and [`matching_file_rows`]. The splits run
-/// concurrently (up to four per unit of available parallelism) and answer in
-/// completion order, so `map` is given each split's range.
+/// [`count_matching_rows`] and [`matching_file_rows`]. Up to four splits per
+/// unit of available parallelism are in flight, spawned onto the runtime's
+/// workers from two splits up ([`ScanDriver::for_filter_evaluation`]), so the
+/// evaluations run on as many cores; `map` is given each split's range.
 async fn map_filter_splits<T, F>(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -417,9 +420,15 @@ where
     F: Fn(Mask, &Range<u64>) -> T,
 {
     let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
+    let splits = ranges.len();
     let tasks = filter_split_tasks(file, filter, &mask_selection, ranges, deleted)?;
     let concurrency = available_parallelism() * 4;
-    let mut results = stream::iter(tasks).buffer_unordered(concurrency);
+    let mut results = match ScanDriver::for_filter_evaluation(splits) {
+        ScanDriver::Inline => stream::iter(tasks)
+            .buffer_unordered(concurrency)
+            .left_stream(),
+        ScanDriver::Spawned => spawned_splits(tasks, concurrency).right_stream(),
+    };
     let mut out = Vec::new();
     while let Some(r) = results.next().await {
         let (mask, range) = r?;

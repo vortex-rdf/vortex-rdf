@@ -577,7 +577,7 @@ Each stage in the code, and where the details are below:
 | 1 · subject chunk probe and prefix | [`matching.rs:630-637`](../core/src/store/query/matching.rs#L630-L637 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L809), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`matching.rs:638-651`](../core/src/store/query/matching.rs#L638-L651 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L764) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:664-734`](../core/src/store/query/matching.rs#L664-L734 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L20) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:657-658`](../core/src/store/query/matching.rs#L657-L658 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L916) and [`matching.rs:742-756`](../core/src/store/query/matching.rs#L742-L756 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L838), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L702) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:657-658`](../core/src/store/query/matching.rs#L657-L658 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L916) and [`matching.rs:742-756`](../core/src/store/query/matching.rs#L742-L756 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L838), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L711) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`matching.rs:758-773`](../core/src/store/query/matching.rs#L758-L773 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L209) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -626,7 +626,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L702) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L711) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -1234,7 +1234,7 @@ applies:
 | memory | `s` of a base sorted by it, over an id list (a predicate-bound match's rows, say) | binary search over the whole sorted column, as above, the admitted runs then intersected with the ids: no selected row is read |
 | memory | anything else | one pass over the selected rows of the column: read in place from its canonical primitive when one is materialized; else a piece at a time (at most 65,536 rows of one chunk, a shared wrapper's source decoded, never its cache filled), a piece with more than 16 selected rows, at least one per 16 rows from its first to its last, decoded and compared, any other read row by row through the cached probe, as is a point-sized selection (at most 256 rows) whole; a set tests a bitmap over its span when dense (the span within 8 bits per member, or within 256 codes per selected row up to 2^23 codes), a binary search when sparse |
 | file | `s` of a file sorted by it: a range, or a set of at most one code per 16 selected rows | located: the admitted rows are runs of the sorted column, found by binary search through its chunk probes and intersected with the selection — no column is read, and a pending filter stays pending |
-| file | any other keep | one pass over the splits the view's rows touch: each split evaluates the view's pending filter (zone pruning, then its conjuncts), reads the column at the rows it left, and tests them — a range with Vortex's `between` kernel over the chunk as it is encoded, a set against the decoded codes (a bitmap or a binary search, as in memory) — so the column is read only where the filter kept rows and no id list of the filter's own matches is built. The keep is never pushed to the scan as an expression, so Vortex's identity-keyed caches never see a per-query code list |
+| file | any other keep | one pass over the splits the view's rows touch, spawned onto the runtime's workers from two splits up: each split evaluates the view's pending filter (zone pruning, then its conjuncts), reads the column at the rows it left, and tests them — a range with Vortex's `between` kernel over the chunk as it is encoded, a set against the decoded codes (a bitmap or a binary search, as in memory) — so the column is read only where the filter kept rows and no id list of the filter's own matches is built. The keep is never pushed to the scan as an expression, so Vortex's identity-keyed caches never see a per-query code list |
 
 A pending view (a served match, or a run held for a count) materializes its
 ids first. The result is an exact selection in base order (`Ids`, a `Range`,
@@ -1329,7 +1329,12 @@ per pull for `code_chunks` and `row_chunks`, the whole set as one chunk for
 (`count_matching_rows_capped`), or by the same pieces over a residual compare
 left pending, and `exists()` is `size_capped(1) > 0` —
 what `contains` reads, so a membership test over a filtered file view
-stops at its first matching block.
+stops at its first matching block. An uncapped count (`size()`) has nothing
+to stop at: it evaluates every split the selection touches
+(`count_matching_rows`), as a delete does to find the rows it tombstones
+(`matching_file_rows`), the splits spawned onto the runtime's workers from
+two up, four per unit of available parallelism in flight, and counted as
+they finish.
 
 ### 16.3 Batches
 
