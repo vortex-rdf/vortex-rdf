@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["core", "encoded-search", "js", "cli", "python", "java"]
-# The DataFusion conformance crate and the comparative benchmark harness are
-# workspaces of their own (see interface-tests/Cargo.toml and
+# The comparative benchmark harness is a workspace of its own (see
 # bench-compare/Cargo.toml), kept out of this one's build and test surface.
-exclude = ["interface-tests", "bench-compare"]
+exclude = ["bench-compare"]
 # The python crate is a PyO3 extension module built by maturin; keep it out of
 # the default cargo build/test surface.
 default-members = ["core", "encoded-search", "js", "cli", "java"]

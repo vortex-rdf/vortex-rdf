@@ -9,4 +9,4 @@ git -C "$repo_root" config core.hooksPath scripts/hooks
 echo "Installed git hooks (skip once with --no-verify):"
 echo "  commit-msg : enforces Conventional Commits (for CHANGELOG generation)."
 echo "  pre-push   : runs scripts/ci-check.sh, every CI job (docs, lint,"
-echo "               rust-tests, interface-tests, python-tests and js-tests)."
+echo "               rust-tests, python-tests, js-tests and java-tests)."

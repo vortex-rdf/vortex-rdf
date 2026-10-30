@@ -8,10 +8,12 @@ view is exposed as a vortex `DataSource`, what the store's persisted children
 look like as tables, how rows stream out without Arrow, which runtime a read
 needs, what a view promises about itself before it is read, and which
 identities tell the engine when its cached codes and plans stop applying.
-Nothing here depends on DataFusion; the conformance crate
-([`interface-tests/tests/datafusion.rs`](../interface-tests/tests/datafusion.rs))
-drives every interface through vortex's own DataFusion integration, which
-is the path such an engine takes.
+Nothing here depends on DataFusion. Core's own tests pin each interface
+([`tests/data_source.rs`](../core/src/tests/data_source.rs),
+[`tests/chunks.rs`](../core/src/tests/chunks.rs),
+[`tests/metadata.rs`](../core/src/tests/metadata.rs)); vortex's DataFusion
+integration ([§8](#8-through-datafusion)) is one way to plan over them, and
+this repository does not test it.
 
 | What the engine needs | What it calls |
 |---|---|
@@ -169,9 +171,7 @@ code columns are `UInt64` (a canonical column converts without a copy) and
 whose `utf8` columns are `Utf8View`; `to_arrow_schema(source.dtype())`
 gives the matching schema, and `RecordBatch::from(struct_array)` the batch.
 The DataFusion integration does exactly this to every chunk a `DataSource`
-partition emits. The conformance crate's
-[`tests/arrow.rs`](../interface-tests/tests/arrow.rs) shows the recipe,
-including the two encodings an engine builds *from* codes:
+partition emits. An engine also builds two encodings *from* codes:
 
 - **Codes as ids.** `Int64` is the zero-copy id form: a `code_chunks`
   buffer reinterprets as an Arrow `Int64` column without a copy
@@ -342,7 +342,8 @@ valid.
 
 ## 8. Through DataFusion
 
-A view registers with vortex's table provider (`vortex-datafusion`'s `v2`):
+vortex's table provider (`vortex-datafusion`'s `v2`) takes a view's data
+source as a table:
 
 ```rust
 let source = view.data_source()?;
@@ -350,38 +351,20 @@ let schema = Arc::new(vortex_session().arrow().to_arrow_schema(source.dtype())?)
 ctx.register_table("quads", Arc::new(VortexTable::new(source, vortex_session().clone(), schema)))?;
 ```
 
-vortex's integration pushes the projection, the filters it can convert
-(comparisons, `AND`/`OR`, `IN` lists as `in_list`, `LIKE`, casts) and the
-limit into the scan request, reads the one partition, and converts every
-chunk to a `RecordBatch`. It reports one partition to DataFusion; set
-`target_partitions` to 1 when the scan's order must survive into the
-results, or use `partitions(n)` and register one table per piece.
+It pushes the projection, the filters it can convert (comparisons,
+`AND`/`OR`, `IN` lists, `LIKE`, casts) and the limit into the scan request
+([§1](#1-a-view-as-a-datasource)), and converts every chunk to a
+`RecordBatch` ([§3](#3-rows-as-columns-without-arrow)). It reports one
+partition; set `target_partitions` to 1 when the scan's order must survive
+into the results, or use `partitions(n)` and register one table per piece.
+SQL parses a bare integer (`WHERE p = 5`) as an `Int64` literal, and
+DataFusion's coercion turns its comparison with a `UInt64` code column into
+one against a `UInt64` literal, so the filter reaches the scan as one on
+codes.
 
-**Integer literals.** SQL parses a bare integer (`WHERE p = 5`) as an
-`Int64` literal. DataFusion's coercion and simplification turn its
-comparison with a `UInt64` code column back into one against a `UInt64`
-literal, so the scan node receives `$.p = 5u64`. A range arrives the same
-way, an `IN` of more than three values as an `in_list` of `UInt64` values,
-and a shorter one as `OR`ed equalities.
-
-The suite ([`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs))
-checks, on in-memory, byte-adopted and file-backed stores (mapped, and
-loaded whole): `COUNT(*)` against `size`, the whole table and projections
-against `code_chunks`, equality, `IN`, range and conjunction filters
-against brute force, bare integer literals on every code column (their
-counts against brute force, their predicates on the plan's scan node),
-limits with and without filters, `ORDER BY` on the base order, `DISTINCT`,
-a view as its own table and a join between two views, the `index:posg`
-child's order and `rid`s, the `dictionary` child's rows and a term-level
-`LIKE` over it, and a string layout's `Utf8View` columns.
-[`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs)
-is the starting point: run it with
-`cargo run --manifest-path interface-tests/Cargo.toml --example datafusion_table`.
-
-The crate is a workspace of its own, so the DataFusion dependency tree
-stays out of `cargo test --workspace`. The `interface-tests` job of
-`scripts/ci-check.sh`, which CI and the pre-push hook run, checks it
-`--locked` against the crate's own `Cargo.lock`.
+This repository does not test the integration; core's tests pin the scan
+request it relies on
+([`tests/data_source.rs`](../core/src/tests/data_source.rs)).
 
 ## 9. Source map
 
@@ -395,4 +378,4 @@ stays out of `cargo test --workspace`. The `interface-tests` job of
 | `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs) |
 | `vortex_session`, the `vortex_scan` re-export | [`core/src/lib.rs`](../core/src/lib.rs) |
-| Conformance through DataFusion, the Arrow recipe, the example | [`interface-tests/Cargo.toml`](../interface-tests/Cargo.toml), [`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs), [`tests/arrow.rs`](../interface-tests/tests/arrow.rs), [`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs) |
+| The interfaces' tests | [`core/src/tests/data_source.rs`](../core/src/tests/data_source.rs), [`chunks.rs`](../core/src/tests/chunks.rs), [`metadata.rs`](../core/src/tests/metadata.rs) |
