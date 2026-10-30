@@ -7,6 +7,7 @@
 //! never field by field.
 
 pub(crate) mod selection;
+pub(crate) mod tail_keys;
 
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ use vortex_array::arrays::{Chunked, ChunkedArray};
 use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_mask::Mask;
 
-use crate::error::Result;
+use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::subject_sorted;
@@ -24,6 +25,7 @@ use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
+use crate::store::view::tail_keys::TailKeys;
 use crate::store::zones::ZoneTable;
 
 #[cfg(feature = "file-io")]
@@ -438,6 +440,10 @@ pub(crate) struct Tail {
     /// The layout `rows` are stored in: [`layout_for`](Self::layout_for) the
     /// store's.
     pub(crate) layout: ResolvedLayout,
+    /// The keys of `rows`, which a fully bound match reads instead of
+    /// comparing every row ([`TailKeys`]); `None` under a layout without key
+    /// columns, which no tail takes.
+    pub(crate) keys: Option<TailKeys>,
 }
 
 /// Tail flatten policy: appended chunks are folded into the flat first chunk
@@ -462,14 +468,16 @@ impl Tail {
     }
 
     /// A tail of fresh `rows` in `layout`, every row visible and none
-    /// deleted.
-    pub(crate) fn new(rows: ArrayRef, layout: ResolvedLayout) -> Tail {
-        Tail {
+    /// deleted, every row keyed.
+    pub(crate) fn new(rows: ArrayRef, layout: ResolvedLayout) -> Result<Tail> {
+        let keys = TailKeys::of(&rows, &layout)?;
+        Ok(Tail {
             rows,
             selection: RowSelection::All,
             deleted: None,
             layout,
-        }
+            keys,
+        })
     }
 
     /// The same rows and tombstones under a different `selection`.
@@ -479,6 +487,7 @@ impl Tail {
             selection,
             deleted: self.deleted.clone(),
             layout: self.layout.clone(),
+            keys: self.keys.clone(),
         }
     }
 
@@ -512,6 +521,7 @@ impl Tail {
                 doomed.to_mask(self.rows.len()),
             )),
             layout: self.layout.clone(),
+            keys: self.keys.clone(),
         }
     }
 
@@ -543,9 +553,27 @@ impl Tail {
     /// folded into it per [`TAIL_FLATTEN_FLOOR`]/[`TAIL_MAX_CHUNKS`]. The new
     /// tail renumbers the rows, which is safe: views of the pre-append store
     /// keep the old tail, and an owner's selection is `All`.
+    ///
+    /// Without tombstones, under an owner's selection, the new tail holds this
+    /// tail's rows in order and then `fresh`'s, so its keys are these keys
+    /// extended by `fresh`'s alone. Dropping a tombstoned row renumbers every
+    /// row after it, and the new tail's rows are keyed again.
     pub(crate) fn append(&self, fresh: ArrayRef) -> Result<Tail> {
         let old = self.live_rows()?;
         let dtype = old.dtype().clone();
+        // Only `fresh` needs its dtype checked: every chunk of `old` has
+        // `dtype` already, which a chunked array of up to `TAIL_MAX_CHUNKS`
+        // chunks would otherwise check again on every append.
+        if fresh.dtype() != &dtype {
+            return Err(VortexRdfError::Vortex(vortex_error::vortex_err!(
+                "appended rows of type {} do not match the tail's {dtype}",
+                fresh.dtype()
+            )));
+        }
+        let keys = match (&self.keys, &self.deleted, &self.selection) {
+            (Some(keys), None, RowSelection::All) => Some(keys.extended(&fresh)?),
+            _ => None,
+        };
         let mut chunks = match old.clone().try_downcast::<Chunked>() {
             Ok(ch) => ch.chunks(),
             Err(_) => vec![old],
@@ -554,7 +582,10 @@ impl Tail {
         let accreted: usize = chunks[1..].iter().map(|c| c.len()).sum::<usize>() + fresh.len();
         chunks.push(fresh);
         let n_chunks = chunks.len();
-        let combined = ChunkedArray::try_new(chunks, dtype)?.into_array();
+        // SAFETY: every chunk has `dtype`: those of `old` are the chunks of an
+        // array of `dtype` (a chunked array's own, or `old` itself), and the
+        // last is `fresh`, checked above.
+        let combined = unsafe { ChunkedArray::new_unchecked(chunks, dtype) }.into_array();
         let rows = if accreted >= flat_len.max(TAIL_FLATTEN_FLOOR) || n_chunks > TAIL_MAX_CHUNKS {
             let mut ctx = VORTEX_SESSION.create_execution_ctx();
             combined
@@ -565,7 +596,16 @@ impl Tail {
             combined
         };
         // `live_rows` dropped the tombstoned rows, so the new tail has none.
-        Ok(Tail::new(rows, self.layout.clone()))
+        match keys {
+            Some(keys) => Ok(Tail {
+                rows,
+                selection: RowSelection::All,
+                deleted: None,
+                layout: self.layout.clone(),
+                keys: Some(keys),
+            }),
+            None => Tail::new(rows, self.layout.clone()),
+        }
     }
 }
 

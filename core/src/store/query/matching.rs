@@ -143,10 +143,19 @@ impl VortexRdfStore {
             // Unconstrained pattern: every selected tail row matches.
             return Ok(carry(tail.selection.clone()));
         }
+        // A fully bound pattern (every `contains`, so every presence check
+        // `add_quads` makes) reads the rows its key names off the tail's
+        // keys, instead of comparing every selected row.
+        if let Some(rows) = Self::keyed_tail_rows(tail, &eqs)? {
+            debug::step!(t, "[match_pattern] Tail matched by its row keys");
+            return Ok(carry(rows));
+        }
+        #[cfg(test)]
+        tail_hooks::note_scanned();
         let applied = tail.selection.apply(&tail.rows)?;
         // Typed fast path first: the tail's string columns compared as raw
         // bytes, without the per-call compare/canonicalize pipeline; every
-        // `contains`, so every `add_quad` presence check, rides it.
+        // pattern the keys cannot answer rides it.
         if let Some(positions) = typed_positions(&applied, &eqs) {
             let mask = Mask::from_indices(applied.len(), positions);
             debug::step!(t, "[match_pattern] Tail matched by typed positions");
@@ -156,6 +165,44 @@ impl VortexRdfStore {
         let matched = carry(tail.selection.clone().refine(&bool_array_to_mask(mask)?));
         debug::step!(t, "[match_pattern] Tail matched by mask scan");
         Ok(matched)
+    }
+
+    /// The selected tail rows that hold every equality of `eqs`, read off the
+    /// tail's keys ([`TailKeys`](crate::store::view::tail_keys::TailKeys)):
+    /// the rows the key of `eqs` names, each checked against every equality,
+    /// so a row that only shares the key is not matched. `None` when the tail
+    /// has no keys or `eqs` leave a key column free (a pattern not fully
+    /// bound), which the scan answers.
+    fn keyed_tail_rows(
+        tail: &Tail,
+        eqs: &[(&'static str, Scalar)],
+    ) -> Result<Option<RowSelection>> {
+        let Some(candidates) = tail.keys.as_ref().and_then(|keys| keys.candidates(eqs)) else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        tail_hooks::note_keyed();
+        let mut rows = Vec::with_capacity(candidates.len());
+        for row in candidates {
+            if tail.selection.contains(row) && Self::tail_row_holds(&tail.rows, row, eqs)? {
+                rows.push(row);
+            }
+        }
+        Ok(Some(RowSelection::from_ids(vortex_buffer::Buffer::from(
+            rows,
+        ))))
+    }
+
+    /// Whether row `row` of the tail `rows` holds every equality of `eqs`,
+    /// compared as the scan compares it.
+    fn tail_row_holds(
+        rows: &ArrayRef,
+        row: schema::RowId,
+        eqs: &[(&'static str, Scalar)],
+    ) -> Result<bool> {
+        let row = row as usize;
+        let one = rows.slice(row..row + 1)?;
+        Ok(bool_array_to_mask(Self::mask_for(&one, eqs)?)?.all_true())
     }
 
     /// Match the pattern against the base alone, composing its restrictions
@@ -886,6 +933,38 @@ fn fold_row_ids(
 /// `match_base`): a lookup costs the rows matching the component it resolves,
 /// not the rows the view still holds. An unrefined view never skips.
 const INDEX_ROUTING_MIN_ROWS: usize = 4_096;
+
+/// Test hook: how many tail matches this thread answered off the tail's keys,
+/// and how many by comparing the tail's selected rows.
+#[cfg(test)]
+pub(crate) mod tail_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static KEYED: Cell<usize> = const { Cell::new(0) };
+        static SCANNED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one tail match answered off the keys.
+    pub(super) fn note_keyed() {
+        KEYED.set(KEYED.get() + 1);
+    }
+
+    /// Record one tail match answered by comparing rows.
+    pub(super) fn note_scanned() {
+        SCANNED.set(SCANNED.get() + 1);
+    }
+
+    /// The tail matches answered off the keys on this thread so far.
+    pub(crate) fn keyed() -> usize {
+        KEYED.get()
+    }
+
+    /// The tail matches answered by comparing rows on this thread so far.
+    pub(crate) fn scanned() -> usize {
+        SCANNED.get()
+    }
+}
 
 /// Test hook: how many in-memory residual filters this thread narrowed to
 /// the zones their codes' bounds hold.

@@ -13,8 +13,10 @@ use crate::store::view::selection::RowSelection;
 use crate::store::view::selection::ViewSelection;
 use crate::store::{Backend, Tail, next_generation};
 
+use hashbrown::HashTable;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use std::collections::HashSet;
+use rustc_hash::FxBuildHasher;
+use std::hash::BuildHasher;
 
 #[cfg(feature = "file-io")]
 use vortex_mask::Mask;
@@ -99,13 +101,16 @@ impl VortexRdfStore {
         self.ensure_owner("add_quads")?;
 
         let mut fresh: Vec<RawQuad> = Vec::new();
-        let mut seen: HashSet<RawQuad> = HashSet::new();
+        // The quads kept so far, by their place in `fresh`: an earlier equal
+        // quad of the batch is found there, with no copy of a kept quad.
+        let mut kept: HashTable<usize> = HashTable::new();
         for quad in quads {
             let raw = RawQuad::from_quad(&quad);
-            if seen.contains(&raw) || self.contains(&quad).await? {
+            let hash = FxBuildHasher.hash_one(&raw);
+            if kept.find(hash, |&i| fresh[i] == raw).is_some() || self.contains(&quad).await? {
                 continue;
             }
-            seen.insert(raw.clone());
+            kept.insert_unique(hash, fresh.len(), |&i| FxBuildHasher.hash_one(&fresh[i]));
             fresh.push(raw);
         }
         if fresh.is_empty() {
@@ -115,7 +120,7 @@ impl VortexRdfStore {
         let layout = Tail::layout_for(&self.layout);
         let fresh_rows = build_struct_array(&fresh, layout.strategy(), false)?;
         let tail = match &self.tail {
-            None => Tail::new(fresh_rows, layout),
+            None => Tail::new(fresh_rows, layout)?,
             // The fresh rows join the tail as one more chunk, flattened per
             // the tail's policy (see `Tail::append`).
             Some(tail) => tail.append(fresh_rows)?,

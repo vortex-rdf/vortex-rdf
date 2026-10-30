@@ -37,6 +37,7 @@ mod roundtrip;
 mod row_limit;
 mod serialization;
 mod streaming;
+mod tail_keys;
 mod unique_quads;
 mod wide_codes;
 mod wide_row_ids;

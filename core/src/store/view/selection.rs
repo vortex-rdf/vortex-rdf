@@ -224,6 +224,15 @@ impl RowSelection {
         }
     }
 
+    /// Whether the selection holds row `row`.
+    pub(crate) fn contains(&self, row: RowId) -> bool {
+        match self {
+            RowSelection::All => true,
+            RowSelection::Range(range) => range.contains(&row),
+            RowSelection::Ids(ids) => ids.binary_search(&row).is_ok(),
+        }
+    }
+
     /// Narrow to the base rows also named by `ids`, which must be ascending
     /// and unique.
     pub(crate) fn intersect_ids(self, ids: Buffer<RowId>) -> Self {
