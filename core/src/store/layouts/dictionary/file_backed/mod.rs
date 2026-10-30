@@ -305,6 +305,21 @@ impl FileBackedDict {
         .await
     }
 
+    /// The term with `code`, `None` outside the dictionary: its window read
+    /// and the one term decompressed, without the sort and grouping a batch
+    /// ([`decode_many_with`](Self::decode_many_with)) costs for one code.
+    pub(crate) async fn decode_one(&self, code: TermCode) -> Result<Option<String>> {
+        let Some(rank) = self.0.code_space.rank_of(code) else {
+            return Ok(None);
+        };
+        let (w, local) = chunk_of(&self.0.starts, rank);
+        let chunk = self.0.window_chunk(w).await?;
+        let mut scratch = Vec::new();
+        Ok(Some(
+            crate::store::array::trusted_str(chunk.bytes_into(local, &mut scratch)).to_owned(),
+        ))
+    }
+
     /// The code of `term`, tolerant of spelling as `TermDictionary::encode`.
     pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         if let Some(code) = self.encode_exact(term).await? {

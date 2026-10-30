@@ -279,7 +279,7 @@ impl DictReader {
         match &self.0 {
             DictAccess::Resident(dict) => Ok(dict.decode(code)),
             #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(_) => Ok(self.decode_many(&[code]).await?.pop().flatten()),
+            DictAccess::FileBacked(dict) => dict.decode_one(code).await,
         }
     }
 
