@@ -11,12 +11,15 @@ use vortex_rdf_core::{
     CodePattern, DictReader, KindRanges, Probe, Result, VortexRdfError, VortexRdfStore,
 };
 
+use crate::cursor::QuadCursor;
+use crate::payload::{Limits, Payload, encode_lookup};
+
 /// Bytes per row [`Store::match_codes`] writes: four codes of eight bytes.
 pub const ROW_BYTES: usize = 32;
 
 /// One runtime for every store of the process, as in the Python bindings: a store's reads are async, the
 /// caller's threads block on them.
-static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -118,6 +121,30 @@ impl Store {
             .collect())
     }
 
+    /// The quads [`quads`](Self::quads) reads, as a cursor that sends them in packed chunks under `limits`:
+    /// the same rows in the same order, found the same way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quads_cursor(
+        &self,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+        offset: u64,
+        limit: Option<usize>,
+        limits: Limits,
+    ) -> Result<QuadCursor> {
+        let probe = Probe::parse(s, p, o, g)?.window(offset as usize, limit);
+        let view = RUNTIME.block_on(self.store.run_probe(&probe))?;
+        if let Some(dict) = &self.dict
+            && let Some(columns) = RUNTIME.block_on(view.code_columns_gathered())?
+        {
+            return Ok(QuadCursor::codes(dict.clone(), columns, limits));
+        }
+        let rows = RUNTIME.block_on(view.shared_quads_vec())?;
+        Ok(QuadCursor::shared(rows, limits))
+    }
+
     // ---- term codes, Dictionary layout ----
 
     fn dict(&self) -> Result<&DictReader> {
@@ -158,6 +185,12 @@ impl Store {
     /// [`decode`](Self::decode) of each code, in order, for codes in any order and with repeats.
     pub fn decode_many(&self, codes: &[u64]) -> Result<Vec<Option<String>>> {
         RUNTIME.block_on(self.dict()?.decode_many(codes))
+    }
+
+    /// The terms of `codes` from the first, as one packed chunk under `limits`, and how many codes it holds
+    /// (at least one, unless `codes` is empty). A code outside the dictionary holds no term.
+    pub fn decode_payload(&self, codes: &[u64], limits: Limits) -> Result<(Payload, usize)> {
+        RUNTIME.block_on(encode_lookup(self.dict()?, codes, limits))
     }
 
     /// The number of quads matching a code pattern, exact and without reading rows.

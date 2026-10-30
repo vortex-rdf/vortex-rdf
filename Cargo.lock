@@ -3689,6 +3689,7 @@ dependencies = [
  "jni",
  "tempfile",
  "tokio",
+ "vortex-buffer",
  "vortex-rdf-core",
  "vortex-rdf-encoded-search",
 ]

@@ -7,6 +7,7 @@
 //! after `close`); a term code is a non-negative `long`, and `-1` means "no code" (a free pattern position, a term
 //! the dictionary lacks); a `null` string is a free pattern position, while `""` is the default graph.
 
+pub mod cursor;
 pub mod engine;
 pub mod payload;
 

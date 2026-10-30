@@ -2,11 +2,13 @@
 //! built from it, one per layout and index set.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use futures::stream;
 use vortex_rdf_core::io::quads_stream_to_vortex_file;
 use vortex_rdf_core::{IndexType, LayoutStrategy, Probe, RawQuad, VortexRdfStore};
+use vortex_rdf_jni::cursor::QuadCursor;
 
 pub type Quad = [String; 4];
 
@@ -154,6 +156,24 @@ pub fn write(dir: &std::path::Path, built: &Built, quads: &[Quad]) -> String {
     path.to_str().unwrap().to_string()
 }
 
+/// The reference reads' runtime and the stores they opened, by path and residency.
+struct Reference {
+    runtime: tokio::runtime::Runtime,
+    opened: RefCell<HashMap<(String, bool), VortexRdfStore>>,
+}
+
+thread_local! {
+    /// One [`Reference`] per test thread: opening a store costs far more than reading a small one, and each
+    /// test writes its paths once, in its own temporary directory.
+    static REFERENCE: Reference = Reference {
+        runtime: tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+        opened: RefCell::new(HashMap::new()),
+    };
+}
+
 /// The rows a pattern matches, `limit` after `offset`, read one `String` per term as the bindings read them
 /// before the packed transfer: a Dictionary store's matched codes decoded a column at a time, the matched
 /// quads' terms otherwise. The tests' reference for the rows the engine hands over, their order included.
@@ -164,51 +184,79 @@ pub fn reference_quads(
     offset: u64,
     limit: Option<usize>,
 ) -> Vec<Quad> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let store = if in_memory {
-            VortexRdfStore::from_file_in_memory(path).await
-        } else {
-            VortexRdfStore::from_file(path).await
-        }
-        .expect("open the store");
-        let [s, p, o, g] = pattern;
-        let probe = Probe::parse(s, p, o, g)
-            .expect("parse the pattern")
-            .window(offset as usize, limit);
-        let view = store.run_probe(&probe).await.expect("run the probe");
-        if let Some(dict) = store.dict_reader()
-            && let Some(columns) = view.code_columns_gathered().await.expect("gather codes")
-        {
-            let mut decoded = Vec::with_capacity(4);
-            for column in &columns {
-                decoded.push(dict.decode_many(column).await.expect("decode a column"));
-            }
-            return (0..decoded[0].len())
-                .map(|row| {
-                    std::array::from_fn(|i| {
-                        decoded[i][row]
-                            .clone()
-                            .expect("a matched row holds a code outside the dictionary")
+    REFERENCE.with(|Reference { runtime, opened }| {
+        let store = opened
+            .borrow_mut()
+            .entry((path.to_string(), in_memory))
+            .or_insert_with(|| {
+                runtime
+                    .block_on(async {
+                        if in_memory {
+                            VortexRdfStore::from_file_in_memory(path).await
+                        } else {
+                            VortexRdfStore::from_file(path).await
+                        }
                     })
-                })
-                .collect();
-        }
-        view.shared_quads_vec()
-            .await
-            .expect("read the quads")
-            .iter()
-            .map(|q| {
-                [
-                    q.s.to_string(),
-                    q.p.to_string(),
-                    q.o.to_string(),
-                    q.g.to_string(),
-                ]
+                    .expect("open the store")
             })
-            .collect()
+            .clone();
+        runtime.block_on(async {
+            let [s, p, o, g] = pattern;
+            let probe = Probe::parse(s, p, o, g)
+                .expect("parse the pattern")
+                .window(offset as usize, limit);
+            let view = store.run_probe(&probe).await.expect("run the probe");
+            if let Some(dict) = store.dict_reader()
+                && let Some(columns) = view.code_columns_gathered().await.expect("gather codes")
+            {
+                let mut decoded = Vec::with_capacity(4);
+                for column in &columns {
+                    decoded.push(dict.decode_many(column).await.expect("decode a column"));
+                }
+                return (0..decoded[0].len())
+                    .map(|row| {
+                        std::array::from_fn(|i| {
+                            decoded[i][row]
+                                .clone()
+                                .expect("a matched row holds a code outside the dictionary")
+                        })
+                    })
+                    .collect();
+            }
+            view.shared_quads_vec()
+                .await
+                .expect("read the quads")
+                .iter()
+                .map(|q| {
+                    [
+                        q.s.to_string(),
+                        q.p.to_string(),
+                        q.o.to_string(),
+                        q.g.to_string(),
+                    ]
+                })
+                .collect()
+        })
     })
+}
+
+/// The rows a cursor sends, each chunk's positions read through `Payload::term`, four to a row; checks that
+/// every chunk holds whole rows and that the rows add up to the cursor's count.
+pub fn drain(mut cursor: QuadCursor) -> Vec<Quad> {
+    let mut rows = Vec::with_capacity(cursor.rows());
+    for payload in &mut cursor {
+        let payload = payload.expect("read a chunk");
+        let positions = payload.positions();
+        assert!(positions > 0 && positions % 4 == 0, "{positions} positions");
+        for row in 0..positions / 4 {
+            rows.push(std::array::from_fn(|c| {
+                payload
+                    .term(4 * row + c)
+                    .expect("a row position holds a term")
+                    .to_string()
+            }));
+        }
+    }
+    assert_eq!(rows.len(), cursor.rows(), "the chunks hold the read's rows");
+    rows
 }
