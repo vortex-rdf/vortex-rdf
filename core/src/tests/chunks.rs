@@ -882,14 +882,12 @@ async fn pull_and_drain<S: futures::Stream + Unpin>(
 }
 
 /// The chunk streams over a filtered no-index file view (`code_chunks`,
-/// `row_chunks`, `quads()` and the data source's scan) stay lazy and scan:
-/// nothing is evaluated or scanned before the first poll, each drained stream
-/// runs one row scan and never reads the filter's masks first, and with the
-/// split limit forced to zero a first pull has at most a scan's window of
-/// splits spawned, four per unit of available parallelism, on a file of more
-/// splits than that. The row-chunk streams spawn through the crate's driver,
-/// which counts each spawn; `quads()` reads through vortex's own scan stream,
-/// whose window the count does not see.
+/// `row_chunks`, `quads()` and the data source's scan) stay lazy and read the
+/// filter's masks first: nothing is evaluated or scanned before the first
+/// poll, each drained stream evaluates every split once and reads each
+/// split's rows at its mask, with no row scan, and with the split limit
+/// forced to zero a first pull has a window of splits spawned, four per unit
+/// of available parallelism, on a file of more splits than that.
 #[tokio::test]
 async fn test_chunk_stream_over_filtered_file_stays_lazy() {
     use crate::io::read::available_parallelism;
@@ -949,19 +947,75 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
             }
         };
         assert_eq!(rows, n, "{read}: every row");
-        assert!(
-            spawned <= window,
-            "{read}: {spawned} splits spawned by a first pull"
-        );
-        if read != "quads" {
-            assert_eq!(spawned, window.min(MANY_SPLITS), "{read}: a scan's window");
-        }
-        assert_eq!(scan_hooks::scans() - scans, 1, "{read}: one row scan");
         assert_eq!(
-            split_hooks::evaluated(),
-            evaluated,
-            "{read}: no masks evaluated"
+            spawned,
+            window.min(MANY_SPLITS),
+            "{read}: a window of splits spawned by a first pull"
         );
-        assert_eq!(masked_read_hooks::reads(), masked, "{read}: no masked read");
+        assert_eq!(scan_hooks::scans(), scans, "{read}: no row scan");
+        assert_eq!(
+            split_hooks::evaluated() - evaluated,
+            MANY_SPLITS,
+            "{read}: every split evaluated once"
+        );
+        let reads = |counts: [usize; 3]| counts.iter().sum::<usize>();
+        assert_eq!(
+            reads(masked_read_hooks::reads()) - reads(masked),
+            MANY_SPLITS,
+            "{read}: each split's rows read at its mask"
+        );
+    }
+}
+
+/// A chunk stream over a filtered no-index file view (`code_chunks`,
+/// `row_chunks`, `quads()` and the data source's scan) dropped after its
+/// first item has evaluated only the splits its driver reached, not the
+/// file's [`MANY_SPLITS`]: the first split, whose matches the item holds, and
+/// at most the rest of the inline driver's window (the host's available
+/// parallelism). A `LIMIT` through DataFusion stops a stream this way.
+#[tokio::test]
+async fn test_chunk_stream_stopped_early_evaluates_only_the_splits_it_reached() {
+    use crate::io::read::available_parallelism;
+    use crate::store::scan::file_filter::split_hooks;
+    use crate::store::scan::file_scans::driver_hooks;
+
+    let (_dir, path) = many_splits_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p0 = iri("p0");
+    let view = matched_view(&store, None, Some(&p0), None, None).await;
+    assert!(view.view_statistics().unwrap().pending_filter);
+    let reach = available_parallelism().min(MANY_SPLITS);
+    // Inline whatever the split count, so the window a first pull fills is
+    // the host's parallelism.
+    let _limit = driver_hooks::ForcedLimit::set(usize::MAX);
+    for read in ["code_chunks", "row_chunks", "quads", "data_source"] {
+        let before = split_hooks::evaluated();
+        let rows = match read {
+            "code_chunks" => {
+                let mut chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+                chunks.next().await.unwrap().unwrap()[0].len()
+            }
+            "row_chunks" => {
+                let mut chunks = view.row_chunks(256).unwrap();
+                chunks.next().await.unwrap().unwrap().len()
+            }
+            "quads" => {
+                view.quads().next().await.unwrap().unwrap();
+                1
+            }
+            _ => {
+                let source = view.data_source().unwrap();
+                let scan = source.scan(ScanRequest::default()).await.unwrap();
+                let partition = scan.partitions().next().await.unwrap().unwrap();
+                let mut chunks = partition.execute().unwrap();
+                chunks.next().await.unwrap().unwrap().len()
+            }
+        };
+        assert!(rows > 0, "{read}: a first item with rows");
+        let evaluated = split_hooks::evaluated() - before;
+        assert!(
+            (1..=reach).contains(&evaluated),
+            "{read}: {evaluated} splits evaluated for a first item, at most {reach}"
+        );
     }
 }

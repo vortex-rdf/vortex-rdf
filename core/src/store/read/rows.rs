@@ -504,9 +504,11 @@ pub(in crate::store) struct FileReadScope<'a> {
 impl FileReadScope<'_> {
     /// The base rows `read` reads by id: point by point through the file's
     /// cached chunk probes ([`file_reads::file_point_rows`]), or taken at the
-    /// ids ([`file_reads::take_file_rows`]). [`ExactRead::Scan`] and
-    /// [`ExactRead::Masks`], which a streaming reader scans, and a read by id
-    /// that declines are the restricted scan ([`scan`](Self::scan)).
+    /// ids ([`file_reads::take_file_rows`]). [`ExactRead::Scan`], a read by
+    /// id that declines, and [`ExactRead::Masks`] (which the streams and the
+    /// one-shot reads evaluate to its masks first; only a whole-view read
+    /// through [`base_read`](VortexRdfStore::base_read) gets it here) are the
+    /// restricted scan ([`scan`](Self::scan)).
     pub(in crate::store) async fn rows(&self, read: ExactRead) -> Result<BaseRead> {
         let rows = match read {
             ExactRead::Points(rows) => {

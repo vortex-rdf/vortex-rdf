@@ -13,7 +13,7 @@ use vortex_array::dtype::DType;
 use vortex_array::expr::{Expression, root, select};
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
-use vortex_error::VortexResult;
+use vortex_error::{VortexError, VortexResult};
 use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
@@ -24,8 +24,9 @@ use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
 use crate::store::scan::file_filter::{self, SplitMasks};
 use crate::store::scan::file_scans::collect_row_splits;
 use crate::store::scan::gather::primitive_from_u64_reads;
-use crate::store::scan::read_plan::{Footprint, POINT_READ_ROWS, ids_by_split};
+use crate::store::scan::read_plan::{Footprint, MaskedRead, POINT_READ_ROWS, ids_by_split};
 use crate::store::schema::{RowId, TermCode};
+use crate::store::view::selection::RowSelection;
 
 /// The rows of `columns` at `rows`, the live rows
 /// [`ExactRead`](super::read_plan::ExactRead) chose to read point by point,
@@ -397,6 +398,65 @@ pub(crate) fn with_pinned(
         children.push(child);
     }
     Ok(named_struct(columns, children, len)?.into_array())
+}
+
+/// The reads of the rows `filter` keeps in `selection`, the filter's masks
+/// first, one future per split the selection touches, in file order: each
+/// evaluates the filter over its split
+/// ([`split_filter_tasks`](file_filter::split_filter_tasks), tombstoned rows
+/// cleared), then reads `columns` at the rows its mask keeps, as
+/// [`MaskedRead`] chooses for that split alone ([`kept_split_rows`]); a
+/// split the filter keeps nothing of reads nothing. Nothing is evaluated
+/// until a future is polled, so a stream of them evaluates only the splits
+/// it reaches.
+pub(crate) fn masks_first_split_reads(
+    file: &Arc<NativeStoreFile>,
+    filter: &Expression,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+    columns: &[&'static str],
+) -> Result<Vec<SplitRead>> {
+    let columns: Arc<[&'static str]> = Arc::from(columns);
+    Ok(
+        file_filter::split_filter_tasks(file, filter, selection, deleted)?
+            .into_iter()
+            .map(|evaluate| {
+                let (file, columns) = (Arc::clone(file), Arc::clone(&columns));
+                async move {
+                    let (mask, range) = evaluate.await?;
+                    if mask.all_false() {
+                        return Ok(None);
+                    }
+                    kept_split_rows(&file, &columns, &SplitMasks::of_split(mask, range)).await
+                }
+                .map(|rows| rows.map_err(VortexError::from))
+                .boxed()
+            })
+            .collect(),
+    )
+}
+
+/// `columns` at the rows one split's `masks` keep, read as [`MaskedRead`]
+/// chooses for them: point by point through the chunk probes, taken at the
+/// kept ids, or projected at the mask. A point read a chunk declines is
+/// taken.
+async fn kept_split_rows(
+    file: &Arc<NativeStoreFile>,
+    columns: &[&'static str],
+    masks: &SplitMasks,
+) -> Result<Option<ArrayRef>> {
+    let read = MaskedRead::of(file, masks)?;
+    if read == MaskedRead::Points
+        && let Some(rows) =
+            file_point_rows(file, columns, None, masks.first_ids(usize::MAX)).await?
+    {
+        return Ok(Some(rows));
+    }
+    let (_, tasks) = masked_split_tasks(file, columns, masks, read != MaskedRead::Project)?;
+    match tasks.into_iter().next() {
+        Some(task) => Ok(task.await?),
+        None => Ok(None),
+    }
 }
 
 /// The rows of `columns` that `masks` keep, each split with a match projected

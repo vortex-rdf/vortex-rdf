@@ -190,6 +190,30 @@ pub(crate) fn stream_rows(
         .boxed())
 }
 
+/// Split futures in flight per unit of available parallelism when a split
+/// loop's futures are spawned: a scan's default concurrency, the window
+/// [`stream_rows`] spawns under.
+pub(crate) const SPLITS_IN_FLIGHT_PER_CORE: usize = 4;
+
+/// `reads` (one future per split, in split order, each the split's rows or
+/// none) streamed as a row scan's splits are ([`stream_rows`]): the driver
+/// is [`ScanDriver::for_row_scan`]'s, [`SPLITS_IN_FLIGHT_PER_CORE`] per core
+/// in flight when spawned. The rows come in split order, the splits that
+/// keep none dropped, a split's error as one error item.
+pub(crate) fn stream_split_reads<F>(reads: Vec<F>) -> BoxStream<'static, Result<ArrayRef>>
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
+{
+    let window = SPLITS_IN_FLIGHT_PER_CORE * available_parallelism();
+    let splits = match ScanDriver::for_row_scan(reads.len()) {
+        ScanDriver::Inline => inline_splits(reads).boxed(),
+        ScanDriver::Spawned => spawned_splits(reads, window).boxed(),
+    };
+    splits
+        .filter_map(|split| future::ready(split.map_err(VortexRdfError::Vortex).transpose()))
+        .boxed()
+}
+
 /// An index child's row-id scan run to completion, its rows in one array,
 /// always inline whatever its split count: zone maps prune almost every
 /// split of such a scan, and a located run is sliced out of the row-id

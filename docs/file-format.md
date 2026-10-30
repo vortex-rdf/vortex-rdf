@@ -527,8 +527,10 @@ rows they keep point by point, by a take, or by projecting each split at its
 mask
 ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
 Streaming reads (`quads()` and its twins) decode inside the per-split tasks
-Vortex's scan stream spawns; under a file-backed dictionary the decode may
-await the dictionary's own reads, so it runs at the stream's consumer instead.
+Vortex's scan stream spawns, or, over such a filter, inside the split reads
+that evaluate its masks a split at a time; under a file-backed dictionary the
+decode may await the dictionary's own reads, so it runs at the stream's
+consumer instead.
 
 **Platforms and limits.** Mapping works on Linux, macOS and Windows. A store
 file is read in place while open: truncating or rewriting it in place is

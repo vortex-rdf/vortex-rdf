@@ -35,7 +35,9 @@ use crate::store::scan::file_filter::SplitMasks;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_reads;
 #[cfg(feature = "file-io")]
-use crate::store::scan::read_plan::MaskedRead;
+use crate::store::scan::file_scans::{SPLITS_IN_FLIGHT_PER_CORE, ScanDriver};
+#[cfg(feature = "file-io")]
+use crate::store::scan::read_plan::{ExactRead, MaskedRead};
 #[cfg(feature = "file-io")]
 use futures::FutureExt as _;
 #[cfg(feature = "file-io")]
@@ -202,10 +204,13 @@ impl VortexRdfStore {
     /// rows in base row order, over the exact selection
     /// ([`base_read`](Self::base_read)): rows read by id
     /// ([`ExactRead`](crate::store::scan::read_plan::ExactRead)) are one chunk, and the
-    /// restricted scan streams split by split. A collected read of a pending
-    /// filter the reads by id leave to the scan reads the filter's masks
-    /// first, then the rows they keep ([`masked_chunks`](Self::masked_chunks)),
-    /// and reads a window's kept masks the same way.
+    /// restricted scan streams split by split. A pending filter the reads by
+    /// id leave to the scan is read by its masks first: a collected read
+    /// evaluates every split's mask, then reads the rows they keep
+    /// ([`masked_chunks`](Self::masked_chunks)), and reads a window's kept
+    /// masks the same way; a stream evaluates each split's mask when it
+    /// reaches the split, then reads the rows that mask keeps
+    /// ([`decoded_split_reads`](Self::decoded_split_reads)).
     #[cfg(feature = "file-io")]
     async fn file_chunks<T: ChunkDecode>(
         &self,
@@ -260,6 +265,19 @@ impl VortexRdfStore {
             && let Some(masks) = scope.masks_first(&read).await?
         {
             return self.masked_chunks(file, &masks, scope.filter, tail).await;
+        }
+        // A stream takes the filter by its masks first too, split by split as
+        // it reaches them, under the row-scan driver.
+        if let (ExactRead::Masks, Some(filter)) = (&read, scope.filter) {
+            let reads = file_reads::masks_first_split_reads(
+                file,
+                filter,
+                &scope.selection,
+                scope.deleted,
+                primary,
+            )?;
+            let spawn = ScanDriver::for_row_scan(reads.len()) == ScanDriver::Spawned;
+            return Ok(self.decoded_split_reads(reads, spawn, tail));
         }
         match scope.rows(read).await? {
             // Rows read by id decode as one chunk, with no scan machinery.
@@ -330,7 +348,23 @@ impl VortexRdfStore {
             })
             .collect();
         let spawn = tasks.len() > 1 && tokio::runtime::Handle::try_current().is_ok();
-        let window = 4 * available_parallelism();
+        Ok(self.decoded_split_reads(tasks, spawn, tail))
+    }
+
+    /// The rows of split `reads` (one per split, in split order) decoded into
+    /// chunks of `T`, then the tail's chunk: the reads spawned onto the
+    /// runtime when `spawn`, [`SPLITS_IN_FLIGHT_PER_CORE`] per core in
+    /// flight, or polled inline. Each chunk decodes inside its split's read
+    /// under a resident dictionary and on the stream under a file-backed one,
+    /// as [`scan_chunks`](Self::scan_chunks) decodes.
+    #[cfg(feature = "file-io")]
+    fn decoded_split_reads<T: ChunkDecode>(
+        &self,
+        tasks: Vec<file_reads::SplitRead>,
+        spawn: bool,
+        tail: Vec<Result<T>>,
+    ) -> Chunks<T> {
+        let window = SPLITS_IN_FLIGHT_PER_CORE * available_parallelism();
         let layout = self.layout.clone();
         let file_backed_dictionary =
             matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
@@ -366,7 +400,7 @@ impl VortexRdfStore {
                 .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(VortexRdfError::Vortex(e))]))
                 .boxed()
         };
-        Ok(with_tail(chunks, tail))
+        with_tail(chunks, tail)
     }
 
     /// `scan`'s chunks decoded through `decoder`, then the tail's chunk; a

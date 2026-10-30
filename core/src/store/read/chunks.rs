@@ -11,9 +11,12 @@
 //! a contiguous selection without tombstones is sliced from the base, and
 //! any other is cut into windows of live ids, each gathered when its chunk is
 //! pulled. On file a selection `ExactRead` takes by id is taken one window of
-//! ids per pull; any other read goes through the one base-row seam
-//! (`base_read`): the few rows `ExactRead` reads point by point, read at
-//! once, or the scan's chunks, streamed through the row-scan driver.
+//! ids per pull; a pending filter it leaves to the masks is evaluated a split
+//! at a time as the stream reaches the split, only the requested columns read
+//! at the rows the split's mask keeps; any other read goes through the one
+//! base-row seam (`base_read`): the few rows `ExactRead` reads point by
+//! point, read at once, or the scan's chunks, streamed through the row-scan
+//! driver.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -34,7 +37,11 @@ use crate::store::VortexRdfStore;
 use crate::store::array::{field_as, into_struct_array, rechunk};
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
-use crate::store::scan::{file_reads::take_file_rows, read_plan::ExactRead};
+use crate::store::scan::{
+    file_reads::{masks_first_split_reads, take_file_rows},
+    file_scans::stream_split_reads,
+    read_plan::ExactRead,
+};
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, SelectedRows};
 
@@ -51,7 +58,8 @@ impl VortexRdfStore {
     /// The rows this view selects as struct chunks in the layout's primary
     /// dtype ([`TermCode`] columns under the Dictionary layout, strings
     /// otherwise), in base row order, each of at most `batch_rows` rows (a
-    /// scanned file view's chunks follow the scan's splits, cut to the cap).
+    /// file view read split by split, scanned or by its filter's masks, has
+    /// its chunks follow the splits, cut to the cap).
     /// Tombstoned rows are skipped; under a string layout the tail's live
     /// rows come last. Nothing is read until the first poll, and a read error
     /// is a stream item.
@@ -82,13 +90,15 @@ impl VortexRdfStore {
     /// other has only `columns` gathered, one window of live ids per chunk;
     /// columns the cache cannot hand out (chunked or wire-encoded) are read
     /// as row chunks and decoded chunk by chunk. On file a selection taken by
-    /// id is taken one chunk's ids per pull. The scan projects only `columns`
-    /// (a pending filter's columns are read to evaluate it), as does a read
-    /// by id with no filter pending; one under a pending filter reads every
-    /// primary column. Errors: `batch_rows == 0` or no columns (invalid
-    /// input), or a view whose rows are not code-addressable (an invalid
-    /// operation: a string layout, or a Dictionary view with a non-empty
-    /// tail).
+    /// id is taken one chunk's ids per pull, and a pending filter the reads
+    /// by id leave to the scan is read by its masks first, a split at a time
+    /// as the stream reaches it. The masked reads and the scan read only
+    /// `columns` at the rows they keep (a pending filter's columns are read
+    /// to evaluate it), as does a read by id with no filter pending; one
+    /// under a pending filter reads every primary column. Errors:
+    /// `batch_rows == 0` or no columns (invalid input), or a view whose rows
+    /// are not code-addressable (an invalid operation: a string layout, or a
+    /// Dictionary view with a non-empty tail).
     pub fn code_chunks(
         &self,
         columns: &[QuadColumn],
@@ -230,9 +240,13 @@ impl VortexRdfStore {
 
     /// A file view's base chunks, its [`ExactRead`] chosen once: a selection
     /// taken by id is cut into windows of at most `batch_rows` live ids, each
-    /// taken ([`take_file_rows`]) when its chunk is pulled; a point or scan
-    /// read is [`FileReadScope::rows`](crate::store::read::rows::FileReadScope::rows)'s,
-    /// cut to the cap.
+    /// taken ([`take_file_rows`]) when its chunk is pulled; a pending filter
+    /// the reads by id leave to the scan ([`ExactRead::Masks`]) is read by
+    /// its masks first, split by split as the stream reaches them, only
+    /// `columns` read at the rows each split's mask keeps
+    /// ([`masks_first_split_reads`]); a point or scan read is
+    /// [`FileReadScope::rows`](crate::store::read::rows::FileReadScope::rows)'s.
+    /// Every chunk is cut to the cap.
     #[cfg(feature = "file-io")]
     async fn file_base_chunks(
         &self,
@@ -241,11 +255,22 @@ impl VortexRdfStore {
         batch_rows: usize,
     ) -> Result<RowChunkStream> {
         let (scope, read) = self.file_read(base, columns).await?;
-        // PROTOTYPE (item 2): a pending filter the reads by id leave to the
-        // restricted scan is evaluated to its split masks first; the rows
-        // they keep then stream split by split, only `columns` read.
-        if let Some(masks) = scope.masks_first(&read).await? {
-            return masked_chunk_stream(&base.file, columns, &masks, batch_rows).await;
+        if let (ExactRead::Masks, Some(filter)) = (&read, scope.filter) {
+            let reads = masks_first_split_reads(
+                &base.file,
+                filter,
+                &scope.selection,
+                scope.deleted,
+                columns,
+            )?;
+            return Ok(stream_split_reads(reads)
+                .flat_map(move |rows| {
+                    stream::iter(match rows {
+                        Ok(rows) => rechunk(rows, batch_rows).collect(),
+                        Err(e) => vec![Err(e)],
+                    })
+                })
+                .boxed());
         }
         let ids = match read {
             ExactRead::Take(ids) => ids,
@@ -291,58 +316,6 @@ impl VortexRdfStore {
             .into_iter()
             .flat_map(move |rows| rechunk(rows, batch_rows)))
     }
-}
-
-/// PROTOTYPE (item 2): the rows `masks` keep as a chunk stream of `columns`,
-/// read as [`MaskedRead`] chooses: point by point as one chunk, taken one
-/// window of ids per pull, or each split with a match projected at its mask
-/// as its read completes, every chunk cut to `batch_rows`.
-#[cfg(feature = "file-io")]
-async fn masked_chunk_stream(
-    file: &Arc<crate::store::persist::native_file::NativeStoreFile>,
-    columns: &[&'static str],
-    masks: &crate::store::scan::file_filter::SplitMasks,
-    batch_rows: usize,
-) -> Result<RowChunkStream> {
-    use crate::store::scan::file_reads;
-    use crate::store::scan::read_plan::MaskedRead;
-
-    let read = MaskedRead::of(file, masks)?;
-    if read != MaskedRead::Project {
-        let ids = masks.first_ids(usize::MAX);
-        if read == MaskedRead::Points
-            && let Some(rows) =
-                file_reads::file_point_rows(file, columns, None, ids.clone()).await?
-        {
-            return Ok(stream::iter(rechunk(rows, batch_rows)).boxed());
-        }
-        let file = Arc::clone(file);
-        let columns: Arc<[&'static str]> = Arc::from(columns);
-        return Ok(stream::iter(id_windows(Buffer::from(ids), batch_rows))
-            .then(move |window| {
-                let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
-                async move {
-                    take_file_rows(&file, &columns, &window)
-                        .await?
-                        .ok_or_else(|| {
-                            VortexRdfError::Vortex(vortex_error::vortex_err!("a take declined"))
-                        })
-                }
-            })
-            .boxed());
-    }
-    let (_, tasks) = file_reads::masked_split_tasks(file, columns, masks, false)?;
-    Ok(stream::iter(tasks)
-        .buffered(crate::io::read::available_parallelism())
-        .flat_map(move |split| {
-            let chunks: Vec<Result<ArrayRef>> = match split {
-                Ok(Some(rows)) => rechunk(rows, batch_rows).collect(),
-                Ok(None) => Vec::new(),
-                Err(e) => vec![Err(e.into())],
-            };
-            stream::iter(chunks)
-        })
-        .boxed())
 }
 
 /// An in-memory view's base rows as the chunk sources cut them.

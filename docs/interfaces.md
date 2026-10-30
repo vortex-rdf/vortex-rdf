@@ -17,7 +17,7 @@ is the path such an engine takes.
 |---|---|
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L103) on any view, registered with vortex's `VortexTable` |
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L70), [`code_chunks`](../core/src/store/read/chunks.rs#L102) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L156), [`index_components`](../core/src/store/read/metadata.rs#L230), [`partitions`](../core/src/store/read/metadata.rs#L265) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
@@ -62,7 +62,7 @@ non-empty tail, which has no source: its tail holds terms without codes, so
 | `projection` | Bound once against the dtype and applied to every chunk after the filter and the limit: a `select`, a `pack` of `get_item`s (renames, reorders) or any computed expression vortex evaluates. The scan's dtype is the projection's return dtype. |
 | `filter` | Bound once and evaluated on every chunk *exactly* — the engine may drop a filter it pushed; a row the filter evaluates to null is dropped. Any expression over the columns: equality, comparisons, `and`/`or`, `in_list`, `like` on string layouts. |
 | `limit` | Enforced exactly after filtering. |
-| `row_range`, `selection` | Addressed in the view's **output** rows (after narrowing, before the filter), applied before the filter. A view with no pending file filter and no tombstones is `window`ed to the `row_range` first, so only the range's rows are read; any other view streams its scan from its first row (through its pending filter, past its tombstones), and the range's end or the `limit` stops it. |
+| `row_range`, `selection` | Addressed in the view's **output** rows (after narrowing, before the filter), applied before the filter. A view with no pending file filter and no tombstones is `window`ed to the `row_range` first, so only the range's rows are read; any other view streams its rows from its first row (through its pending filter, past its tombstones), and the range's end or the `limit` stops it. |
 | `ordered` | Rows always come in base order. |
 | `partition_range`, `partition_selection` | The source has one partition, index 0; a window that leaves it out yields no partitions. |
 
@@ -154,7 +154,8 @@ zero-copy over the base's canonical code columns for a contiguous selection
 without tombstones. On a file view whose pending filter no read by id
 serves, it evaluates the filter's masks split by split first and then reads
 only the rows they keep, point by point, by one take, or by projecting each
-split at its mask, where the streams scan the file. The chunk stream is the
+split at its mask. The streams read such a view the same way, a split at a
+time as they are pulled. The chunk stream is the
 form for a match consumed
 incrementally or of unknown size, and the bindings reach it through
 `match_code_chunks` (Python) and `matchCodeChunks` (JS). A Python

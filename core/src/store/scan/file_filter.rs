@@ -292,7 +292,20 @@ fn filter_split_tasks(
 
 /// One split's filter evaluation, owning everything it reads: the surviving
 /// split-relative mask with the split's range.
-type SplitTask = BoxFuture<'static, Result<(Mask, Range<u64>)>>;
+pub(crate) type SplitTask = BoxFuture<'static, Result<(Mask, Range<u64>)>>;
+
+/// The filter tasks of every split `selection` touches, in file order
+/// ([`filter_split_tasks`]), tombstoned rows cleared from their masks. Each
+/// evaluates only when polled.
+pub(crate) fn split_filter_tasks(
+    file: &NativeStoreFile,
+    filter: &Expression,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+) -> Result<Vec<SplitTask>> {
+    let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
+    filter_split_tasks(file, filter, &mask_selection, ranges, deleted)
+}
 
 /// The natural file splits `selection` touches, each clamped to its bounds,
 /// in file order, beside the [`Selection`] that narrows each split's mask
@@ -475,6 +488,11 @@ where
 pub(crate) struct SplitMasks(Vec<(Mask, Range<u64>)>);
 
 impl SplitMasks {
+    /// One split's evaluation: its mask beside its range.
+    pub(crate) fn of_split(mask: Mask, range: Range<u64>) -> Self {
+        Self(vec![(mask, range)])
+    }
+
     /// Each evaluated split's mask beside its range, in file order.
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, (Mask, Range<u64>)> {
         self.0.iter()

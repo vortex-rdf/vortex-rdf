@@ -487,7 +487,8 @@ async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
 /// building no scan with the filter, its statistics are exact with no filter
 /// pending, and each stream (`code_chunks`, `row_chunks`, `quads()` and the
 /// data source's scan) reads the matches' ids, where the plain view's streams
-/// scan with the filter.
+/// evaluate the filter's masks first. No stream builds a scan with the
+/// filter.
 #[tokio::test]
 async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
     let (_dir, path) = masks_file().await;
@@ -505,8 +506,8 @@ async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
         let n = codes.len();
         let bound = stats.rows.upper_bound;
         assert!(n < bound, "{shape}: {n} rows under a bound of {bound}");
-        // Each view beside its label and whether its streams scan with the
-        // filter.
+        // Each view beside its label and whether its streams evaluate the
+        // filter's masks.
         let mut views = vec![(format!("{shape} plain"), plain, true)];
         for limit in [bound, usize::MAX] {
             let label = format!("{shape} limit {limit}");
@@ -535,22 +536,23 @@ async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
             );
             views.push((label, windowed, false));
         }
-        for (label, view, scans_filter) in &views {
+        for (label, view, evaluates_masks) in &views {
             // What a reader did since `before`.
             let check = |reader: &str, before: ReadCounters| {
                 let label = format!("{label} {reader}");
                 let after = ReadCounters::now();
-                if *scans_filter {
-                    assert!(
-                        after.filtered_scans > before.filtered_scans,
-                        "{label}: a scan with the filter"
-                    );
-                    return;
-                }
                 assert_eq!(
                     after.filtered_scans, before.filtered_scans,
                     "{label}: no scan with the filter"
                 );
+                if *evaluates_masks {
+                    assert!(
+                        after.evaluated > before.evaluated,
+                        "{label}: the filter's masks evaluated"
+                    );
+                    assert_ne!(after.masked, before.masked, "{label}: masked reads");
+                    return;
+                }
                 assert_eq!(
                     after.evaluated, before.evaluated,
                     "{label}: no split evaluated"

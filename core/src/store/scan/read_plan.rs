@@ -43,7 +43,8 @@ pub(crate) enum ExactRead {
     /// By the pending filter's masks first, then the rows they keep
     /// ([`MaskedRead`]): a filter of code equalities over columns that all
     /// have chunk probes, at a selection the reads by id decline. A streaming
-    /// reader reads it as [`Scan`](Self::Scan).
+    /// reader evaluates each split's mask when it reaches the split
+    /// ([`masks_first_split_reads`](crate::store::scan::file_reads::masks_first_split_reads)).
     Masks,
     /// By the restricted scan.
     Scan,
