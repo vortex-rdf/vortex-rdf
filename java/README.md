@@ -52,7 +52,7 @@ store.quads(s, p, o, g);             // List<String[]>, rows {s, p, o, g}
 store.quads(s, p, o, g, 100, 50);    // 50 rows after the first 100 of the match
 ```
 
-Both work on every layout, with identical results. `quads` is served from the term-code columns where the store has them and from the matched quads otherwise.
+Both work on every layout, with identical results. `quads` is served from the term-code columns where the store has them and from the matched quads otherwise. Each row is its own `String[4]`, which the caller may change; terms cross from the native library in chunks of up to 65,536 rows, and the rows of a chunk that hold the same term share one `String`.
 
 ## Term codes (low-level)
 
@@ -94,7 +94,7 @@ For measurements, two switches are read once when the native library loads: `VOR
 
 ## Threads, memory and lifetime
 
-A store is safe to query from any number of threads. `close()` waits for the calls in progress, and later calls raise `IllegalStateException`. A file store is memory-mapped: what stays in RAM is the operating system's page cache plus a few MiB of rebuilt dictionary windows, and the file must not be modified while open (replace it by renaming a new file over it). `VortexStore.open(path, true)` loads the whole store instead.
+A store is safe to query from any number of threads. `close()` waits for the calls in progress, and later calls raise `IllegalStateException`. A file store is memory-mapped: what stays in RAM is the operating system's page cache plus a few MiB of rebuilt dictionary windows, and the file must not be modified while open (replace it by renaming a new file over it). `VortexStore.open(path, true)` loads the whole store instead. Besides its result, a read holds one chunk of terms in transit: at most 16 MiB of them, or one row when that row's terms are larger.
 
 ## Development
 
