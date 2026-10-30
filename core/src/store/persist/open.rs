@@ -327,6 +327,7 @@ impl VortexRdfStore {
                 filter: None,
                 serve: None,
                 masks: None,
+                pins: None,
             })),
             tail: None,
         })

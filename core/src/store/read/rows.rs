@@ -84,22 +84,33 @@ impl BaseRead {
 }
 
 /// The codes at `ids` of each of the four code primitives `prims`, in the
-/// order of `ids`: one gather per column.
+/// order of `ids`: one gather per column. Called column by column rather
+/// than mapped over the columns, so that each gather stays a loop of its
+/// own: mapped, it can be inlined into the array map's iteration, at 9 %
+/// more instructions.
 pub(in crate::store) fn gather_codes(
     prims: &[PrimitiveArray; 4],
     ids: &[RowId],
 ) -> [Buffer<TermCode>; 4] {
     #[cfg(test)]
     column_hooks::note(true);
-    prims.each_ref().map(|prim| {
-        let slice = prim.as_slice::<TermCode>();
-        Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
-    })
+    let [s, p, o, g] = prims;
+    [
+        gather(s, ids),
+        gather(p, ids),
+        gather(o, ids),
+        gather(g, ids),
+    ]
 }
 
 pub(in crate::store) fn gather_column(prim: &PrimitiveArray, ids: &[RowId]) -> Buffer<TermCode> {
     #[cfg(test)]
     column_hooks::note(false);
+    gather(prim, ids)
+}
+
+/// The codes of `prim` at `ids`, in the order of `ids`.
+fn gather(prim: &PrimitiveArray, ids: &[RowId]) -> Buffer<TermCode> {
     let slice = prim.as_slice::<TermCode>();
     Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
 }
@@ -261,16 +272,16 @@ impl VortexRdfStore {
             }
             let rows = match read {
                 ExactRead::Points(rows) => {
-                    if let Some(codes) = file_reads::file_point_codes(
-                        scope.file,
-                        scope.by_id_columns,
-                        scope.filter,
-                        rows,
-                    )
-                    .await?
-                        && let Some(codes) = primary_order(scope.by_id_columns, codes)
+                    let pins = scope.pins();
+                    let read_columns = pins.columns_to_read(scope.by_id_columns);
+                    if let Some(codes) =
+                        file_reads::file_point_codes(scope.file, &read_columns, scope.filter, rows)
+                            .await?
                     {
-                        return Ok(Some(codes));
+                        // The read columns in `(s, p, o, g)` order, the pinned
+                        // ones filled: every primary column is read or pinned.
+                        let kept = codes.first().map_or(0, Buffer::len);
+                        return pins.fill_codes(&read_columns, codes, kept).map(Some);
                     }
                     // Declined as the row read would decline: the scan reads.
                     BaseRead::Scan(Box::new(scope.scan()?))
@@ -356,6 +367,7 @@ impl VortexRdfStore {
             filter,
             selection,
             deleted: self.quads.deleted.as_ref(),
+            pins: base.pins.as_deref(),
         };
         let read = ExactRead::of(
             scope.file,
@@ -480,6 +492,10 @@ pub(in crate::store) struct FileReadScope<'a> {
     pub(in crate::store) filter: Option<&'a Expression>,
     pub(in crate::store) selection: Cow<'a, RowSelection>,
     pub(in crate::store) deleted: Option<&'a Mask>,
+    /// The codes a window's resolved filter pinned ([`FileBase::pins`]):
+    /// a read by id ([`pins`](Self::pins)) reads the
+    /// columns they leave free and fills them.
+    pub(in crate::store) pins: Option<&'a PinnedCodes>,
 }
 
 #[cfg(feature = "file-io")]
@@ -494,11 +510,20 @@ impl FileReadScope<'_> {
     pub(in crate::store) async fn rows(&self, read: ExactRead) -> Result<BaseRead> {
         let rows = match read {
             ExactRead::Points(rows) => {
-                file_reads::file_point_rows(self.file, self.by_id_columns, self.filter, rows)
+                let pins = self.pins();
+                let columns = pins.columns_to_read(self.by_id_columns);
+                file_reads::file_point_rows(self.file, &columns, self.filter, rows)
                     .await?
+                    .map(|rows| pins.fill_rows(rows, self.by_id_columns))
+                    .transpose()?
             }
             ExactRead::Take(ids) => {
-                file_reads::take_file_rows(self.file, self.by_id_columns, &ids).await?
+                let pins = self.pins();
+                let columns = pins.columns_to_read(self.by_id_columns);
+                file_reads::take_file_rows(self.file, &columns, &ids)
+                    .await?
+                    .map(|rows| pins.fill_rows(rows, self.by_id_columns))
+                    .transpose()?
             }
             ExactRead::Scan | ExactRead::Masks => None,
         };
@@ -506,6 +531,12 @@ impl FileReadScope<'_> {
             Some(rows) => BaseRead::Rows(rows),
             None => BaseRead::Scan(Box::new(self.scan()?)),
         })
+    }
+
+    /// The codes a read by id fills instead of reading: the pins of the
+    /// filter a window resolved ([`FileBase::pins`]), else none.
+    pub(in crate::store) fn pins(&self) -> &PinnedCodes {
+        self.pins.unwrap_or(PinnedCodes::NONE)
     }
 
     /// The pending filter's masks over the selection, tombstones cleared,
@@ -557,25 +588,6 @@ fn primary_codes(rows: ArrayRef) -> Result<[Buffer<TermCode>; 4]> {
     Ok(extract_codes(rows, &schema::PRIMARY_COLUMNS)?
         .try_into()
         .expect("one code buffer per primary column"))
-}
-
-/// `codes`, one buffer per column of `columns`, as the `(s, p, o, g)` code
-/// columns; `None` when a primary column is missing.
-#[cfg(feature = "file-io")]
-fn primary_order(
-    columns: &[&str],
-    mut codes: Vec<vortex_buffer::Buffer<TermCode>>,
-) -> Option<[vortex_buffer::Buffer<TermCode>; 4]> {
-    let mut take = |name: &str| {
-        let idx = columns.iter().position(|c| *c == name)?;
-        Some(std::mem::take(&mut codes[idx]))
-    };
-    Some([
-        take(schema::COL_S)?,
-        take(schema::COL_P)?,
-        take(schema::COL_O)?,
-        take(schema::COL_G)?,
-    ])
 }
 
 /// Test hook: how many gathers this thread made from code primitives, by

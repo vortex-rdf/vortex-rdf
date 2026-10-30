@@ -111,11 +111,11 @@ impl VortexRdfStore {
         let base_taken = windowed.len(self.quads.base_len());
         // The window is a position range over base order with the filter it
         // resolved applied, so the view carries exact ids, no filter and no
-        // plan.
+        // plan, only the codes the filter pinned, for its reads by id.
         let quads = self
             .quads
             .with_selection(ViewSelection::Exact(windowed))
-            .without_filter();
+            .with_filter_resolved();
         // Whatever the base could not fill falls to the tail: the offset it
         // did not consume, the limit it did not take.
         let tail = self.tail.as_ref().map(|tail| {
@@ -196,6 +196,7 @@ impl VortexRdfStore {
                 filter: Some(filter),
                 serve: None,
                 masks: None,
+                ..
             }),
             ViewSelection::Exact(selection),
         ) = (self.quads.file(), &self.quads.selection)
@@ -212,12 +213,13 @@ impl VortexRdfStore {
     /// ([`file_filter::split_masks_until`]). `None` for any other view.
     ///
     /// With `limit` matches the window is their ids, in base order, with no
-    /// filter and the tail cut off. With fewer it cuts no base row: the view
-    /// keeps its filter with the masks kept for its reads where the masks are
-    /// smaller than the matches' ids ([`SplitMasks::smaller_than_ids`]) and the
-    /// filter is one the reads by id check ([`read_plan::point_readable`]),
-    /// else holds those ids with no filter, and its tail is windowed to the
-    /// rest of the limit.
+    /// filter (only the codes it pinned, for the reads by id) and the tail
+    /// cut off. With fewer it cuts no base row: the view keeps its filter
+    /// with the masks kept for its reads (and the codes it pins, for the
+    /// reads by id) where the masks are smaller than the matches' ids
+    /// ([`SplitMasks::smaller_than_ids`]) and the filter is one the reads by
+    /// id check ([`read_plan::point_readable`]), else holds those ids the
+    /// same way, and its tail is windowed to the rest of the limit.
     #[cfg(feature = "file-io")]
     async fn filter_window(&self, limit: usize) -> Result<Option<Self>> {
         let (Some(base), ViewSelection::Exact(selection), Some((file, filter))) = (
@@ -243,11 +245,13 @@ impl VortexRdfStore {
                 limit - found,
             )
         } else {
+            // The matches' ids, the filter resolved into them: no filter
+            // left, only the codes it pinned, for the reads by id.
             let taken = found.min(limit);
             let ids = Buffer::from(masks.first_ids(taken));
             let selection = ViewSelection::Exact(RowSelection::from_ids(ids));
             (
-                self.quads.file_with(base, None, selection, None),
+                self.quads.with_selection(selection).with_filter_resolved(),
                 limit - taken,
             )
         };

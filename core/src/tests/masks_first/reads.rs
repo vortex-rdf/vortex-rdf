@@ -583,7 +583,12 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
 /// read a split at a time, so the 32 rows a split of `P` and of `pm` in the
 /// default graph keep are read point by point, every column, as are `O`'s
 /// and `PO`'s few; `G`'s 512 a split are projected, its pinned graph left
-/// out. Every answer is the in-memory store's.
+/// out. A window keeps the codes its filter pinned for its reads by id,
+/// one-shot and streamed: the streams of the window that keeps `P`'s masks
+/// take its ids without `p`; `G` cut to 100 rows reads `s`, `p` and `o`
+/// point by point, cut to 10 (too few to keep the pins) every column; and
+/// the first 300 rows of `pm` in the default graph are taken without `p`
+/// and `g`. Every answer is the in-memory store's.
 ///
 /// [`PIN_POINT_MIN_ROWS`]: crate::store::scan::file_reads::PIN_POINT_MIN_ROWS
 #[tokio::test]
@@ -628,16 +633,40 @@ async fn test_masked_reads_skip_the_columns_the_filter_pins() {
         ),
         (
             "PG",
-            Probe::new(None, Some(pm), None, Some(GraphName::DefaultGraph)),
+            Probe::new(None, Some(pm.clone()), None, Some(GraphName::DefaultGraph)),
             ["s", "o"].as_slice(),
             Some(every),
         ),
-        // The window's streams read its kept ids, with no filter to pin.
+        // The window's streams take its kept ids, filling the code its
+        // filter pins.
         (
             "P windowed",
             p.window(0, Some(all_rows)),
             ["s", "o", "g"].as_slice(),
-            None,
+            Some(["s", "o", "g"].as_slice()),
+        ),
+        // A window that keeps its matches' ids keeps the codes its filter
+        // pinned: `G`'s first 100 rows are read point by point, and `PG`'s
+        // first 300 (32 a split) taken, without the columns their filters
+        // pin.
+        (
+            "G windowed to 100",
+            Probe::new(None, None, None, Some(iri_graph("gd"))).window(0, Some(100)),
+            ["s", "p", "o"].as_slice(),
+            Some(["s", "p", "o"].as_slice()),
+        ),
+        // Too few rows for the window to keep the pins.
+        (
+            "G windowed to 10",
+            Probe::new(None, None, None, Some(iri_graph("gd"))).window(0, Some(10)),
+            every,
+            Some(every),
+        ),
+        (
+            "PG windowed to 300",
+            Probe::new(None, Some(pm), None, Some(GraphName::DefaultGraph)).window(0, Some(300)),
+            ["s", "o"].as_slice(),
+            Some(["s", "o"].as_slice()),
         ),
     ] {
         let view = file.run_probe(&probe).await.unwrap();

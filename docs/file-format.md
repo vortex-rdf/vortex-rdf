@@ -559,7 +559,7 @@ filesystems are unsupported for mapping.
 
 A store in memory holds the same three pieces the file does, in the forms the
 read paths are written against: its source (the selection and tombstones, and
-the in-memory backend, [`MemoryBase`](../core/src/store/view/mod.rs#L72)) and
+the in-memory backend, [`MemoryBase`](../core/src/store/view/mod.rs#L74)) and
 its layout:
 
 | In the file | In memory |
@@ -573,7 +573,7 @@ its layout:
 | — | the source's `selection` and `deleted`, and the base's `serve` — a view's restrictions ([matching.md §1](matching.md#1-what-a-match-produces)) |
 
 A file-backed store (its source's `Backend::File`, a
-[`FileBase`](../core/src/store/view/mod.rs#L99)) holds none of the rows: the
+[`FileBase`](../core/src/store/view/mod.rs#L101)) holds none of the rows: the
 file handle, a pushed-down filter and an optional serve plan, beside the
 source's selection and tombstones. Its index data stays in the index children
 and is reached by chunk probes and pushed-down scans; a `FileBase`
@@ -644,7 +644,7 @@ open rather than being read around.
 | `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L24) |
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L35) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L30) |
-| `PIN_POINT_MIN_ROWS` | 64 rows — a point read of the rows a filter's masks keep leaves out the columns the filter pins, as a take or a projection always does, only from this many rows ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L380) |
+| `PIN_POINT_MIN_ROWS` | 64 rows — a point read of the rows a filter's masks keep leaves out the columns the filter pins, as a take or a projection always does, only from this many rows, and a window keeps its filter's pins for its reads by id only from this many rows ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L383) |
 | `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scans.rs`](../core/src/store/scan/file_scans.rs#L64) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: an emitted chunk's size, an index child chunk's size and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L46) |
 | `DEFAULT_RUN_ROWS` | 1,048,576 entries per out-of-core spill run: quads per quad run, entries per index-family run (whose `u32` row offsets this bounds) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L54) |

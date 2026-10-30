@@ -35,6 +35,8 @@ use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter::SplitMasks;
 #[cfg(feature = "file-io")]
+use crate::store::scan::file_reads::PinnedCodes;
+#[cfg(feature = "file-io")]
 use vortex_array::expr::Expression;
 
 /// A view's base rows: the base the store was constructed from, never
@@ -121,6 +123,13 @@ pub(crate) struct FileBase {
     /// are read off their bits, so nothing caches beside them. Every view
     /// derived from this one starts without them.
     pub(crate) masks: Option<Arc<SplitMasks>>,
+    /// The codes pinned by the filter a window resolved into exact ids, or
+    /// evaluated into the masks it kept ([`PinnedCodes`]), for a window of
+    /// at least as many rows as a point read pins for: every row such a view
+    /// reads passed that filter, so a read of its rows by id reads only the
+    /// columns the filter left free and fills these with their codes. Every
+    /// view derived from this one starts without them.
+    pub(crate) pins: Option<Arc<PinnedCodes>>,
 }
 
 impl QuadsSource {
@@ -222,7 +231,8 @@ impl QuadsSource {
     }
 
     /// This file source with `masks`, its pending filter evaluated over its
-    /// exact selection, kept for its reads ([`FileBase::masks`]).
+    /// exact selection, kept for its reads ([`FileBase::masks`]), and the
+    /// codes the filter pins kept for its reads by id ([`FileBase::pins`]).
     #[cfg(feature = "file-io")]
     pub(crate) fn with_evaluated_masks(&self, masks: Arc<SplitMasks>) -> Self {
         debug_assert!(self.has_filter(), "masks are a pending filter's");
@@ -236,6 +246,7 @@ impl QuadsSource {
         );
         let mut source = self.clone();
         if let Backend::File(base) = &mut source.backend {
+            base.pins = Self::pins_of(base.filter.as_ref(), masks.kept());
             base.masks = Some(masks);
         }
         source
@@ -353,6 +364,7 @@ impl QuadsSource {
                 filter,
                 serve,
                 masks: None,
+                pins: None,
             }),
         }
     }
@@ -381,18 +393,41 @@ impl QuadsSource {
         }
     }
 
-    /// This source with its pushed-down filter dropped, and the filter's
-    /// masks with it (a no-op in memory).
-    pub(crate) fn without_filter(mut self) -> Self {
+    /// This source with its pushed-down filter resolved into its exact
+    /// selection: the filter dropped, and the filter's masks with it, the
+    /// codes the filter pinned kept for the reads by id
+    /// ([`FileBase::pins`]); a no-op in memory.
+    pub(crate) fn with_filter_resolved(mut self) -> Self {
+        #[cfg(feature = "file-io")]
+        let rows = match &self.selection {
+            ViewSelection::Exact(selection) => selection.len(self.base_len()),
+            ViewSelection::Pending(_) => 0,
+        };
         match &mut self.backend {
             Backend::InMemory(_) => {}
             #[cfg(feature = "file-io")]
             Backend::File(base) => {
+                base.pins = Self::pins_of(base.filter.as_ref(), rows);
                 base.filter = None;
                 base.masks = None;
             }
         }
         self
+    }
+
+    /// The codes `filter` pins, for [`FileBase::pins`] of a view of `rows`
+    /// rows: none for fewer rows than a point read pins for
+    /// ([`PIN_POINT_MIN_ROWS`](crate::store::scan::file_reads::PIN_POINT_MIN_ROWS)),
+    /// or without a filter of code equalities.
+    #[cfg(feature = "file-io")]
+    fn pins_of(filter: Option<&Expression>, rows: usize) -> Option<Arc<PinnedCodes>> {
+        use crate::store::scan::file_reads::PIN_POINT_MIN_ROWS;
+
+        if rows < PIN_POINT_MIN_ROWS {
+            return None;
+        }
+        let pins = PinnedCodes::of(filter);
+        (!pins.is_empty()).then(|| Arc::new(pins))
     }
 
     /// This source with the base rows `doomed` sets added to its tombstones,

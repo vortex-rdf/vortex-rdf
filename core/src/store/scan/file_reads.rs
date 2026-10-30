@@ -4,6 +4,7 @@
 //! filter's split masks keep, as [`read_plan`](super::read_plan) chooses
 //! them. Functions of the file, with no store state.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -248,6 +249,8 @@ pub(crate) async fn take_file_rows(
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::validity::Validity;
 
+    #[cfg(test)]
+    masked_column_hooks::note(columns);
     if let Some(rows) = chunk_take(file, columns, ids).await? {
         #[cfg(test)]
         take_hooks::note(true);
@@ -388,10 +391,18 @@ pub(crate) const PIN_POINT_MIN_ROWS: usize = 64;
 pub(crate) struct PinnedCodes(Vec<(vortex_array::dtype::FieldName, TermCode)>);
 
 impl PinnedCodes {
+    /// No column pinned: a read of every column, filling none.
+    pub(crate) const NONE: &'static Self = &Self(Vec::new());
+
     /// The columns `filter` pins: none without a filter, or for one that is
     /// not code equalities.
     pub(crate) fn of(filter: Option<&Expression>) -> Self {
         Self(filter.and_then(eq_code_pairs).unwrap_or_default())
+    }
+
+    /// Whether no column is pinned.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Whether a read of `rows` kept rows the way `read` reads them fills
@@ -410,17 +421,23 @@ impl PinnedCodes {
 
     /// The columns of `columns` a read of the kept rows reads, in order: the
     /// unpinned ones, or the first of `columns` when every one is pinned, so
-    /// that the read still yields its rows.
-    pub(crate) fn columns_to_read(&self, columns: &[&'static str]) -> Vec<&'static str> {
+    /// that the read still yields its rows; `columns` itself when none is.
+    pub(crate) fn columns_to_read<'c>(
+        &self,
+        columns: &'c [&'static str],
+    ) -> Cow<'c, [&'static str]> {
+        if self.is_empty() {
+            return Cow::Borrowed(columns);
+        }
         let unpinned: Vec<&'static str> = columns
             .iter()
             .copied()
             .filter(|&c| self.code(c).is_none())
             .collect();
         if unpinned.is_empty() {
-            columns.iter().take(1).copied().collect()
+            Cow::Borrowed(&columns[..columns.len().min(1)])
         } else {
-            unpinned
+            Cow::Owned(unpinned)
         }
     }
 
@@ -457,29 +474,35 @@ impl PinnedCodes {
     pub(crate) fn fill_codes(
         &self,
         read_columns: &[&'static str],
-        codes: Vec<Buffer<TermCode>>,
+        mut codes: Vec<Buffer<TermCode>>,
         kept: usize,
     ) -> Result<[Buffer<TermCode>; 4]> {
-        let column = |name: &str| -> Result<Buffer<TermCode>> {
-            if let Some(code) = self.code(name) {
-                return Ok(Buffer::full(code, kept));
+        use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
+
+        let mut column = |name: &str| match self.code(name) {
+            Some(code) => Some(Buffer::full(code, kept)),
+            None => {
+                let at = read_columns.iter().position(|&c| c == name)?;
+                codes.get_mut(at).map(std::mem::take)
             }
-            read_columns
-                .iter()
-                .position(|&c| c == name)
-                .and_then(|at| codes.get(at).cloned())
-                .ok_or_else(|| {
-                    VortexRdfError::InvalidOperation(format!(
-                        "a masked read neither read nor pinned the {name} column"
-                    ))
-                })
         };
-        Ok([
-            column(crate::store::schema::COL_S)?,
-            column(crate::store::schema::COL_P)?,
-            column(crate::store::schema::COL_O)?,
-            column(crate::store::schema::COL_G)?,
-        ])
+        let filled = (|| {
+            Some([
+                column(COL_S)?,
+                column(COL_P)?,
+                column(COL_O)?,
+                column(COL_G)?,
+            ])
+        })();
+        filled.ok_or_else(|| {
+            let missing = [COL_S, COL_P, COL_O, COL_G]
+                .into_iter()
+                .find(|&name| self.code(name).is_none() && !read_columns.contains(&name))
+                .unwrap_or_default();
+            VortexRdfError::InvalidOperation(format!(
+                "a read neither read nor pinned the {missing} column"
+            ))
+        })
     }
 }
 
@@ -649,8 +672,9 @@ pub(crate) mod take_hooks {
 }
 
 /// Test hook: the columns each point read ([`file_point_rows`],
-/// [`file_point_codes`]) and each take or projection of a filter's kept rows
-/// ([`masked_split_tasks`]) read on this thread.
+/// [`file_point_codes`]), each take by id ([`take_file_rows`]) and each take
+/// or projection of a filter's kept rows ([`masked_split_tasks`]) read on
+/// this thread.
 #[cfg(test)]
 pub(crate) mod masked_column_hooks {
     use std::cell::RefCell;
