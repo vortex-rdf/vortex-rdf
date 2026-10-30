@@ -254,7 +254,7 @@ it.
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229)):
 every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
-([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L110)) or,
+([`build_code_chunk`](../core/src/store/layouts/dictionary/codec.rs#L106)) or,
 under the string layouts, as their terms again
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L172)). With indexes a
 first merge runs to completion

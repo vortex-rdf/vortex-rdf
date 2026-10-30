@@ -18,18 +18,14 @@ use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-#[cfg(feature = "file-io")]
-use crate::store::array::trusted_str;
 use crate::store::array::{field_as, named_struct, stamp_is_sorted};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TermCode};
 use crate::store::{RawQuad, SharedQuad};
 
 #[cfg(feature = "file-io")]
-use super::file_backed::FileBackedDict;
+use super::file_backed::{FileBackedDict, HeldWindows};
 use super::ingest::BorrowedTermCodeMap;
 use super::storage::DictCursor;
-#[cfg(feature = "file-io")]
-use super::storage::TermChunk;
 use super::term_dict::{CodeSpace, TermDictionary, check_code};
 
 /// Dictionary-encoded quad columns: every term replaced by its code. Code
@@ -281,65 +277,15 @@ impl<'a> TermSource for MappedTerms<'a> {
     }
 }
 
-/// Term strings read in place from a file-backed dictionary's windows, as
-/// [`DictTerms`] reads a resident dictionary's chunks: each window the
-/// chunk's codes fall in is taken once ([`FileBackedDict::window_chunk_now`])
-/// and held until the decode ends, and a term is decompressed into its
-/// role's scratch. The held windows are charged as the window cache charges
-/// them, within its budget. The source gives up ([`TermSource::gave_up`])
-/// when a window's read would wait, or would take the held windows past the
-/// budget: a chunk whose codes scatter over more windows than the cache
-/// holds decodes the resolved way ([`resolve_chunk_terms`]), which holds one
-/// window at a time.
+/// Term strings read in place from a file-backed dictionary's windows
+/// ([`HeldWindows`]), as [`DictTerms`] reads a resident dictionary's chunks:
+/// a term is decompressed into its role's scratch. When the hold gives up
+/// ([`TermSource::gave_up`]), the chunk decodes the resolved way
+/// ([`resolve_chunk_terms`]).
 #[cfg(feature = "file-io")]
 struct FileTerms<'a> {
-    fb: &'a FileBackedDict,
-    code_space: CodeSpace,
-    /// The windows taken so far, by window index.
-    windows: Vec<Option<Arc<TermChunk>>>,
-    /// What the held windows are charged, and the most they may be.
-    held: usize,
-    budget: usize,
+    held: HeldWindows<'a>,
     scratch: [Vec<u8>; 4],
-    gave_up: bool,
-}
-
-#[cfg(feature = "file-io")]
-impl<'a> FileTerms<'a> {
-    fn new(fb: &'a FileBackedDict) -> Self {
-        Self {
-            fb,
-            code_space: fb.code_space(),
-            windows: vec![None; fb.window_count()],
-            held: 0,
-            budget: fb.window_budget(),
-            scratch: Default::default(),
-            gave_up: false,
-        }
-    }
-
-    /// Take window `w` and hold it; an error, the source given up, when its
-    /// read would wait or the held windows would outgrow the budget.
-    fn take(&mut self, w: usize) -> Result<()> {
-        let Some(chunk) = self.fb.window_chunk_now(w) else {
-            return Err(self.give_up("a window read would wait"));
-        };
-        let chunk = chunk?;
-        let held = self
-            .held
-            .saturating_add(FileBackedDict::window_charge(&chunk));
-        if held > self.budget {
-            return Err(self.give_up("the chunk's windows outgrow the window cache"));
-        }
-        self.held = held;
-        self.windows[w] = Some(chunk);
-        Ok(())
-    }
-
-    fn give_up(&mut self, why: &str) -> VortexRdfError {
-        self.gave_up = true;
-        VortexRdfError::InvalidOperation(format!("in-place decode given up: {why}"))
-    }
 }
 
 #[cfg(feature = "file-io")]
@@ -347,15 +293,7 @@ impl TermSource for FileTerms<'_> {
     type Shared = Arc<str>;
 
     fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str> {
-        let rank = check_code(code, self.code_space)?;
-        let (w, local) = self.fb.window_of(rank);
-        if self.windows[w].is_none() {
-            self.take(w)?;
-        }
-        let chunk = self.windows[w].as_deref().expect("window taken above");
-        Ok(trusted_str(
-            chunk.bytes_into(local, &mut self.scratch[role]),
-        ))
+        self.held.str_at(code, &mut self.scratch[role])
     }
 
     fn shared_at(&mut self, role: usize, code: TermCode) -> Result<Arc<str>> {
@@ -363,7 +301,7 @@ impl TermSource for FileTerms<'_> {
     }
 
     fn gave_up(&self) -> bool {
-        self.gave_up
+        self.held.gave_up()
     }
 }
 
@@ -542,15 +480,46 @@ fn decode_rows_shared<S: TermSource, R: StringRow>(
     rows
 }
 
-/// `chunk`'s rows as quads, decoded against the resident `dict`
-/// ([`decode_rows`]); a failure to read the code columns is the chunk's one
-/// `Err`.
-pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<Quad>> {
+/// A row type a chunk's code columns decode into, through any
+/// [`TermSource`]: quads through [`decode_rows`], rows of term strings
+/// through [`decode_rows_shared`].
+trait DecodeRows: Sized {
+    fn decode(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Self>>;
+}
+
+impl DecodeRows for Quad {
+    fn decode(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Self>> {
+        decode_rows(cols, src)
+    }
+}
+
+impl DecodeRows for SharedQuad {
+    fn decode(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Self>> {
+        decode_rows_shared(cols, src)
+    }
+}
+
+impl DecodeRows for RawQuad {
+    fn decode(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Self>> {
+        decode_rows_shared(cols, src)
+    }
+}
+
+/// `chunk`'s rows decoded against the resident `dict`; a failure to read the
+/// code columns is the chunk's one `Err`.
+fn decode_resident<T: DecodeRows>(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<T>> {
     let columns = match code_columns(chunk) {
         Ok(columns) => columns,
         Err(e) => return vec![Err(e)],
     };
-    decode_rows(code_slices(&columns), &mut DictTerms::new(dict))
+    T::decode(code_slices(&columns), &mut DictTerms::new(dict))
+}
+
+/// `chunk`'s rows as quads, decoded against the resident `dict`
+/// ([`decode_rows`]); a failure to read the code columns is the chunk's one
+/// `Err`.
+pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<Quad>> {
+    decode_resident(chunk, dict)
 }
 
 /// [`decode_chunk`] with shared-string terms (see [`decode_rows_shared`]).
@@ -558,11 +527,7 @@ pub(crate) fn decode_chunk_shared(
     chunk: &ArrayRef,
     dict: &TermDictionary,
 ) -> Vec<Result<SharedQuad>> {
-    let columns = match code_columns(chunk) {
-        Ok(columns) => columns,
-        Err(e) => return vec![Err(e)],
-    };
-    decode_rows_shared(code_slices(&columns), &mut DictTerms::new(dict))
+    decode_resident(chunk, dict)
 }
 
 /// One role's code column as owned terms, a repeated code read once while
@@ -618,35 +583,34 @@ async fn resolve_chunk_terms(fb: &FileBackedDict, columns: [&[TermCode]; 4]) -> 
 }
 
 /// A chunk decoded against a file-backed dictionary, its code columns read
-/// once. The rows decode in place first ([`FileTerms`], through
-/// `in_place`), as against a resident dictionary; when that gives up, or
-/// once the handle's window reads have had to wait, they decode through
-/// `resolved` against their distinct codes' terms ([`resolve_chunk_terms`]).
-/// `in_place` and `resolved` are the same decode over the two sources. A
-/// failure to read the columns or to resolve their codes is the chunk's one
-/// `Err`; in place, a code outside the dictionary fails as it does against a
-/// resident dictionary.
+/// once. The rows decode in place first ([`FileTerms`]), as against a
+/// resident dictionary; when that gives up, or once the handle's window
+/// reads have had to wait, they decode against their distinct codes' terms
+/// ([`resolve_chunk_terms`]). A failure to read the columns or to resolve
+/// their codes is the chunk's one `Err`; in place, a code outside the
+/// dictionary fails as it does against a resident dictionary.
 #[cfg(feature = "file-io")]
-async fn decode_file_backed<T>(
+async fn decode_file_backed<T: DecodeRows>(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
-    in_place: impl FnOnce([&[TermCode]; 4], &mut FileTerms<'_>) -> Vec<Result<T>>,
-    resolved: impl FnOnce([&[TermCode]; 4], &mut MappedTerms<'_>) -> Vec<Result<T>>,
 ) -> Vec<Result<T>> {
     let columns = match code_columns(chunk) {
         Ok(columns) => columns,
         Err(e) => return vec![Err(e)],
     };
     let cols = code_slices(&columns);
-    if !fb.reads_wait() {
-        let mut terms = FileTerms::new(fb);
-        let rows = in_place(cols, &mut terms);
-        if !terms.gave_up {
+    if let Some(held) = fb.hold_windows() {
+        let mut terms = FileTerms {
+            held,
+            scratch: Default::default(),
+        };
+        let rows = T::decode(cols, &mut terms);
+        if !terms.gave_up() {
             return rows;
         }
     }
     match resolve_chunk_terms(fb, cols).await {
-        Ok(terms) => resolved(cols, &mut MappedTerms(&terms)),
+        Ok(terms) => T::decode(cols, &mut MappedTerms(&terms)),
         Err(e) => vec![Err(e)],
     }
 }
@@ -658,13 +622,7 @@ pub(crate) async fn decode_chunk_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<Quad>> {
-    decode_file_backed(
-        fb,
-        chunk,
-        |cols, terms| decode_rows(cols, terms),
-        |cols, terms| decode_rows(cols, terms),
-    )
-    .await
+    decode_file_backed(fb, chunk).await
 }
 
 /// [`decode_chunk_file_backed`] with shared-string terms (see
@@ -674,13 +632,7 @@ pub(crate) async fn decode_chunk_shared_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<SharedQuad>> {
-    decode_file_backed(
-        fb,
-        chunk,
-        |cols, terms| decode_rows_shared(cols, terms),
-        |cols, terms| decode_rows_shared(cols, terms),
-    )
-    .await
+    decode_file_backed(fb, chunk).await
 }
 
 /// [`decode_chunk_file_backed`] into [`RawQuad`]s, every row's terms copied
@@ -690,13 +642,7 @@ pub(crate) async fn decode_chunk_raw_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<RawQuad>> {
-    decode_file_backed(
-        fb,
-        chunk,
-        |cols, terms| decode_rows_shared(cols, terms),
-        |cols, terms| decode_rows_shared(cols, terms),
-    )
-    .await
+    decode_file_backed(fb, chunk).await
 }
 
 #[cfg(test)]
@@ -857,7 +803,7 @@ mod tests {
             let fb = file_backed(&dict).await;
             let case = format!("{} quads", quads.len());
             assert_file_backed_decodes(&fb, &dict, &chunk, false, &case).await;
-            assert!(!fb.reads_wait(), "{case}");
+            assert!(!fb.debug_reads_wait(), "{case}");
         }
     }
 
@@ -876,9 +822,9 @@ mod tests {
             .await
             .unwrap()
             .expect("the written dictionary child must be window-searchable");
-        assert!(!fb.reads_wait());
+        assert!(!fb.debug_reads_wait());
         assert_file_backed_decodes(&fb, &dict, &chunk, true, "waiting reads").await;
-        assert!(fb.reads_wait());
+        assert!(fb.debug_reads_wait());
         // Every window the chunk touches is cached now, yet a decode still
         // resolves: once reads wait, none is tried in place.
         assert!(!fb.debug_cached_windows().is_empty());
@@ -909,7 +855,7 @@ mod tests {
                 .unwrap();
             let case = format!("budget {budget} of {touched}");
             assert_file_backed_decodes(&fb, &dict, &chunk, resolved, &case).await;
-            assert!(!fb.reads_wait(), "{case}");
+            assert!(!fb.debug_reads_wait(), "{case}");
         }
     }
 

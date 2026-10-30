@@ -11,14 +11,16 @@
 //! ([`store::persist::open`](crate::store::persist::open)).
 //!
 //! [`open`] reads the child's shape and window bounds when the handle opens,
-//! [`cache`] keeps the rebuilt windows, and this module holds the handle and
-//! its lookups.
+//! [`cache`] keeps the rebuilt windows, [`held`] holds the windows a chunk
+//! decode reads in place, and this module holds the handle and its lookups.
 
 mod cache;
+mod held;
 mod open;
 
 #[cfg(test)]
 pub(super) use self::cache::WINDOW_ENTRY_OVERHEAD;
+pub(super) use self::held::HeldWindows;
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -78,9 +80,9 @@ struct Windows {
     /// Whether a leaf's segment read has had to wait: never over a mapped
     /// file or a buffer, whose reads complete when first polled. Once set, a
     /// chunk decode no longer reads windows in place
-    /// ([`window_chunk_now`](Windows::window_chunk_now)).
+    /// ([`FileBackedDict::hold_windows`]).
     reads_wait: AtomicBool,
-    /// Test hook: windows rebuilt since open (the cache's misses).
+    /// Test hook: windows rebuilt from their segments since open.
     #[cfg(test)]
     rebuilt: std::sync::atomic::AtomicUsize,
     /// Test hook: windows asked for since open, hits and misses alike.
@@ -117,53 +119,37 @@ impl Windows {
         self.cache().get(w)
     }
 
-    /// Window `w`'s leaf, read from its segment, adopted
-    /// ([`TermChunk::from_wire`]) and cached.
-    fn adopt(&self, w: usize, leaf: vortex_array::ArrayRef) -> Result<Arc<TermChunk>> {
-        let chunk = TermChunk::from_wire(leaf, &mut VORTEX_SESSION.create_execution_ctx())?;
-        Ok(self.cache().insert(w, Arc::new(chunk)))
-    }
-
     /// Window `w`'s chunk: the cached one, else its leaf rebuilt over its
-    /// segment, adopted and cached. The rebuild runs with the lock released,
-    /// so two tasks missing one window both rebuild it and the cache keeps
-    /// the first insert.
+    /// segment, adopted ([`TermChunk::from_wire`]) and cached. The rebuild
+    /// runs with the lock released, so two tasks missing one window both
+    /// rebuild it and the cache keeps the first insert.
     async fn window_chunk(&self, w: usize) -> Result<Arc<TermChunk>> {
         if let Some(chunk) = self.cached(w) {
             return Ok(chunk);
         }
+        let leaf = fetch_flat(&self.windows[w].layout, &self.source, &VORTEX_SESSION).await?;
         #[cfg(test)]
         self.rebuilt
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let leaf = fetch_flat(&self.windows[w].layout, &self.source, &VORTEX_SESSION).await?;
-        self.adopt(w, leaf)
+        let chunk = TermChunk::from_wire(leaf, &mut VORTEX_SESSION.create_execution_ctx())?;
+        Ok(self.cache().insert(w, Arc::new(chunk)))
     }
 
     /// [`window_chunk`](Self::window_chunk) when it needs no waiting: `None`
     /// when the leaf's segment read does not complete on its first poll,
-    /// which sets [`reads_wait`](Self::reads_wait). The read is then dropped
-    /// unfinished, and only a cached window is answered from then on.
+    /// which sets [`reads_wait`](Self::reads_wait) and drops the read
+    /// unfinished. Once reads wait, only a cached window is answered.
     fn window_chunk_now(&self, w: usize) -> Option<Result<Arc<TermChunk>>> {
         use futures::FutureExt as _;
-        if let Some(chunk) = self.cached(w) {
-            return Some(Ok(chunk));
-        }
         if self.reads_wait.load(std::sync::atomic::Ordering::Relaxed) {
-            return None;
+            return self.cached(w).map(Ok);
         }
-        let read = fetch_flat(&self.windows[w].layout, &self.source, &VORTEX_SESSION);
-        let Some(leaf) = read.now_or_never() else {
+        let chunk = self.window_chunk(w).now_or_never();
+        if chunk.is_none() {
             self.reads_wait
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        };
-        #[cfg(test)]
-        self.rebuilt
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(
-            leaf.map_err(Into::into)
-                .and_then(|leaf| self.adopt(w, leaf)),
-        )
+        }
+        chunk
     }
 }
 
@@ -182,49 +168,6 @@ impl FileBackedDict {
 
     pub(crate) fn len(&self) -> usize {
         self.0.code_space.len()
-    }
-
-    /// The codes the dictionary's terms take.
-    pub(in crate::store::layouts::dictionary) fn code_space(&self) -> CodeSpace {
-        self.0.code_space
-    }
-
-    /// The number of windows (leaves) of the term column.
-    pub(in crate::store::layouts::dictionary) fn window_count(&self) -> usize {
-        self.0.windows.len()
-    }
-
-    /// The window holding term `rank` (below [`len`](Self::len)), and the
-    /// rank within it.
-    pub(in crate::store::layouts::dictionary) fn window_of(&self, rank: usize) -> (usize, usize) {
-        chunk_of(&self.0.starts, rank)
-    }
-
-    /// The most the window cache may be charged, and so the most a chunk
-    /// decode holds in place ([`window_chunk_now`](Self::window_chunk_now)).
-    pub(in crate::store::layouts::dictionary) fn window_budget(&self) -> usize {
-        self.0.cache().budget()
-    }
-
-    /// What a window holding `chunk` is charged against the budget, as the
-    /// cache charges it.
-    pub(in crate::store::layouts::dictionary) fn window_charge(chunk: &TermChunk) -> usize {
-        WindowCache::charge(chunk)
-    }
-
-    /// Whether a window read has had to wait ([`Windows::reads_wait`]).
-    pub(in crate::store::layouts::dictionary) fn reads_wait(&self) -> bool {
-        self.0.reads_wait.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Window `w`'s chunk if it can be had without waiting: cached, or read
-    /// from a segment that completes when first polled (a mapped file's or
-    /// a buffer's). `None` when the read would wait.
-    pub(in crate::store::layouts::dictionary) fn window_chunk_now(
-        &self,
-        w: usize,
-    ) -> Option<Result<Arc<TermChunk>>> {
-        self.0.window_chunk_now(w)
     }
 
     /// The code of `term` exactly as spelled: the window whose bounds enclose
@@ -445,6 +388,12 @@ impl FileBackedDict {
             .lifted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TermDictionary::from_child_reader(self.0.reader.clone()).await
+    }
+
+    /// Whether a window read has had to wait ([`Windows::reads_wait`]).
+    #[cfg(test)]
+    pub(crate) fn debug_reads_wait(&self) -> bool {
+        self.0.reads_wait.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Windows rebuilt from their segments since the handle opened.

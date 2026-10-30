@@ -287,7 +287,7 @@ written without the zone map; readers inspect the layout for it.
 **Reading it from a file.** A file store is memory-mapped
 ([`from_file`](../core/src/store/persist/open.rs#L238)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L176)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L162)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
@@ -303,7 +303,7 @@ the bounds from the leaves.
   rows are decompressed. A batch in any order, with repeats, reads each
   distinct code once.
 - **A chunk's rows** decode in place, as against a resident dictionary
-  ([`decode_file_backed`](../core/src/store/layouts/dictionary/codec.rs#L630)):
+  ([`decode_file_backed`](../core/src/store/layouts/dictionary/codec.rs#L593)):
   each window the chunk's codes fall in is taken once from the window cache,
   rebuilt on a miss by a segment read that completes at once over a mapping,
   and held until the chunk is decoded, and each row's terms are decompressed
@@ -489,7 +489,7 @@ kernel's decision; no segment cache sits in between.
 What a file store keeps for its lifetime, and what bounds it. The opened handle
 ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L36)) and the file-backed
 dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L176))
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L162))
 keep:
 
 | Kept | Bound |
@@ -647,7 +647,7 @@ open rather than being read around.
 | Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers, exact zone maps | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/file.rs`](../core/src/io/file.rs), [`read.rs`](../core/src/io/read.rs), [`zone_map.rs`](../core/src/io/zone_map.rs) |
 | The opened-file handle and its bounded memos | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs), [`memo.rs`](../core/src/store/persist/memo.rs) |
 | Primary column names | [`core/src/store/schema.rs`](../core/src/store/schema.rs), [`layouts/typed_object.rs`](../core/src/store/layouts/typed_object.rs) |
-| Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |
+| Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`held.rs`](../core/src/store/layouts/dictionary/file_backed/held.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
 | Locating and point-reading index runs on file | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
