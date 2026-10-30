@@ -8,6 +8,7 @@
 //! the dictionary lacks); a `null` string is a free pattern position, while `""` is the default graph.
 
 pub mod engine;
+pub mod payload;
 
 use engine::{ROW_BYTES, Store};
 use jni::errors::ErrorPolicy;
