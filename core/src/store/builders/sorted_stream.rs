@@ -245,12 +245,12 @@ pub(crate) async fn build_chunk_stream(
         spiller.push(ids, &terms)?;
         ingested += 1;
     }
-    let runs = spiller.finish(&terms)?;
+    let spilled = spiller.finish(&terms)?;
     log::debug!(
         "[SortedStreamBuilder] Ingested {} quads ({} distinct terms) into {} runs in {:?}",
         ingested,
         terms.len(),
-        runs.run_count(),
+        spilled.run_count(),
         debug::elapsed(start)
     );
 
@@ -258,6 +258,8 @@ pub(crate) async fn build_chunk_stream(
     let frozen = terms.finish();
     let rank_of = Arc::new(frozen.rank_of);
     let encoding = Encoding::new(layout, frozen.sorted)?;
+    // A build that spilled nothing sorts its one run here, by rank.
+    let runs = spilled.ranked(&rank_of)?;
     log::debug!(
         "[SortedStreamBuilder] Ranked {} terms in {:?}",
         rank_of.len(),

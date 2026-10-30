@@ -160,6 +160,47 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
         });
 }
 
+/// The out-of-core build over quads in no order: `serialize` of the
+/// Dictionary layout with no index, its input in a fixed shuffle, so the
+/// spill sorts its run from scratch (the `serialize` cells above feed the
+/// dataset in order, which a sort passes over).
+#[divan::bench(sample_count = HEAVY_SAMPLES)]
+fn serialize_shuffled(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| {
+            let mut quads = materialize_quads(bench_size());
+            shuffle(&mut quads);
+            quads
+        })
+        .bench_values(|quads| {
+            rt().block_on(async move {
+                let mut buf = Vec::new();
+                let stream = stream::iter(quads.into_iter().map(Ok::<_, VortexRdfError>));
+                io::quads_stream_to_vortex_writer(
+                    stream,
+                    &mut buf,
+                    LayoutStrategy::Dictionary,
+                    vec![],
+                )
+                .await
+                .expect("serialize failed");
+                black_box(buf.len())
+            })
+        });
+}
+
+/// `items` in a fixed pseudo-random order: a Fisher-Yates shuffle driven by
+/// a xorshift sequence from a constant seed, the same order every run.
+fn shuffle<T>(items: &mut [T]) {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for i in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        items.swap(i, (state % (i as u64 + 1)) as usize);
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Group 2 — MATCH (query path)
 //

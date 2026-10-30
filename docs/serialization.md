@@ -206,6 +206,7 @@ flowchart TD
         I0["intern each term: a u32 id, the term held once"] --> I1["buffer up to 1,048,576 quads as four ids"]
         I1 --> I2{"buffer full?"}
         I2 -- "yes" --> I3["sort it in the terms' order, drop repeats,<br/>spill it as quads_run_N.bin (16 bytes a quad)"]
+        I2 -- "input ends, nothing spilled" --> I4["keep the buffer, unsorted:<br/>it is sorted by rank after the freeze"]
         I3 --> I1
         I2 -- "no" --> I0
     end
@@ -217,26 +218,34 @@ flowchart TD
 ```
 
 **Phase 1 — runs.** Every term is interned as it arrives, under every layout
-([`TermInterner`](../core/src/store/builders/interner.rs#L36)): each distinct
+([`TermInterner`](../core/src/store/builders/interner.rs#L37)): each distinct
 term is held once under a provisional `u32` id, in arrival order, and a quad is
 kept as its four ids. The buffer holds up to
 [`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L54) (1,048,576) quads,
-16 bytes each; a buffer that would overflow is sorted in its terms' order (an
-equal id is an equal term, never read), deduplicated and spilled as one run
-([`QuadSpiller`](../core/src/store/builders/runs.rs#L262)). A dataset that fits
-in a single buffer never touches the filesystem — the sorted buffer *is* the
-run. The distinct terms are the one thing this pipeline holds for the
+16 bytes each; a buffer that would overflow is sorted in its terms' order,
+deduplicated and spilled as one run
+([`QuadSpiller`](../core/src/store/builders/runs.rs#L267)). Where its terms
+repeat (at most one distinct term for two quads), the buffer's distinct terms
+are compared once, to rank them among themselves, and the quads sort in place
+as tuples of those ranks; otherwise they are compared term by term, a role's
+terms read only where the roles before it tie (an equal id is an equal term,
+never read). A dataset that fits in a single buffer never touches the
+filesystem: the buffer *is* the run, kept unsorted until the freeze has ranked
+every term, then sorted as rank tuples, integers alone compared. The distinct terms are the one thing this pipeline holds for the
 dataset's lifetime: in the interner during ingest, then as the Dictionary
 layout's term dictionary or, under the string layouts, as the sorted terms the
 ranks are spelled back from. A build of more than `i32::MAX` distinct terms is
 refused at the term past it.
 
 **Freeze.** The interner's
-[`finish`](../core/src/store/builders/interner.rs#L117) sorts the terms once, in
+[`finish`](../core/src/store/builders/interner.rs#L115) sorts the terms once, in
 byte order, and maps each id to its term's rank. A rank keeps its term's order
 — the order of dictionary codes and of `RawQuad`'s derived `Ord` — so a run
 sorted by its terms is sorted by rank tuple once its ids are read as ranks: no
-run is sorted again. Under the Dictionary layout the ranked terms become the
+spilled run is sorted again. The in-memory run of a build that spilled nothing
+is sorted here, its ids replaced by their ranks
+([`SpilledQuads::ranked`](../core/src/store/builders/runs.rs#L419)), so its
+sort compares integers where a spilled run's compares terms. Under the Dictionary layout the ranked terms become the
 term dictionary (a rank's code is its position), each term moved into the
 column and freed as it is copied.
 
@@ -262,7 +271,7 @@ first merge runs to completion
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's ranks are pushed into one spiller per requested family
-([`EntrySpiller`](../core/src/store/builders/runs.rs#L494)), each spilling its
+([`EntrySpiller`](../core/src/store/builders/runs.rs#L598)), each spilling its
 own sorted runs:
 
 | Family | Spilled entry | Run files |
