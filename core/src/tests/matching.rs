@@ -501,3 +501,32 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
         assert_eq!(by_so.size().await.unwrap(), 6, "{label}");
     }
 }
+
+/// The match prelude looks a resident dictionary's bound terms up in `s`,
+/// `p`, `o` order and stops at the first the dictionary lacks: the pattern is
+/// then provably empty, and the terms after it are never searched for.
+#[tokio::test]
+async fn test_match_prelude_stops_at_the_first_absent_term() {
+    use crate::store::layouts::resolve_hooks;
+
+    let quads = modular_quads(30, 3, 4);
+    let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let (s, p, o) = (&quads[1].subject, &quads[1].predicate, &quads[1].object);
+    let absent = NamedNode::new_unchecked("http://example.org/absent");
+    let absent_s = NamedOrBlankNode::NamedNode(absent.clone());
+    let absent_o = Term::NamedNode(absent.clone());
+    for (pattern, lookups, rows) in [
+        ((s, p, o), 3, 1),
+        ((&absent_s, p, o), 1, 0),
+        ((s, &absent, o), 2, 0),
+        ((s, p, &absent_o), 3, 0),
+    ] {
+        let (s, p, o) = pattern;
+        let before = resolve_hooks::resolved();
+        assert_eq!(
+            matched_size(&store, Some(s), Some(p), Some(o), None).await,
+            rows
+        );
+        assert_eq!(resolve_hooks::resolved() - before, lookups, "{s} {p} {o}");
+    }
+}

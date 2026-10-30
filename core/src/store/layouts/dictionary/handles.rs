@@ -21,7 +21,7 @@ use super::term_dict::TermDictionary;
 /// demand (`FileBacked`), which makes term ↔ code translation asynchronous.
 /// During a match the dictionary does I/O in
 /// [`resolve_pattern`](Self::resolve_pattern) only: that async prelude
-/// resolves every bound role into the match's [`PatternCodes`] witness,
+/// resolves the bound roles into the match's [`PatternCodes`] witness,
 /// which only the prelude mints, so the synchronous match core answers from
 /// those codes and never touches the dictionary. Paths that need the whole
 /// column take [`resident`](Self::resident), or lift a file-backed
@@ -39,12 +39,14 @@ pub(crate) enum DictAccess {
 }
 
 impl DictAccess {
-    /// Resolve every bound term of `pattern` into `codes`, the witness the
+    /// Resolve the bound terms of `pattern` into `codes`, the witness the
     /// async prelude
     /// ([`prepare_pattern`](crate::store::layouts::ResolvedLayout::prepare_pattern))
-    /// minted. A resident dictionary resolves them here too, so under either
-    /// residency every bound role is in the witness once the prelude has
-    /// run.
+    /// minted. A resident dictionary resolves them one by one, in `s`, `p`,
+    /// `o`, `g` order, and stops at the first it lacks: the pattern is then
+    /// provably empty (`PatternCodes::provably_empty`), so no match reads the
+    /// codes of the roles after it. A file-backed one searches every bound
+    /// role at once, its window reads overlapped.
     pub(in crate::store::layouts) async fn resolve_pattern(
         &self,
         pattern: QuadPattern<'_>,
@@ -53,7 +55,9 @@ impl DictAccess {
         match self {
             DictAccess::Resident(dict) => {
                 for term in pattern.bound_roles() {
-                    codes.resolve(term, |t| dict.encode_exact(t));
+                    if codes.resolve(term, |t| dict.encode_exact(t)).is_none() {
+                        break;
+                    }
                 }
             }
             // One window search per bound role. The searches are independent

@@ -17,9 +17,9 @@ tests pin each interface
 |---|---|
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L70), [`code_chunks`](../core/src/store/read/chunks.rs#L102) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L153), [`index_components`](../core/src/store/read/metadata.rs#L227), [`partitions`](../core/src/store/read/metadata.rs#L262) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L139), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L266) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L139), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
 | A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L76) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
@@ -242,7 +242,7 @@ count and scan to child 0
 ([file-format.md §3](./file-format.md#3-the-store-root-vortex-rdfstorev2)),
 so a scan reads `{s, p, o, g}` in base row order, `UInt64` codes under the
 Dictionary layout, which the
-[`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) decodes.
+[`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) decodes.
 That is the file's base alone: a view's narrowing, tombstones and tail live
 in the store, and its rows come out through the streams of
 [§1](#1-rows-as-columns-without-arrow). An engine on vortex's DataFusion

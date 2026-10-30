@@ -133,7 +133,7 @@ perform I/O, and the only reason the prelude is async at all.
 |---|---|---|---|
 | `Default` | — | nothing: the witness only holds the layout (never suspends) | the N-Triples string |
 | `TypedObject` | — | nothing: the witness only holds the layout (never suspends) | the N-Triples string; the object decomposes into `o_kind`/`o_value`/`o_datatype`/`o_lang` |
-| `Dictionary` | in-memory | seeds the role cache by in-memory binary search | `u64` code |
+| `Dictionary` | in-memory | seeds the role cache by in-memory binary search, role by role in `s`, `p`, `o`, `g` order, stopping at the first term the dictionary lacks: the pattern is then provably empty, and no stage reads the roles after it | `u64` code |
 | `Dictionary` | file-backed | one window search of the mapped dictionary child per bound role, all **concurrent** (`join_all`), seeding every bound role | `u64` code |
 
 What the witness saves is likewise layout-dependent. Its **role cache holds
