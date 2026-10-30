@@ -484,8 +484,7 @@ enum LazyRowIdSource {
 /// as far as it reaches: the rows of `selection` (of `base`) where `eqs`
 /// hold.
 pub(crate) struct PendingResidual {
-    pub(crate) base: ArrayRef,
-    pub(crate) probes: Arc<crate::store::probes::StructProbes>,
+    pub(crate) memory: crate::store::MemoryBase,
     pub(crate) selection: crate::store::view::selection::RowSelection,
     pub(crate) eqs: Vec<(&'static str, Scalar)>,
 }
@@ -493,13 +492,13 @@ pub(crate) struct PendingResidual {
 impl PendingResidual {
     fn all_ids(&self) -> Result<Buffer<RowId>> {
         use crate::store::view::selection::SelectedRows;
-        let matched = crate::store::VortexRdfStore::residual_selection(
-            &self.base,
-            &self.probes,
+        let matched = crate::store::VortexRdfStore::residual_rows(
+            &self.memory,
             self.selection.clone(),
             &self.eqs,
+            None,
         )?;
-        Ok(match matched.as_rows(self.base.len()) {
+        Ok(match matched.as_rows(self.memory.base.len()) {
             SelectedRows::Run(run) => Buffer::from_iter(run.start as RowId..run.end as RowId),
             SelectedRows::Ids(ids) => ids.clone(),
         })
@@ -526,8 +525,7 @@ impl LazyRowIds {
             return Ok(Some((ids.clone(), true)));
         }
         let (found, complete) = crate::store::VortexRdfStore::residual_prefix(
-            &residual.base,
-            &residual.probes,
+            &residual.memory,
             &residual.selection,
             &residual.eqs,
             want,

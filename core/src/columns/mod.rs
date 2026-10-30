@@ -1,10 +1,11 @@
-//! Kernels over [`TermCode`] columns: distinct values and value counts, an
-//! index gather, and an equi-join (its pair count, its row pairs, refused past
-//! a cap before either output is allocated, and its build side
-//! [`CodeGroups`], which joins a left column slice by slice and can gather the
-//! joined columns). All work on plain slices and preserve order: distinct
-//! values come out in first-seen order, join pairs in nested-loop order (left
-//! rows in order, each with its right matches in their order). Row indices
+//! Kernels over [`TermCode`] columns: distinct values and value counts, the
+//! starts of runs of equal rows, an index gather, and an equi-join (its pair
+//! count, its row pairs, refused past a cap before either output is
+//! allocated, and its build side [`CodeGroups`], which joins a left column
+//! slice by slice and can gather the joined columns). All work on plain
+//! slices and preserve order: distinct values come out in first-seen order,
+//! join pairs in nested-loop order (left rows in order, each with its right
+//! matches in their order). Row indices
 //! and counts are `u64`, the codes' width, so one column type carries all
 //! three. Each kernel uses a direct-mapped table when the code range is dense
 //! relative to the column (`dense_table_fits`), else a hash map.
@@ -119,6 +120,26 @@ pub fn take(codes: &[TermCode], indices: &[u64]) -> Result<Buffer<TermCode>, usi
     ))
 }
 
+/// The rows of equally long columns where a run of equal rows starts: row 0,
+/// and every row whose code in some column differs from the row before.
+/// Gathered with [`take`], they keep one row of each run, which is the
+/// distinct rows when equal rows are adjacent — as the rows of one match are
+/// on the columns its sort order puts before the graph (every order a store
+/// holds ends in `g`), so the triples of a union over graphs. `None` when the
+/// columns differ in length; no column, no rows.
+pub fn run_starts(columns: &[&[TermCode]]) -> Option<Buffer<u64>> {
+    let Some(first) = columns.first() else {
+        return Some(Buffer::empty());
+    };
+    let len = first.len();
+    if columns.iter().any(|c| c.len() != len) {
+        return None;
+    }
+    Some(Buffer::from_iter((0..len).filter_map(|i| {
+        (i == 0 || columns.iter().any(|c| c[i] != c[i - 1])).then_some(i as u64)
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +147,18 @@ mod tests {
     /// Past `u32::MAX`, so a kernel narrowing a code to 32 bits would read
     /// it as 7. The join's tests use it too.
     pub(super) const WIDE: TermCode = (1 << 32) + 7;
+
+    #[test]
+    fn run_starts_keeps_one_row_per_run() {
+        let s = [1, 1, 1, 2, 2, WIDE];
+        let p = [5, 5, 6, 6, 6, 6];
+        let starts = run_starts(&[&s, &p]).unwrap();
+        assert_eq!(starts.as_slice(), &[0, 2, 3, 5]);
+        assert_eq!(run_starts(&[&s]).unwrap().as_slice(), &[0, 3, 5]);
+        assert!(run_starts(&[&s, &p[..2]]).is_none());
+        assert!(run_starts(&[]).unwrap().is_empty());
+        assert!(run_starts(&[&[]]).unwrap().is_empty());
+    }
 
     #[test]
     fn distinct_keeps_first_seen_order() {

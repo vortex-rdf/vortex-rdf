@@ -25,6 +25,7 @@ use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
+use crate::store::zones::ZoneTable;
 
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
@@ -80,6 +81,9 @@ pub(crate) struct MemoryBase {
     /// resolved lazily and shared by every view of this base; a new base
     /// takes a new cache.
     pub(crate) probes: Arc<StructProbes>,
+    /// The per-zone code bounds of `base`'s code columns ([`ZoneTable`]),
+    /// shared by every view of this base; empty when the base has none.
+    pub(crate) zones: Arc<ZoneTable>,
     /// The index's plan for reading this view's rows from the index's own
     /// columns ([`InMemoryServePlan`]). Present only while the selection is
     /// exactly the plan's run: any narrowing drops it, materializing a
@@ -325,6 +329,7 @@ impl QuadsSource {
                 base: memory.base.clone(),
                 components: Arc::clone(&memory.components),
                 probes: Arc::clone(&memory.probes),
+                zones: Arc::clone(&memory.zones),
                 serve,
             }),
         }

@@ -9,6 +9,7 @@ use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
 use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 
 use super::wire::StoreComponentDescriptor;
+use crate::io::zone_map::ZONE_ROWS;
 
 /// A producer of one component's chunks: buffered arrays
 /// ([`BufferedComponentSource`], replayable) or a spill-run merger pulled
@@ -109,10 +110,6 @@ impl NativeComponentWrite {
 /// Vortex's default uncompressed block target, the coalescing size of every
 /// column the store writes outside [`id_column_strategy`].
 pub(crate) const ONE_MEG: u64 = 1 << 20;
-
-/// Rows per repartitioned block and per zone-map zone: the
-/// `WriteStrategyBuilder` default the store keeps.
-const ROW_BLOCK: usize = 8192;
 
 /// The compressor every store child is written with: the session's schemes,
 /// limited to the wire forms its write editions allow, minus FastLanes delta.
@@ -248,7 +245,7 @@ fn id_column_strategy(
             CompressingStrategy::new(buffered, Arc::clone(&data_compressor)),
             RepartitionWriterOptions {
                 block_size_minimum: target,
-                block_len_multiple: ROW_BLOCK,
+                block_len_multiple: ZONE_ROWS,
                 block_size_target: Some(target),
                 canonicalize: true,
             },
@@ -268,7 +265,7 @@ fn id_column_strategy(
         dict,
         compress_then_flat,
         ZonedLayoutOptions {
-            block_size: NonZeroUsize::new(ROW_BLOCK).expect("the row block is not empty"),
+            block_size: NonZeroUsize::new(ZONE_ROWS).expect("a zone is not empty"),
             ..Default::default()
         },
     );
@@ -276,7 +273,7 @@ fn id_column_strategy(
         zoned,
         RepartitionWriterOptions {
             block_size_minimum: 0,
-            block_len_multiple: ROW_BLOCK,
+            block_len_multiple: ZONE_ROWS,
             block_size_target: None,
             canonicalize: false,
         },
@@ -305,9 +302,7 @@ pub(crate) fn dict_child_strategy(
             FlatLayoutStrategy::default(),
             ZonedLayoutOptions {
                 block_size,
-                aggregate_fns: Some(
-                    crate::store::layouts::dictionary::storage::window_bound_aggregates(),
-                ),
+                aggregate_fns: Some(crate::io::zone_map::exact_bound_aggregates()),
                 concurrency: std::num::NonZeroUsize::MIN,
             },
         )),

@@ -3,6 +3,7 @@
 
 use crate::debug;
 use crate::error::Result;
+use crate::io::zone_map::ZONE_ROWS;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{
     bool_array_to_mask, column_is_sorted, into_struct_array, search_sorted_bounds,
@@ -310,8 +311,7 @@ impl VortexRdfStore {
                 };
                 let lazy = crate::store::indexes::LazyRowIds::from_residual(
                     crate::store::indexes::PendingResidual {
-                        base: base.clone(),
-                        probes: std::sync::Arc::clone(probes),
+                        memory: memory.clone(),
                         selection: exact,
                         eqs,
                     },
@@ -319,9 +319,7 @@ impl VortexRdfStore {
                 (ViewSelection::Pending(lazy), true)
             }
             ViewSelection::Exact(exact) if !exact.is_empty(base_len) && pat.any_bound() => {
-                let Some(narrowed) =
-                    Self::residual_narrow(&struct_arr, base, probes, exact, pat, codes, t)?
-                else {
+                let Some(narrowed) = Self::residual_narrow(memory, exact, pat, codes, t)? else {
                     return Ok(self.empty_view());
                 };
                 (ViewSelection::Exact(narrowed), true)
@@ -443,9 +441,7 @@ impl VortexRdfStore {
     /// over those rows only. `None` when the residual compiles to
     /// `AlwaysFalse`.
     fn residual_narrow(
-        struct_arr: &StructArray,
-        base: &ArrayRef,
-        probes: &StructProbes,
+        memory: &MemoryBase,
         selection: RowSelection,
         pat: QuadPattern<'_>,
         codes: &mut PatternCodes,
@@ -458,37 +454,59 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
+        Self::residual_rows(memory, selection, &eqs, t).map(Some)
+    }
+
+    /// The rows of `selection` (of `memory`'s base) where every equality of
+    /// `eqs` holds, compared as [`residual_narrow`](Self::residual_narrow)
+    /// describes.
+    pub(crate) fn residual_rows(
+        memory: &MemoryBase,
+        selection: RowSelection,
+        eqs: &[(&'static str, Scalar)],
+        t: Option<Instant>,
+    ) -> Result<RowSelection> {
+        let MemoryBase {
+            base,
+            probes,
+            zones,
+            ..
+        } = memory;
+        let struct_arr = into_struct_array(base.clone())?;
         // The zones whose code bounds cannot hold a constrained code are
-        // skipped, as a file's zone maps skip them: a run of rows has its
-        // surviving zones compared run by run, each a slice of the base, and
-        // an id list keeps only its ids in them.
-        let selection = match Self::zone_runs(base, probes, &selection, &eqs) {
-            None => selection,
-            Some(runs) => match selection {
-                RowSelection::Ids(_) => selection.intersect_runs(&runs),
-                selection => {
-                    let ids = Self::runs_matching(base, &selection, &runs, &eqs)?;
-                    debug::step!(t, "[match_pattern] In-memory narrowed by zone bounds");
-                    return Ok(Some(RowSelection::from_ids(vortex_buffer::Buffer::from(
-                        ids,
-                    ))));
+        // skipped, as a file's zone maps skip them. Every row or a range has
+        // the zone runs left inside it compared run by run, each a slice of
+        // the base, with no id list of the rows left (those runs are many
+        // where a code's zones scatter); an id list keeps only its ids in them.
+        let mut selection = selection;
+        if selection.len(base.len()) > ZONE_ROWS
+            && let Some(runs) = zones.runs_holding(eqs, base.len())
+        {
+            #[cfg(test)]
+            zone_hooks::note_narrowed();
+            debug::step!(t, "[match_pattern] In-memory narrowed by zone bounds");
+            match selection.clip_runs(&runs) {
+                Some(runs) => {
+                    let ids = Self::runs_matching(base, &runs, eqs)?;
+                    return Ok(RowSelection::from_ids(vortex_buffer::Buffer::from(ids)));
                 }
-            },
-        };
-        if selection.is_empty(base.len()) {
-            return Ok(Some(selection));
+                None => selection = selection.intersect_runs(&runs),
+            }
+            if selection.is_empty(base.len()) {
+                return Ok(selection);
+            }
         }
         // Typed fast path: residual equalities over canonical code columns
         // (Dictionary layout) become slice loops yielding exact base ids,
         // with no slice/compare/mask pipeline, and a probe-bound column reads
         // through the store's own probe. Only the selection's rows are
         // tested, so the ids are already the intersection.
-        Ok(Some(
+        Ok(
             match typed_residual_ids(
-                struct_arr,
+                &struct_arr,
                 &selection,
                 base.len(),
-                &eqs,
+                eqs,
                 Some((base, probes)),
             ) {
                 Some(ids) => {
@@ -499,49 +517,10 @@ impl VortexRdfStore {
                     RowSelection::Ids(ids)
                 }
                 None => {
-                    let mask = Self::mask_for(&selection.apply(base)?, &eqs)?;
+                    let mask = Self::mask_for(&selection.apply(base)?, eqs)?;
                     let narrowed = selection.refine(&bool_array_to_mask(mask)?);
                     debug::step!(t, "[match_pattern] In-memory narrowed by mask scan");
                     narrowed
-                }
-            },
-        ))
-    }
-
-    /// PROTOTYPE (item 3): the rows of `selection` (of `base`) that satisfy
-    /// `eqs`, as [`residual_narrow`](Self::residual_narrow) compares them.
-    pub(crate) fn residual_selection(
-        base: &ArrayRef,
-        probes: &StructProbes,
-        selection: RowSelection,
-        eqs: &[(&'static str, Scalar)],
-    ) -> Result<RowSelection> {
-        let struct_arr = into_struct_array(base.clone())?;
-        let selection = match Self::zone_runs(base, probes, &selection, eqs) {
-            None => selection,
-            Some(runs) => match selection {
-                RowSelection::Ids(_) => selection.intersect_runs(&runs),
-                selection => {
-                    let ids = Self::runs_matching(base, &selection, &runs, eqs)?;
-                    return Ok(RowSelection::from_ids(vortex_buffer::Buffer::from(ids)));
-                }
-            },
-        };
-        if selection.is_empty(base.len()) {
-            return Ok(selection);
-        }
-        Ok(
-            match typed_residual_ids(
-                &struct_arr,
-                &selection,
-                base.len(),
-                eqs,
-                Some((base, probes)),
-            ) {
-                Some(ids) => RowSelection::Ids(ids),
-                None => {
-                    let mask = Self::mask_for(&selection.apply(base)?, eqs)?;
-                    selection.refine(&bool_array_to_mask(mask)?)
                 }
             },
         )
@@ -553,17 +532,16 @@ impl VortexRdfStore {
     /// fourfold) until `want` rows are found. `true` when every piece was
     /// compared, so the rows are all of them.
     pub(crate) fn residual_prefix(
-        base: &ArrayRef,
-        probes: &StructProbes,
+        memory: &MemoryBase,
         selection: &RowSelection,
         eqs: &[(&'static str, Scalar)],
         want: usize,
     ) -> Result<(Vec<u64>, bool)> {
         use crate::store::view::selection::SelectedRows;
-        let base_len = base.len();
+        let base_len = memory.base.len();
         let mut found: Vec<u64> = Vec::new();
         let push = |found: &mut Vec<u64>, piece: RowSelection| -> Result<()> {
-            match Self::residual_selection(base, probes, piece, eqs)?.as_rows(base_len) {
+            match Self::residual_rows(memory, piece, eqs, None)?.as_rows(base_len) {
                 SelectedRows::Run(run) => found.extend(run.start as u64..run.end as u64),
                 SelectedRows::Ids(ids) => found.extend(ids.iter().copied()),
             }
@@ -605,78 +583,16 @@ impl VortexRdfStore {
         Ok((found, true))
     }
 
-    /// The row runs of the zones whose code bounds
-    /// ([`CodeZones`](crate::store::zones::CodeZones), set when the base was
-    /// built or loaded) hold every code equality of `eqs`, adjacent zones
-    /// joined. `None` when `selection` covers a zone's rows or fewer, no
-    /// constrained column has bounds, or the surviving zones hold more than
-    /// half the base's rows: comparing a whole column then costs less than
-    /// comparing its runs.
-    fn zone_runs(
-        base: &ArrayRef,
-        probes: &StructProbes,
-        selection: &RowSelection,
-        eqs: &[(&'static str, Scalar)],
-    ) -> Option<Vec<std::ops::Range<u64>>> {
-        use crate::store::zones::ZONE_ROWS;
-        let base_len = base.len();
-        if selection.len(base_len) <= ZONE_ROWS {
-            return None;
-        }
-        let mut keep: Option<Vec<bool>> = None;
-        for (field, scalar) in eqs {
-            if !scalar.dtype().is_unsigned_int() {
-                continue;
-            }
-            let (Ok(code), Some(zones)) = (
-                schema::TermCode::try_from(scalar),
-                probes.zones(base, field),
-            ) else {
-                continue;
-            };
-            let keep = keep.get_or_insert_with(|| vec![true; zones.zones()]);
-            for (zone, kept) in keep.iter_mut().enumerate() {
-                *kept &= zones.may_hold(zone, code);
-            }
-        }
-        let keep = keep?;
-        let kept = keep.iter().filter(|&&kept| kept).count();
-        if kept.saturating_mul(2) > keep.len() {
-            return None;
-        }
-        let mut runs: Vec<std::ops::Range<u64>> = Vec::new();
-        for (zone, _) in keep.iter().enumerate().filter(|(_, kept)| **kept) {
-            let start = (zone * ZONE_ROWS) as u64;
-            let end = ((zone + 1) * ZONE_ROWS).min(base_len) as u64;
-            match runs.last_mut() {
-                Some(run) if run.end == start => run.end = end,
-                _ => runs.push(start..end),
-            }
-        }
-        #[cfg(test)]
-        zone_hooks::note_narrowed();
-        Some(runs)
-    }
-
-    /// The base rows of `runs` inside `selection` (every row, or a range)
-    /// that satisfy `eqs`, ascending: each run's slice of the base compared
-    /// on the constrained columns alone ([`mask_for`](Self::mask_for)).
+    /// The base rows of `runs` that satisfy `eqs`, ascending: each run's
+    /// slice of the base compared on the constrained columns alone
+    /// ([`mask_for`](Self::mask_for)).
     fn runs_matching(
         base: &ArrayRef,
-        selection: &RowSelection,
         runs: &[std::ops::Range<u64>],
         eqs: &[(&'static str, Scalar)],
     ) -> Result<Vec<u64>> {
-        let within = match selection {
-            RowSelection::Range(range) => range.clone(),
-            _ => 0..base.len() as u64,
-        };
         let mut ids = Vec::new();
         for run in runs {
-            let run = run.start.max(within.start)..run.end.min(within.end);
-            if run.start >= run.end {
-                continue;
-            }
             let rows = base.slice(run.start as usize..run.end as usize)?;
             match bool_array_to_mask(Self::mask_for(&rows, eqs)?)?.bit_buffer() {
                 vortex_mask::AllOr::All => ids.extend(run.clone()),

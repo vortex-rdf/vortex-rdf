@@ -1,13 +1,13 @@
-//! In-memory zone bounds (vortex-rdf/vortex-rdf#124): an in-memory base's
-//! code columns carry the smallest and largest code of each 8,192-row zone,
-//! taken in the pass that compresses a build's codes or read from the zone
-//! maps of the file the store was loaded from, and a residual equality on a
-//! base no index serves compares only the zones whose bounds hold its code.
-//! Its answers are the full compare's, over every kind of selection.
+//! In-memory zone bounds: an in-memory base's code columns carry the
+//! smallest and largest code of each 8,192-row zone, taken in the pass that
+//! compresses a build's codes or read from the zone maps of the file the store
+//! was loaded from, and a residual equality on a base no index serves compares
+//! only the zones whose bounds hold its code. Its answers are the full
+//! compare's, over every kind of selection.
 
 use super::*;
+use crate::io::zone_map::ZONE_ROWS;
 use crate::store::query::matching::zone_hooks;
-use crate::store::zones::ZONE_ROWS;
 
 /// The rows of [`zoned_quads`]: four zones and part of a fifth.
 const ROWS: usize = 4 * ZONE_ROWS + 1_000;

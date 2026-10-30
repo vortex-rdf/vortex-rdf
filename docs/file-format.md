@@ -219,7 +219,7 @@ column
 
 An id column — a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64`
 row-id `rid` — takes the same pipeline with one change, through the writer's
-per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L156)):
+per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L153)):
 if it does not dictionary-encode (a row-id column never does: its ids are
 unique), it coalesces toward ~2 MiB, 262,144 rows per leaf. A code column that
 dictionary-encodes keeps its codes at ~1 MiB: they are as narrow as its
@@ -275,7 +275,7 @@ the dtype alone decides the layout ([§4](#4-the-quad-table)).
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L293)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L290)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates
@@ -287,7 +287,7 @@ written without the zone map; readers inspect the layout for it.
 **Reading it from a file.** A file store is memory-mapped
 ([`from_file`](../core/src/store/persist/open.rs#L238)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L176)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L162)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
@@ -303,7 +303,7 @@ the bounds from the leaves.
   rows are decompressed. A batch in any order, with repeats, reads each
   distinct code once.
 - **A chunk's rows** decode in place, as against a resident dictionary
-  ([`decode_file_backed`](../core/src/store/layouts/dictionary/codec.rs#L630)):
+  ([`decode_file_backed`](../core/src/store/layouts/dictionary/codec/mod.rs#L593)):
   each window the chunk's codes fall in is taken once from the window cache,
   rebuilt on a miss by a segment read that completes at once over a mapping,
   and held until the chunk is decoded, and each row's terms are decompressed
@@ -489,7 +489,7 @@ kernel's decision; no segment cache sits in between.
 What a file store keeps for its lifetime, and what bounds it. The opened handle
 ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L36)) and the file-backed
 dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L176))
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L162))
 keep:
 
 | Kept | Bound |
@@ -546,7 +546,7 @@ filesystems are unsupported for mapping.
 
 A store in memory holds the same three pieces the file does, in the forms the
 read paths are written against: its source (the selection and tombstones, and
-the in-memory backend, [`MemoryBase`](../core/src/store/view/mod.rs#L70)) and
+the in-memory backend, [`MemoryBase`](../core/src/store/view/mod.rs#L71)) and
 its layout:
 
 | In the file | In memory |
@@ -560,7 +560,7 @@ its layout:
 | — | the source's `selection` and `deleted`, and the base's `serve` — a view's restrictions ([matching.md §1](matching.md#1-what-a-match-produces)) |
 
 A file-backed store (its source's `Backend::File`, a
-[`FileBase`](../core/src/store/view/mod.rs#L94)) holds none of the rows: the
+[`FileBase`](../core/src/store/view/mod.rs#L98)) holds none of the rows: the
 file handle, a pushed-down filter and an optional serve plan, beside the
 source's selection and tombstones. Its index data stays in the index children
 and is reached by chunk probes and pushed-down scans; a `FileBase`
@@ -620,14 +620,14 @@ open rather than being read around.
 |---|---|---|
 | `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L28) |
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L16) |
-| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L115) |
-| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L111), [`child_strategy`](../core/src/io/container/sources.rs#L156) |
+| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ZONE_ROWS`](../core/src/io/zone_map.rs#L22) |
+| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L112), [`child_strategy`](../core/src/io/container/sources.rs#L153) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs#L36) |
 | `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, and a chunk decode hold in place, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L47) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L51) |
-| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L531) |
+| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L541) |
 | `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L24) |
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L35) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L30) |
@@ -644,10 +644,10 @@ open rather than being read around.
 | Container identity, root layout vtable, component addressing | [`core/src/io/container/mod.rs`](../core/src/io/container/mod.rs), [`layout.rs`](../core/src/io/container/layout.rs) |
 | Inventory descriptors and their JSON codec | [`core/src/io/container/wire.rs`](../core/src/io/container/wire.rs) |
 | Write strategy, component sources | [`core/src/io/container/write.rs`](../core/src/io/container/write.rs), [`sources.rs`](../core/src/io/container/sources.rs) |
-| Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/file.rs`](../core/src/io/file.rs), [`read.rs`](../core/src/io/read.rs) |
+| Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers, exact zone maps | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/file.rs`](../core/src/io/file.rs), [`read.rs`](../core/src/io/read.rs), [`zone_map.rs`](../core/src/io/zone_map.rs) |
 | The opened-file handle and its bounded memos | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs), [`memo.rs`](../core/src/store/persist/memo.rs) |
 | Primary column names | [`core/src/store/schema.rs`](../core/src/store/schema.rs), [`layouts/typed_object.rs`](../core/src/store/layouts/typed_object.rs) |
-| Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |
+| Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`held.rs`](../core/src/store/layouts/dictionary/file_backed/held.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
 | Locating and point-reading index runs on file | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |

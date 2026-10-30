@@ -424,50 +424,60 @@ impl RowSelection {
     /// a keep admitting one contiguous run builds no id list; several become
     /// an id list, and an id list stays one.
     pub(crate) fn intersect_runs(self, runs: &[Range<u64>]) -> Self {
-        match self {
-            RowSelection::Ids(ids) => {
-                // Each run keeps one window of the ascending id list, and the
-                // runs ascend, so the windows follow each other.
-                let slice = ids.as_slice();
-                let mut windows: Vec<Range<usize>> = Vec::new();
-                let mut from = 0;
-                for run in runs {
-                    let lo = from + slice[from..].partition_point(|&id| id < run.start);
-                    let hi = lo + slice[lo..].partition_point(|&id| id < run.end);
-                    if lo < hi {
-                        windows.push(lo..hi);
-                    }
-                    from = hi;
-                }
-                match windows.as_slice() {
-                    [] => RowSelection::empty(),
-                    [window] => RowSelection::Ids(ids.slice(window.clone())),
-                    windows => RowSelection::Ids(Buffer::from_iter(
-                        windows
-                            .iter()
-                            .flat_map(|window| slice[window.clone()].iter().copied()),
-                    )),
-                }
-            }
+        let ids = match self {
+            RowSelection::Ids(ids) => ids,
             selection => {
-                let within = match &selection {
-                    RowSelection::Range(range) => range.clone(),
-                    _ => 0..u64::MAX,
-                };
-                let clipped: Vec<Range<u64>> = runs
-                    .iter()
-                    .map(|run| run.start.max(within.start)..run.end.min(within.end))
-                    .filter(|run| run.start < run.end)
-                    .collect();
-                match clipped.as_slice() {
+                let clipped = selection
+                    .clip_runs(runs)
+                    .expect("every row or a range clips runs");
+                return match clipped.as_slice() {
                     [] => RowSelection::empty(),
                     [run] => RowSelection::Range(run.clone()),
                     runs => RowSelection::Ids(Buffer::from_iter(
                         runs.iter().flat_map(|run| run.clone()),
                     )),
-                }
+                };
             }
+        };
+        // Each run keeps one window of the ascending id list, and the runs
+        // ascend, so the windows follow each other.
+        let slice = ids.as_slice();
+        let mut windows: Vec<Range<usize>> = Vec::new();
+        let mut from = 0;
+        for run in runs {
+            let lo = from + slice[from..].partition_point(|&id| id < run.start);
+            let hi = lo + slice[lo..].partition_point(|&id| id < run.end);
+            if lo < hi {
+                windows.push(lo..hi);
+            }
+            from = hi;
         }
+        match windows.as_slice() {
+            [] => RowSelection::empty(),
+            [window] => RowSelection::Ids(ids.slice(window.clone())),
+            windows => RowSelection::Ids(Buffer::from_iter(
+                windows
+                    .iter()
+                    .flat_map(|window| slice[window.clone()].iter().copied()),
+            )),
+        }
+    }
+
+    /// `runs` (ascending, disjoint) clipped to the rows of every row or of a
+    /// range, the empty ones dropped; `None` for an id list, whose rows are
+    /// no run.
+    pub(crate) fn clip_runs(&self, runs: &[Range<u64>]) -> Option<Vec<Range<u64>>> {
+        let within = match self {
+            RowSelection::All => 0..u64::MAX,
+            RowSelection::Range(range) => range.clone(),
+            RowSelection::Ids(_) => return None,
+        };
+        Some(
+            runs.iter()
+                .map(|run| run.start.max(within.start)..run.end.min(within.end))
+                .filter(|run| run.start < run.end)
+                .collect(),
+        )
     }
 }
 

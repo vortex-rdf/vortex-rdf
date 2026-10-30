@@ -112,11 +112,7 @@ impl VortexRdfStore {
     pub fn from_built(built: BuiltArray) -> Result<Self> {
         Self::adopt(
             built,
-            |base| {
-                let mut zones = ZoneTable::default();
-                let base = resident::with_compressed_int_children(base, true, Some(&mut zones))?;
-                Ok((base, zones))
-            },
+            |base| resident::with_compressed_int_children(base, true),
             IndexComponent::into_compressed,
         )
     }
@@ -148,7 +144,9 @@ impl VortexRdfStore {
     ///
     /// A Dictionary `layout` must hold its dictionary resident: an in-memory
     /// view decodes its rows without suspending, through that dictionary
-    /// ([`in_memory_chunk`](Self::in_memory_chunk)).
+    /// ([`in_memory_chunk`](Self::in_memory_chunk)). Of `zones`, the base
+    /// keeps each column whose zones cover its rows
+    /// ([`ZoneTable::covering`]).
     pub(super) fn assemble_resident(
         base: ArrayRef,
         components: Vec<IndexComponent>,
@@ -167,7 +165,7 @@ impl VortexRdfStore {
         // the encoding-tree walk.
         let store_probes = probes::StructProbes::new();
         store_probes.warm(&base);
-        store_probes.set_zones(&base, zones);
+        let zones = Arc::new(zones.covering(base.len()));
         for component in components.iter() {
             component.warm_probes();
         }
@@ -179,6 +177,7 @@ impl VortexRdfStore {
                 base,
                 components,
                 probes: store_probes,
+                zones,
                 serve: None,
             })),
             tail: None,

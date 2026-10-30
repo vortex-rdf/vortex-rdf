@@ -143,6 +143,27 @@ impl U64Column {
         Ok((U64Column::from(left_idx), U64Column::from(right_idx)))
     }
 
+    /// The rows where a run of equal rows starts, across this column and
+    /// `others` (each a `U64Column`, u64 buffer or int sequence of this
+    /// column's length): row 0, and every row whose value in some column
+    /// differs from the row before. Gathered with [`take`](Self::take) they
+    /// keep one row of each run — the distinct rows of a match whose equal
+    /// rows are adjacent, as a union over graphs' triples are (see
+    /// `columns::run_starts`). Columns of unequal lengths raise `ValueError`.
+    #[pyo3(signature = (*others))]
+    fn run_starts(&self, py: Python<'_>, others: &Bound<'_, PyTuple>) -> PyResult<U64Column> {
+        let others = others
+            .iter()
+            .map(|other| extract_u64s(&other))
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut columns = vec![self.codes.as_slice()];
+        columns.extend(others.iter().map(|other| other.as_slice()));
+        let starts = py
+            .detach(|| columns::run_starts(&columns))
+            .ok_or_else(|| PyValueError::new_err("run_starts columns differ in length"))?;
+        Ok(U64Column::from(starts))
+    }
+
     /// This column's rows grouped by value: the right side of
     /// [`join_indices`](Self::join_indices), built once and joined with any
     /// number of left columns (see [`CodeGroups`]).

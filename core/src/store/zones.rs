@@ -1,21 +1,25 @@
 //! Per-zone code bounds of an in-memory base's code columns: the in-memory
 //! counterpart of a written file's zone maps. A residual equality over a base
-//! that no index serves compares only the zones whose bounds hold its code,
-//! as the file path's zone-map pruning reads only those. The bounds are taken
-//! where they cost next to nothing: in the pass over a build's codes that
-//! picks their compression ([`ZoneBuilder`]), or from the zone maps of the
-//! file a store is loaded from ([`ZoneTable::read_from_file`]). A base with
-//! neither has none, and its residual filter compares every row as before.
+//! that no index serves compares only the zones whose bounds hold its code
+//! ([`ZoneTable::runs_holding`]), as the file path's zone-map pruning reads
+//! only those. A build takes the bounds in the pass that picks each code
+//! column's compression, which reads every code anyway ([`ZoneBuilder`]); a
+//! store loaded from a file or from bytes reads them from the file's zone maps
+//! ([`ZoneTable::read_from_file`]). A base with neither has none, and its
+//! residual filter compares every row.
 
+use std::ops::Range;
 use std::sync::Arc;
 
-use vortex_array::dtype::FieldName;
+use vortex_array::dtype::{DType, FieldName, Nullability, PType};
+use vortex_array::scalar::Scalar;
 
+use crate::error::Result;
+use crate::io::zone_map::{ExactZoneMap, ZONE_ROWS};
 use crate::store::schema::TermCode;
 
-/// Rows per zone: a written file's zone-map block, so a loaded store's bounds
-/// are the file's own.
-pub(crate) const ZONE_ROWS: usize = 8_192;
+/// The dtype of a code column that carries zone bounds.
+const CODE_DTYPE: DType = DType::Primitive(PType::U64, Nullability::NonNullable);
 
 /// The smallest and largest code of each zone of one code column, in row
 /// order: zone `z` covers rows `z * ZONE_ROWS` up to the next zone's first.
@@ -26,7 +30,7 @@ pub(crate) struct CodeZones {
 
 impl CodeZones {
     /// The zones of a column's codes, given as consecutive slices in row
-    /// order (a zone may span slices).
+    /// order (a zone may span slices), through a [`ZoneBuilder`].
     #[cfg(test)]
     pub(crate) fn of_slices<'a>(slices: impl IntoIterator<Item = &'a [TermCode]>) -> Self {
         let mut builder = ZoneBuilder::new();
@@ -133,22 +137,22 @@ impl ZoneBuilder {
 /// A base's code columns' zones, by column name; columns without bounds are
 /// absent.
 #[derive(Debug, Default)]
-pub(crate) struct ZoneTable(Vec<(FieldName, Arc<CodeZones>)>);
+pub(crate) struct ZoneTable(Vec<(FieldName, CodeZones)>);
 
 impl ZoneTable {
     /// The zones of a store file's quad code columns, read from their zone
     /// maps: each non-nullable `u64` column zoned in [`ZONE_ROWS`]-row zones
-    /// with exact `max` and `min` (every column this crate writes). `quads`
-    /// is the quad child's struct layout, its segments read from `source`; a
-    /// column without such a map has no zones. The columns' tables are read
-    /// concurrently: over a file read through I/O, each read waits.
+    /// with exact `max` and `min` ([`ExactZoneMap`], every column this crate
+    /// writes). `quads` is the quad child's struct layout, its segments read
+    /// from `source`; a column without such a map has no zones. The columns'
+    /// tables are read concurrently: over a file read through I/O, each read
+    /// waits.
     pub(crate) async fn read_from_file(
         quads: &vortex_layout::LayoutRef,
         source: &Arc<dyn vortex_layout::segments::SegmentSource>,
-    ) -> crate::error::Result<Self> {
-        use vortex_array::dtype::{DType, PType};
+    ) -> Result<Self> {
+        use vortex_array::arrays::PrimitiveArray;
         use vortex_layout::LayoutChildType;
-        use vortex_layout::layouts::zoned::Zoned;
 
         if quads
             .as_opt::<vortex_layout::layouts::struct_::Struct>()
@@ -156,8 +160,7 @@ impl ZoneTable {
         {
             return Ok(Self::default());
         }
-        let [max, min] = zone_bound_names();
-        let mut tables = Vec::new();
+        let mut maps = Vec::new();
         for slot in 0..quads.nslots() {
             let Some(LayoutChildType::Field(name)) = quads.slot_type(slot) else {
                 continue;
@@ -165,30 +168,26 @@ impl ZoneTable {
             let Some(column) = quads.slot(slot)? else {
                 continue;
             };
-            let Some(zoned) = column.as_opt::<Zoned>() else {
-                continue;
-            };
-            let present = zoned.present_aggregates();
-            if !matches!(column.dtype(), DType::Primitive(PType::U64, n) if !n.is_nullable())
-                || zoned.zone_len() != ZONE_ROWS
-                || !present.contains(&max)
-                || !present.contains(&min)
-            {
+            if column.dtype() != &CODE_DTYPE {
                 continue;
             }
-            let Some(bounds) = column.slot(1)? else {
+            let Some(map) = ExactZoneMap::of(&column) else {
                 continue;
             };
-            if bounds.row_count() == column.row_count().div_ceil(ZONE_ROWS as u64) {
-                tables.push((name, bounds));
+            let zones = column.row_count().div_ceil(ZONE_ROWS as u64);
+            if map.zone_len == ZONE_ROWS && map.table.row_count() == zones {
+                maps.push((name, map));
             }
         }
-        let read = tables.into_iter().map(|(name, bounds)| {
-            let (source, max, min) = (Arc::clone(source), &max, &min);
-            async move {
-                let zones = read_bounds(bounds, source, max, min).await?;
-                crate::error::Result::Ok(zones.map(|zones| (name, zones)))
-            }
+        let read = maps.into_iter().map(|(name, map)| async move {
+            let bounds = map.read_bounds::<PrimitiveArray>(source).await?;
+            let zones = bounds
+                .filter(|(maxes, mins)| maxes.ptype() == PType::U64 && mins.ptype() == PType::U64);
+            Result::Ok(zones.map(|(maxes, mins)| {
+                let (maxes, mins) = (maxes.as_slice::<TermCode>(), mins.as_slice::<TermCode>());
+                let bounds = mins.iter().copied().zip(maxes.iter().copied()).collect();
+                (name, CodeZones::from_bounds(bounds))
+            }))
         });
         let mut table = Self::default();
         for (name, zones) in futures::future::try_join_all(read)
@@ -203,7 +202,7 @@ impl ZoneTable {
 
     /// Record `zones` as column `name`'s.
     pub(crate) fn insert(&mut self, name: FieldName, zones: CodeZones) {
-        self.0.push((name, Arc::new(zones)));
+        self.0.push((name, zones));
     }
 
     /// The columns whose zones cover `rows` rows: a column with another
@@ -220,7 +219,47 @@ impl ZoneTable {
         self.0
             .iter()
             .find(|(column, _)| column.as_ref() == name)
-            .map(|(_, zones)| &**zones)
+            .map(|(_, zones)| zones)
+    }
+
+    /// The rows of the zones whose bounds may hold every code `eqs` binds,
+    /// as ascending runs over a base of `rows` rows, adjacent zones joined.
+    /// `None` when no bound column has zones, or when the zones left hold
+    /// more than half the base: comparing a whole column then costs less than
+    /// comparing its runs.
+    pub(crate) fn runs_holding(
+        &self,
+        eqs: &[(&str, Scalar)],
+        rows: usize,
+    ) -> Option<Vec<Range<u64>>> {
+        let mut keep: Option<Vec<bool>> = None;
+        for (field, scalar) in eqs {
+            if !scalar.dtype().is_unsigned_int() {
+                continue;
+            }
+            let (Ok(code), Some(zones)) = (TermCode::try_from(scalar), self.get(field)) else {
+                continue;
+            };
+            let keep = keep.get_or_insert_with(|| vec![true; zones.zones()]);
+            for (zone, kept) in keep.iter_mut().enumerate() {
+                *kept &= zones.may_hold(zone, code);
+            }
+        }
+        let keep = keep?;
+        let kept = keep.iter().filter(|&&kept| kept).count();
+        if kept.saturating_mul(2) > keep.len() {
+            return None;
+        }
+        let mut runs: Vec<Range<u64>> = Vec::new();
+        for zone in (0..keep.len()).filter(|&zone| keep[zone]) {
+            let start = (zone * ZONE_ROWS) as u64;
+            let end = ((zone + 1) * ZONE_ROWS).min(rows) as u64;
+            match runs.last_mut() {
+                Some(run) if run.end == start => run.end = end,
+                _ => runs.push(start..end),
+            }
+        }
+        Some(runs)
     }
 
     /// The columns that have zones, in the order they were recorded.
@@ -228,55 +267,6 @@ impl ZoneTable {
     pub(crate) fn columns(&self) -> Vec<String> {
         self.0.iter().map(|(name, _)| name.to_string()).collect()
     }
-}
-
-/// One column's zones from its zone table, `bounds` (one row per zone, a
-/// column per aggregate): `None` unless the `max` and `min` columns are
-/// `u64` and valid in every zone.
-async fn read_bounds(
-    bounds: vortex_layout::LayoutRef,
-    source: Arc<dyn vortex_layout::segments::SegmentSource>,
-    max: &str,
-    min: &str,
-) -> crate::error::Result<Option<CodeZones>> {
-    use vortex_array::VortexSessionExecute as _;
-    use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::arrays::struct_::{StructArray, StructArrayExt as _};
-    use vortex_array::dtype::PType;
-
-    let reader = bounds.new_reader(
-        "quad-zones".into(),
-        source,
-        &crate::session::VORTEX_SESSION,
-        &Default::default(),
-    )?;
-    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-    let table = crate::io::read::scan_all_reader(reader)
-        .await?
-        .execute::<StructArray>(&mut ctx)?;
-    let mut column_of = |aggregate: &str| -> crate::error::Result<Option<Vec<TermCode>>> {
-        let Ok(field) = table.unmasked_field_by_name(aggregate) else {
-            return Ok(None);
-        };
-        if !field.all_valid(&mut ctx)? {
-            return Ok(None);
-        }
-        let values = field.clone().execute::<PrimitiveArray>(&mut ctx)?;
-        Ok((values.ptype() == PType::U64).then(|| values.as_slice::<TermCode>().to_vec()))
-    };
-    let (Some(maxes), Some(mins)) = (column_of(max)?, column_of(min)?) else {
-        return Ok(None);
-    };
-    Ok(Some(CodeZones::from_bounds(
-        mins.into_iter().zip(maxes).collect(),
-    )))
-}
-
-/// The zone-map aggregate names of exact `max` and `min`, as a written
-/// file's zone table names its columns.
-fn zone_bound_names() -> [String; 2] {
-    let aggregates = crate::store::layouts::dictionary::storage::window_bound_aggregates();
-    [aggregates[0].to_string(), aggregates[1].to_string()]
 }
 
 #[cfg(test)]
