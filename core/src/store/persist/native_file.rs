@@ -132,7 +132,14 @@ pub(crate) struct LocatedTables {
     pub(crate) sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
     /// Per reference index (`index:ref-p`, `index:ref-o`), its `(val, rid)`.
     pub(crate) references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
+    /// The rows that the last long checked runs (a bound graph after a free
+    /// slot, a long reference run) kept, by the pattern's `(s, p, o, g)`
+    /// codes, so each window of one reads only its own rows.
+    pub(crate) long_runs: LongRuns,
 }
+
+/// [`LocatedTables::long_runs`]: each pattern's codes beside the rows kept.
+pub(crate) type LongRuns = Mutex<Vec<([Option<u64>; 4], Arc<[u64]>)>>;
 
 /// What the tests count of how reads reached a file
 /// ([`NativeStoreFile::note`], [`NativeStoreFile::count`]).
