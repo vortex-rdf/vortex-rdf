@@ -40,6 +40,7 @@ mod streaming;
 mod unique_quads;
 mod wide_codes;
 mod wide_row_ids;
+mod zone_bounds;
 
 const LAYOUTS: [LayoutStrategy; 3] = [
     LayoutStrategy::Default,

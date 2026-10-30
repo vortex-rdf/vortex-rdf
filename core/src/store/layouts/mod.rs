@@ -701,8 +701,10 @@ pub(crate) trait ChunkDecode: Sized + Send + 'static {
     fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>>;
 
     /// `chunk`'s rows against the file-backed dictionary `fb`: the chunk's
-    /// code columns are read once and their distinct codes resolve to terms
-    /// with one read of the dictionary windows holding them.
+    /// code columns are read once and decoded in place through the windows
+    /// their codes fall in, or, when those outgrow the window cache or their
+    /// reads would wait, against their distinct codes' terms, read with one
+    /// read of each window holding them.
     #[cfg(feature = "file-io")]
     fn decode_file_backed<'a>(
         fb: &'a FileBackedDict,

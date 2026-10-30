@@ -18,6 +18,7 @@ use vortex_scan::selection::Selection;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{available_parallelism, spawned_splits};
+use crate::io::zone_map::ZONE_ROWS;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::NativeStoreFile;
@@ -211,20 +212,58 @@ async fn evaluate_filter_split(
     Ok(mask)
 }
 
-/// The per-split filter tasks of a file view, in file order: one future per
-/// natural split the selection touches, each evaluating `filter` over its
-/// split (zone-map pruning first, then the conjuncts) and answering the
-/// split-relative surviving mask with its range. The prelude of
-/// [`map_filter_splits`] and [`fold_filter_splits_ordered`], which differ in
-/// how they drive the tasks.
+/// The rows a fold that may stop at its first matches evaluates first, as
+/// one piece of its first split: one zone ([`ZONE_ROWS`]). Each later piece is
+/// [`PIECE_GROWTH`] times the one before, inside one split, so the pieces
+/// soon reach whole splits, and a fold that runs to the end evaluates its
+/// first split in a few pieces rather than one.
+const FIRST_PIECE_ROWS: u64 = ZONE_ROWS as u64;
+
+/// How much each piece of [`early_exit_pieces`] outgrows the one before.
+const PIECE_GROWTH: u64 = 4;
+
+/// Whether a fold that stops at `want` matches evaluates its splits in
+/// [`early_exit_pieces`]: only when the first piece alone could hold them,
+/// so a fold whose cap the first piece cannot reach (a probing `LIMIT` past
+/// the rows) evaluates whole splits.
+fn cut_into_pieces(want: usize) -> bool {
+    (want as u64) < FIRST_PIECE_ROWS
+}
+
+/// `ranges` (ascending, disjoint) cut into pieces from [`FIRST_PIECE_ROWS`]
+/// rows up, each [`PIECE_GROWTH`] times the one before, none crossing a
+/// range's end, each beside the index of the range it was cut from: the
+/// order a fold that may stop early evaluates them in.
+fn early_exit_pieces(ranges: &[Range<u64>]) -> Vec<(usize, Range<u64>)> {
+    let mut pieces = Vec::with_capacity(ranges.len() + 3);
+    let mut size = FIRST_PIECE_ROWS;
+    for (split, range) in ranges.iter().enumerate() {
+        let mut start = range.start;
+        while start < range.end {
+            let end = start.saturating_add(size).min(range.end);
+            pieces.push((split, start..end));
+            start = end;
+            size = size.saturating_mul(PIECE_GROWTH);
+        }
+    }
+    pieces
+}
+
+/// The filter tasks over `ranges` (each inside one of the selection's split
+/// ranges, [`selection_split_ranges`], whose `mask_selection` narrows them),
+/// in order: each evaluates `filter` over its range (zone-map pruning first,
+/// then the conjuncts) and answers the range-relative surviving mask with
+/// its range. The prelude of [`kept_file_rows`], [`map_filter_splits`] and
+/// [`fold_filter_splits_ordered`], which differ in how they drive the tasks.
 ///
-/// The clamped ranges are owned before the task futures are built: an
-/// iterator borrowing the memoized splits across the awaits trips rustc's
+/// The ranges are owned before the task futures are built: an iterator
+/// borrowing the memoized splits across the awaits trips rustc's
 /// higher-ranked lifetime inference when a caller spawns the future.
 fn filter_split_tasks(
     file: &NativeStoreFile,
     filter: &Expression,
-    selection: &RowSelection,
+    mask_selection: &Selection,
+    ranges: Vec<Range<u64>>,
     deleted: Option<&Mask>,
 ) -> Result<Vec<SplitTask>> {
     // The cached layout reader tree, shared by every split task, so the
@@ -234,13 +273,12 @@ fn filter_split_tasks(
         filter,
         bound_conjuncts(file, reader.as_ref(), filter).collect::<Result<_>>()?,
     ));
-    let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
     Ok(ranges
         .into_iter()
         .map(|range| {
             let reader = Arc::clone(&reader);
             let order = Arc::clone(&order);
-            let start_mask = split_start_mask(&mask_selection, deleted, &range);
+            let start_mask = split_start_mask(mask_selection, deleted, &range);
             async move {
                 #[cfg(test)]
                 split_hooks::note_evaluated();
@@ -299,18 +337,16 @@ pub(crate) async fn kept_file_rows(
     column: &'static str,
     test: ChunkTest,
 ) -> Result<Vec<RowId>> {
+    let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
     let tasks = match filter {
-        Some(filter) => filter_split_tasks(file, filter, selection, None)?,
-        None => {
-            let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
-            ranges
-                .into_iter()
-                .map(|range| {
-                    let mask = split_start_mask(&mask_selection, None, &range);
-                    future::ready(Ok((mask, range))).boxed()
-                })
-                .collect()
-        }
+        Some(filter) => filter_split_tasks(file, filter, &mask_selection, ranges, None)?,
+        None => ranges
+            .into_iter()
+            .map(|range| {
+                let mask = split_start_mask(&mask_selection, None, &range);
+                future::ready(Ok((mask, range))).boxed()
+            })
+            .collect(),
     };
     let reader = file.layout_reader()?;
     let projection =
@@ -367,7 +403,8 @@ async fn map_filter_splits<T, F>(
 where
     F: Fn(Mask, &Range<u64>) -> T,
 {
-    let tasks = filter_split_tasks(file, filter, selection, deleted)?;
+    let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
+    let tasks = filter_split_tasks(file, filter, &mask_selection, ranges, deleted)?;
     let concurrency = available_parallelism() * 4;
     let mut results = stream::iter(tasks).buffer_unordered(concurrency);
     let mut out = Vec::new();
@@ -379,35 +416,51 @@ where
 }
 
 /// `filter` evaluated over the selection's splits in file order, each split's
-/// surviving mask fed to `step` until it answers `false`: the early-exit twin
-/// of [`map_filter_splits`], behind [`split_masks_until`],
-/// [`first_matching_rows`] and [`count_matching_rows_capped`]. The splits run
-/// on the row-scan driver ([`ScanDriver::for_row_scan`]): inline up to its
-/// split limit, spawned onto the runtime above it. Either way a few splits
-/// (the available parallelism, at least two) run ahead of the consumer, so
-/// the I/O overlaps; whatever is in flight past the exit is dropped unread,
-/// a spawned split aborted with its task.
+/// surviving mask fed to `step` with the split's index among the selection's
+/// splits, until it answers `false`: the early-exit twin of
+/// [`map_filter_splits`], behind [`split_masks_until`],
+/// [`first_matching_rows`] and [`count_matching_rows_capped`]. A fold that
+/// stops at `want` matches, fewer than one piece holds
+/// ([`cut_into_pieces`]), evaluates the splits in [`early_exit_pieces`], so
+/// matches found in the first rows do not wait for the rest of their split;
+/// `step` then gets each piece. The splits' pieces run on the row-scan
+/// driver ([`ScanDriver::for_row_scan`]): inline up to its split limit,
+/// spawned onto the runtime above it. Either way a few (the available
+/// parallelism, at least two) run ahead of the consumer, so the I/O
+/// overlaps; whatever is in flight past the exit is dropped unread, a
+/// spawned piece aborted with its task.
 async fn fold_filter_splits_ordered<F>(
     file: &NativeStoreFile,
     filter: &Expression,
     selection: &RowSelection,
     deleted: Option<&Mask>,
+    want: usize,
     mut step: F,
 ) -> Result<()>
 where
-    F: FnMut(Mask, &Range<u64>) -> bool,
+    F: FnMut(Mask, &Range<u64>, usize) -> bool,
 {
-    let tasks = filter_split_tasks(file, filter, selection, deleted)?;
+    let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
+    let splits = ranges.len();
+    let pieces = if cut_into_pieces(want) {
+        early_exit_pieces(&ranges)
+    } else {
+        ranges.into_iter().enumerate().collect()
+    };
+    let (split_of, ranges): (Vec<usize>, Vec<Range<u64>>) = pieces.into_iter().unzip();
+    let tasks = filter_split_tasks(file, filter, &mask_selection, ranges, deleted)?;
     let lookahead = available_parallelism().max(2);
-    let mut results = match ScanDriver::for_row_scan(tasks.len()) {
+    let mut results = match ScanDriver::for_row_scan(splits) {
         ScanDriver::Inline => stream::iter(tasks).buffered(lookahead).left_stream(),
         ScanDriver::Spawned => spawned_splits(tasks, lookahead).right_stream(),
     };
+    let mut split_of = split_of.into_iter();
     while let Some(r) = results.next().await {
         let (mask, range) = r?;
         #[cfg(test)]
-        split_hooks::note_consumed();
-        if !step(mask, &range) {
+        split_hooks::note_consumed(&range);
+        let split = split_of.next().expect("one split index per task");
+        if !step(mask, &range, split) {
             break;
         }
     }
@@ -416,7 +469,9 @@ where
 
 /// A pending filter's evaluation over a selection: each evaluated split's
 /// surviving mask (one bit per row of its range, tombstoned rows cleared)
-/// beside the split's range, clamped to the selection, in file order.
+/// beside the split's range, clamped to the selection, in file order. Of an
+/// evaluation that stopped early, the last split may hold only its first
+/// rows (see [`split_masks_until`]).
 pub(crate) struct SplitMasks(Vec<(Mask, Range<u64>)>);
 
 impl SplitMasks {
@@ -471,7 +526,10 @@ pub(crate) async fn split_masks(
 }
 
 /// [`split_masks`] in file order up to the first split that brings the
-/// matches to `want`: every split when fewer match, none for no `want`.
+/// matches to `want`: every split when fewer match, none for no `want`. A
+/// fold cut into pieces ([`early_exit_pieces`]) stops at the piece that
+/// brings them; the pieces of one split are joined into its one mask, so a
+/// split evaluated whole is one mask as without pieces.
 pub(crate) async fn split_masks_until(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -479,16 +537,33 @@ pub(crate) async fn split_masks_until(
     deleted: Option<&Mask>,
     want: usize,
 ) -> Result<SplitMasks> {
-    let mut masks = Vec::new();
+    let mut masks: Vec<(Mask, Range<u64>)> = Vec::new();
     if want == 0 {
         return Ok(SplitMasks(masks));
     }
     let mut found = 0usize;
-    fold_filter_splits_ordered(file, filter, selection, deleted, |mask, range| {
-        found = found.saturating_add(mask.true_count());
-        masks.push((mask, range.clone()));
-        found < want
-    })
+    let mut last_split = None;
+    fold_filter_splits_ordered(
+        file,
+        filter,
+        selection,
+        deleted,
+        want,
+        |mask, range, split| {
+            found = found.saturating_add(mask.true_count());
+            match masks.last_mut() {
+                // The next piece of the split the last mask holds.
+                Some((last, last_range)) if last_split == Some(split) => {
+                    let before = std::mem::replace(last, Mask::new_false(0));
+                    *last = [before, mask].into_iter().collect();
+                    last_range.end = range.end;
+                }
+                _ => masks.push((mask, range.clone())),
+            }
+            last_split = Some(split);
+            found < want
+        },
+    )
     .await?;
     Ok(SplitMasks(masks))
 }
@@ -521,7 +596,7 @@ pub(crate) async fn first_matching_rows(
     if want == 0 {
         return Ok(Buffer::from(ids));
     }
-    fold_filter_splits_ordered(file, filter, selection, deleted, |mask, range| {
+    fold_filter_splits_ordered(file, filter, selection, deleted, want, |mask, range, _| {
         push_kept_ids(&mut ids, &mask, range);
         ids.len() < want
     })
@@ -543,7 +618,7 @@ pub(crate) async fn count_matching_rows_capped(
     if cap == 0 {
         return Ok(0);
     }
-    fold_filter_splits_ordered(file, filter, selection, deleted, |mask, _| {
+    fold_filter_splits_ordered(file, filter, selection, deleted, cap, |mask, _, _| {
         count += mask.true_count();
         count < cap
     })
@@ -655,14 +730,16 @@ pub(crate) async fn row_range_from_pruning(
 /// Test hook: how many split filter evaluations this thread started (a split
 /// task's body, a spawned one's included, since the current-thread runtime
 /// polls it here), and how many split masks the in-order fold handed its
-/// consumer.
+/// consumer, with the ranges of the last ones it handed.
 #[cfg(test)]
 pub(crate) mod split_hooks {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::ops::Range;
 
     thread_local! {
         static EVALUATED: Cell<usize> = const { Cell::new(0) };
         static CONSUMED: Cell<usize> = const { Cell::new(0) };
+        static CONSUMED_RANGES: RefCell<Vec<Range<u64>>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Record one split evaluation started.
@@ -670,9 +747,10 @@ pub(crate) mod split_hooks {
         EVALUATED.set(EVALUATED.get() + 1);
     }
 
-    /// Record one split mask the in-order fold consumed.
-    pub(super) fn note_consumed() {
+    /// Record one split mask the in-order fold consumed, of `range`.
+    pub(super) fn note_consumed(range: &Range<u64>) {
         CONSUMED.set(CONSUMED.get() + 1);
+        CONSUMED_RANGES.with_borrow_mut(|ranges| ranges.push(range.clone()));
     }
 
     /// The split evaluations started on this thread so far.
@@ -683,6 +761,12 @@ pub(crate) mod split_hooks {
     /// The split masks the in-order fold consumed on this thread so far.
     pub(crate) fn consumed() -> usize {
         CONSUMED.get()
+    }
+
+    /// The ranges of the split masks the in-order fold consumed on this
+    /// thread since the last call, in order.
+    pub(crate) fn take_consumed_ranges() -> Vec<Range<u64>> {
+        CONSUMED_RANGES.with_borrow_mut(std::mem::take)
     }
 }
 
@@ -707,6 +791,45 @@ mod tests {
         );
         assert_eq!(prior_order(&filter, 4), vec![0, 2, 1, 3]);
         assert_eq!(prior_order(&lit(false), 1), vec![0]);
+    }
+
+    /// The pieces start at one zone and grow fourfold, none crossing a
+    /// range's end, the growth carried from range to range, so ranges past
+    /// it stay whole, each piece beside the index of its range; only a fold
+    /// stopping at fewer matches than a zone's rows is cut.
+    #[test]
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "the pieces are cut from a list of ranges, and some cases hold just one"
+    )]
+    fn early_exit_pieces_grow_from_one_zone() {
+        let z = FIRST_PIECE_ROWS;
+        assert_eq!(early_exit_pieces(&[]), []);
+        assert_eq!(early_exit_pieces(&[0..100]), [(0, 0..100)]);
+        assert_eq!(
+            early_exit_pieces(&[0..262_144, 262_144..524_288]),
+            [
+                (0, 0..z),
+                (0, z..5 * z),
+                (0, 5 * z..21 * z),
+                (0, 21 * z..262_144),
+                (1, 262_144..524_288)
+            ]
+        );
+        // A selection's clamped ranges, the first shorter than a zone.
+        assert_eq!(
+            early_exit_pieces(&[10..20, 100..100_000, 200_000..300_000]),
+            [
+                (0, 10..20),
+                (1, 100..100 + 4 * z),
+                (1, 100 + 4 * z..100_000),
+                (2, 200_000..300_000)
+            ]
+        );
+        assert!(cut_into_pieces(1));
+        assert!(cut_into_pieces(z as usize - 1));
+        assert!(!cut_into_pieces(z as usize));
+        assert!(!cut_into_pieces(usize::MAX));
     }
 
     /// The prior holds until every conjunct has been tested; from then on the

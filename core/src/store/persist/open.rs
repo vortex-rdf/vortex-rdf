@@ -29,6 +29,7 @@ use crate::store::VortexRdfStore;
 use crate::store::construct::resolved_layout;
 use crate::store::indexes::COL_RID;
 use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
+use crate::store::zones::ZoneTable;
 
 /// Refuse a table whose id columns are integers of another width than this
 /// version reads: an integer `s`, `p`, `o`, `g` (the quad table and the copy
@@ -246,7 +247,20 @@ impl VortexRdfStore {
     #[cfg(feature = "file-io")]
     pub async fn from_file_in_memory<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let opened = Self::open_file(path, FileAccess::Read).await?;
-        Self::from_parts(opened.to_serializable_parts().await?)
+        // The base's zone bounds come from the file's zone maps (its rows are
+        // the file's quad rows, in file order), read beside the parts so the
+        // two reads' waits overlap.
+        let file = &opened
+            .quads
+            .file()
+            .expect("a store opened from a file reads that file")
+            .file;
+        let (quads, source) = (file.quad_layout()?, file.segment_source());
+        let (parts, zones) = futures::try_join!(
+            opened.to_serializable_parts(),
+            ZoneTable::read_from_file(&quads, &source)
+        )?;
+        Self::from_parts(parts, zones)
     }
 
     /// The open behind both: footer, component roster and resolved layout,
@@ -345,6 +359,10 @@ impl VortexRdfStore {
         let quads = read::scan_all_reader(file.layout_reader()?).await?;
         let root = file.footer().layout();
         let typed = root.as_::<container::RdfStoreLayoutVTable>();
+        // The base's zone bounds, from the quad child's zone maps.
+        let zones =
+            ZoneTable::read_from_file(&container::quad_source(typed)?, &file.segment_source())
+                .await?;
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let quads = quads.execute::<StructArray>(&mut ctx)?.into_array();
         // Restore the subject stamp from the file's recorded provenance,
@@ -375,6 +393,6 @@ impl VortexRdfStore {
             })
             .collect::<Result<Vec<_>>>()?;
         let layout = resolved_layout(dict, quads.dtype())?;
-        Self::assemble_resident(quads, components, layout)
+        Self::assemble_resident(quads, components, layout, zones)
     }
 }

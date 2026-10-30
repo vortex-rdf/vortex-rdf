@@ -282,7 +282,9 @@ impl IndexComponent {
     ///
     /// [`resident::with_compressed_int_children`]: crate::store::resident::with_compressed_int_children
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        self.rebuilt(|rows| crate::store::resident::with_compressed_int_children(rows, false))
+        self.rebuilt(|rows| {
+            crate::store::resident::with_compressed_int_children(rows, false).map(|(rows, _)| rows)
+        })
     }
 
     /// The cached encoded-search probe over the component's `column`, or

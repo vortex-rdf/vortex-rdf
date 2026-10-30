@@ -371,6 +371,55 @@ async fn test_subject_keep_over_every_row_searches_the_sorted_column() {
     }
 }
 
+/// Over an id list (the 600 rows of a predicate-bound view of a store sorted
+/// by subject), a keep on `s` is still a binary search: the rows it admits
+/// are runs of the whole sorted column, located there and intersected with
+/// the ids, so no selected row is read. Ranges and a set of two codes (two
+/// searches of ⌊log2 3000⌋ + 1 = 12 steps, fewer than the pass's 600 / 16)
+/// equal brute force over the view's rows; a set of four codes (48 steps)
+/// or more takes the pass.
+#[tokio::test]
+async fn test_subject_keep_over_an_id_list_searches_the_sorted_column() {
+    use crate::store::query::keep::keep_hooks::{probed_rows, sorted_run_keeps};
+    let store = streamed_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    let p1 = iri("p1");
+    let by_p = matched_view(&store, None, Some(&p1), None, None).await;
+    let rows = row_list(&by_p).await;
+    assert_eq!(by_p.debug_selection_range(), None, "an id list, not a run");
+    let (lo, hi) = store
+        .dict_reader()
+        .unwrap()
+        .prefix_range("<http://example.org/s")
+        .await
+        .unwrap();
+    let mid = lo + (hi - lo) / 2;
+    for (keep, searched) in [
+        (Keep::range(lo..hi), true),
+        (Keep::range(lo + 7..mid), true),
+        (Keep::range(mid..mid + 1), true),
+        (Keep::range(hi..hi + 3), true),
+        (Keep::set([lo + 1, mid]), true),
+        (Keep::set([lo + 1, lo + 41, mid, hi - 1]), false),
+        (Keep::set(lo..hi), false),
+    ] {
+        let (searches, probed) = (sorted_run_keeps(), probed_rows());
+        let narrowed = by_p.keep(QuadColumn::S, &keep).await.unwrap();
+        assert_eq!(
+            sorted_run_keeps() - searches,
+            usize::from(searched),
+            "keep {keep:?}"
+        );
+        if searched {
+            assert_eq!(probed_rows(), probed, "keep {keep:?}: no row read");
+        }
+        assert_eq!(
+            row_list(&narrowed).await,
+            brute_keep(&rows, QuadColumn::S, &keep),
+            "keep {keep:?}"
+        );
+    }
+}
+
 /// A store loaded whole from a file of 500-row leaves holds its code columns
 /// chunked, so a keep's pass reads them through their probes a piece at a
 /// time. Over every row and over a predicate-bound view, ranges on `g` and

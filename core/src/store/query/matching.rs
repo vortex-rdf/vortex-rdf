@@ -3,6 +3,7 @@
 
 use crate::debug;
 use crate::error::Result;
+use crate::io::zone_map::ZONE_ROWS;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{
     bool_array_to_mask, column_is_sorted, into_struct_array, search_sorted_bounds,
@@ -298,7 +299,7 @@ impl VortexRdfStore {
         let (selection, residual_narrowed) = match selection {
             ViewSelection::Exact(exact) if !exact.is_empty(base_len) && pat.any_bound() => {
                 let Some(narrowed) =
-                    Self::residual_narrow(&struct_arr, base, probes, exact, pat, codes, t)?
+                    Self::residual_narrow(&struct_arr, memory, exact, pat, codes, t)?
                 else {
                     return Ok(self.empty_view());
                 };
@@ -422,13 +423,18 @@ impl VortexRdfStore {
     /// `AlwaysFalse`.
     fn residual_narrow(
         struct_arr: &StructArray,
-        base: &ArrayRef,
-        probes: &StructProbes,
+        memory: &MemoryBase,
         selection: RowSelection,
         pat: QuadPattern<'_>,
         codes: &mut PatternCodes,
         t: Option<Instant>,
     ) -> Result<Option<RowSelection>> {
+        let MemoryBase {
+            base,
+            probes,
+            zones,
+            ..
+        } = memory;
         // The residual binds a subset of the roles the caller's gate
         // already resolved to codes, so the unmatchable arm cannot fire;
         // it stays for totality.
@@ -436,6 +442,31 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
+        // The zones whose code bounds cannot hold a constrained code are
+        // skipped, as a file's zone maps skip them. Every row or a range has
+        // the zone runs left inside it compared run by run, each a slice of
+        // the base, with no id list of the rows left (those runs are many
+        // where a code's zones scatter); an id list keeps only its ids in them.
+        let mut selection = selection;
+        if selection.len(base.len()) > ZONE_ROWS
+            && let Some(runs) = zones.runs_holding(&eqs, base.len())
+        {
+            #[cfg(test)]
+            zone_hooks::note_narrowed();
+            debug::step!(t, "[match_pattern] In-memory narrowed by zone bounds");
+            match selection.clip_runs(&runs) {
+                Some(runs) => {
+                    let ids = Self::runs_matching(base, &runs, &eqs)?;
+                    return Ok(Some(RowSelection::from_ids(vortex_buffer::Buffer::from(
+                        ids,
+                    ))));
+                }
+                None => selection = selection.intersect_runs(&runs),
+            }
+            if selection.is_empty(base.len()) {
+                return Ok(Some(selection));
+            }
+        }
         // Typed fast path: residual equalities over canonical code columns
         // (Dictionary layout) become slice loops yielding exact base ids,
         // with no slice/compare/mask pipeline, and a probe-bound column reads
@@ -464,6 +495,28 @@ impl VortexRdfStore {
                 }
             },
         ))
+    }
+
+    /// The base rows of `runs` that satisfy `eqs`, ascending: each run's
+    /// slice of the base compared on the constrained columns alone
+    /// ([`mask_for`](Self::mask_for)).
+    fn runs_matching(
+        base: &ArrayRef,
+        runs: &[std::ops::Range<u64>],
+        eqs: &[(&'static str, Scalar)],
+    ) -> Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        for run in runs {
+            let rows = base.slice(run.start as usize..run.end as usize)?;
+            match bool_array_to_mask(Self::mask_for(&rows, eqs)?)?.bit_buffer() {
+                vortex_mask::AllOr::All => ids.extend(run.clone()),
+                vortex_mask::AllOr::None => {}
+                vortex_mask::AllOr::Some(bits) => {
+                    bits.for_each_set_index(|i| ids.push(run.start + i as u64));
+                }
+            }
+        }
+        Ok(ids)
     }
 
     /// The file backend of [`match_base`](Self::match_base), `base` the
@@ -796,3 +849,24 @@ fn fold_row_ids(
 /// `match_base`): a lookup costs the rows matching the component it resolves,
 /// not the rows the view still holds. An unrefined view never skips.
 const INDEX_ROUTING_MIN_ROWS: usize = 4_096;
+
+/// Test hook: how many in-memory residual filters this thread narrowed to
+/// the zones their codes' bounds hold.
+#[cfg(test)]
+pub(crate) mod zone_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NARROWED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one residual filter narrowed by zone bounds.
+    pub(super) fn note_narrowed() {
+        NARROWED.set(NARROWED.get() + 1);
+    }
+
+    /// The residual filters narrowed by zone bounds on this thread so far.
+    pub(crate) fn narrowed() -> usize {
+        NARROWED.get()
+    }
+}

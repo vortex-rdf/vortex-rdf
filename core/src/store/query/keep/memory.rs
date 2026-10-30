@@ -74,11 +74,13 @@ impl VortexRdfStore {
         ))
     }
 
-    /// The keep by binary search, when the selection is a run of the sorted
-    /// base that `column` orders (every earlier column of the `(s, p, o, g)`
-    /// order is constant over the run), every row of the base counting as
-    /// one run. A range keep is two lower bounds; a small set is one bounded
-    /// sub-run per code. `None` declines to the row pass.
+    /// The keep by binary search, when the rows it admits are runs of the
+    /// sorted base ([`located_runs`]) searched in a window: the selection
+    /// itself when it is a run that `column` orders (every earlier column of
+    /// the `(s, p, o, g)` order is constant over the run, every row of the
+    /// base counting as one run), or the whole base for a keep on `s` over an
+    /// id list, as the file backend locates a subject keep. The runs are
+    /// intersected with the selection. `None` declines to the row pass.
     fn keep_sorted_run(
         struct_arr: &vortex_array::arrays::StructArray,
         base: &ArrayRef,
@@ -87,57 +89,27 @@ impl VortexRdfStore {
         column: QuadColumn,
         keep: &Keep,
     ) -> Option<RowSelection> {
-        let SelectedRows::Run(run) = selection.as_rows(base.len()) else {
-            return None;
-        };
         let s_col = struct_arr.unmasked_field_by_name(schema::COL_S).ok()?;
         if !column_is_sorted(s_col) {
             return None;
         }
-        if run.is_empty() {
-            return None;
-        }
-        for earlier in &QuadColumn::ALL[..column.index()] {
-            let probe = probes.by_name(base, earlier.name()).flatten()?.probe();
-            if probe.value_at(run.start) != probe.value_at(run.end - 1) {
-                return None;
-            }
-        }
-        let probe = probes.by_name(base, column.name()).flatten()?.probe();
-        let width = run.len();
-        match keep {
-            Keep::Range(lo, hi) => {
-                let (start, _) = probe.bounds_in(run.clone(), *lo);
-                let (end, _) = probe.bounds_in(start..run.end, *hi);
-                Some(RowSelection::Range(start as u64..end as u64))
-            }
-            Keep::Set(codes) => {
-                // One bounded search per code while that beats a pass, in
-                // probe reads: a point-sized run's pass reads each of its
-                // rows through the probe, a wider run's decodes them, a
-                // probe read costing `KEEP_DECODE_ROWS_PER_ID` decoded rows.
-                let searches = codes.len().saturating_mul(width.ilog2() as usize + 1);
-                let pass = if point_sized(width as u64) {
-                    width
-                } else {
-                    width / KEEP_DECODE_ROWS_PER_ID
-                };
-                if searches >= pass {
-                    return None;
-                }
-                let mut ids: Vec<u64> = Vec::new();
-                let mut from = run.start;
-                for &code in codes.as_slice() {
-                    let (lo, hi) = probe.bounds_in(from..run.end, code);
-                    ids.extend(lo as u64..hi as u64);
-                    from = hi;
-                    if from >= run.end {
-                        break;
+        let (window, selected) = match selection.as_rows(base.len()) {
+            SelectedRows::Run(run) if !run.is_empty() => {
+                for earlier in &QuadColumn::ALL[..column.index()] {
+                    let probe = probes.by_name(base, earlier.name()).flatten()?.probe();
+                    if probe.value_at(run.start) != probe.value_at(run.end - 1) {
+                        return None;
                     }
                 }
-                Some(RowSelection::Ids(Buffer::from(ids)))
+                let width = run.len();
+                (run, width)
             }
-        }
+            SelectedRows::Ids(ids) if column == QuadColumn::S => (0..base.len(), ids.len()),
+            _ => return None,
+        };
+        let probe = probes.by_name(base, column.name()).flatten()?.probe();
+        let runs = located_runs(probe, window, keep, selected)?;
+        Some(selection.clone().intersect_runs(&runs))
     }
 
     /// The keep by one pass over the selected rows of `column`: read in place
@@ -179,6 +151,54 @@ impl VortexRdfStore {
         Ok(selection
             .clone()
             .refine(&keep_mask(prim.as_slice::<TermCode>(), &test)))
+    }
+}
+
+/// The rows of `window` whose code the keep admits, as ascending runs:
+/// `window` is a run of the sorted base that `probe`'s column orders, so a
+/// range is two lower bounds and a set one bounded search per code. `None`
+/// when a set's searches cost more than a pass over the `selected` rows they
+/// stand in for, in probe reads: a point-sized pass reads each row through
+/// the probe, a wider one decodes them, a probe read costing
+/// [`KEEP_DECODE_ROWS_PER_ID`] decoded rows.
+fn located_runs(
+    probe: &SortedProbe<'_>,
+    window: Range<usize>,
+    keep: &Keep,
+    selected: usize,
+) -> Option<Vec<Range<u64>>> {
+    match keep {
+        Keep::Range(lo, hi) => {
+            let (start, _) = probe.bounds_in(window.clone(), *lo);
+            let (end, _) = probe.bounds_in(start..window.end, *hi);
+            Some(std::iter::once(start as u64..end as u64).collect())
+        }
+        Keep::Set(codes) => {
+            let searches = codes
+                .len()
+                .saturating_mul(window.len().max(1).ilog2() as usize + 1);
+            let pass = if point_sized(selected as u64) {
+                selected
+            } else {
+                selected / KEEP_DECODE_ROWS_PER_ID
+            };
+            if searches >= pass {
+                return None;
+            }
+            let mut runs = Vec::new();
+            let mut from = window.start;
+            for &code in codes.as_slice() {
+                let (lo, hi) = probe.bounds_in(from..window.end, code);
+                if lo < hi {
+                    runs.push(lo as u64..hi as u64);
+                }
+                from = hi;
+                if from >= window.end {
+                    break;
+                }
+            }
+            Some(runs)
+        }
     }
 }
 
@@ -517,7 +537,7 @@ mod tests {
         )
         .unwrap()
         .into_array();
-        let base = with_compressed_int_children(rows, true).unwrap();
+        let base = with_compressed_int_children(rows, true).unwrap().0;
         let probes = StructProbes::new();
         probes.warm(&base);
         (into_struct_array(base.clone()).unwrap(), base, probes)

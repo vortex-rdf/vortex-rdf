@@ -54,6 +54,17 @@ impl WindowCache {
         }
     }
 
+    /// The most the cached windows may be charged.
+    pub(super) fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// What a window holding `chunk` is charged: its bytes
+    /// ([`TermChunk::heap_bytes`]) plus [`WINDOW_ENTRY_OVERHEAD`].
+    pub(super) fn charge(chunk: &TermChunk) -> usize {
+        chunk.heap_bytes().saturating_add(WINDOW_ENTRY_OVERHEAD)
+    }
+
     /// Window `w`'s chunk, marked the most recently used.
     pub(super) fn get(&mut self, w: usize) -> Option<Arc<TermChunk>> {
         let cached = self.windows.get_mut(&w)?;
@@ -69,7 +80,7 @@ impl WindowCache {
         if let Some(kept) = self.get(w) {
             return kept;
         }
-        let bytes = chunk.heap_bytes().saturating_add(WINDOW_ENTRY_OVERHEAD);
+        let bytes = Self::charge(&chunk);
         if bytes > self.budget {
             return chunk;
         }

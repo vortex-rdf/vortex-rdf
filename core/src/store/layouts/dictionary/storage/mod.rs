@@ -73,6 +73,16 @@ impl TermChunk {
         }
     }
 
+    /// Term `local`'s bytes: borrowed from a canonical chunk, or decoded into
+    /// `scratch` from an FSST one. Unlike a [`cursor`](Self::cursor), the
+    /// scratch is the caller's, so one scratch serves every chunk it reads.
+    pub(super) fn bytes_into<'a>(&'a self, local: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        match self {
+            TermChunk::Canonical(a) => StrColReader::new(a).bytes_at(local),
+            TermChunk::Fsst(f) => f.decode_into(local, scratch),
+        }
+    }
+
     /// The chunk as an array, in its stored encoding.
     fn array(&self) -> ArrayRef {
         match self {
@@ -153,10 +163,8 @@ impl ResidentChunks {
     /// `scratch` from an FSST one. A single-term read passes one scratch
     /// through all its probes, where a cursor holds one per chunk.
     pub(super) fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
-        match self.locate(i) {
-            (TermChunk::Canonical(a), local) => StrColReader::new(a).bytes_at(local),
-            (TermChunk::Fsst(f), local) => f.decode_into(local, scratch),
-        }
+        let (chunk, local) = self.locate(i);
+        chunk.bytes_into(local, scratch)
     }
 
     /// A cursor over the terms: one chunk cursor per chunk, each with its own
@@ -507,19 +515,6 @@ impl TermChunk {
             TermChunk::Fsst(f) => Some(f.offsets.as_ptr() as usize),
         }
     }
-}
-
-/// The zone aggregates recording a dictionary window's exact bounds, in the
-/// order the zone table holds them: `vortex.max()` (last term), then
-/// `vortex.min()` (first term). Not the bounded string aggregates Vortex
-/// writes by default, which truncate long terms.
-pub(crate) fn window_bound_aggregates() -> Arc<[vortex_array::aggregate_fn::AggregateFnRef]> {
-    use vortex_array::aggregate_fn::fns::{max::Max, min::Min};
-    use vortex_array::aggregate_fn::{AggregateFnVTableExt as _, NumericalAggregateOpts};
-    Arc::from([
-        Max.bind(NumericalAggregateOpts::skip_nans()),
-        Min.bind(NumericalAggregateOpts::skip_nans()),
-    ])
 }
 
 impl TermDictionary {

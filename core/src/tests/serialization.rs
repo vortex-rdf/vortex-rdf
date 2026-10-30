@@ -419,7 +419,7 @@ async fn test_from_parts_adopts_searchable_children() {
     .unwrap();
     let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     let parts = adopted.to_serializable_parts().await.unwrap();
-    let store = VortexRdfStore::from_parts(parts).unwrap();
+    let store = VortexRdfStore::from_parts(parts, Default::default()).unwrap();
     assert!(
         store.debug_base_probe_resolvable(),
         "from_parts must leave every sorted column probe-bindable"
@@ -450,7 +450,8 @@ async fn test_from_parts_adopts_searchable_children() {
     // A sorted column in an encoding no probe reads (pcodec):
     // adoption decodes it and keeps its stamp, so a bound subject is still
     // one searched row range, answering as the built store does.
-    let decoded = VortexRdfStore::from_parts(pco_coded_build("s").await).unwrap();
+    let decoded =
+        VortexRdfStore::from_parts(pco_coded_build("s").await, Default::default()).unwrap();
     assert!(decoded.debug_base_probe_resolvable());
     assert_eq!(decoded.debug_base_child_int_canonical("s"), Some(true));
     assert_eq!(
@@ -467,7 +468,8 @@ async fn test_from_parts_adopts_searchable_children() {
     }
     // An unsorted column in such an encoding is decoded too: `from_parts`
     // leaves no integer column without a probe or a primitive.
-    let decoded = VortexRdfStore::from_parts(pco_coded_build("o").await).unwrap();
+    let decoded =
+        VortexRdfStore::from_parts(pco_coded_build("o").await, Default::default()).unwrap();
     assert_eq!(decoded.debug_base_child_int_canonical("o"), Some(true));
     assert_eq!(view_strings(&decoded).await, view_strings(&reference).await);
 
@@ -480,11 +482,14 @@ async fn test_from_parts_adopts_searchable_children() {
     };
     let adopted = unstamped_store(&quads_unsorted);
     assert_eq!(
-        VortexRdfStore::from_parts(adopted.to_serializable_parts().await.unwrap())
-            .unwrap()
-            .view_statistics()
-            .unwrap()
-            .sort_order,
+        VortexRdfStore::from_parts(
+            adopted.to_serializable_parts().await.unwrap(),
+            Default::default()
+        )
+        .unwrap()
+        .view_statistics()
+        .unwrap()
+        .sort_order,
         None,
         "rows with no sorted provenance must stay unstamped through adoption"
     );
@@ -604,7 +609,11 @@ async fn test_from_bytes_and_from_parts_answer_every_pattern_like_from_built() {
     let canonical = built_store(quads, LayoutStrategy::Dictionary, ALL_INDEX_TYPES.to_vec()).await;
     let bytes = canonical.to_bytes().await.unwrap();
     let lean = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-    let resident = VortexRdfStore::from_parts(lean.to_serializable_parts().await.unwrap()).unwrap();
+    let resident = VortexRdfStore::from_parts(
+        lean.to_serializable_parts().await.unwrap(),
+        Default::default(),
+    )
+    .unwrap();
 
     assert!(canonical.debug_base_probe_resolvable());
     assert!(
@@ -677,7 +686,11 @@ async fn test_from_parts_retains_dict_children() {
     .await;
     let bytes = canonical.to_bytes().await.unwrap();
     let lean = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-    let resident = VortexRdfStore::from_parts(lean.to_serializable_parts().await.unwrap()).unwrap();
+    let resident = VortexRdfStore::from_parts(
+        lean.to_serializable_parts().await.unwrap(),
+        Default::default(),
+    )
+    .unwrap();
 
     assert_eq!(
         resident.debug_base_child_int_canonical(schema::COL_O),

@@ -11,9 +11,11 @@ use crate::session::VORTEX_SESSION;
 use crate::store::array::{column_is_sorted, stamp_is_sorted};
 use crate::store::schema;
 use crate::store::schema::CODE_PTYPE;
+use crate::store::zones::{ZoneBuilder, ZoneTable};
 
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::dtype::FieldName;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
@@ -35,7 +37,7 @@ use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     use vortex_array::arrays::PrimitiveArray;
 
-    map_struct_children(rows, |child, ctx| {
+    map_struct_children(rows, |_, child, ctx| {
         let decode = child.dtype().is_int()
             && !child.dtype().is_nullable()
             && vortex_rdf_encoded_search::SortedProbe::resolve(child).is_none();
@@ -62,20 +64,33 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// untouched. A chunked column is compressed chunk by chunk
 /// ([`compress_int_child`]).
 ///
+/// The pass that picks a column's encoding reads all its codes, and takes
+/// the column's zone bounds on the way ([`ZoneBuilder`]): they come back
+/// beside the struct ([`ZoneTable`]), for the primary base, whose residual
+/// filter skips zones by them.
+///
 /// `payload_lazy` wraps each compressed column in a `vortex.shared` wrapper:
 /// the match fast paths probe the compressed source through it, while the
 /// code-column payload path decodes the canonical primitive once into its
 /// cache (`shared_code_primitive`) and is zero-copy on every later call. Pass
 /// it for the primary base, the only array the payload path reads.
-pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -> Result<ArrayRef> {
+pub(crate) fn with_compressed_int_children(
+    rows: ArrayRef,
+    payload_lazy: bool,
+) -> Result<(ArrayRef, ZoneTable)> {
     use vortex_array::arrays::Primitive;
     use vortex_layout::arrays::shared::Shared;
 
-    map_struct_children(rows, |child, ctx| {
+    let mut zones = ZoneTable::default();
+    let rows = map_struct_children(rows, |name, child, ctx| {
         let sorted = column_is_sorted(child);
-        let Some(mut encoded) = compress_int_child(child, sorted, ctx)? else {
+        let mut bounds = ZoneBuilder::new();
+        let Some(mut encoded) = compress_int_child(child, sorted, &mut bounds, ctx)? else {
             return Ok(None);
         };
+        if let Some(column) = bounds.finish(child.len()) {
+            zones.insert(name.clone(), column);
+        }
         if payload_lazy && !encoded.is::<Primitive>() {
             encoded = Shared::new(encoded).into_array();
         }
@@ -83,7 +98,8 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
             stamp_is_sorted(&encoded);
         }
         Ok(Some(encoded))
-    })
+    })?;
+    Ok((rows, zones))
 }
 
 /// `rows` executed to a struct, each child replaced by the array `f` returns
@@ -91,7 +107,7 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
 /// `f` keeps every child. A nullable struct passes through untouched.
 fn map_struct_children(
     rows: ArrayRef,
-    mut f: impl FnMut(&ArrayRef, &mut ExecutionCtx) -> Result<Option<ArrayRef>>,
+    mut f: impl FnMut(&FieldName, &ArrayRef, &mut ExecutionCtx) -> Result<Option<ArrayRef>>,
 ) -> Result<ArrayRef> {
     if rows.dtype().is_nullable() {
         return Ok(rows);
@@ -103,7 +119,7 @@ fn map_struct_children(
     let mut changed = false;
     for name in names.iter() {
         let child = struct_arr.unmasked_field_by_name(name.as_ref())?;
-        match f(child, &mut ctx)? {
+        match f(name, child, &mut ctx)? {
             Some(replacement) => {
                 children.push(replacement);
                 changed = true;
@@ -187,9 +203,11 @@ fn canonical_code(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray
 /// primitive). A chunked column (any build past `DEFAULT_CHUNK_ROWS` rows) is
 /// compressed chunk by chunk and reassembled; a chunk of a globally sorted
 /// column is itself sorted, so the RunEnd choice stays valid per chunk.
+/// `zones` sees the codes of every chunk compressed, in row order.
 fn compress_int_child(
     child: &ArrayRef,
     sorted: bool,
+    zones: &mut ZoneBuilder,
     ctx: &mut vortex_array::ExecutionCtx,
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::arrays::chunked::ChunkedArrayExt as _;
@@ -202,7 +220,7 @@ fn compress_int_child(
         let mut out = Vec::with_capacity(chunked.nchunks());
         let mut compressed_any = false;
         for chunk in chunked.chunks() {
-            match compress_int_child(&chunk, sorted, ctx)? {
+            match compress_int_child(&chunk, sorted, zones, ctx)? {
                 Some(encoded) => {
                     if sorted {
                         stamp_is_sorted(&encoded);
@@ -231,16 +249,19 @@ fn compress_int_child(
         &prim,
         prim.as_slice::<u64>(),
         sorted,
+        zones,
         ctx,
     )?))
 }
 
 /// One column's encoding choice; see [`with_compressed_int_children`].
-/// `values` is `prim`'s slice.
+/// `values` is `prim`'s slice; `zones` folds in their bounds zone by zone, in
+/// the pass that takes the column's own.
 fn compress_int_column(
     prim: &vortex_array::arrays::PrimitiveArray,
     values: &[u64],
     sorted: bool,
+    zones: &mut ZoneBuilder,
     ctx: &mut vortex_array::ExecutionCtx,
 ) -> Result<ArrayRef> {
     use vortex::encodings::fastlanes::BitPacked;
@@ -250,21 +271,30 @@ fn compress_int_column(
     if values.is_empty() {
         return Ok(prim.clone().into_array());
     }
-    let mut max = values[0];
-    let mut min = values[0];
+    let (mut min, mut max) = (u64::MAX, u64::MIN);
     let mut runs = 1usize;
     let mut prev = values[0];
-    for &v in &values[1..] {
-        if v > max {
-            max = v;
+    let mut rest = values;
+    while !rest.is_empty() {
+        // Up to the end of the zone being filled.
+        let (part, next) = rest.split_at(zones.room().min(rest.len()));
+        let (mut lo, mut hi) = (u64::MAX, u64::MIN);
+        for &v in part {
+            if v > hi {
+                hi = v;
+            }
+            if v < lo {
+                lo = v;
+            }
+            if v != prev {
+                runs += 1;
+                prev = v;
+            }
         }
-        if v < min {
-            min = v;
-        }
-        if v != prev {
-            runs += 1;
-            prev = v;
-        }
+        zones.push(part.len(), lo, hi);
+        min = min.min(lo);
+        max = max.max(hi);
+        rest = next;
     }
     if min == max {
         return Ok(ConstantArray::new(min, values.len()).into_array());

@@ -345,10 +345,39 @@ impl VortexRdfStore {
         self.quads.is_pending_without_plan()
     }
 
+    /// The base columns with zone bounds, of an in-memory view; none for any
+    /// other.
+    pub(crate) fn debug_zone_columns(&self) -> Vec<String> {
+        match &self.quads.backend {
+            crate::store::Backend::InMemory(memory) => memory.zones.columns(),
+            #[cfg(feature = "file-io")]
+            crate::store::Backend::File(_) => Vec::new(),
+        }
+    }
+
+    /// Base column `name`'s zone bounds, `(min, max)` per zone, of an
+    /// in-memory view; `None` for a column without them or any other view.
+    pub(crate) fn debug_zone_bounds(&self, name: &str) -> Option<Vec<(TermCode, TermCode)>> {
+        match &self.quads.backend {
+            crate::store::Backend::InMemory(memory) => {
+                memory.zones.get(name).map(|zones| zones.bounds().to_vec())
+            }
+            #[cfg(feature = "file-io")]
+            crate::store::Backend::File(_) => None,
+        }
+    }
+
     /// The live base rows the filter masks a window kept on this view hold
     /// (see `FileBase::masks`); `None` on a view without them.
     pub(crate) fn debug_evaluated_len(&self) -> Option<usize> {
         self.quads.evaluated_len()
+    }
+
+    /// The ranges of the filter masks a window kept on this view, in file
+    /// order (see `FileBase::masks`); `None` on a view without them.
+    pub(crate) fn debug_evaluated_ranges(&self) -> Option<Vec<std::ops::Range<u64>>> {
+        let masks = self.quads.file()?.masks.as_ref()?;
+        Some(masks.iter().map(|(_, range)| range.clone()).collect())
     }
 
     /// Whether this view's one-shot reads take its pending filter by the
