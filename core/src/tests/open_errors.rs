@@ -451,8 +451,8 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
 
 /// The quad table's dtype alone decides the layout: a `dictionary` child
 /// beside string columns, which this crate never writes, is left unread by
-/// every open path. Each opens the store under its string layout, answers
-/// from the strings, and offers no dictionary table.
+/// every open path. Each opens the store under its string layout and answers
+/// from the strings.
 #[tokio::test]
 async fn test_open_leaves_a_dictionary_child_beside_string_columns_unread() {
     let quads = dictionary_test_quads();
@@ -480,13 +480,6 @@ async fn test_open_leaves_a_dictionary_child_beside_string_columns_unread() {
                 view_strings(&matched_view(&store, None, Some(&p1), None, None).await).await,
                 expected_strings(&quads, |i| i % 3 == 1),
                 "{layout:?} {open}"
-            );
-            assert!(
-                store
-                    .component_data_source(container::DICT_COMPONENT_NAME)
-                    .unwrap()
-                    .is_none(),
-                "{layout:?} {open}: the dictionary child is offered"
             );
         }
     }

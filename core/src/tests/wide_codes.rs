@@ -532,15 +532,11 @@ async fn codes_past_u32_survive_mutation_rebuilds() {
     check_store(&shrunk, &quads, "deleted and compacted").await;
 }
 
-/// `code_chunks`, `row_chunks` and the data source's scan of `store`, built
-/// or opened under the [`BASE`] guard, over the whole store, an index-served
-/// predicate match and a subject run: each export answers the gathered codes
-/// in base row order, every code it yields is at least the base, and a scan
-/// filtered on a wide code keeps exactly that code's rows.
+/// `code_chunks` and `row_chunks` of `store`, built or opened under the
+/// [`BASE`] guard, over the whole store, an index-served predicate match and
+/// a subject run: each export answers the gathered codes in base row order,
+/// and every code it yields is at least the base.
 async fn check_chunk_exports(store: &VortexRdfStore, label: &str) {
-    use crate::vortex_scan::ScanRequest;
-    use vortex_array::expr::{eq, get_item, lit, root};
-
     let name = iri("name");
     let alice = iri_subject("alice");
     let views = [
@@ -569,29 +565,10 @@ async fn check_chunk_exports(store: &VortexRdfStore, label: &str) {
             "{label} {tag}: a row_chunks code fits 32 bits"
         );
         assert_eq!(rows, expected, "{label} {tag}: row_chunks");
-        let source = view.data_source().unwrap();
-        let scanned = scan_codes(&source, ScanRequest::default()).await;
-        assert!(
-            scanned.iter().flatten().all(|&code| code >= BASE),
-            "{label} {tag}: a scanned code fits 32 bits"
-        );
-        assert_eq!(scanned, expected, "{label} {tag}: the data source's scan");
-        let p = expected[0][1];
-        let filtered = scan_codes(
-            &source,
-            ScanRequest {
-                filter: Some(eq(get_item("p", root()), lit(p))),
-                ..Default::default()
-            },
-        )
-        .await;
-        let want: Vec<[TermCode; 4]> = expected.iter().copied().filter(|r| r[1] == p).collect();
-        assert_eq!(filtered, want, "{label} {tag}: a scan filtered on code {p}");
     }
 }
 
-/// The chunk exports and the data source's scan carry codes past `u32::MAX`
-/// unchanged: on an in-memory build, and on its file opened mapped, loaded
+/// The chunk exports carry codes past `u32::MAX` unchanged: on an in-memory build, and on its file opened mapped, loaded
 /// whole and adopted from its bytes.
 #[tokio::test]
 async fn codes_past_u32_through_the_chunk_exports() {

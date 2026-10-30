@@ -70,15 +70,9 @@ pub use store::{
     export_rdf,
 };
 
-/// The vortex scan interface behind [`VortexRdfStore::data_source`] and
-/// [`component_data_source`](VortexRdfStore::component_data_source): build
-/// `ScanRequest`s from this copy, the version the store was compiled against.
-pub use vortex_scan;
-
 /// The vortex session holding this crate's store layout, encodings and write
-/// editions: hand it to vortex's own integrations (its DataFusion table
-/// provider) beside a [`data_source`](VortexRdfStore::data_source), and to
-/// vortex's own reader to open this crate's files.
+/// editions: hand it to vortex's own reader to open this crate's files, whose
+/// root scans as the quad table.
 pub fn vortex_session() -> &'static vortex_session::VortexSession {
     &session::VORTEX_SESSION
 }

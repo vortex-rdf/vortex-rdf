@@ -1,6 +1,5 @@
-//! Chunked exports — `row_chunks`, `code_chunks` and the data source's scan
-//! over them — against the whole-view reads, on every backend, over
-//! narrowed, served, tombstoned and tailed views.
+//! Chunked exports — `row_chunks` and `code_chunks` — against the whole-view
+//! reads, on every backend, over narrowed, served, tombstoned and tailed views.
 
 use super::masks_first::{MANY_SPLITS, many_splits_file};
 use super::*;
@@ -8,22 +7,16 @@ use crate::store::array::rechunk_hooks;
 use crate::store::read::chunks::{RowChunkStream, gather_hooks, run_hooks};
 use crate::store::read::rows::column_hooks;
 use crate::store::{QuadColumn, TermCode};
-use crate::vortex_scan::ScanRequest;
-use vortex_array::dtype::{DType, Nullability};
-use vortex_array::expr::stats::Precision;
 
 /// Both exports of `view` agree with its base-ordered codes at several batch
 /// sizes — one row (on a view of at most 256 rows), a size the rows do not
 /// divide, the view's length — in the chunks the view reads at its length
 /// (one, or a file scan's split each), each cut to the batch; every column
 /// subset reads the subset's columns of the four-column read, and a subset
-/// comes in the requested order. Its data source scans to the same codes
-/// under a non-nullable struct dtype, and advertises its statistics' count
-/// (exact, or as the upper bound) and four `u64` codes a row as its byte
-/// size; the source and the statistics are taken before anything reads the
-/// view. Returns the count the source advertises.
-async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64> {
-    let source = view.data_source().unwrap();
+/// comes in the requested order. Its statistics, taken before anything reads
+/// the view, count its rows exactly or bound them. Returns whether the count
+/// is exact.
+async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> bool {
     let hint = view.view_statistics().unwrap().rows;
     let expected = base_ordered_codes(view).await;
     let n = expected.len();
@@ -66,32 +59,16 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
     let want: Vec<[TermCode; 2]> = all.iter().map(|r| [r[2], r[0]]).collect();
     assert_eq!(rows, want, "{tag}: a column subset in the requested order");
 
-    assert!(
-        matches!(source.dtype(), DType::Struct(_, Nullability::NonNullable)),
-        "{tag}: a non-nullable struct dtype"
-    );
-    let count = match hint.exact {
+    match hint.exact {
         Some(n) => {
             assert_eq!(n, expected.len(), "{tag}: an exact count");
-            Precision::exact(n as u64)
+            true
         }
         None => {
             assert!(hint.upper_bound >= expected.len(), "{tag}: a bound");
-            Precision::inexact(hint.upper_bound as u64)
+            false
         }
-    };
-    assert_eq!(source.row_count(), count, "{tag}: the statistics' count");
-    assert_eq!(
-        source.byte_size(),
-        count.map(|n| n * 32),
-        "{tag}: four u64 codes a row"
-    );
-    assert_eq!(
-        scan_codes(&source, ScanRequest::default()).await,
-        expected,
-        "{tag}: the data source's scan"
-    );
-    count
+    }
 }
 
 /// Every subset of `N` code columns, in `(s, p, o, g)` order, read from
@@ -151,17 +128,6 @@ async fn chunks_before_error<T, E: std::fmt::Display>(
         }
     }
     panic!("no error item after {chunks} chunks")
-}
-
-/// [`multi_chunk_store`]'s quads with the copy index: an index child of
-/// 20,000 rows, which a data source cuts into three chunks.
-async fn indexed_multi_chunk_store() -> VortexRdfStore {
-    built_store(
-        modular_quads(20_000, 3, 8),
-        LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByCopy],
-    )
-    .await
 }
 
 /// Every item of `stream`, unwrapped, beside how far `counter` rose over the
@@ -269,27 +235,23 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
 }
 
 /// In memory, over every index set, and the multi-chunk store whole: each
-/// view's chunks and data source scan are its base-ordered codes, which the
-/// source counts exactly, and the whole store's code chunks are its code
-/// columns, not copies of them. An index-served match gathers one window of
+/// view's chunks are its base-ordered codes, which its statistics count
+/// exactly, and the whole store's code chunks are its code columns, not
+/// copies of them. An index-served match gathers one window of
 /// its ids per chunk, as the chunk is pulled, and of only the columns read;
 /// the whole store, a contiguous run, gathers nothing.
 #[tokio::test]
 async fn test_chunks_in_memory_match_gathered() {
-    let count = assert_chunks_match(&multi_chunk_store().await, "memory multi-chunk").await;
     assert!(
-        matches!(count, Precision::Exact(_)),
+        assert_chunks_match(&multi_chunk_store().await, "memory multi-chunk").await,
         "multi-chunk: exact in memory"
     );
     for indexes in IndexConfig::ALL.map(IndexConfig::types) {
         let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
         for (name, view) in views_of(&store).await {
             let tag = format!("memory {indexes:?} {name}");
-            let count = assert_chunks_match(&view, &tag).await;
-            assert!(
-                matches!(count, Precision::Exact(_)),
-                "{tag}: exact in memory"
-            );
+            let exact = assert_chunks_match(&view, &tag).await;
+            assert!(exact, "{tag}: exact in memory");
         }
         let [s, ..] = store.code_columns_gathered().await.unwrap().unwrap();
         let mut chunks = store.code_chunks(&[QuadColumn::S], usize::MAX).unwrap();
@@ -327,14 +289,9 @@ async fn test_chunks_in_memory_match_gathered() {
 /// of its row chunks, cuts one chunk, and each stream one per row; at the
 /// run's length its one row chunk is the run itself, cut nowhere. A stream
 /// dropped early cuts only the chunks it pulled — the store's, a file scan's
-/// split, a tailed store's before its tail — and a `LIMIT` scan only its
-/// first chunk, of the multi-chunk store and of an index child's table,
-/// whose drained chunks are the child's rows cut to the data source's batch;
-/// a child the batch holds whole is one chunk, cut nowhere.
+/// split, a tailed store's before its tail.
 #[tokio::test]
 async fn test_chunks_cut_a_run_per_pull() {
-    use crate::store::read::data_source::DATA_SOURCE_BATCH_ROWS;
-
     let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let expected = base_ordered_codes(&store).await;
     let codes = store.code_chunks(&QuadColumn::ALL, 1).unwrap();
@@ -383,59 +340,12 @@ async fn test_chunks_cut_a_run_per_pull() {
         1,
         "a tailed store's first chunk, the tail uncut"
     );
-
-    let limited = ScanRequest {
-        limit: Some(100),
-        ..Default::default()
-    };
-    let multi = multi_chunk_store().await;
-    let start = rechunk_hooks::cuts();
-    let rows = scan_codes(&multi.data_source().unwrap(), limited.clone()).await;
-    assert_eq!(rows.len(), 100);
-    assert_eq!(rechunk_hooks::cuts() - start, 1, "the store's LIMIT scan");
-    let indexed = indexed_multi_chunk_store().await;
-    let table = indexed
-        .component_data_source("index:posg")
-        .unwrap()
-        .unwrap();
-    let start = rechunk_hooks::cuts();
-    assert_eq!(scan_chunks(&table, limited).await.len(), 1);
-    assert_eq!(
-        rechunk_hooks::cuts() - start,
-        1,
-        "an index child's LIMIT scan"
-    );
-    let start = rechunk_hooks::cuts();
-    let lengths: Vec<usize> = scan_chunks(&table, ScanRequest::default())
-        .await
-        .iter()
-        .map(|c| c.len())
-        .collect();
-    let want: Vec<usize> = cut_lengths(20_000, DATA_SOURCE_BATCH_ROWS).collect();
-    assert_eq!(lengths, want, "an index child's rows cut to the batch");
-    assert_eq!(rechunk_hooks::cuts() - start, want.len(), "a cut a chunk");
-    let small = built_store(
-        fixture_quads(),
-        LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByCopy],
-    )
-    .await;
-    let table = small.component_data_source("index:posg").unwrap().unwrap();
-    let start = rechunk_hooks::cuts();
-    let lengths: Vec<usize> = scan_chunks(&table, ScanRequest::default())
-        .await
-        .iter()
-        .map(|c| c.len())
-        .collect();
-    assert_eq!(lengths, [3_000], "a child the batch holds is one chunk");
-    assert_eq!(rechunk_hooks::cuts() - start, 0, "and is cut nowhere");
 }
 
 /// A slice that fails to cut is its chunk's error item, after the chunks
 /// before it, wherever rows are cut into chunks: an in-memory store's row
-/// chunks, a file scan's split through both exports, a tailed store's tail,
-/// and an index child's table, whose partition still executes and whose
-/// stream carries the error.
+/// chunks, a file scan's split through both exports, and a tailed store's
+/// tail.
 #[tokio::test]
 async fn test_chunks_surface_a_failed_cut() {
     use crate::store::array::rechunk_hooks::FailingCut;
@@ -475,31 +385,12 @@ async fn test_chunks_surface_a_failed_cut() {
         let before = hooked(chunks_before_error(tailed.row_chunks(20).unwrap()).await);
         assert_eq!(before, 151, "the tail's second chunk fails");
     }
-    let indexed = indexed_multi_chunk_store().await;
-    let table = indexed
-        .component_data_source("index:posg")
-        .unwrap()
-        .unwrap();
-    let _fail = FailingCut::after(1);
-    let mut partitions = table
-        .scan(ScanRequest::default())
-        .await
-        .unwrap()
-        .partitions();
-    let partition = partitions.next().await.unwrap().unwrap();
-    let stream = partition.execute().expect("the partition executes");
-    assert_eq!(
-        hooked(chunks_before_error(stream).await),
-        1,
-        "an index child's table: its second chunk fails"
-    );
 }
 
 /// In memory, over every index set, the views of a store with tombstones:
-/// the exports and the data source's scan skip the deleted rows, and the
-/// source counts the live ones exactly. Every view, the whole store's
-/// included, gathers one window of its live ids per chunk, of only the
-/// columns read.
+/// the exports skip the deleted rows, and the statistics count the live ones
+/// exactly. Every view, the whole store's included, gathers one window of its
+/// live ids per chunk, of only the columns read.
 #[tokio::test]
 async fn test_chunks_skip_tombstones() {
     let quads = fixture_quads();
@@ -509,11 +400,8 @@ async fn test_chunks_skip_tombstones() {
         assert_eq!(deleted.size().await.unwrap(), quads.len() - 50);
         for (name, view) in views_of(&deleted).await {
             let tag = format!("tombstoned {indexes:?} {name}");
-            let count = assert_chunks_match(&view, &tag).await;
-            assert!(
-                matches!(count, Precision::Exact(_)),
-                "{tag}: exact in memory"
-            );
+            let exact = assert_chunks_match(&view, &tag).await;
+            assert!(exact, "{tag}: exact in memory");
             let rows = view.size().await.unwrap();
             assert_gathers(&view, 7, rows.div_ceil(7), &tag).await;
         }
@@ -521,25 +409,21 @@ async fn test_chunks_skip_tombstones() {
 }
 
 /// On every file open and index set, and on the multi-chunk store's mapped
-/// file whole, each view's chunks and data source scan are its base-ordered
-/// codes; the source counts them exactly where the statistics know the count
-/// and as a bound while a pushed-down filter is pending, and the matrix
-/// reaches both.
+/// file whole, each view's chunks are its base-ordered codes; the statistics
+/// count them exactly where they know the count and bound them while a
+/// pushed-down filter is pending, and the matrix reaches both.
 #[tokio::test]
 async fn test_chunks_file_backed_match_gathered() {
     let (_multi_dir, multi_chunk) = multi_chunk_file().await;
-    let mut counts = vec![assert_chunks_match(&multi_chunk, "mapped multi-chunk").await];
+    let mut exact = vec![assert_chunks_match(&multi_chunk, "mapped multi-chunk").await];
     for fixture in file_stores().await {
         let tag = fixture.tag();
         for (name, view) in views_of(&fixture.store).await {
-            counts.push(assert_chunks_match(&view, &format!("{tag} {name}")).await);
+            exact.push(assert_chunks_match(&view, &format!("{tag} {name}")).await);
         }
     }
-    let exact_counts = counts
-        .iter()
-        .filter(|count| matches!(count, Precision::Exact(_)))
-        .count();
-    let bounds = counts.len() - exact_counts;
+    let exact_counts = exact.iter().filter(|&&e| e).count();
+    let bounds = exact.len() - exact_counts;
     assert!(
         exact_counts > 0 && bounds > 0,
         "{exact_counts} exact counts, {bounds} bounds"
@@ -704,11 +588,10 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
     }
 }
 
-/// A file view's chunks, and its data source's scan, read with no tokio
-/// runtime: a bare executor on a plain thread polls them, with the split
-/// limit forced to zero so the scan would spawn wherever a runtime were there
-/// to spawn onto. Nothing is spawned, and both exports and the scan answer
-/// the view's base-ordered codes.
+/// A file view's chunks read with no tokio runtime: a bare executor on a
+/// plain thread polls them, with the split limit forced to zero so the scan
+/// would spawn wherever a runtime were there to spawn onto. Nothing is
+/// spawned, and both exports answer the view's base-ordered codes.
 #[tokio::test]
 async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     use crate::store::scan::file_scans::driver_hooks;
@@ -721,15 +604,13 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     let expected = base_ordered_codes(&view).await;
     assert_eq!(expected.len(), 600);
 
-    let (codes, rows, scanned, spawned) = std::thread::spawn(move || {
+    let (codes, rows, spawned) = std::thread::spawn(move || {
         let _limit = driver_hooks::ForcedLimit::set(0);
         futures::executor::block_on(async {
             driver_hooks::take_spawned();
             let (codes, _) = collect_code_chunks(&view, &QuadColumn::ALL, 256).await;
             let rows = struct_chunk_codes(&collect_row_chunks(&view, 256).await);
-            let source = view.data_source().unwrap();
-            let scanned = scan_codes(&source, ScanRequest::default()).await;
-            (codes, rows, scanned, driver_hooks::take_spawned())
+            (codes, rows, driver_hooks::take_spawned())
         })
     })
     .join()
@@ -737,36 +618,12 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     assert_eq!(spawned, 0, "no runtime to spawn onto, so nothing spawned");
     assert_eq!(codes, expected, "code_chunks");
     assert_eq!(rows, expected, "row_chunks");
-    assert_eq!(scanned, expected, "the data source's scan");
-}
-
-/// The data source of a string-layout `view` whose subjects, in the order
-/// `quads()` decodes them, are `expected`: it counts them exactly, reports no
-/// byte size, and its scan carries the same utf8 rows.
-async fn assert_string_source(view: &VortexRdfStore, expected: &[String], tag: &str) {
-    let source = view.data_source().unwrap();
-    assert_eq!(
-        source.row_count(),
-        Precision::exact(expected.len() as u64),
-        "{tag}"
-    );
-    assert_eq!(
-        source.byte_size(),
-        Precision::Absent,
-        "{tag}: string columns have no fixed width"
-    );
-    let chunks = scan_chunks(&source, ScanRequest::default()).await;
-    assert_eq!(
-        chunk_subjects(&chunks),
-        expected,
-        "{tag}: the data source's scan"
-    );
 }
 
 /// The string layouts stream their native struct rows, the tail last, in the
-/// order `quads()` decodes them, through the chunks — the base's rows and the
+/// order `quads()` decodes them, through the chunks: the base's rows and the
 /// tail's cut apart, each to the batch, from one row a chunk to the view's
-/// length — and the data source.
+/// length.
 #[tokio::test]
 async fn test_chunks_string_layouts_include_tail() {
     let quads = fixture_quads();
@@ -807,7 +664,6 @@ async fn test_chunks_string_layouts_include_tail() {
             ),
             "no codes under {layout:?}"
         );
-        assert_string_source(&tailed, &expected, &format!("{layout:?}")).await;
     }
     {
         let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, vec![]).await;
@@ -830,13 +686,12 @@ async fn test_chunks_string_layouts_include_tail() {
             expected,
             "file-backed Default with a tail"
         );
-        assert_string_source(&tailed, &expected, "file-backed Default with a tail").await;
     }
 }
 
 /// The gates: a zero batch and no columns are invalid input; a Dictionary
-/// view whose tail holds terms without codes has no chunks and no data
-/// source, an invalid operation.
+/// view whose tail holds terms without codes has no chunks, an invalid
+/// operation.
 #[tokio::test]
 async fn test_chunks_gates() {
     let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
@@ -855,10 +710,6 @@ async fn test_chunks_gates() {
         "a tailed Dictionary view has no single dtype"
     );
     assert!(refused(tailed.code_chunks(&QuadColumn::ALL, 10).map(drop)));
-    assert!(
-        refused(tailed.data_source().map(drop)),
-        "a tailed Dictionary view has no source"
-    );
 }
 
 /// `stream` pulled once and then drained: the splits its first pull spawned,
@@ -882,7 +733,7 @@ async fn pull_and_drain<S: futures::Stream + Unpin>(
 }
 
 /// The chunk streams over a filtered no-index file view (`code_chunks`,
-/// `row_chunks`, `quads()` and the data source's scan) stay lazy and scan:
+/// `row_chunks` and `quads()`) stay lazy and scan:
 /// nothing is evaluated or scanned before the first poll, each drained stream
 /// runs one row scan and never reads the filter's masks first, and with the
 /// split limit forced to zero a first pull has at most a scan's window of
@@ -907,7 +758,7 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
     let n = view.size().await.unwrap();
     let window = 4 * available_parallelism();
     let _limit = driver_hooks::ForcedLimit::set(0);
-    for read in ["code_chunks", "row_chunks", "quads", "data_source"] {
+    for read in ["code_chunks", "row_chunks", "quads"] {
         let (scans, evaluated) = (scan_hooks::scans(), split_hooks::evaluated());
         let masked = masked_read_hooks::reads();
         let lazy = || {
@@ -931,21 +782,12 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
                 let chunks = view.row_chunks(256).unwrap();
                 pull_and_drain(chunks, lazy, |chunk| chunk.unwrap().len()).await
             }
-            "quads" => {
+            _ => {
                 pull_and_drain(view.quads(), lazy, |quad| {
                     quad.unwrap();
                     1
                 })
                 .await
-            }
-            _ => {
-                let source = view.data_source().unwrap();
-                let scan = source.scan(ScanRequest::default()).await.unwrap();
-                let mut partitions = scan.partitions();
-                let partition = partitions.next().await.unwrap().unwrap();
-                assert!(partitions.next().await.is_none(), "one partition");
-                let chunks = partition.execute().unwrap();
-                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap().len()).await
             }
         };
         assert_eq!(rows, n, "{read}: every row");
