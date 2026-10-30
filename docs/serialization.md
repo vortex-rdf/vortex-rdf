@@ -54,7 +54,7 @@ A builder hands these back in one of two shapes
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L66), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L112) to name the builder | either | in-memory store |
-| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L133) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
+| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L132) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
 | Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L248) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
@@ -178,7 +178,7 @@ of its adjacent repeats, and built into one struct of primary columns through
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
-([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L137)):
+([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L250)):
 each distinct term is held once (a `Box<str>` keyed map), and each quad is kept
 as four provisional `u64` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
@@ -187,7 +187,7 @@ lexicographic ranks, sorting `[u64; 4]` rows is the same order as sorting the
 term strings, so the sort moves 32-byte rows instead of four-string structs;
 equal rows are then adjacent and the repeats are dropped, since equal codes are
 equal terms.
-[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L101) is
+[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L214) is
 the push-based form of the same ingest, for callers that produce quads one at a
 time (the wasm array path).
 
@@ -363,7 +363,7 @@ fit an `i32`.
 
 Which pipeline built the dictionary decides how a term reaches its code during
 encoding: a rebuild looks it up in a term→code map borrowed from the live quads
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L62)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L64)),
 while the interning builds never look a term up again: their quads hold term
 ids, remapped to ranks, and a rank's code is its position. Either way the
 mapping exists only for the build; stores keep the columnar dictionary alone.
@@ -591,13 +591,20 @@ parts are:
 | tailed, or tombstoned with indexes | live base rows + live tail rows, **re-sorted** into `(s, p, o, g)` order | **rebuilt** over the merged rows | **fresh** under Dictionary — the tail may hold terms the old dictionary never coded |
 | narrowed (a `match_pattern` result) | its selected rows only | none — its rows are renumbered, and rebuilding indexes for an arbitrary view is compaction's job | the store's own |
 
-The re-sort ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L87),
-the one compaction runs too) sorts the small tail alone and merges it into the
-already-sorted base in a linear pass; only a base that never carried the stamp
-pays a full sort. The written artifact therefore always claims `quads_sorted`
-truthfully. The sorted rows are then deduplicated, as every builder's output
-is, so the artifact holds each quad once even when the rows it was gathered
-from did not.
+The rebuild ([`rebuilt_parts`](../core/src/store/write/compaction.rs#L83),
+the one compaction runs too) works on codes under the Dictionary layout with
+its dictionary in memory: the live base rows are read as codes, only the
+distinct terms they use are decoded, once each, and merged with the tail's
+into the fresh dictionary, and the rows sort as integers once their codes are
+remapped ([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L89)).
+Under the string layouts, or a dictionary left in its file, the re-sort
+([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L107)) sorts
+the small tail alone and merges it into the already-sorted base in a linear
+pass; only a base that never carried the stamp pays a full sort. Both give the
+same parts, so the written artifact always claims `quads_sorted` truthfully.
+The sorted rows are deduplicated, as every builder's output is, so the
+artifact holds each quad once even when the rows it was gathered from did
+not.
 
 ### 11.2 Compaction
 

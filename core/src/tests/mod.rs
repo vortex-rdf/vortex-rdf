@@ -34,6 +34,7 @@ mod narrowing;
 mod open_errors;
 mod pending_residual;
 mod predicates;
+mod rebuild;
 mod roundtrip;
 mod row_limit;
 mod serialization;

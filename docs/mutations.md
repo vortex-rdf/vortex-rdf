@@ -175,28 +175,40 @@ flowchart TD
 | `to_bytes()` | a tailed or tombstoned owner re-sorts base + tail into `(s, p, o, g)` order and rebuilds its indexes ([serialization.md §11.1](serialization.md#111-serializing-a-store-to_bytes-to_serializable_parts)) | folded into the same rebuild |
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
-The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/read/rows.rs#L440): base rows first (in view
-order), then tail rows, tombstones already excluded. Both put them in order the
-same way ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L87)):
-the tail is sorted alone and merged into the sorted base in one linear pass (a
-base without the sorted stamp is sorted whole), and repeated quads are dropped.
+Both rebuild the same way
+([`rebuilt_parts`](../core/src/store/write/compaction.rs#L83)). Under the
+Dictionary layout with its dictionary in memory, from the base rows' codes
+([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L89)):
+the live base rows are read as codes, only the distinct terms they use are
+decoded, once each, and merged with the tail's terms into the fresh
+dictionary, every base code moves to its term's new code (code order being
+term order) and the rows, the tail's beside them, sort as integers, each
+quad once. Otherwise from the quads spelled out
+([`live_raw_quads`](../core/src/store/read/rows.rs#L440): base rows first, in
+view order, then tail rows, tombstones already excluded), put in order by
+[`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L107): the tail
+is sorted alone and merged into the sorted base in one linear pass (a base
+without the sorted stamp is sorted whole), and repeated quads are dropped.
+Both give the same parts, byte for byte.
 
 ---
 
 ## 5. Compaction
 
-[`compact`](../core/src/store/write/compaction.rs#L28) (keep the current index set)
-/ [`compact_with_indexes`](../core/src/store/write/compaction.rs#L56) (rebuild a
+[`compact`](../core/src/store/write/compaction.rs#L29) (keep the current index set)
+/ [`compact_with_indexes`](../core/src/store/write/compaction.rs#L57) (rebuild a
 chosen set) are the only operations that rewrite data. A compaction:
 
 1. Reads every *live* row the view covers — base rows first, then tail rows,
-   tombstones excluded (`live_raw_quads`).
-2. Sorts them by `(s, p, o, g)` and drops repeated quads
-   (`sorted_live_raw_quads`, as a tailed store's serialization does).
-3. Rebuilds a fresh base through the normal builder pipeline — under the
-   Dictionary layout with a fresh `TermDictionary`, since the tail may hold
-   terms the old dictionary never coded — stamping `s` as sorted.
+   tombstones excluded: as codes under the Dictionary layout with its
+   dictionary in memory, else spelled out (`live_raw_quads`).
+2. Sorts them by `(s, p, o, g)` and drops repeated quads, as a tailed
+   store's serialization does: as integers once the codes are remapped
+   (`rebuild_from_codes`), else as strings (`sorted_live_raw_quads`).
+3. Rebuilds a fresh base — under the Dictionary layout with a fresh
+   `TermDictionary` of exactly the live rows' terms, since the tail may hold
+   terms the old dictionary never coded and tombstones may leave some unused
+   — stamping `s` as sorted.
 4. Rebuilds the requested secondary indexes over the new order.
 
 The result has an empty tail, no tombstones, and — because it is freshly
@@ -212,13 +224,16 @@ flowchart TD
     F1 --> F2["built_stream_to_vortex_writer into the temp file"]
     F2 --> F3["rename the temp file over the original"]
     F3 --> F4["reopen it memory-mapped"]
-    O -- "no" --> L2["sorted_live_raw_quads()"]
-    L2 --> M1["build_parts_from_raws: rows, components,<br/>fresh dictionary under Dictionary"]
-    M1 --> M2["from_built → an owning in-memory store"]
+    O -- "no" --> D{"Dictionary layout,<br/>dictionary in memory?"}
+    D -- "yes" --> R["rebuild_from_codes: base codes remapped to a fresh<br/>dictionary of the live terms, tail encoded, sorted, dedup"]
+    D -- "no" --> L2["sorted_live_raw_quads()"]
+    L2 --> M1["build_parts_from_raws: rows, components"]
+    R --> M2["from_built → an owning in-memory store"]
+    M1 --> M2
 ```
 
 - **A file-backed owner stays file-backed**
-  ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L118)): the
+  ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L138)): the
   writer is prepared first
   ([`PendingStore::create`](../core/src/io/pending.rs#L106), the one writer every
   path-taking build shares), so a source file the process cannot write (a
@@ -250,8 +265,10 @@ flowchart TD
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default), in a
   run directory named after that file.
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
-  subset of a file other readers share), rebuilds in memory through
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L223) and adopts
+  subset of a file other readers share), rebuilds in memory
+  ([`rebuilt_parts`](../core/src/store/write/compaction.rs#L83): from codes
+  under a resident dictionary, else through
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L223)) and adopts
   the result through [`from_built`](../core/src/store/construct.rs#L112), in the
   same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
@@ -260,7 +277,7 @@ flowchart TD
 
 `add_quads` is append-then-check: the append itself is policy-free, and
 whichever call pushes the tail past a threshold
-([`should_auto_compact`](../core/src/store/write/compaction.rs#L143) →
+([`should_auto_compact`](../core/src/store/write/compaction.rs#L163) →
 [`tail_needs_compaction`](../core/src/store/write/compaction.rs#L166)) pays for
 folding it back into the base, which amortizes the O(n log n) rebuild to
 roughly constant cost per appended row. The tail is folded once it reaches
@@ -329,9 +346,9 @@ runs the mutation on the store the view came from.
 |---|---|---|---|
 | `TAIL_FLATTEN_FLOOR` | 1,024 | [`view/mod.rs`](../core/src/store/view/mod.rs#L463) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
 | `TAIL_MAX_CHUNKS` | 64 | [`view/mod.rs`](../core/src/store/view/mod.rs#L467) | the tail is flattened once it holds more chunks than this, whatever their row counts |
-| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/write/compaction.rs#L152) | below this many tail rows `add_quads` never compacts |
-| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/write/compaction.rs#L156) | compact once the tail reaches base / 10 |
-| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/write/compaction.rs#L162) | compact once the tail could fill a builder chunk, however large the base |
+| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/write/compaction.rs#L172) | below this many tail rows `add_quads` never compacts |
+| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/write/compaction.rs#L176) | compact once the tail reaches base / 10 |
+| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/write/compaction.rs#L182) | compact once the tail could fill a builder chunk, however large the base |
 
 ---
 

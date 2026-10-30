@@ -6,9 +6,10 @@ use crate::error::Result;
 use crate::error::VortexRdfError;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
-use crate::store::RawQuad;
-use crate::store::builders::{DEFAULT_CHUNK_ROWS, build_parts_from_raws};
+use crate::store::builders::{BuiltArray, DEFAULT_CHUNK_ROWS, build_parts_from_raws};
 use crate::store::indexes::Indexes;
+use crate::store::layouts::dictionary::ingest::rebuild_from_codes;
+use crate::store::{RawQuad, Tail};
 
 use crate::store::VortexRdfStore;
 
@@ -69,12 +70,31 @@ impl VortexRdfStore {
                 .stream_compacted_to_file(indexes, path, file.identity())
                 .await;
         }
+        Self::from_built(self.rebuilt_parts(&indexes).await?)
+    }
+
+    /// This view's live quads, each once in (s, p, o, g) order, rebuilt into
+    /// fresh parts with `indexes` over them: what an in-memory compaction
+    /// and a mutated store's serialization build. Under the Dictionary layout
+    /// with its dictionary in memory they are rebuilt from the base rows'
+    /// codes ([`rebuild_from_codes`]): only the distinct terms those rows use
+    /// are decoded, once each, and the rows sort as integers. Otherwise from
+    /// the quads spelled out ([`sorted_live_raw_quads`](Self::sorted_live_raw_quads)).
+    pub(in crate::store) async fn rebuilt_parts(&self, indexes: &Indexes) -> Result<BuiltArray> {
+        if let Some(dict) = self.layout.resident_dictionary() {
+            let base = self.derived(self.quads.clone(), None);
+            if let Some(codes) = base.code_columns_gathered().await? {
+                let tail = self.tail.as_ref().map(Tail::raw_quads).transpose()?;
+                return rebuild_from_codes(
+                    dict,
+                    &codes,
+                    tail.as_deref().unwrap_or_default(),
+                    indexes,
+                );
+            }
+        }
         let raws = self.sorted_live_raw_quads().await?;
-        Self::from_built(build_parts_from_raws(
-            &raws,
-            self.layout.strategy(),
-            &indexes,
-        )?)
+        build_parts_from_raws(&raws, self.layout.strategy(), indexes)
     }
 
     /// Every live quad this view covers in (s, p, o, g) order, each once: the

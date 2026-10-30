@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::store::Backend;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
-use crate::store::builders::{BuiltArray, build_parts_from_raws};
+use crate::store::builders::BuiltArray;
 use crate::store::layouts::ResolvedLayout;
 
 use crate::store::VortexRdfStore;
@@ -95,8 +95,7 @@ impl VortexRdfStore {
             // each once, as every builder's output is, so the written
             // artifact carries the subject stamp and readers keep the
             // subject binary search and, on a file, the subject chunk probe.
-            let raws = self.sorted_live_raw_quads().await?;
-            return build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes);
+            return self.rebuilt_parts(&self.indexes).await;
         }
         let base = self.base_selected_rows().await?;
         let components = if owner_shaped && !tombstoned {

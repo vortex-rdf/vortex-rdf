@@ -596,6 +596,17 @@ pub(crate) enum Constraints {
 }
 
 impl ResolvedLayout {
+    /// The term dictionary, when it is in memory: `None` for the string
+    /// layouts and for a dictionary left in its file.
+    pub(crate) fn resident_dictionary(
+        &self,
+    ) -> Option<&std::sync::Arc<dictionary::TermDictionary>> {
+        match self {
+            ResolvedLayout::Dictionary(access) => access.resident(),
+            _ => None,
+        }
+    }
+
     /// The build-time strategy tag this layout was resolved from.
     pub(crate) fn strategy(&self) -> LayoutStrategy {
         match self {

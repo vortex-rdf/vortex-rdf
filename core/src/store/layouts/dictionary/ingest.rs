@@ -12,11 +12,13 @@ use std::sync::Arc;
 use futures::{Stream, StreamExt};
 use vortex_array::arrays::VarBinViewArray;
 
+use vortex_buffer::Buffer;
+
 use crate::debug;
-use crate::error::Result;
+use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::builders::{BuiltArray, build_components};
-use crate::store::indexes::{IndexInput, Indexes};
+use crate::store::indexes::{IndexInput, IndexType, Indexes};
 use crate::store::schema::TermCode;
 
 use super::codec::{QuadCodes, build_code_chunk};
@@ -72,6 +74,117 @@ impl TermDictionary {
         );
         Ok((dict, code_map))
     }
+}
+
+/// A Dictionary-layout store's parts rebuilt from its codes: `base`, its
+/// live base rows as `(s, p, o, g)` codes of `dict` in any order, and
+/// `tail`, its live tail quads as terms, become one sorted dataset, each
+/// quad once, over a fresh dictionary of exactly their terms, with
+/// `indexes`' components over it. These are the parts
+/// [`build_parts_from_raws`](crate::store::builders::build_parts_from_raws)
+/// builds from the same quads spelled out, without spelling a base row's
+/// terms: the distinct terms the base rows use are decoded once each and
+/// merged with the tail's own, every base code moves to its term's new code
+/// (code order being term order) and the rows sort as integers.
+pub(crate) fn rebuild_from_codes(
+    dict: &TermDictionary,
+    base: &[Buffer<TermCode>; 4],
+    tail: &[RawQuad],
+    indexes: &[IndexType],
+) -> Result<BuiltArray> {
+    #[cfg(test)]
+    rebuild_hooks::note_rebuilt();
+    let start = debug::timer();
+    let unknown = |code: TermCode| {
+        VortexRdfError::Serialization(format!("code {code} names no term of the dictionary"))
+    };
+    // The ranks of `dict` the base rows use, and the tail's own terms, each
+    // marked under its rank when `dict` holds it.
+    let mut used = vec![false; dict.len()];
+    for &code in base.iter().flat_map(|column| column.iter()) {
+        used[dict.rank_of(code).ok_or_else(|| unknown(code))?] = true;
+    }
+    let mut tail_terms: Vec<&str> = tail
+        .iter()
+        .flat_map(|q| [q.s.as_str(), q.p.as_str(), q.o.as_str(), q.g.as_str()])
+        .collect();
+    tail_terms.sort_unstable();
+    tail_terms.dedup();
+    let mut fresh: Vec<&str> = Vec::new();
+    for &term in &tail_terms {
+        match dict.encode_exact(term).and_then(|code| dict.rank_of(code)) {
+            Some(rank) => used[rank] = true,
+            None => fresh.push(term),
+        }
+    }
+    // The used terms in rank order merged with the fresh ones (sorted, as
+    // `tail_terms` was), each old rank beside its new one.
+    let mut terms: Vec<String> = Vec::new();
+    let mut new_rank_of = vec![usize::MAX; dict.len()];
+    let mut fresh_terms = fresh.iter().peekable();
+    for rank in (0..dict.len()).filter(|&rank| used[rank]) {
+        let term = dict
+            .decode(dict.code_at(rank))
+            .ok_or_else(|| unknown(dict.code_at(rank)))?;
+        while let Some(&&next) = fresh_terms.peek()
+            && next < term.as_str()
+        {
+            terms.push(next.to_owned());
+            fresh_terms.next();
+        }
+        new_rank_of[rank] = terms.len();
+        terms.push(term);
+    }
+    terms.extend(fresh_terms.map(|&term| term.to_owned()));
+    let fresh_dict = TermDictionary::from_sorted_column(VarBinViewArray::from_iter_str(
+        terms.iter().map(String::as_str),
+    ))?;
+    let recode = |code: TermCode| -> Result<TermCode> {
+        let rank = dict.rank_of(code).ok_or_else(|| unknown(code))?;
+        Ok(fresh_dict.code_at(new_rank_of[rank]))
+    };
+    let code_of = |term: &str| -> Result<TermCode> {
+        let rank = terms
+            .binary_search_by(|held| held.as_str().cmp(term))
+            .map_err(|_| VortexRdfError::Serialization(format!("tail term {term} lost")))?;
+        Ok(fresh_dict.code_at(rank))
+    };
+    let [s, p, o, g] = base;
+    let mut rows: Vec<[TermCode; 4]> = Vec::with_capacity(s.len() + tail.len());
+    for (((&s, &p), &o), &g) in s.iter().zip(p.iter()).zip(o.iter()).zip(g.iter()) {
+        rows.push([recode(s)?, recode(p)?, recode(o)?, recode(g)?]);
+    }
+    for q in tail {
+        rows.push([
+            code_of(&q.s)?,
+            code_of(&q.p)?,
+            code_of(&q.o)?,
+            code_of(&q.g)?,
+        ]);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    let mut codes = QuadCodes::with_capacity(rows.len());
+    for [s, p, o, g] in rows {
+        codes.s.push(s);
+        codes.p.push(p);
+        codes.o.push(o);
+        codes.g.push(g);
+    }
+    // The rows are in global (s, p, o, g) order: `s` is stamped sorted.
+    let array = build_code_chunk(&codes, 0..codes.s.len(), true)?;
+    let components = build_components(indexes, IndexInput::Codes(&codes))?;
+    log::debug!(
+        "[Dictionary] Rebuilt {} quads over {} terms from their codes in {:?}",
+        codes.s.len(),
+        fresh_dict.len(),
+        debug::elapsed(start)
+    );
+    Ok(BuiltArray {
+        array,
+        components,
+        dict: Some(Arc::new(fresh_dict)),
+    })
 }
 
 /// Freeze `interner`'s dictionary and build the single-chunk
@@ -238,5 +351,26 @@ impl InterningQuadBuilder {
             debug::elapsed(total_start)
         );
         Ok((dict, codes))
+    }
+}
+
+/// Test hook: how many stores this thread rebuilt from their codes
+/// ([`rebuild_from_codes`]).
+#[cfg(test)]
+pub(crate) mod rebuild_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REBUILT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one rebuild from codes.
+    pub(super) fn note_rebuilt() {
+        REBUILT.set(REBUILT.get() + 1);
+    }
+
+    /// The rebuilds from codes on this thread so far.
+    pub(crate) fn rebuilt() -> usize {
+        REBUILT.get()
     }
 }
