@@ -34,7 +34,7 @@ class ChunkedTransferTest {
 	}
 
 	/** The oracle's rows matching a pattern, tab-joined, in the oracle's order. */
-	private static List<String> inOracleOrder(String[] pattern) {
+	static List<String> inOracleOrder(String[] pattern) {
 		return VortexStoreTest.quads.stream().filter(q -> {
 			for (int i = 0; i < 4; i++) {
 				if (pattern[i] != null && !pattern[i].equals(q[i])) {
@@ -46,7 +46,7 @@ class ChunkedTransferTest {
 	}
 
 	/** Rows tab-joined, in their order. */
-	private static List<String> joined(List<String[]> rows) {
+	static List<String> joined(List<String[]> rows) {
 		return rows.stream().map(VortexStoreTest::key).collect(Collectors.toList());
 	}
 

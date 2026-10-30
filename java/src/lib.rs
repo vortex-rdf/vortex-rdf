@@ -26,6 +26,7 @@ use jni::strings::JNIString;
 use jni::sys::{jboolean, jint, jlong};
 use jni::{Env, EnvUnowned, jni_str};
 use payload::{Limits, Pace, Payload};
+use streams::{CodeStream, TermStream};
 use vortex_rdf_core::CodePattern;
 
 /// A native call's failure: the store's own, or a JNI call's.
@@ -186,6 +187,30 @@ fn java_strings<'local, 'a>(
         }
     }
     Ok(array)
+}
+
+/// The first `max_rows` rows of the direct buffer `buf`, `ROW_BYTES` each, for `call` to write codes into; an
+/// error naming `call` when `buf` is not a direct buffer of that many rows.
+fn direct_rows<'a>(
+    env: &Env<'_>,
+    buf: &JByteBuffer<'_>,
+    max_rows: jint,
+    call: &str,
+) -> Result<&'a mut [[u8; ROW_BYTES]], Failure> {
+    let not_a_buffer = || format!("{call}: not a direct buffer of 32 * maxRows bytes");
+    let addr = env
+        .get_direct_buffer_address(buf)
+        .map_err(|_| not_a_buffer())?;
+    let capacity = env
+        .get_direct_buffer_capacity(buf)
+        .map_err(|_| not_a_buffer())?;
+    let rows = max_rows.max(0) as usize;
+    if rows.checked_mul(ROW_BYTES).is_none_or(|len| len > capacity) {
+        return Err(not_a_buffer().into());
+    }
+    // SAFETY: the buffer's memory holds `rows` rows (checked above) and stays valid for the native call, the
+    // Java caller holding the buffer.
+    Ok(unsafe { std::slice::from_raw_parts_mut(addr.cast::<[u8; ROW_BYTES]>(), rows) })
 }
 
 /// A term code from a `long`: `None` for `-1` (and any negative value).
@@ -360,6 +385,121 @@ pub extern "system" fn Java_org_vortexrdf_Native_cursorClose<'local>(
     call(&mut env, |_| {
         // SAFETY: as for `cursorNext`, and nothing uses the cursor afterwards.
         unsafe { Handle::<QuadCursor>::close(cursor) };
+        Ok(())
+    })
+}
+
+/// The native stream behind a Java iterator: its terms, or its codes.
+enum Stream {
+    Terms(TermStream),
+    Codes(CodeStream),
+}
+
+/// A read of the quads matching a pattern as a stream of chunks of at most `batchRows` rows, in base row
+/// order; the pattern is parsed and matched now. Returns the stream's handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_termStreamOpen<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    h: jlong,
+    s: JString<'local>,
+    p: JString<'local>,
+    o: JString<'local>,
+    g: JString<'local>,
+    batch_rows: jint,
+) -> jlong {
+    call(&mut env, |env| {
+        let [s, p, o, g] = [
+            term(env, &s)?,
+            term(env, &p)?,
+            term(env, &o)?,
+            term(env, &g)?,
+        ];
+        let stream = store(h).term_stream(
+            s.as_deref(),
+            p.as_deref(),
+            o.as_deref(),
+            g.as_deref(),
+            batch_rows.max(0) as usize,
+        )?;
+        Ok(Handle::open(Stream::Terms(stream)))
+    })
+}
+
+/// A term stream's next payload of at most `chunkRows` rows and `chunkBytes` bytes of terms (`Payload.java`,
+/// its last slot `null`); `null` once every row was sent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_termStreamNext<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    stream: jlong,
+    chunk_rows: jint,
+    chunk_bytes: jint,
+    large_term: jint,
+) -> JObjectArray<'local, JObject<'local>> {
+    call(&mut env, |env| {
+        let limits = limits(chunk_rows, chunk_bytes, large_term)?;
+        // SAFETY: the Java side passes a stream `termStreamOpen` returned, before freeing it, one call at a
+        // time (its `NativeStream` serializes them).
+        let Stream::Terms(terms) = (unsafe { Handle::<Stream>::get(stream) }) else {
+            return Err("termStreamNext: not a term stream".into());
+        };
+        match terms.next(limits)? {
+            Some(payload) => java_payload(env, &payload, None),
+            None => Ok(JObjectArray::default()),
+        }
+    })
+}
+
+/// A read of the quads matching a code pattern (`-1` is free) as a stream of their codes, in chunks of at
+/// most `batchRows` rows, in base row order. Returns the stream's handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_codeStreamOpen<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    h: jlong,
+    s: jlong,
+    p: jlong,
+    o: jlong,
+    g: jlong,
+    batch_rows: jint,
+) -> jlong {
+    call(&mut env, |_| {
+        let stream = store(h).code_stream(pattern(s, p, o, g), batch_rows.max(0) as usize)?;
+        Ok(Handle::open(Stream::Codes(stream)))
+    })
+}
+
+/// Writes a code stream's next rows, up to `maxRows`, from the start of the direct buffer `buf` as
+/// `matchCodes` writes them. Returns the rows written, 0 once every row was.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_codeStreamNext<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    stream: jlong,
+    buf: JByteBuffer<'local>,
+    max_rows: jint,
+) -> jint {
+    call(&mut env, |env| {
+        let out = direct_rows(env, &buf, max_rows, "codeStreamNext")?;
+        // SAFETY: as for `termStreamNext`.
+        let Stream::Codes(codes) = (unsafe { Handle::<Stream>::get(stream) }) else {
+            return Err("codeStreamNext: not a code stream".into());
+        };
+        Ok(codes.next(out)? as jint)
+    })
+}
+
+/// Frees a term or code stream; `0` is a no-op.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_streamClose<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    stream: jlong,
+) {
+    call(&mut env, |_| {
+        // SAFETY: as for `termStreamNext`, and nothing uses the stream afterwards.
+        unsafe { Handle::<Stream>::close(stream) };
         Ok(())
     })
 }
@@ -556,20 +696,7 @@ pub extern "system" fn Java_org_vortexrdf_Native_matchCodes<'local>(
     max_rows: jint,
 ) -> jint {
     call(&mut env, |env| {
-        const NOT_A_BUFFER: &str = "matchCodes: not a direct buffer of 32 * maxRows bytes";
-        let addr = env
-            .get_direct_buffer_address(&buf)
-            .map_err(|_| NOT_A_BUFFER)?;
-        let capacity = env
-            .get_direct_buffer_capacity(&buf)
-            .map_err(|_| NOT_A_BUFFER)?;
-        let rows = max_rows.max(0) as usize;
-        if rows.checked_mul(ROW_BYTES).is_none_or(|len| len > capacity) {
-            return Err(NOT_A_BUFFER.into());
-        }
-        // SAFETY: the buffer's memory holds `rows` rows (checked above) and stays valid for this call, the Java
-        // caller holding the buffer.
-        let out = unsafe { std::slice::from_raw_parts_mut(addr.cast::<[u8; ROW_BYTES]>(), rows) };
+        let out = direct_rows(env, &buf, max_rows, "matchCodes")?;
         let written = store(h).match_codes(pattern(s, p, o, g), offset.max(0) as u64, out)?;
         Ok(written as jint)
     })

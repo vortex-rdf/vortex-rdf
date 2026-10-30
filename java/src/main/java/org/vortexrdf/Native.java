@@ -62,8 +62,23 @@ final class Native {
 	/** Frees a cursor; 0 is a no-op. */
 	static native void cursorClose(long cursor);
 
-	/** The native objects held by handle and not yet freed, in this process: cursors (and later streams). */
+	/** The native objects held by handle and not yet freed, in this process: cursors and streams. */
 	static native long openHandles();
+
+	/** A read of the matching quads as a stream of chunks of at most {@code batchRows} rows; its handle. */
+	static native long termStreamOpen(long handle, String s, String p, String o, String g, int batchRows);
+
+	/** A term stream's next chunk ({@link Payload}, its last slot null); null at the end. */
+	static native Object[] termStreamNext(long stream, int chunkRows, int chunkBytes, int largeTerm);
+
+	/** A read of the quads matching a pattern of codes (-1 is free) as a stream of their codes; its handle. */
+	static native long codeStreamOpen(long handle, long s, long p, long o, long g, int batchRows);
+
+	/** Writes a code stream's next rows, up to {@code maxRows}, as {@link #matchCodes} does; 0 at the end. */
+	static native int codeStreamNext(long stream, ByteBuffer out, int maxRows);
+
+	/** Frees a term or code stream; 0 is a no-op. */
+	static native void streamClose(long stream);
 
 	static native boolean hasDictionary(long handle);
 
