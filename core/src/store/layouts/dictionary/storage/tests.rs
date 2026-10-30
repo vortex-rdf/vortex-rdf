@@ -306,7 +306,7 @@ fn plaintext_terms_adopt_canonical() {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
 
     let single =
-        TermDictionary::from_term_chunks(vec![plain.clone().into_array()], &mut ctx).unwrap();
+        TermDictionary::from_term_chunks(vec![plain.clone().into_array()], &mut ctx, true).unwrap();
     assert!(matches!(single.terms.chunks[..], [TermChunk::Canonical(_)]));
     // A canonical chunk has no FSST code offsets to point at.
     assert_eq!(single.terms.chunks[0].offsets_addr(), None);
@@ -316,7 +316,7 @@ fn plaintext_terms_adopt_canonical() {
         column.slice(0..120).unwrap(),
         column.slice(120..300).unwrap(),
     ];
-    let chunked = TermDictionary::from_term_chunks(pieces, &mut ctx).unwrap();
+    let chunked = TermDictionary::from_term_chunks(pieces, &mut ctx, true).unwrap();
     let c = &chunked.terms;
     assert_eq!(c.chunks.len(), 2);
     assert_eq!(c.starts, vec![0, 120]);
@@ -350,7 +350,7 @@ async fn non_uniform_chunks_write_without_zone_maps() {
         column.slice(0..120).unwrap(),
         column.slice(120..300).unwrap(),
     ];
-    let d = TermDictionary::from_term_chunks(pieces, &mut ctx).unwrap();
+    let d = TermDictionary::from_term_chunks(pieces, &mut ctx, true).unwrap();
     assert_eq!(d.uniform_window(), None);
     let windowed = TermDictionary::compress_windowed(
         VarBinViewArray::from_iter_str(terms.iter().map(String::as_str)),
@@ -392,7 +392,7 @@ async fn unzoned_dict_child_point_reads_file_backed() {
         column.slice(0..120).unwrap(),
         column.slice(120..300).unwrap(),
     ];
-    let d = TermDictionary::from_term_chunks(pieces, &mut ctx).unwrap();
+    let d = TermDictionary::from_term_chunks(pieces, &mut ctx, true).unwrap();
     assert_eq!(d.uniform_window(), None);
     let bytes = crate::tests::write_dict_only_store(&d).await;
     let file = VORTEX_SESSION
@@ -426,4 +426,30 @@ async fn unzoned_dict_child_point_reads_file_backed() {
     for (code, term) in codes.iter().zip(&decoded) {
         assert_eq!(term.as_ref(), terms[*code as usize]);
     }
+}
+
+/// A build records whether every IRI is spelled `<`, its text, `>`: any
+/// `<` term that does not close (a lone `<`, an IRI cut short, text past
+/// the `>`) clears it, the terms around the IRIs never do, and a dictionary
+/// with no IRI has it.
+#[test]
+fn a_build_records_whether_its_iris_are_bracketed() {
+    let build = |extra: &[&str]| {
+        let mut terms = vec!["", "\"a\"", ";", "<>", "<http://ex.org/a>", "=", "_:b0"];
+        terms.extend_from_slice(extra);
+        terms.sort_unstable();
+        TermDictionary::compress_windowed(VarBinViewArray::from_iter_str(terms), 2).unwrap()
+    };
+    assert!(build(&[]).bracketed_iris());
+    assert!(build(&["<a>", "<b>"]).bracketed_iris());
+    for foreign in ["<", "<a", "<é", "<a>b"] {
+        assert!(!build(&[foreign]).bracketed_iris(), "{foreign:?}");
+    }
+    let no_iri = VarBinViewArray::from_iter_str(["\"a\"", "_:b0"]);
+    assert!(
+        TermDictionary::compress_windowed(no_iri, 2)
+            .unwrap()
+            .bracketed_iris()
+    );
+    assert!(TermDictionary::empty().bracketed_iris());
 }

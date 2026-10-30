@@ -297,6 +297,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                     required: false,
                     // Per-chunk sorts only: the writer may not claim global order.
                     sorted: false,
+                    bracketed_iris: false,
                     dtype: copy_child_chunk::<String>(family, &[])
                         .unwrap()
                         .dtype()

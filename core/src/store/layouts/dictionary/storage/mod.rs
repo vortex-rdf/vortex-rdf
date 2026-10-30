@@ -22,7 +22,7 @@ use crate::io::read::scan_reader_chunks;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{StrColReader, trusted_str};
 
-use super::term_dict::TermDictionary;
+use super::term_dict::{TermDictionary, lower_bound_by};
 
 /// The `dictionary` child's single column: non-nullable utf8, row i the term
 /// with code i, globally sorted. Wire contract, owned here per the rule in
@@ -125,6 +125,20 @@ pub(super) fn chunk_of(starts: &[usize], i: usize) -> (usize, usize) {
     (chunk, i - starts[chunk])
 }
 
+/// Whether every IRI of the sorted terms `plain` (the run of terms starting
+/// with `<`) is spelled `<`, its text, `>`: what lets a `STR()` prefix over
+/// IRIs be decided by a code range ([`TermDictionary::filter_codes`]). Two
+/// binary searches find the run, and only its terms' ends are looked at.
+fn iris_bracketed(plain: &VarBinViewArray) -> bool {
+    let terms = StrColReader::new(plain);
+    let len = plain.len();
+    let lo = lower_bound_by(0..len, |i| terms.bytes_at(i) < b"<".as_slice());
+    // `=` is the byte after `<`: from `lo`, the terms below it start with `<`.
+    let hi = lower_bound_by(lo..len, |i| terms.bytes_at(i) < b"=".as_slice());
+    // Each starts with `<`, so one ending with `>` is two bytes at least.
+    (lo..hi).all(|i| terms.bytes_at(i).ends_with(b">"))
+}
+
 impl ResidentChunks {
     /// The column `chunks` concatenate to; at least one chunk.
     fn new(chunks: Vec<TermChunk>) -> Self {
@@ -190,15 +204,19 @@ impl ResidentChunks {
 
 impl TermDictionary {
     /// A dictionary of no terms, held canonical: there is nothing to train
-    /// FSST on.
+    /// FSST on. With no IRI, every IRI is bracketed.
     pub(crate) fn empty() -> Self {
-        Self::new(ResidentChunks::new(vec![TermChunk::Canonical(
-            VarBinViewArray::from_iter_str(std::iter::empty::<&str>()),
-        )]))
+        Self::new(
+            ResidentChunks::new(vec![TermChunk::Canonical(VarBinViewArray::from_iter_str(
+                std::iter::empty::<&str>(),
+            ))]),
+            true,
+        )
     }
 
     /// A dictionary of `plain`'s sorted unique terms, FSST-compressed in
-    /// windows ([`compress`](Self::compress)); a `Serialization` error past
+    /// windows ([`compress`](Self::compress)), recording whether its IRIs
+    /// are bracketed ([`iris_bracketed`]); a `Serialization` error past
     /// `i32::MAX` terms.
     pub(crate) fn from_sorted_column(plain: VarBinViewArray) -> Result<Self> {
         // A conservative cap, not a format limit: nothing in the format needs
@@ -217,10 +235,13 @@ impl TermDictionary {
     }
 
     /// The dictionary of a term column's `chunks`, each adopted through
-    /// [`TermChunk::from_wire`]; empty chunks are dropped.
+    /// [`TermChunk::from_wire`], its IRIs bracketed as `bracketed_iris` says
+    /// (the provenance of the child they were read from); empty chunks are
+    /// dropped.
     fn from_term_chunks(
         chunks: Vec<ArrayRef>,
         ctx: &mut vortex_array::ExecutionCtx,
+        bracketed_iris: bool,
     ) -> Result<Self> {
         let mut adopted = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -232,7 +253,7 @@ impl TermDictionary {
         if adopted.is_empty() {
             return Ok(Self::empty());
         }
-        Ok(Self::new(ResidentChunks::new(adopted)))
+        Ok(Self::new(ResidentChunks::new(adopted), bracketed_iris))
     }
 
     /// `plain` FSST-compressed in windows of [`DICT_CHUNK_ROWS`] terms: one
@@ -248,10 +269,12 @@ impl TermDictionary {
     /// [`compress`](Self::compress) in windows of `window` terms, so tests
     /// reach the multi-window path with few terms.
     pub(super) fn compress_windowed(plain: VarBinViewArray, window: usize) -> Result<Self> {
+        let bracketed_iris = iris_bracketed(&plain);
         if plain.is_empty() {
-            return Ok(Self::new(ResidentChunks::new(vec![TermChunk::Canonical(
-                plain,
-            )])));
+            return Ok(Self::new(
+                ResidentChunks::new(vec![TermChunk::Canonical(plain)]),
+                bracketed_iris,
+            ));
         }
         let start = debug::timer();
         let len = plain.len();
@@ -286,7 +309,7 @@ impl TermDictionary {
             debug::elapsed(start),
             chunks.len()
         );
-        Ok(Self::new(ResidentChunks::new(chunks)))
+        Ok(Self::new(ResidentChunks::new(chunks), bracketed_iris))
     }
 }
 
@@ -491,10 +514,14 @@ impl DictCursor<'_> {
 
 impl TermDictionary {
     /// The resident dictionary of a `dictionary` child's whole term column,
-    /// each scan chunk adopted as one chunk ([`TermChunk::from_wire`]). The
-    /// scan runs inline ([`scan_reader_chunks`]), with no runtime handle, so
-    /// it serves every open path, wasm's included.
-    pub(crate) async fn from_child_reader(reader: vortex_layout::LayoutReaderRef) -> Result<Self> {
+    /// each scan chunk adopted as one chunk ([`TermChunk::from_wire`]), its
+    /// IRIs bracketed as the child's descriptor records (`bracketed_iris`).
+    /// The scan runs inline ([`scan_reader_chunks`]), with no runtime
+    /// handle, so it serves every open path, wasm's included.
+    pub(crate) async fn from_child_reader(
+        reader: vortex_layout::LayoutReaderRef,
+        bracketed_iris: bool,
+    ) -> Result<Self> {
         if reader.row_count() == 0 {
             return Ok(Self::empty());
         }
@@ -504,7 +531,7 @@ impl TermDictionary {
             let struct_arr = chunk.execute::<StructArray>(&mut ctx)?;
             chunks.push(struct_arr.unmasked_field_by_name(COL_DICT_TERM)?.clone());
         }
-        Self::from_term_chunks(chunks, &mut ctx)
+        Self::from_term_chunks(chunks, &mut ctx, bracketed_iris)
     }
 }
 
@@ -549,6 +576,7 @@ impl TermDictionary {
                 version: container::DICT_VERSION,
                 required: true,
                 sorted: true,
+                bracketed_iris: self.bracketed_iris(),
                 dtype,
             },
             Arc::new(BufferedComponentSource::try_new(chunks)?),

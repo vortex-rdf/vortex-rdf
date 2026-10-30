@@ -134,7 +134,7 @@ Two kinds of child:
 
 ### 3.1 The inventory
 
-The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L185))
+The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L193))
 carried inside the Layout flatbuffer, so it is read with the footer:
 
 ```json
@@ -150,7 +150,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
                   { "name": "rid", "kind": "u64" } ] },
     { "name": "dictionary", "role": "dictionary",
       "implementation": "sorted-terms-fsst-v1", "version": 2,
-      "required": true, "sorted": true,
+      "required": true, "sorted": true, "bracketed_iris": true,
       "fields": [ { "name": "_dict_term", "kind": "utf8" } ] }
   ]
 }
@@ -167,6 +167,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `version` | the implementation's version, positive; a dictionary or index child above the version a reader reads (`DICT_VERSION`, `INDEX_VERSION`) fails the open ([§3](#3-the-store-root-vortex-rdfstorev2)) |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
 | `sorted` | the writer's provenance that the sort-key columns are *globally* sorted — a reader may binary-search the child only when this is set; absent means false |
+| `bracketed_iris` | dictionary children only: the writer's provenance that every IRI term (every term starting with `<`) is spelled `<`, its text, `>` — a reader may then decide a `STR()` prefix over IRIs by a code range ([§5](#5-the-dictionary-child)); written only when true, absent means false |
 | `fields` | the column shape in a closed vocabulary of non-nullable kinds: `u32`, `u64`, `utf8` |
 
 On open the layout checks that the child count is `1 + components.len()`,
@@ -267,10 +268,11 @@ the dtype alone decides the layout ([§4](#4-the-quad-table)).
 | `name` / `role` | `dictionary` / `dictionary` |
 | `implementation` / `version` | `sorted-terms-fsst-v1` / 2 ([`DICT_VERSION`](../core/src/io/container/mod.rs#L47)); version 1, without zone maps, is read the same way, and a higher version is refused at open |
 | `required` / `sorted` | `true` / `true` |
+| `bracketed_iris` | `true` when every IRI the writer wrote is spelled `<`, its text, `>` (always, from RDF this crate parsed; a term built by hand, as a `RawQuad`'s, may not be): a `STR()` prefix over the IRIs is then the code range of `<` and the prefix ([matching.md §16.4](matching.md#164-predicates-and-the-dictionary-handle)) |
 | schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage/mod.rs#L30): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
-| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage/mod.rs#L203)), not of the format |
+| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage/mod.rs#L221)), not of the format |
 
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36))
@@ -285,9 +287,9 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L238)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L244)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L163)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L166)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
@@ -489,7 +491,7 @@ kernel's decision; no segment cache sits in between.
 What a file store keeps for its lifetime, and what bounds it. The opened handle
 ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L36)) and the file-backed
 dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L163))
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L166))
 keep:
 
 | Kept | Bound |

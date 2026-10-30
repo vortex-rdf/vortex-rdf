@@ -813,13 +813,15 @@ fn probe_window(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// A term predicate over 4,096 candidate codes spread across the dictionary:
-/// the per-query FILTER evaluation (resident: a cursor read per code;
+/// the per-query FILTER evaluation (resident: a cursor read per code read;
 /// file-backed: the windows holding them).
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn narrow_filter_codes(bencher: divan::Bencher, residency: &DictResidency) {
     use vortex_rdf_core::{TermPredicate, TextOptions};
     let store = open_dict_store(*residency, bench_size());
-    // Over `STR()`: an IRI is a text only there, so its candidates are read.
+    // Over `STR()`: an IRI is a text only there. The build records its IRIs
+    // bracketed, so their candidates are decided by the prefix's code range
+    // and only the literals' are read.
     let options = TextOptions {
         as_str: true,
         ..TextOptions::default()

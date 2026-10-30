@@ -576,7 +576,9 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(!store.dict_reader().unwrap().is_file_backed());
-    assert!(store.dict_reader().unwrap().snapshot().is_some());
+    let snapshot = store.dict_reader().unwrap().snapshot().unwrap();
+    // The descriptor's provenance comes along: the IRIs are bracketed.
+    assert!(dict.bracketed_iris() && snapshot.0.bracketed_iris());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
     let p0 = iri("p0");
     assert_eq!(
@@ -768,7 +770,9 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
             &Default::default(),
         )
         .unwrap();
-    let lifted = TermDictionary::from_child_reader(reader).await.unwrap();
+    let lifted = TermDictionary::from_child_reader(reader, dict.bracketed_iris())
+        .await
+        .unwrap();
 
     // Multi-chunk, and every chunk still FSST.
     let chunks = lifted.term_chunks();
@@ -859,4 +863,31 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
         fb.encode_exact("\"object value 0099999\"").await.unwrap(),
         None
     );
+}
+
+/// A build's `bracketed_iris` is written in the dictionary child's
+/// descriptor and read back by every open: file-backed, lifted resident
+/// from it, and loaded from the bytes. A dictionary with an IRI that does
+/// not close writes it unset, and every open reads it so.
+#[tokio::test]
+async fn test_bracketed_iris_survive_every_open() {
+    use crate::store::layouts::dictionary::TermDictionary;
+    use vortex_array::arrays::VarBinViewArray;
+
+    for (iri, bracketed) in [("<http://ex.org/a>", true), ("<http://ex.org/a", false)] {
+        let dict =
+            TermDictionary::from_sorted_column(VarBinViewArray::from_iter_str(["\"a\"", iri]))
+                .unwrap();
+        assert_eq!(dict.bracketed_iris(), bracketed, "{iri}");
+        let bytes = crate::tests::write_dict_only_store(&dict).await;
+        let native = crate::tests::open_native_bytes(bytes.clone());
+        assert_eq!(native.dict_bracketed_iris(), bracketed, "{iri}");
+        let fb = FileBackedDict::open(&native).await.unwrap().unwrap();
+        assert_eq!(fb.bracketed_iris(), bracketed, "{iri}");
+        let lifted = fb.lift_resident().await.unwrap();
+        assert_eq!(lifted.bracketed_iris(), bracketed, "{iri}");
+        let loaded = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+        let snapshot = loaded.dict_reader().unwrap().snapshot().unwrap();
+        assert_eq!(snapshot.0.bracketed_iris(), bracketed, "{iri}");
+    }
 }

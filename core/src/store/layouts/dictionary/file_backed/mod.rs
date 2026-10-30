@@ -43,9 +43,9 @@ use self::cache::WindowCache;
 use super::predicates::{KindRanges, TermPredicate};
 use super::storage::{TermChunk, chunk_of};
 use super::term_dict::{
-    CodeSpace, TermDictionary, check_candidates, check_code, find_by, kind_verdicts,
-    lower_bound_by, next_lower_bound_by, prefix_range_from, prefix_successor, split_verdicts,
-    tolerant_fallback,
+    CodeSpace, TermDictionary, check_candidates, check_code, decide_iris, find_by,
+    iri_prefix_to_decide, kind_verdicts, lower_bound_by, next_lower_bound_by, prefix_range_from,
+    prefix_successor, split_verdicts, tolerant_fallback,
 };
 
 /// One flat leaf of the term column (one FSST window as written): the rank of
@@ -75,6 +75,9 @@ struct Windows {
     source: Arc<dyn SegmentSource>,
     /// The kind ranges, computed on first use.
     kinds: OnceLock<KindRanges>,
+    /// Whether every IRI is spelled `<`, its text, `>`: the child's
+    /// descriptor's `bracketed_iris` provenance, as `TermDictionary`'s.
+    bracketed_iris: bool,
     /// The rebuilt windows. The lock is held for a lookup or an insert, never
     /// across an `.await`.
     cache: Mutex<WindowCache>,
@@ -169,6 +172,12 @@ impl FileBackedDict {
 
     pub(crate) fn len(&self) -> usize {
         self.0.code_space.len()
+    }
+
+    /// Whether every IRI is spelled `<`, its text, `>` (the child's
+    /// descriptor says).
+    pub(crate) fn bracketed_iris(&self) -> bool {
+        self.0.bracketed_iris
     }
 
     /// The code of `term` exactly as spelled: the window whose bounds enclose
@@ -476,9 +485,10 @@ impl FileBackedDict {
     }
 
     /// `TermDictionary::filter_codes` over the file, under its precondition:
-    /// the candidates their kind does not decide are read through
-    /// [`visit_terms`](Self::visit_terms), so only the windows holding them
-    /// are read.
+    /// the candidates their kind does not decide, less the IRIs a `STR()`
+    /// prefix decides by its code range (whose two bounds read a window
+    /// each at most), are read through [`visit_terms`](Self::visit_terms),
+    /// so only the windows holding them are read.
     pub(crate) async fn filter_codes(
         &self,
         predicate: &TermPredicate,
@@ -486,7 +496,13 @@ impl FileBackedDict {
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         check_candidates(codes, self.0.code_space)?;
         let kinds = self.kind_ranges().await?;
-        let (mut verdicts, read_at) = kind_verdicts(predicate, &kinds, codes);
+        let (mut verdicts, mut read_at) = kind_verdicts(predicate, &kinds, codes);
+        if let Some(prefix) =
+            iri_prefix_to_decide(predicate, self.bracketed_iris(), &kinds, codes, &read_at)
+        {
+            let passing = self.prefix_range(&format!("<{prefix}")).await?;
+            decide_iris(&mut verdicts, &mut read_at, codes, &kinds.iris, &passing);
+        }
         let read: Vec<TermCode> = read_at.iter().map(|&at| codes[at]).collect();
         self.visit_terms(&read, |j, spelling| {
             verdicts[read_at[j]] = predicate.eval(spelling);
@@ -504,7 +520,7 @@ impl FileBackedDict {
         self.0
             .lifted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        TermDictionary::from_child_reader(self.0.reader.clone()).await
+        TermDictionary::from_child_reader(self.0.reader.clone(), self.bracketed_iris()).await
     }
 
     /// Whether a window read has had to wait ([`Windows::reads_wait`]).

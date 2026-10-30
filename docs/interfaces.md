@@ -231,13 +231,13 @@ valid.
   transactional engine therefore compacts on commit, or serves strings
   (`quads`, `row_chunks` on a string layout) while a tail exists, and
   re-takes the dictionary handle after the compaction.
-- A store opened by [`from_file`](../core/src/store/persist/open.rs#L238)
+- A store opened by [`from_file`](../core/src/store/persist/open.rs#L244)
   reads its memory-mapped file in place, and so does every view, partition
   and stream derived from it: the file must not be truncated or rewritten
   while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
-  [`from_file_in_memory`](../core/src/store/persist/open.rs#L248) loads the
+  [`from_file_in_memory`](../core/src/store/persist/open.rs#L254) loads the
   file whole instead and never reads it again.
 
 ## 6. A store file through vortex's reader

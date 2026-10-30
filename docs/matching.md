@@ -1400,8 +1400,14 @@ position.
 `filter_codes(&TermPredicate, codes)` evaluates the predicate over the
 *candidate* codes a query produced — sorted and unique — and answers
 `(passed, undecided)`, both subsets of the candidates; a candidate in
-neither fails. A candidate whose kind range decides it is not read; every
-other one's spelling is read and evaluated. No verdict is memoized. Kinds:
+neither fails. A candidate whose kind range decides it is not read. Nor is
+an IRI under a `STR()` prefix — `str_prefix`, or `strstarts` with a plain
+string, with no `case` and no `>` in the prefix — when the dictionary
+records its IRIs bracketed (`bracketed_iris`,
+[file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)):
+it passes exactly when its code is in the range of `<` and the prefix.
+Every other candidate's spelling is read and evaluated. No verdict is
+memoized. Kinds:
 `is_literal`, `is_iri`, `is_blank`, `datatype`, `lang`,
 `lang_matches`, `num_*` (values beyond 64 bits for `xsd:long`/
 `xsd:unsignedLong` are undecided), and the string kinds `str_prefix`,

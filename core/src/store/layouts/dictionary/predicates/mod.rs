@@ -355,6 +355,16 @@ impl TermPredicate {
         }
     }
 
+    /// The prefix an IRI's `STR()` text must start with to pass, when that
+    /// is the whole test ([`TextPredicate::iri_prefix`]); `None` for any
+    /// other predicate.
+    pub(super) fn iri_prefix(&self) -> Option<&str> {
+        match self {
+            TermPredicate::Text(text) => text.iri_prefix(),
+            _ => None,
+        }
+    }
+
     /// The `(kind, arg)` pair [`Display`](fmt::Display) prints. The kind
     /// and numeric predicates print a pair `parse` accepts back; a string
     /// kind's `arg` also names its options (` [lower]`, ` [upper]`,

@@ -117,6 +117,7 @@ impl FileBackedDict {
             code_space: CodeSpace::new(start),
             source,
             kinds: OnceLock::new(),
+            bracketed_iris: native.dict_bracketed_iris(),
             cache: Mutex::new(WindowCache::new(budget)),
             reads_wait: AtomicBool::new(false),
             #[cfg(test)]

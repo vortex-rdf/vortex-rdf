@@ -33,6 +33,11 @@ pub(crate) struct TermDictionary {
     code_space: CodeSpace,
     /// The kind ranges, computed on first use.
     kinds: OnceLock<KindRanges>,
+    /// Whether every IRI is spelled `<`, its text, `>`: read from the terms a
+    /// build compresses, else the provenance of the child they were read
+    /// from. Lets [`filter_codes`](Self::filter_codes) decide a `STR()`
+    /// prefix over IRIs by a code range.
+    bracketed_iris: bool,
 }
 
 /// The rank of `code` in a dictionary of `len` terms from `base`; `None` when
@@ -128,14 +133,28 @@ pub(crate) fn next_dictionary_id() -> u64 {
 }
 
 impl TermDictionary {
-    /// A dictionary over `terms`, under a fresh identity.
-    pub(super) fn new(terms: ResidentChunks) -> Self {
+    /// A dictionary over `terms`, under a fresh identity, its IRIs bracketed
+    /// as `bracketed_iris` says.
+    pub(super) fn new(terms: ResidentChunks, bracketed_iris: bool) -> Self {
         Self {
             id: next_dictionary_id(),
             code_space: CodeSpace::new(terms.len()),
             terms,
             kinds: OnceLock::new(),
+            bracketed_iris,
         }
+    }
+
+    /// Whether every IRI is spelled `<`, its text, `>`.
+    pub(crate) fn bracketed_iris(&self) -> bool {
+        self.bracketed_iris
+    }
+
+    /// Test hook: claim bracketed IRIs whatever the terms, so a test tells a
+    /// verdict from the code range from one from reading the term.
+    #[cfg(test)]
+    pub(crate) fn claim_bracketed_iris(&mut self, bracketed_iris: bool) {
+        self.bracketed_iris = bracketed_iris;
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -296,14 +315,23 @@ impl TermDictionary {
     /// inside the dictionary ([`check_candidates`]): `(passed, undecided)`,
     /// both ascending subsets of `codes`; a candidate in neither failed. Only
     /// the candidates their kind does not decide
-    /// ([`TermPredicate::kind_verdict`]) are read. Nothing is memoized.
+    /// ([`TermPredicate::kind_verdict`]) are read, less the IRIs a `STR()`
+    /// prefix decides by its code range ([`decide_iris`]). Nothing is
+    /// memoized.
     pub(crate) fn filter_codes(
         &self,
         predicate: &TermPredicate,
         codes: &[TermCode],
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         check_candidates(codes, self.code_space)?;
-        let (mut verdicts, read) = kind_verdicts(predicate, self.kind_ranges(), codes);
+        let kinds = self.kind_ranges();
+        let (mut verdicts, mut read) = kind_verdicts(predicate, kinds, codes);
+        if let Some(prefix) =
+            iri_prefix_to_decide(predicate, self.bracketed_iris, kinds, codes, &read)
+        {
+            let passing = self.prefix_range(&format!("<{prefix}"));
+            decide_iris(&mut verdicts, &mut read, codes, &kinds.iris, &passing);
+        }
         let mut cursor = self.cursor();
         for at in read {
             // In range: the candidates were checked above.
@@ -477,6 +505,49 @@ pub(super) fn kind_verdicts(
         })
         .collect();
     (verdicts, read)
+}
+
+/// The prefix whose code range decides the IRI candidates
+/// [`kind_verdicts`] left to `read` ([`decide_iris`]): `predicate`'s
+/// ([`TermPredicate::iri_prefix`]), when the dictionary's IRIs are all
+/// bracketed and an IRI is among the candidates to read. `None` otherwise:
+/// they are read.
+pub(super) fn iri_prefix_to_decide<'p>(
+    predicate: &'p TermPredicate,
+    bracketed_iris: bool,
+    kinds: &KindRanges,
+    codes: &[TermCode],
+    read: &[usize],
+) -> Option<&'p str> {
+    if !bracketed_iris {
+        return None;
+    }
+    let prefix = predicate.iri_prefix()?;
+    read.iter()
+        .any(|&at| kinds.iris.contains(&codes[at]))
+        .then_some(prefix)
+}
+
+/// Takes the IRI candidates out of `read`, each with its verdict from
+/// `passing`, the code range of `<` and an [`iri_prefix_to_decide`]: every
+/// IRI spelled `<`, its text, `>` and the prefix holding no `>`, an IRI's
+/// `STR()` starts with the prefix exactly when its spelling starts with `<`
+/// and the prefix. The other candidates stay to be read.
+pub(super) fn decide_iris(
+    verdicts: &mut [Verdict],
+    read: &mut Vec<usize>,
+    codes: &[TermCode],
+    iris: &Range<TermCode>,
+    passing: &Range<TermCode>,
+) {
+    read.retain(|&at| {
+        let code = codes[at];
+        if !iris.contains(&code) {
+            return true;
+        }
+        verdicts[at] = Verdict::from(passing.contains(&code));
+        false
+    });
 }
 
 /// The candidates' verdicts as `(passed, undecided)`, both ascending

@@ -482,9 +482,10 @@ def test_pushdown_chunks(benchmark, stores, store_paths, residency, batch_rows):
 @pytest.mark.parametrize("kind", ["is_iri", "str_prefix"])
 def test_pushdown_filter_codes(benchmark, store_paths, kind):
     """A term predicate over candidate codes spread across the dictionary —
-    the per-query FILTER evaluation: a kind test reads nothing, a string
-    prefix over `STR()` reads the terms of the candidates their kind does not
-    decide (an IRI is a text only there)."""
+    the per-query FILTER evaluation: a kind test reads nothing, and so does a
+    string prefix over `STR()` of an IRI (an IRI is a text only there), which
+    its code range decides since the build records the IRIs bracketed; the
+    candidates neither decides are read."""
     from vortex_rdf import U64Column
 
     term_dict = VortexRdfStore(store_paths["triples::dict"]).term_dict()

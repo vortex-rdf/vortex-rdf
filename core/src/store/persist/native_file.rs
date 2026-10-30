@@ -363,6 +363,12 @@ impl NativeStoreFile {
         self.quads_sorted
     }
 
+    /// Whether the dictionary child records its IRIs bracketed (its
+    /// descriptor's `bracketed_iris`); `false` without one.
+    pub(crate) fn dict_bracketed_iris(&self) -> bool {
+        self.roster.dict_bracketed_iris
+    }
+
     /// The known index children of the file's roster, in inventory order.
     pub(in crate::store) fn index_children(&self) -> &[IndexChild] {
         &self.roster.index_children

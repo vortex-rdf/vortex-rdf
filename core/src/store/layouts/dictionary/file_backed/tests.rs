@@ -349,10 +349,11 @@ async fn filter_codes_rebuilds_only_candidate_windows() {
     let (fbd, _) = windowed_handle(600, 100).await;
     fbd.kind_ranges().await.unwrap();
     let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
-    // An IRI is a text only under `STR()`.
+    // An IRI is a text only under `STR()`; a `contains` reads it, where a
+    // prefix is a code range (below).
     let predicate = TermPredicate::parse_with(
-        "str_prefix",
-        "http://example.org/term/01",
+        "contains",
+        "\"term/01\"",
         &super::super::predicates::TextOptions {
             as_str: true,
             ..Default::default()
@@ -386,6 +387,127 @@ async fn filter_codes_rebuilds_only_candidate_windows() {
     assert_eq!(fbd.debug_windows_rebuilt(), before);
     assert_eq!(fbd.debug_windows_requested(), asked);
     assert!(passed.is_empty() && undecided.is_empty());
+}
+
+/// Over bracketed IRIs a `STR()` prefix (`str_prefix`, or `strstarts` with
+/// a plain string) decides the IRI candidates by its code range: nothing is
+/// read when both bounds are windows' first terms, and only the bounds'
+/// window when they fall inside one, not the candidates' windows.
+#[tokio::test]
+async fn an_iri_prefix_under_str_is_a_code_range() {
+    use super::super::predicates::TextOptions;
+
+    let (fbd, _) = windowed_handle(600, 100).await;
+    assert!(fbd.bracketed_iris());
+    fbd.kind_ranges().await.unwrap();
+    let options = TextOptions {
+        as_str: true,
+        ..Default::default()
+    };
+    for (kind, arg) in [
+        ("str_prefix", "http://example.org/term/01"),
+        ("strstarts", "\"http://example.org/term/01\""),
+    ] {
+        let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
+        let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
+        let (passed, undecided) = fbd
+            .filter_codes(&predicate, &[105, 150, 450])
+            .await
+            .unwrap();
+        // `<…/term/01` and `<…/term/02` lead windows 1 and 2.
+        assert_eq!(fbd.debug_windows_requested(), asked, "{kind}");
+        assert_eq!(fbd.debug_windows_rebuilt(), before, "{kind}");
+        assert_eq!(passed.as_slice(), &[105, 150], "{kind}");
+        assert!(undecided.is_empty(), "{kind}");
+    }
+    // `<…/term/015` and `<…/term/016` both fall inside window 1.
+    let predicate =
+        TermPredicate::parse_with("str_prefix", "http://example.org/term/015", &options).unwrap();
+    let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
+    let (passed, undecided) = fbd
+        .filter_codes(&predicate, &[105, 150, 155, 450])
+        .await
+        .unwrap();
+    assert_eq!(fbd.debug_windows_requested(), asked + 2);
+    assert_eq!(fbd.debug_windows_rebuilt(), before + 1);
+    assert_eq!(passed.as_slice(), &[150, 155]);
+    assert!(undecided.is_empty());
+}
+
+/// The code range stands in for reading the IRIs only over bracketed ones:
+/// claimed over an IRI that does not close, a prefix passes it by its
+/// spelling where reading it leaves it undecided. A prefix holding a `>`,
+/// a case wrapper and a tagged constant still read. Both residencies agree,
+/// the file-backed one taking the claim from the descriptor it was written
+/// with.
+#[tokio::test]
+async fn the_iri_range_stands_in_only_for_bracketed_iris() {
+    use super::super::predicates::{CaseMap, TextOptions};
+
+    let terms: Vec<String> = ["<a", "<ab>", "<b>"].map(String::from).into();
+    let (honest_native, honest) = native_over(&terms, 2).await;
+    let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+    let mut claimed = TermDictionary::compress_windowed(plain, 2).unwrap();
+    assert!(!honest.bracketed_iris() && !claimed.bracketed_iris());
+    claimed.claim_bracketed_iris(true);
+    let claimed_native =
+        crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&claimed).await);
+    let honest_fbd = FileBackedDict::open(&honest_native).await.unwrap().unwrap();
+    let claimed_fbd = FileBackedDict::open(&claimed_native)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!honest_fbd.bracketed_iris() && claimed_fbd.bracketed_iris());
+
+    // `(passed, undecided)`: what reading the three terms gives, and what a
+    // prefix decided by its range gives over them.
+    type Verdicts<'a> = (&'a [TermCode], &'a [TermCode]);
+    let all: [TermCode; 3] = [0, 1, 2];
+    let read: Verdicts = (&[1], &[0]);
+    let cases: [(&str, &str, Option<CaseMap>, Verdicts, Verdicts); 5] = [
+        ("str_prefix", "a", None, (&[0, 1], &[]), read),
+        ("strstarts", "\"a\"", None, (&[0, 1], &[]), read),
+        ("str_prefix", "ab>", None, (&[], &[0]), (&[], &[0])),
+        ("str_prefix", "a", Some(CaseMap::Lower), read, read),
+        ("strstarts", "\"a\"@en", None, (&[], &[0]), (&[], &[0])),
+    ];
+    for (kind, arg, case, claimed_want, honest_want) in cases {
+        let options = TextOptions {
+            as_str: true,
+            case,
+            ..Default::default()
+        };
+        let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
+        let why = format!("{kind} {arg:?} {case:?}");
+        for (got, want, residency) in [
+            (
+                claimed.filter_codes(&predicate, &all).unwrap(),
+                claimed_want,
+                "claimed, resident",
+            ),
+            (
+                claimed_fbd.filter_codes(&predicate, &all).await.unwrap(),
+                claimed_want,
+                "claimed, file-backed",
+            ),
+            (
+                honest.filter_codes(&predicate, &all).unwrap(),
+                honest_want,
+                "honest, resident",
+            ),
+            (
+                honest_fbd.filter_codes(&predicate, &all).await.unwrap(),
+                honest_want,
+                "honest, file-backed",
+            ),
+        ] {
+            assert_eq!(
+                (got.0.as_slice(), got.1.as_slice()),
+                want,
+                "{why}: {residency}"
+            );
+        }
+    }
 }
 
 /// A candidate list that is not ascending, unique and inside the

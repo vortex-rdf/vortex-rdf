@@ -407,6 +407,7 @@ impl ChildStream {
                 version: INDEX_VERSION,
                 required: false,
                 sorted: self.sorted,
+                bracketed_iris: false,
                 dtype,
             },
             self.source,

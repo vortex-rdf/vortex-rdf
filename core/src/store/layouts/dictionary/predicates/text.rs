@@ -244,6 +244,24 @@ impl TextPredicate {
         }
     }
 
+    /// The prefix an IRI's `STR()` text must start with to pass, when that
+    /// is the whole test: `str_prefix`, or `STRSTARTS` with a plain string
+    /// constant, under `STR()` and no case wrapper. `None` for any other
+    /// test, and for a prefix holding a `>`: no IRI's text starts with one,
+    /// but the code range of `<` and that prefix would take in the IRI the
+    /// `>` closes.
+    pub(super) fn iri_prefix(&self) -> Option<&str> {
+        if !self.as_str || self.case.is_some() {
+            return None;
+        }
+        let prefix = match &self.test {
+            TextTest::Prefix(prefix) => prefix,
+            TextTest::StartsWith(TextConstant::Text { text, lang: None }) => text,
+            _ => return None,
+        };
+        (!prefix.contains('>')).then_some(prefix.as_str())
+    }
+
     pub(super) fn eval(&self, spelling: &str, kind: Kind) -> Verdict {
         let (text, lang) = match self.text_of(spelling, kind) {
             Ok(text) => text,
