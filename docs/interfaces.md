@@ -15,7 +15,7 @@ tests pin each interface
 
 | What the engine needs | What it calls |
 |---|---|
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L77), [`code_chunks`](../core/src/store/read/chunks.rs#L127) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L153), [`index_components`](../core/src/store/read/metadata.rs#L227), [`partitions`](../core/src/store/read/metadata.rs#L262) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
@@ -45,10 +45,18 @@ chunk, both reading only the requested columns. On file a selection taken
 by id is taken one window of ids per pulled chunk; the scan reads the file
 split by split, a bounded window of splits in flight ahead of the pulls
 ([§2](#2-which-runtime-a-read-needs)); and a selection small enough for
-point reads is read at once, at the first poll. The scan, and a read by id
-with no filter pending, read only the requested columns. A served match
-materializes its row ids at the first poll, so its chunks come in base row
-order, never the index's.
+point reads is read at once, at the first poll. A pending filter of code
+equalities that no read by id serves (a bound `o` or `p` on a store without
+an index) is evaluated split by split, in file order, as the stream reaches
+each split, and the rows of a few whole splits, as many as a chunk holds,
+are read as the one-shot read reads them (below), so a sparse filter's
+chunks cost what its rows cost rather than a decode of every row of their
+splits. The scan, those masked reads, and a read by id with no filter
+pending read only the requested columns. A served match's chunks come in
+base row order, never the index's: `code_chunks` reads a file view's
+located run of at most 16 chunks, its row ids still pending, off the
+index's own columns and sorts it into base order; any other served match
+materializes its row ids at the first poll.
 
 `code_columns_gathered` is the one-shot form, for a match the caller has
 counted and will consume whole: one call answers all four columns,
@@ -56,13 +64,22 @@ zero-copy over the base's canonical code columns for a contiguous selection
 without tombstones. On a file view whose pending filter no read by id
 serves, it evaluates the filter's masks split by split first and then reads
 only the rows they keep, point by point, by one take, or by projecting each
-split at its mask, where the streams scan the file. The chunk stream is the
-form for a match consumed
+split at its mask, as the chunk streams do a few splits at a time. The chunk
+stream is the form for a match consumed
 incrementally or of unknown size, and the bindings reach it through
 `match_code_chunks` (Python) and `matchCodeChunks` (JS). A Python
 `match_codes` call given a cancel token returns its result when its gather
 completes before the cancel is observed, and raises `Cancelled` when the
 token is cancelled before the call or while the call waits for data.
+
+Two calls let a binding build its own chunked read of a pattern:
+[`code_probe`](../core/src/store/query/located.rs#L131) turns a `CodePattern` into
+the `Probe` that `match_code_pattern` runs when no located run answers it
+(`None` when no quad can match), for `run_probe` and then `code_chunks`;
+and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L94) decodes one of
+a string layout's `row_chunks` into `SharedQuad`s, each distinct term of the
+chunk once, as `shared_quads_vec` decodes it (a Dictionary store's chunks
+hold codes, which `dict_reader` decodes).
 
 **To Arrow.** vortex converts a chunk through its own session:
 `vortex_session().arrow().execute_arrow(chunk, None, &mut ctx)` (the
@@ -253,8 +270,9 @@ integration can register the file through vortex's own data source over it
 
 | Concern | File |
 |---|---|
-| `count_code_pattern`, `match_code_pattern`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
-| `row_chunks`, `code_chunks` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
+| `count_code_pattern`, `match_code_pattern`, `code_probe`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
+| `row_chunks`, `code_chunks`, `decode_row_chunk` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
+| A filtered file view's chunks, read by its masks | [`core/src/store/scan/masked_chunks.rs`](../core/src/store/scan/masked_chunks.rs) |
 | `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
 | The scan driver of a file view's reads | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs) |
 | `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |

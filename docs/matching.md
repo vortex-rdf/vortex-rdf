@@ -555,7 +555,7 @@ Each stage in the code, and where the details are below:
 | 1 · subject chunk probe and prefix | [`matching.rs:546-553`](../core/src/store/query/matching.rs#L546-L553 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L725), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`matching.rs:554-567`](../core/src/store/query/matching.rs#L554-L567 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L683) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:580-650`](../core/src/store/query/matching.rs#L580-L650 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L19) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:573-574`](../core/src/store/query/matching.rs#L573-L574 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L832) and [`matching.rs:658-672`](../core/src/store/query/matching.rs#L658-L672 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L754), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L684) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:573-574`](../core/src/store/query/matching.rs#L573-L574 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L832) and [`matching.rs:658-672`](../core/src/store/query/matching.rs#L658-L672 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L754), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L713) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`matching.rs:674-689`](../core/src/store/query/matching.rs#L674-L689 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L208) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -604,7 +604,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L684) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L713) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -972,9 +972,17 @@ splits holding them (`MaskedRead`): point by point, by one take, or, denser
 than a take, each split projected at its own mask, the filter not evaluated
 again. `quads_vec` and `shared_quads_vec` read and decode a take or a
 projection split by split, spawning the split reads when there is more than
-one and a tokio runtime is current. The streams (`quads()`, `row_chunks`,
-`code_chunks`, the data source) keep the restricted scan, which reads the file
-split by split as they are pulled.
+one and a tokio runtime is current. `quads()` and the export keep the
+restricted scan, which reads the file split by split as it is pulled. The
+chunk streams (`row_chunks`, `code_chunks`) read the masks as a stream
+([`split_mask_stream`](../core/src/store/scan/file_filter.rs#L433)), each
+split evaluated in file order as the stream reaches it, a few ahead, and
+gather whole splits until they keep a chunk's rows, which `MaskedRead` then
+reads as above
+([`masked_row_chunks`](../core/src/store/scan/masked_chunks.rs#L30)).
+Nothing is evaluated before the first poll; a stream of fewer rows a chunk
+than a zone holds evaluates its first split in pieces, as a window does; and
+a stream dropped early leaves the splits past its look-ahead unevaluated.
 
 `LazyRowIds` caches into a shared `OnceLock`, so the first consumer that needs
 the ids pays for them once and every clone of the view reads them back for free.
@@ -1224,7 +1232,7 @@ stopped at the first split that fills `offset + limit` rows — so `LIMIT`
 over a filtered scan costs the matching prefix of the file, not all of it.
 A loop that stops at fewer matches than a zone has rows (8,192: an
 `exists`, a small `LIMIT`) evaluates the splits in pieces
-([`early_exit_pieces`](../core/src/store/scan/file_filter.rs#L237)): the
+([`early_exit_pieces`](../core/src/store/scan/file_filter.rs#L238)): the
 first zone, then pieces four times the one before inside a split, which
 reach whole splits within the first, so matches in the first rows end the
 loop there; a loop that runs to the end evaluates its first split in a few
@@ -1249,9 +1257,8 @@ they read any filter's masks
 the ids the masks keep; with the ids kept, every read reads those. Ids are
 read as `ExactRead` reads exact ids: a point-sized set, or one of at most 16
 ids a split, at once; a set at a take's density by takes, one window of ids
-per pull for `code_chunks`, `row_chunks` and the data source, the whole set
-as one chunk for `quads()` and `shared_quad_chunks`; anything denser by a
-scan of those ids.
+per pull for `code_chunks` and `row_chunks`, the whole set as one chunk for
+`quads()` and `shared_quad_chunks`; anything denser by a scan of those ids.
 
 `size_capped(limit)` is `min(size, limit)` by the same loop
 (`count_matching_rows_capped`), and `exists()` is `size_capped(1) > 0` —

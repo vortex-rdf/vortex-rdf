@@ -904,6 +904,8 @@ limit_pairs!(
     Gathered (Index::ByCopy, Source::InMemory, [P, PO]) => match_codes_plain_dict_bycopy_mem / match_codes_limit_dict_bycopy_mem,
     // The chunk stream, the no-index file store.
     Chunks (Index::None, Source::File, [P, PO, O, G]) => chunks_codes_plain_dict_noindex_file / chunks_codes_limit_dict_noindex_file,
+    // The chunk stream, the by-copy file store: P, PO and O are index-served runs.
+    Chunks (Index::ByCopy, Source::File, [P, PO, O]) => chunks_codes_plain_dict_bycopy_file / chunks_codes_limit_dict_bycopy_file,
 );
 
 // ══════════════════════════════════════════════════════════════════════════
