@@ -871,6 +871,26 @@ fn narrow_filter_codes_text(bencher: divan::Bencher, kind: &str) {
     });
 }
 
+/// 256 subject IRIs spread across the dictionary encoded in one
+/// `encode_many`: the batch lookup a query engine runs over a `VALUES` block
+/// or a join's bound side.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_encode_many(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let dict = store.dict_reader().expect("dictionary handle");
+    let subjects = bench_moduli().n_subj;
+    let terms: Vec<String> = (0..256)
+        .map(|i| format!("<{}>", dataset::subject_iri((i * 7919) % subjects)))
+        .collect();
+    let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let codes = dict.encode_many(&terms).await.expect("encode_many");
+            black_box(codes.iter().flatten().count())
+        })
+    });
+}
+
 /// A batch of 64 subject probes in one `match_many`, gathered: the
 /// nested-loop join's shape, where a file-backed store overlaps the probes'
 /// reads.

@@ -237,9 +237,36 @@ impl TermDictionary {
         Ok(tolerant_fallback(term)?.and_then(|canonical| self.encode_exact(&canonical)))
     }
 
-    /// [`encode`](Self::encode) over a batch, in order.
+    /// [`encode`](Self::encode) over a batch, in order. The exact lookups
+    /// run in the terms' byte order, each searching only past where the one
+    /// before landed ([`next_lower_bound_by`]), every probe decoded into one
+    /// scratch buffer; then each miss takes its canonical spelling's lookup,
+    /// in input order, so the first malformed miss is the error, as the
+    /// lookups one at a time report it.
     pub(crate) fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
-        terms.iter().map(|term| self.encode(term)).collect()
+        let mut order: Vec<usize> = (0..terms.len()).collect();
+        order.sort_unstable_by_key(|&at| terms[at]);
+        let mut codes = vec![None; terms.len()];
+        let mut scratch = Vec::new();
+        let mut from = 0;
+        for (searched, &at) in order.iter().enumerate() {
+            let needle = terms[at].as_bytes();
+            let left = order.len() - searched;
+            let rank = next_lower_bound_by(from..self.len(), left, |i| {
+                self.terms.bytes_into(i, &mut scratch) < needle
+            });
+            if rank < self.len() && self.terms.bytes_into(rank, &mut scratch) == needle {
+                codes[at] = Some(self.code_at(rank));
+            }
+            from = rank;
+        }
+        for (code, term) in codes.iter_mut().zip(terms) {
+            if code.is_none() {
+                *code =
+                    tolerant_fallback(term)?.and_then(|canonical| self.encode_exact(&canonical));
+            }
+        }
+        Ok(codes)
     }
 
     /// [`decode`](Self::decode) over a batch, in order, each term handed to
@@ -344,6 +371,48 @@ pub(super) fn lower_bound_by(
     lo
 }
 
+/// The lower bound of the next of `left` sorted needles, `range` starting
+/// where the one before landed: galloped out from the start
+/// ([`gallop_lower_bound_by`]) while the needles left are more than the
+/// square root of the range, so that the next is likely near, else the
+/// range bisected ([`lower_bound_by`]). A bound `d` positions in costs about
+/// `2 log2(d)` probes galloped, against `log2` of the range bisected, so
+/// neither is ever much worse than one search of the whole dictionary per
+/// needle.
+pub(super) fn next_lower_bound_by(
+    range: Range<usize>,
+    left: usize,
+    is_below: impl FnMut(usize) -> bool,
+) -> usize {
+    if left.saturating_mul(left) > range.len() {
+        gallop_lower_bound_by(range, is_below)
+    } else {
+        lower_bound_by(range, is_below)
+    }
+}
+
+/// [`lower_bound_by`] for a bound expected near `range.start`: the probes
+/// step out from there, doubling each time, until one fails, then bisect the
+/// last step, so a bound `d` positions in costs about `2 log2(d)` probes
+/// however long the range.
+pub(super) fn gallop_lower_bound_by(
+    range: Range<usize>,
+    mut is_below: impl FnMut(usize) -> bool,
+) -> usize {
+    // Every position from `range.start` up to `lo` is below.
+    let (mut lo, end) = (range.start, range.end);
+    let mut step = 1;
+    while lo < end {
+        let probe = lo.saturating_add(step - 1).min(end - 1);
+        if !is_below(probe) {
+            return lower_bound_by(lo..probe, is_below);
+        }
+        lo = probe + 1;
+        step = step.saturating_mul(2);
+    }
+    end
+}
+
 /// The position of `range` where `cmp` is `Equal`, `cmp` being `Less` before
 /// it and `Greater` after it; `None` when no position is. A bisection that
 /// returns on the first hit.
@@ -432,6 +501,92 @@ mod tests {
     use super::super::storage::scratch_hooks;
     use super::*;
     use vortex_array::arrays::VarBinViewArray;
+
+    /// A batch lookup answers as the lookups one at a time, duplicates,
+    /// absent terms and a non-canonical spelling included, and decodes every
+    /// probe of its exact lookups into one scratch buffer. The galloping
+    /// bound agrees with the bisection wherever it starts.
+    #[test]
+    fn a_batch_lookup_answers_as_single_ones_through_one_scratch() {
+        let terms: Vec<String> = (0..1024)
+            .map(|i| format!("<http://example.org/term/{i:05}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let dict = TermDictionary::compress_windowed(plain, 32).unwrap();
+        let mut batch: Vec<&str> = (0..1024)
+            .rev()
+            .step_by(7)
+            .map(|i| terms[i].as_str())
+            .collect();
+        batch.extend([
+            terms[3].as_str(),
+            terms[3].as_str(),
+            "<http://example.org/term/00003x>",
+        ]);
+        batch.extend([
+            "<http://example.org/term/zzz>",
+            "<http://example.org/a>",
+            terms[1023].as_str(),
+        ]);
+        let fresh = scratch_hooks::fresh();
+        let codes = dict.encode_many(&batch).unwrap();
+        // The absent terms are spelled canonically already: none takes a
+        // second lookup.
+        assert_eq!(scratch_hooks::fresh() - fresh, 1);
+        let one_at_a_time: Vec<_> = batch.iter().map(|t| dict.encode(t).unwrap()).collect();
+        assert_eq!(codes, one_at_a_time);
+        // Each search runs only past the one before. Terms two apart gallop:
+        // under half the probes of the lookups one at a time. Terms sixteen
+        // apart gallop too, about 2 log2(16) probes each and an equality
+        // read. Terms 128 apart, too few to gallop, bisect what is left of
+        // the dictionary, never more than one search of it.
+        let probes = |batch: &[&str]| {
+            let reads = scratch_hooks::reads();
+            dict.encode_many(batch).unwrap();
+            scratch_hooks::reads() - reads
+        };
+        let every = |step: usize| -> Vec<&str> {
+            (0..1024).step_by(step).map(|i| terms[i].as_str()).collect()
+        };
+        let dense = every(2);
+        let reads = scratch_hooks::reads();
+        for term in &dense {
+            dict.encode_exact(term);
+        }
+        let single = scratch_hooks::reads() - reads;
+        let batched = probes(&dense);
+        assert!(
+            batched * 2 < single,
+            "{batched} probes, {single} one at a time"
+        );
+        let batched = probes(&every(16));
+        assert!(batched <= 64 * 10, "{batched} probes for 64 terms 16 apart");
+        let batched = probes(&every(128));
+        assert!(batched <= 8 * 11, "{batched} probes for 8 terms 128 apart");
+        // A tolerated spelling (no angle brackets) resolves through the
+        // fallback; a malformed miss is the error.
+        assert_eq!(
+            dict.encode_many(&["http://example.org/term/00010", terms[2].as_str()])
+                .unwrap(),
+            vec![Some(10), Some(2)]
+        );
+        assert!(
+            dict.encode_many(&[terms[0].as_str(), "\"unterminated"])
+                .is_err()
+        );
+
+        let values: Vec<usize> = (0..100).map(|i| i * 3).collect();
+        for start in 0..values.len() {
+            for needle in 0..310 {
+                let want = lower_bound_by(start..values.len(), |i| values[i] < needle);
+                assert_eq!(
+                    gallop_lower_bound_by(start..values.len(), |i| values[i] < needle),
+                    want,
+                    "from {start} for {needle}"
+                );
+            }
+        }
+    }
 
     /// A single-term read — an encode, a lower bound, a decode — decodes every
     /// probe into one scratch buffer, so it allocates one buffer however many

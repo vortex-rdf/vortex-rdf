@@ -360,7 +360,7 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage/mod.rs#L242)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage/mod.rs#L244)):
 one symbol table is trained on the whole column and the terms are compressed in
 independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36)
 (65,536) terms, each window a self-contained FSST array. The term count must

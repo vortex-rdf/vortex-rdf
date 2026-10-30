@@ -163,6 +163,8 @@ impl ResidentChunks {
     /// `scratch` from an FSST one. A single-term read passes one scratch
     /// through all its probes, where a cursor holds one per chunk.
     pub(super) fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        #[cfg(test)]
+        scratch_hooks::note_read();
         let (chunk, local) = self.locate(i);
         chunk.bytes_into(local, scratch)
     }
@@ -381,7 +383,7 @@ impl FsstTerms {
 }
 
 /// Test hooks: the FSST reads on this thread that allocated a fresh scratch,
-/// and those that grew one.
+/// and those that grew one; and the terms read by position.
 #[cfg(test)]
 pub(super) mod scratch_hooks {
     use std::cell::Cell;
@@ -389,6 +391,16 @@ pub(super) mod scratch_hooks {
     thread_local! {
         static FRESH: Cell<usize> = const { Cell::new(0) };
         static REGROWN: Cell<usize> = const { Cell::new(0) };
+        static READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_read() {
+        READS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The terms this thread read by position (`bytes_into`) so far.
+    pub(in crate::store::layouts::dictionary) fn reads() -> usize {
+        READS.with(Cell::get)
     }
 
     pub(super) fn note_fresh() {

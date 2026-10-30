@@ -168,6 +168,9 @@ conjunct), `window`/`size_capped`/`exists` (`LIMIT`, `OFFSET`, `ASK` without
 reading past the answer), `match_many`/`count_many` (a batch of probes;
 `run_probe`/`count_probe` for one), and the dictionary handle's
 `encode_many`, `prefix_range`, `filter_codes` and `kind_ranges`.
+`encode_many` looks its terms up in byte order, each search running only
+past the one before, and reads each window of a file-backed dictionary once
+for all the terms it holds.
 `filter_codes(predicate, candidates)` answers `(passed, undecided)`, both
 ascending subsets of the candidate codes: a candidate is decided only where
 the native rule is certain

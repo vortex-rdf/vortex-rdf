@@ -44,7 +44,8 @@ use super::predicates::{KindRanges, TermPredicate};
 use super::storage::{TermChunk, chunk_of};
 use super::term_dict::{
     CodeSpace, TermDictionary, check_candidates, check_code, find_by, kind_verdicts,
-    lower_bound_by, prefix_range_from, prefix_successor, split_verdicts, tolerant_fallback,
+    lower_bound_by, next_lower_bound_by, prefix_range_from, prefix_successor, split_verdicts,
+    tolerant_fallback,
 };
 
 /// One flat leaf of the term column (one FSST window as written): the rank of
@@ -316,12 +317,80 @@ impl FileBackedDict {
         }
     }
 
-    /// [`encode`](Self::encode) over a batch, in order, the lookups overlapped.
+    /// [`encode`](Self::encode) over a batch, in order. The exact lookups
+    /// run in the terms' byte order: a term at a window's bounds, below its
+    /// first term or past every window is answered without a read, and the
+    /// rest are grouped by window, each window read once (the reads
+    /// overlapped) and searched through one cursor, each search running only
+    /// past where the one before landed ([`next_lower_bound_by`]). Then each miss takes its
+    /// canonical spelling's lookup, in input order, so the first malformed
+    /// miss is the error, as the lookups one at a time report it.
     pub(crate) async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
-        futures::stream::iter(terms.iter().map(|term| self.encode(term)))
+        let inner = &*self.0;
+        let mut order: Vec<usize> = (0..terms.len()).collect();
+        order.sort_unstable_by_key(|&at| terms[at]);
+        let mut codes: Vec<Option<TermCode>> = vec![None; terms.len()];
+        // The windows to read, each beside its terms in byte order.
+        let mut reads: Vec<(usize, Vec<usize>)> = Vec::new();
+        for at in order {
+            let needle = terms[at].as_bytes();
+            let Some((w, window)) = inner.locate(needle) else {
+                continue;
+            };
+            match needle.cmp(&*window.first) {
+                Ordering::Less => continue,
+                Ordering::Equal => {
+                    codes[at] = Some(inner.code_space.code_at(window.start));
+                    continue;
+                }
+                Ordering::Greater => {}
+            }
+            if needle == &*window.last {
+                codes[at] = Some(inner.code_space.code_at(window.start + window.rows - 1));
+                continue;
+            }
+            match reads.last_mut() {
+                Some((last, ats)) if *last == w => ats.push(at),
+                _ => reads.push((w, vec![at])),
+            }
+        }
+        let hits: Vec<Vec<(usize, TermCode)>> = futures::stream::iter(reads)
+            .map(|(w, ats)| async move {
+                let window = &inner.windows[w];
+                let chunk = inner.window_chunk(w).await?;
+                let mut cursor = chunk.cursor();
+                // first < needle < last: a hit lies strictly inside.
+                let inside = window.rows - 1;
+                let mut from = 1;
+                let mut hits = Vec::new();
+                let count = ats.len();
+                for (searched, at) in ats.into_iter().enumerate() {
+                    let needle = terms[at].as_bytes();
+                    let local = next_lower_bound_by(from..inside, count - searched, |local| {
+                        cursor.bytes_at(local) < needle
+                    });
+                    if local < inside && cursor.bytes_at(local) == needle {
+                        hits.push((at, inner.code_space.code_at(window.start + local)));
+                    }
+                    from = local;
+                }
+                Ok::<_, VortexRdfError>(hits)
+            })
             .buffered(available_parallelism().max(4))
             .try_collect()
-            .await
+            .await?;
+        for (at, code) in hits.into_iter().flatten() {
+            codes[at] = Some(code);
+        }
+        for (at, term) in terms.iter().enumerate() {
+            if codes[at].is_none() {
+                codes[at] = match tolerant_fallback(term)? {
+                    Some(canonical) => self.encode_exact(&canonical).await?,
+                    None => None,
+                };
+            }
+        }
+        Ok(codes)
     }
 
     /// The code range of the terms spelled with `prefix`, as
