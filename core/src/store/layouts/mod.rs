@@ -17,6 +17,8 @@
 //! index modules own those columns and their names (see
 //! [`IndexType`](crate::store::indexes::IndexType)).
 
+use std::sync::Arc;
+
 #[cfg(feature = "file-io")]
 use futures::FutureExt as _;
 #[cfg(feature = "file-io")]
@@ -598,9 +600,7 @@ pub(crate) enum Constraints {
 impl ResolvedLayout {
     /// The term dictionary, when it is in memory: `None` for the string
     /// layouts and for a dictionary left in its file.
-    pub(crate) fn resident_dictionary(
-        &self,
-    ) -> Option<&std::sync::Arc<dictionary::TermDictionary>> {
+    pub(crate) fn resident_dictionary(&self) -> Option<&Arc<dictionary::TermDictionary>> {
         match self {
             ResolvedLayout::Dictionary(access) => access.resident(),
             _ => None,
@@ -644,17 +644,16 @@ impl ResolvedLayout {
 
     /// [`decode_chunk`](Self::decode_chunk) into [`SharedQuad`]s: terms as
     /// shared N-Triples strings, decoded once per distinct code under the
-    /// Dictionary layout; the string layouts read their columns as
-    /// [`raw_quads`](Self::raw_quads) does, one string per row.
+    /// Dictionary layout; the string layouts read each term in place
+    /// ([`shared_quads`](Self::shared_quads)).
     pub(crate) fn decode_chunk_shared(&self, chunk: &ArrayRef) -> Vec<Result<SharedQuad>> {
         match self {
-            ResolvedLayout::Default | ResolvedLayout::TypedObject => match self.raw_quads(chunk) {
-                Ok(raws) => raws
-                    .into_iter()
-                    .map(|raw| Ok(SharedQuad::from(raw)))
-                    .collect(),
-                Err(e) => vec![Err(e)],
-            },
+            ResolvedLayout::Default | ResolvedLayout::TypedObject => {
+                match self.shared_quads(chunk) {
+                    Ok(rows) => rows.into_iter().map(Ok).collect(),
+                    Err(e) => vec![Err(e)],
+                }
+            }
             ResolvedLayout::Dictionary(access) => match access.resident() {
                 Some(dict) => dictionary::decode_chunk_shared(chunk, dict),
                 None => vec![Err(VortexRdfError::Deserialization(
@@ -726,6 +725,52 @@ impl ResolvedLayout {
             .zip(o)
             .zip(g)
             .map(|(((s, p), o), g)| RawQuad { s, p, o, g })
+            .collect())
+    }
+
+    /// A string layout's rows as [`SharedQuad`]s. Each term is read in place
+    /// (a TypedObject object spelled from its sub-columns into one buffer)
+    /// and copied into a fresh `Arc<str>` only where it differs from the same
+    /// role's term in the row before, so a run of rows repeating a term, as
+    /// rows sorted by subject repeat their subject, predicate and graph,
+    /// shares one allocation. A Dictionary layout is an error here.
+    fn shared_quads(&self, rows: &ArrayRef) -> Result<Vec<SharedQuad>> {
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let struct_arr = rows.clone().execute::<StructArray>(&mut ctx)?;
+        let n = struct_arr.len();
+        let s = field_as::<VarBinViewArray>(&struct_arr, COL_S, &mut ctx)?;
+        let p = field_as::<VarBinViewArray>(&struct_arr, COL_P, &mut ctx)?;
+        let g = field_as::<VarBinViewArray>(&struct_arr, COL_G, &mut ctx)?;
+        let objects: Vec<Arc<str>> = match self {
+            ResolvedLayout::Default => {
+                let o = field_as::<VarBinViewArray>(&struct_arr, COL_O, &mut ctx)?;
+                shared_column(&o)
+            }
+            ResolvedLayout::TypedObject => {
+                let columns = typed_object::ObjectColumns::load(&struct_arr, &mut ctx)?;
+                let reader = columns.reader();
+                let mut spelling = String::new();
+                let mut run = None;
+                (0..n)
+                    .map(|i| {
+                        spelling.clear();
+                        reader.push_spelling(i, &mut spelling)?;
+                        Ok(shared_term(&mut run, &spelling))
+                    })
+                    .collect::<Result<_>>()?
+            }
+            ResolvedLayout::Dictionary(_) => {
+                return Err(VortexRdfError::Deserialization(
+                    "a Dictionary layout shares its terms by code".to_string(),
+                ));
+            }
+        };
+        Ok(shared_column(&s)
+            .into_iter()
+            .zip(shared_column(&p))
+            .zip(objects)
+            .zip(shared_column(&g))
+            .map(|(((s, p), o), g)| SharedQuad { s, p, o, g })
             .collect())
     }
 
@@ -841,6 +886,30 @@ fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String
     Ok((0..col.len())
         .map(|i| reader.str_at(i).to_string())
         .collect())
+}
+
+/// `term` as a shared string: `run`'s, the term of the row before, when the
+/// two are equal, else a fresh copy, which becomes `run`.
+fn shared_term(run: &mut Option<Arc<str>>, term: &str) -> Arc<str> {
+    if let Some(held) = run
+        && **held == *term
+    {
+        return Arc::clone(held);
+    }
+    let fresh: Arc<str> = Arc::from(term);
+    *run = Some(Arc::clone(&fresh));
+    fresh
+}
+
+/// A UTF-8 string column's terms as shared strings ([`shared_term`]), each
+/// run of equal terms one allocation. Unchecked UTF-8, as
+/// [`read_string_column`] reads.
+fn shared_column(col: &VarBinViewArray) -> Vec<Arc<str>> {
+    let reader = StrColReader::new(col);
+    let mut run = None;
+    (0..col.len())
+        .map(|i| shared_term(&mut run, reader.str_at(i)))
+        .collect()
 }
 
 fn read_code_column(struct_arr: &StructArray, name: &str) -> Result<Vec<TermCode>> {

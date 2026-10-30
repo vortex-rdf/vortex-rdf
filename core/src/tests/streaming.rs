@@ -100,6 +100,49 @@ async fn test_shared_quads_share_repeated_terms() {
     }
 }
 
+/// Under the string layouts each term is read in place and shared down a
+/// run of rows repeating it: a subject's rows hold one allocation of it, as
+/// do the runs of an object (a typed literal the TypedObject layout spells
+/// from its sub-columns) and of the graph, while the predicate, which
+/// changes from row to row, is one allocation per row. The rows are
+/// `quads_vec`'s.
+#[tokio::test]
+async fn test_shared_quads_share_runs_under_the_string_layouts() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let quads: Vec<Quad> = (0..4)
+        .flat_map(|s| {
+            (0..3).map(move |p| {
+                Quad::new(
+                    iri_subject(&format!("s{s}")),
+                    iri(&format!("p{p}")),
+                    Term::Literal(Literal::new_typed_literal(
+                        format!("{s}"),
+                        oxrdf::vocab::xsd::INTEGER,
+                    )),
+                    iri_graph("g"),
+                )
+            })
+        })
+        .collect();
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let store = built_store(quads.clone(), layout, vec![]).await;
+        let rows = store.shared_quads_vec().await.unwrap();
+        assert_shared_matches_quads(&store, &format!("{layout:?}")).await;
+        let allocations = |role: fn(&crate::store::SharedQuad) -> &Arc<str>| {
+            rows.iter()
+                .map(|row| Arc::as_ptr(role(row)) as *const u8)
+                .collect::<HashSet<_>>()
+                .len()
+        };
+        assert_eq!(allocations(|row| &row.s), 4, "{layout:?}: subjects");
+        assert_eq!(allocations(|row| &row.p), 12, "{layout:?}: predicates");
+        assert_eq!(allocations(|row| &row.o), 4, "{layout:?}: objects");
+        assert_eq!(allocations(|row| &row.g), 1, "{layout:?}: graphs");
+    }
+}
+
 /// An in-memory index-served match reads its shared rows off the serving
 /// index's columns, and a tombstoned derivative off the gather path; both
 /// must agree with `quads_vec`.

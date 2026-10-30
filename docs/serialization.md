@@ -336,7 +336,7 @@ full) or to a writable directory (any other failure).
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L52)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L54)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |
@@ -345,7 +345,7 @@ Every layout puts `s` first and stamps it when the rows are sorted.
 | `TypedObject` | `s`, `p`, `o_kind` (`u8`), `o_value` (`Utf8`), `o_datatype` (nullable `Utf8`), `o_lang` (nullable `Utf8`), `g` | as `Default`, with the object decomposed |
 | `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u64` | codes into one sorted dictionary |
 
-**TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L66)):
+**TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L67)):
 
 | `o_kind` | Object | `o_value` | `o_datatype` | `o_lang` |
 |---|---|---|---|---|

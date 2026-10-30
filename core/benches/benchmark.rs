@@ -323,6 +323,23 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
         });
 }
 
+/// Decode every quad in the store as shared-term rows (`shared_quads_vec()`
+/// → `Vec`), the read the bindings' term columns go through: one string per
+/// distinct term of a chunk under the Dictionary layout, one per run of rows
+/// repeating a term under the string layouts.
+#[divan::bench(args = DECODE_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn decode_all_shared(bencher: divan::Bencher, cfg: &DecodeCfg) {
+    let cfg = *cfg;
+    bencher
+        .with_inputs(|| make_store(cfg.source, cfg.layout, Index::None, bench_size()))
+        .bench_refs(|store| {
+            rt().block_on(async {
+                let quads = store.shared_quads_vec().await.expect("decode all shared");
+                black_box(quads.len())
+            })
+        });
+}
+
 /// [`decode_all`] over a literal-bearing dataset. The main dataset's literals
 /// are plain and escape-free, so this is the one benchmark whose decode reaches
 /// the language-tag, datatype and unescape paths.
