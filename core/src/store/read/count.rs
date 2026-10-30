@@ -6,6 +6,7 @@
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
+use crate::store::view::selection::ViewSelection;
 use crate::store::{QuadsSource, Tail, VortexRdfStore};
 
 impl VortexRdfStore {
@@ -54,7 +55,9 @@ impl VortexRdfStore {
 
     /// `min(size, limit)`, stopping once `limit` rows are known to exist: a
     /// pending file filter evaluates its splits in file order and stops at
-    /// the first that reaches the cap. Available on every layout.
+    /// the first that reaches the cap, and an in-memory residual compare a
+    /// count left pending compares its pieces in base row order and stops at
+    /// the first that does. Available on every layout.
     pub async fn size_capped(&self, limit: usize) -> Result<usize> {
         if limit == 0 {
             return Ok(0);
@@ -66,17 +69,17 @@ impl VortexRdfStore {
         Ok((base + self.tail_size()).min(limit))
     }
 
-    /// [`base_size`](Self::base_size), a pending file filter stopping at
-    /// `limit` matches; a window's kept masks answer first.
+    /// [`base_size`](Self::base_size), a pending file filter or residual
+    /// compare stopping at `limit` matches; a window's kept masks answer
+    /// first.
     async fn base_size_capped(&self, limit: usize) -> Result<usize> {
         if let Some(live) = self.quads.evaluated_len() {
             return Ok(live.min(limit));
         }
-        // PROTOTYPE (item 3): a pending residual compares only until `limit`
-        // rows are found.
-        if let (crate::store::view::selection::ViewSelection::Pending(lazy), None) =
-            (&self.quads.selection, &self.quads.deleted)
-            && let Some(count) = lazy.residual_count_capped(limit)?
+        // A residual compare left pending compares its pieces only until
+        // `limit` live rows are found.
+        if let ViewSelection::Pending(lazy) = &self.quads.selection
+            && let Some(count) = lazy.residual_count_capped(limit, self.quads.deleted.as_ref())?
         {
             return Ok(count);
         }

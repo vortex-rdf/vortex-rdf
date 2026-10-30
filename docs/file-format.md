@@ -357,8 +357,8 @@ Shared rules:
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L105)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L119))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L108)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L122))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match

@@ -32,6 +32,7 @@ mod mutation;
 mod names;
 mod narrowing;
 mod open_errors;
+mod pending_residual;
 mod predicates;
 mod roundtrip;
 mod row_limit;

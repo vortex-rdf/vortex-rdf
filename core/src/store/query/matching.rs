@@ -10,9 +10,12 @@ use crate::store::array::{
 };
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
-use crate::store::indexes::{IndexResolution, ResolvedRowIds, resolve_indexes_in_memory};
+use crate::store::indexes::{
+    IndexResolution, LazyRowIds, ResolvedRowIds, resolve_indexes_in_memory,
+};
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::probes::StructProbes;
+use crate::store::query::residual::PendingResidual;
 use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_exprs, file_filter, file_reads, subject_runs};
@@ -44,16 +47,27 @@ use vortex_array::expr::{Expression, and};
 use crate::store::VortexRdfStore;
 
 /// What the caller of a match does with the view's selection: whether a
-/// located index run may leave its row ids unread without a serve plan.
+/// located index run may leave its row ids unread without a serve plan, and
+/// an in-memory residual compare its rows uncompared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IdsNeed {
     /// The view may be read row by row: every resolution's ids are computed,
     /// or deferred behind a serve plan (the public `match_pattern`).
     Rows,
-    /// The view is only counted (`size`, `size_capped`) or windowed: a run
-    /// whose width is known keeps its ids deferred, so a count reads none
-    /// and a window reads only the rows it takes.
-    CountOrWindow,
+    /// The view is only counted (`size`, `size_capped`), windowed or kept,
+    /// and needs at most its first `reach` rows (`usize::MAX`: all of them):
+    /// a run whose width is known keeps its ids deferred, so a count reads
+    /// none and a window reads only the rows it takes, and an in-memory
+    /// residual compare over more rows than `reach` is left pending, compared
+    /// only as far as the count or the window reaches ([`PendingResidual`]).
+    CountOrWindow { reach: usize },
+}
+
+impl IdsNeed {
+    /// Whether the view is only counted, windowed or kept.
+    pub(crate) fn counts_or_windows(self) -> bool {
+        matches!(self, IdsNeed::CountOrWindow { .. })
+    }
 }
 
 impl VortexRdfStore {
@@ -99,7 +113,7 @@ impl VortexRdfStore {
             matched.tail = Some(Self::match_tail(tail, pattern).await?);
         }
         debug_assert!(
-            need == IdsNeed::CountOrWindow || !matched.quads.is_pending_without_plan(),
+            need.counts_or_windows() || !matched.quads.is_pending_without_plan(),
             "a view built for its rows (IdsNeed::Rows) is never pending without a serve plan"
         );
         Ok(matched)
@@ -191,7 +205,8 @@ impl VortexRdfStore {
     /// here, except that an index resolution that is the view's sole
     /// restriction leaves them pending (`LazyRowIds`) when its plan serves
     /// the view's reads, or when the caller only counts or windows the view
-    /// (`need`).
+    /// (`need`), and a residual compare a count or a window may stop short of
+    /// is left pending too ([`PendingResidual`]).
     ///
     /// Tombstones are not consulted: every read applies them, so a match may
     /// name deleted rows the result never shows, and the mask scan's
@@ -281,7 +296,7 @@ impl VortexRdfStore {
         let sole = unrefined && !prefix_narrowed && !pat.any_bound();
         let selection = match resolved {
             Some(row_ids) => {
-                let defer = sole && (serve.is_some() || need == IdsNeed::CountOrWindow);
+                let defer = sole && (serve.is_some() || need.counts_or_windows());
                 let selection = fold_row_ids(selection, row_ids, defer)?;
                 debug::step!(t, "[match_pattern] In-memory index resolved");
                 selection
@@ -297,32 +312,12 @@ impl VortexRdfStore {
         // pending selection never gets here, as its deferral left nothing
         // bound.
         let (selection, residual_narrowed) = match selection {
-            // PROTOTYPE (item 3): a view only counted or windowed leaves a
-            // wide residual pending, evaluated piece by piece as far as the
-            // count or the window reaches.
-            ViewSelection::Exact(exact)
-                if need == IdsNeed::CountOrWindow
-                    && exact.len(base_len) > RESIDUAL_FIRST_PIECE
-                    && pat.any_bound() =>
-            {
-                let eqs = match codes.constraints(pat)? {
-                    Constraints::AlwaysFalse => return Ok(self.empty_view()),
-                    Constraints::Eq(eqs) => eqs,
-                };
-                let lazy = crate::store::indexes::LazyRowIds::from_residual(
-                    crate::store::indexes::PendingResidual {
-                        memory: memory.clone(),
-                        selection: exact,
-                        eqs,
-                    },
-                );
-                (ViewSelection::Pending(lazy), true)
-            }
             ViewSelection::Exact(exact) if !exact.is_empty(base_len) && pat.any_bound() => {
-                let Some(narrowed) = Self::residual_narrow(memory, exact, pat, codes, t)? else {
+                let Some(narrowed) = Self::residual_narrow(memory, exact, pat, codes, need, t)?
+                else {
                     return Ok(self.empty_view());
                 };
-                (ViewSelection::Exact(narrowed), true)
+                (narrowed, true)
             }
             selection => (selection, false),
         };
@@ -438,15 +433,19 @@ impl VortexRdfStore {
 
     /// The residual column filter: `selection` narrowed to its rows matching
     /// every role the fast paths left bound in `pat`, compared column-wise
-    /// over those rows only. `None` when the residual compiles to
-    /// `AlwaysFalse`.
+    /// over those rows only ([`residual_rows`](Self::residual_rows)). A view
+    /// only counted or windowed short of the selection's rows (`need`) leaves
+    /// a compare over more rows than one piece holds pending instead
+    /// ([`PendingResidual`]), compared only as far as the count or the window
+    /// reaches. `None` when the residual compiles to `AlwaysFalse`.
     fn residual_narrow(
         memory: &MemoryBase,
         selection: RowSelection,
         pat: QuadPattern<'_>,
         codes: &mut PatternCodes,
+        need: IdsNeed,
         t: Option<Instant>,
-    ) -> Result<Option<RowSelection>> {
+    ) -> Result<Option<ViewSelection>> {
         // The residual binds a subset of the roles the caller's gate
         // already resolved to codes, so the unmatchable arm cannot fire;
         // it stays for totality.
@@ -454,12 +453,21 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
-        Self::residual_rows(memory, selection, &eqs, t).map(Some)
+        if PendingResidual::defers(need, selection.len(memory.base.len())) {
+            debug::step!(t, "[match_pattern] In-memory residual left pending");
+            let pending = PendingResidual::new(memory.clone(), selection, eqs);
+            return Ok(Some(ViewSelection::Pending(LazyRowIds::from_residual(
+                pending,
+            ))));
+        }
+        let narrowed = Self::residual_rows(memory, selection, &eqs, t)?;
+        Ok(Some(ViewSelection::Exact(narrowed)))
     }
 
     /// The rows of `selection` (of `memory`'s base) where every equality of
-    /// `eqs` holds, compared as [`residual_narrow`](Self::residual_narrow)
-    /// describes.
+    /// `eqs` holds: the zones whose code bounds cannot hold a constrained
+    /// code skipped, then the typed fast path or the mask scan over the rows
+    /// left.
     pub(crate) fn residual_rows(
         memory: &MemoryBase,
         selection: RowSelection,
@@ -524,63 +532,6 @@ impl VortexRdfStore {
                 }
             },
         )
-    }
-
-    /// PROTOTYPE (item 3): the first rows of `selection` that satisfy `eqs`,
-    /// in base row order, at least `want` of them when there are: the
-    /// selection is compared in pieces ([`RESIDUAL_FIRST_PIECE`] rows, then
-    /// fourfold) until `want` rows are found. `true` when every piece was
-    /// compared, so the rows are all of them.
-    pub(crate) fn residual_prefix(
-        memory: &MemoryBase,
-        selection: &RowSelection,
-        eqs: &[(&'static str, Scalar)],
-        want: usize,
-    ) -> Result<(Vec<u64>, bool)> {
-        use crate::store::view::selection::SelectedRows;
-        let base_len = memory.base.len();
-        let mut found: Vec<u64> = Vec::new();
-        let push = |found: &mut Vec<u64>, piece: RowSelection| -> Result<()> {
-            match Self::residual_rows(memory, piece, eqs, None)?.as_rows(base_len) {
-                SelectedRows::Run(run) => found.extend(run.start as u64..run.end as u64),
-                SelectedRows::Ids(ids) => found.extend(ids.iter().copied()),
-            }
-            Ok(())
-        };
-        // A selection of no more rows than wanted cannot stop early: one
-        // piece.
-        let mut size = if selection.len(base_len) <= want {
-            usize::MAX
-        } else {
-            RESIDUAL_FIRST_PIECE
-        };
-        match selection.as_rows(base_len) {
-            SelectedRows::Run(run) => {
-                let mut start = run.start;
-                while start < run.end {
-                    let end = start.saturating_add(size).min(run.end);
-                    push(&mut found, RowSelection::Range(start as u64..end as u64))?;
-                    start = end;
-                    size = size.saturating_mul(4);
-                    if found.len() >= want {
-                        return Ok((found, start == run.end));
-                    }
-                }
-            }
-            SelectedRows::Ids(ids) => {
-                let mut start = 0;
-                while start < ids.len() {
-                    let end = start.saturating_add(size).min(ids.len());
-                    push(&mut found, RowSelection::Ids(ids.slice(start..end)))?;
-                    start = end;
-                    size = size.saturating_mul(4);
-                    if found.len() >= want {
-                        return Ok((found, start == ids.len()));
-                    }
-                }
-            }
-        }
-        Ok((found, true))
     }
 
     /// The base rows of `runs` that satisfy `eqs`, ascending: each run's
@@ -691,7 +642,7 @@ impl VortexRdfStore {
                 // window reads only its own rows. Any other lazy resolution
                 // is read now and folds as an eager one's ids do.
                 let defer = serve.is_some()
-                    || (need == IdsNeed::CountOrWindow
+                    || (need.counts_or_windows()
                         && keep_serve
                         && residual.is_none()
                         && match &row_ids {
@@ -935,11 +886,6 @@ fn fold_row_ids(
 /// `match_base`): a lookup costs the rows matching the component it resolves,
 /// not the rows the view still holds. An unrefined view never skips.
 const INDEX_ROUTING_MIN_ROWS: usize = 4_096;
-
-/// PROTOTYPE (item 3): the rows of a pending residual's first piece: a zone,
-/// above the typed residual's cap, so a piece is a mask scan and never the
-/// per-row probe reads the typed loop makes over a probe-bound column.
-pub(crate) const RESIDUAL_FIRST_PIECE: usize = 8_192;
 
 /// Test hook: how many in-memory residual filters this thread narrowed to
 /// the zones their codes' bounds hold.

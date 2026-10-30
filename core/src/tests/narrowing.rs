@@ -1170,7 +1170,13 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
             for (limit, cuts) in [(n - 1, true), (n, false), (n + 1, false)] {
                 let label = format!("{label} limit {limit}");
                 let view = store
-                    .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+                    .match_pattern_for(
+                        None,
+                        Some(&p1),
+                        None,
+                        None,
+                        IdsNeed::CountOrWindow { reach: usize::MAX },
+                    )
                     .await
                     .unwrap();
                 assert_eq!(view.debug_pending_len(), Some(None), "{label}: unread");

@@ -280,30 +280,36 @@ impl QuadsSource {
         }
     }
 
-    /// The `limit` rows after skipping `offset` of a run held pending for a
-    /// window (`IdsNeed::CountOrWindow`), with the run's width as the base's
-    /// live size, read without the run's other ids ([`LazyRowIds::window`]):
-    /// in memory cut, before decoding, from a rid column whose rids ascend;
-    /// on file read from the window's rows of a located run's rid column.
-    /// `None` for any other view (an exact selection, a run of unknown width
-    /// or whose rids do not ascend, tombstones, a pending file filter), whose
+    /// The `limit` rows after skipping `offset` of a selection held pending
+    /// for a window (`IdsNeed::CountOrWindow`), beside the base's live rows
+    /// as far as the window knows them, read without the selection's other
+    /// ids. A residual compare left pending compares its pieces only until
+    /// the window's last live row is found ([`LazyRowIds::residual_window`]).
+    /// A run, with no tombstones, has its width as the base's live size and
+    /// reads its window's rows alone ([`LazyRowIds::window`]): in memory cut,
+    /// before decoding, from a rid column whose rids ascend; on file read
+    /// from the window's rows of a located run's rid column. `None` for any
+    /// other view (an exact selection, a run of unknown width or whose rids
+    /// do not ascend, a run under tombstones, a pending file filter), whose
     /// window comes from its materialized selection.
     ///
     /// [`LazyRowIds::window`]: crate::store::indexes::LazyRowIds::window
+    /// [`LazyRowIds::residual_window`]: crate::store::indexes::LazyRowIds::residual_window
     pub(crate) async fn located_window(
         &self,
         offset: usize,
         limit: usize,
     ) -> Result<Option<(RowSelection, usize)>> {
-        let (ViewSelection::Pending(lazy), None) = (&self.selection, &self.deleted) else {
+        let ViewSelection::Pending(lazy) = &self.selection else {
             return Ok(None);
         };
-        // PROTOTYPE (item 3): a pending residual compares only as far as the
-        // window reaches.
-        if let Some((ids, live)) = lazy.residual_window(offset, limit)? {
+        if let Some((ids, live)) = lazy.residual_window(offset, limit, self.deleted.as_ref())? {
             return Ok(Some((RowSelection::from_ids(ids), live)));
         }
-        let Some(live) = lazy.len_if_known().filter(|_| !self.has_filter()) else {
+        let Some(live) = lazy
+            .len_if_known()
+            .filter(|_| self.deleted.is_none() && !self.has_filter())
+        else {
             return Ok(None);
         };
         Ok(lazy

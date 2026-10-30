@@ -18,8 +18,10 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use vortex_array::ArrayRef;
+#[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
+use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
@@ -27,6 +29,7 @@ use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::ChildReader;
+use crate::store::query::residual::{PendingResidual, ResidualPrefix};
 use crate::store::schema::RowId;
 use resolve::IndexProbe;
 
@@ -474,38 +477,16 @@ enum LazyRowIdSource {
         child: ChildReader,
         range: Range<u64>,
     },
-    /// PROTOTYPE (item 3): an in-memory residual compare left pending for a
-    /// view only counted or windowed.
+    /// In-memory: a residual compare left pending for a view only counted or
+    /// windowed ([`PendingResidual`]), compared whole on first need, or piece
+    /// by piece only as far as a count or a window reaches
+    /// ([`residual_count_capped`](LazyRowIds::residual_count_capped),
+    /// [`residual_window`](LazyRowIds::residual_window)).
     Residual(Arc<PendingResidual>),
 }
 
-/// PROTOTYPE (item 3): a residual compare a count or a window evaluates only
-/// as far as it reaches: the rows of `selection` (of `base`) where `eqs`
-/// hold.
-pub(crate) struct PendingResidual {
-    pub(crate) memory: crate::store::MemoryBase,
-    pub(crate) selection: crate::store::view::selection::RowSelection,
-    pub(crate) eqs: Vec<(&'static str, Scalar)>,
-}
-
-impl PendingResidual {
-    fn all_ids(&self) -> Result<Buffer<RowId>> {
-        use crate::store::view::selection::SelectedRows;
-        let matched = crate::store::VortexRdfStore::residual_rows(
-            &self.memory,
-            self.selection.clone(),
-            &self.eqs,
-            None,
-        )?;
-        Ok(match matched.as_rows(self.memory.base.len()) {
-            SelectedRows::Run(run) => Buffer::from_iter(run.start as RowId..run.end as RowId),
-            SelectedRows::Ids(ids) => ids.clone(),
-        })
-    }
-}
-
 impl LazyRowIds {
-    /// PROTOTYPE (item 3): lazy ids of a pending residual compare.
+    /// Lazy ids of a residual compare left pending.
     pub(crate) fn from_residual(residual: PendingResidual) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
@@ -513,53 +494,61 @@ impl LazyRowIds {
         }
     }
 
-    /// PROTOTYPE (item 3): a pending residual's first matches, at least
-    /// `want` when there are, and whether they are all of them (then cached
-    /// as the ids). `None` for any other source.
-    fn residual_prefix(&self, want: usize) -> Result<Option<(Buffer<RowId>, bool)>> {
+    /// What a pending residual's first pieces match, at least `want` live
+    /// rows under `deleted` when there are as many
+    /// ([`PendingResidual::prefix`]); every match once the ids are known, as
+    /// a prefix that compared every piece leaves them. `None` for any other
+    /// source.
+    fn residual_prefix(
+        &self,
+        want: usize,
+        deleted: Option<&Mask>,
+    ) -> Result<Option<ResidualPrefix>> {
         let LazyRowIdSource::Residual(residual) = &self.source else {
             return Ok(None);
         };
         if let Some(ids) = self.cell.get() {
-            return Ok(Some((ids.clone(), true)));
+            return Ok(Some(ResidualPrefix::whole(ids.clone(), deleted)));
         }
-        let (found, complete) = crate::store::VortexRdfStore::residual_prefix(
-            &residual.memory,
-            &residual.selection,
-            &residual.eqs,
-            want,
-        )?;
-        let found = Buffer::from(found);
-        if complete {
-            return Ok(Some((self.cell.get_or_init(|| found).clone(), true)));
+        let prefix = residual.prefix(want, deleted)?;
+        if prefix.complete {
+            self.cell.get_or_init(|| prefix.ids.clone());
         }
-        Ok(Some((found, false)))
+        Ok(Some(prefix))
     }
 
-    /// PROTOTYPE (item 3): `min(rows, limit)` of a pending residual, compared
-    /// only until `limit` rows are found. `None` for any other source.
-    pub(crate) fn residual_count_capped(&self, limit: usize) -> Result<Option<usize>> {
+    /// `min(live matches, limit)` of a pending residual (`deleted`
+    /// tombstoned), its pieces compared only until `limit` live rows are
+    /// found. `None` for any other source.
+    pub(crate) fn residual_count_capped(
+        &self,
+        limit: usize,
+        deleted: Option<&Mask>,
+    ) -> Result<Option<usize>> {
         Ok(self
-            .residual_prefix(limit)?
-            .map(|(found, _)| found.len().min(limit)))
+            .residual_prefix(limit, deleted)?
+            .map(|prefix| prefix.live.min(limit)))
     }
 
-    /// PROTOTYPE (item 3): rows `offset..offset + limit` of a pending
-    /// residual's matches, beside the base's live rows as far as they are
-    /// known: all of them when the compare ran to the end, else the rows
-    /// found, at least `offset + limit`. `None` for any other source.
+    /// The live rows `offset..offset + limit` of a pending residual's
+    /// matches (`deleted` tombstoned), in base row order, its pieces compared
+    /// only until the window's last row is found, beside the base's live
+    /// rows as far as they are known: every one once every piece was
+    /// compared, else the ones found, at least `offset + limit`. `None` for
+    /// any other source.
     pub(crate) fn residual_window(
         &self,
         offset: usize,
         limit: usize,
+        deleted: Option<&Mask>,
     ) -> Result<Option<(Buffer<RowId>, usize)>> {
-        Ok(self
-            .residual_prefix(offset.saturating_add(limit))?
-            .map(|(found, _)| {
-                let rows = window_rows(offset, limit, found.len() as u64)
-                    .map_or(0..0, |rows| rows.start as usize..rows.end as usize);
-                (found.slice(rows), found.len())
-            }))
+        let Some(prefix) = self.residual_prefix(offset.saturating_add(limit), deleted)? else {
+            return Ok(None);
+        };
+        let live = prefix.live_ids(deleted);
+        let rows = window_rows(offset, limit, live.len() as u64)
+            .map_or(0..0, |rows| rows.start as usize..rows.end as usize);
+        Ok(Some((live.slice(rows), live.len())))
     }
 
     /// Test-only hook: whether the ids have been computed, so a test can pin
@@ -656,7 +645,8 @@ impl LazyRowIds {
     /// in-memory run knows its width up front (so a count on a served match
     /// never decodes), and so does a located file run, whether its ids come
     /// from the run itself or from the child scan it bounds; an unlocated
-    /// child scan only once its ids are read.
+    /// child scan and a pending residual compare only once their ids are
+    /// known.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
             LazyRowIdSource::Component { rids, .. } => Some(rids.len()),
@@ -672,9 +662,10 @@ impl LazyRowIds {
         }
     }
 
-    /// The ids, when they take no I/O: an in-memory run's, computed (and
-    /// cached) here as [`materialized`](Self::materialized) does, or a file
-    /// child's once read. `None` for a file child's ids not read yet.
+    /// The ids, when they take no I/O: an in-memory run's or a pending
+    /// residual compare's, computed (and cached) here as
+    /// [`materialized`](Self::materialized) does, or a file child's once
+    /// read. `None` for a file child's ids not read yet.
     pub(crate) fn ids_without_io(&self) -> Result<Option<Buffer<RowId>>> {
         match &self.source {
             LazyRowIdSource::Component { .. } | LazyRowIdSource::Residual(_) => {
@@ -724,8 +715,8 @@ impl LazyRowIds {
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 unreachable!(
-                    "an in-memory view only ever carries component-sourced pending ids, and the \
-                     file match reads a file run's ids before it folds them"
+                    "an in-memory view only ever carries component or residual pending ids, and \
+                     the file match reads a file run's ids before it folds them"
                 )
             }
         };

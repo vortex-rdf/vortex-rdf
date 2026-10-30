@@ -615,7 +615,13 @@ async fn test_reference_index_counts_located_runs_from_width() {
         let p1 = iri("p1");
         let o2 = plain_literal("o2");
         let counted = store
-            .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+            .match_pattern_for(
+                None,
+                Some(&p1),
+                None,
+                None,
+                IdsNeed::CountOrWindow { reach: usize::MAX },
+            )
             .await
             .unwrap();
         assert!(selection_pending(&counted));
@@ -681,7 +687,13 @@ async fn test_reference_index_counts_located_runs_from_width() {
         // The counted run under the tombstone: on file its width bounds its
         // rows until its ids are read; in memory they decode to count them.
         let counted = deleted
-            .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+            .match_pattern_for(
+                None,
+                Some(&p1),
+                None,
+                None,
+                IdsNeed::CountOrWindow { reach: usize::MAX },
+            )
             .await
             .unwrap();
         let rows = |view: &VortexRdfStore| view.view_statistics().unwrap().rows;
@@ -820,7 +832,13 @@ pub(super) async fn assert_windows_read_only_their_rows(
     assert_eq!(reads(), before, "a count reads no row id");
 
     let pending = store
-        .match_pattern_for(None, p, o, None, IdsNeed::CountOrWindow)
+        .match_pattern_for(
+            None,
+            p,
+            o,
+            None,
+            IdsNeed::CountOrWindow { reach: usize::MAX },
+        )
         .await
         .unwrap();
     assert_eq!(pending.debug_row_ids_materialized(), Some(false));
@@ -977,14 +995,26 @@ async fn test_reference_index_pending_run_composes() {
 
         // A keep reads the pending run's ids, then narrows like any other.
         let pending = store
-            .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+            .match_pattern_for(
+                None,
+                Some(&p1),
+                None,
+                None,
+                IdsNeed::CountOrWindow { reach: usize::MAX },
+            )
             .await
             .unwrap();
         assert!(selection_pending(&pending));
         // A residual term keeps the run's ids from staying pending: the
         // filter over them needs the ids.
         let residual = store
-            .match_pattern_for(None, Some(&p1), Some(&o2), None, IdsNeed::CountOrWindow)
+            .match_pattern_for(
+                None,
+                Some(&p1),
+                Some(&o2),
+                None,
+                IdsNeed::CountOrWindow { reach: usize::MAX },
+            )
             .await
             .unwrap();
         assert!(!selection_pending(&residual));
@@ -1116,7 +1146,13 @@ async fn test_only_a_counted_view_is_pending_without_a_plan() {
         VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
     ] {
         let counted = store
-            .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+            .match_pattern_for(
+                None,
+                Some(&p1),
+                None,
+                None,
+                IdsNeed::CountOrWindow { reach: usize::MAX },
+            )
             .await
             .unwrap();
         assert!(counted.debug_pending_without_plan());
@@ -1164,7 +1200,13 @@ async fn stream_a_counted_view(open: impl AsyncFnOnce(&std::path::Path) -> Vorte
     let store = open(&path).await;
     let p1 = iri("p1");
     let counted = store
-        .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+        .match_pattern_for(
+            None,
+            Some(&p1),
+            None,
+            None,
+            IdsNeed::CountOrWindow { reach: usize::MAX },
+        )
         .await
         .unwrap();
     assert!(counted.debug_pending_without_plan());
@@ -1359,7 +1401,13 @@ async fn test_reference_index_counts_with_named_graphs() {
                 // Counted: the run's width while the graph is free, its ids
                 // once the graph is bound (a residual the index does not cover).
                 let counted = store
-                    .match_pattern_for(None, p, o, graph, IdsNeed::CountOrWindow)
+                    .match_pattern_for(
+                        None,
+                        p,
+                        o,
+                        graph,
+                        IdsNeed::CountOrWindow { reach: usize::MAX },
+                    )
                     .await
                     .unwrap();
                 assert_eq!(selection_pending(&counted), graph.is_none(), "{label}");

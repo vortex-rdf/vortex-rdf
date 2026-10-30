@@ -1031,7 +1031,13 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
         assert_eq!(all[0].len(), width, "{index:?}");
         let probe = Probe::new(None, Some(p1.clone()), None, None);
         let pending = store
-            .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+            .match_pattern_for(
+                None,
+                Some(&p1),
+                None,
+                None,
+                IdsNeed::CountOrWindow { reach: usize::MAX },
+            )
             .await
             .unwrap();
         assert_eq!(

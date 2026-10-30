@@ -145,8 +145,10 @@ impl VortexRdfStore {
     /// a serve plan always may cut: its window takes its rows into exact
     /// ids, the rows and order of the plain match, and where
     /// [`QuadsSource::located_window`](crate::store::QuadsSource::located_window)
-    /// answers (no tombstones, an in-memory run whose rids ascend, a file run
-    /// with no filter) it reads them without the run's other ids. So does a
+    /// answers (an in-memory residual compare left pending, compared only as
+    /// far as the window reaches; with no tombstones, an in-memory run whose
+    /// rids ascend or a file run with no filter) it reads them without the
+    /// selection's other ids. So does a
     /// file view whose reads take its pending filter by the masks first
     /// ([`reads_masks_first`](Self::reads_masks_first)), whatever its bound:
     /// its window evaluates the filter, which its reads would evaluate
