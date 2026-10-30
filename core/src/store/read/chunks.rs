@@ -36,8 +36,17 @@ use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_reads::take_file_rows, read_plan::ExactRead};
 use crate::store::schema::{QuadColumn, RowId, TermCode};
+#[cfg(feature = "file-io")]
+use crate::store::view::selection::ViewSelection;
 use crate::store::view::selection::{RowSelection, SelectedRows};
 use crate::store::{SharedQuad, VortexRdfStore};
+
+/// The longest served run, in chunks, a code-chunk stream reads off its
+/// index at once ([`VortexRdfStore::code_chunks`]): the run is held whole, at
+/// about 48 bytes a row (four codes, a row id and its sort slot) against the
+/// 8 of the row ids a read by id holds, so a longer run is read by id.
+#[cfg(feature = "file-io")]
+const SERVED_RUN_BATCHES: usize = 16;
 
 /// A view's rows as struct chunks in the layout's primary dtype, each of at
 /// most the requested `batch_rows` rows.
@@ -192,11 +201,61 @@ impl VortexRdfStore {
                 }
             });
         }
+        // A file view its index serves from a short located run: the run off
+        // the index's own columns, in base row order, sliced into chunks.
+        #[cfg(feature = "file-io")]
+        if let Some(codes) = self.served_run_codes(batch_rows).await? {
+            #[cfg(test)]
+            chunk_path_hooks::note_served_run();
+            let picked: Vec<Buffer<TermCode>> =
+                columns.iter().map(|c| codes[c.index()].clone()).collect();
+            let rows = picked[0].len();
+            return Ok(
+                stream::iter((0..rows).step_by(batch_rows).map(move |start| {
+                    let end = start.saturating_add(batch_rows).min(rows);
+                    Ok(picked.iter().map(|b| b.slice(start..end)).collect())
+                }))
+                .boxed(),
+            );
+        }
         // A file view, or a base whose code columns the shared cache cannot
         // hand out: its rows, chunked, their codes read per chunk by name.
         let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
         let base = self.base_chunks(&names, batch_rows).await?;
         Ok(base.map(move |chunk| extract_codes(chunk?, &names)).boxed())
+    }
+
+    /// The live codes of this file view's served run in base row order,
+    /// when its index serves it (nothing else narrowing it: no masks, no
+    /// filter) from a located run of at most [`SERVED_RUN_BATCHES`] chunks
+    /// whose row ids are still pending: read off the index's own columns, no
+    /// row id taken from the base. `None` otherwise, for the reads by id,
+    /// which also take a point-sized run, resolved to its ids at once and
+    /// read point by point for less than a scan of the index costs.
+    #[cfg(feature = "file-io")]
+    async fn served_run_codes(&self, batch_rows: usize) -> Result<Option<[Buffer<TermCode>; 4]>> {
+        #[cfg(test)]
+        if chunk_path_hooks::legacy() {
+            return Ok(None);
+        }
+        let (
+            ViewSelection::Pending(_),
+            Some(FileBase {
+                serve: Some(plan),
+                masks: None,
+                filter: None,
+                ..
+            }),
+        ) = (&self.quads.selection, self.quads.file())
+        else {
+            return Ok(None);
+        };
+        let cap = SERVED_RUN_BATCHES.saturating_mul(batch_rows) as u64;
+        if plan.located_rows().is_none_or(|rows| rows > cap) {
+            return Ok(None);
+        }
+        plan.code_columns_in_row_order(self.quads.deleted.as_ref())
+            .await
     }
 
     /// The base rows this view covers, without the tail, in chunks of at
@@ -452,6 +511,7 @@ pub(crate) mod chunk_path_hooks {
 
     thread_local! {
         static LEGACY: Cell<bool> = const { Cell::new(false) };
+        static SERVED_RUNS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The pre-fix paths for this thread's chunk streams, until dropped; the
@@ -473,5 +533,15 @@ pub(crate) mod chunk_path_hooks {
     /// Whether this thread's chunk streams take their pre-fix paths.
     pub(crate) fn legacy() -> bool {
         LEGACY.with(Cell::get)
+    }
+
+    /// Record one code-chunk stream read off its serving index's run.
+    pub(crate) fn note_served_run() {
+        SERVED_RUNS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The code-chunk streams this thread read off a serving index's run.
+    pub(crate) fn served_runs() -> usize {
+        SERVED_RUNS.with(Cell::get)
     }
 }

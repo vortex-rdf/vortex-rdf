@@ -283,3 +283,161 @@ async fn chunk_reads_equal_the_legacy_paths() {
         }
     }
 }
+
+/// A file view's code-chunk stream at `batch_rows`, drained, and whether it
+/// was read off its serving index's run.
+async fn drain_counting_served(
+    view: &VortexRdfStore,
+    batch_rows: usize,
+) -> (Vec<[TermCode; 4]>, bool) {
+    let before = chunk_path_hooks::served_runs();
+    let (rows, _) = collect_code_chunks(view, &QuadColumn::ALL, batch_rows).await;
+    let after = chunk_path_hooks::served_runs();
+    assert!(after - before <= 1, "one stream, one run");
+    (rows, after > before)
+}
+
+/// The matched view of a pattern of spellings.
+async fn probe_view(store: &VortexRdfStore, [s, p, o, g]: [Option<&str>; 4]) -> VortexRdfStore {
+    store
+        .run_probe(&Probe::parse(s, p, o, g).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn served_runs_are_read_off_the_index() {
+    let (_dir, path) = write_store_file(
+        modular_quads(20_000, 7, 11),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    for (name, pattern) in [
+        ("P", [None, Some("<http://example.org/p2>"), None, None]),
+        ("O", [None, None, Some("\"object 3\""), None]),
+    ] {
+        let view = probe_view(&store, pattern).await;
+        assert!(
+            served_component(&view).is_some(),
+            "{name}: an index serves it"
+        );
+        for batch_rows in [256, 65_536] {
+            let chosen = crate::store::scan::read_plan::exact_read_hooks::chosen();
+            let (_, served) = drain_counting_served(&view, batch_rows).await;
+            assert!(served, "{name} at {batch_rows}: read off the index");
+            assert_eq!(
+                crate::store::scan::read_plan::exact_read_hooks::chosen(),
+                chosen,
+                "{name} at {batch_rows}: no read of the base chosen"
+            );
+        }
+        for batch_rows in [1, 256, 65_536] {
+            assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, batch_rows, name).await;
+        }
+        assert_code_chunks_equal_legacy(&view, &[QuadColumn::O, QuadColumn::S], 256, name).await;
+    }
+}
+
+#[tokio::test]
+async fn served_runs_at_the_cap_and_with_tombstones() {
+    // p0 holds every even row: a run of 4,096 rows, exactly 16 chunks of 256;
+    // its objects cycle 0, 2, 1, so "object 0" is every third of its rows.
+    let (_dir, path) = write_store_file(
+        modular_quads(8_192, 2, 3),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p0 = [None, Some("<http://example.org/p0>"), None, None];
+    let view = probe_view(&store, p0).await;
+    let (rows, served) = drain_counting_served(&view, 256).await;
+    assert_eq!(rows.len(), 4_096);
+    assert!(served, "a run of exactly 16 chunks is read off the index");
+    let (_, served) = drain_counting_served(&view, 255).await;
+    assert!(!served, "a run a row past 16 chunks keeps the legacy path");
+    assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 256, "at the cap").await;
+    assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 255, "past the cap").await;
+
+    let tombstoned = store
+        .delete_matching(None, None, Some(&plain_literal("object 0")), None)
+        .await
+        .unwrap();
+    let deleted = store
+        .dict_reader()
+        .unwrap()
+        .encode("\"object 0\"")
+        .await
+        .unwrap()
+        .unwrap();
+    let view = probe_view(&tombstoned, p0).await;
+    let (rows, served) = drain_counting_served(&view, 256).await;
+    assert!(served, "tombstones keep the index path");
+    assert_eq!(
+        rows.len(),
+        4_096 - 1_366,
+        "every third row of the run deleted"
+    );
+    assert!(rows.iter().all(|row| row[2] != deleted), "no deleted row");
+    assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 256, "tombstoned").await;
+}
+
+#[tokio::test]
+async fn other_served_views_keep_their_path() {
+    let quads = modular_quads(20_000, 7, 11);
+    let p2 = [None, Some("<http://example.org/p2>"), None, None];
+    let (_copy_dir, copy) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let (_reference_dir, reference) = write_store_file(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    for (name, store) in [
+        (
+            "copy in memory",
+            VortexRdfStore::from_file_in_memory(&copy).await.unwrap(),
+        ),
+        (
+            "reference on file",
+            VortexRdfStore::from_file(&reference).await.unwrap(),
+        ),
+    ] {
+        let view = probe_view(&store, p2).await;
+        for batch_rows in [256, 65_536] {
+            let (_, served) = drain_counting_served(&view, batch_rows).await;
+            assert!(!served, "{name} at {batch_rows}: not read off an index run");
+            assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, batch_rows, name).await;
+        }
+    }
+    // A point-sized run's ids are resolved at once and read point by point,
+    // which costs less than scanning the run off the index.
+    let mut quads = modular_quads(2_000, 7, 11);
+    for s in ["rare-a", "rare-b"] {
+        quads.push(make_quad(
+            &format!("http://example.org/{s}"),
+            "http://example.org/p0",
+            "rare",
+            GraphName::DefaultGraph,
+        ));
+    }
+    let (_rare_dir, rare) = write_store_file(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&rare).await.unwrap();
+    let view = probe_view(&store, [None, None, Some("\"rare\""), None]).await;
+    let (rows, served) = drain_counting_served(&view, 256).await;
+    assert_eq!(rows.len(), 2);
+    assert!(!served, "a point-sized run is read by id");
+    assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 256, "point-sized").await;
+}
