@@ -18,7 +18,6 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use vortex_array::ArrayRef;
-#[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
 
