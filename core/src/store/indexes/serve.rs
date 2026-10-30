@@ -85,7 +85,6 @@ impl ServeDecode {
     /// A chunk's live rows as four code columns, `(s, p, o, g)`: the
     /// code-payload counterpart of [`decode_columns`](Self::decode_columns)
     /// for a Dictionary decode layout, whose columns hold codes.
-    #[cfg(feature = "file-io")]
     pub(super) fn chunk_code_columns(
         &self,
         chunk: &ArrayRef,
@@ -280,18 +279,24 @@ impl InMemoryServePlan {
     /// [`decode`](Self::decode), in the index's order as `decode` serves
     /// them. Under the Dictionary layout a copy holds the view's codes
     /// contiguously, so no row id is materialized and no primary column
-    /// gathered.
+    /// gathered: a run of at most [`POINT_GATHER_MAX_ROWS`] rows is read
+    /// point by point through the component's cached probes, and any other
+    /// is the component sliced to the run, each column decoded whole.
     ///
-    /// `None` declines to the caller's gather path: a run wider than
-    /// [`POINT_GATHER_MAX_ROWS`], a non-Dictionary decode layout (its columns
-    /// hold terms, not codes), or a column no probe resolves.
+    /// `None` declines to the caller's gather path: a non-Dictionary decode
+    /// layout (its columns hold terms, not codes), or a slice that fails to
+    /// decode (the gather path reports the error).
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return None;
         }
-        self.live_point_columns(deleted)
+        if let Some(columns) = self.live_point_columns(deleted) {
+            return Some(columns);
+        }
+        let rows = self.array.slice(self.range.clone()).ok()?;
+        self.decode.chunk_code_columns(&rows, deleted).ok()
     }
 
     /// The matched rows decoded from the index component's own rows as the

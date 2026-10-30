@@ -129,7 +129,7 @@ is the one way it fails.
 | `sort_order` | `Some(Spog)` when the base is globally sorted (every base this crate writes) and the view reads no tail row — the order `row_chunks` and `code_chunks` produce, whatever answered the match. A view that reads tail rows has none: they follow the base in append order. |
 | `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a file view's pushed-down filter binds by equality, while the view still carries the filter (pending, or evaluated by a window that kept its masks). |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |
-| `served_component` | The index child that answered the match, if any (`index:posg`, …; `quads()` on such a view decodes in that child's order). |
+| `served_component` | The index child that answered the match, if any (`index:posg`, …; `quads()` on such a view decodes in that child's order, and `code_columns_gathered` reads its codes in it). |
 | `pending_filter` | Whether every read runs a pushed-down file filter. A filter a window has evaluated over every row, finding it cuts none, is not pending: its matches are counted exactly and read without running it again, and the view's selection reads as `Ids`. |
 | `tombstones`, `tail_rows` | Rows tombstoned in the base (never counted) and live rows in the append tail (counted, read last). |
 | `file_backed`, `generation` | Where the base lives, and the data's identity ([§5](#5-snapshots-and-mutation)). |

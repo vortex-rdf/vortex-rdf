@@ -842,7 +842,9 @@ async fn test_in_memory_copy_index_serving() {
 
     // Over code columns a served run within the point-read cap is read point
     // by point through the component's probes, and a wider one is sliced;
-    // both read the matched quads.
+    // both read the matched quads, tombstones dropped. Their code read takes
+    // the same path: the codes of the rows `quads()` reads, in its order, the
+    // run's ids left pending.
     let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
     let store = built_store(
         quads.clone(),
@@ -850,19 +852,40 @@ async fn test_in_memory_copy_index_serving() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
+    // Quad 1 binds `p1` and `o1`: it is in both runs.
+    let tombstoned = store.delete_quad(&quads[1]).await.unwrap();
     let o1 = plain_literal("o1");
     for (object, width, point_read) in [(Some(&o1), 43, true), (None, 300, false)] {
-        let by_p = matched_view(&store, None, Some(&p1), object, None).await;
-        assert_eq!(served_component(&by_p), Some("index:posg"));
-        let before = point_reads();
-        let served: Vec<Quad> = by_p.quads().try_collect().await.unwrap();
-        assert_eq!(point_reads() - before, usize::from(point_read), "{width}");
-        assert_eq!(
-            quad_strings(&served),
-            expected_strings(&quads, |i| i % 3 == 1 && (object.is_none() || i % 7 == 1)),
-            "{width}"
-        );
-        assert_eq!(served.len(), width);
+        for (store, deleted) in [(&store, None), (&tombstoned, Some(1))] {
+            let tag = format!("{width} rows, deleted {deleted:?}");
+            let by_p = matched_view(store, None, Some(&p1), object, None).await;
+            let before = point_reads();
+            let served: Vec<Quad> = by_p.quads().try_collect().await.unwrap();
+            assert_eq!(point_reads() - before, usize::from(point_read), "{tag}");
+            let keep = |i| deleted != Some(i) && i % 3 == 1 && (object.is_none() || i % 7 == 1);
+            assert_eq!(
+                quad_strings(&served),
+                expected_strings(&quads, keep),
+                "{tag}"
+            );
+            assert_eq!(
+                served.len(),
+                width - usize::from(deleted.is_some()),
+                "{tag}"
+            );
+
+            let codes = by_p
+                .code_columns()
+                .expect("a served Dictionary view reads codes");
+            assert_eq!(by_p.debug_row_ids_materialized(), Some(false), "{tag}");
+            assert_eq!(
+                decoded_rows(&codes, &by_p.dict_reader().unwrap()).await,
+                tuple_rows(&served),
+                "{tag}: the codes of the rows `quads()` reads, in its order"
+            );
+            // Asked last: a tombstoned view's statistics decode its ids.
+            assert_eq!(served_component(&by_p), Some("index:posg"), "{tag}");
+        }
     }
 }
 
@@ -990,11 +1013,12 @@ async fn test_code_columns_serves_from_the_answering_index() {
 /// own rows of the run (rows of one value are in row id order, so a window of
 /// the run is a window of its ids): none for an empty window — no limit, or an
 /// offset at or past the run's end — and never more than the run. The window
-/// holds the same rows as the slice of the whole run, and the pending view it
-/// is taken beside keeps its ids undecoded. A copy index's run is in key
-/// order, so a window that can cut it decodes it whole (and shares it with
-/// the pending view), while one that cannot cut a row is the served match as
-/// it is and decodes nothing.
+/// holds the same rows as the slice of the whole run read in base order, and
+/// the pending view it is taken beside keeps its ids undecoded. A copy
+/// index's run is in key order, so a window that can cut it decodes it whole
+/// (and shares it with the pending view), while one that cannot cut a row is
+/// the served match as it is, read in the index's order, and decodes
+/// nothing.
 #[tokio::test]
 async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
     use crate::store::{IdsNeed, Probe};
@@ -1022,13 +1046,12 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
         (IndexType::SecondaryByCopy, true),
     ] {
         let store = streamed_store(quads.clone(), LayoutStrategy::Dictionary, vec![index]).await;
-        let all = matched_view(&store, None, Some(&p1), None, None)
-            .await
-            .code_columns_gathered()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(all[0].len(), width, "{index:?}");
+        // The whole run in base order, as its code chunks come, and in the
+        // order its one-shot read takes: the index's under a copy's plan.
+        let matched = matched_view(&store, None, Some(&p1), None, None).await;
+        let (base_order, _) = collect_code_chunks(&matched, &QuadColumn::ALL, width).await;
+        let served_order = row_list(&matched).await;
+        assert_eq!(base_order.len(), width, "{index:?}");
         let probe = Probe::new(None, Some(p1.clone()), None, None);
         let pending = store
             .match_pattern_for(
@@ -1083,14 +1106,15 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
                     to - from,
                     "{index:?} ({offset}, {limit})"
                 );
-                let cols = view.code_columns_gathered().await.unwrap().unwrap();
-                for (col, whole) in cols.iter().zip(&all) {
-                    assert_eq!(
-                        col.as_slice(),
-                        &whole.as_slice()[from..to],
-                        "{index:?} ({offset}, {limit})"
-                    );
-                }
+                let expected = match served_component(view) {
+                    Some(_) => &served_order[..],
+                    None => &base_order[from..to],
+                };
+                assert_eq!(
+                    row_list(view).await,
+                    expected,
+                    "{index:?} ({offset}, {limit})"
+                );
             }
         }
     }
