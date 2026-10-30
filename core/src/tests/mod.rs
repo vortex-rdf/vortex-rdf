@@ -1327,8 +1327,7 @@ fn chunk_columns(chunks: &[vortex_array::ArrayRef], names: &[&str]) -> Vec<Vec<u
 }
 
 /// The `(s, p, o, g)` codes of Dictionary-layout struct chunks — what
-/// `row_chunks` and a data source scan yield — concatenated: one
-/// `[s, p, o, g]` row per chunk row.
+/// `row_chunks` yields — concatenated: one `[s, p, o, g]` row per chunk row.
 fn struct_chunk_codes(chunks: &[vortex_array::ArrayRef]) -> Vec<[TermCode; 4]> {
     chunk_columns(chunks, &crate::store::schema::PRIMARY_COLUMNS)
         .into_iter()

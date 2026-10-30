@@ -1296,9 +1296,8 @@ they read any filter's masks
 the ids the masks keep; with the ids kept, every read reads those. Ids are
 read as `ExactRead` reads exact ids: a point-sized set, or one of at most 16
 ids a split, at once; a set at a take's density by takes, one window of ids
-per pull for `code_chunks`, `row_chunks` and the data source, the whole set
-as one chunk for `quads()` and `shared_quad_chunks`; anything denser by a
-scan of those ids.
+per pull for `code_chunks` and `row_chunks`, the whole set as one chunk for
+`quads()` and `shared_quad_chunks`; anything denser by a scan of those ids.
 
 `size_capped(limit)` is `min(size, limit)` by the same loop
 (`count_matching_rows_capped`), or by the same pieces over a residual compare

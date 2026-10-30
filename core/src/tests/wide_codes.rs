@@ -4,8 +4,8 @@
 //! hold, and every path that takes or returns a code — the build's code map,
 //! the written code columns, matches through each index, keeps, batched
 //! probes, mutation and compaction rebuilds, the dictionary handles under
-//! both residencies, the view statistics' code bounds, the chunk exports, the
-//! data source's scan and the column kernels — has to carry them unchanged.
+//! both residencies, the view statistics' code bounds, the chunk exports and
+//! the column kernels — has to carry them unchanged.
 //! A code narrowed anywhere on the way lands below the base, where no term
 //! is, so a truncation fails loudly instead of answering with another term.
 
