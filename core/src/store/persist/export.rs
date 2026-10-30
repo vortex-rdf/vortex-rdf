@@ -14,9 +14,10 @@ use std::io::Write;
 /// sequentially. N-Triples and N-Quads are written straight from the store's
 /// raw columns; every other format goes through oxrdfio's serializer.
 ///
-/// The writer receives each quad as several small writes and is neither
-/// buffered nor flushed here. Wrap one that makes a system call per write (a
-/// `File`) or per line (`Stdout`, which is line-buffered) in a
+/// N-Triples and N-Quads lines reach the writer a chunk at a time (a scan
+/// split, a read by id, or a whole in-memory view); the other formats'
+/// serializer writes each quad as several small writes. The writer is not flushed here. Wrap one that makes a system call
+/// per write (a `File`) or per line (`Stdout`, which is line-buffered) in a
 /// [`BufWriter`](std::io::BufWriter), pass it by `&mut`, and flush it once the
 /// export returns: a `BufWriter` dropped unflushed discards the error of its
 /// last write.
@@ -37,34 +38,33 @@ pub async fn export_rdf<W: Write>(
 
 /// The N-Triples/N-Quads fast path: both formats are `s p o [g] .` lines of
 /// N-Triples-form terms, the form the columns store (the empty string marking
-/// the default graph), so each line is assembled from the raw strings with no
-/// term parsed or re-escaped. N-Triples cannot represent a named graph: a quad
-/// in one fails as oxrdfio's serializer fails it.
+/// the default graph), so each chunk's lines are written straight from its
+/// columns ([`NQuadLines`](crate::common::quad::NQuadLines)) with no term
+/// parsed or re-escaped and no string per row, and handed to the writer a
+/// chunk at a time. N-Triples cannot represent a named graph: a quad in one
+/// fails as oxrdfio's serializer fails it.
 async fn write_raw<W: Write>(
     store: VortexRdfStore,
     mut writer: W,
     format: RdfFormat,
 ) -> error::Result<()> {
-    // The view's raw chunks, read from the first poll on, so the loop's
-    // timing below includes the read.
-    let mut chunks = store.raw_quad_chunks();
+    // The view's chunks, read from the first poll on, so the loop's timing
+    // below includes the read.
+    let mut chunks = store.nquad_line_chunks();
 
     let write_start = debug::timer();
     let named_graphs = format == RdfFormat::NQuads;
     while let Some(chunk) = chunks.next().await {
-        for quad in chunk {
-            let quad = quad?;
-            if quad.g.is_empty() {
-                writeln!(writer, "{} {} {} .", quad.s, quad.p, quad.o)?;
-            } else if named_graphs {
-                writeln!(writer, "{} {} {} {} .", quad.s, quad.p, quad.o, quad.g)?;
-            } else {
+        for lines in chunk {
+            let lines = lines?;
+            if lines.named_graph && !named_graphs {
                 // The same refusal oxrdfio's N-Triples serializer gives.
                 return Err(VortexRdfError::Serialization(
                     "Only quads in the default graph can be serialized to a RDF graph format"
                         .to_string(),
                 ));
             }
+            writer.write_all(lines.text.as_bytes())?;
         }
     }
     log::debug!(

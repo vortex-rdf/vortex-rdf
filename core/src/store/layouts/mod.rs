@@ -30,7 +30,7 @@ use vortex_array::dtype::DType;
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 
-use crate::common::quad::SharedQuad;
+use crate::common::quad::{NQuadLines, SharedQuad};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
@@ -774,6 +774,50 @@ impl ResolvedLayout {
             .collect())
     }
 
+    /// A string layout's rows as N-Triples/N-Quads lines, each term read in
+    /// place (a TypedObject object spelled from its sub-columns straight into
+    /// the lines). A Dictionary layout is an error here.
+    fn nquad_lines(&self, rows: &ArrayRef) -> Result<NQuadLines> {
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let struct_arr = rows.clone().execute::<StructArray>(&mut ctx)?;
+        let n = struct_arr.len();
+        let s = field_as::<VarBinViewArray>(&struct_arr, COL_S, &mut ctx)?;
+        let p = field_as::<VarBinViewArray>(&struct_arr, COL_P, &mut ctx)?;
+        let g = field_as::<VarBinViewArray>(&struct_arr, COL_G, &mut ctx)?;
+        let (s, p, g) = (
+            StrColReader::new(&s),
+            StrColReader::new(&p),
+            StrColReader::new(&g),
+        );
+        let mut lines = NQuadLines::with_capacity(n);
+        match self {
+            ResolvedLayout::Default => {
+                let o = field_as::<VarBinViewArray>(&struct_arr, COL_O, &mut ctx)?;
+                let o = StrColReader::new(&o);
+                for i in 0..n {
+                    lines.push([s.str_at(i), p.str_at(i), o.str_at(i), g.str_at(i)]);
+                }
+            }
+            ResolvedLayout::TypedObject => {
+                let columns = typed_object::ObjectColumns::load(&struct_arr, &mut ctx)?;
+                let objects = columns.reader();
+                for i in 0..n {
+                    lines.term(s.str_at(i));
+                    lines.term(p.str_at(i));
+                    objects.push_spelling(i, &mut lines.text)?;
+                    lines.text.push(' ');
+                    lines.end(g.str_at(i));
+                }
+            }
+            ResolvedLayout::Dictionary(_) => {
+                return Err(VortexRdfError::Deserialization(
+                    "a Dictionary layout writes its lines from its codes".to_string(),
+                ));
+            }
+        }
+        Ok(lines)
+    }
+
     /// [`raw_quads`](Self::raw_quads) with the file-backed Dictionary case
     /// handled: the whole dictionary is lifted resident transiently, then the
     /// sync decode runs unchanged. Its one caller, `live_raw_quads`, serves
@@ -793,11 +837,11 @@ impl ResolvedLayout {
     }
 }
 
-/// The row representations a chunk decodes into: owned oxrdf [`Quad`]s,
-/// [`SharedQuad`]s whose terms are shared strings, or [`RawQuad`]s holding
-/// each term's N-Triples string. Each pipeline over chunks (the serve plans,
-/// the reads by id, the scan streams, the raw export stream) is written once
-/// against this trait for all three.
+/// The representations a chunk's rows decode into: owned oxrdf [`Quad`]s,
+/// [`SharedQuad`]s whose terms are shared N-Triples strings, one row each,
+/// or the chunk's rows written as one [`NQuadLines`]. Each pipeline over
+/// chunks (the serve plans, the reads by id, the scan streams) is written
+/// once against this trait for all three.
 pub(crate) trait ChunkDecode: Sized + Send + 'static {
     /// `chunk`'s rows through `layout`, under
     /// [`ResolvedLayout::decode_chunk`]'s error convention; a file-backed
@@ -845,6 +889,31 @@ impl ChunkDecode for Quad {
     }
 }
 
+impl ChunkDecode for NQuadLines {
+    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
+        match layout {
+            ResolvedLayout::Default | ResolvedLayout::TypedObject => {
+                vec![layout.nquad_lines(chunk)]
+            }
+            ResolvedLayout::Dictionary(access) => match access.resident() {
+                Some(dict) => dictionary::decode_chunk_lines(chunk, dict),
+                None => vec![Err(VortexRdfError::Deserialization(
+                    "a file-backed dictionary decodes chunks through the async read path"
+                        .to_string(),
+                ))],
+            },
+        }
+    }
+
+    #[cfg(feature = "file-io")]
+    fn decode_file_backed<'a>(
+        fb: &'a FileBackedDict,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        dictionary::decode_chunk_lines_file_backed(fb, chunk).boxed()
+    }
+}
+
 impl ChunkDecode for SharedQuad {
     fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
         layout.decode_chunk_shared(chunk)
@@ -856,23 +925,6 @@ impl ChunkDecode for SharedQuad {
         chunk: &'a ArrayRef,
     ) -> BoxFuture<'a, Vec<Result<Self>>> {
         dictionary::decode_chunk_shared_file_backed(fb, chunk).boxed()
-    }
-}
-
-impl ChunkDecode for RawQuad {
-    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
-        match layout.raw_quads(chunk) {
-            Ok(raws) => raws.into_iter().map(Ok).collect(),
-            Err(e) => vec![Err(e)],
-        }
-    }
-
-    #[cfg(feature = "file-io")]
-    fn decode_file_backed<'a>(
-        fb: &'a FileBackedDict,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        dictionary::decode_chunk_raw_file_backed(fb, chunk).boxed()
     }
 }
 

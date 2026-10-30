@@ -1,15 +1,16 @@
 //! Quad streaming: the chunk-granularity decode stream behind `quads`,
-//! `quads_vec`, their shared-term twins and the raw export stream, one
-//! pipeline for every row representation ([`ChunkDecode`]).
+//! `quads_vec`, their shared-term twins and the N-Triples/N-Quads export's
+//! stream, one pipeline for every row representation ([`ChunkDecode`]).
 
 use futures::future;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, stream};
 use oxrdf::Quad;
 
+use crate::common::quad::NQuadLines;
 use crate::error::Result;
 use crate::store::layouts::ChunkDecode;
-use crate::store::{Backend, MemoryBase, RawQuad, SharedQuad, Tail, VortexRdfStore};
+use crate::store::{Backend, MemoryBase, SharedQuad, Tail, VortexRdfStore};
 
 #[cfg(feature = "file-io")]
 use std::sync::Arc;
@@ -118,17 +119,17 @@ impl VortexRdfStore {
         Box::new(self.chunk_stream::<SharedQuad>(QuadRead::Served))
     }
 
-    /// The raw-text counterpart of
-    /// [`shared_quad_chunks`](Self::shared_quad_chunks): chunks of this view's
-    /// quads as [`RawQuad`]s, every term in the N-Triples form the columns
-    /// store, which the N-Triples/N-Quads export writes verbatim (no oxrdf
-    /// parse and re-escape per term, as [`quads`](Self::quads) pays).
+    /// This view's chunks as N-Triples/N-Quads lines ([`NQuadLines`]), each
+    /// chunk's rows written straight from its columns, every term in the
+    /// N-Triples form they store (no oxrdf parse and re-escape per term, as
+    /// [`quads`](Self::quads) pays): what the N-Triples/N-Quads export
+    /// writes.
     ///
     /// Rows come in base row order: a serve plan, which orders rows by its
     /// index, is not consulted, so a served view's pending selection
     /// materializes and its rows are read as an unserved view's are.
-    pub(in crate::store) fn raw_quad_chunks(&self) -> BoxStream<'_, Vec<Result<RawQuad>>> {
-        self.chunk_stream::<RawQuad>(QuadRead::BaseOrder)
+    pub(in crate::store) fn nquad_line_chunks(&self) -> BoxStream<'_, Vec<Result<NQuadLines>>> {
+        self.chunk_stream::<NQuadLines>(QuadRead::BaseOrder)
     }
 
     /// Collect every decoded chunk, then flatten into one exactly-sized `Vec`.

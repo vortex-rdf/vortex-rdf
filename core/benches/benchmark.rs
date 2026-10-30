@@ -340,6 +340,25 @@ fn decode_all_shared(bencher: divan::Bencher, cfg: &DecodeCfg) {
         });
 }
 
+/// Export every quad as N-Quads into a `Vec` (`export_rdf`, behind the
+/// CLI's `deserialize` and the bindings' `toRdf`): each stored term written
+/// verbatim into its line.
+#[divan::bench(args = DECODE_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn export_nquads(bencher: divan::Bencher, cfg: &DecodeCfg) {
+    let cfg = *cfg;
+    bencher
+        .with_inputs(|| make_store(cfg.source, cfg.layout, Index::None, bench_size()))
+        .bench_values(|store| {
+            rt().block_on(async {
+                let mut out = Vec::new();
+                vortex_rdf_core::export_rdf(store, &mut out, oxrdfio::RdfFormat::NQuads)
+                    .await
+                    .expect("export");
+                black_box(out.len())
+            })
+        });
+}
+
 /// [`decode_all`] over a literal-bearing dataset. The main dataset's literals
 /// are plain and escape-free, so this is the one benchmark whose decode reaches
 /// the language-tag, datatype and unescape paths.

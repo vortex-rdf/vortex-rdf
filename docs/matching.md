@@ -1018,7 +1018,7 @@ The match's decisions show up here
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — under the Dictionary layout one `Arc<str>` per distinct term of a chunk, under the string layouts one per run of rows repeating a term, each read in place, handed to every row that holds it | the same gather or file read, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located run's width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
 | `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L586)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
-| `raw_quad_chunks()` | plan deliberately ignored (it reorders rows): the pending ids materialize and the rows are read as without one | as `quads()`, in base row order: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
+| `nquad_line_chunks()` (the N-Triples/N-Quads export) | plan deliberately ignored (it reorders rows): the pending ids materialize and the rows are read as without one | as `quads()`, in base row order, each chunk written as N-Quads lines: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
 
 An exact file selection is read the cheapest way
 ([`ExactRead`](../core/src/store/scan/read_plan.rs#L38)): point by point
@@ -1048,7 +1048,7 @@ so few rows skip. `quads_vec` and `shared_quads_vec` read and decode a take
 or a projection split by split, spawning the split reads when there is more
 than one and a tokio runtime is current.
 
-The streams (`quads()` and its twins, `raw_quad_chunks`, `row_chunks`,
+The streams (`quads()` and its twins, `nquad_line_chunks`, `row_chunks`,
 `code_chunks`) read such a view by its masks first too, but a split at a time
 as they are pulled
 ([`masks_first_split_reads`](../core/src/store/scan/file_reads.rs#L496)): each

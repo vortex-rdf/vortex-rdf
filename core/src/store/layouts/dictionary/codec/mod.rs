@@ -14,6 +14,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
+use crate::common::quad::NQuadLines;
 use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
@@ -190,7 +191,7 @@ impl SharedTerm for &Arc<str> {
 }
 
 /// A row of four term strings, built from the terms [`decode_rows_shared`]
-/// holds: a [`SharedQuad`] shares them, a [`RawQuad`] copies them out.
+/// holds, shared.
 trait StringRow {
     fn from_terms<T: SharedTerm>(terms: [T; 4]) -> Self;
 }
@@ -203,13 +204,6 @@ impl StringRow for SharedQuad {
             o: o.into_shared(),
             g: g.into_shared(),
         }
-    }
-}
-
-impl StringRow for RawQuad {
-    fn from_terms<T: SharedTerm>(terms: [T; 4]) -> Self {
-        let [s, p, o, g] = terms.each_ref().map(|term| String::from(term.as_ref()));
-        RawQuad { s, p, o, g }
     }
 }
 
@@ -499,9 +493,60 @@ impl DecodeRows for SharedQuad {
     }
 }
 
-impl DecodeRows for RawQuad {
+impl DecodeRows for NQuadLines {
+    /// The rows as one [`NQuadLines`], each term read through `src` unless
+    /// the same role's term of a recent row with the same code is in the
+    /// lines already ([`SpanMemo`]): then its bytes are copied from there.
+    /// Any failure is the chunk's one `Err`.
     fn decode(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Self>> {
-        decode_rows_shared(cols, src)
+        let [s, p, o, g] = cols;
+        let mut lines = NQuadLines::with_capacity(s.len());
+        let mut spans: [SpanMemo; 4] = std::array::from_fn(|_| SpanMemo::new());
+        for (((&s, &p), &o), &g) in s.iter().zip(p).zip(o).zip(g) {
+            for (role, (memo, code)) in spans.iter_mut().zip([s, p, o, g]).enumerate() {
+                let start = lines.text.len();
+                match memo.get(code) {
+                    Some(span) => lines.text.extend_from_within(span),
+                    None => match src.str_at(role, code) {
+                        Ok(term) => lines.text.push_str(term),
+                        Err(e) => return vec![Err(e)],
+                    },
+                }
+                memo.put(code, start..lines.text.len());
+                // A graph is followed by its space only when there is one:
+                // the default graph's `""` writes nothing.
+                if role < 3 || lines.text.len() > start {
+                    lines.named_graph |= role == 3;
+                    lines.text.push(' ');
+                }
+            }
+            lines.text.push_str(".\n");
+        }
+        vec![Ok(lines)]
+    }
+}
+
+/// Slots of a [`SpanMemo`]: a power of two, so a code's slot is a mask.
+const SPAN_SLOTS: usize = 256;
+
+/// One role's recent terms in an [`NQuadLines`] being written: the span of
+/// the lines each was last written to, in a direct-mapped table by code, so
+/// a repeated code is copied from the lines rather than read again.
+struct SpanMemo(Vec<(TermCode, std::ops::Range<usize>)>);
+
+impl SpanMemo {
+    fn new() -> Self {
+        Self(vec![(TermCode::MAX, 0..0); SPAN_SLOTS])
+    }
+
+    /// The span `code` was last written to, while its slot still holds it.
+    fn get(&self, code: TermCode) -> Option<std::ops::Range<usize>> {
+        let (held, span) = &self.0[(code as usize) & (SPAN_SLOTS - 1)];
+        (*held == code).then(|| span.clone())
+    }
+
+    fn put(&mut self, code: TermCode, span: std::ops::Range<usize>) {
+        self.0[(code as usize) & (SPAN_SLOTS - 1)] = (code, span);
     }
 }
 
@@ -519,6 +564,15 @@ fn decode_resident<T: DecodeRows>(chunk: &ArrayRef, dict: &TermDictionary) -> Ve
 /// ([`decode_rows`]); a failure to read the code columns is the chunk's one
 /// `Err`.
 pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<Quad>> {
+    decode_resident(chunk, dict)
+}
+
+/// `chunk`'s rows as N-Triples/N-Quads lines, decoded against the resident
+/// `dict`.
+pub(crate) fn decode_chunk_lines(
+    chunk: &ArrayRef,
+    dict: &TermDictionary,
+) -> Vec<Result<NQuadLines>> {
     decode_resident(chunk, dict)
 }
 
@@ -625,6 +679,16 @@ pub(crate) async fn decode_chunk_file_backed(
     decode_file_backed(fb, chunk).await
 }
 
+/// [`decode_chunk_lines`] against a file-backed dictionary
+/// ([`decode_file_backed`]).
+#[cfg(feature = "file-io")]
+pub(crate) async fn decode_chunk_lines_file_backed(
+    fb: &FileBackedDict,
+    chunk: &ArrayRef,
+) -> Vec<Result<NQuadLines>> {
+    decode_file_backed(fb, chunk).await
+}
+
 /// [`decode_chunk_file_backed`] with shared-string terms (see
 /// [`decode_rows_shared`]).
 #[cfg(feature = "file-io")]
@@ -632,16 +696,6 @@ pub(crate) async fn decode_chunk_shared_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<SharedQuad>> {
-    decode_file_backed(fb, chunk).await
-}
-
-/// [`decode_chunk_file_backed`] into [`RawQuad`]s, every row's terms copied
-/// out as owned N-Triples strings.
-#[cfg(feature = "file-io")]
-pub(crate) async fn decode_chunk_raw_file_backed(
-    fb: &FileBackedDict,
-    chunk: &ArrayRef,
-) -> Vec<Result<RawQuad>> {
     decode_file_backed(fb, chunk).await
 }
 

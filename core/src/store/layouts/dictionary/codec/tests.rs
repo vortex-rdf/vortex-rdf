@@ -121,18 +121,6 @@ async fn assert_file_backed_decodes(
         .collect();
     assert_eq!(shared, want, "{case}: shared quads");
 
-    let (raw, reads, resolves) = decode_counts(RawQuad::decode_async(&layout, chunk)).await;
-    assert_eq!((reads, resolves), counts, "{case}: raw quads");
-    let terms = |q: RawQuad| [q.s, q.p, q.o, q.g];
-    let raw: Vec<[String; 4]> = raw.into_iter().map(|row| terms(row.unwrap())).collect();
-    let want: Vec<[String; 4]> = ResolvedLayout::Dictionary(DictAccess::Resident(Arc::clone(dict)))
-        .raw_quads(chunk)
-        .unwrap()
-        .into_iter()
-        .map(terms)
-        .collect();
-    assert_eq!(raw, want, "{case}: raw quads");
-
     assert_eq!(fb.debug_lifts(), 0, "{case}");
 }
 

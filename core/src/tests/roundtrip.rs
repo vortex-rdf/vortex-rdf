@@ -414,10 +414,28 @@ async fn test_unstamped_base_rebuild_sorts_fully() {
 // ─── Textual export ────────────────────────────────────────────────────
 
 /// Quads whose terms exercise everything the N-Triples escape and suffix
-/// grammar has: quotes, backslashes, newlines, a language tag, a datatype,
-/// a blank node, and a named graph.
+/// grammar has: quotes, backslashes, newlines, the other control characters
+/// and the two noncharacters oxrdf escapes, a language tag, a datatype, blank
+/// nodes, and a named and a blank graph; a subject, a predicate and a graph
+/// repeated down consecutive rows, which the export reads as one shared term.
 fn export_test_quads() -> Vec<Quad> {
+    let s = iri_subject("s");
+    let blank_g = GraphName::BlankNode(oxrdf::BlankNode::new("bg").unwrap());
     vec![
+        Quad::new(
+            s.clone(),
+            iri("p"),
+            Term::Literal(Literal::new_simple_literal(
+                "\u{1}\t\u{8}\u{c}\r\u{7f} and \u{fffe}\u{ffff}",
+            )),
+            blank_g.clone(),
+        ),
+        Quad::new(
+            s,
+            iri("p"),
+            Term::Literal(Literal::new_simple_literal("second row")),
+            blank_g,
+        ),
         Quad::new(
             NamedOrBlankNode::BlankNode(oxrdf::BlankNode::new("b0").unwrap()),
             iri("p"),
@@ -496,7 +514,7 @@ async fn assert_export_matches_oxrdf(store: VortexRdfStore) {
 /// The N-Quads export fast path writes the store's raw term strings
 /// verbatim; this pins it byte-for-byte against oxrdfio's serializer over
 /// terms that exercise escaping, tags, datatypes, blank nodes, and a named
-/// graph, under every layout's raw chunk decoding — and, with a tombstoned
+/// and a blank graph, under every layout's shared chunk decoding — and, with a tombstoned
 /// base row and an append tail, skipping the deleted row and including the
 /// tail row.
 #[tokio::test]
@@ -504,6 +522,39 @@ async fn test_export_nquads_fast_path_matches_oxrdf() {
     for layout in LAYOUTS {
         let store = built_store(export_test_quads(), layout, vec![]).await;
         assert_export_matches_oxrdf(store).await;
+    }
+}
+
+/// An export of thousands of quads, their terms repeating within a chunk
+/// from row to row and between rows apart, is oxrdfio's bytes for the same
+/// rows under every layout, in memory and from a file.
+#[tokio::test]
+async fn test_export_nquads_of_many_quads_matches_oxrdf() {
+    let g = iri_graph("g");
+    let quads = graph_modular_quads(3_000, 4, 3, 5, &[GraphName::DefaultGraph, g]);
+    for layout in LAYOUTS {
+        let (_dir, path) = write_store_file(quads.clone(), layout, vec![]).await;
+        let stores = [
+            ("memory", built_store(quads.clone(), layout, vec![]).await),
+            ("file", VortexRdfStore::from_file(&path).await.unwrap()),
+        ];
+        for (source, store) in stores {
+            let stored = store.quads_vec().await.unwrap();
+            let mut exported = Vec::new();
+            crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
+                .await
+                .unwrap();
+            assert!(
+                exported.len() > 2 << 16,
+                "{layout:?} {source}: {}",
+                exported.len()
+            );
+            assert_eq!(
+                String::from_utf8(exported).unwrap(),
+                oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
+                "{layout:?} {source}"
+            );
+        }
     }
 }
 
@@ -517,31 +568,34 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
         .filter(|q| q.graph_name == GraphName::DefaultGraph)
         .cloned()
         .collect();
-    let store = built_store(default_graph_only.clone(), LayoutStrategy::Default, vec![]).await;
-    let stored: Vec<Quad> = store.quads().try_collect().await.unwrap();
-    let mut exported = Vec::new();
-    crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
-        .await
-        .unwrap();
-    assert_eq!(
-        String::from_utf8(exported).unwrap(),
-        oxrdf_reference(&stored, oxrdfio::RdfFormat::NTriples)
-    );
-
-    // A named graph cannot be represented in a graph format: the fast path
-    // (N-Triples) and the structured serializer (Turtle) both refuse it as a
-    // Serialization error, not a writer failure.
-    let store = built_store(quads, LayoutStrategy::Default, vec![]).await;
-    for format in [oxrdfio::RdfFormat::NTriples, oxrdfio::RdfFormat::Turtle] {
-        let result = crate::export_rdf(store.clone(), Vec::new(), format).await;
-        assert!(
-            matches!(result, Err(VortexRdfError::Serialization(_))),
-            "{format:?}: {result:?}"
+    for layout in LAYOUTS {
+        let store = built_store(default_graph_only.clone(), layout, vec![]).await;
+        let stored: Vec<Quad> = store.quads().try_collect().await.unwrap();
+        let mut exported = Vec::new();
+        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(exported).unwrap(),
+            oxrdf_reference(&stored, oxrdfio::RdfFormat::NTriples),
+            "{layout:?}"
         );
+
+        // A named graph cannot be represented in a graph format: the fast
+        // path (N-Triples) and the structured serializer (Turtle) both
+        // refuse it as a Serialization error, not a writer failure.
+        let store = built_store(quads.clone(), layout, vec![]).await;
+        for format in [oxrdfio::RdfFormat::NTriples, oxrdfio::RdfFormat::Turtle] {
+            let result = crate::export_rdf(store.clone(), Vec::new(), format).await;
+            assert!(
+                matches!(result, Err(VortexRdfError::Serialization(_))),
+                "{layout:?} {format:?}: {result:?}"
+            );
+        }
     }
 }
 
-/// The fast path's file arm: the raw chunk stream over a scan must produce
+/// The fast path's file arm: the shared chunk stream over a scan must produce
 /// the same bytes as the in-memory arm under every layout — the file-backed
 /// dictionary's codes resolved through the async read path included — with
 /// the tombstone and the tail held in memory beside the file.

@@ -72,7 +72,7 @@ the same kebab-case names, which `LayoutStrategy`/`IndexType` parse and print.
 ## 3. The ingest currency: `RawQuad`
 
 Every builder consumes one thing: a stream of
-[`RawQuad`](../core/src/common/quad.rs#L66)s, four owned strings in the exact
+[`RawQuad`](../core/src/common/quad.rs#L112)s, four owned strings in the exact
 form the columns store.
 
 | Field | Spelling | Example |
@@ -115,7 +115,7 @@ deduplicated dataset (an RDF dataset is a set: a quad is in it or is not).
 The rebuilds of [§11](#11-rebuilds-mutated-stores-compaction-export) do the
 same. Builders do not parse a term again, so a build's input must come from
 one of the canonical sources: `RawQuad::from_quad` (an `oxrdf` quad), the
-parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L91), which
+parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L137), which
 turns four strings into a `RawQuad` and rejects what is no quad (a literal
 subject, a malformed IRI). A `RawQuad` written by hand in some other spelling
 of the same terms is a different quad.
@@ -268,7 +268,7 @@ it.
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229)):
 every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
-([`build_code_chunk`](../core/src/store/layouts/dictionary/codec/mod.rs#L106)) or,
+([`build_code_chunk`](../core/src/store/layouts/dictionary/codec/mod.rs#L107)) or,
 under the string layouts, as their terms again
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L172)). With indexes a
 first merge runs to completion
@@ -621,10 +621,13 @@ in-memory store rebuilds and when `add_quads` compacts by itself are in
 
 ### 11.3 Back to RDF text
 
-The reverse direction is [`export_rdf`](../core/src/store/persist/export.rs#L27) (the
+The reverse direction is [`export_rdf`](../core/src/store/persist/export.rs#L28) (the
 CLI's `deserialize`, the bindings' `toRdf`): N-Triples and N-Quads are written
-straight from the raw term columns — the strings *are* the serialization — while
-every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
+straight from the raw term columns — the strings *are* the serialization —
+each chunk's rows into one buffer of lines with no string per row (under the
+Dictionary layout a term whose code a recent row of its role had is copied
+from that row's line), handed to the writer a chunk at a time, while every
+other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 
 ---
 
