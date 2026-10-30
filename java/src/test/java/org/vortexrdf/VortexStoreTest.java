@@ -40,7 +40,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  */
 class VortexStoreTest {
 	private static Path fixtures;
-	private static List<String[]> quads;
+	static List<String[]> quads;
 
 	@BeforeAll
 	static void loadOracle() throws IOException {
@@ -54,11 +54,11 @@ class VortexStoreTest {
 		assertTrue(quads.size() > 100);
 	}
 
-	private static VortexStore open(String name, boolean inMemory) {
+	static VortexStore open(String name, boolean inMemory) {
 		return VortexStore.open(fixtures.resolve(name + ".vortex"), inMemory);
 	}
 
-	private static String key(String[] quad) {
+	static String key(String[] quad) {
 		return String.join("\t", quad);
 	}
 
@@ -67,7 +67,7 @@ class VortexStoreTest {
 	}
 
 	/** The oracle's quads matching a pattern, by scan. */
-	private static Set<String> scan(String[] pattern) {
+	static Set<String> scan(String[] pattern) {
 		Set<String> out = new TreeSet<>();
 		for (String[] q : quads) {
 			boolean all = true;
@@ -82,7 +82,7 @@ class VortexStoreTest {
 	}
 
 	/** One pattern per way an argument arrives: all free, each position bound, all four, "", an absent term. */
-	private static List<String[]> patterns() {
+	static List<String[]> patterns() {
 		String[] q = quads.get(quads.size() / 2);
 		return List.of(new String[] { null, null, null, null }, new String[] { q[0], null, null, null },
 				new String[] { null, q[1], null, null }, new String[] { null, null, q[2], null },
@@ -91,12 +91,12 @@ class VortexStoreTest {
 	}
 
 	@ParameterizedTest
-	@ValueSource(strings = { "dictionary", "copy", "reference", "default" })
+	@ValueSource(strings = { "dictionary", "copy", "reference", "default", "typed" })
 	void termPatternsCrossTheBoundary(String name) {
 		try (VortexStore store = open(name, false); VortexStore loaded = open(name, true)) {
 			assertEquals(quads.size(), store.size());
 			assertEquals(store.size(), loaded.size());
-			assertEquals(!name.equals("default"), store.dictionary().isPresent());
+			assertEquals(!name.equals("default") && !name.equals("typed"), store.dictionary().isPresent());
 			for (String[] p : patterns()) {
 				Set<String> want = scan(p);
 				String tag = name + " " + Arrays.toString(p);

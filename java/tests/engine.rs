@@ -88,7 +88,11 @@ fn term_patterns_match_a_scan_on_every_layout() {
                     want.len() as u64,
                     "{tag}: count"
                 );
-                let all = store.quads(r[0], r[1], r[2], r[3], 0, None).unwrap();
+                let all = drain(
+                    store
+                        .quads_cursor(r[0], r[1], r[2], r[3], 0, None, Limits::DEFAULT)
+                        .unwrap(),
+                );
                 assert_eq!(
                     all.iter().cloned().collect::<BTreeSet<_>>(),
                     want,
@@ -102,9 +106,19 @@ fn term_patterns_match_a_scan_on_every_layout() {
                     let mut seen = Vec::new();
                     let mut offset = 0u64;
                     while (offset as usize) < want.len() {
-                        let rows = store
-                            .quads(r[0], r[1], r[2], r[3], offset, Some(page))
-                            .unwrap();
+                        let rows = drain(
+                            store
+                                .quads_cursor(
+                                    r[0],
+                                    r[1],
+                                    r[2],
+                                    r[3],
+                                    offset,
+                                    Some(page),
+                                    Limits::DEFAULT,
+                                )
+                                .unwrap(),
+                        );
                         assert_eq!(
                             rows.len(),
                             page.min(want.len() - offset as usize),
@@ -306,8 +320,17 @@ fn term_patterns_report_what_a_caller_can_get_wrong() {
         .to_string();
     assert!(error.contains("pattern subject"), "{error}");
     let error = store
-        .quads(None, Some("not a term"), None, None, 0, None)
-        .unwrap_err()
+        .quads_cursor(
+            None,
+            Some("not a term"),
+            None,
+            None,
+            0,
+            None,
+            Limits::DEFAULT,
+        )
+        .err()
+        .expect("a malformed predicate")
         .to_string();
     assert!(error.contains("pattern predicate"), "{error}");
     assert!(Store::open(dir.path().join("missing.vortex").to_str().unwrap(), false).is_err());
@@ -365,9 +388,10 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
                         .unwrap_or_else(|| panic!("{tag}: {t} has no code"))
                 })
                 .collect();
-            let decoded = store.decode_many(&codes).unwrap();
-            for (term, back) in distinct.iter().zip(&decoded) {
-                assert_eq!(back.as_deref(), Some(term.as_str()), "{tag}: round trip");
+            let (decoded, n) = store.decode_payload(&codes, Limits::DEFAULT).unwrap();
+            assert_eq!(n, codes.len(), "{tag}: one chunk");
+            for (i, term) in distinct.iter().enumerate() {
+                assert_eq!(decoded.term(i), Some(term.as_str()), "{tag}: round trip");
             }
             assert_eq!(
                 store.decode(codes[0]).unwrap().as_deref(),

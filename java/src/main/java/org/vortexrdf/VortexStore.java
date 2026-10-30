@@ -174,12 +174,32 @@ public final class VortexStore implements AutoCloseable {
 		if (offset < 0) {
 			throw new IllegalArgumentException("offset < 0");
 		}
-		String[] flat = call(h -> Native.quads(h, s, p, o, g, offset, limit));
-		List<String[]> rows = new ArrayList<>(flat.length / 4);
-		for (int i = 0; i < flat.length; i += 4) {
-			rows.add(new String[] { flat[i], flat[i + 1], flat[i + 2], flat[i + 3] });
-		}
-		return rows;
+		return quads(s, p, o, g, offset, limit, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
+	}
+
+	/**
+	 * {@link #quads(String, String, String, String, long, int)} with the chunk limits the rows cross in, which tests
+	 * set small to cut every chunk. The read's cursor lives within this call: freed before it returns or throws.
+	 */
+	List<String[]> quads(String s, String p, String o, String g, long offset, int limit, int chunkRows, int chunkBytes,
+			int largeTerm) {
+		return call(h -> {
+			Object[] first = Native.quadsOpen(h, s, p, o, g, offset, limit, chunkRows, chunkBytes, largeTerm);
+			long cursor = Payload.cursor(first);
+			try {
+				List<String[]> rows = new ArrayList<>(Payload.rows(first));
+				Payload.addQuads(first, rows);
+				Object[] next;
+				while (cursor != 0 && (next = Native.cursorNext(cursor)) != null) {
+					Payload.addQuads(next, rows);
+				}
+				return rows;
+			} finally {
+				if (cursor != 0) {
+					Native.cursorClose(cursor);
+				}
+			}
+		});
 	}
 
 	// ---- term codes ----

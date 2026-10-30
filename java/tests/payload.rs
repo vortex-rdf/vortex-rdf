@@ -380,4 +380,9 @@ fn pace_follows_the_cut_and_grows_back() {
     // A short input held whole is no cut.
     pace.learn(3, 3, 900);
     assert_eq!(pace.limits().rows, 100);
+    // The same rule without state, for a lookup whose slices its Java caller cuts: no cap but the caller's.
+    assert_eq!(Pace::next_slice(100, 10, 990, 1_000), 10);
+    assert_eq!(Pace::next_slice(10, 10, 900, 1_000), 10);
+    assert_eq!(Pace::next_slice(10, 10, 400, 1_000), 20);
+    assert_eq!(Pace::next_slice(65_536, 65_536, 0, 1_000), 131_072);
 }

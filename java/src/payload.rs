@@ -332,10 +332,26 @@ impl Pace {
 
     /// Learns from a chunk that held `held` of the `offered` rows, in `bytes` bytes of distinct terms.
     pub fn learn(&mut self, offered: usize, held: usize, bytes: usize) {
-        if held < offered {
-            self.rows = held.max(1);
-        } else if bytes <= self.limits.chunk_bytes / 2 {
-            self.rows = self.rows.saturating_mul(2).min(self.limits.rows);
-        }
+        self.rows =
+            paced(self.rows, offered, held, bytes, self.limits.chunk_bytes).min(self.limits.rows);
+    }
+
+    /// The codes a lookup's next slice offers after one that held `held` of the `offered` codes in `bytes`
+    /// bytes, under a budget of `chunk_bytes`: the same rule, for a lookup whose slices its Java caller cuts
+    /// and caps.
+    pub fn next_slice(offered: usize, held: usize, bytes: usize, chunk_bytes: usize) -> usize {
+        paced(offered, offered, held, bytes, chunk_bytes)
+    }
+}
+
+/// The rows after a chunk that held `held` of the `offered` rows in `bytes` bytes, the pace having been
+/// `rows`: the rows that fit after a cut, twice as many after a chunk at most half full, else the same.
+fn paced(rows: usize, offered: usize, held: usize, bytes: usize, chunk_bytes: usize) -> usize {
+    if held < offered {
+        held.max(1)
+    } else if bytes <= chunk_bytes / 2 {
+        rows.saturating_mul(2)
+    } else {
+        rows
     }
 }

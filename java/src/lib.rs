@@ -4,19 +4,27 @@
 //! ([`ThrowVortexException`]) and never unwinds into the JVM.
 //!
 //! Conventions: a store handle is the address of a boxed [`engine::Store`] (the Java side owns it and never calls
-//! after `close`); a term code is a non-negative `long`, and `-1` means "no code" (a free pattern position, a term
-//! the dictionary lacks); a `null` string is a free pattern position, while `""` is the default graph.
+//! after `close`); a cursor handle is the address of a boxed [`Handle`], which the Java side frees within the
+//! call that opened it; a term code is a non-negative `long`, and `-1` means "no code" (a free pattern position,
+//! a term the dictionary lacks); a `null` string is a free pattern position, while `""` is the default graph.
+//!
+//! Terms cross in packed chunks (`Payload.java`, [`java_payload`]): the UTF-8 text of a chunk's distinct terms
+//! once, and an `int` per position naming its term.
 
 pub mod cursor;
 pub mod engine;
 pub mod payload;
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use cursor::QuadCursor;
 use engine::{ROW_BYTES, Store};
 use jni::errors::ErrorPolicy;
-use jni::objects::{JByteBuffer, JClass, JLongArray, JObjectArray, JString};
+use jni::objects::{JByteBuffer, JClass, JIntArray, JLongArray, JObject, JObjectArray, JString};
 use jni::strings::JNIString;
 use jni::sys::{jboolean, jint, jlong};
 use jni::{Env, EnvUnowned, jni_str};
+use payload::{Limits, Pace, Payload};
 use vortex_rdf_core::CodePattern;
 
 /// A native call's failure: the store's own, or a JNI call's.
@@ -81,6 +89,86 @@ fn term(env: &Env<'_>, s: &JString<'_>) -> Result<Option<String>, Failure> {
     } else {
         Some(s.try_to_string(env)?)
     })
+}
+
+/// Native objects the Java side holds by handle and has not freed: cursors, then streams.
+static OPEN_HANDLES: AtomicI64 = AtomicI64::new(0);
+
+/// A native object the Java side holds by handle, counted in [`OPEN_HANDLES`] from [`open`](Self::open) to
+/// its drop.
+struct Handle<T>(T);
+
+impl<T> Handle<T> {
+    /// Boxes `value` for the Java side; returns its handle.
+    fn open(value: T) -> jlong {
+        OPEN_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Box::into_raw(Box::new(Handle(value))) as jlong
+    }
+
+    /// The object a handle addresses.
+    ///
+    /// # Safety
+    ///
+    /// `h` came from [`open`](Self::open) with this `T`, is not closed, and no other call uses it meanwhile.
+    unsafe fn get<'a>(h: jlong) -> &'a mut T {
+        // SAFETY: as the caller promises.
+        unsafe { &mut (*(h as *mut Handle<T>)).0 }
+    }
+
+    /// Frees a handle; `0` is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// As for [`get`](Self::get), and nothing uses the handle afterwards.
+    unsafe fn close(h: jlong) {
+        if h != 0 {
+            // SAFETY: as the caller promises.
+            drop(unsafe { Box::from_raw(h as *mut Handle<T>) });
+        }
+    }
+}
+
+impl<T> Drop for Handle<T> {
+    fn drop(&mut self) {
+        OPEN_HANDLES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The most rows a read hands over: what a Java `ArrayList` holds.
+const MAX_JAVA_LIST: usize = i32::MAX as usize - 8;
+
+/// The chunk limits a native call's `int`s give; out of range (a negative value included) is `InvalidInput`.
+fn limits(rows: jint, bytes: jint, large_term: jint) -> Result<Limits, Failure> {
+    let size = |value: jint| usize::try_from(value).unwrap_or(0);
+    Ok(Limits::new(size(rows), size(bytes), size(large_term))?)
+}
+
+/// A chunk as the `Object[5]` `Payload.java` reads: the text (`byte[]`), the distinct terms' bounds and each
+/// position's term (`int[]` each), the large terms (`String[]`, or `null` when there are none), and `tail`
+/// (`long[]`, or `null`).
+fn java_payload<'local>(
+    env: &mut Env<'local>,
+    payload: &Payload,
+    tail: Option<&[i64]>,
+) -> Result<JObjectArray<'local, JObject<'local>>, Failure> {
+    let array = JObjectArray::<JObject>::new(env, 5, JObject::null())?;
+    let text = env.byte_array_from_slice(&payload.text)?;
+    array.set_element(env, 0, &text)?;
+    for (slot, ints) in [(1, &payload.bounds), (2, &payload.terms)] {
+        let java = JIntArray::new(env, ints.len())?;
+        java.set_region(env, 0, ints)?;
+        array.set_element(env, slot, &java)?;
+    }
+    if !payload.large.is_empty() {
+        let large = java_strings(env, payload.large.iter().map(|t| Some(t.as_str())))?;
+        array.set_element(env, 3, &large)?;
+    }
+    if let Some(tail) = tail {
+        let java = JLongArray::new(env, tail.len())?;
+        java.set_region(env, 0, tail)?;
+        array.set_element(env, 4, &java)?;
+    }
+    Ok(array)
 }
 
 /// A `String[]` of `strings`, a `null` element for a `None`.
@@ -189,9 +277,12 @@ pub extern "system" fn Java_org_vortexrdf_Native_count<'local>(
     })
 }
 
-/// The matching quads as a flat `String[]`, four terms per quad; `limit < 0` takes every row.
+/// A read of the quads matching a pattern, `limit` rows (every one when negative) after `offset`, as its first
+/// chunk; the last slot is `{cursor, rows}`: the cursor of the chunks left, `0` when this one ends the read,
+/// and the read's rows. A chunk holds at most `chunkRows` rows and `chunkBytes` bytes of terms; terms over
+/// `largeTerm` bytes cross on their own.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vortexrdf_Native_quads<'local>(
+pub extern "system" fn Java_org_vortexrdf_Native_quadsOpen<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
     h: jlong,
@@ -201,7 +292,10 @@ pub extern "system" fn Java_org_vortexrdf_Native_quads<'local>(
     g: JString<'local>,
     offset: jlong,
     limit: jint,
-) -> JObjectArray<'local, JString<'local>> {
+    chunk_rows: jint,
+    chunk_bytes: jint,
+    large_term: jint,
+) -> JObjectArray<'local, JObject<'local>> {
     call(&mut env, |env| {
         let [s, p, o, g] = [
             term(env, &s)?,
@@ -209,17 +303,73 @@ pub extern "system" fn Java_org_vortexrdf_Native_quads<'local>(
             term(env, &o)?,
             term(env, &g)?,
         ];
-        let rows = store(h).quads(
+        let limits = limits(chunk_rows, chunk_bytes, large_term)?;
+        let mut cursor = store(h).quads_cursor(
             s.as_deref(),
             p.as_deref(),
             o.as_deref(),
             g.as_deref(),
             offset.max(0) as u64,
             (limit >= 0).then_some(limit as usize),
+            limits,
         )?;
-        let flat: Vec<&str> = rows.iter().flatten().map(String::as_str).collect();
-        java_strings(env, flat.into_iter().map(Some))
+        let rows = cursor.rows();
+        if rows > MAX_JAVA_LIST {
+            return Err("the match has more rows than a Java list holds".into());
+        }
+        let first = cursor.next().transpose()?.unwrap_or_default();
+        let handle = if first.positions() / 4 < rows {
+            Handle::open(cursor)
+        } else {
+            0
+        };
+        java_payload(env, &first, Some(&[handle, rows as i64])).inspect_err(|_| {
+            // SAFETY: the handle was just opened and never reached the Java side.
+            unsafe { Handle::<QuadCursor>::close(handle) }
+        })
     })
+}
+
+/// The next chunk of a read [`Java_org_vortexrdf_Native_quadsOpen`] started, its last slot `null`; `null`
+/// once the read is over.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_cursorNext<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    cursor: jlong,
+) -> JObjectArray<'local, JObject<'local>> {
+    call(&mut env, |env| {
+        // SAFETY: the Java side passes a cursor `quadsOpen` returned, before closing it, from the one thread
+        // that opened it.
+        let cursor = unsafe { Handle::<QuadCursor>::get(cursor) };
+        match cursor.next().transpose()? {
+            Some(payload) => java_payload(env, &payload, None),
+            None => Ok(JObjectArray::default()),
+        }
+    })
+}
+
+/// Frees a cursor; `0` is a no-op.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_cursorClose<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    cursor: jlong,
+) {
+    call(&mut env, |_| {
+        // SAFETY: as for `cursorNext`, and nothing uses the cursor afterwards.
+        unsafe { Handle::<QuadCursor>::close(cursor) };
+        Ok(())
+    })
+}
+
+/// The native objects the Java side holds by handle and has not freed, in this process.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_openHandles<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+) -> jlong {
+    call(&mut env, |_| Ok(OPEN_HANDLES.load(Ordering::Relaxed)))
 }
 
 #[unsafe(no_mangle)]
@@ -322,20 +472,36 @@ pub extern "system" fn Java_org_vortexrdf_Native_decode<'local>(
     })
 }
 
+/// The terms of `codes[from, from + count)` from the first, as one chunk of at most `chunkBytes` bytes of terms
+/// and at least one code (unless `count` is 0); a negative code and one outside the dictionary hold no term.
+/// The last slot is `{next}`, the codes the next slice should offer ([`Pace::next_slice`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_vortexrdf_Native_decodeMany<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
     h: jlong,
     codes: JLongArray<'local>,
-) -> JObjectArray<'local, JString<'local>> {
+    from: jint,
+    count: jint,
+    chunk_bytes: jint,
+    large_term: jint,
+) -> JObjectArray<'local, JObject<'local>> {
     call(&mut env, |env| {
-        let mut buf = vec![0i64; codes.len(env)?];
-        codes.get_region(env, 0, &mut buf)?;
+        let len = codes.len(env)?;
+        let (Ok(start), Ok(n)) = (usize::try_from(from), usize::try_from(count)) else {
+            return Err("decodeMany: from and count must not be negative".into());
+        };
+        if start.checked_add(n).is_none_or(|end| end > len) {
+            return Err("decodeMany: from + count passes the end of codes".into());
+        }
+        let mut buf = vec![0i64; n];
+        codes.get_region(env, from, &mut buf)?;
         // A negative code is no code: u64::MAX is outside every dictionary, so it decodes to `None`.
         let codes: Vec<u64> = buf.iter().map(|&c| code(c).unwrap_or(u64::MAX)).collect();
-        let terms = store(h).decode_many(&codes)?;
-        java_strings(env, terms.iter().map(|t| t.as_deref()))
+        let limits = limits(count.max(1), chunk_bytes, large_term)?;
+        let (payload, held) = store(h).decode_payload(&codes, limits)?;
+        let next = Pace::next_slice(n, held, payload.bytes(), limits.chunk_bytes);
+        java_payload(env, &payload, Some(&[next.min(i64::MAX as usize) as i64]))
     })
 }
 

@@ -47,8 +47,23 @@ final class Native {
 	/** Terms are N-Triples spellings; null is a free position, "" the default graph. */
 	static native long count(long handle, String s, String p, String o, String g);
 
-	/** The matching quads, four terms each, flat; a negative limit takes every row. */
-	static native String[] quads(long handle, String s, String p, String o, String g, long offset, int limit);
+	/**
+	 * A read of the matching quads (a negative limit takes every row) as its first chunk ({@link Payload}), whose
+	 * last slot is {@code {cursor, rows}}: the cursor of the chunks left, 0 when none are, and the read's rows. A
+	 * chunk holds at most {@code chunkRows} rows and {@code chunkBytes} bytes of terms; terms over
+	 * {@code largeTerm} bytes cross on their own. The caller closes the cursor within the call that opened it.
+	 */
+	static native Object[] quadsOpen(long handle, String s, String p, String o, String g, long offset, int limit,
+			int chunkRows, int chunkBytes, int largeTerm);
+
+	/** The next chunk of a read, its last slot null; null once the read is over. */
+	static native Object[] cursorNext(long cursor);
+
+	/** Frees a cursor; 0 is a no-op. */
+	static native void cursorClose(long cursor);
+
+	/** The native objects held by handle and not yet freed, in this process: cursors (and later streams). */
+	static native long openHandles();
 
 	static native boolean hasDictionary(long handle);
 
@@ -67,7 +82,12 @@ final class Native {
 
 	static native String decode(long handle, long code);
 
-	static native String[] decodeMany(long handle, long[] codes);
+	/**
+	 * The terms of {@code codes[from, from + count)} from the first, as one chunk ({@link Payload}) of at most
+	 * {@code chunkBytes} bytes of terms and at least one code; a negative code and one outside the dictionary hold
+	 * no term. The last slot is {@code {next}}, the codes the next slice should offer.
+	 */
+	static native Object[] decodeMany(long handle, long[] codes, int from, int count, int chunkBytes, int largeTerm);
 
 	/** Codes are non-negative; -1 is a free position. */
 	static native long countCodes(long handle, long s, long p, long o, long g);

@@ -36,10 +36,31 @@ public final class TermDictionary {
 		return store.call(h -> Native.decode(h, code));
 	}
 
-	/** {@link #decode} of each code, in order, for codes in any order and with repeats; one native call. */
+	/** {@link #decode} of each code, in order, for codes in any order and with repeats. */
 	public String[] decodeMany(long[] codes) {
 		Objects.requireNonNull(codes, "codes");
-		return store.call(h -> Native.decodeMany(h, codes));
+		return decodeMany(codes, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
+	}
+
+	/**
+	 * {@link #decodeMany(long[])} in native calls of at most {@code sliceCodes} codes and {@code chunkBytes} bytes of
+	 * terms, terms over {@code largeTerm} bytes crossing on their own; tests set them small to cut every chunk.
+	 */
+	String[] decodeMany(long[] codes, int sliceCodes, int chunkBytes, int largeTerm) {
+		if (sliceCodes < 1) {
+			throw new IllegalArgumentException("sliceCodes < 1");
+		}
+		return store.call(h -> {
+			String[] terms = new String[codes.length];
+			int slice = sliceCodes;
+			for (int from = 0; from < codes.length;) {
+				Object[] payload = Native.decodeMany(h, codes, from, Math.min(slice, codes.length - from), chunkBytes,
+						largeTerm);
+				from += Payload.fill(payload, terms, from);
+				slice = Payload.nextSlice(payload, sliceCodes);
+			}
+			return terms;
+		});
 	}
 
 	/** The code ranges of the term kinds. Terms of a kind are contiguous, so a code's kind is a range check. */

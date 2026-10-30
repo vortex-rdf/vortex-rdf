@@ -80,49 +80,9 @@ impl Store {
         Ok(RUNTIME.block_on(self.store.count_probe(&probe))? as u64)
     }
 
-    /// The quads matching a pattern as `(s, p, o, g)` N-Triples spellings, `limit` rows after `offset` in the
-    /// store's row order: a Dictionary store's matched codes decoded a column at a time, the matched quads'
-    /// terms otherwise.
-    pub fn quads(
-        &self,
-        s: Option<&str>,
-        p: Option<&str>,
-        o: Option<&str>,
-        g: Option<&str>,
-        offset: u64,
-        limit: Option<usize>,
-    ) -> Result<Vec<[String; 4]>> {
-        let probe = Probe::parse(s, p, o, g)?.window(offset as usize, limit);
-        let view = RUNTIME.block_on(self.store.run_probe(&probe))?;
-        if let Some(dict) = &self.dict
-            && let Some([s, p, o, g]) = RUNTIME.block_on(view.code_columns_gathered())?
-        {
-            let decode = |column| RUNTIME.block_on(dict.decode_many(column));
-            let rows = decode(&s)?
-                .into_iter()
-                .zip(decode(&p)?)
-                .zip(decode(&o)?)
-                .zip(decode(&g)?);
-            return rows
-                .map(|(((s, p), o), g)| Ok([spelled(s)?, spelled(p)?, spelled(o)?, spelled(g)?]))
-                .collect();
-        }
-        let rows = RUNTIME.block_on(view.shared_quads_vec())?;
-        Ok(rows
-            .iter()
-            .map(|q| {
-                [
-                    q.s.to_string(),
-                    q.p.to_string(),
-                    q.o.to_string(),
-                    q.g.to_string(),
-                ]
-            })
-            .collect())
-    }
-
-    /// The quads [`quads`](Self::quads) reads, as a cursor that sends them in packed chunks under `limits`:
-    /// the same rows in the same order, found the same way.
+    /// The quads matching a pattern of N-Triples spellings, `limit` rows after `offset` in the store's row order,
+    /// as a cursor that hands them out in packed chunks under `limits`: a Dictionary store's matched codes,
+    /// gathered (in index order when an index serves the pattern), or the matched quads' terms otherwise.
     #[allow(clippy::too_many_arguments)]
     pub fn quads_cursor(
         &self,
@@ -182,11 +142,6 @@ impl Store {
         RUNTIME.block_on(self.dict()?.decode(code))
     }
 
-    /// [`decode`](Self::decode) of each code, in order, for codes in any order and with repeats.
-    pub fn decode_many(&self, codes: &[u64]) -> Result<Vec<Option<String>>> {
-        RUNTIME.block_on(self.dict()?.decode_many(codes))
-    }
-
     /// The terms of `codes` from the first, as one packed chunk under `limits`, and how many codes it holds
     /// (at least one, unless `codes` is empty). A code outside the dictionary holds no term.
     pub fn decode_payload(&self, codes: &[u64], limits: Limits) -> Result<(Payload, usize)> {
@@ -219,11 +174,4 @@ impl Store {
         }
         Ok(rows)
     }
-}
-
-/// A matched row's decoded term; `None` is a code outside the dictionary.
-fn spelled(term: Option<String>) -> Result<String> {
-    term.ok_or_else(|| {
-        VortexRdfError::Deserialization("a matched row holds a code outside the dictionary".into())
-    })
 }
