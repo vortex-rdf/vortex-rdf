@@ -18,6 +18,7 @@ use vortex_scan::selection::Selection;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{available_parallelism, spawned_splits};
+use crate::io::zone_map::ZONE_ROWS;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::NativeStoreFile;
@@ -212,11 +213,11 @@ async fn evaluate_filter_split(
 }
 
 /// The rows a fold that may stop at its first matches evaluates first, as
-/// one piece of its first split: one zone. Each later piece is
+/// one piece of its first split: one zone ([`ZONE_ROWS`]). Each later piece is
 /// [`PIECE_GROWTH`] times the one before, inside one split, so the pieces
 /// soon reach whole splits, and a fold that runs to the end evaluates its
 /// first split in a few pieces rather than one.
-const FIRST_PIECE_ROWS: u64 = 8_192;
+const FIRST_PIECE_ROWS: u64 = ZONE_ROWS as u64;
 
 /// How much each piece of [`early_exit_pieces`] outgrows the one before.
 const PIECE_GROWTH: u64 = 4;

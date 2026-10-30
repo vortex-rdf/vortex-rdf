@@ -349,7 +349,7 @@ impl VortexRdfStore {
     /// other.
     pub(crate) fn debug_zone_columns(&self) -> Vec<String> {
         match &self.quads.backend {
-            crate::store::Backend::InMemory(memory) => memory.probes.zone_columns(&memory.base),
+            crate::store::Backend::InMemory(memory) => memory.zones.columns(),
             #[cfg(feature = "file-io")]
             crate::store::Backend::File(_) => Vec::new(),
         }
@@ -359,10 +359,9 @@ impl VortexRdfStore {
     /// in-memory view; `None` for a column without them or any other view.
     pub(crate) fn debug_zone_bounds(&self, name: &str) -> Option<Vec<(TermCode, TermCode)>> {
         match &self.quads.backend {
-            crate::store::Backend::InMemory(memory) => memory
-                .probes
-                .zones(&memory.base, name)
-                .map(|zones| zones.bounds().to_vec()),
+            crate::store::Backend::InMemory(memory) => {
+                memory.zones.get(name).map(|zones| zones.bounds().to_vec())
+            }
             #[cfg(feature = "file-io")]
             crate::store::Backend::File(_) => None,
         }

@@ -8,23 +8,22 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::{ExecutionCtx, VortexSessionExecute};
 use vortex_layout::layouts::flat::FlatLayout;
 use vortex_layout::layouts::struct_::Struct as StructLayout;
-use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
 use vortex_rdf_encoded_search::{fetch_flat, flat_leaves};
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
+use crate::io::zone_map::ExactZoneMap;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::StrColReader;
 use crate::store::persist::native_file::NativeStoreFile;
 
-use super::super::storage::{COL_DICT_TERM, TermChunk, window_bound_aggregates};
+use super::super::storage::{COL_DICT_TERM, TermChunk};
 use super::super::term_dict::{CodeSpace, next_dictionary_id};
 use super::cache::{WINDOW_CACHE_BYTES, WindowCache};
 use super::{FileBackedDict, Window, Windows};
@@ -130,34 +129,17 @@ impl FileBackedDict {
     }
 }
 
-/// A zone-mapped term column's zone table, with the rows each zone covers.
-struct Zones {
-    /// The zones child: one row per zone, holding its bounds.
-    table: LayoutRef,
-    /// Rows per zone, the last zone's excepted.
-    zone_len: usize,
-}
-
 /// The term column's flat leaves (one per FSST window, in row order, with
 /// their row counts) and, when the column is zone-mapped with exact window
-/// bounds, its zone table. `None` for any shape a window search cannot
-/// address.
-fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<Zones>)> {
+/// bounds, its zone map. `None` for any shape a window search cannot address.
+fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<ExactZoneMap>)> {
     dict.as_opt::<StructLayout>()?;
     let column = (0..dict.nslots()).find_map(|i| {
         matches!(dict.slot_type(i), Some(LayoutChildType::Field(ref n)) if n.as_ref() == COL_DICT_TERM)
             .then(|| dict.slot(i).ok().flatten())
             .flatten()
     })?;
-    let zones = match column.as_opt::<Zoned>() {
-        Some(zoned) if exact_bounds(&zoned.present_aggregates()) => {
-            column.slot(1).ok().flatten().map(|table| Zones {
-                table,
-                zone_len: zoned.zone_len(),
-            })
-        }
-        _ => None,
-    };
+    let zones = ExactZoneMap::of(&column);
     // An empty child has nothing to search; a term count past what a `usize`
     // holds cannot be ranked on this target.
     if !usize::try_from(column.row_count()).is_ok_and(|rows| rows > 0) {
@@ -174,19 +156,12 @@ fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<Zones>)> {
     Some((leaves, zones))
 }
 
-/// Whether a zone map records this crate's exact window bounds.
-fn exact_bounds(present: &[String]) -> bool {
-    window_bound_aggregates()
-        .iter()
-        .all(|aggregate| present.contains(&aggregate.to_string()))
-}
-
 /// Whether zone `i` of `zones` covers exactly leaf `i`: one zone per leaf,
 /// every leaf but the last holding `zone_len` rows and the last at most that.
 /// A column written with its windows as zones is cut so; a foreign writer's
 /// may have as many zones as leaves and still cut them elsewhere, which would
 /// hand a window the bounds of other rows.
-fn zones_cut_at_leaves(zones: &Zones, leaves: &[(FlatLayout, usize)]) -> bool {
+fn zones_cut_at_leaves(zones: &ExactZoneMap, leaves: &[(FlatLayout, usize)]) -> bool {
     let Some(((_, last), rest)) = leaves.split_last() else {
         return false;
     };
@@ -200,51 +175,22 @@ fn zones_cut_at_leaves(zones: &Zones, leaves: &[(FlatLayout, usize)]) -> bool {
 /// window; `None` when the zones are not cut at the leaves
 /// ([`zones_cut_at_leaves`]) or a bound is null.
 async fn zone_bounds(
-    zones: &Zones,
+    zones: &ExactZoneMap,
     leaves: &[(FlatLayout, usize)],
     source: &Arc<dyn SegmentSource>,
 ) -> Result<Option<Vec<Bounds>>> {
     if !zones_cut_at_leaves(zones, leaves) {
         return Ok(None);
     }
-    let windows = leaves.len();
-    let reader = zones.table.new_reader(
-        "dictionary-zones".into(),
-        Arc::clone(source),
-        &VORTEX_SESSION,
-        &Default::default(),
-    )?;
-    let table = crate::io::read::scan_all_reader(reader).await?;
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let table = table.execute::<StructArray>(&mut ctx)?;
-    let aggregates = window_bound_aggregates();
-    let Some(maxes) = bound_column(&table, &aggregates[0].to_string(), &mut ctx)? else {
-        return Ok(None);
-    };
-    let Some(mins) = bound_column(&table, &aggregates[1].to_string(), &mut ctx)? else {
+    let Some((maxes, mins)) = zones.read_bounds::<VarBinViewArray>(source).await? else {
         return Ok(None);
     };
     let (maxes, mins) = (StrColReader::new(&maxes), StrColReader::new(&mins));
     Ok(Some(
-        (0..windows)
+        (0..leaves.len())
             .map(|w| (Box::from(mins.bytes_at(w)), Box::from(maxes.bytes_at(w))))
             .collect(),
     ))
-}
-
-/// One bound column of the zone table, `None` when absent or holding a null.
-fn bound_column(
-    table: &StructArray,
-    name: &str,
-    ctx: &mut ExecutionCtx,
-) -> Result<Option<VarBinViewArray>> {
-    let Ok(column) = table.unmasked_field_by_name(name) else {
-        return Ok(None);
-    };
-    if !column.all_valid(ctx)? {
-        return Ok(None);
-    }
-    Ok(Some(column.clone().execute::<VarBinViewArray>(ctx)?))
 }
 
 /// Each window's bounds read from its own leaf, for a term column without
@@ -278,10 +224,13 @@ fn ordered(bounds: &[Bounds]) -> bool {
 mod tests {
     use super::super::fixtures::windowed_handle;
     use super::*;
+    use crate::io::zone_map::exact_bound_aggregates;
     use crate::store::layouts::dictionary::TermDictionary;
     use crate::store::schema::TermCode;
+    use vortex_array::arrays::struct_::{StructArray, StructArrayExt as _};
     use vortex_buffer::ByteBuffer;
     use vortex_file::OpenOptionsSessionExt as _;
+    use vortex_layout::layouts::zoned::Zoned;
 
     /// Windows that are each sorted but out of term order across the child
     /// are an invalid dictionary: the open fails with a `Deserialization`
@@ -369,7 +318,7 @@ mod tests {
         assert_eq!(zoned.nzones(), 6);
         assert_eq!(zoned.zone_len(), 100);
         // The zone table holds the maximum, then the minimum.
-        let names: Vec<String> = window_bound_aggregates()
+        let names: Vec<String> = exact_bound_aggregates()
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -617,7 +566,7 @@ mod tests {
         // the zones did.
         use vortex_array::IntoArray as _;
         use vortex_file::WriteOptionsSessionExt as _;
-        let names: Vec<String> = window_bound_aggregates()
+        let names: Vec<String> = exact_bound_aggregates()
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -658,7 +607,7 @@ mod tests {
                 .open_options()
                 .open_buffer(ByteBuffer::from(bytes))
                 .unwrap();
-            let hand = Zones {
+            let hand = ExactZoneMap {
                 table: file.footer().layout().clone(),
                 zone_len: 100,
             };

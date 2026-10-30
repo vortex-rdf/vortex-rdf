@@ -429,7 +429,7 @@ flowchart TD
     R --> F["Vortex footer, postscript, end-of-file marker"]
 ```
 
-- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L156)
+- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L153)
   — Vortex's default `WriteStrategyBuilder` pipeline: split the struct into
   columns, repartition each column into 8,192-row blocks, compute zoned
   statistics per block, dictionary-encode a column where sampling says it pays,
@@ -437,7 +437,7 @@ flowchart TD
   BtrBlocks-style compressor, and write flat leaf layouts. Each id column —
   a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid` —
   is handed, through the builder's per-field override, to
-  [`id_column_strategy`](../core/src/io/container/sources.rs#L216): the same
+  [`id_column_strategy`](../core/src/io/container/sources.rs#L213): the same
   per-column pipeline rebuilt step for step from Vortex's layout strategies,
   with the coalescing target split in two. A column that does not
   dictionary-encode coalesces toward ~2 MiB, 262,144 rows per leaf for a
@@ -446,12 +446,12 @@ flowchart TD
   copy to Vortex's pipeline: at 1 MiB for both targets it must write the
   stock bytes. A table without id columns — the string layouts' quad
   table — gets the stock pipeline unchanged
-  ([`default_child_strategy`](../core/src/io/container/sources.rs#L138)).
+  ([`default_child_strategy`](../core/src/io/container/sources.rs#L135)).
 - **Index children** take exactly the same strategy, so their encoding is what a
   plain table write produces: plain code columns and `rid` (row ids are
   unique, so never dictionary-encoded) at ~2 MiB, dictionary codes at ~1 MiB,
   term strings under the string layouts at ~1 MiB.
-- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L293):
+- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L290):
   its chunks are already FSST-compressed windows, so they are written verbatim
   as one flat leaf each under a chunked node — no sampling, no re-encoding —
   zoned one zone per window with the window's exact first and last term when
@@ -523,7 +523,7 @@ inode stays alive for the mapping.
 A build that is queried in place, without a file, skips the writer:
 [`from_built`](../core/src/store/construct.rs#L112) turns a `BuiltArray` into the
 store's *compressed-resident* form (through
-[`adopt`](../core/src/store/construct.rs#L129), the step it shares with
+[`adopt`](../core/src/store/construct.rs#L125), the step it shares with
 `from_parts`):
 
 - every non-nullable `u64` code child and row-id child of the base and of
@@ -531,18 +531,18 @@ store's *compressed-resident* form (through
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L76)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L77)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
   path decodes the canonical primitive once into the wrapper's cache;
 - the encoded-search probes over every column are resolved up front
-  ([`StructProbes::warm`](../core/src/store/probes.rs#L41)), so no query pays the
+  ([`StructProbes::warm`](../core/src/store/probes.rs#L36)), so no query pays the
   encoding-tree walk;
 - the smallest and largest code of each 8,192-row zone of every code column
   is taken in the pass that picks the column's encoding, which reads every
   code for the column's own bounds anyway
-  ([`ZoneBuilder`](../core/src/store/zones.rs#L74)): the in-memory
+  ([`ZoneBuilder`](../core/src/store/zones.rs#L78)): the in-memory
   counterpart of a file's zone maps, so a match's residual equality compares
   only the zones that may hold its code
   ([matching.md §6.3](matching.md#63-residual-column-filtering)).
@@ -551,7 +551,7 @@ The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L95)
 (crate-private; `from_file_in_memory` calls it), takes a store's split parts:
 it keeps each integer child's existing encoding wherever a probe binds it and
 decodes only the ones that decline. Its zone bounds are the file's own zone
-maps, read at open ([`ZoneTable::read_from_file`](../core/src/store/zones.rs#L145)),
+maps, read at open ([`ZoneTable::read_from_file`](../core/src/store/zones.rs#L150)),
 as `from_bytes` reads them. Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).
 

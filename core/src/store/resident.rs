@@ -64,34 +64,32 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// untouched. A chunked column is compressed chunk by chunk
 /// ([`compress_int_child`]).
 ///
+/// The pass that picks a column's encoding reads all its codes, and takes
+/// the column's zone bounds on the way ([`ZoneBuilder`]): they come back
+/// beside the struct ([`ZoneTable`]), for the primary base, whose residual
+/// filter skips zones by them.
+///
 /// `payload_lazy` wraps each compressed column in a `vortex.shared` wrapper:
 /// the match fast paths probe the compressed source through it, while the
 /// code-column payload path decodes the canonical primitive once into its
 /// cache (`shared_code_primitive`) and is zero-copy on every later call. Pass
 /// it for the primary base, the only array the payload path reads.
-///
-/// `zones`, when given, receives each compressed column's zone bounds, read
-/// in the pass that chooses its encoding ([`ZoneBuilder`]); pass it for the
-/// primary base, whose residual filter skips zones by them.
 pub(crate) fn with_compressed_int_children(
     rows: ArrayRef,
     payload_lazy: bool,
-    mut zones: Option<&mut ZoneTable>,
-) -> Result<ArrayRef> {
+) -> Result<(ArrayRef, ZoneTable)> {
     use vortex_array::arrays::Primitive;
     use vortex_layout::arrays::shared::Shared;
 
-    map_struct_children(rows, |name, child, ctx| {
+    let mut zones = ZoneTable::default();
+    let rows = map_struct_children(rows, |name, child, ctx| {
         let sorted = column_is_sorted(child);
-        let mut bounds = zones.is_some().then(ZoneBuilder::new);
-        let Some(mut encoded) = compress_int_child(child, sorted, bounds.as_mut(), ctx)? else {
+        let mut bounds = ZoneBuilder::new();
+        let Some(mut encoded) = compress_int_child(child, sorted, &mut bounds, ctx)? else {
             return Ok(None);
         };
-        if let (Some(table), Some(column)) = (
-            zones.as_deref_mut(),
-            bounds.and_then(|bounds| bounds.finish(child.len())),
-        ) {
-            table.insert(name.clone(), column);
+        if let Some(column) = bounds.finish(child.len()) {
+            zones.insert(name.clone(), column);
         }
         if payload_lazy && !encoded.is::<Primitive>() {
             encoded = Shared::new(encoded).into_array();
@@ -100,7 +98,8 @@ pub(crate) fn with_compressed_int_children(
             stamp_is_sorted(&encoded);
         }
         Ok(Some(encoded))
-    })
+    })?;
+    Ok((rows, zones))
 }
 
 /// `rows` executed to a struct, each child replaced by the array `f` returns
@@ -208,7 +207,7 @@ fn canonical_code(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray
 fn compress_int_child(
     child: &ArrayRef,
     sorted: bool,
-    mut zones: Option<&mut ZoneBuilder>,
+    zones: &mut ZoneBuilder,
     ctx: &mut vortex_array::ExecutionCtx,
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::arrays::chunked::ChunkedArrayExt as _;
@@ -221,7 +220,7 @@ fn compress_int_child(
         let mut out = Vec::with_capacity(chunked.nchunks());
         let mut compressed_any = false;
         for chunk in chunked.chunks() {
-            match compress_int_child(&chunk, sorted, zones.as_deref_mut(), ctx)? {
+            match compress_int_child(&chunk, sorted, zones, ctx)? {
                 Some(encoded) => {
                     if sorted {
                         stamp_is_sorted(&encoded);
@@ -262,7 +261,7 @@ fn compress_int_column(
     prim: &vortex_array::arrays::PrimitiveArray,
     values: &[u64],
     sorted: bool,
-    mut zones: Option<&mut ZoneBuilder>,
+    zones: &mut ZoneBuilder,
     ctx: &mut vortex_array::ExecutionCtx,
 ) -> Result<ArrayRef> {
     use vortex::encodings::fastlanes::BitPacked;
@@ -277,11 +276,8 @@ fn compress_int_column(
     let mut prev = values[0];
     let mut rest = values;
     while !rest.is_empty() {
-        // Up to the end of the zone being filled when zones are wanted.
-        let take = zones
-            .as_ref()
-            .map_or(rest.len(), |zones| zones.room().min(rest.len()));
-        let (part, next) = rest.split_at(take);
+        // Up to the end of the zone being filled.
+        let (part, next) = rest.split_at(zones.room().min(rest.len()));
         let (mut lo, mut hi) = (u64::MAX, u64::MIN);
         for &v in part {
             if v > hi {
@@ -295,9 +291,7 @@ fn compress_int_column(
                 prev = v;
             }
         }
-        if let Some(zones) = zones.as_deref_mut() {
-            zones.push(part.len(), lo, hi);
-        }
+        zones.push(part.len(), lo, hi);
         min = min.min(lo);
         max = max.max(hi);
         rest = next;

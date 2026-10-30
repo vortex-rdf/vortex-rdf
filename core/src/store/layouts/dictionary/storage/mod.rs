@@ -517,19 +517,6 @@ impl TermChunk {
     }
 }
 
-/// The zone aggregates recording a dictionary window's exact bounds, in the
-/// order the zone table holds them: `vortex.max()` (last term), then
-/// `vortex.min()` (first term). Not the bounded string aggregates Vortex
-/// writes by default, which truncate long terms.
-pub(crate) fn window_bound_aggregates() -> Arc<[vortex_array::aggregate_fn::AggregateFnRef]> {
-    use vortex_array::aggregate_fn::fns::{max::Max, min::Min};
-    use vortex_array::aggregate_fn::{AggregateFnVTableExt as _, NumericalAggregateOpts};
-    Arc::from([
-        Max.bind(NumericalAggregateOpts::skip_nans()),
-        Min.bind(NumericalAggregateOpts::skip_nans()),
-    ])
-}
-
 impl TermDictionary {
     /// This dictionary as the root's required `dictionary` component: the
     /// chunks of [`child_chunks`](Self::child_chunks), each written verbatim

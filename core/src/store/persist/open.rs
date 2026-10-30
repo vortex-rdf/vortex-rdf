@@ -250,19 +250,16 @@ impl VortexRdfStore {
         // The base's zone bounds come from the file's zone maps (its rows are
         // the file's quad rows, in file order), read beside the parts so the
         // two reads' waits overlap.
-        let zones = async {
-            match opened.quads.file() {
-                Some(base) => {
-                    ZoneTable::read_from_file(
-                        &base.file.quad_layout()?,
-                        &base.file.segment_source(),
-                    )
-                    .await
-                }
-                None => Ok(ZoneTable::default()),
-            }
-        };
-        let (parts, zones) = futures::try_join!(opened.to_serializable_parts(), zones)?;
+        let file = &opened
+            .quads
+            .file()
+            .expect("a store opened from a file reads that file")
+            .file;
+        let (quads, source) = (file.quad_layout()?, file.segment_source());
+        let (parts, zones) = futures::try_join!(
+            opened.to_serializable_parts(),
+            ZoneTable::read_from_file(&quads, &source)
+        )?;
         Self::from_parts(parts, zones)
     }
 
