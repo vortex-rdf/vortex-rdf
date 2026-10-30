@@ -521,8 +521,28 @@ fn clamped(range: &Range<u64>, base_len: usize) -> Range<usize> {
     start..end.max(start)
 }
 
-/// Intersection of two ascending id lists, by sorted merge.
+/// Intersection of two ascending id lists: by sorted merge, or, when one is
+/// more than [`GALLOP_RATIO`] times the other's length, by searching the
+/// longer for each id of the shorter, each search starting where the last
+/// one ended.
 fn intersect_sorted_ids(left: &[RowId], right: &[RowId]) -> Buffer<RowId> {
+    let (short, long) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if long.len() / GALLOP_RATIO > short.len() {
+        let mut out = Vec::with_capacity(short.len());
+        let mut rest = long;
+        for &id in short {
+            let at = rest.partition_point(|&other| other < id);
+            rest = &rest[at..];
+            if rest.first() == Some(&id) {
+                out.push(id);
+            }
+        }
+        return Buffer::from(out);
+    }
     let mut i = 0usize;
     let mut j = 0usize;
     let mut out = Vec::with_capacity(left.len().min(right.len()));
@@ -540,6 +560,11 @@ fn intersect_sorted_ids(left: &[RowId], right: &[RowId]) -> Buffer<RowId> {
     }
     Buffer::from(out)
 }
+
+/// How many times longer one id list must be than the other for
+/// [`intersect_sorted_ids`] to search the longer for each id of the shorter,
+/// a binary search costing about as much as this many merge steps.
+const GALLOP_RATIO: usize = 32;
 
 /// Selection size up to which a gather reads rows point by point through
 /// encoded-search probes instead of the slice/take pipeline
@@ -599,6 +624,34 @@ mod tests {
             RowSelection::Ids(ids) => ids.as_slice().to_vec(),
             RowSelection::Range(range) => range.clone().collect(),
             RowSelection::All => panic!("All has no explicit ids"),
+        }
+    }
+
+    /// The intersection of two ascending id lists, by merge or, past the
+    /// length ratio, by searching the longer for each id of the shorter, in
+    /// either order, equals the ids both hold: none, some at either end or
+    /// in the middle, and every one.
+    #[test]
+    fn intersect_sorted_ids_merges_or_searches() {
+        let long: Vec<RowId> = (0..4_000).map(|i| i * 3).collect();
+        let cases: [Vec<RowId>; 6] = [
+            vec![],
+            vec![1, 2, 4],
+            vec![0, 3, 11_997],
+            vec![5, 300, 301, 302, 6_000, 11_999],
+            (0..200).map(|i| i * 60).collect(),
+            long.clone(),
+        ];
+        for short in cases {
+            let want: Vec<RowId> = short
+                .iter()
+                .copied()
+                .filter(|id| long.binary_search(id).is_ok())
+                .collect();
+            for (left, right) in [(&short, &long), (&long, &short)] {
+                let got = intersect_sorted_ids(left, right);
+                assert_eq!(got.as_slice(), want.as_slice(), "{} ids", short.len());
+            }
         }
     }
 

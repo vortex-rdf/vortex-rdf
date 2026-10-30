@@ -819,6 +819,16 @@ every read is a gather of the primaries at those ids, where a copy serves a
 contiguous run. The trade is size: `{val, rid}` pairs are a fraction of a
 second sorted copy of every quad.
 
+Putting a run's rids in base row order costs little either way
+([`sorted_row_ids`](../core/src/store/indexes/components.rs)): a reference
+run's rids already ascend and are checked, not sorted; a copy run's scatter
+over a window of the base, and while that window holds under 64 rows per
+rid they are set as bits of a bitmap over it and read back in order, two
+linear passes where a comparison sort costs `n log n`; only rids spread
+wider than that are compared. Intersecting the ids with a selection far
+smaller than they are (a chained match's few ids) searches the longer list
+for each of the shorter's instead of merging the two.
+
 ### 8.4 Serve plans, side by side
 
 | | `InMemoryServePlan` | `FileServePlan` |
