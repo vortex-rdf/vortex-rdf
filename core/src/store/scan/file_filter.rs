@@ -7,6 +7,7 @@ use std::ops::{BitAnd, Range};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use futures::{FutureExt as _, StreamExt, future, stream};
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{BoundExpression, Expression, get_item, root};
@@ -226,7 +227,7 @@ const PIECE_GROWTH: u64 = 4;
 /// [`early_exit_pieces`]: only when the first piece alone could hold them,
 /// so a fold whose cap the first piece cannot reach (a probing `LIMIT` past
 /// the rows) evaluates whole splits.
-fn cut_into_pieces(want: usize) -> bool {
+pub(crate) fn cut_into_pieces(want: usize) -> bool {
     (want as u64) < FIRST_PIECE_ROWS
 }
 
@@ -415,20 +416,60 @@ where
     Ok(out)
 }
 
-/// `filter` evaluated over the selection's splits in file order, each split's
-/// surviving mask fed to `step` with the split's index among the selection's
-/// splits, until it answers `false`: the early-exit twin of
-/// [`map_filter_splits`], behind [`split_masks_until`],
+/// Each evaluated range's surviving mask (one bit per row of the range,
+/// tombstoned rows cleared), the range, and the index of the split it was
+/// cut from among the selection's splits, in file order.
+pub(crate) type SplitMaskStream = BoxStream<'static, Result<(Mask, Range<u64>, usize)>>;
+
+/// `filter` evaluated over the selection's splits in file order, as a stream:
+/// each split whole, or, with `pieces`, cut into [`early_exit_pieces`], so
+/// the first rows of a split answer before the rest of it. The evaluations
+/// run on the row-scan driver ([`ScanDriver::for_row_scan`]): inline up to
+/// its split limit, spawned onto the runtime above it. Either way a few (the
+/// available parallelism, at least two) run ahead of the consumer, so the
+/// I/O overlaps. Nothing is evaluated before the first poll; a stream
+/// dropped early leaves the splits past its look-ahead unevaluated, and
+/// aborts a spawned evaluation in flight.
+pub(crate) fn split_mask_stream(
+    file: &NativeStoreFile,
+    filter: &Expression,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+    pieces: bool,
+) -> Result<SplitMaskStream> {
+    let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
+    let splits = ranges.len();
+    let pieces = if pieces {
+        early_exit_pieces(&ranges)
+    } else {
+        ranges.into_iter().enumerate().collect()
+    };
+    let (split_of, ranges): (Vec<usize>, Vec<Range<u64>>) = pieces.into_iter().unzip();
+    let tasks = filter_split_tasks(file, filter, &mask_selection, ranges, deleted)?;
+    let lookahead = available_parallelism().max(2);
+    let results = match ScanDriver::for_row_scan(splits) {
+        ScanDriver::Inline => stream::iter(tasks).buffered(lookahead).boxed(),
+        ScanDriver::Spawned => spawned_splits(tasks, lookahead).boxed(),
+    };
+    Ok(results
+        .zip(stream::iter(split_of))
+        .map(|(result, split)| {
+            let (mask, range) = result?;
+            #[cfg(test)]
+            split_hooks::note_consumed(&range);
+            Ok((mask, range, split))
+        })
+        .boxed())
+}
+
+/// [`split_mask_stream`] fed to `step` until it answers `false`: the
+/// early-exit twin of [`map_filter_splits`], behind [`split_masks_until`],
 /// [`first_matching_rows`] and [`count_matching_rows_capped`]. A fold that
 /// stops at `want` matches, fewer than one piece holds
 /// ([`cut_into_pieces`]), evaluates the splits in [`early_exit_pieces`], so
 /// matches found in the first rows do not wait for the rest of their split;
-/// `step` then gets each piece. The splits' pieces run on the row-scan
-/// driver ([`ScanDriver::for_row_scan`]): inline up to its split limit,
-/// spawned onto the runtime above it. Either way a few (the available
-/// parallelism, at least two) run ahead of the consumer, so the I/O
-/// overlaps; whatever is in flight past the exit is dropped unread, a
-/// spawned piece aborted with its task.
+/// `step` then gets each piece. Whatever is in flight past the exit is
+/// dropped unread, a spawned piece aborted with its task.
 async fn fold_filter_splits_ordered<F>(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -440,26 +481,9 @@ async fn fold_filter_splits_ordered<F>(
 where
     F: FnMut(Mask, &Range<u64>, usize) -> bool,
 {
-    let (mask_selection, ranges) = selection_split_ranges(file, selection)?;
-    let splits = ranges.len();
-    let pieces = if cut_into_pieces(want) {
-        early_exit_pieces(&ranges)
-    } else {
-        ranges.into_iter().enumerate().collect()
-    };
-    let (split_of, ranges): (Vec<usize>, Vec<Range<u64>>) = pieces.into_iter().unzip();
-    let tasks = filter_split_tasks(file, filter, &mask_selection, ranges, deleted)?;
-    let lookahead = available_parallelism().max(2);
-    let mut results = match ScanDriver::for_row_scan(splits) {
-        ScanDriver::Inline => stream::iter(tasks).buffered(lookahead).left_stream(),
-        ScanDriver::Spawned => spawned_splits(tasks, lookahead).right_stream(),
-    };
-    let mut split_of = split_of.into_iter();
-    while let Some(r) = results.next().await {
-        let (mask, range) = r?;
-        #[cfg(test)]
-        split_hooks::note_consumed(&range);
-        let split = split_of.next().expect("one split index per task");
+    let mut masks = split_mask_stream(file, filter, selection, deleted, cut_into_pieces(want))?;
+    while let Some(result) = masks.next().await {
+        let (mask, range, split) = result?;
         if !step(mask, &range, split) {
             break;
         }
@@ -475,6 +499,11 @@ where
 pub(crate) struct SplitMasks(Vec<(Mask, Range<u64>)>);
 
 impl SplitMasks {
+    /// The masks of `masks`, each beside its range, in file order.
+    pub(crate) fn from_masks(masks: Vec<(Mask, Range<u64>)>) -> Self {
+        SplitMasks(masks)
+    }
+
     /// Each evaluated split's mask beside its range, in file order.
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, (Mask, Range<u64>)> {
         self.0.iter()

@@ -441,3 +441,118 @@ async fn other_served_views_keep_their_path() {
     assert!(!served, "a point-sized run is read by id");
     assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 256, "point-sized").await;
 }
+
+/// `rows` quads `s{i:05} p{i % 3} "o{i % 4}"` in the default graph, except
+/// the last three, whose object is `"rare"`, as a Dictionary file of 32-row
+/// leaves with no index: the rare object's rows in the last split only.
+async fn rare_tail_file(rows: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    let quads: Vec<Quad> = (0..rows)
+        .map(|i| {
+            let o = if i + 3 >= rows {
+                "rare".to_string()
+            } else {
+                format!("o{}", i % 4)
+            };
+            make_quad(
+                &format!("http://example.org/s{i:05}"),
+                &format!("http://example.org/p{}", i % 3),
+                &o,
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    write_chunked_store_file(&quads, 32).await
+}
+
+#[tokio::test]
+async fn masked_streams_of_rare_and_absent_codes() {
+    use crate::store::scan::read_plan::masked_read_hooks;
+
+    let (_dir, path) = rare_tail_file(8_192).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    // Held only by the last split's rows: the whole file is evaluated before
+    // the first chunk, which holds them.
+    let rare = probe_view(&store, [None, None, Some("\"rare\""), None]).await;
+    let streams = chunk_path_hooks::masked_streams();
+    let mut chunks = rare.code_chunks(&QuadColumn::ALL, 256).unwrap();
+    let first = chunks.next().await.unwrap().unwrap();
+    assert_eq!(first[0].len(), 3, "the rare rows in the first chunk");
+    assert!(chunks.next().await.is_none());
+    assert_eq!(chunk_path_hooks::masked_streams(), streams + 1);
+    // A dictionary code no quad holds as an object (an IRI only predicates
+    // hold, which the object column's zones rule out): no chunk, no read.
+    let absent = probe_view(&store, [None, None, Some("<http://example.org/p0>"), None]).await;
+    let reads = masked_read_hooks::reads();
+    let mut chunks = absent.code_chunks(&QuadColumn::ALL, 256).unwrap();
+    assert!(chunks.next().await.is_none(), "no chunk");
+    assert_eq!(masked_read_hooks::reads(), reads, "no read of kept rows");
+}
+
+#[tokio::test]
+async fn a_masked_stream_dropped_after_its_first_chunk_evaluates_no_further() {
+    use crate::io::read::available_parallelism;
+    use crate::store::scan::file_filter::split_hooks;
+
+    let (_dir, path) = super::masks_first::many_splits_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let view = probe_view(&store, [None, Some("<http://example.org/p0>"), None, None]).await;
+    let lookahead = available_parallelism().max(2);
+    let (evaluated, consumed) = (split_hooks::evaluated(), split_hooks::consumed());
+    let streams = chunk_path_hooks::masked_streams();
+    let mut chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+    assert_eq!(chunks.next().await.unwrap().unwrap()[0].len(), 256);
+    assert_eq!(
+        chunk_path_hooks::masked_streams(),
+        streams + 1,
+        "a masked stream"
+    );
+    drop(chunks);
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    let evaluated = split_hooks::evaluated() - evaluated;
+    let consumed = split_hooks::consumed() - consumed;
+    assert!(
+        evaluated <= consumed + lookahead,
+        "{evaluated} splits evaluated for {consumed} consumed"
+    );
+    assert!(
+        evaluated < super::masks_first::MANY_SPLITS / 2,
+        "most splits never evaluated"
+    );
+}
+
+#[tokio::test]
+async fn masked_streams_are_taken() {
+    let (_dir, path) = write_store_file(
+        modular_quads(20_000, 7, 11),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    for (name, pattern) in [
+        ("P", [None, Some("<http://example.org/p2>"), None, None]),
+        ("O", [None, None, Some("\"object 3\""), None]),
+    ] {
+        let view = probe_view(&store, pattern).await;
+        for batch_rows in [1, 256, 65_536] {
+            let streams = chunk_path_hooks::masked_streams();
+            collect_code_chunks(&view, &QuadColumn::ALL, batch_rows).await;
+            assert_eq!(
+                chunk_path_hooks::masked_streams(),
+                streams + 1,
+                "{name}: code_chunks at {batch_rows}"
+            );
+            let streams = chunk_path_hooks::masked_streams();
+            collect_row_chunks(&view, batch_rows).await;
+            assert_eq!(
+                chunk_path_hooks::masked_streams(),
+                streams + 1,
+                "{name}: row_chunks at {batch_rows}"
+            );
+            assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, batch_rows, name).await;
+            assert_row_chunks_equal_legacy(&view, batch_rows, name).await;
+        }
+    }
+}

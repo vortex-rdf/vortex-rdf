@@ -475,9 +475,10 @@ async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
 /// bound or more) evaluates the filter: for `O`, `PO` and `P`, its one-shot
 /// reads return the plain view's rows, evaluating no split again and
 /// building no scan with the filter, its statistics are exact with no filter
-/// pending, and each stream (`code_chunks`, `row_chunks`, `quads()` and the
-/// data source's scan) reads the matches' ids, where the plain view's streams
-/// scan with the filter.
+/// pending, and each stream (`code_chunks`, `row_chunks` and `quads()`) reads
+/// the matches' ids. The plain view's `quads()` scans with the filter, and
+/// its chunk streams evaluate the filter's masks split by split and read the
+/// rows they keep.
 #[tokio::test]
 async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
     let (_dir, path) = masks_file().await;
@@ -531,10 +532,22 @@ async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
                 let label = format!("{label} {reader}");
                 let after = ReadCounters::now();
                 if *scans_filter {
-                    assert!(
-                        after.filtered_scans > before.filtered_scans,
-                        "{label}: a scan with the filter"
-                    );
+                    if reader == "quads()" {
+                        assert!(
+                            after.filtered_scans > before.filtered_scans,
+                            "{label}: a scan with the filter"
+                        );
+                    } else {
+                        assert_eq!(
+                            after.filtered_scans, before.filtered_scans,
+                            "{label}: no scan with the filter"
+                        );
+                        assert!(
+                            after.evaluated > before.evaluated,
+                            "{label}: the filter's masks evaluated"
+                        );
+                        assert_ne!(after.masked, before.masked, "{label}: a masked read");
+                    }
                     return;
                 }
                 assert_eq!(

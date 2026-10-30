@@ -173,3 +173,23 @@ async fn a_window_keeps_one_mask_a_split_whatever_its_pieces() {
     assert_eq!(windowed.debug_evaluated_len(), Some(n));
     assert_eq!(row_list(&windowed).await, rows, "the plain rows");
 }
+
+/// A chunk stream of fewer rows a chunk than a zone holds evaluates the
+/// filter's first split in pieces, its first zone first, as a fold that may
+/// stop early does.
+#[tokio::test]
+async fn small_batches_evaluate_the_first_split_in_pieces() {
+    let (_dir, store) = pieces_store().await;
+    let view = matched_view(&store, None, None, None, Some(&iri_graph("gd"))).await;
+    assert!(view.view_statistics().unwrap().pending_filter);
+    split_hooks::take_consumed_ranges();
+    let mut chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+    assert_eq!(chunks.next().await.unwrap().unwrap()[0].len(), 256);
+    drop(chunks);
+    let ranges = split_hooks::take_consumed_ranges();
+    assert_eq!(
+        ranges.first(),
+        Some(&(0..FIRST_PIECE)),
+        "the first zone first"
+    );
+}

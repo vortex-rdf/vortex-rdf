@@ -732,15 +732,17 @@ async fn pull_and_drain<S: futures::Stream + Unpin>(
     (spawned, rows)
 }
 
-/// The chunk streams over a filtered no-index file view (`code_chunks`,
-/// `row_chunks` and `quads()`) stay lazy and scan:
-/// nothing is evaluated or scanned before the first poll, each drained stream
-/// runs one row scan and never reads the filter's masks first, and with the
-/// split limit forced to zero a first pull has at most a scan's window of
-/// splits spawned, four per unit of available parallelism, on a file of more
-/// splits than that. The row-chunk streams spawn through the crate's driver,
-/// which counts each spawn; `quads()` reads through vortex's own scan stream,
-/// whose window the count does not see.
+/// The chunk streams over a filtered no-index file view stay lazy.
+/// `code_chunks` and `row_chunks` evaluate the filter split by split, in file
+/// order, as they reach each split, and read each batch's kept rows as the
+/// one-shot read does: nothing is evaluated or scanned before the first poll,
+/// a first pull at 256 rows has evaluated the splits it consumed and at most
+/// the look-ahead beyond them, far from every split, and drained, the
+/// consumed ranges tile the selection once, no row scan ran and the kept rows
+/// were read by masked reads. `quads()` keeps the restricted scan: one row
+/// scan, no masks, and with the split limit forced to zero at most a scan's
+/// window of splits spawned by a first pull (four per unit of available
+/// parallelism) on a file of more splits than that.
 #[tokio::test]
 async fn test_chunk_stream_over_filtered_file_stays_lazy() {
     use crate::io::read::available_parallelism;
@@ -752,15 +754,19 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
 
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let file_rows = store.size().await.unwrap() as u64;
     let p0 = iri("p0");
     let view = matched_view(&store, None, Some(&p0), None, None).await;
     assert!(view.view_statistics().unwrap().pending_filter);
     let n = view.size().await.unwrap();
     let window = 4 * available_parallelism();
+    let lookahead = available_parallelism().max(2);
     let _limit = driver_hooks::ForcedLimit::set(0);
     for read in ["code_chunks", "row_chunks", "quads"] {
         let (scans, evaluated) = (scan_hooks::scans(), split_hooks::evaluated());
-        let masked = masked_read_hooks::reads();
+        let consumed = split_hooks::consumed();
+        split_hooks::take_consumed_ranges();
+        let masked: usize = masked_read_hooks::reads().iter().sum();
         let lazy = || {
             assert_eq!(
                 scan_hooks::scans(),
@@ -773,37 +779,74 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
                 "{read}: no split evaluated before the first poll"
             );
         };
-        let (spawned, rows) = match read {
-            "code_chunks" => {
-                let chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
-                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap()[0].len()).await
-            }
-            "row_chunks" => {
-                let chunks = view.row_chunks(256).unwrap();
-                pull_and_drain(chunks, lazy, |chunk| chunk.unwrap().len()).await
-            }
-            _ => {
-                pull_and_drain(view.quads(), lazy, |quad| {
-                    quad.unwrap();
-                    1
-                })
-                .await
-            }
-        };
-        assert_eq!(rows, n, "{read}: every row");
-        assert!(
-            spawned <= window,
-            "{read}: {spawned} splits spawned by a first pull"
-        );
-        if read != "quads" {
-            assert_eq!(spawned, window.min(MANY_SPLITS), "{read}: a scan's window");
+        if read == "quads" {
+            let (spawned, rows) = pull_and_drain(view.quads(), lazy, |quad| {
+                quad.unwrap();
+                1
+            })
+            .await;
+            assert_eq!(rows, n, "{read}: every row");
+            assert!(
+                spawned <= window,
+                "{read}: {spawned} splits spawned by a first pull"
+            );
+            assert_eq!(scan_hooks::scans() - scans, 1, "{read}: one row scan");
+            assert_eq!(
+                split_hooks::evaluated(),
+                evaluated,
+                "{read}: no masks evaluated"
+            );
+            let reads: usize = masked_read_hooks::reads().iter().sum();
+            assert_eq!(reads, masked, "{read}: no masked read");
+            continue;
         }
-        assert_eq!(scan_hooks::scans() - scans, 1, "{read}: one row scan");
+        let mut rows = 0;
+        let mut first = true;
+        let mut pulled = |chunk_rows: usize| {
+            if first {
+                let evaluated = split_hooks::evaluated() - evaluated;
+                let consumed = split_hooks::consumed() - consumed;
+                assert!(
+                    evaluated <= consumed + lookahead,
+                    "{read}: {evaluated} splits evaluated for a first chunk of {consumed}"
+                );
+                assert!(evaluated < MANY_SPLITS / 2, "{read}: not every split");
+                first = false;
+            }
+            rows += chunk_rows;
+        };
+        lazy();
+        if read == "code_chunks" {
+            let mut chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+            lazy();
+            while let Some(chunk) = chunks.next().await {
+                pulled(chunk.unwrap()[0].len());
+            }
+        } else {
+            let mut chunks = view.row_chunks(256).unwrap();
+            lazy();
+            while let Some(chunk) = chunks.next().await {
+                pulled(chunk.unwrap().len());
+            }
+        }
+        assert_eq!(rows, n, "{read}: every row");
+        let ranges = split_hooks::take_consumed_ranges();
         assert_eq!(
-            split_hooks::evaluated(),
-            evaluated,
-            "{read}: no masks evaluated"
+            ranges.first().map(|r| r.start),
+            Some(0),
+            "{read}: from the first row"
         );
-        assert_eq!(masked_read_hooks::reads(), masked, "{read}: no masked read");
+        assert!(
+            ranges.windows(2).all(|pair| pair[0].end == pair[1].start),
+            "{read}: each range where the last ended"
+        );
+        assert_eq!(
+            ranges.last().map(|r| r.end),
+            Some(file_rows),
+            "{read}: to the last row"
+        );
+        assert_eq!(scan_hooks::scans(), scans, "{read}: no row scan");
+        let reads: usize = masked_read_hooks::reads().iter().sum();
+        assert!(reads > masked, "{read}: the kept rows read by masked reads");
     }
 }

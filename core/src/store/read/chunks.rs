@@ -34,7 +34,12 @@ use crate::store::array::{field_as, into_struct_array, rechunk};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
-use crate::store::scan::{file_reads::take_file_rows, read_plan::ExactRead};
+use crate::store::scan::{
+    file_filter::{cut_into_pieces, split_mask_stream},
+    file_reads::take_file_rows,
+    masked_chunks::masked_row_chunks,
+    read_plan::ExactRead,
+};
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::ViewSelection;
@@ -321,6 +326,32 @@ impl VortexRdfStore {
         batch_rows: usize,
     ) -> Result<RowChunkStream> {
         let (scope, read) = self.file_read(base, columns).await?;
+        #[cfg(test)]
+        let legacy = chunk_path_hooks::legacy();
+        #[cfg(not(test))]
+        let legacy = false;
+        // A filter of code equalities the reads by id leave to its masks:
+        // evaluated split by split as the stream reaches each split, the rows
+        // a few splits keep read at a time, as the one-shot read reads them.
+        if let (ExactRead::Masks, Some(filter)) = (&read, scope.filter)
+            && !legacy
+        {
+            #[cfg(test)]
+            chunk_path_hooks::note_masked_stream();
+            let masks = split_mask_stream(
+                &base.file,
+                filter,
+                &scope.selection,
+                scope.deleted,
+                cut_into_pieces(batch_rows),
+            )?;
+            return Ok(masked_row_chunks(
+                Arc::clone(&base.file),
+                masks,
+                Arc::from(columns),
+                batch_rows,
+            ));
+        }
         let ids = match read {
             ExactRead::Take(ids) => ids,
             read => return scope.rows(read).await?.chunks(batch_rows),
@@ -512,6 +543,7 @@ pub(crate) mod chunk_path_hooks {
     thread_local! {
         static LEGACY: Cell<bool> = const { Cell::new(false) };
         static SERVED_RUNS: Cell<usize> = const { Cell::new(0) };
+        static MASKED_STREAMS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The pre-fix paths for this thread's chunk streams, until dropped; the
@@ -543,5 +575,15 @@ pub(crate) mod chunk_path_hooks {
     /// The code-chunk streams this thread read off a serving index's run.
     pub(crate) fn served_runs() -> usize {
         SERVED_RUNS.with(Cell::get)
+    }
+
+    /// Record one chunk stream read by its filter's masks, split by split.
+    pub(crate) fn note_masked_stream() {
+        MASKED_STREAMS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The chunk streams this thread read by their filter's masks.
+    pub(crate) fn masked_streams() -> usize {
+        MASKED_STREAMS.with(Cell::get)
     }
 }
