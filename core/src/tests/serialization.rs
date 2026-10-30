@@ -155,8 +155,8 @@ async fn test_unstamped_owner_to_bytes_records_unsorted() {
     );
 }
 
-/// An unrefined file-backed store's `to_bytes` reads its index children
-/// wholesale, so the byte round-trip keeps the index set.
+/// An untouched file-backed store's `to_bytes` is its file, index children
+/// and all, so the byte round-trip keeps the index set.
 #[tokio::test]
 async fn test_file_backed_to_bytes_keeps_indexes() {
     let (_dir, path) = write_store_file(
@@ -181,8 +181,9 @@ async fn test_file_backed_to_bytes_keeps_indexes() {
 }
 
 /// A sorted store's `quads_sorted` provenance survives the file → bytes
-/// round-trip: the file arm of serialization re-stamps from the root
-/// metadata, never from stats a multi-chunk scan lost.
+/// round-trip: an untouched store's bytes are the file's, and a filtered
+/// view that keeps every row is written again, its rows re-stamped from the
+/// root metadata, never from stats a multi-chunk scan lost.
 #[tokio::test]
 async fn test_file_backed_to_bytes_keeps_quads_sorted() {
     let quads: Vec<Quad> = (0..500)
@@ -197,12 +198,16 @@ async fn test_file_backed_to_bytes_keeps_quads_sorted() {
         .collect();
     let (_dir, path) = write_store_file(quads, LayoutStrategy::Default, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let bytes = store.to_bytes().await.unwrap();
-    let (quads_sorted, _) = container::store_metadata_of_bytes(&bytes);
-    assert!(
-        quads_sorted,
-        "file-backed to_bytes must carry the sorted provenance across"
-    );
+    let every_row = matched_view(&store, None, Some(&iri("p")), None, None).await;
+    assert_eq!(every_row.size().await.unwrap(), 500);
+    for view in [&store, &every_row] {
+        let bytes = view.to_bytes().await.unwrap();
+        let (quads_sorted, _) = container::store_metadata_of_bytes(&bytes);
+        assert!(
+            quads_sorted,
+            "file-backed to_bytes must carry the sorted provenance across"
+        );
+    }
 }
 
 /// Serialization is deterministic: two `to_bytes` of the same store are
@@ -799,4 +804,45 @@ fn test_parts_stream_requires_dictionary_beside_code_rows() {
         dict: None,
     };
     let _ = parts.into_stream();
+}
+
+/// A store opened from a file and left as it is serializes as that file: its
+/// `to_bytes`, and an unconstrained match's, is the file's bytes, copied with
+/// nothing read or written, under every layout. Once a narrowing, a tail or a
+/// tombstone changes what the store holds, `to_bytes` writes it again, and
+/// each reads back with its own rows.
+#[tokio::test]
+async fn test_untouched_file_store_to_bytes_copies_its_file() {
+    use crate::store::persist::serialize::serialize_hooks;
+
+    let quads = modular_quads(60, 3, 4);
+    for layout in LAYOUTS {
+        let (_dir, path) =
+            write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
+        let file_bytes = std::fs::read(&path).unwrap();
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+        let copied = serialize_hooks::copied();
+        let unconstrained = matched_view(&store, None, None, None, None).await;
+        for view in [&store, &unconstrained] {
+            assert_eq!(view.to_bytes().await.unwrap(), file_bytes, "{layout:?}");
+        }
+        assert_eq!(serialize_hooks::copied() - copied, 2, "{layout:?}");
+
+        let p1 = iri("p1");
+        let narrowed = matched_view(&store, None, Some(&p1), None, None).await;
+        let tailed = store.add_quad(extra_quad()).await.unwrap();
+        let tombstoned = store.delete_quad(&quads[0]).await.unwrap();
+        for (tag, view, rows) in [
+            ("narrowed", &narrowed, 20),
+            ("tailed", &tailed, 61),
+            ("tombstoned", &tombstoned, 59),
+        ] {
+            let bytes = view.to_bytes().await.unwrap();
+            assert_ne!(bytes, file_bytes, "{layout:?} {tag}");
+            let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+            assert_eq!(reread.size().await.unwrap(), rows, "{layout:?} {tag}");
+        }
+        assert_eq!(serialize_hooks::copied() - copied, 2, "{layout:?}");
+    }
 }

@@ -87,6 +87,9 @@ pub(crate) struct NativeStoreFile {
     /// compaction rewrites its rows over; none for a file opened over a
     /// buffer.
     path: Option<PathBuf>,
+    /// The whole file's bytes when the open mapped it, which `to_bytes` of
+    /// an untouched store copies; none otherwise.
+    bytes: Option<vortex_buffer::ByteBuffer>,
     /// The tests' counts of how reads reached the file ([`FileCounter`]).
     #[cfg(test)]
     counters: [std::sync::atomic::AtomicUsize; 3],
@@ -213,6 +216,7 @@ impl NativeStoreFile {
             mapped,
             identity,
             path,
+            bytes,
         } = opened.into();
         let roster = ComponentRoster::of(&file)?;
         let data = file.footer().layout().as_::<RdfStoreLayoutVTable>().data();
@@ -233,6 +237,7 @@ impl NativeStoreFile {
             mapped,
             identity,
             path,
+            bytes,
             #[cfg(test)]
             counters: Default::default(),
         })
@@ -276,6 +281,12 @@ impl NativeStoreFile {
     /// over a buffer.
     pub(crate) fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// The whole file's bytes, where the open mapped it; `None` for a file
+    /// read through Vortex's reader or opened over a buffer.
+    pub(crate) fn bytes(&self) -> Option<&vortex_buffer::ByteBuffer> {
+        self.bytes.as_ref()
     }
 
     /// A quad column's chunk-probe handle by name, for point reads and exact

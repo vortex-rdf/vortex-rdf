@@ -54,7 +54,7 @@ A builder hands these back in one of two shapes
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L66), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L112) to name the builder | either | in-memory store |
-| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L129) | — (re-serializes a store) | bytes |
+| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L133) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
 | Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L248) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
@@ -566,6 +566,12 @@ where those layers are folded back into the three parts of
 [§1](#1-what-a-build-produces).
 
 ### 11.1 Serializing a store (`to_bytes`, `to_serializable_parts`)
+
+A store opened from a mapped file (`from_file`) and left untouched — no
+pushed-down filter, an all-rows selection, no tombstone and no tail — *is*
+that file, so `to_bytes` copies the mapped bytes as they are: no row is read,
+no part rebuilt, no compression run, and the copy reads back as the file
+does, unknown children included. Any other store is written from its parts.
 
 [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L88) decides what a view's
 parts are:

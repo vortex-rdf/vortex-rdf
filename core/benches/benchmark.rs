@@ -414,6 +414,18 @@ fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
         });
 }
 
+/// `to_bytes` of a store opened from its file and left as it is, the
+/// bindings' serialization of an opened store: the mapped open copies its
+/// file, and the loaded one, held in memory, writes its rows, dictionary and
+/// indexes again.
+#[divan::bench(args = DICT_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn dict_to_bytes(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    bencher.bench(|| {
+        rt().block_on(async { black_box(store.to_bytes().await.expect("to_bytes").len()) })
+    });
+}
+
 /// Cold term → code probes: a fully bound pattern (four dictionary probes) on a
 /// store opened fresh each iteration, so nothing the store holds carries over
 /// (the operating system's page cache does). Resident probes are in-memory

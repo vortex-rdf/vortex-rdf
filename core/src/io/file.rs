@@ -60,6 +60,9 @@ pub(crate) struct OpenedFile {
     /// The absolute path the file was opened from, so that a later change of
     /// the working directory does not move it; none for a buffer.
     pub(crate) path: Option<std::path::PathBuf>,
+    /// The whole file's bytes, where the open holds them: the mapping. None
+    /// where the file is read through Vortex's reader, and for a buffer.
+    pub(crate) bytes: Option<vortex_buffer::ByteBuffer>,
 }
 
 /// A file opened over a buffer: no mapping, no identity, no path.
@@ -70,6 +73,7 @@ impl From<vortex_file::VortexFile> for OpenedFile {
             mapped: false,
             identity: None,
             path: None,
+            bytes: None,
         }
     }
 }
@@ -125,12 +129,14 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
         FileAccess::Mapped => {
             let identity = file.metadata().ok().as_ref().and_then(FileIdentity::of);
             let mmap = map_file(&file).map_err(|e| path_error("map", path, e))?;
-            let opened = open_store_buffer(vortex_buffer::ByteBuffer::from(mmap))?;
+            let bytes = vortex_buffer::ByteBuffer::from(mmap);
+            let opened = open_store_buffer(bytes.clone())?;
             Ok(OpenedFile {
                 file: opened,
                 mapped: true,
                 identity,
                 path: Some(absolute),
+                bytes: Some(bytes),
             })
         }
         FileAccess::Read => {

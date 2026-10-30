@@ -126,7 +126,17 @@ impl VortexRdfStore {
     /// the quad table as the transparent root child, the dictionary and index
     /// children as auxiliary children. Read back with
     /// [`from_bytes`](Self::from_bytes), or written as a `.vortex` file.
+    ///
+    /// A store opened from a file it has not changed since (no tail, no
+    /// tombstone, no narrowing) is that file: its mapped bytes are copied as
+    /// they are, with no row read or written.
     pub async fn to_bytes(&self) -> Result<Vec<u8>> {
+        #[cfg(feature = "file-io")]
+        if let Some(bytes) = self.untouched_file_bytes() {
+            #[cfg(test)]
+            serialize_hooks::note_copied();
+            return Ok(bytes.as_slice().to_vec());
+        }
         let parts = self.to_serializable_parts().await?;
         let start = crate::debug::timer();
         let mut bytes = Vec::new();
@@ -136,5 +146,40 @@ impl VortexRdfStore {
             crate::debug::elapsed(start)
         );
         Ok(bytes)
+    }
+
+    /// The bytes of the file this store was opened from, while the store is
+    /// still exactly that file's: a mapped file's base with no pushed-down
+    /// filter, an all-rows selection, no tombstone and no tail. `None`
+    /// otherwise, and for a file not mapped.
+    #[cfg(feature = "file-io")]
+    fn untouched_file_bytes(&self) -> Option<&vortex_buffer::ByteBuffer> {
+        let Backend::File(FileBase { file, .. }) = &self.quads.backend else {
+            return None;
+        };
+        let untouched =
+            self.quads.is_unrefined() && self.quads.deleted.is_none() && self.tail.is_none();
+        if untouched { file.bytes() } else { None }
+    }
+}
+
+/// Test hook: how many `to_bytes` calls this thread answered by copying the
+/// store's file.
+#[cfg(test)]
+pub(crate) mod serialize_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COPIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one store serialized as a copy of its file.
+    pub(super) fn note_copied() {
+        COPIED.set(COPIED.get() + 1);
+    }
+
+    /// The stores serialized as copies of their files on this thread so far.
+    pub(crate) fn copied() -> usize {
+        COPIED.get()
     }
 }
