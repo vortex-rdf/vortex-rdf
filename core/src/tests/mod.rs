@@ -13,7 +13,6 @@ mod adoption;
 mod atomic_write;
 mod builders;
 mod chunks;
-mod data_source;
 mod dictionary;
 mod dictionary_file_backed;
 mod dictionary_handle;
@@ -1116,11 +1115,9 @@ async fn views_of(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)>
 }
 
 /// The multi-chunk fixture: 20,000 [`modular_quads`] in a Dictionary-layout
-/// store with no index, built in memory. Its rows fill more than two data
-/// source chunks ([`DATA_SOURCE_BATCH_ROWS`] rows each), so a scan of it
-/// crosses chunk boundaries.
-///
-/// [`DATA_SOURCE_BATCH_ROWS`]: crate::store::read::data_source::DATA_SOURCE_BATCH_ROWS
+/// store with no index, built in memory. Its rows are more than two 8,192-row
+/// zones, so its file ([`multi_chunk_file`]) holds them in several chunks and
+/// a scan of it crosses chunk boundaries.
 async fn multi_chunk_store() -> VortexRdfStore {
     built_store(
         modular_quads(20_000, 3, 8),
@@ -1361,35 +1358,6 @@ fn chunk_strings(chunks: &[vortex_array::ArrayRef], name: &str) -> Vec<String> {
 /// The `s` column strings of string-layout struct chunks, concatenated.
 fn chunk_subjects(chunks: &[vortex_array::ArrayRef]) -> Vec<String> {
     chunk_strings(chunks, "s")
-}
-
-/// Every chunk of every partition of one scan of `source`, in partition
-/// order. Asserts each chunk carries the scan's dtype.
-async fn scan_chunks(
-    source: &crate::vortex_scan::DataSourceRef,
-    request: crate::vortex_scan::ScanRequest,
-) -> Vec<vortex_array::ArrayRef> {
-    let scan = source.scan(request).await.unwrap();
-    let dtype = scan.dtype().clone();
-    let mut partitions = scan.partitions();
-    let mut chunks = Vec::new();
-    while let Some(partition) = partitions.next().await {
-        let mut stream = partition.unwrap().execute().unwrap();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.unwrap();
-            assert_eq!(chunk.dtype(), &dtype, "a chunk carries its scan's dtype");
-            chunks.push(chunk);
-        }
-    }
-    chunks
-}
-
-/// The `(s, p, o, g)` codes one scan of a Dictionary-layout `source` yields.
-async fn scan_codes(
-    source: &crate::vortex_scan::DataSourceRef,
-    request: crate::vortex_scan::ScanRequest,
-) -> Vec<[TermCode; 4]> {
-    struct_chunk_codes(&scan_chunks(source, request).await)
 }
 
 /// The two-quad dataset the Default and TypedObject probes match over.

@@ -42,8 +42,8 @@ pub enum VortexRdfError {
     InvalidInput(String),
 }
 
-/// This crate's error as the vortex error a stream or `DataSource` reports. A
-/// wrapped [`VortexError`] passes through unchanged.
+/// This crate's error as a vortex error. A wrapped [`VortexError`] passes
+/// through unchanged.
 impl From<VortexRdfError> for VortexError {
     fn from(e: VortexRdfError) -> Self {
         match e {

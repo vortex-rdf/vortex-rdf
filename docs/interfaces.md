@@ -4,125 +4,27 @@ This document is the contract between `vortex-rdf-core` and a query engine
 built outside this repository — a SPARQL planner on Apache DataFusion, say,
 that treats a store as a set of tables of term codes. The engine owns
 parsing, algebra, planning and execution; this crate owns the data: how a
-view is exposed as a vortex `DataSource`, what the store's persisted children
-look like as tables, how rows stream out without Arrow, which runtime a read
-needs, what a view promises about itself before it is read, and which
-identities tell the engine when its cached codes and plans stop applying.
-Nothing here depends on DataFusion; the conformance crate
-([`interface-tests/tests/datafusion.rs`](../interface-tests/tests/datafusion.rs))
-drives every interface through vortex's own DataFusion integration, which
-is the path such an engine takes.
+view's rows stream out as columns, which runtime a read needs, what a view
+promises about itself before it is read, which identities tell the engine
+when its cached codes and plans stop applying, and how a store file opens
+through vortex's own reader. Nothing here depends on DataFusion; core's own
+tests pin each interface
+([`tests/chunks.rs`](../core/src/tests/chunks.rs),
+[`tests/metadata.rs`](../core/src/tests/metadata.rs),
+[`tests/mapping.rs`](../core/src/tests/mapping.rs)).
 
 | What the engine needs | What it calls |
 |---|---|
-| A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L103) on any view, registered with vortex's `VortexTable` |
-| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L70), [`code_chunks`](../core/src/store/read/chunks.rs#L102) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L156), [`index_components`](../core/src/store/read/metadata.rs#L230), [`partitions`](../core/src/store/read/metadata.rs#L265) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L153), [`index_components`](../core/src/store/read/metadata.rs#L227), [`partitions`](../core/src/store/read/metadata.rs#L262) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L142), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L266) |
-| The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L82), with [`vortex_scan`](../core/src/lib.rs#L76) re-exported |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L139), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L266) |
+| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L76) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
 
-## 1. A view as a `DataSource`
-
-`data_source()` wraps **any** view — the whole store, a `match_pattern`
-result, a `keep`, a `window`, a partition — as a
-[`vortex_scan::DataSource`](https://docs.rs/vortex-scan). The call is
-synchronous and does no I/O. It takes its row count from
-`view_statistics()` ([§5](#5-what-a-view-promises-before-it-is-read)), so it
-does what that call does: on an in-memory view whose selection is a pending
-index run over a base with tombstones, it decodes the run's row ids and
-caches them on the view. The source is a snapshot: it holds the view, and
-the view holds its base immutably.
-
-**Dtype.** The layout's primary struct, non-nullable: `{s, p, o, g}` of
-`UInt64` codes (`TermCode`) under the Dictionary layout, of `utf8`
-N-Triples spellings under `Default`, and the seven-column split form under
-`TypedObject`. The index columns are never part of it.
-
-**Rows.** The view's rows in **base row order** — the `(s, p, o, g)` order of
-every base this crate writes — with the view's narrowing applied: the
-pattern, keeps, windows and tombstones. A view an index served
-(`view_statistics().served_component`) is read in base order too; its row
-ids materialize on the first poll. Under a string layout the append tail's
-live rows follow the base.
-
-**Errors.** `data_source` errors for a Dictionary-layout view with a
-non-empty tail, which has no source: its tail holds terms without codes, so
-`compact` first ([§7](#7-snapshots-and-mutation)). It also errors where
-`view_statistics` does, when the row-id decode above fails.
-
-**The scan request.**
-
-| Field | How the source applies it |
-|---|---|
-| `projection` | Bound once against the dtype and applied to every chunk after the filter and the limit: a `select`, a `pack` of `get_item`s (renames, reorders) or any computed expression vortex evaluates. The scan's dtype is the projection's return dtype. |
-| `filter` | Bound once and evaluated on every chunk *exactly* — the engine may drop a filter it pushed; a row the filter evaluates to null is dropped. Any expression over the columns: equality, comparisons, `and`/`or`, `in_list`, `like` on string layouts. |
-| `limit` | Enforced exactly after filtering. |
-| `row_range`, `selection` | Addressed in the view's **output** rows (after narrowing, before the filter), applied before the filter. A view with no pending file filter and no tombstones is `window`ed to the `row_range` first, so only the range's rows are read; any other view streams its rows from its first row (through its pending filter, past its tombstones), and the range's end or the `limit` stops it. |
-| `ordered` | Rows always come in base order. |
-| `partition_range`, `partition_selection` | The source has one partition, index 0; a window that leaves it out yields no partitions. |
-
-**Statistics.** `row_count()` is the
-[`view_statistics`](#5-what-a-view-promises-before-it-is-read) count:
-`Exact` when that is known without reading, otherwise `Inexact` with its
-upper bound. `byte_size()` is the
-rows' uncompressed width under the Dictionary layout, four `u64` codes (32
-bytes) a row, and absent under a string layout. The partition reports its
-own: its row count (a bound once the request filters or selects, otherwise
-cut by `row_range` and `limit`) times the width of a *projected* row.
-`field_statistics` reports `NullCount` = 0 for every non-nullable column
-and, when the row count is exact, the `UncompressedSizeInBytes` of a
-primitive column (8 bytes a row for a code); min/max are absent — code
-bounds come from `view_statistics`.
-
-**What to push where.** A vortex filter on a code column is correct and
-evaluated chunk by chunk; a *native* narrowing is cheaper when it maps to a
-code set or range the store can apply through its probes, zone maps and
-indexes. The engine's rule of thumb: resolve the pattern with
-`match_pattern`, turn term-level constraints into `keep`s (a `VALUES` block,
-the codes a predicate's `filter_codes` passes, a namespace's
-`prefix_range`), apply `window` for `LIMIT`/`OFFSET`, and hand the resulting
-view to DataFusion as the table — leaving to the scan request only what is
-left.
-
-## 2. The persisted children as tables
-
-`component_data_source(name)` serves one of the store's children as a plain
-table:
-
-| Name | Columns | Order | Rows |
-|---|---|---|---|
-| `index:posg` | `s, p, o, g, rid` (`UInt64` codes or strings, as the layout; `rid: UInt64`) | `(p, o, s, g)` | one per base quad |
-| `index:ospg` | the same | `(o, s, p, g)` | one per base quad |
-| `index:ref-p`, `index:ref-o` | `val, rid` | by `val` | one per base quad |
-| `dictionary` | `_dict_term` (`utf8`, the N-Triples spelling) | lexicographic | row *i* = the term with code *i* |
-
-`rid` is the base row id, so a join on it reaches the quad table's row. The
-reference children's `val` holds the predicate or object; the copy children
-are complete quad copies, which is what gives an engine a merge-join order
-on `p` or `o` without a sort. `index_components()` lists which children a
-store holds ([§5](#5-what-a-view-promises-before-it-is-read)).
-
-The children are **raw**: they do not apply a view's narrowing, tombstones
-or append tail. Use them over a store without tombstones or tail (`compact`
-produces one), or anti-join their `rid` against the view's own rows.
-`None` is returned for a name the store has no child of. An index child goes
-by the name its implementation slug gives it, as `index_components()` lists
-it, so one under a slug this version does not know has none. On a view that
-a match or a narrowing proved empty, the backends differ, as they do for
-`index_components` ([§5](#5-what-a-view-promises-before-it-is-read)). In
-memory, such a view holds no index children, so every `index:…` name
-returns `None` (the `dictionary` table stays). On file, every view serves
-the file's children. An in-memory store's tables read its resident
-children. On file, each child is vortex's own `LayoutReaderDataSource` over
-the child's layout reader, so a scan reads only the child's bytes, and it
-needs a tokio runtime ([§4](#4-which-runtime-a-read-needs)).
-
-## 3. Rows as columns, without Arrow
+## 1. Rows as columns, without Arrow
 
 Two streams read a view's rows as chunks, lazily (nothing is gathered or
 scanned until the first poll), in base row order, every chunk holding at
@@ -142,7 +44,7 @@ other selection is gathered one window of `batch_rows` live ids per pulled
 chunk, both reading only the requested columns. On file a selection taken
 by id is taken one window of ids per pulled chunk; the scan reads the file
 split by split, a bounded window of splits in flight ahead of the pulls
-([§4](#4-which-runtime-a-read-needs)); and a selection small enough for
+([§2](#2-which-runtime-a-read-needs)); and a selection small enough for
 point reads is read at once, at the first poll. The scan, and a read by id
 with no filter pending, read only the requested columns. A served match
 materializes its row ids at the first poll, so its chunks come in base row
@@ -167,12 +69,9 @@ token is cancelled before the call or while the call waits for data.
 `vortex_session().arrow().execute_arrow(chunk, None, &mut ctx)` (the
 `ArrowSessionExt` of `vortex-arrow`) yields an Arrow `StructArray` whose
 code columns are `UInt64` (a canonical column converts without a copy) and
-whose `utf8` columns are `Utf8View`; `to_arrow_schema(source.dtype())`
+whose `utf8` columns are `Utf8View`; `to_arrow_schema(chunk.dtype())`
 gives the matching schema, and `RecordBatch::from(struct_array)` the batch.
-The DataFusion integration does exactly this to every chunk a `DataSource`
-partition emits. The conformance crate's
-[`tests/arrow.rs`](../interface-tests/tests/arrow.rs) shows the recipe,
-including the two encodings an engine builds *from* codes:
+An engine also builds two encodings *from* codes:
 
 - **Codes as ids.** `Int64` is the zero-copy id form: a `code_chunks`
   buffer reinterprets as an Arrow `Int64` column without a copy
@@ -191,19 +90,12 @@ exactly when any quad is in the default graph
 (`DictReader::kind_ranges().default_graph`); an engine that wants `NULL`
 for it maps that code.
 
-## 4. Which runtime a read needs
+## 2. Which runtime a read needs
 
 Every read is lazy, and a stream's first poll decides how it runs:
 
-- An in-memory view's reads — its data source's scan, `row_chunks`,
-  `code_chunks` — and an in-memory store's component tables are CPU work on
-  the polling task, and need no runtime. One exception runs earlier. An
-  adopted store (`from_bytes`, `from_bytes_owned`, `from_file_in_memory`)
-  holds its index children deferred, and `component_data_source`
-  materializes the child it serves when it is called, not at the first
-  poll. For a byte-adopted child that means scanning the buffer and then
-  decoding it. Every view of the store reuses the result, and a failure is
-  the call's error.
+- An in-memory view's reads — `row_chunks`, `code_chunks` — are CPU work on
+  the polling task, and need no runtime.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
   ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L51)), and a
@@ -217,15 +109,12 @@ Every read is lazy, and a stream's first poll decides how it runs:
   same rule, and `quads_vec` and `shared_quads_vec` spawn their split reads
   whenever there is more than one and a runtime is current: each such call,
   once it has spawned, must be polled to completion inside that runtime.
-- A file-backed store's component tables are vortex's own
-  `LayoutReaderDataSource`, whose scan always spawns: read them inside a
-  tokio runtime.
 
-DataFusion runs on tokio, so a query through its integration meets every
-one of these. A consumer polling outside tokio gets the inline driver on a
-view's scan and cannot read a file store's component tables.
+An engine that polls on tokio, as DataFusion does, meets every one of
+these. A consumer polling outside tokio gets the inline driver on a view's
+scan.
 
-## 5. What a view promises before it is read
+## 3. What a view promises before it is read
 
 `view_statistics()` answers without I/O; a count that would need a scan is
 a bound, a code range that would need a read is `None`. It returns a
@@ -237,19 +126,18 @@ is the one way it fails.
 | Field | Meaning |
 |---|---|
 | `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones; a filter a window has evaluated, finding it cuts no row, counts as none. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
-| `sort_order` | `Some(Spog)` when the base is globally sorted (every base this crate writes) and the view reads no tail row — the order `row_chunks`, `code_chunks` and the data source produce, whatever answered the match. A view that reads tail rows has none: they follow the base in append order. |
+| `sort_order` | `Some(Spog)` when the base is globally sorted (every base this crate writes) and the view reads no tail row — the order `row_chunks` and `code_chunks` produce, whatever answered the match. A view that reads tail rows has none: they follow the base in append order. |
 | `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a file view's pushed-down filter binds by equality, while the view still carries the filter (pending, or evaluated by a window that kept its masks). |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |
 | `served_component` | The index child that answered the match, if any (`index:posg`, …; `quads()` on such a view decodes in that child's order). |
 | `pending_filter` | Whether every read runs a pushed-down file filter. A filter a window has evaluated over every row, finding it cuts none, is not pending: its matches are counted exactly and read without running it again, and the view's selection reads as `Ids`. |
 | `tombstones`, `tail_rows` | Rows tombstoned in the base (never counted) and live rows in the append tail (counted, read last). |
-| `file_backed`, `generation` | Where the base lives, and the data's identity ([§7](#7-snapshots-and-mutation)). |
+| `file_backed`, `generation` | Where the base lives, and the data's identity ([§5](#5-snapshots-and-mutation)). |
 
 `index_components()` lists the store's index children, each with its
-component name (the one `component_data_source` takes), its `IndexType`, its
-sort order (`Posg`, `Ospg`, or none for the reference pairs), its sortedness
-provenance, and `rows: usize`, the base's row count, since every index
-child holds one row per base quad. It returns a `Result`, and it classifies
+component name, its `IndexType`, its sort order (`Posg`, `Ospg`, or none
+for the reference pairs), its sortedness provenance, and `rows: usize`, the
+base's row count, since every index child holds one row per base quad. It returns a `Result`, and it classifies
 a child by its implementation slug, leaving out one under a slug this
 version does not know. On a view a match or a narrowing proved empty the
 backends differ: in memory the view holds no children and lists none; on
@@ -264,10 +152,10 @@ are read first and no partition keeps the serve plan. The append tail rides
 with the last partition, so over a sorted base every partition but the last
 keeps the `Spog` order, and the last keeps it only when the view reads no
 tail row. Sizes are about equal *before* filtering; a view selecting no base
-row is its own one partition. Each partition is an ordinary view —
-`data_source` on each gives an engine one source per worker.
+row is its own one partition. Each partition is an ordinary view, so an
+engine reads one per worker through its chunk streams.
 
-## 6. Narrowing natively
+## 4. Narrowing natively
 
 Everything in [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern)
 is the engine's pushdown vocabulary: `keep`/`keep_many` (a code set or range
@@ -282,6 +170,12 @@ the native rule is certain
 ([matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle)),
 and one in neither set fails. An engine keeps `passed` (as a `keep`),
 evaluates `undecided` itself, and drops the rest.
+
+The engine's rule of thumb: resolve the pattern with `match_pattern`, turn
+term-level constraints into `keep`s (a `VALUES` block, the codes a
+predicate's `filter_codes` passes, a namespace's `prefix_range`), apply
+`window` for `LIMIT`/`OFFSET`, and read the resulting view's chunks
+([§1](#1-rows-as-columns-without-arrow)), filtering only what is left.
 
 An engine that already holds term codes, as a nested-loop join's
 per-binding probe does, asks `count_code_pattern(CodePattern)` and
@@ -304,7 +198,7 @@ same order. A code in a position its term kind cannot take matches nothing.
 answers only a whole file-backed Dictionary store (no tail, tombstones or
 narrowing) and returns `None` otherwise.
 
-## 7. Snapshots and mutation
+## 5. Snapshots and mutation
 
 A `VortexRdfStore` value is a snapshot: views share an immutable base, and
 every read of a view sees the same rows. `add_quads`, `delete_quad`,
@@ -325,75 +219,46 @@ valid.
   promise nothing, so an engine that interns codes re-encodes its constants
   when the id changes.
 - Under the Dictionary layout an append tail holds strings whose terms have
-  no code: `row_chunks`, `code_chunks`, `data_source` and `keep` refuse such
-  a view, and `code_columns_gathered` and `dict_reader()` answer `None`. A
+  no code: `row_chunks`, `code_chunks` and `keep` refuse such a view, and
+  `code_columns_gathered` and `dict_reader()` answer `None`. A
   transactional engine therefore compacts on commit, or serves strings
   (`quads`, `row_chunks` on a string layout) while a tail exists, and
   re-takes the dictionary handle after the compaction.
-- The persisted children ([§2](#2-the-persisted-children-as-tables)) are
-  the base's, untouched by tombstones and tails.
 - A store opened by [`from_file`](../core/src/store/persist/open.rs#L238)
-  reads its memory-mapped file in place, and so does every view, data
-  source, partition and stream derived from it: the file must not be
-  truncated or rewritten while any of them lives. Replacing it by a rename
+  reads its memory-mapped file in place, and so does every view, partition
+  and stream derived from it: the file must not be truncated or rewritten
+  while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
   [`from_file_in_memory`](../core/src/store/persist/open.rs#L248) loads the
   file whole instead and never reads it again.
 
-## 8. Through DataFusion
+## 6. A store file through vortex's reader
 
-A view registers with vortex's table provider (`vortex-datafusion`'s `v2`):
+[`vortex_session`](../core/src/lib.rs#L76) holds this crate's store layout,
+encodings and write editions. vortex's own reader opens a store file through
+it, and the file scans as the quad table: the root hands its dtype, row
+count and scan to child 0
+([file-format.md §3](./file-format.md#3-the-store-root-vortex-rdfstorev2)),
+so a scan reads `{s, p, o, g}` in base row order, `UInt64` codes under the
+Dictionary layout, which the
+[`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L242) decodes.
+That is the file's base alone: a view's narrowing, tombstones and tail live
+in the store, and its rows come out through the streams of
+[§1](#1-rows-as-columns-without-arrow). An engine on vortex's DataFusion
+integration can register the file through vortex's own data source over it
+(`VortexFile::data_source`); this repository tests the open and the scan
+([`tests/mapping.rs`](../core/src/tests/mapping.rs)), not the integration.
 
-```rust
-let source = view.data_source()?;
-let schema = Arc::new(vortex_session().arrow().to_arrow_schema(source.dtype())?);
-ctx.register_table("quads", Arc::new(VortexTable::new(source, vortex_session().clone(), schema)))?;
-```
-
-vortex's integration pushes the projection, the filters it can convert
-(comparisons, `AND`/`OR`, `IN` lists as `in_list`, `LIKE`, casts) and the
-limit into the scan request, reads the one partition, and converts every
-chunk to a `RecordBatch`. It reports one partition to DataFusion; set
-`target_partitions` to 1 when the scan's order must survive into the
-results, or use `partitions(n)` and register one table per piece.
-
-**Integer literals.** SQL parses a bare integer (`WHERE p = 5`) as an
-`Int64` literal. DataFusion's coercion and simplification turn its
-comparison with a `UInt64` code column back into one against a `UInt64`
-literal, so the scan node receives `$.p = 5u64`. A range arrives the same
-way, an `IN` of more than three values as an `in_list` of `UInt64` values,
-and a shorter one as `OR`ed equalities.
-
-The suite ([`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs))
-checks, on in-memory, byte-adopted and file-backed stores (mapped, and
-loaded whole): `COUNT(*)` against `size`, the whole table and projections
-against `code_chunks`, equality, `IN`, range and conjunction filters
-against brute force, bare integer literals on every code column (their
-counts against brute force, their predicates on the plan's scan node),
-limits with and without filters, `ORDER BY` on the base order, `DISTINCT`,
-a view as its own table and a join between two views, the `index:posg`
-child's order and `rid`s, the `dictionary` child's rows and a term-level
-`LIKE` over it, and a string layout's `Utf8View` columns.
-[`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs)
-is the starting point: run it with
-`cargo run --manifest-path interface-tests/Cargo.toml --example datafusion_table`.
-
-The crate is a workspace of its own, so the DataFusion dependency tree
-stays out of `cargo test --workspace`. The `interface-tests` job of
-`scripts/ci-check.sh`, which CI and the pre-push hook run, checks it
-`--locked` against the crate's own `Cargo.lock`.
-
-## 9. Source map
+## 7. Source map
 
 | Concern | File |
 |---|---|
-| `DataSource` over a view, component tables, the request plan | [`core/src/store/read/data_source.rs`](../core/src/store/read/data_source.rs) |
 | `count_code_pattern`, `match_code_pattern`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
 | `row_chunks`, `code_chunks` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
 | `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
 | The scan driver of a file view's reads | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs) |
 | `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs) |
-| `vortex_session`, the `vortex_scan` re-export | [`core/src/lib.rs`](../core/src/lib.rs) |
-| Conformance through DataFusion, the Arrow recipe, the example | [`interface-tests/Cargo.toml`](../interface-tests/Cargo.toml), [`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs), [`tests/arrow.rs`](../interface-tests/tests/arrow.rs), [`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs) |
+| `vortex_session` | [`core/src/lib.rs`](../core/src/lib.rs) |
+| The interfaces' tests | [`core/src/tests/chunks.rs`](../core/src/tests/chunks.rs), [`metadata.rs`](../core/src/tests/metadata.rs), [`mapping.rs`](../core/src/tests/mapping.rs) |

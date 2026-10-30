@@ -6,7 +6,6 @@
 //! with no filter.
 
 use super::*;
-use crate::vortex_scan::ScanRequest;
 
 /// A window over a filtered file view that finds fewer matches than its limit
 /// cuts no base row: it reads the plain rows and knows its size and
@@ -397,8 +396,7 @@ impl ReadCounters {
 }
 
 /// Each of `view`'s streams drained in turn: `code_chunks` and `row_chunks`
-/// at 4,096 rows a chunk and the data source's scan answer `codes`, and
-/// `quads()` answers `quads`. After each, `check` is handed the stream's name
+/// at 4,096 rows a chunk answer `codes`, and `quads()` answers `quads`. After each, `check` is handed the stream's name
 /// and the read counters from just before it.
 async fn assert_streams_answer(
     view: &VortexRdfStore,
@@ -422,18 +420,10 @@ async fn assert_streams_answer(
     let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
     assert_eq!(streamed, quads, "{label}: quads()");
     check("quads()", before);
-    let before = ReadCounters::now();
-    let source = view.data_source().unwrap();
-    assert_eq!(
-        scan_codes(&source, ScanRequest::default()).await,
-        codes,
-        "{label}: the data source's scan"
-    );
-    check("data_source", before);
 }
 
 /// The streams over a view whose window kept its filter's masks (`code_chunks`,
-/// `row_chunks`, `quads()` and the data source's scan) read the masks' ids as
+/// `row_chunks` and `quads()`) read the masks' ids as
 /// exact ids with no filter: the plain view's rows, each reader evaluating no
 /// split of the filter, making no masked read and building no scan with the
 /// filter, for a take's density (the ids taken, no row scan) and a
@@ -485,10 +475,9 @@ async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
 /// bound or more) evaluates the filter: for `O`, `PO` and `P`, its one-shot
 /// reads return the plain view's rows, evaluating no split again and
 /// building no scan with the filter, its statistics are exact with no filter
-/// pending, and each stream (`code_chunks`, `row_chunks`, `quads()` and the
-/// data source's scan) reads the matches' ids, where the plain view's streams
-/// evaluate the filter's masks first. No stream builds a scan with the
-/// filter.
+/// pending, and each stream (`code_chunks`, `row_chunks` and `quads()`)
+/// reads the matches' ids, where the plain view's streams evaluate the
+/// filter's masks first. No stream builds a scan with the filter.
 #[tokio::test]
 async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
     let (_dir, path) = masks_file().await;

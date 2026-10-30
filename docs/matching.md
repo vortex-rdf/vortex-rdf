@@ -199,8 +199,8 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` matches on the
-[`Backend`](../core/src/store/view/mod.rs#L60) of the store's
-[`QuadsSource`](../core/src/store/view/mod.rs#L44) and hands that backend's
+[`Backend`](../core/src/store/view/mod.rs#L59) of the store's
+[`QuadsSource`](../core/src/store/view/mod.rs#L43) and hands that backend's
 base and the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
@@ -1003,8 +1003,8 @@ or a projection split by split, spawning the split reads when there is more
 than one and a tokio runtime is current.
 
 The streams (`quads()` and its twins, `raw_quad_chunks`, `row_chunks`,
-`code_chunks`, the data source) read such a view by its masks first too, but
-a split at a time as they are pulled
+`code_chunks`) read such a view by its masks first too, but a split at a time
+as they are pulled
 ([`masks_first_split_reads`](../core/src/store/scan/file_reads.rs#L503)): each
 split's future evaluates the filter over the split, then reads the rows its
 mask keeps as `MaskedRead` chooses for that split alone, so a stream stopped
@@ -1225,7 +1225,7 @@ it reads its rows in the order the view itself reads them. It cannot cut
 one when `offset` is 0 and `limit` is at least the view's row count, or a
 bound on it, known without reading: the `rows.upper_bound` of
 `view_statistics`
-([interfaces §5](interfaces.md#5-what-a-view-promises-before-it-is-read)),
+([interfaces §3](interfaces.md#3-what-a-view-promises-before-it-is-read)),
 the base's selected rows (a pending run's width; under a pending file
 filter, the rows it has yet to test), their live rows under tombstones when
 those take no read, plus the tail's live rows. The selected rows are tested

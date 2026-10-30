@@ -11,8 +11,7 @@ run their jobs through it. The `pre-push` hook runs every job; run
 (`./scripts/ci-check.sh lint rust-tests`). Skip the hook for one push with
 `git push --no-verify`. The script's header lists the jobs and what a local
 run does differently: it skips a step whose tool is missing, builds the wasm
-package without wasm-opt, and caps the compile jobs of `interface-tests` and
-`js-tests`.
+package without wasm-opt, and caps the compile jobs of `js-tests`.
 
 Core builds in two configurations: natively with its default `file-io`
 feature, and for wasm32 without it, as the wasm bindings take it. A native

@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::{Chunked, ChunkedArray};
-use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_mask::Mask;
 
@@ -184,15 +183,6 @@ impl QuadsSource {
             Backend::InMemory(memory) => memory.base.len(),
             #[cfg(feature = "file-io")]
             Backend::File(FileBase { file, .. }) => file.row_count() as usize,
-        }
-    }
-
-    /// The base's struct dtype: the layout's primary columns.
-    pub(crate) fn dtype(&self) -> &DType {
-        match &self.backend {
-            Backend::InMemory(memory) => memory.base.dtype(),
-            #[cfg(feature = "file-io")]
-            Backend::File(FileBase { file, .. }) => file.dtype(),
         }
     }
 

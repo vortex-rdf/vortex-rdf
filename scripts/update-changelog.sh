@@ -9,9 +9,9 @@
 # script only rewrites [Unreleased], a preview that changes no version. A cut
 # also sets X.Y.Z everywhere a version is declared: the three version lines of
 # Cargo.toml ([workspace.package] and the two path dependencies), the workspace
-# entries of Cargo.lock, interface-tests/Cargo.lock and bench-compare/Cargo.lock
-# (`cargo update -w`), js/package.json with its lock (`npm version`), and the
-# project version of java/pom.xml (its first <version>, the line release.yml
+# entries of Cargo.lock and bench-compare/Cargo.lock (`cargo update -w`),
+# js/package.json with its lock (`npm version`), and the project version of
+# java/pom.xml (its first <version>, the line release.yml
 # checks). Python inherits the workspace version through maturin. Released
 # sections (## [x.y.z]) are kept verbatim.
 #
@@ -126,7 +126,6 @@ rm Cargo.toml.bak
 set_lines="$(grep -cE "^version = \"$ver\"\$|^vortex-rdf-(core|encoded-search) = \{ path = \"[^\"]*\", version = \"$ver\" \}\$" Cargo.toml || true)"
 [ "$set_lines" = 3 ] || { echo "error: set $set_lines of Cargo.toml's 3 version lines; check it by hand" >&2; exit 1; }
 cargo update -w
-cargo update -w --manifest-path interface-tests/Cargo.toml
 cargo update -w --manifest-path bench-compare/Cargo.toml
 (cd js && npm version "$ver" --no-git-tag-version --allow-same-version)
 # The pom's first <version> is the project's own (release.yml reads the same line).

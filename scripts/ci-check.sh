@@ -7,7 +7,7 @@
 #   scripts/ci-check.sh                  # every job, in this order
 #   scripts/ci-check.sh lint rust-tests  # only the named jobs
 #
-# Jobs: docs, lint, rust-tests, interface-tests, python-tests, js-tests, java-tests.
+# Jobs: docs, lint, rust-tests, python-tests, js-tests, java-tests.
 #
 # Under CI=true (GitHub Actions sets it) every job runs in full and a missing
 # tool fails it. A local run differs in three ways:
@@ -20,13 +20,12 @@
 #     in the installed js/node_modules, where CI runs `npm ci` and
 #     `npm run build`. The tests then run against an unoptimized binary, so CI
 #     stays the source of truth for the artifact that ships.
-#   * interface-tests and js-tests compile with at most 4 jobs unless
-#     CARGO_BUILD_JOBS is set: a cold build compiles DataFusion's or the wasm
-#     build's dependency tree, and one rustc per core can exhaust a small
-#     machine's memory. CI sets no cap.
+#   * js-tests compiles with at most 4 jobs unless CARGO_BUILD_JOBS is set:
+#     a cold build compiles the wasm build's dependency tree, and one rustc
+#     per core can exhaust a small machine's memory. CI sets no cap.
 set -euo pipefail
 
-JOBS=(docs lint rust-tests interface-tests python-tests js-tests java-tests)
+JOBS=(docs lint rust-tests python-tests js-tests java-tests)
 
 case "${1:-}" in
   -h | --help)
@@ -113,15 +112,6 @@ job_lint() {
 
 job_rust_tests() {
   run cargo test --workspace
-}
-
-# The DataFusion conformance crate is a workspace of its own
-# (interface-tests/Cargo.toml), checked against its own Cargo.lock.
-job_interface_tests() {
-  if ! in_ci; then local -x CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"; fi
-  run cargo fmt --manifest-path interface-tests/Cargo.toml --check
-  run cargo clippy --manifest-path interface-tests/Cargo.toml --all-targets --locked -- -D warnings
-  run cargo test --manifest-path interface-tests/Cargo.toml --locked
 }
 
 # `bench/test_codspeed.py` runs too: without `--codspeed` the plugin calls each
