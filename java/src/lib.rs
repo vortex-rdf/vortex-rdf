@@ -472,6 +472,25 @@ pub extern "system" fn Java_org_vortexrdf_Native_decode<'local>(
     })
 }
 
+/// Each code's term, one `String` apiece (`null` for a negative code or one outside the dictionary): the
+/// per-term call, for a lookup too small for a chunk's fixed cost to pay off.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_decodeStrings<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    h: jlong,
+    codes: JLongArray<'local>,
+) -> JObjectArray<'local, JString<'local>> {
+    call(&mut env, |env| {
+        let mut buf = vec![0i64; codes.len(env)?];
+        codes.get_region(env, 0, &mut buf)?;
+        // A negative code is no code: u64::MAX is outside every dictionary, so it decodes to `None`.
+        let codes: Vec<u64> = buf.iter().map(|&c| code(c).unwrap_or(u64::MAX)).collect();
+        let terms = store(h).decode_many(&codes)?;
+        java_strings(env, terms.iter().map(|t| t.as_deref()))
+    })
+}
+
 /// The terms of `codes[from, from + count)` from the first, as one chunk of at most `chunkBytes` bytes of terms
 /// and at least one code (unless `count` is 0); a negative code and one outside the dictionary hold no term.
 /// The last slot is `{next}`, the codes the next slice should offer ([`Pace::next_slice`]).

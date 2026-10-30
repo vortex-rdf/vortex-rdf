@@ -82,6 +82,9 @@ final class Native {
 
 	static native String decode(long handle, long code);
 
+	/** Each code's term, one string apiece (null for a negative code or one outside the dictionary). */
+	static native String[] decodeStrings(long handle, long[] codes);
+
 	/**
 	 * The terms of {@code codes[from, from + count)} from the first, as one chunk ({@link Payload}) of at most
 	 * {@code chunkBytes} bytes of terms and at least one code; a negative code and one outside the dictionary hold

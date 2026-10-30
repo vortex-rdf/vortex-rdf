@@ -176,18 +176,20 @@ async fn encode_distinct(
 /// The distinct codes of the first `positions` positions, `width` to a row, and each position's slot among
 /// them, found as Python's `decode_slice` finds them: a direct-mapped cache of recent codes per column; a
 /// hit shares its slot, a miss (a new code, or one its bucket lost) makes a new one. Slots are made in
-/// position order.
+/// position order, and the cache's size does not depend on how many rows are offered, so a prefix of rows
+/// gets the same slots however many follow it.
 fn distinct_codes(
     positions: usize,
     width: usize,
     code: impl Fn(usize) -> TermCode,
 ) -> (Vec<TermCode>, Vec<u32>) {
-    let mut recent = vec![[(0, u32::MAX); BUCKETS]; width];
+    let mut recent = vec![(0, u32::MAX); width * BUCKETS];
     let mut distinct = Vec::new();
     let mut slots = Vec::with_capacity(positions);
     for position in 0..positions {
         let code = code(position);
-        let entry = &mut recent[position % width][(code % BUCKETS as TermCode) as usize];
+        let bucket = (code % BUCKETS as TermCode) as usize;
+        let entry = &mut recent[position % width * BUCKETS + bucket];
         if entry.1 == u32::MAX || entry.0 != code {
             *entry = (code, distinct.len() as u32);
             distinct.push(code);

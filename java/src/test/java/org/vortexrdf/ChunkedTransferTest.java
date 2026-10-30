@@ -1,5 +1,6 @@
 package org.vortexrdf;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -148,6 +149,16 @@ class ChunkedTransferTest {
 				assertNull(terms[distinct.size() + 1], tag + " past the dictionary");
 			}
 			assertEquals(0, dict.decodeMany(new long[0]).length);
+			// Fewer codes than a chunk pays for cross a string apiece: the same answers, null for a miss.
+			long[] few = { codes[0], VortexStore.NONE, codes[1], dict.size() + 1, codes[0] };
+			for (int n = 1; n < TermDictionary.CHUNKED_CODES && n <= few.length; n++) {
+				long[] some = Arrays.copyOf(few, n);
+				String[] want = new String[n];
+				for (int i = 0; i < n; i++) {
+					want[i] = dict.decode(some[i]);
+				}
+				assertArrayEquals(want, dict.decodeMany(some), name + " " + n + " codes");
+			}
 			// A slice of no codes would never advance.
 			assertThrows(IllegalArgumentException.class,
 					() -> dict.decodeMany(codes, 0, Payload.CHUNK_BYTES, Payload.LARGE_TERM));

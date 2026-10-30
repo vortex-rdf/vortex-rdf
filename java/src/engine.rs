@@ -142,6 +142,11 @@ impl Store {
         RUNTIME.block_on(self.dict()?.decode(code))
     }
 
+    /// [`decode`](Self::decode) of each code, in order, for codes in any order and with repeats.
+    pub fn decode_many(&self, codes: &[u64]) -> Result<Vec<Option<String>>> {
+        RUNTIME.block_on(self.dict()?.decode_many(codes))
+    }
+
     /// The terms of `codes` from the first, as one packed chunk under `limits`, and how many codes it holds
     /// (at least one, unless `codes` is empty). A code outside the dictionary holds no term.
     pub fn decode_payload(&self, codes: &[u64], limits: Limits) -> Result<(Payload, usize)> {

@@ -390,8 +390,14 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
                 .collect();
             let (decoded, n) = store.decode_payload(&codes, Limits::DEFAULT).unwrap();
             assert_eq!(n, codes.len(), "{tag}: one chunk");
+            let strings = store.decode_many(&codes).unwrap();
             for (i, term) in distinct.iter().enumerate() {
                 assert_eq!(decoded.term(i), Some(term.as_str()), "{tag}: round trip");
+                assert_eq!(
+                    strings[i].as_deref(),
+                    Some(term.as_str()),
+                    "{tag}: a string apiece"
+                );
             }
             assert_eq!(
                 store.decode(codes[0]).unwrap().as_deref(),

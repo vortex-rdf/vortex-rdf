@@ -9,6 +9,12 @@ import java.util.Objects;
  * the mapped file on demand.
  */
 public final class TermDictionary {
+	/**
+	 * The fewest codes {@link #decodeMany(long[])} sends as a packed chunk; fewer cross a string apiece, which costs
+	 * less than a chunk's fixed cost below about ten codes.
+	 */
+	static final int CHUNKED_CODES = 10;
+
 	private final VortexStore store;
 
 	TermDictionary(VortexStore store) {
@@ -51,6 +57,9 @@ public final class TermDictionary {
 			throw new IllegalArgumentException("sliceCodes < 1");
 		}
 		return store.call(h -> {
+			if (codes.length < CHUNKED_CODES) {
+				return Native.decodeStrings(h, codes);
+			}
 			String[] terms = new String[codes.length];
 			int slice = sliceCodes;
 			for (int from = 0; from < codes.length;) {
