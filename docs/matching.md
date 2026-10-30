@@ -1393,9 +1393,10 @@ under either residency: a resident dictionary answers in place, a
 file-backed one reads the windows it needs from the mapped child, through a
 bounded cache of rebuilt windows
 ([file-format.md §5](file-format.md#5-the-dictionary-child)). `decode_many`
-decodes a batch of codes in any order, with repeats, reading each distinct code
-once; `decode_many_with(codes, visit)` hands every position its term, borrowed
-for the call, instead of building a `String` per position.
+decodes a batch of codes in any order, with repeats, a file-backed one reading
+each window that holds a code once; `decode_many_with(codes, visit)` hands every
+position its term, borrowed for the call, instead of building a `String` per
+position.
 `filter_codes(&TermPredicate, codes)` evaluates the predicate over the
 *candidate* codes a query produced — sorted and unique — and answers
 `(passed, undecided)`, both subsets of the candidates; a candidate in

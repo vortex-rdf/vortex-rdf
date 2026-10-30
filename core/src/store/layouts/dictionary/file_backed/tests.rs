@@ -184,16 +184,20 @@ async fn windows_of_widely_varying_term_lengths_resolve() {
 }
 
 /// The visitor delivers each position once, in any order with repeats and
-/// out-of-range codes, reading each window holding a code once.
+/// out-of-range codes, reading each window holding a code once: the
+/// out-of-range positions first, then window by window, each window's
+/// positions in input order.
 #[tokio::test]
 async fn decode_many_with_visits_each_position_once_across_windows() {
     let (fbd, terms) = windowed_handle(600, 100).await;
     let codes: [TermCode; 12] = [450, 5, 450, 105, 9999, 5, 599, 0, 105, 600, 450, u64::MAX];
     let mut got = vec![None; codes.len()];
     let mut visits = vec![0usize; codes.len()];
+    let mut order = Vec::new();
     let before = fbd.debug_windows_rebuilt();
     fbd.decode_many_with(&codes, |i, term| {
         visits[i] += 1;
+        order.push(i);
         got[i] = term.map(str::to_owned);
     })
     .await
@@ -201,12 +205,34 @@ async fn decode_many_with_visits_each_position_once_across_windows() {
     // Windows 0, 1, 4 and 5 hold codes.
     assert_eq!(fbd.debug_windows_rebuilt() - before, 4);
     assert!(visits.iter().all(|&n| n == 1), "{visits:?}");
+    // Out of range: 4, 9, 11. Window 0: 1, 5, 7; 1: 3, 8; 4: 0, 2, 10; 5: 6.
+    assert_eq!(order, [4, 9, 11, 1, 5, 7, 3, 8, 0, 2, 10, 6]);
     let want: Vec<Option<String>> = codes
         .iter()
         .map(|&code| terms.get(code as usize).cloned())
         .collect();
     assert_eq!(got, want);
     assert_eq!(reader(&fbd).decode_many(&codes).await.unwrap(), want);
+
+    // Inside one window (4): the out-of-range position, then input order,
+    // the window asked for once.
+    let codes: [TermCode; 5] = [450, 405, 9999, 450, 499];
+    let mut order = Vec::new();
+    let mut got = vec![None; codes.len()];
+    let before = fbd.debug_windows_requested();
+    fbd.decode_many_with(&codes, |i, term| {
+        order.push(i);
+        got[i] = term.map(str::to_owned);
+    })
+    .await
+    .unwrap();
+    assert_eq!(fbd.debug_windows_requested() - before, 1);
+    assert_eq!(order, [2, 0, 1, 3, 4]);
+    let want: Vec<Option<String>> = codes
+        .iter()
+        .map(|&code| terms.get(code as usize).cloned())
+        .collect();
+    assert_eq!(got, want);
 }
 
 /// A code list that is not strictly ascending is an error, however far

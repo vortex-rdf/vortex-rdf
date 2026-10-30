@@ -302,10 +302,11 @@ impl DictReader {
     /// the spelling borrowed for the call (`None` for an out-of-range code).
     /// Codes may come in any order and repeat. A resident dictionary visits
     /// in the order of `codes`; a file-backed one visits the out-of-range
-    /// positions first, then reads each distinct code once, in one batch, and
-    /// visits every position holding it, in code order. The `Result` reports
-    /// a failed read of the file. Terms are read as UTF-8 unchecked, so the
-    /// store must be one this crate wrote or the caller trusts.
+    /// positions first, then reads each window holding a code once (the
+    /// reads overlapped) and visits the window's positions in the order of
+    /// `codes`, window by window. The `Result` reports a failed read of the
+    /// file. Terms are read as UTF-8 unchecked, so the store must be one this
+    /// crate wrote or the caller trusts.
     pub async fn decode_many_with(
         &self,
         codes: &[TermCode],

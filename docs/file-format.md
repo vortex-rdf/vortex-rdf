@@ -299,9 +299,9 @@ the bounds from the leaves.
   windows, read no leaf. A match resolves its bound terms concurrently
   ([matching.md §3](matching.md#3-stage-a--prepare_pattern)).
 - **code → term** (`decode`, `decode_many`): the codes are grouped by
-  window; each touched window comes from the window cache and only the asked
-  rows are decompressed. A batch in any order, with repeats, reads each
-  distinct code once.
+  window in one counting pass, not a sort; each touched window comes from the
+  window cache, once per batch in any order and with repeats, and only the
+  asked rows are decompressed.
 - **A chunk's rows** decode in place, as against a resident dictionary
   ([`decode_file_backed`](../core/src/store/layouts/dictionary/codec/mod.rs#L647)):
   each window the chunk's codes fall in is taken once from the window cache,

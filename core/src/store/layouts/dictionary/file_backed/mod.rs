@@ -280,30 +280,78 @@ impl FileBackedDict {
     /// The terms of `codes`, in any order and with repeats, each handed to
     /// `visit(position, term)` once per position (`None` for an out-of-range
     /// code), borrowed: no string is built per term. Out-of-range positions
-    /// are visited first, then the rest in code order, each distinct code
-    /// read once ([`visit_terms`](Self::visit_terms)).
+    /// are visited first. The rest are grouped by window in one counting
+    /// pass, not a sort: each window holding any of them is read once (the
+    /// reads overlapped, as [`encode_many`](Self::encode_many)'s), and its
+    /// positions are visited in input order through one cursor, which
+    /// decompresses only the asked rows, a repeated code at each of its
+    /// positions as a resident decode does.
     pub(crate) async fn decode_many_with(
         &self,
         codes: &[TermCode],
         mut visit: impl FnMut(usize, Option<&str>),
     ) -> Result<()> {
-        let mut sorted: Vec<(TermCode, usize)> = Vec::with_capacity(codes.len());
-        for (i, &code) in codes.iter().enumerate() {
-            if self.0.code_space.rank_of(code).is_some() {
-                sorted.push((code, i));
-            } else {
-                visit(i, None);
+        let inner = &*self.0;
+        // Each in-range position beside its window, and the windows
+        // `lo..hi` they fall in.
+        let mut located: Vec<(usize, usize)> = Vec::with_capacity(codes.len());
+        let (mut lo, mut hi) = (usize::MAX, 0);
+        for (at, &code) in codes.iter().enumerate() {
+            match inner.code_space.rank_of(code) {
+                Some(rank) => {
+                    let (w, _) = chunk_of(&inner.starts, rank);
+                    lo = lo.min(w);
+                    hi = hi.max(w + 1);
+                    located.push((w, at));
+                }
+                None => visit(at, None),
             }
         }
-        sorted.sort_unstable();
-        let groups: Vec<&[(TermCode, usize)]> = sorted.chunk_by(|a, b| a.0 == b.0).collect();
-        let distinct: Vec<TermCode> = groups.iter().map(|group| group[0].0).collect();
-        self.visit_terms(&distinct, |j, term| {
-            for &(_, i) in groups[j] {
-                visit(i, Some(term));
+        if located.is_empty() {
+            return Ok(());
+        }
+        // In range (checked above), so a code's offset from the first code
+        // is a rank below the term count: exact as a `usize`.
+        let base = inner.code_space.base();
+        let rank = |at: usize| (codes[at] - base) as usize;
+        if hi - lo == 1 {
+            // One window, as for a single code: read it straight and visit
+            // in input order, with nothing to group.
+            let chunk = inner.window_chunk(lo).await?;
+            let start = inner.windows[lo].start;
+            let mut cursor = chunk.cursor();
+            for &(_, at) in &located {
+                visit(at, Some(cursor.str_at(rank(at) - start)));
             }
-        })
-        .await
+            return Ok(());
+        }
+        // A counting sort by window, which keeps input order within one:
+        // window `lo + k`'s positions are `order[bounds[k]..bounds[k + 1]]`.
+        let mut bounds = vec![0usize; hi - lo + 1];
+        for &(w, _) in &located {
+            bounds[w - lo + 1] += 1;
+        }
+        for k in 1..bounds.len() {
+            bounds[k] += bounds[k - 1];
+        }
+        let mut next = bounds.clone();
+        let mut order = vec![0usize; located.len()];
+        for &(w, at) in &located {
+            order[next[w - lo]] = at;
+            next[w - lo] += 1;
+        }
+        let touched = (0..hi - lo).filter(|&k| bounds[k] < bounds[k + 1]);
+        let mut chunks = futures::stream::iter(touched)
+            .map(|k| async move { Ok::<_, VortexRdfError>((k, inner.window_chunk(lo + k).await?)) })
+            .buffered(available_parallelism().max(4));
+        while let Some((k, chunk)) = chunks.try_next().await? {
+            let start = inner.windows[lo + k].start;
+            let mut cursor = chunk.cursor();
+            for &at in &order[bounds[k]..bounds[k + 1]] {
+                visit(at, Some(cursor.str_at(rank(at) - start)));
+            }
+        }
+        Ok(())
     }
 
     /// The code of `term`, tolerant of spelling as `TermDictionary::encode`.
