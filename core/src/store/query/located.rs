@@ -532,10 +532,17 @@ async fn check_rows(
                 && rows.len() < SEARCHES_PER_LEAF * leaves_holding(&quads[slot], &rows)
             {
                 // The other run is walked one leaf at a time, each leaf's
-                // probe found once for all the rows that fall in it.
+                // probe found once for all the rows that fall in it, and
+                // the leaves holding no row skipped by a search for the
+                // next row's bound: the rows of a short run sit far apart
+                // in a long one, and walking to them read every leaf between.
                 let mut kept = Vec::with_capacity(rows.len());
                 let mut pending = rows.as_slice();
-                let mut from = other_run.start;
+                let Some(mut from) =
+                    seek(other_rid, other_run.clone(), rows[0], source, session).await?
+                else {
+                    return Ok(None);
+                };
                 while from < other_run.end && !pending.is_empty() {
                     let to = other_rid.leaf_end(from).min(other_run.end);
                     let Some(leaf) = other_rid.leaf_rows(from..to, source, session).await? else {
@@ -551,7 +558,15 @@ async fn check_rows(
                         }
                         pending = rest;
                     }
-                    from = to;
+                    let Some(&next) = pending.first() else {
+                        break;
+                    };
+                    let Some(at) =
+                        seek(other_rid, to..other_run.end, next, source, session).await?
+                    else {
+                        return Ok(None);
+                    };
+                    from = at;
                 }
                 rows = kept;
                 continue;
@@ -850,6 +865,23 @@ async fn taken_codes(
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let prim = taken.execute::<PrimitiveArray>(&mut ctx)?;
     Ok(prim.into_buffer::<TermCode>())
+}
+
+/// The first row of `run`, a window of `column`'s ascending values, whose
+/// value is not below `value` (`run.end` when none is); `None` when a chunk
+/// declines its probe.
+#[cfg(feature = "file-io")]
+async fn seek(
+    column: &vortex_rdf_encoded_search::ColumnChunks,
+    run: std::ops::Range<u64>,
+    value: u64,
+    source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
+    session: &vortex_session::VortexSession,
+) -> Result<Option<u64>> {
+    Ok(column
+        .bounds_in(run, value, source, session)
+        .await?
+        .map(|hit| hit.start))
 }
 
 /// How many of `column`'s leaves hold `rows` (ascending), from the layout.
