@@ -265,7 +265,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`matching.rs:223-248`](../core/src/store/query/matching.rs#L223-L248 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L357), [`search_sorted_bounds`](../core/src/store/array.rs#L215) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:252-305`](../core/src/store/query/matching.rs#L252-L305 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L739), [`fold_row_ids`](../core/src/store/query/matching.rs#L869) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:307-323`](../core/src/store/query/matching.rs#L307-L323 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L441), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L257), [`mask_for`](../core/src/store/query/matching.rs#L818) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`matching.rs:307-323`](../core/src/store/query/matching.rs#L307-L323 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L441), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L267), [`mask_for`](../core/src/store/query/matching.rs#L818) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:325-332`](../core/src/store/query/matching.rs#L325-L332 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -433,7 +433,8 @@ Then two implementations, in order:
 
    It **declines** when any column is nullable or unsupported, when a lone
    constraint faces a wide selection (`> 4096` rows — SIMD wins there), or when
-   a probe-bound (wire-encoded) column faces a wide selection.
+   a probe-bound (wire-encoded) column faces more than 256 rows: read a row at
+   a time, such a column costs more than the mask scan's whole call by then.
 
 2. **Mask scan** (`mask_for`) — the general vectorized fallback: take the
    gathered rows as a struct (again only the struct, not its columns),
@@ -472,8 +473,8 @@ matches as the view's ids, and any other consumer compares the whole
 selection at once. A count without a limit, a window that reaches every row,
 a probe with keeps and `match_pattern` compare eagerly, as above. An ASK over
 a pattern every zone holds then compares the first piece, not the store, and
-the first piece is above the typed residual's 4,096-row cap, so it never
-reads a probe-bound column row by row.
+the first piece is above the typed residual's caps, so the mask scan compares
+it.
 
 **Examples** (no index unless stated):
 
@@ -1030,7 +1031,7 @@ file run) and a rid-only scan of the index child otherwise.
 | 4 | in memory | resolution `Lazy` ∧ unrefined ∧ untouched ∧ nothing bound ∧ (plan ∨ count or window) | defer the ids (`Pending`) |
 | 5 | in memory | selection non-empty ∧ something still bound | residual filtering |
 | 5b | in memory | count or window ∧ its offset + limit < the selection's rows ∧ the selection > 8,192 rows | the residual left `Pending`, compared piece by piece as far as the count or window reaches |
-| 6 | in memory | every residual column typed-bindable ∧ not (single eq over > 4096 rows) ∧ no probe-bound column over a wide selection | typed row loop, else mask scan |
+| 6 | in memory | every residual column typed-bindable ∧ not (single eq over > 4096 rows) ∧ no probe-bound column over > 256 rows | typed row loop, else mask scan |
 | 7 | in memory | `unrefined ∧ !prefix_narrowed ∧ !residual_narrowed` | keep the serve plan |
 | 8 | file | `s` bound ∧ `quads_sorted` ∧ integer probe ∧ chunk probes resolve | exact subject row range; subject cleared |
 | 8b | file | subject run found ∧ next role in (p, o, g) bound ∧ it has a code and chunk probes | `bounds_in` narrows the run; that role cleared; repeat until a role declines |
@@ -1049,7 +1050,8 @@ file run) and a rid-only scan of the index child otherwise.
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
 | `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L888) | an already-narrowed view below this skips index routing |
-| `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L245) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
+| `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L244) | selection size above which the typed row loop declines to the vectorized mask scan for a lone residual equality |
+| `TYPED_PROBE_MAX_ROWS` | 256 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L253) | the same for any set that binds a column through an encoded-search probe, read a row at a time: the mask scan costs less from about 256 rows of a range and 512 of scattered ids |
 | `FIRST_PIECE_ROWS` | 8192 | [`residual.rs`](../core/src/store/query/residual.rs#L28) | the first piece of a residual compare left pending for a count or a window, each piece after four times the one before; a selection this wide or narrower is compared eagerly |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
