@@ -2,9 +2,10 @@
 //! [`RawQuad`] (owned N-Triples strings, the builders' input) and
 //! [`SharedQuad`] (`Arc<str>` terms, the shared-string read output).
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
-use oxrdf::Quad;
+use oxrdf::{Quad, TermRef};
 
 use crate::common::terms::{Trust, at, graph_name, named_node, quad_from_terms, subject, term};
 use crate::error::Result;
@@ -119,6 +120,24 @@ impl RawQuad {
                 oxrdf::GraphName::BlankNode(b) => blank_node_string(b),
             },
         }
+    }
+}
+
+/// Append `term`'s canonical spelling to `out`: the one
+/// [`RawQuad::from_quad`] renders for it, `<iri>`, `_:id` or a literal's
+/// Display form.
+pub(crate) fn push_spelling(out: &mut String, term: TermRef<'_>) {
+    match term {
+        TermRef::NamedNode(n) => {
+            out.push('<');
+            out.push_str(n.as_str());
+            out.push('>');
+        }
+        TermRef::BlankNode(b) => {
+            out.push_str("_:");
+            out.push_str(b.as_str());
+        }
+        TermRef::Literal(l) => write!(out, "{l}").expect("a String takes every write"),
     }
 }
 

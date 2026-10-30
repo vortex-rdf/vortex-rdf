@@ -13,9 +13,8 @@ use crate::store::view::selection::RowSelection;
 use crate::store::view::selection::ViewSelection;
 use crate::store::{Backend, Tail, next_generation};
 
-use hashbrown::HashTable;
+use hashbrown::{DefaultHashBuilder, HashTable};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use rustc_hash::FxBuildHasher;
 use std::hash::BuildHasher;
 
 #[cfg(feature = "file-io")]
@@ -102,15 +101,17 @@ impl VortexRdfStore {
 
         let mut fresh: Vec<RawQuad> = Vec::new();
         // The quads kept so far, by their place in `fresh`: an earlier equal
-        // quad of the batch is found there, with no copy of a kept quad.
+        // quad of the batch is found there, with no copy of a kept quad. The
+        // hasher is seeded, as the dictionary ingest's term tables are.
         let mut kept: HashTable<usize> = HashTable::new();
+        let hasher = DefaultHashBuilder::default();
         for quad in quads {
             let raw = RawQuad::from_quad(&quad);
-            let hash = FxBuildHasher.hash_one(&raw);
+            let hash = hasher.hash_one(&raw);
             if kept.find(hash, |&i| fresh[i] == raw).is_some() || self.contains(&quad).await? {
                 continue;
             }
-            kept.insert_unique(hash, fresh.len(), |&i| FxBuildHasher.hash_one(&fresh[i]));
+            kept.insert_unique(hash, fresh.len(), |&i| hasher.hash_one(&fresh[i]));
             fresh.push(raw);
         }
         if fresh.is_empty() {

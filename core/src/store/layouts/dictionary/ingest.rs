@@ -5,15 +5,22 @@
 //! one per RDF term, so a dictionary holds one code per term; the interning
 //! ingest drops repeated quads after its sort, before anything is derived
 //! from them.
+//!
+//! The term-keyed tables hash under hashbrown's default hasher, seeded per
+//! table, so input crafted to collide under one fixed hash cannot turn the
+//! ingest quadratic.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
+use hashbrown::hash_map::EntryRef;
+use hashbrown::{HashMap, HashSet};
+use oxrdf::{GraphNameRef, QuadRef, TermRef};
 use vortex_array::arrays::VarBinViewArray;
 
 use vortex_buffer::Buffer;
 
+use crate::common::quad::push_spelling;
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
@@ -214,6 +221,9 @@ pub(crate) fn finish_interned(
 pub struct DictionaryQuadSink {
     interner: InterningQuadBuilder,
     indexes: Indexes,
+    /// The spelling of the term [`push_quad`](Self::push_quad) interns,
+    /// reused from term to term.
+    spelling: String,
 }
 
 impl DictionaryQuadSink {
@@ -223,6 +233,7 @@ impl DictionaryQuadSink {
         Self {
             interner: InterningQuadBuilder::new(),
             indexes,
+            spelling: String::new(),
         }
     }
 
@@ -231,6 +242,35 @@ impl DictionaryQuadSink {
     /// spelling given is the term interned.
     pub fn push(&mut self, quad: RawQuad) {
         self.interner.push(quad);
+    }
+
+    /// Intern a borrowed quad's four terms by the spelling
+    /// [`RawQuad::from_quad`] renders, and append their codes, as
+    /// [`push`](Self::push) of that quad does. Each term is spelled into one
+    /// buffer the sink reuses, so only a term seen for the first time is
+    /// copied out of it.
+    pub fn push_quad(&mut self, quad: QuadRef<'_>) {
+        let codes = [
+            self.intern_spelled(Some(quad.subject.into())),
+            self.intern_spelled(Some(quad.predicate.into())),
+            self.intern_spelled(Some(quad.object)),
+            self.intern_spelled(match quad.graph_name {
+                GraphNameRef::DefaultGraph => None,
+                GraphNameRef::NamedNode(n) => Some(n.into()),
+                GraphNameRef::BlankNode(b) => Some(b.into()),
+            }),
+        ];
+        self.interner.quads.push(codes);
+    }
+
+    /// The provisional code of `term`'s spelling, the default graph's (`""`)
+    /// for `None`.
+    fn intern_spelled(&mut self, term: Option<TermRef<'_>>) -> TermCode {
+        self.spelling.clear();
+        if let Some(term) = term {
+            push_spelling(&mut self.spelling, term);
+        }
+        self.interner.intern_str(&self.spelling)
     }
 
     /// Freeze the dictionary and build the single-chunk Dictionary-layout
@@ -274,13 +314,31 @@ impl InterningQuadBuilder {
         Ok(interner)
     }
 
+    /// The provisional code of `term`, moved in when it is new. Provisional
+    /// codes are insertion ranks: below the term count, so they index
+    /// `rank_of` in `finish`.
     fn intern(&mut self, term: String) -> TermCode {
-        // Provisional codes are insertion ranks: below the term count, so
-        // they index `rank_of` in `finish`.
+        if let Some(&code) = self.codes.get(term.as_str()) {
+            return code;
+        }
         let next = self.codes.len() as TermCode;
         // `into_boxed_str` is free for exact-capacity Strings (the common
         // case from `RawQuad::from_quad`) and shrinks the rest.
-        *self.codes.entry(term.into_boxed_str()).or_insert(next)
+        self.codes.insert(term.into_boxed_str(), next);
+        next
+    }
+
+    /// The provisional code of `term`, copied in only when it is new.
+    fn intern_str(&mut self, term: &str) -> TermCode {
+        let next = self.codes.len() as TermCode;
+        match self.codes.entry_ref(term) {
+            EntryRef::Occupied(entry) => *entry.get(),
+            EntryRef::Vacant(entry) => {
+                #[cfg(test)]
+                intern_hooks::note_copied();
+                *entry.insert_with_key(Box::from(term), next)
+            }
+        }
     }
 
     /// Intern the quad's four terms, keeping only their codes.
@@ -372,5 +430,26 @@ pub(crate) mod rebuild_hooks {
     /// The rebuilds from codes on this thread so far.
     pub(crate) fn rebuilt() -> usize {
         REBUILT.get()
+    }
+}
+
+/// Test hook: how many terms this thread's interners copied in from a
+/// borrowed spelling.
+#[cfg(test)]
+pub(crate) mod intern_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COPIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one term copied in.
+    pub(super) fn note_copied() {
+        COPIED.set(COPIED.get() + 1);
+    }
+
+    /// The terms copied in on this thread so far.
+    pub(crate) fn copied() -> usize {
+        COPIED.get()
     }
 }

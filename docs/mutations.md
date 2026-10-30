@@ -47,7 +47,7 @@ owns its rows accepts them ([§6](#6-ownership-and-owned)).
 
 ## 2. Additions: the append tail
 
-[`add_quad`](../core/src/store/write/mutation.rs#L78) /
+[`add_quad`](../core/src/store/write/mutation.rs#L77) /
 [`add_quads`](../core/src/store/write/mutation.rs#L100) never touch the base — they
 append into the **Tail**, the write-optimized half of the design beside the
 read-optimized base.
@@ -113,8 +113,8 @@ flowchart TD
 
 ## 3. Deletions: tombstone masks
 
-[`delete_quad`](../core/src/store/write/mutation.rs#L155) /
-[`delete_matching`](../core/src/store/write/mutation.rs#L174) never remove or
+[`delete_quad`](../core/src/store/write/mutation.rs#L156) /
+[`delete_matching`](../core/src/store/write/mutation.rs#L175) never remove or
 rewrite rows either — they mark them dead.
 
 ```mermaid
@@ -155,7 +155,7 @@ flowchart TD
   [`Tail::live_rows`](../core/src/store/view/mod.rs#L541).
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
-  [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L226) (through
+  [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L227) (through
   [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L676)), and on
   every later read the mask is applied **inside the scan**
   ([`restrict_scan`](../core/src/store/scan/file_scans.rs#L254)) — as an
@@ -178,7 +178,7 @@ flowchart TD
 Both rebuild the same way
 ([`rebuilt_parts`](../core/src/store/write/compaction.rs#L83)). Under the
 Dictionary layout with its dictionary in memory, from the base rows' codes
-([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L89)):
+([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L96)):
 the live base rows are read as codes, only the distinct terms they use are
 decoded, once each, and merged with the tail's terms into the fresh
 dictionary, every base code moves to its term's new code (code order being
@@ -322,8 +322,8 @@ so a read-only store is for reading: append to a copy.
 ## 6. Ownership and `owned()`
 
 Only a store that owns its rows may be mutated
-([`is_owner`](../core/src/store/write/mutation.rs#L50),
-[`ensure_owner`](../core/src/store/write/mutation.rs#L62)): its base selection is
+([`is_owner`](../core/src/store/write/mutation.rs#L49),
+[`ensure_owner`](../core/src/store/write/mutation.rs#L61)): its base selection is
 `All`, it has no pending file filter, and its tail selection (if any) is
 `All`. A view derived from `match_pattern` is a window onto a base it shares,
 so mutating it would either silently drop the rows outside the view or write
@@ -332,7 +332,7 @@ unconstrained match) counts as an owner while its selection is still `All`. A
 keep located on a sorted file's subject column leaves an explicit range even
 when it admits every row, so such a view is not an owner.
 
-[`owned`](../core/src/store/write/mutation.rs#L36) turns any store into one that can be
+[`owned`](../core/src/store/write/mutation.rs#L35) turns any store into one that can be
 mutated: an owner comes back as a cheap clone (tombstones and indexes kept), a
 narrowed view is compacted with its declared indexes into an independent
 store. Mutating a match result therefore goes `view.owned().await?` first, or

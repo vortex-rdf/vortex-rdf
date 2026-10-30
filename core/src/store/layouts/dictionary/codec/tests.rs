@@ -50,7 +50,7 @@ fn skewed_chunk(quads: &[RawQuad]) -> (TermDictionary, ArrayRef) {
         .collect();
     terms.sort_unstable();
     terms.dedup();
-    let code_map: HashMap<&str, TermCode> = terms
+    let code_map: BorrowedTermCodeMap<'_> = terms
         .iter()
         .enumerate()
         .map(|(rank, &term)| (term, rank as TermCode))

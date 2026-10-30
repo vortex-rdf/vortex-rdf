@@ -634,3 +634,57 @@ async fn test_dictionary_quad_sink_serializes_like_the_builder() {
         "the sink's wire form must be the builder's"
     );
 }
+
+/// A sink fed borrowed quads (`push_quad`) builds the bytes a sink fed the
+/// same quads spelled out (`push` of `RawQuad::from_quad`) builds, over every
+/// kind of term: IRIs and blank nodes in each role, simple, escaped,
+/// language-tagged and typed literals (an `xsd:string` one spelled as the
+/// simple literal it is), and the default, a named and a blank graph. Only a
+/// term seen for the first time is copied out of the sink's spelling buffer.
+#[tokio::test]
+async fn test_dictionary_quad_sink_interns_borrowed_quads() {
+    use crate::store::RawQuad;
+    use crate::store::layouts::dictionary::ingest::intern_hooks;
+
+    let mut quads = term_kind_quads();
+    let s = iri_subject("escapes");
+    let p = iri("p1");
+    for o in [
+        Literal::new_simple_literal("quote \" and newline\n and tab\t"),
+        Literal::new_simple_literal("control \u{1} and \u{7f}"),
+        Literal::new_typed_literal("typed", oxrdf::vocab::xsd::STRING),
+        Literal::new_language_tagged_literal("hello", "EN-gb").unwrap(),
+    ] {
+        quads.push(Quad::new(s.clone(), p.clone(), o, GraphName::DefaultGraph));
+    }
+    // Every term again, so each is met a second time.
+    quads.extend(dictionary_test_quads());
+    quads.extend(dictionary_test_quads());
+    let raws: Vec<RawQuad> = quads.iter().map(RawQuad::from_quad).collect();
+    let distinct: std::collections::HashSet<&str> = raws
+        .iter()
+        .flat_map(|q| [q.s.as_str(), q.p.as_str(), q.o.as_str(), q.g.as_str()])
+        .collect();
+
+    let indexes = vec![IndexType::SecondaryByCopy];
+    let mut spelled = DictionaryQuadSink::new(indexes.clone());
+    for raw in raws.iter().cloned() {
+        spelled.push(raw);
+    }
+    let mut borrowed = DictionaryQuadSink::new(indexes);
+    let copied = intern_hooks::copied();
+    for quad in &quads {
+        borrowed.push_quad(quad.as_ref());
+    }
+    assert_eq!(intern_hooks::copied() - copied, distinct.len());
+
+    let spelled = VortexRdfStore::from_built(spelled.finish().unwrap()).unwrap();
+    let borrowed = VortexRdfStore::from_built(borrowed.finish().unwrap()).unwrap();
+    assert_eq!(
+        borrowed.to_bytes().await.unwrap(),
+        spelled.to_bytes().await.unwrap()
+    );
+    let mut expected = quad_strings(&quads);
+    expected.dedup();
+    assert_eq!(view_strings(&borrowed).await, expected);
+}

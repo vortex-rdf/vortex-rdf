@@ -8,7 +8,8 @@
 //! matches in their order). Row indices
 //! and counts are `u64`, the codes' width, so one column type carries all
 //! three. Each kernel uses a direct-mapped table when the code range is dense
-//! relative to the column (`dense_table_fits`), else a hash map.
+//! relative to the column (`dense_table_fits`), else a hash map under the fast
+//! hasher of the code-keyed maps (the join's too).
 //!
 //! The kernels over one column, and the table rule they share with the join,
 //! are here; the equi-join and its build side are in `join.rs`.
@@ -17,8 +18,7 @@ mod join;
 
 pub use join::{CodeGroups, equi_join_indices, join_count};
 
-use std::collections::HashMap;
-
+use rustc_hash::{FxHashMap, FxHashSet};
 use vortex_buffer::Buffer;
 
 use crate::store::schema::TermCode;
@@ -56,9 +56,10 @@ pub fn distinct_first_seen(codes: &[TermCode]) -> Buffer<TermCode> {
             }
         }
     } else {
-        let mut seen = HashMap::with_capacity(codes.len().min(1 << 20));
+        let mut seen =
+            FxHashSet::with_capacity_and_hasher(codes.len().min(1 << 20), Default::default());
         for &c in codes {
-            if seen.insert(c, ()).is_none() {
+            if seen.insert(c) {
                 out.push(c);
             }
         }
@@ -89,7 +90,8 @@ pub fn value_counts(codes: &[TermCode]) -> (Buffer<TermCode>, Buffer<u64>) {
             }
         }
     } else {
-        let mut slot: HashMap<TermCode, usize> = HashMap::with_capacity(codes.len().min(1 << 20));
+        let mut slot: FxHashMap<TermCode, usize> =
+            FxHashMap::with_capacity_and_hasher(codes.len().min(1 << 20), Default::default());
         for &c in codes {
             match slot.get(&c) {
                 Some(&i) => counts[i] += 1,

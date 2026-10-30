@@ -72,7 +72,7 @@ the same kebab-case names, which `LayoutStrategy`/`IndexType` parse and print.
 ## 3. The ingest currency: `RawQuad`
 
 Every builder consumes one thing: a stream of
-[`RawQuad`](../core/src/common/quad.rs#L65)s, four owned strings in the exact
+[`RawQuad`](../core/src/common/quad.rs#L66)s, four owned strings in the exact
 form the columns store.
 
 | Field | Spelling | Example |
@@ -99,7 +99,8 @@ Where the stream comes from:
   wasm; an RDF/JS `Stream<Quad>` is drained through its `data`/`end`/`error`
   events into a channel. Under the Dictionary layout an array goes straight
   into the interning sink ([§5](#5-pipeline-a--sorted-in-memory)), so no
-  per-quad strings accumulate. Both shapes build each term through the same
+  per-quad strings accumulate: each term is spelled into one buffer the sink
+  reuses and copied out only the first time it is seen. Both shapes build each term through the same
   validated constructors ([`terms.rs`](../js/src/terms.rs)), so they accept
   and reject the same quads.
 
@@ -114,7 +115,7 @@ deduplicated dataset (an RDF dataset is a set: a quad is in it or is not).
 The rebuilds of [§11](#11-rebuilds-mutated-stores-compaction-export) do the
 same. Builders do not parse a term again, so a build's input must come from
 one of the canonical sources: `RawQuad::from_quad` (an `oxrdf` quad), the
-parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L90), which
+parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L91), which
 turns four strings into a `RawQuad` and rejects what is no quad (a literal
 subject, a malformed IRI). A `RawQuad` written by hand in some other spelling
 of the same terms is a different quad.
@@ -178,18 +179,22 @@ of its adjacent repeats, and built into one struct of primary columns through
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
-([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L250)):
-each distinct term is held once (a `Box<str>` keyed map), and each quad is kept
-as four provisional `u64` codes. `finish` sorts the distinct terms, freezes them
+([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L290)):
+each distinct term is held once (a `Box<str>`-keyed map under hashbrown's
+default hasher, seeded per map, so input crafted to collide under one fixed
+hash cannot make the ingest quadratic), and each quad is kept as four
+provisional `u64` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
 which *is* the dictionary code — and sorts the coded rows. Because codes are
 lexicographic ranks, sorting `[u64; 4]` rows is the same order as sorting the
 term strings, so the sort moves 32-byte rows instead of four-string structs;
 equal rows are then adjacent and the repeats are dropped, since equal codes are
 equal terms.
-[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L214) is
+[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L221) is
 the push-based form of the same ingest, for callers that produce quads one at a
-time (the wasm array path).
+time (the wasm array path). Its `push_quad` takes a borrowed `oxrdf` quad and
+spells each term into one buffer it reuses, so a term already interned is
+looked up without a copy and only a new term is copied in.
 
 ---
 
@@ -363,7 +368,7 @@ fit an `i32`.
 
 Which pipeline built the dictionary decides how a term reaches its code during
 encoding: a rebuild looks it up in a term→code map borrowed from the live quads
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L64)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L71)),
 while the interning builds never look a term up again: their quads hold term
 ids, remapped to ranks, and a rank's code is its position. Either way the
 mapping exists only for the build; stores keep the columnar dictionary alone.
@@ -596,7 +601,7 @@ the one compaction runs too) works on codes under the Dictionary layout with
 its dictionary in memory: the live base rows are read as codes, only the
 distinct terms they use are decoded, once each, and merged with the tail's
 into the fresh dictionary, and the rows sort as integers once their codes are
-remapped ([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L89)).
+remapped ([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L96)).
 Under the string layouts, or a dictionary left in its file, the re-sort
 ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L107)) sorts
 the small tail alone and merges it into the already-sorted base in a linear
