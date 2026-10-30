@@ -33,7 +33,7 @@ use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter::SplitMasks;
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_reads;
+use crate::store::scan::file_reads::{self, PinnedCodes};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scans::{SPLITS_IN_FLIGHT_PER_CORE, ScanDriver};
 #[cfg(feature = "file-io")]
@@ -292,15 +292,17 @@ impl VortexRdfStore {
     /// A one-shot read's chunks of the rows `masks` keep (a pending filter's
     /// split masks), then the tail's chunk, read as [`MaskedRead`] chooses:
     /// point by point as one chunk, read inline, or else one chunk per split
-    /// with a match, taken at its ids or projected at its mask. Those split
-    /// reads are spawned onto the tokio runtime whenever there is more than
-    /// one and a runtime is current, whatever the row-scan driver's split
-    /// limit: the read is collected whole, so many splits' reads overlap
-    /// their decodes, where a single split, read inline, spares a spawn's
-    /// latency. Each chunk decodes
-    /// inside its split's task under a resident dictionary and on the stream
-    /// under a file-backed one, as [`scan_chunks`](Self::scan_chunks)
-    /// decodes. A point read a chunk declines is taken.
+    /// with a match, taken at its ids or projected at its mask, reading only
+    /// the columns `filter` leaves free and filling the ones it pins with
+    /// their codes where the read pins ([`PinnedCodes::pins`]). Those split reads are spawned onto the
+    /// tokio runtime whenever there is more than one and a runtime is
+    /// current, whatever the row-scan driver's split limit: the read is
+    /// collected whole, so many splits' reads overlap their decodes, where a
+    /// single split, read inline, spares a spawn's latency. Each chunk
+    /// decodes inside its split's task under a resident dictionary and on
+    /// the stream under a file-backed one, as
+    /// [`scan_chunks`](Self::scan_chunks) decodes. A point read a chunk
+    /// declines is taken.
     #[cfg(feature = "file-io")]
     async fn masked_chunks<T: ChunkDecode>(
         &self,
@@ -310,22 +312,19 @@ impl VortexRdfStore {
         tail: Vec<Result<T>>,
     ) -> Result<Chunks<T>> {
         let primary = self.layout.strategy().primary_column_names();
-        // PROTO: the columns the filter pins are not read, but filled with
-        // their code.
-        let pinned: Arc<[(String, u64)]> = filter
-            .and_then(crate::store::scan::file_exprs::eq_code_pairs)
-            .unwrap_or_default()
-            .into();
-        let read_columns: Vec<&'static str> = primary
-            .iter()
-            .copied()
-            .filter(|c| !pinned.iter().any(|(name, _)| name == c))
-            .collect();
         let read = MaskedRead::of(file, masks)?;
+        // Only the columns the filter leaves free are read where the read
+        // pins: every row the masks keep holds the pinned code in the others.
+        let pinned = Arc::new(if PinnedCodes::pins(read, masks.kept()) {
+            PinnedCodes::of(filter)
+        } else {
+            PinnedCodes::default()
+        });
+        let read_columns = pinned.columns_to_read(primary);
         if read == MaskedRead::Points {
             let ids = masks.first_ids(usize::MAX);
             if let Some(rows) = file_reads::file_point_rows(file, &read_columns, None, ids).await? {
-                let rows = file_reads::with_pinned(rows, primary, &pinned)?;
+                let rows = pinned.fill_rows(rows, primary)?;
                 let chunk = T::decode_async(&self.layout, &rows).await;
                 return Ok(with_tail(stream::iter([chunk]), tail));
             }
@@ -337,12 +336,13 @@ impl VortexRdfStore {
             .map(|task| {
                 let pinned = Arc::clone(&pinned);
                 async move {
-                    let rows = task.await?;
-                    rows.map(|rows| {
-                        file_reads::with_pinned(rows, primary, &pinned)
-                            .map_err(|e| vortex_error::vortex_err!("{e}"))
-                    })
-                    .transpose()
+                    task.await?
+                        .map(|rows| {
+                            pinned
+                                .fill_rows(rows, primary)
+                                .map_err(vortex_error::VortexError::from)
+                        })
+                        .transpose()
                 }
                 .boxed()
             })

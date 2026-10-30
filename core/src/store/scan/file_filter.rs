@@ -122,7 +122,7 @@ fn prior_order(filter: &Expression, n: usize) -> Vec<usize> {
         && pairs.len() == n
     {
         // A stable sort: ties keep the filter's order.
-        prior.sort_by_key(|&i| column_rank(&pairs[i].0));
+        prior.sort_by_key(|&i| column_rank(pairs[i].0.as_ref()));
     }
     prior
 }

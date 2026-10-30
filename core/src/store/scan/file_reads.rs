@@ -45,6 +45,8 @@ pub(crate) async fn file_point_rows(
     filter: Option<&Expression>,
     rows: Vec<u64>,
 ) -> Result<Option<ArrayRef>> {
+    #[cfg(test)]
+    masked_column_hooks::note(columns);
     let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
     };
@@ -64,6 +66,8 @@ pub(crate) async fn file_point_codes(
     filter: Option<&Expression>,
     rows: Vec<u64>,
 ) -> Result<Option<Vec<Buffer<TermCode>>>> {
+    #[cfg(test)]
+    masked_column_hooks::note(columns);
     let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
     };
@@ -76,7 +80,7 @@ pub(crate) async fn file_point_codes(
 /// them.
 struct PointRows {
     handles: Vec<Arc<vortex_rdf_encoded_search::ColumnChunks>>,
-    eqs: Vec<(String, u64)>,
+    eqs: Vec<(vortex_array::dtype::FieldName, u64)>,
     live: Vec<u64>,
 }
 
@@ -109,7 +113,7 @@ impl PointRows {
         let Some(checks) = eqs
             .iter()
             .map(|(col, code)| {
-                let idx = columns.iter().position(|c| c == col)?;
+                let idx = columns.iter().position(|&c| c == col.as_ref())?;
                 Some((Arc::clone(&handles[idx]), *code))
             })
             .collect::<Option<Vec<_>>>()
@@ -125,7 +129,10 @@ impl PointRows {
     /// The code every surviving row reads in `column`, when the filter pins
     /// it.
     fn constant(&self, column: &str) -> Option<u64> {
-        self.eqs.iter().find(|(c, _)| c == column).map(|(_, v)| *v)
+        self.eqs
+            .iter()
+            .find(|(c, _)| c.as_ref() == column)
+            .map(|(_, v)| *v)
     }
 
     /// The live rows' values of `columns`, the columns `handles` read, in
@@ -220,7 +227,7 @@ pub(crate) async fn point_filter_ids(
     }
     let Some(checks) = eqs
         .iter()
-        .map(|(col, code)| Some((file.column_chunks(col)?, *code)))
+        .map(|(col, code)| Some((file.column_chunks(col.as_ref())?, *code)))
         .collect::<Option<Vec<_>>>()
     else {
         return Ok(None);
@@ -336,6 +343,8 @@ pub(crate) fn masked_split_tasks(
     masks: &SplitMasks,
     take: bool,
 ) -> Result<(DType, Vec<SplitRead>)> {
+    #[cfg(test)]
+    masked_column_hooks::note(columns);
     let reader = file.layout_reader()?;
     let projection =
         file.bound_exprs()
@@ -370,34 +379,115 @@ pub(crate) fn masked_split_tasks(
     Ok((dtype, tasks))
 }
 
-/// PROTO: `rows` (a struct of some of `columns`) with every column of
-/// `columns` in that order, a column `pinned` names filled with its code.
-pub(crate) fn with_pinned(
-    rows: ArrayRef,
-    columns: &[&'static str],
-    pinned: &[(String, u64)],
-) -> Result<ArrayRef> {
-    use vortex_array::IntoArray;
-    use vortex_array::arrays::ConstantArray;
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::scalar::Scalar;
-    if pinned.is_empty() {
-        return Ok(rows);
+/// Point reads of fewer rows than this read every column, pinned or not:
+/// filling the pinned ones costs a fixed few thousand instructions, more than
+/// the values so few rows skip. On the bench store a pinned point read of
+/// two rows cost 1.6 % more than reading all four columns (4 % for a quad or
+/// chunk read), and one of 114 rows over two pinned columns 15 % less.
+pub(crate) const PIN_POINT_MIN_ROWS: usize = 64;
+
+/// The code each column of a pending filter of code equalities pins
+/// ([`eq_code_pairs`]): every row the filter keeps holds that code there, so a
+/// read of the rows its masks keep (taken, projected, or point by point when
+/// they are [`PIN_POINT_MIN_ROWS`] or more) reads only the other columns and
+/// fills these with their codes.
+#[derive(Debug, Default)]
+pub(crate) struct PinnedCodes(Vec<(vortex_array::dtype::FieldName, TermCode)>);
+
+impl PinnedCodes {
+    /// The columns `filter` pins: none without a filter, or for one that is
+    /// not code equalities.
+    pub(crate) fn of(filter: Option<&Expression>) -> Self {
+        Self(filter.and_then(eq_code_pairs).unwrap_or_default())
     }
-    let len = rows.len();
-    let struct_arr = crate::store::array::into_struct_array(rows)?;
-    let mut children = Vec::with_capacity(columns.len());
-    for &name in columns {
-        let child = match pinned.iter().find(|(n, _)| n == name) {
-            Some((_, code)) => ConstantArray::new(Scalar::from(*code), len).into_array(),
-            None => struct_arr
-                .unmasked_field_by_name(name)
-                .map_err(crate::error::VortexRdfError::Vortex)?
-                .clone(),
+
+    /// Whether a read of `rows` kept rows the way `read` reads them fills
+    /// the pinned columns: every take and projection, and a point read of at
+    /// least [`PIN_POINT_MIN_ROWS`] rows.
+    pub(crate) fn pins(read: MaskedRead, rows: usize) -> bool {
+        read != MaskedRead::Points || rows >= PIN_POINT_MIN_ROWS
+    }
+
+    /// The code `column` is pinned to.
+    pub(crate) fn code(&self, column: &str) -> Option<TermCode> {
+        self.0
+            .iter()
+            .find_map(|(name, code)| (name.as_ref() == column).then_some(*code))
+    }
+
+    /// The columns of `columns` a read of the kept rows reads, in order: the
+    /// unpinned ones, or the first of `columns` when every one is pinned, so
+    /// that the read still yields its rows.
+    pub(crate) fn columns_to_read(&self, columns: &[&'static str]) -> Vec<&'static str> {
+        let unpinned: Vec<&'static str> = columns
+            .iter()
+            .copied()
+            .filter(|&c| self.code(c).is_none())
+            .collect();
+        if unpinned.is_empty() {
+            columns.iter().take(1).copied().collect()
+        } else {
+            unpinned
+        }
+    }
+
+    /// `rows`, read as [`columns_to_read`](Self::columns_to_read) lists them
+    /// for `columns`, as a struct of every column of `columns` in order, each
+    /// pinned one a constant of its code.
+    pub(crate) fn fill_rows(&self, rows: ArrayRef, columns: &[&'static str]) -> Result<ArrayRef> {
+        use vortex_array::IntoArray;
+        use vortex_array::arrays::ConstantArray;
+        use vortex_array::arrays::struct_::StructArrayExt;
+        use vortex_array::scalar::Scalar;
+
+        if columns.iter().all(|&c| self.code(c).is_none()) {
+            return Ok(rows);
+        }
+        let len = rows.len();
+        let read = crate::store::array::into_struct_array(rows)?;
+        let children = columns
+            .iter()
+            .map(|&name| match self.code(name) {
+                Some(code) => Ok(ConstantArray::new(Scalar::from(code), len).into_array()),
+                None => read
+                    .unmasked_field_by_name(name)
+                    .cloned()
+                    .map_err(VortexRdfError::Vortex),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(named_struct(columns, children, len)?.into_array())
+    }
+
+    /// The `(s, p, o, g)` code columns of `kept` rows: each pinned one its
+    /// code repeated, each other one its buffer among `codes`, read in
+    /// `read_columns`' order.
+    pub(crate) fn fill_codes(
+        &self,
+        read_columns: &[&'static str],
+        codes: Vec<Buffer<TermCode>>,
+        kept: usize,
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        let column = |name: &str| -> Result<Buffer<TermCode>> {
+            if let Some(code) = self.code(name) {
+                return Ok(Buffer::full(code, kept));
+            }
+            read_columns
+                .iter()
+                .position(|&c| c == name)
+                .and_then(|at| codes.get(at).cloned())
+                .ok_or_else(|| {
+                    VortexRdfError::InvalidOperation(format!(
+                        "a masked read neither read nor pinned the {name} column"
+                    ))
+                })
         };
-        children.push(child);
+        Ok([
+            column(crate::store::schema::COL_S)?,
+            column(crate::store::schema::COL_P)?,
+            column(crate::store::schema::COL_O)?,
+            column(crate::store::schema::COL_G)?,
+        ])
     }
-    Ok(named_struct(columns, children, len)?.into_array())
 }
 
 /// The reads of the rows `filter` keeps in `selection`, the filter's masks
@@ -405,10 +495,11 @@ pub(crate) fn with_pinned(
 /// evaluates the filter over its split
 /// ([`split_filter_tasks`](file_filter::split_filter_tasks), tombstoned rows
 /// cleared), then reads `columns` at the rows its mask keeps, as
-/// [`MaskedRead`] chooses for that split alone ([`kept_split_rows`]); a
-/// split the filter keeps nothing of reads nothing. Nothing is evaluated
-/// until a future is polled, so a stream of them evaluates only the splits
-/// it reaches.
+/// [`MaskedRead`] chooses for that split alone, filling the columns the
+/// filter pins rather than reading them ([`kept_split_rows`]); a split the
+/// filter keeps nothing of reads nothing.
+/// Nothing is evaluated until a future is polled, so a stream of them
+/// evaluates only the splits it reaches.
 pub(crate) fn masks_first_split_reads(
     file: &Arc<NativeStoreFile>,
     filter: &Expression,
@@ -417,17 +508,20 @@ pub(crate) fn masks_first_split_reads(
     columns: &[&'static str],
 ) -> Result<Vec<SplitRead>> {
     let columns: Arc<[&'static str]> = Arc::from(columns);
+    let pinned = Arc::new(PinnedCodes::of(Some(filter)));
     Ok(
         file_filter::split_filter_tasks(file, filter, selection, deleted)?
             .into_iter()
             .map(|evaluate| {
                 let (file, columns) = (Arc::clone(file), Arc::clone(&columns));
+                let pinned = Arc::clone(&pinned);
                 async move {
                     let (mask, range) = evaluate.await?;
                     if mask.all_false() {
                         return Ok(None);
                     }
-                    kept_split_rows(&file, &columns, &SplitMasks::of_split(mask, range)).await
+                    let masks = SplitMasks::of_split(mask, range);
+                    kept_split_rows(&file, &columns, &pinned, &masks).await
                 }
                 .map(|rows| rows.map_err(VortexError::from))
                 .boxed()
@@ -438,23 +532,35 @@ pub(crate) fn masks_first_split_reads(
 
 /// `columns` at the rows one split's `masks` keep, read as [`MaskedRead`]
 /// chooses for them: point by point through the chunk probes, taken at the
-/// kept ids, or projected at the mask. A point read a chunk declines is
-/// taken.
+/// kept ids or projected at the mask, reading only the columns `pinned`
+/// leaves free and filling the others where the read pins
+/// ([`PinnedCodes::pins`]). A point read a chunk declines is taken.
 async fn kept_split_rows(
     file: &Arc<NativeStoreFile>,
     columns: &[&'static str],
+    pinned: &PinnedCodes,
     masks: &SplitMasks,
 ) -> Result<Option<ArrayRef>> {
     let read = MaskedRead::of(file, masks)?;
+    let unpinned = PinnedCodes::default();
+    let pinned = if PinnedCodes::pins(read, masks.kept()) {
+        pinned
+    } else {
+        &unpinned
+    };
+    let read_columns = pinned.columns_to_read(columns);
     if read == MaskedRead::Points
         && let Some(rows) =
-            file_point_rows(file, columns, None, masks.first_ids(usize::MAX)).await?
+            file_point_rows(file, &read_columns, None, masks.first_ids(usize::MAX)).await?
     {
-        return Ok(Some(rows));
+        return pinned.fill_rows(rows, columns).map(Some);
     }
-    let (_, tasks) = masked_split_tasks(file, columns, masks, read != MaskedRead::Project)?;
+    let (_, tasks) = masked_split_tasks(file, &read_columns, masks, read != MaskedRead::Project)?;
     match tasks.into_iter().next() {
-        Some(task) => Ok(task.await?),
+        Some(task) => task
+            .await?
+            .map(|rows| pinned.fill_rows(rows, columns))
+            .transpose(),
         None => Ok(None),
     }
 }
@@ -546,5 +652,30 @@ pub(crate) mod take_hooks {
     /// probes, split by split)`.
     pub(crate) fn takes() -> (usize, usize) {
         (CHUNKS.with(Cell::get), SPLITS.with(Cell::get))
+    }
+}
+
+/// Test hook: the columns each point read ([`file_point_rows`],
+/// [`file_point_codes`]) and each take or projection of a filter's kept rows
+/// ([`masked_split_tasks`]) read on this thread.
+#[cfg(test)]
+pub(crate) mod masked_column_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static READS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Record one read of `columns`.
+    pub(super) fn note(columns: &[&str]) {
+        READS.with_borrow_mut(|reads| {
+            reads.push(columns.iter().map(|c| c.to_string()).collect());
+        });
+    }
+
+    /// The columns of each point read, take or projection on this thread
+    /// since the last call, in order.
+    pub(crate) fn take() -> Vec<Vec<String>> {
+        READS.with_borrow_mut(std::mem::take)
     }
 }

@@ -213,7 +213,7 @@ impl VortexRdfStore {
                     && let Some(pairs) = crate::store::scan::file_exprs::eq_code_pairs(filter)
                 {
                     for (column, code) in pairs {
-                        if let Some(column) = QuadColumn::from_name(&column) {
+                        if let Some(column) = QuadColumn::from_name(column.as_ref()) {
                             code_bounds[column.index()] = Some((code, code));
                         }
                     }

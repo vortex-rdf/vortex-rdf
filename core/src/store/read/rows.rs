@@ -17,6 +17,8 @@ use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::read::chunks::{RowChunkStream, extract_codes};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter::{self, SplitMasks};
+#[cfg(feature = "file-io")]
+use crate::store::scan::file_reads::PinnedCodes;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::scan::read_plan::{ExactRead, MaskedRead};
@@ -394,7 +396,9 @@ impl VortexRdfStore {
     /// filter's split masks, in file order), `columns` the layout's primary
     /// columns, read as [`MaskedRead`] chooses with no filter left to check:
     /// point by point straight into the code buffers, by one take through the
-    /// chunk probes, or each split projected at its mask. A read by id that a
+    /// chunk probes, or each split projected at its mask, reading only the
+    /// columns `filter` leaves free and filling the ones it pins with their
+    /// codes where the read pins ([`PinnedCodes::pins`]). A read by id that a
     /// chunk declines falls to the next.
     #[cfg(feature = "file-io")]
     async fn masked_codes(
@@ -403,65 +407,30 @@ impl VortexRdfStore {
         masks: &SplitMasks,
         filter: Option<&Expression>,
     ) -> Result<[Buffer<TermCode>; 4]> {
-        // PROTO: the columns the filter pins to one code are not read: every
-        // row the masks keep holds that code there.
-        let pinned: Vec<(String, u64)> = filter
-            .and_then(file_exprs::eq_code_pairs)
-            .unwrap_or_default();
-        let read_columns: Vec<&'static str> = columns
-            .iter()
-            .copied()
-            .filter(|c| !pinned.iter().any(|(name, _)| name == c))
-            .collect();
-        let kept = masks.kept();
-        let fill = |codes: Vec<Buffer<TermCode>>| -> Option<[Buffer<TermCode>; 4]> {
-            let mut codes = codes.into_iter();
-            let mut read: Vec<(&'static str, Buffer<TermCode>)> = Vec::new();
-            for &c in &read_columns {
-                read.push((c, codes.next()?));
-            }
-            let mut column = |name: &str| -> Option<Buffer<TermCode>> {
-                if let Some((_, code)) = pinned.iter().find(|(n, _)| n == name) {
-                    return Some(Buffer::full(*code, kept));
-                }
-                let at = read.iter().position(|(c, _)| *c == name)?;
-                Some(std::mem::take(&mut read[at].1))
-            };
-            Some([
-                column(schema::COL_S)?,
-                column(schema::COL_P)?,
-                column(schema::COL_O)?,
-                column(schema::COL_G)?,
-            ])
-        };
-        if read_columns.is_empty()
-            && let Some(codes) = fill(Vec::new())
-        {
-            return Ok(codes);
-        }
         let read = MaskedRead::of(file, masks)?;
+        let pinned = if PinnedCodes::pins(read, masks.kept()) {
+            PinnedCodes::of(filter)
+        } else {
+            PinnedCodes::default()
+        };
+        let read_columns = pinned.columns_to_read(columns);
+        if read == MaskedRead::Points
+            && let Some(codes) =
+                file_reads::file_point_codes(file, &read_columns, None, masks.first_ids(usize::MAX))
+                    .await?
+        {
+            return pinned.fill_codes(&read_columns, codes, masks.kept());
+        }
         if read != MaskedRead::Project {
             let ids = masks.first_ids(usize::MAX);
-            if read == MaskedRead::Points
-                && let Some(codes) =
-                    file_reads::file_point_codes(file, &read_columns, None, ids.clone()).await?
-                && let Some(codes) = fill(codes)
-            {
-                return Ok(codes);
-            }
-            if let Some(rows) = file_reads::take_file_rows(file, &read_columns, &ids).await?
-                && let Some(codes) = fill(extract_codes(rows, &read_columns)?)
-            {
-                return Ok(codes);
+            if let Some(rows) = file_reads::take_file_rows(file, &read_columns, &ids).await? {
+                let codes = extract_codes(rows, &read_columns)?;
+                return pinned.fill_codes(&read_columns, codes, masks.kept());
             }
         }
         let rows = file_reads::masked_projection(file, &read_columns, masks).await?;
-        match fill(extract_codes(rows, &read_columns)?) {
-            Some(codes) => Ok(codes),
-            None => Err(crate::error::VortexRdfError::InvalidOperation(
-                "a masked read lost a primary column".into(),
-            )),
-        }
+        let codes = extract_codes(rows, &read_columns)?;
+        pinned.fill_codes(&read_columns, codes, masks.kept())
     }
 
     /// Every live quad this view covers, decoded to raw N-Triples term strings

@@ -571,3 +571,101 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
         "the dropped count's splits never ran"
     );
 }
+
+/// A read of the rows a filter's masks keep reads only the columns the
+/// filter leaves free and fills the ones it pins with their codes, where the
+/// read pins: every take and projection, and a point read of at least
+/// [`PIN_POINT_MIN_ROWS`] rows. The one-shot reads (the code read and
+/// `quads_vec`) of `O` (30 rows, point by point) read every column, of `PO`
+/// (about 75, point by point) `s` and `g`, of `P` (taken) `s`, `o` and `g`,
+/// of `G` (projected) `s`, `p` and `o`, of `pm` in the default graph (taken)
+/// `s` and `o`, and of a window that keeps `P`'s masks as `P`'s. The streams
+/// read a split at a time, so the 32 rows a split of `P` and of `pm` in the
+/// default graph keep are read point by point, every column, as are `O`'s
+/// and `PO`'s few; `G`'s 512 a split are projected, its pinned graph left
+/// out. Every answer is the in-memory store's.
+///
+/// [`PIN_POINT_MIN_ROWS`]: crate::store::scan::file_reads::PIN_POINT_MIN_ROWS
+#[tokio::test]
+async fn test_masked_reads_skip_the_columns_the_filter_pins() {
+    use crate::store::scan::file_reads::masked_column_hooks;
+
+    /// Asserts `reads` holds at least one read and only reads of `want`.
+    fn assert_reads(reads: Vec<Vec<String>>, want: &[&str], label: &str) {
+        assert!(!reads.is_empty(), "{label}: reads");
+        for columns in &reads {
+            let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+            assert_eq!(columns, want, "{label}: the columns read");
+        }
+    }
+
+    let (_dir, path) = masks_file().await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let pm = iri("pm");
+    let p = Probe::new(None, Some(pm.clone()), None, None);
+    let every: &[&str] = &["s", "p", "o", "g"];
+    let all_rows = MASKS_SPLITS * MASKS_SPLIT_ROWS;
+    for (shape, probe, one_shot, streamed) in [
+        (
+            "O",
+            Probe::new(None, None, Some(plain_literal("sparse")), None),
+            every,
+            Some(every),
+        ),
+        (
+            "PO",
+            Probe::new(None, Some(pm.clone()), Some(plain_literal("o0")), None),
+            ["s", "g"].as_slice(),
+            Some(every),
+        ),
+        ("P", p.clone(), ["s", "o", "g"].as_slice(), Some(every)),
+        (
+            "G",
+            Probe::new(None, None, None, Some(iri_graph("gd"))),
+            ["s", "p", "o"].as_slice(),
+            Some(["s", "p", "o"].as_slice()),
+        ),
+        (
+            "PG",
+            Probe::new(None, Some(pm), None, Some(GraphName::DefaultGraph)),
+            ["s", "o"].as_slice(),
+            Some(every),
+        ),
+        // The window's streams read its kept ids, with no filter to pin.
+        (
+            "P windowed",
+            p.window(0, Some(all_rows)),
+            ["s", "o", "g"].as_slice(),
+            None,
+        ),
+    ] {
+        let view = file.run_probe(&probe).await.unwrap();
+        let in_memory = memory.run_probe(&probe).await.unwrap();
+        let want = row_list(&in_memory).await;
+        assert!(!want.is_empty(), "{shape}: the pattern matches");
+        masked_column_hooks::take();
+        assert_eq!(row_list(&view).await, want, "{shape}: the code read");
+        assert_eq!(
+            view.quads_vec().await.unwrap(),
+            in_memory.quads_vec().await.unwrap(),
+            "{shape}: quads_vec"
+        );
+        assert_reads(
+            masked_column_hooks::take(),
+            one_shot,
+            &format!("{shape} one-shot"),
+        );
+        let (codes, _) = collect_code_chunks(&view, &QuadColumn::ALL, 4_096).await;
+        assert_eq!(codes, want, "{shape}: the code chunks");
+        assert_eq!(
+            struct_chunk_codes(&collect_row_chunks(&view, 4_096).await),
+            want,
+            "{shape}: the row chunks"
+        );
+        let reads = masked_column_hooks::take();
+        if let Some(streamed) = streamed {
+            assert_reads(reads, streamed, &format!("{shape} streamed"));
+        }
+    }
+}

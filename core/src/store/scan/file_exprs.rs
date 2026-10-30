@@ -2,6 +2,7 @@
 //! scope of its schema, the filter a pattern compiles to, and the code
 //! equalities read back out of such a filter.
 
+use vortex_array::dtype::FieldName;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root};
 use vortex_array::scalar::Scalar;
@@ -40,10 +41,11 @@ pub(crate) fn eq_conjunction(
 }
 
 /// The `(column, code)` pairs of a filter [`build_file_filter`] built, a
-/// conjunction of `column == literal` over root fields. `None` for any other
-/// shape (the `AlwaysFalse` literal, say): such a filter cannot be applied as
-/// per-row equality tests.
-pub(crate) fn eq_code_pairs(filter: &Expression) -> Option<Vec<(String, u64)>> {
+/// conjunction of `column == literal` over root fields, each column the
+/// field name the filter holds (a reference-count bump, no copy). `None` for
+/// any other shape (the `AlwaysFalse` literal, say): such a filter cannot be
+/// applied as per-row equality tests.
+pub(crate) fn eq_code_pairs(filter: &Expression) -> Option<Vec<(FieldName, u64)>> {
     use vortex_array::scalar_fn::fns::binary::Binary;
     use vortex_array::scalar_fn::fns::get_item::GetItem;
     use vortex_array::scalar_fn::fns::literal::Literal;
@@ -59,7 +61,7 @@ pub(crate) fn eq_code_pairs(filter: &Expression) -> Option<Vec<(String, u64)>> {
             let field = c.child(0).as_opt::<GetItem>()?;
             let scalar = c.child(1).as_opt::<Literal>()?;
             let code = crate::store::array::unsigned_value(scalar)?;
-            Some((field.to_string(), code))
+            Some((field.clone(), code))
         })
         .collect()
 }
@@ -77,10 +79,9 @@ mod tests {
             eq(get_item("p", root()), lit(3u32)),
             eq(get_item("o", root()), lit(7u32)),
         );
-        assert_eq!(
-            eq_code_pairs(&filter),
-            Some(vec![("p".to_string(), 3), ("o".to_string(), 7)])
-        );
+        let pairs = eq_code_pairs(&filter).unwrap();
+        let pairs: Vec<(&str, u64)> = pairs.iter().map(|(c, v)| (c.as_ref(), *v)).collect();
+        assert_eq!(pairs, [("p", 3), ("o", 7)]);
         assert!(eq_code_pairs(&lit(false)).is_none());
         assert!(eq_code_pairs(&eq(get_item("p", root()), lit("x"))).is_none());
     }
