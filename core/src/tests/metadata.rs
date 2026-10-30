@@ -486,9 +486,8 @@ async fn test_index_components() {
 }
 
 /// A child under a known name but an implementation slug this version does
-/// not know is no index child of it: every open lists and serves as a data
-/// source only the children whose slug it knows, and no match reaches the
-/// foreign one — a pattern only it would answer is scanned, while its known
+/// not know is no index child of it: every open lists only the children
+/// whose slug it knows, and no match reaches the foreign one — a pattern only it would answer is scanned, while its known
 /// sibling still serves.
 #[tokio::test]
 async fn test_index_components_classify_children_by_slug() {
@@ -523,10 +522,6 @@ async fn test_index_components_classify_children_by_slug() {
     for (open, store) in reopened_stores(&path).await {
         let open = open.tag();
         assert_eq!(store.index_components().unwrap(), want, "{open}");
-        // The data source names the children as the roster does.
-        let source = |name: &str| store.component_data_source(name).unwrap();
-        assert!(source("index:posg").is_none(), "{open}: index:posg");
-        assert!(source("index:ospg").is_some(), "{open}: index:ospg");
         for (pattern, view, served, rows) in [
             (
                 "predicate",

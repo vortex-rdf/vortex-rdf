@@ -907,14 +907,13 @@ limit_pairs!(
 );
 
 // ══════════════════════════════════════════════════════════════════════════
-// Group 4d — CHUNK READS (code chunks / the data source)
+// Group 4d — CHUNK READS (code chunks)
 //
-// The streams a query engine reads an in-memory view through, on the Group 2
+// The stream a query engine reads an in-memory view through, on the Group 2
 // in-memory Dictionary store (`from_built`, the store `from_quads` and the JS
 // `fromString`/`fromQuads` build): a predicate-bound view's code chunks, each
 // a window of its row ids gathered from the base's code columns, for one
-// column and for all four; and a `LIMIT` scan of the whole store's data
-// source, which needs only the first chunk of the store's rows.
+// column and for all four.
 // ══════════════════════════════════════════════════════════════════════════
 
 /// The columns a code-chunk read asks for.
@@ -971,35 +970,6 @@ fn chunks_codes(bencher: divan::Bencher, columns: &ChunkColumns) {
     };
     assert!(drain() > 0, "the predicate-bound view has rows");
     bencher.bench(|| black_box(drain()));
-}
-
-/// `LIMIT 100` over the in-memory store's data source: its one partition's
-/// stream ends with the first of the store's 8,192-row chunks.
-#[divan::bench(sample_count = QUERY_SAMPLES)]
-fn chunks_source_limit(bencher: divan::Bencher) {
-    use vortex_rdf_core::vortex_scan::ScanRequest;
-    let source = cached_store(Layout::Dictionary, Index::None, bench_size())
-        .data_source()
-        .expect("data source");
-    let scan = || {
-        rt().block_on(async {
-            let request = ScanRequest {
-                limit: Some(100),
-                ..ScanRequest::default()
-            };
-            let mut partitions = source.scan(request).await.expect("scan").partitions();
-            let mut rows = 0;
-            while let Some(partition) = partitions.next().await {
-                let mut chunks = partition.expect("partition").execute().expect("execute");
-                while let Some(chunk) = chunks.next().await {
-                    rows += chunk.expect("chunk").len();
-                }
-            }
-            rows
-        })
-    };
-    assert_eq!(scan(), 100, "the limit's rows");
-    bencher.bench(|| black_box(scan()));
 }
 
 // ══════════════════════════════════════════════════════════════════════════

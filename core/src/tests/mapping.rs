@@ -1,5 +1,6 @@
 //! Opening store files: `from_file` maps the file and reads it in place,
-//! `from_file_in_memory` loads the whole store, and both answer alike.
+//! `from_file_in_memory` loads the whole store, and both answer alike; vortex's
+//! own reader opens them through the crate's session.
 
 use super::*;
 
@@ -201,4 +202,42 @@ async fn test_open_errors_are_io_errors_naming_the_path_in_both_modes() {
             );
         }
     }
+}
+
+/// The session [`vortex_session`](crate::vortex_session) hands out opens a
+/// store file through vortex's own reader: it holds the store's container
+/// layout, whose root is the quad table, and a scan of the file reads the
+/// store's codes in base row order.
+#[tokio::test]
+async fn test_vortex_session_opens_store_files() {
+    use futures::TryStreamExt as _;
+    use vortex_array::dtype::DType;
+    use vortex_file::OpenOptionsSessionExt as _;
+
+    let (_dir, path) = write_store_file(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    let bytes = vortex_buffer::ByteBuffer::from(std::fs::read(&path).unwrap());
+    let file = crate::vortex_session()
+        .open_options()
+        .open_buffer(bytes)
+        .unwrap();
+    assert_eq!(file.row_count(), 3_000);
+    let DType::Struct(fields, _) = file.dtype() else {
+        panic!("the quad table is a struct")
+    };
+    let names: Vec<String> = fields.names().iter().map(|n| n.to_string()).collect();
+    assert_eq!(names, ["s", "p", "o", "g"]);
+    let chunks: Vec<vortex_array::ArrayRef> = file
+        .scan()
+        .unwrap()
+        .into_array_stream()
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(
+        struct_chunk_codes(&chunks),
+        base_ordered_codes(&store).await,
+        "a scan of the file reads the store's codes"
+    );
 }
