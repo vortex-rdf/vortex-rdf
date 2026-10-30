@@ -542,7 +542,7 @@ fn hub_quads() -> Vec<Quad> {
 /// (the suite's fixture, and [`multiplicity_quads`] and [`hub_quads`]
 /// mapped), the total is `size()` and the rows are the match's, in pages that
 /// cover them once. It declines (`None`) rather than answer a tombstoned or
-/// narrowed view or a non-prefix shape; a code no quad holds matches nothing.
+/// narrowed view; a code no quad holds matches nothing.
 #[tokio::test]
 async fn test_locate_codes_matches_the_term_path() {
     if !crate::store::query::located::locate_enabled() {
@@ -730,6 +730,74 @@ async fn check_code_patterns(fixture: &FixtureStore) {
     }
 }
 
+/// A bound graph after a free slot over a run longer than the rows checked
+/// unmemoized: `(? p o g)`, one `(p, o)` run of 40,000 quads alternating
+/// between two graphs, on the copy index (its `posg` run, checked) and the
+/// reference index (a long reference run, checked), read in pages and
+/// counted, more than once and interleaved with another such pattern, as the
+/// term path answers it.
+#[tokio::test]
+async fn test_locate_codes_long_graph_bound_run() {
+    if !crate::store::query::located::locate_enabled() {
+        return;
+    }
+    for index in [IndexConfig::Copy, IndexConfig::Reference] {
+        check_long_graph_bound_run(index).await;
+    }
+}
+
+async fn check_long_graph_bound_run(index: IndexConfig) {
+    use crate::{CodePattern, Probe};
+    let quads: Vec<Quad> = (0..40_000)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{i:05}"),
+                "http://example.org/type",
+                "Taxon",
+                numbered_graph(i % 2),
+            )
+        })
+        .collect();
+    let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, index.types()).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let dict = store.dict_reader().unwrap();
+    let row = row_list(&store).await[0];
+    let other = row_list(&store)
+        .await
+        .into_iter()
+        .find(|r| r[3] != row[3])
+        .unwrap();
+    for _ in 0..2 {
+        for graph in [row[3], other[3]] {
+            let pattern = CodePattern::new(None, Some(row[1]), Some(row[2]), Some(graph));
+            let probe = Probe::parse(
+                None,
+                Some(&dict.decode(row[1]).await.unwrap().unwrap()),
+                Some(&dict.decode(row[2]).await.unwrap().unwrap()),
+                Some(&dict.decode(graph).await.unwrap().unwrap()),
+            )
+            .unwrap();
+            let want = sorted_rows(&store.run_probe(&probe).await.unwrap()).await;
+            assert_eq!(want.len(), 20_000);
+            assert_eq!(store.count_code_pattern(pattern).await.unwrap(), 20_000);
+            let mut seen = Vec::new();
+            let mut offset = 0;
+            while offset < want.len() {
+                let got = store
+                    .locate_codes(pattern, offset, Some(4096))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(got.total, 20_000);
+                seen.extend(code_rows::<4>(&got.columns));
+                offset += 4096;
+            }
+            seen.sort_unstable();
+            assert_eq!(seen, want);
+        }
+    }
+}
+
 async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], step: usize) {
     use crate::{CodePattern, Probe};
     let store = &fixture.store;
@@ -835,7 +903,25 @@ async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], s
             );
         }
     }
-    assert!(!answered.contains(&0b1001), "{tag}: s??g answered");
+    // A bound graph after a free slot is the longest bound prefix's run,
+    // checked: `s??g` and `sp?g` on a mapped sorted file, and the shapes
+    // of the copy index's orders too.
+    if fixture.mapped() {
+        for mask in [0b1001, 0b1011] {
+            assert!(
+                answered.contains(&mask),
+                "{tag}: mask {mask:04b} not answered"
+            );
+        }
+    }
+    if fixture.index == IndexConfig::Copy && fixture.mapped() {
+        for mask in [0b1010, 0b1100, 0b1101, 0b1110] {
+            assert!(
+                answered.contains(&mask),
+                "{tag}: mask {mask:04b} not answered"
+            );
+        }
+    }
     // A code no quad holds, past the dictionary, as a subject.
     let absent = CodePattern::new(Some(dict.len() as TermCode + 7), None, None, None);
     if let Some(got) = store.locate_codes(absent, 0, None).await.unwrap() {
