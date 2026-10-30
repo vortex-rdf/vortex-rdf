@@ -6,12 +6,48 @@ use std::collections::BTreeSet;
 
 use futures::stream;
 use vortex_rdf_core::io::quads_stream_to_vortex_file;
-use vortex_rdf_core::{IndexType, LayoutStrategy, RawQuad};
+use vortex_rdf_core::{IndexType, LayoutStrategy, Probe, RawQuad, VortexRdfStore};
 
 pub type Quad = [String; 4];
 
-/// Quads over named and blank subjects, IRI, blank and literal objects (plain, language-tagged, typed, with
-/// non-BMP characters) and three graphs, the default one included.
+/// Spellings that are hard to carry across JNI: escapes (tab, quote, backslash, NUL and another control
+/// character), characters outside the BMP in a literal and in an IRI, BMP characters of two and three UTF-8
+/// bytes, a zero-width space, a region language tag and a blank object.
+const SPELLINGS: &[[&str; 4]] = &[
+    [
+        "<http://example.org/s1>",
+        "<http://example.org/p0>",
+        "\"tab\\there \\\"q\\\" back\\\\slash\"",
+        "",
+    ],
+    [
+        "<http://example.org/s2>",
+        "<http://example.org/p0>",
+        "\"astral \u{1F600} \u{10348} end\"@en-gb",
+        "<http://example.org/g1>",
+    ],
+    [
+        "<http://example.org/s3>",
+        "<http://example.org/p1>",
+        "\"bmp é ß 中文 \u{200B}\"",
+        "",
+    ],
+    [
+        "<http://example.org/é/s7>",
+        "<http://example.org/p1>",
+        "_:b1",
+        "<http://example.org/g/\u{1F600}>",
+    ],
+    [
+        "<http://example.org/s4>",
+        "<http://example.org/p2>",
+        "\"nul \\u0000 ctl \\u0001\"",
+        "<http://example.org/g2>",
+    ],
+];
+
+/// `count` quads over named and blank subjects, IRI, blank and literal objects (plain, language-tagged,
+/// typed, with non-BMP characters) and three graphs, the default one included, then the [`SPELLINGS`].
 pub fn quads(count: usize) -> Vec<Quad> {
     let mut seen = BTreeSet::new();
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -46,6 +82,10 @@ pub fn quads(count: usize) -> Vec<Quad> {
         let q = RawQuad::canonical(&s, &p, &o, &g).expect("canonical quad");
         seen.insert([q.s, q.p, q.o, q.g]);
     }
+    for [s, p, o, g] in SPELLINGS {
+        let q = RawQuad::canonical(s, p, o, g).expect("canonical quad");
+        seen.insert([q.s, q.p, q.o, q.g]);
+    }
     seen.into_iter().collect()
 }
 
@@ -78,6 +118,11 @@ pub fn builds() -> Vec<Built> {
             layout: LayoutStrategy::Default,
             indexes: vec![],
         },
+        Built {
+            name: "typed",
+            layout: LayoutStrategy::TypedObject,
+            indexes: vec![],
+        },
     ]
 }
 
@@ -107,4 +152,63 @@ pub fn write(dir: &std::path::Path, built: &Built, quads: &[Quad]) -> String {
         ))
         .expect("write the store");
     path.to_str().unwrap().to_string()
+}
+
+/// The rows a pattern matches, `limit` after `offset`, read one `String` per term as the bindings read them
+/// before the packed transfer: a Dictionary store's matched codes decoded a column at a time, the matched
+/// quads' terms otherwise. The tests' reference for the rows the engine hands over, their order included.
+pub fn reference_quads(
+    path: &str,
+    in_memory: bool,
+    pattern: [Option<&str>; 4],
+    offset: u64,
+    limit: Option<usize>,
+) -> Vec<Quad> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = if in_memory {
+            VortexRdfStore::from_file_in_memory(path).await
+        } else {
+            VortexRdfStore::from_file(path).await
+        }
+        .expect("open the store");
+        let [s, p, o, g] = pattern;
+        let probe = Probe::parse(s, p, o, g)
+            .expect("parse the pattern")
+            .window(offset as usize, limit);
+        let view = store.run_probe(&probe).await.expect("run the probe");
+        if let Some(dict) = store.dict_reader()
+            && let Some(columns) = view.code_columns_gathered().await.expect("gather codes")
+        {
+            let mut decoded = Vec::with_capacity(4);
+            for column in &columns {
+                decoded.push(dict.decode_many(column).await.expect("decode a column"));
+            }
+            return (0..decoded[0].len())
+                .map(|row| {
+                    std::array::from_fn(|i| {
+                        decoded[i][row]
+                            .clone()
+                            .expect("a matched row holds a code outside the dictionary")
+                    })
+                })
+                .collect();
+        }
+        view.shared_quads_vec()
+            .await
+            .expect("read the quads")
+            .iter()
+            .map(|q| {
+                [
+                    q.s.to_string(),
+                    q.p.to_string(),
+                    q.o.to_string(),
+                    q.g.to_string(),
+                ]
+            })
+            .collect()
+    })
 }

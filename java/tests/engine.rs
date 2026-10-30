@@ -5,7 +5,7 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use common::{Quad, builds, quads as make_quads, write};
+use common::{Quad, builds, quads as make_quads, reference_quads, write};
 use vortex_rdf_core::{CodePattern, LayoutStrategy};
 use vortex_rdf_jni::engine::{ROW_BYTES, Store};
 
@@ -117,6 +117,34 @@ fn term_patterns_match_a_scan_on_every_layout() {
                         "{tag}: pages of {page}"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// The per-term read the tests compare the packed transfer against is itself right: on every build, both
+/// residencies and every pattern it gives the scan's rows, once each.
+#[test]
+fn reference_reads_the_scan_on_every_build() {
+    let quads = quads();
+    // The oracle carries the hard spellings: an astral character only they hold.
+    assert!(quads.iter().any(|q| q[2].contains('\u{10348}')));
+    let dir = tempfile::tempdir().unwrap();
+    let all = builds();
+    assert_eq!(all.len(), 5, "five builds");
+    for built in all {
+        let path = write(dir.path(), &built, &quads);
+        if built.name == "typed" {
+            assert_eq!(Store::open(&path, false).unwrap().layout(), "typed-object");
+        }
+        for in_memory in [false, true] {
+            for pattern in patterns(&quads) {
+                let r = as_refs(&pattern);
+                let want = scan(&quads, &r);
+                let tag = format!("{} in_memory={in_memory} {pattern:?}", built.name);
+                let rows = reference_quads(&path, in_memory, r, 0, None);
+                assert_eq!(rows.len(), want.len(), "{tag}: no duplicate rows");
+                assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), want, "{tag}");
             }
         }
     }
