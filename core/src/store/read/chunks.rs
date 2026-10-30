@@ -30,13 +30,14 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
-use crate::store::VortexRdfStore;
 use crate::store::array::{field_as, into_struct_array, rechunk};
+use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_reads::take_file_rows, read_plan::ExactRead};
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, SelectedRows};
+use crate::store::{SharedQuad, VortexRdfStore};
 
 /// A view's rows as struct chunks in the layout's primary dtype, each of at
 /// most the requested `batch_rows` rows.
@@ -67,6 +68,26 @@ impl VortexRdfStore {
             async move { store.row_chunk_source(batch_rows).await },
             Err,
         ))
+    }
+
+    /// The rows of one of this store's [`row_chunks`](Self::row_chunks) as
+    /// [`SharedQuad`]s, decoded as [`shared_quads_vec`](Self::shared_quads_vec)
+    /// decodes a chunk: each distinct term of the chunk once, shared by the
+    /// rows repeating it. For the string layouts (Default and TypedObject); a
+    /// Dictionary store's chunks hold codes, which
+    /// [`code_chunks`](Self::code_chunks) reads and
+    /// [`dict_reader`](Self::dict_reader) decodes (an invalid operation here).
+    pub fn decode_row_chunk(&self, chunk: &ArrayRef) -> Result<Vec<SharedQuad>> {
+        if let ResolvedLayout::Dictionary(_) = self.layout {
+            return Err(VortexRdfError::InvalidOperation(
+                "decode_row_chunk decodes string layouts: read a Dictionary store's rows with \
+                 code_chunks and decode them with dict_reader"
+                    .into(),
+            ));
+        }
+        SharedQuad::decode(&self.layout, chunk)
+            .into_iter()
+            .collect()
     }
 
     /// The rows this view selects as [`TermCode`] columns, one buffer per

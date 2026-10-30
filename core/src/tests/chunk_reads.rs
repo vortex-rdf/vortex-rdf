@@ -101,3 +101,52 @@ async fn code_probe_refuses_a_store_without_a_dictionary() {
         .to_string();
     assert!(error.contains("no term dictionary"), "{error}");
 }
+
+/// Every row chunk of `view` at `batch_rows`, each decoded with `decode_row_chunk`, in order.
+async fn decoded_chunks(view: &VortexRdfStore, batch_rows: usize) -> Vec<SharedQuad> {
+    let mut chunks = view.row_chunks(batch_rows).unwrap();
+    let mut rows = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        rows.extend(view.decode_row_chunk(&chunk.unwrap()).unwrap());
+    }
+    rows
+}
+
+#[tokio::test]
+async fn decode_row_chunk_equals_shared_quads() {
+    let quads = modular_quads(200, 3, 5);
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let (_dir, path) = write_store_file(quads.clone(), layout, vec![]).await;
+        for in_memory in [false, true] {
+            let store = if in_memory {
+                VortexRdfStore::from_file_in_memory(&path).await
+            } else {
+                VortexRdfStore::from_file(&path).await
+            }
+            .unwrap();
+            let p1 = Probe::parse(None, Some("<http://example.org/p1>"), None, None).unwrap();
+            let bound = store.run_probe(&p1).await.unwrap();
+            for (view, what) in [(&store, "whole"), (&bound, "p-bound")] {
+                let want = view.shared_quads_vec().await.unwrap();
+                assert!(!want.is_empty());
+                for batch_rows in [1, 7, 65_536] {
+                    let tag = format!("{layout:?} in_memory={in_memory} {what} at {batch_rows}");
+                    assert_eq!(decoded_chunks(view, batch_rows).await, want, "{tag}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn decode_row_chunk_refuses_a_dictionary_store() {
+    let (_dir, path) =
+        write_store_file(modular_quads(20, 3, 5), LayoutStrategy::Dictionary, vec![]).await;
+    let store = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let chunk = store.row_chunks(8).unwrap().next().await.unwrap().unwrap();
+    let error = store.decode_row_chunk(&chunk).unwrap_err().to_string();
+    assert!(
+        error.contains("decode_row_chunk decodes string layouts"),
+        "{error}"
+    );
+}
