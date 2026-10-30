@@ -105,17 +105,6 @@ class VortexStoreTest {
 				assertEquals(want, keys(all), tag);
 				assertEquals(want.size(), all.size(), tag + " no duplicate rows");
 			}
-			// Windows of the whole store: an offset and a limit cross as a long and an int.
-			Set<String> paged = new TreeSet<>();
-			for (long offset = 0; offset < quads.size(); offset += 7) {
-				List<String[]> page = store.quads(null, null, null, null, offset, 7);
-				assertEquals(Math.min(7, quads.size() - offset), page.size(), name + " page at " + offset);
-				paged.addAll(keys(page));
-			}
-			assertEquals(scan(new String[4]), paged, name + " pages");
-			assertTrue(store.quads(null, null, null, null, quads.size(), 5).isEmpty());
-			assertTrue(store.quads(null, null, null, null, 0, 0).isEmpty());
-			assertEquals(quads.size(), store.quads(null, null, null, null, 3, -1).size() + 3);
 		}
 	}
 
@@ -181,8 +170,13 @@ class VortexStoreTest {
 					}
 				}
 				assertEquals(want, new TreeSet<>(seen), tag);
-				long[] flat = store.matchCodes(pattern[0], pattern[1], pattern[2], pattern[3], 0, 1000);
-				assertEquals(4 * want.size(), flat.length, tag + " array form");
+				int chunked = 0;
+				try (CodeChunks chunks = store.matchCodeChunks(pattern[0], pattern[1], pattern[2], pattern[3])) {
+					for (int n; (n = chunks.next(out, 5)) > 0;) {
+						chunked += n;
+					}
+				}
+				assertEquals(want.size(), chunked, tag + " chunks");
 			}
 		}
 	}
@@ -263,7 +257,8 @@ class VortexStoreTest {
 				assertThrows(IllegalArgumentException.class,
 						() -> store.matchCodes(-1, -1, -1, -1, 0, bad, 2));
 			}
-			assertThrows(IllegalArgumentException.class, () -> store.quads(null, null, null, null, -1, 1));
+			ByteBuffer good = ByteBuffer.allocateDirect(64).order(ByteOrder.nativeOrder());
+			assertThrows(IllegalArgumentException.class, () -> store.matchCodes(-1, -1, -1, -1, -1, good, 2));
 		}
 		assertThrows(VortexException.class, () -> VortexStore.open(fixtures.resolve("missing.vortex")));
 	}

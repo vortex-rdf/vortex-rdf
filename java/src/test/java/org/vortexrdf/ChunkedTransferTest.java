@@ -9,7 +9,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
@@ -59,15 +58,6 @@ class ChunkedTransferTest {
 					String tag = name + " inMemory=" + inMemory + " " + Arrays.toString(p);
 					List<String> want = inOracleOrder(p);
 					assertEquals(want, joined(store.quads(p[0], p[1], p[2], p[3])), tag);
-					List<String> paged = new ArrayList<>();
-					for (long offset = 0;; offset += 7) {
-						List<String[]> page = store.quads(p[0], p[1], p[2], p[3], offset, 7);
-						paged.addAll(joined(page));
-						if (page.size() < 7) {
-							break;
-						}
-					}
-					assertEquals(want, paged, tag + " pages of 7");
 				}
 			}
 		}
@@ -81,8 +71,8 @@ class ChunkedTransferTest {
 				for (String[] p : VortexStoreTest.patterns()) {
 					String tag = name + " inMemory=" + inMemory + " " + Arrays.toString(p);
 					List<String> whole = joined(store.quads(p[0], p[1], p[2], p[3]));
-					assertEquals(whole, joined(store.quads(p[0], p[1], p[2], p[3], 0, -1, 1, 64, 16)), tag + " a row a chunk");
-					assertEquals(whole, joined(store.quads(p[0], p[1], p[2], p[3], 0, -1, 7, 256, 64)), tag + " 7 rows a chunk");
+					assertEquals(whole, joined(store.quads(p[0], p[1], p[2], p[3], 1, 64, 16)), tag + " a row a chunk");
+					assertEquals(whole, joined(store.quads(p[0], p[1], p[2], p[3], 7, 256, 64)), tag + " 7 rows a chunk");
 				}
 			}
 		}
@@ -94,7 +84,7 @@ class ChunkedTransferTest {
 		try (VortexStore store = VortexStoreTest.open(name, false)) {
 			List<String> whole = joined(store.quads(null, null, null, null));
 			// Every term over 16 bytes (most of them) crosses on its own.
-			List<String> large = joined(store.quads(null, null, null, null, 0, -1, Payload.CHUNK_ROWS, 64, 16));
+			List<String> large = joined(store.quads(null, null, null, null, Payload.CHUNK_ROWS, 64, 16));
 			assertEquals(whole, large, name);
 			assertEquals(new TreeSet<>(inOracleOrder(new String[4])), new TreeSet<>(large), name);
 			// The hard spellings: escapes, and characters outside ASCII and outside the BMP.
@@ -177,7 +167,7 @@ class ChunkedTransferTest {
 				store.quads(p[0], p[1], p[2], p[3]);
 				assertEquals(0, Native.openHandles(), Arrays.toString(p));
 			}
-			assertEquals(VortexStoreTest.quads.size(), store.quads(null, null, null, null, 0, -1, 1, 64, 16).size());
+			assertEquals(VortexStoreTest.quads.size(), store.quads(null, null, null, null, 1, 64, 16).size());
 			assertEquals(0, Native.openHandles(), "after a read of a row a chunk");
 			assertThrows(VortexException.class, () -> store.quads(null, "not a term", null, null));
 			assertEquals(0, Native.openHandles(), "after a malformed term");

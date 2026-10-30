@@ -303,10 +303,9 @@ pub extern "system" fn Java_org_vortexrdf_Native_count<'local>(
     })
 }
 
-/// A read of the quads matching a pattern, `limit` rows (every one when negative) after `offset`, as its first
-/// chunk; the last slot is `{cursor, rows}`: the cursor of the chunks left, `0` when this one ends the read,
-/// and the read's rows. A chunk holds at most `chunkRows` rows and `chunkBytes` bytes of terms; terms over
-/// `largeTerm` bytes cross on their own.
+/// A read of every quad matching a pattern, as its first chunk; the last slot is `{cursor, rows}`: the cursor
+/// of the chunks left, `0` when this one ends the read, and the read's rows. A chunk holds at most `chunkRows`
+/// rows and `chunkBytes` bytes of terms; terms over `largeTerm` bytes cross on their own.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_vortexrdf_Native_quadsOpen<'local>(
     mut env: EnvUnowned<'local>,
@@ -316,8 +315,6 @@ pub extern "system" fn Java_org_vortexrdf_Native_quadsOpen<'local>(
     p: JString<'local>,
     o: JString<'local>,
     g: JString<'local>,
-    offset: jlong,
-    limit: jint,
     chunk_rows: jint,
     chunk_bytes: jint,
     large_term: jint,
@@ -335,8 +332,6 @@ pub extern "system" fn Java_org_vortexrdf_Native_quadsOpen<'local>(
             p.as_deref(),
             o.as_deref(),
             g.as_deref(),
-            offset.max(0) as u64,
-            (limit >= 0).then_some(limit as usize),
             limits,
         )?;
         let rows = cursor.rows();

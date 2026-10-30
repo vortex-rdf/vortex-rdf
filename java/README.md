@@ -49,10 +49,10 @@ store.layout();                      // "dictionary" | "default" | "typed-object
 store.indexes();                     // e.g. [secondary-by-reference]
 store.count(s, p, o, g);             // long
 store.quads(s, p, o, g);             // List<String[]>, rows {s, p, o, g}
-store.quads(s, p, o, g, 100, 50);    // 50 rows after the first 100 of the match
+store.iterateQuads(s, p, o, g);      // QuadIterator: the same rows, read a chunk at a time; close it when done
 ```
 
-Both work on every layout, with identical results. `quads` is served from the term-code columns where the store has them and from the matched quads otherwise. Each row is its own `String[4]`, which the caller may change; terms cross from the native library in chunks of up to 65,536 rows, and the rows of a chunk that hold the same term share one `String`.
+They work on every layout, with identical results. `quads` is served from the term-code columns where the store has them and from the matched quads otherwise. Each row is its own `String[4]`, which the caller may change; terms cross from the native library in chunks of up to 65,536 rows, and the rows of a chunk that hold the same term share one `String`.
 
 ## Term codes (low-level)
 
@@ -79,14 +79,20 @@ if (name != VortexStore.NONE) {                               // the store holds
     for (int i = 0; i < got; i++) {
         long s = rows.getLong(i * VortexStore.ROW_BYTES), o = rows.getLong(i * VortexStore.ROW_BYTES + 16);
     }
+
+    try (CodeChunks chunks = store.matchCodeChunks(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE)) {
+        for (int n; (n = chunks.next(rows, 4096)) > 0; ) {          // the whole match, up to 4096 rows a call
+            // rows 0 .. n-1 of the buffer, as above
+        }
+    }
 }
 ```
 
 `matchCodes` fills a reusable, writable direct buffer with `(s, p, o, g)` codes, four longs per row, from its start.
 
 - A long match is read in windows by passing the offset. Every window of one pattern comes in the same row order.
+- `matchCodeChunks` reads a whole match into the same kind of buffer, the next rows each call, with no offset to keep; close it, or drain it, when done.
 - A pattern that cannot match gives no rows, not an error: a code past the dictionary, or a literal in the subject position.
-- The `long[]`-returning overload is the same call for callers that do not mind an allocation.
 
 When a file store can locate the pattern's rows by binary search (a prefix of the quad table's `(s, p, o, g)` order, or with `secondary-by-copy` the predicate- and object-led orders), a code lookup is one located run with no dictionary search; it takes the general path otherwise, and returns the same rows.
 

@@ -81,21 +81,18 @@ impl Store {
         Ok(RUNTIME.block_on(self.store.count_probe(&probe))? as u64)
     }
 
-    /// The quads matching a pattern of N-Triples spellings, `limit` rows after `offset` in the store's row order,
-    /// as a cursor that hands them out in packed chunks under `limits`: a Dictionary store's matched codes,
-    /// gathered (in index order when an index serves the pattern), or the matched quads' terms otherwise.
-    #[allow(clippy::too_many_arguments)]
+    /// The quads matching a pattern of N-Triples spellings, in the store's row order, as a cursor that hands
+    /// them out in packed chunks under `limits`: a Dictionary store's matched codes, gathered (in index order
+    /// when an index serves the pattern), or the matched quads' terms otherwise.
     pub fn quads_cursor(
         &self,
         s: Option<&str>,
         p: Option<&str>,
         o: Option<&str>,
         g: Option<&str>,
-        offset: u64,
-        limit: Option<usize>,
         limits: Limits,
     ) -> Result<QuadCursor> {
-        let probe = Probe::parse(s, p, o, g)?.window(offset as usize, limit);
+        let probe = Probe::parse(s, p, o, g)?;
         let view = RUNTIME.block_on(self.store.run_probe(&probe))?;
         if let Some(dict) = &self.dict
             && let Some(columns) = RUNTIME.block_on(view.code_columns_gathered())?

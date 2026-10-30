@@ -205,25 +205,16 @@ public final class VortexStore implements AutoCloseable {
 
 	/** Every quad matching a pattern of terms, as {@code {s, p, o, g}} spellings, in the store's row order. */
 	public List<String[]> quads(String s, String p, String o, String g) {
-		return quads(s, p, o, g, 0, -1);
-	}
-
-	/** {@code limit} quads (all when negative) after {@code offset} rows of the match, in the store's row order. */
-	public List<String[]> quads(String s, String p, String o, String g, long offset, int limit) {
-		if (offset < 0) {
-			throw new IllegalArgumentException("offset < 0");
-		}
-		return quads(s, p, o, g, offset, limit, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
+		return quads(s, p, o, g, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
 	}
 
 	/**
-	 * {@link #quads(String, String, String, String, long, int)} with the chunk limits the rows cross in, which tests
-	 * set small to cut every chunk. The read's cursor lives within this call: freed before it returns or throws.
+	 * {@link #quads(String, String, String, String)} with the chunk limits the rows cross in, which tests set small to
+	 * cut every chunk. The read's cursor lives within this call: freed before it returns or throws.
 	 */
-	List<String[]> quads(String s, String p, String o, String g, long offset, int limit, int chunkRows, int chunkBytes,
-			int largeTerm) {
+	List<String[]> quads(String s, String p, String o, String g, int chunkRows, int chunkBytes, int largeTerm) {
 		return call(h -> {
-			Object[] first = Native.quadsOpen(h, s, p, o, g, offset, limit, chunkRows, chunkBytes, largeTerm);
+			Object[] first = Native.quadsOpen(h, s, p, o, g, chunkRows, chunkBytes, largeTerm);
 			long cursor = Payload.cursor(first);
 			try {
 				List<String[]> rows = new ArrayList<>(Payload.rows(first));
@@ -323,16 +314,6 @@ public final class VortexStore implements AutoCloseable {
 			throw new IllegalArgumentException("out must be a writable, direct, native-order buffer of at least maxRows * "
 					+ ROW_BYTES + " bytes");
 		}
-	}
-
-	/** {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)} into a new array of four codes per row. */
-	public long[] matchCodes(long s, long p, long o, long g, long offset, int limit) {
-		checkWindow(offset, limit);
-		ByteBuffer out = ByteBuffer.allocateDirect(Math.multiplyExact(limit, ROW_BYTES)).order(ByteOrder.nativeOrder());
-		int rows = matchCodes(s, p, o, g, offset, out, limit);
-		long[] codes = new long[4 * rows];
-		out.asLongBuffer().get(codes);
-		return codes;
 	}
 
 	private static void checkWindow(long offset, int rows) {

@@ -50,7 +50,7 @@ fn term_patterns_match_a_scan_on_every_layout() {
                 );
                 let all = drain(
                     store
-                        .quads_cursor(r[0], r[1], r[2], r[3], 0, None, Limits::DEFAULT)
+                        .quads_cursor(r[0], r[1], r[2], r[3], Limits::DEFAULT)
                         .unwrap(),
                 );
                 assert_eq!(
@@ -59,40 +59,6 @@ fn term_patterns_match_a_scan_on_every_layout() {
                     "{tag}: quads"
                 );
                 assert_eq!(all.len(), want.len(), "{tag}: no duplicate rows");
-                for page in [1usize, 7]
-                    .into_iter()
-                    .filter(|&page| page == 7 || want.len() < 10)
-                {
-                    let mut seen = Vec::new();
-                    let mut offset = 0u64;
-                    while (offset as usize) < want.len() {
-                        let rows = drain(
-                            store
-                                .quads_cursor(
-                                    r[0],
-                                    r[1],
-                                    r[2],
-                                    r[3],
-                                    offset,
-                                    Some(page),
-                                    Limits::DEFAULT,
-                                )
-                                .unwrap(),
-                        );
-                        assert_eq!(
-                            rows.len(),
-                            page.min(want.len() - offset as usize),
-                            "{tag}: page {page} at {offset}"
-                        );
-                        seen.extend(rows);
-                        offset += page as u64;
-                    }
-                    assert_eq!(
-                        seen.into_iter().collect::<BTreeSet<_>>(),
-                        want,
-                        "{tag}: pages of {page}"
-                    );
-                }
             }
         }
     }
@@ -118,7 +84,7 @@ fn reference_reads_the_scan_on_every_build() {
                 let r = as_refs(&pattern);
                 let want = scan(&quads, &r);
                 let tag = format!("{} in_memory={in_memory} {pattern:?}", built.name);
-                let rows = reference_quads(&path, in_memory, r, 0, None);
+                let rows = reference_quads(&path, in_memory, r);
                 assert_eq!(rows.len(), want.len(), "{tag}: no duplicate rows");
                 assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), want, "{tag}");
             }
@@ -126,11 +92,8 @@ fn reference_reads_the_scan_on_every_build() {
     }
 }
 
-/// The windows the cursor tests read: whole, inside, and a point read.
-const WINDOWS: [(u64, Option<usize>); 3] = [(0, None), (3, Some(7)), (0, Some(1))];
-
-/// The cursor's rows against the per-term read's, row for row, on every build, residency, pattern and window,
-/// under each of `limits`.
+/// The cursor's rows against the per-term read's, row for row, on every build, residency and pattern, under
+/// each of `limits`.
 fn cursor_matches_the_reference(limits: &[Limits]) {
     let quads = quads();
     let dir = tempfile::tempdir().unwrap();
@@ -140,19 +103,15 @@ fn cursor_matches_the_reference(limits: &[Limits]) {
             let store = Store::open(&path, in_memory).unwrap();
             for pattern in patterns(&quads) {
                 let r = as_refs(&pattern);
-                for (offset, limit) in WINDOWS {
-                    let want = reference_quads(&path, in_memory, r, offset, limit);
-                    for &limits in limits {
-                        let tag = format!(
-                            "{} in_memory={in_memory} {pattern:?} window ({offset}, {limit:?}) {limits:?}",
-                            built.name
-                        );
-                        let cursor = store
-                            .quads_cursor(r[0], r[1], r[2], r[3], offset, limit, limits)
-                            .unwrap();
-                        assert_eq!(cursor.rows(), want.len(), "{tag}: rows");
-                        assert_eq!(drain(cursor), want, "{tag}");
-                    }
+                let want = reference_quads(&path, in_memory, r);
+                for &limits in limits {
+                    let tag = format!(
+                        "{} in_memory={in_memory} {pattern:?} {limits:?}",
+                        built.name
+                    );
+                    let cursor = store.quads_cursor(r[0], r[1], r[2], r[3], limits).unwrap();
+                    assert_eq!(cursor.rows(), want.len(), "{tag}: rows");
+                    assert_eq!(drain(cursor), want, "{tag}");
                 }
             }
         }
@@ -208,9 +167,7 @@ fn cursor_paces_chunks_by_the_last_fit() {
             indexes: vec![],
         };
         let store = Store::open(&write(dir.path(), &built, &quads), false).unwrap();
-        let cursor = store
-            .quads_cursor(None, None, None, None, 0, None, limits)
-            .unwrap();
+        let cursor = store.quads_cursor(None, None, None, None, limits).unwrap();
         let mut held = Vec::new();
         for payload in cursor {
             let payload = payload.unwrap();
@@ -280,15 +237,7 @@ fn term_patterns_report_what_a_caller_can_get_wrong() {
         .to_string();
     assert!(error.contains("pattern subject"), "{error}");
     let error = store
-        .quads_cursor(
-            None,
-            Some("not a term"),
-            None,
-            None,
-            0,
-            None,
-            Limits::DEFAULT,
-        )
+        .quads_cursor(None, Some("not a term"), None, None, Limits::DEFAULT)
         .err()
         .expect("a malformed predicate")
         .to_string();

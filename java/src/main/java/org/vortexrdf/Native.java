@@ -48,13 +48,13 @@ final class Native {
 	static native long count(long handle, String s, String p, String o, String g);
 
 	/**
-	 * A read of the matching quads (a negative limit takes every row) as its first chunk ({@link Payload}), whose
-	 * last slot is {@code {cursor, rows}}: the cursor of the chunks left, 0 when none are, and the read's rows. A
-	 * chunk holds at most {@code chunkRows} rows and {@code chunkBytes} bytes of terms; terms over
-	 * {@code largeTerm} bytes cross on their own. The caller closes the cursor within the call that opened it.
+	 * A read of every quad matching a pattern as its first chunk ({@link Payload}), whose last slot is
+	 * {@code {cursor, rows}}: the cursor of the chunks left, 0 when none are, and the read's rows. A chunk holds at
+	 * most {@code chunkRows} rows and {@code chunkBytes} bytes of terms; terms over {@code largeTerm} bytes cross on
+	 * their own. The caller closes the cursor within the call that opened it.
 	 */
-	static native Object[] quadsOpen(long handle, String s, String p, String o, String g, long offset, int limit,
-			int chunkRows, int chunkBytes, int largeTerm);
+	static native Object[] quadsOpen(long handle, String s, String p, String o, String g, int chunkRows,
+			int chunkBytes, int largeTerm);
 
 	/** The next chunk of a read, its last slot null; null once the read is over. */
 	static native Object[] cursorNext(long cursor);

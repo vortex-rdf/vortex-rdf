@@ -174,16 +174,10 @@ thread_local! {
     };
 }
 
-/// The rows a pattern matches, `limit` after `offset`, read one `String` per term as the bindings read them
-/// before the packed transfer: a Dictionary store's matched codes decoded a column at a time, the matched
-/// quads' terms otherwise. The tests' reference for the rows the engine hands over, their order included.
-pub fn reference_quads(
-    path: &str,
-    in_memory: bool,
-    pattern: [Option<&str>; 4],
-    offset: u64,
-    limit: Option<usize>,
-) -> Vec<Quad> {
+/// The rows a pattern matches, read one `String` per term as the bindings read them before the packed
+/// transfer: a Dictionary store's matched codes decoded a column at a time, the matched quads' terms
+/// otherwise. The tests' reference for the rows the engine hands over, their order included.
+pub fn reference_quads(path: &str, in_memory: bool, pattern: [Option<&str>; 4]) -> Vec<Quad> {
     REFERENCE.with(|Reference { runtime, opened }| {
         let store = opened
             .borrow_mut()
@@ -202,9 +196,7 @@ pub fn reference_quads(
             .clone();
         runtime.block_on(async {
             let [s, p, o, g] = pattern;
-            let probe = Probe::parse(s, p, o, g)
-                .expect("parse the pattern")
-                .window(offset as usize, limit);
+            let probe = Probe::parse(s, p, o, g).expect("parse the pattern");
             let view = store.run_probe(&probe).await.expect("run the probe");
             if let Some(dict) = store.dict_reader()
                 && let Some(columns) = view.code_columns_gathered().await.expect("gather codes")
