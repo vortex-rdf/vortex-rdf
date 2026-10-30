@@ -523,9 +523,12 @@ impl FileBackedDict {
         TermDictionary::from_child_reader(self.0.reader.clone(), self.bracketed_iris()).await
     }
 
-    /// Whether a window read has had to wait ([`Windows::reads_wait`]).
-    #[cfg(test)]
-    pub(crate) fn debug_reads_wait(&self) -> bool {
+    /// Whether a window read has had to wait ([`Windows::reads_wait`]):
+    /// from then on a chunk decode reads no window in place, and a decode
+    /// that cannot await leaves its chunk ([`ChunkDecode::decode_now`]).
+    ///
+    /// [`ChunkDecode::decode_now`]: crate::store::layouts::ChunkDecode::decode_now
+    pub(crate) fn reads_wait(&self) -> bool {
         self.0.reads_wait.load(std::sync::atomic::Ordering::Relaxed)
     }
 

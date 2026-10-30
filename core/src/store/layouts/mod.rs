@@ -873,6 +873,23 @@ pub(crate) trait ChunkDecode: Sized + Send + 'static {
         }
         future::ready(Self::decode(layout, chunk)).boxed()
     }
+
+    /// [`decode_async`](Self::decode_async) where it finishes without
+    /// waiting, for a caller that cannot await (a scan's split task): every
+    /// layout but a file-backed dictionary's, and that one while its window
+    /// reads complete when first polled, as over a mapped file. `None` when
+    /// a read would wait, and without reading once the dictionary's reads
+    /// have had to: the chunk is then `decode_async`'s.
+    #[cfg(feature = "file-io")]
+    fn decode_now(layout: &ResolvedLayout, chunk: &ArrayRef) -> Option<Vec<Result<Self>>> {
+        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = layout {
+            if fb.reads_wait() {
+                return None;
+            }
+            return Self::decode_file_backed(fb, chunk).now_or_never();
+        }
+        Some(Self::decode(layout, chunk))
+    }
 }
 
 impl ChunkDecode for Quad {

@@ -300,10 +300,9 @@ impl VortexRdfStore {
     /// current, whatever the row-scan driver's split limit: the read is
     /// collected whole, so many splits' reads overlap their decodes, where a
     /// single split, read inline, spares a spawn's latency. Each chunk
-    /// decodes inside its split's task under a resident dictionary and on
-    /// the stream under a file-backed one, as
-    /// [`scan_chunks`](Self::scan_chunks) decodes. A point read a chunk
-    /// declines is taken.
+    /// decodes inside its split's read
+    /// ([`decoded_split_reads`](Self::decoded_split_reads)). A point read a
+    /// chunk declines is taken.
     #[cfg(feature = "file-io")]
     async fn masked_chunks<T: ChunkDecode>(
         &self,
@@ -355,9 +354,10 @@ impl VortexRdfStore {
     /// The rows of split `reads` (one per split, in split order) decoded into
     /// chunks of `T`, then the tail's chunk: the reads spawned onto the
     /// runtime when `spawn`, [`SPLITS_IN_FLIGHT_PER_CORE`] per core in
-    /// flight, or polled inline. Each chunk decodes inside its split's read
-    /// under a resident dictionary and on the stream under a file-backed one,
-    /// as [`scan_chunks`](Self::scan_chunks) decodes.
+    /// flight, or polled inline. Each chunk decodes inside its split's read,
+    /// so spawned splits decode on the runtime's workers, a file-backed
+    /// dictionary's awaiting its window reads there; a file-backed chunk of
+    /// fewer than [`TASK_DECODE_MIN_ROWS`] rows decodes on the stream.
     #[cfg(feature = "file-io")]
     fn decoded_split_reads<T: ChunkDecode>(
         &self,
@@ -366,50 +366,49 @@ impl VortexRdfStore {
         tail: Vec<Result<T>>,
     ) -> Chunks<T> {
         let window = SPLITS_IN_FLIGHT_PER_CORE * available_parallelism();
-        let layout = self.layout.clone();
         let file_backed_dictionary =
             matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
-        let chunks: Chunks<T> = if file_backed_dictionary {
-            let rows = if spawn {
-                spawned_splits(tasks, window).left_stream()
-            } else {
-                inline_splits(tasks).right_stream()
-            };
-            rows.filter_map(|split| future::ready(split.transpose()))
-                .then(move |chunk| match chunk {
-                    Ok(chunk) => ChunkDecoder::<T>::decode_async(&layout, chunk),
-                    Err(e) => future::ready(vec![Err(VortexRdfError::Vortex(e))]).boxed(),
-                })
-                .boxed()
+        let decoding: Vec<_> = tasks
+            .into_iter()
+            .map(|task| {
+                let layout = self.layout.clone();
+                async move {
+                    let Some(rows) = task.await? else {
+                        return Ok(None);
+                    };
+                    let chunk = if !file_backed_dictionary {
+                        SplitChunk::Decoded(T::decode(&layout, &rows))
+                    } else if rows.len() < TASK_DECODE_MIN_ROWS {
+                        SplitChunk::Undecoded(rows)
+                    } else {
+                        SplitChunk::Decoded(T::decode_async(&layout, &rows).await)
+                    };
+                    Ok(Some(chunk))
+                }
+            })
+            .collect();
+        let rows = if spawn {
+            spawned_splits(decoding, window).left_stream()
         } else {
-            let decoding: Vec<_> = tasks
-                .into_iter()
-                .map(|task| {
-                    let layout = layout.clone();
-                    async move {
-                        task.await
-                            .map(|rows| rows.map(|rows| T::decode(&layout, &rows)))
-                    }
-                })
-                .collect();
-            let rows = if spawn {
-                spawned_splits(decoding, window).left_stream()
-            } else {
-                inline_splits(decoding).right_stream()
-            };
-            rows.filter_map(|split| future::ready(split.transpose()))
-                .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(VortexRdfError::Vortex(e))]))
-                .boxed()
+            inline_splits(decoding).right_stream()
         };
+        let layout = self.layout.clone();
+        let chunks = rows
+            .filter_map(|split| future::ready(split.transpose()))
+            .then(move |chunk| finished_on_stream(&layout, chunk))
+            .boxed();
         with_tail(chunks, tail)
     }
 
     /// `scan`'s chunks decoded through `decoder`, then the tail's chunk; a
     /// chunk's read error is one error chunk. The decode runs inside the
     /// scan's split tasks (its map function), concurrently across the
-    /// runtime's workers, except under a file-backed dictionary: that decode
-    /// awaits a read of the dictionary windows holding the chunk's codes, so
-    /// it runs on the scan's stream.
+    /// runtime's workers. Those tasks cannot await, so under a file-backed
+    /// dictionary they decode a chunk only where its window reads complete
+    /// when first polled ([`ChunkDecoder::decode_now`]), as a mapped file's
+    /// always do; a chunk whose reads would wait, or of fewer than
+    /// [`TASK_DECODE_MIN_ROWS`] rows, passes on undecoded and decodes on the
+    /// scan's stream.
     #[cfg(feature = "file-io")]
     fn scan_chunks<T: ChunkDecode>(
         &self,
@@ -422,12 +421,19 @@ impl VortexRdfStore {
         let file_backed_dictionary =
             matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
         let chunks: Chunks<T> = if file_backed_dictionary {
-            scan.into_stream()?
-                .then(move |chunk| match chunk {
-                    Ok(chunk) => decoder.decode_async(chunk),
-                    Err(e) => future::ready(vec![Err(VortexRdfError::Vortex(e))]).boxed(),
+            let in_task = decoder.clone();
+            scan.map(move |chunk| {
+                if chunk.len() < TASK_DECODE_MIN_ROWS {
+                    return Ok(SplitChunk::Undecoded(chunk));
+                }
+                Ok(match in_task.decode_now(&chunk) {
+                    Some(rows) => SplitChunk::Decoded(rows),
+                    None => SplitChunk::Undecoded(chunk),
                 })
-                .boxed()
+            })
+            .into_stream()?
+            .then(move |chunk| finished_on_stream(&decoder, chunk))
+            .boxed()
         } else {
             scan.map(move |chunk| Ok(decoder.decode(&chunk)))
                 .into_stream()?
@@ -462,6 +468,41 @@ fn with_tail<T: Send + 'static>(
     chunks.chain(stream::iter([tail])).boxed()
 }
 
+/// The fewest rows a file-backed Dictionary chunk has for its split task to
+/// decode it. A smaller chunk gains little from a worker and would decode
+/// there against windows out of that core's cache, so it decodes on the
+/// stream, on the thread that reads it.
+#[cfg(feature = "file-io")]
+const TASK_DECODE_MIN_ROWS: usize = 1024;
+
+/// A chunk as a split task hands it on: decoded, or left for the stream to
+/// decode (a file-backed dictionary's, when its reads would wait or it is
+/// small).
+#[cfg(feature = "file-io")]
+enum SplitChunk<T> {
+    Decoded(Vec<Result<T>>),
+    Undecoded(ArrayRef),
+}
+
+/// `chunk` finished on the stream: decoded rows as they are, an undecoded
+/// chunk decoded through `decoder` (awaiting a file-backed dictionary's
+/// reads), an error as one error chunk.
+#[cfg(feature = "file-io")]
+fn finished_on_stream<T: ChunkDecode, D: ChunkDecoder<T>>(
+    decoder: &D,
+    chunk: vortex_error::VortexResult<SplitChunk<T>>,
+) -> impl Future<Output = Vec<Result<T>>> + Send + use<T, D> {
+    match chunk {
+        Ok(SplitChunk::Decoded(rows)) => future::ready(rows).left_future(),
+        Ok(SplitChunk::Undecoded(chunk)) => {
+            #[cfg(test)]
+            stream_decode_hooks::note(chunk.len());
+            decoder.decode_async(chunk).right_future()
+        }
+        Err(e) => future::ready(vec![Err(VortexRdfError::Vortex(e))]).left_future(),
+    }
+}
+
 /// How a file read's scanned chunks decode into `T` rows: synchronously
 /// inside the scan's split tasks, or awaiting a file-backed dictionary.
 #[cfg(feature = "file-io")]
@@ -471,6 +512,10 @@ trait ChunkDecoder<T>: Clone + Send + Sync + 'static {
     /// `chunk`'s rows, resolving a file-backed dictionary's codes with a read
     /// of its child.
     fn decode_async(&self, chunk: ArrayRef) -> BoxFuture<'static, Vec<Result<T>>>;
+    /// `chunk`'s rows where [`decode_async`](Self::decode_async) finishes
+    /// without waiting ([`ChunkDecode::decode_now`]); `None` leaves the
+    /// chunk to it.
+    fn decode_now(&self, chunk: &ArrayRef) -> Option<Vec<Result<T>>>;
 }
 
 /// Chunks of the quad table's primary columns.
@@ -483,6 +528,10 @@ impl<T: ChunkDecode> ChunkDecoder<T> for ResolvedLayout {
     fn decode_async(&self, chunk: ArrayRef) -> BoxFuture<'static, Vec<Result<T>>> {
         let layout = self.clone();
         async move { T::decode_async(&layout, &chunk).await }.boxed()
+    }
+
+    fn decode_now(&self, chunk: &ArrayRef) -> Option<Vec<Result<T>>> {
+        T::decode_now(self, chunk)
     }
 }
 
@@ -511,6 +560,11 @@ impl<T: ChunkDecode> ChunkDecoder<T> for ServedDecoder {
         }
         .boxed()
     }
+
+    fn decode_now(&self, chunk: &ArrayRef) -> Option<Vec<Result<T>>> {
+        self.plan
+            .decode_columns_now::<T>(chunk, self.deleted.as_ref())
+    }
 }
 
 /// Test hook: how many chunk streams this thread's reads built (materializing
@@ -531,5 +585,172 @@ pub(crate) mod chunk_stream_hooks {
     /// The chunk streams built on this thread so far.
     pub(crate) fn streams() -> usize {
         STREAMS.with(Cell::get)
+    }
+}
+
+/// Test hook: the row counts of the chunks this thread's streams decoded
+/// themselves, their split tasks having left them undecoded.
+#[cfg(all(test, feature = "file-io"))]
+pub(crate) mod stream_decode_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LEFT: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Record a chunk of `rows` rows decoded on a stream.
+    pub(super) fn note(rows: usize) {
+        LEFT.with_borrow_mut(|left| left.push(rows));
+    }
+
+    /// The row counts of the chunks decoded on this thread's streams so
+    /// far, in order.
+    pub(crate) fn left() -> Vec<usize> {
+        LEFT.with_borrow(Vec::clone)
+    }
+}
+
+#[cfg(all(test, feature = "file-io"))]
+mod tests {
+    use super::*;
+    use crate::store::layouts::dictionary::{DictAccess, FileBackedDict};
+    use crate::{LayoutStrategy, export_rdf};
+
+    /// The rows, shared rows and N-Quads lines of `store`, each read
+    /// whole, and the row counts of the chunks behind them that their
+    /// streams decoded.
+    async fn read_whole(
+        store: &VortexRdfStore,
+    ) -> ((Vec<Quad>, Vec<SharedQuad>, Vec<u8>), Vec<usize>) {
+        let before = stream_decode_hooks::left().len();
+        let quads = store.quads_vec().await.unwrap();
+        let shared = store.shared_quads_vec().await.unwrap();
+        let mut lines = Vec::new();
+        export_rdf(store.clone(), &mut lines, oxrdfio::RdfFormat::NQuads)
+            .await
+            .unwrap();
+        let left = stream_decode_hooks::left().split_off(before);
+        ((quads, shared, lines), left)
+    }
+
+    /// The chunks of the file at `path`, in scan order, by row count.
+    async fn chunk_rows(path: &std::path::Path) -> Vec<usize> {
+        let native = crate::tests::open_mapped(path).await;
+        let chunks: Vec<ArrayRef> = native
+            .scan()
+            .unwrap()
+            .into_stream()
+            .unwrap()
+            .map(|chunk| chunk.unwrap())
+            .collect()
+            .await;
+        chunks.iter().map(|chunk| chunk.len()).collect()
+    }
+
+    /// A file-backed Dictionary store's chunks decode inside their split
+    /// tasks: over a mapped file every window read completes when first
+    /// polled, so no chunk of [`TASK_DECODE_MIN_ROWS`] rows or more is left
+    /// to the stream, for the whole store, for a match read by its filter's
+    /// masks a split at a time and for one an index serves by a scan of its
+    /// run, and the rows are those of the store loaded in memory. A smaller
+    /// chunk is left to the stream, and so is every chunk over dictionary
+    /// reads that wait, decoded the same.
+    #[tokio::test]
+    async fn file_backed_chunks_decode_in_their_split_tasks() {
+        // Each whole read is three: the rows, the shared rows, the export.
+        for count in [600, 3000] {
+            let quads = crate::tests::modular_quads(count, 7, 50);
+            let (_dir, path) =
+                crate::tests::write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
+            assert_eq!(chunk_rows(&path).await, [count]);
+            let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+            let (want, _) = read_whole(&loaded).await;
+
+            let mapped = VortexRdfStore::from_file(&path).await.unwrap();
+            assert!(mapped.dict_reader().unwrap().is_file_backed());
+            let (got, left) = read_whole(&mapped).await;
+            assert!(got == want, "{count} mapped rows");
+            let small: &[usize] = if count < TASK_DECODE_MIN_ROWS {
+                &[count; 3]
+            } else {
+                &[]
+            };
+            assert_eq!(left, small, "{count} mapped rows");
+
+            let native = crate::tests::open_mapped(&path).await;
+            let waiting_dict = FileBackedDict::open_with_waiting_reads(&native)
+                .await
+                .unwrap()
+                .expect("the written dictionary child must be window-searchable");
+            let mut waiting = mapped.clone();
+            waiting.layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(waiting_dict));
+            let (got, left) = read_whole(&waiting).await;
+            assert!(got == want, "{count} waiting rows");
+            assert_eq!(left, [count; 3], "{count} waiting rows");
+        }
+
+        // A predicate's rows over a store without an index: its filter's
+        // masks first, then the rows they keep, a split's read at a time,
+        // which the export takes for 86 rows too (the one-shot reads take
+        // so few point by point, as one chunk on the stream's thread).
+        let p = oxrdf::NamedNode::new("http://example.org/p1").unwrap();
+        for (count, modulus, small) in [(4000, 3, None), (600, 7, Some(86))] {
+            let quads = crate::tests::modular_quads(count, modulus, 50);
+            let (_dir, path) =
+                crate::tests::write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
+            let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+            let loaded = loaded
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .unwrap();
+            let (want, _) = read_whole(&loaded).await;
+            let mapped = VortexRdfStore::from_file(&path).await.unwrap();
+            let filtered = mapped
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .unwrap();
+            assert!(matches!(
+                filtered.quads.file(),
+                Some(FileBase {
+                    filter: Some(_),
+                    serve: None,
+                    ..
+                })
+            ));
+            let (got, left) = read_whole(&filtered).await;
+            assert!(got == want, "{count} filtered rows");
+            assert_eq!(left, Vec::from_iter(small), "{count} filtered rows");
+        }
+
+        // The same rows as an index's run, too wide to point-read, scanned
+        // as a chunk of 1,024 rows and one of 309.
+        let quads = crate::tests::modular_quads(4000, 3, 50);
+        let (_dir, path) = crate::tests::write_store_file(
+            quads,
+            LayoutStrategy::Dictionary,
+            vec![crate::IndexType::SecondaryByCopy],
+        )
+        .await;
+        let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+        let loaded = loaded
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
+        let (want, _) = read_whole(&loaded).await;
+        let mapped = VortexRdfStore::from_file(&path).await.unwrap();
+        let served = mapped
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            served.quads.file(),
+            Some(FileBase { serve: Some(_), .. })
+        ));
+        let (got, left) = read_whole(&served).await;
+        assert!(got == want, "served rows");
+        assert!(
+            !left.is_empty() && left.iter().all(|&rows| rows < TASK_DECODE_MIN_ROWS),
+            "served chunks left to the stream: {left:?}"
+        );
     }
 }

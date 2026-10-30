@@ -535,9 +535,13 @@ evaluation decodes and compares its rows, work that outlasts waking a
 worker.
 Streaming reads (`quads()` and its twins) decode inside the per-split tasks
 Vortex's scan stream spawns, or, over such a filter, inside the split reads
-that evaluate its masks a split at a time; under a file-backed dictionary the
-decode may await the dictionary's own reads, so it runs at the stream's
-consumer instead.
+that evaluate its masks a split at a time. Under a file-backed dictionary the
+decode may await the dictionary's own reads, which a scan's split task cannot
+do: there a chunk decodes in its task only when its window reads complete at
+once, as over a mapping they always do, and at the stream's consumer
+otherwise. A file-backed chunk of fewer than 1,024 rows decodes at the
+consumer too, against the windows its core has in cache, where a worker would
+gain it no parallelism.
 
 **Platforms and limits.** Mapping works on Linux, macOS and Windows. A store
 file is read in place while open: truncating or rewriting it in place is

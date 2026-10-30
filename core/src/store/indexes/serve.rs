@@ -82,6 +82,21 @@ impl ServeDecode {
         }
     }
 
+    /// [`decode_columns_async`](Self::decode_columns_async) where it
+    /// finishes without waiting ([`ChunkDecode::decode_now`]); `None` leaves
+    /// the chunk to it.
+    #[cfg(feature = "file-io")]
+    pub(super) fn decode_columns_now<T: ChunkDecode>(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Option<Vec<Result<T>>> {
+        match self.chunk_rows(chunk, deleted) {
+            Ok(rows) => T::decode_now(&self.decode_layout, &rows),
+            Err(e) => Some(vec![Err(e)]),
+        }
+    }
+
     /// A chunk's live rows as four code columns, `(s, p, o, g)`: the
     /// code-payload counterpart of [`decode_columns`](Self::decode_columns)
     /// for a Dictionary decode layout, whose columns hold codes.

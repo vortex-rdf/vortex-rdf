@@ -616,6 +616,17 @@ impl FileServePlan {
     ) -> Vec<Result<T>> {
         self.decode.decode_columns_async(chunk, deleted).await
     }
+
+    /// [`decode_columns_async`](Self::decode_columns_async) where it
+    /// finishes without waiting, for a scan's split task; `None` leaves the
+    /// chunk to it.
+    pub(crate) fn decode_columns_now<T: ChunkDecode>(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Option<Vec<Result<T>>> {
+        self.decode.decode_columns_now(chunk, deleted)
+    }
 }
 
 #[cfg(test)]

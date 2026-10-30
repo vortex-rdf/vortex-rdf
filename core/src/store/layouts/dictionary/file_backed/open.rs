@@ -57,9 +57,7 @@ impl FileBackedDict {
     /// [`open`](Self::open) over a source whose every segment read waits
     /// once before it completes, as a read of storage not in memory would.
     #[cfg(test)]
-    pub(in crate::store::layouts::dictionary) async fn open_with_waiting_reads(
-        native: &NativeStoreFile,
-    ) -> Result<Option<Self>> {
+    pub(crate) async fn open_with_waiting_reads(native: &NativeStoreFile) -> Result<Option<Self>> {
         let source = Arc::new(super::fixtures::WaitingSource(native.segment_source()));
         Self::open_over(native, WINDOW_CACHE_BYTES, source).await
     }
