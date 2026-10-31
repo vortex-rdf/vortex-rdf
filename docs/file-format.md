@@ -359,8 +359,8 @@ Shared rules:
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L108)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L122))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L110)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L124))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
@@ -388,7 +388,7 @@ row ids.
 On a file-backed store an index child is never lifted into memory. Under the
 `Dictionary` layout its run is located by binary-searching the child's
 encoded chunks through the chunk probes of [§4](#4-the-quad-table)
-([`locate_component_run`](../core/src/store/indexes/file.rs#L48)): a
+([`locate_component_run`](../core/src/store/indexes/file.rs#L58)): a
 located run of at most `POINT_GATHER_MAX_ROWS` rows is point-read, a wider
 one is read as a scan of exactly that row range. A run the probes cannot
 locate — a string-keyed child under the other layouts — is answered by a
@@ -594,7 +594,7 @@ its layout:
 | — | the source's `selection` and `deleted`, and the base's `serve` — a view's restrictions ([matching.md §1](matching.md#1-what-a-match-produces)) |
 
 A file-backed store (its source's `Backend::File`, a
-[`FileBase`](../core/src/store/view/mod.rs#L100)) holds none of the rows: the
+[`FileBase`](../core/src/store/view/mod.rs#L102)) holds none of the rows: the
 file handle, a pushed-down filter and an optional serve plan, beside the
 source's selection and tombstones. Its index data stays in the index children
 and is reached by chunk probes and pushed-down scans; a `FileBase`
@@ -661,7 +661,7 @@ open rather than being read around.
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L47) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L51) |
-| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes, each run of consecutive rows in one pass (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L615) |
+| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes, each run of consecutive rows in one pass (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L622) |
 | `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L24) |
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L35) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L30) |

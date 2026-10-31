@@ -124,7 +124,7 @@ async fn masks_file_with(flat_dictionary: bool) -> (tempfile::TempDir, std::path
         let (_dir, path) = write_chunked_store(
             &masks_quads(),
             MASKS_SPLIT_ROWS,
-            false,
+            None,
             flat_dictionary,
             None,
         )

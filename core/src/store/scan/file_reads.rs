@@ -594,6 +594,18 @@ pub(crate) async fn component_point_chunk(
     columns: &[&'static str],
     range: Range<u64>,
 ) -> Result<Option<ArrayRef>> {
+    component_point_rows(file, component, columns, range.collect()).await
+}
+
+/// [`component_point_rows`] as one value column per column of `columns`, in
+/// that order, without building the chunk: the values a code read of a
+/// served run takes. `Ok(None)` declines as [`component_point_rows`] does.
+pub(crate) async fn component_point_values(
+    file: &NativeStoreFile,
+    component: &str,
+    columns: &[&'static str],
+    positions: Vec<u64>,
+) -> Result<Option<Vec<Vec<u64>>>> {
     let Some(handles) = columns
         .iter()
         .map(|c| file.component_column_chunks(component, c))
@@ -601,11 +613,38 @@ pub(crate) async fn component_point_chunk(
     else {
         return Ok(None);
     };
-    // The run's rows, under no filter: every column is read.
+    // The rows, under no filter: every column is read.
     let run = PointRows {
         handles,
         eqs: CodeEqs::default(),
-        live: range.collect(),
+        live: positions,
+    };
+    run.columns(file, columns).await
+}
+
+/// The component's `columns` at the child rows `positions` (ascending),
+/// read point by point through its cached chunk probes into one canonical
+/// child-named chunk, in the order of `positions`: a located run's rows, or
+/// the rows a narrowed served view kept of one. `Ok(None)` declines (a column
+/// or chunk without a probe).
+pub(crate) async fn component_point_rows(
+    file: &NativeStoreFile,
+    component: &str,
+    columns: &[&'static str],
+    positions: Vec<u64>,
+) -> Result<Option<ArrayRef>> {
+    let Some(handles) = columns
+        .iter()
+        .map(|c| file.component_column_chunks(component, c))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    // The rows, under no filter: every column is read.
+    let run = PointRows {
+        handles,
+        eqs: CodeEqs::default(),
+        live: positions,
     };
     let Some(values) = run.columns(file, columns).await? else {
         return Ok(None);

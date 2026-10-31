@@ -170,6 +170,17 @@ pub(crate) fn shared_code_primitive(
     (prim.ptype() == CODE_PTYPE).then_some(prim)
 }
 
+/// Whether a base child keeps its decode once made: a canonical column, or a
+/// `vortex.shared` wrapper, whose one-way cache holds its decoded source. A
+/// child of any other encoding (wire-encoded, as a store read off a file or
+/// adopted from bytes keeps it) decodes again on every take, so a gather at
+/// scattered ids is a whole-column decode per chunk. Decodes nothing.
+pub(crate) fn decodes_once(child: &ArrayRef) -> bool {
+    use vortex_layout::arrays::shared::Shared;
+
+    child.is_canonical() || child.as_opt::<Shared>().is_some()
+}
+
 /// The non-decoding half of [`shared_code_primitive`]: a base child's
 /// canonical code primitive when one already exists (the column itself, or a
 /// `vortex.shared` wrapper whose cache an earlier read filled). `None` when

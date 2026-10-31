@@ -5,55 +5,17 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use common::{Quad, builds, quads as make_quads, write};
+use common::{
+    Built, Quad, as_refs, builds, drain, patterns, quads as make_quads, reference_quads, scan,
+    write,
+};
 use vortex_rdf_core::{CodePattern, LayoutStrategy};
+use vortex_rdf_jni::cursor::QuadCursor;
 use vortex_rdf_jni::engine::{ROW_BYTES, Store};
+use vortex_rdf_jni::payload::Limits;
 
 fn quads() -> Vec<Quad> {
     make_quads(400)
-}
-
-/// The quads matching a pattern of spellings, by scan.
-fn scan(quads: &[Quad], pattern: &[Option<&str>; 4]) -> BTreeSet<Quad> {
-    quads
-        .iter()
-        .filter(|q| {
-            pattern
-                .iter()
-                .zip(q.iter())
-                .all(|(want, have)| want.is_none_or(|w| w == have))
-        })
-        .cloned()
-        .collect()
-}
-
-/// Patterns: every subset of positions bound to a stored quad's own terms, for a spread of stored quads, plus
-/// a pattern per position bound to a well-formed term no quad holds.
-fn patterns(quads: &[Quad]) -> Vec<[Option<String>; 4]> {
-    let mut out = Vec::new();
-    for quad in quads.iter().step_by(29) {
-        for mask in 0..16u8 {
-            out.push(std::array::from_fn(|i| {
-                (mask & (1 << i) != 0).then(|| quad[i].clone())
-            }));
-        }
-    }
-    let absent = [
-        "<http://example.org/absent>",
-        "<http://example.org/absent>",
-        "<http://example.org/absent>",
-        "<http://example.org/absent>",
-    ];
-    for i in 0..4 {
-        out.push(std::array::from_fn(|j| {
-            (i == j).then(|| absent[j].to_string())
-        }));
-    }
-    out
-}
-
-fn as_refs(pattern: &[Option<String>; 4]) -> [Option<&str>; 4] {
-    std::array::from_fn(|i| pattern[i].as_deref())
 }
 
 /// The code at `position` of a row [`Store::match_codes`] wrote.
@@ -86,37 +48,177 @@ fn term_patterns_match_a_scan_on_every_layout() {
                     want.len() as u64,
                     "{tag}: count"
                 );
-                let all = store.quads(r[0], r[1], r[2], r[3], 0, None).unwrap();
+                let all = drain(
+                    store
+                        .quads_cursor(r[0], r[1], r[2], r[3], Limits::DEFAULT)
+                        .unwrap(),
+                );
                 assert_eq!(
                     all.iter().cloned().collect::<BTreeSet<_>>(),
                     want,
                     "{tag}: quads"
                 );
                 assert_eq!(all.len(), want.len(), "{tag}: no duplicate rows");
-                for page in [1usize, 7]
-                    .into_iter()
-                    .filter(|&page| page == 7 || want.len() < 10)
-                {
-                    let mut seen = Vec::new();
-                    let mut offset = 0u64;
-                    while (offset as usize) < want.len() {
-                        let rows = store
-                            .quads(r[0], r[1], r[2], r[3], offset, Some(page))
-                            .unwrap();
-                        assert_eq!(
-                            rows.len(),
-                            page.min(want.len() - offset as usize),
-                            "{tag}: page {page} at {offset}"
-                        );
-                        seen.extend(rows);
-                        offset += page as u64;
-                    }
-                    assert_eq!(
-                        seen.into_iter().collect::<BTreeSet<_>>(),
-                        want,
-                        "{tag}: pages of {page}"
+            }
+        }
+    }
+}
+
+/// The per-term read the tests compare the packed transfer against is itself right: on every build, both
+/// residencies and every pattern it gives the scan's rows, once each.
+#[test]
+fn reference_reads_the_scan_on_every_build() {
+    let quads = quads();
+    // The oracle carries the hard spellings: an astral character only they hold.
+    assert!(quads.iter().any(|q| q[2].contains('\u{10348}')));
+    let dir = tempfile::tempdir().unwrap();
+    let all = builds();
+    assert_eq!(all.len(), 5, "five builds");
+    for built in all {
+        let path = write(dir.path(), &built, &quads);
+        if built.name == "typed" {
+            assert_eq!(Store::open(&path, false).unwrap().layout(), "typed-object");
+        }
+        for in_memory in [false, true] {
+            for pattern in patterns(&quads) {
+                let r = as_refs(&pattern);
+                let want = scan(&quads, &r);
+                let tag = format!("{} in_memory={in_memory} {pattern:?}", built.name);
+                let rows = reference_quads(&path, in_memory, r);
+                assert_eq!(rows.len(), want.len(), "{tag}: no duplicate rows");
+                assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), want, "{tag}");
+            }
+        }
+    }
+}
+
+/// The cursor's rows against the per-term read's, row for row, on every build, residency and pattern, under
+/// each of `limits`.
+fn cursor_matches_the_reference(limits: &[Limits]) {
+    let quads = quads();
+    let dir = tempfile::tempdir().unwrap();
+    for built in builds() {
+        let path = write(dir.path(), &built, &quads);
+        for in_memory in [false, true] {
+            let store = Store::open(&path, in_memory).unwrap();
+            for pattern in patterns(&quads) {
+                let r = as_refs(&pattern);
+                let want = reference_quads(&path, in_memory, r);
+                for &limits in limits {
+                    let tag = format!(
+                        "{} in_memory={in_memory} {pattern:?} {limits:?}",
+                        built.name
                     );
+                    let cursor = store.quads_cursor(r[0], r[1], r[2], r[3], limits).unwrap();
+                    assert_eq!(cursor.rows(), want.len(), "{tag}: rows");
+                    assert_eq!(drain(cursor), want, "{tag}");
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn cursor_reads_equal_the_reference_row_for_row() {
+    cursor_matches_the_reference(&[Limits::DEFAULT]);
+}
+
+#[test]
+fn cursor_reads_survive_every_chunk_cut() {
+    cursor_matches_the_reference(&[
+        Limits::new(1, 64, 16).unwrap(),
+        Limits::new(7, 256, 64).unwrap(),
+    ]);
+}
+
+#[test]
+fn cursors_can_cross_threads() {
+    fn send<T: Send>() {}
+    send::<QuadCursor>();
+}
+
+/// After a chunk the byte budget cut, the next one offers the rows that fit, growing back at most twofold a
+/// chunk: rows of long literals followed by short ones never jump from a few rows a chunk to many.
+#[test]
+fn cursor_paces_chunks_by_the_last_fit() {
+    let long = "x".repeat(200);
+    let quads: Vec<Quad> = (0..40)
+        .map(|i| format!("\"{long} {i}\""))
+        .chain((0..400).map(|i| format!("\"{i}\"")))
+        .enumerate()
+        .map(|(i, o)| {
+            [
+                format!("<http://example.org/s{i:03}>"),
+                "<http://example.org/p>".to_string(),
+                o,
+                String::new(),
+            ]
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let limits = Limits::new(1024, 2048, 512).unwrap();
+    for (name, layout) in [
+        ("dictionary", LayoutStrategy::Dictionary),
+        ("default", LayoutStrategy::Default),
+    ] {
+        let built = Built {
+            name,
+            layout,
+            indexes: vec![],
+        };
+        let store = Store::open(&write(dir.path(), &built, &quads), false).unwrap();
+        let cursor = store.quads_cursor(None, None, None, None, limits).unwrap();
+        let mut held = Vec::new();
+        for payload in cursor {
+            let payload = payload.unwrap();
+            held.push(payload.positions() / 4);
+        }
+        assert_eq!(held.iter().sum::<usize>(), quads.len(), "{name}");
+        assert!(held[0] < 10, "{name}: long rows cut early: {held:?}");
+        for pair in held.windows(2) {
+            assert!(pair[1] <= 2 * pair[0], "{name}: {held:?}");
+        }
+        assert!(
+            held.iter().any(|&n| n > 20),
+            "{name}: short rows grow back: {held:?}"
+        );
+    }
+}
+
+#[test]
+fn decode_payload_matches_decode() {
+    let quads = quads();
+    let dir = tempfile::tempdir().unwrap();
+    for built in builds()
+        .into_iter()
+        .filter(|b| b.layout == LayoutStrategy::Dictionary)
+    {
+        let path = write(dir.path(), &built, &quads);
+        for in_memory in [false, true] {
+            let store = Store::open(&path, in_memory).unwrap();
+            let tag = format!("{} in_memory={in_memory}", built.name);
+            let distinct: BTreeSet<&String> = quads.iter().flat_map(|q| q.iter()).collect();
+            let mut codes: Vec<u64> = distinct
+                .iter()
+                .map(|t| store.encode(t).unwrap().unwrap())
+                .collect();
+            codes.extend([u64::MAX, codes[0], codes[3], codes[0]]);
+            let check = |from: usize, payload: &vortex_rdf_jni::payload::Payload, n: usize| {
+                for i in 0..n {
+                    let want = store.decode(codes[from + i]).unwrap();
+                    assert_eq!(payload.term(i), want.as_deref(), "{tag}: code {}", from + i);
+                }
+            };
+            let (payload, n) = store.decode_payload(&codes, Limits::DEFAULT).unwrap();
+            assert_eq!(n, codes.len(), "{tag}: one call");
+            check(0, &payload, n);
+            let three = Limits::new(3, 16 << 20, 1 << 20).unwrap();
+            let mut from = 0;
+            while from < codes.len() {
+                let (payload, n) = store.decode_payload(&codes[from..], three).unwrap();
+                assert_eq!(n, 3.min(codes.len() - from), "{tag}: three a call");
+                check(from, &payload, n);
+                from += n;
             }
         }
     }
@@ -135,8 +237,9 @@ fn term_patterns_report_what_a_caller_can_get_wrong() {
         .to_string();
     assert!(error.contains("pattern subject"), "{error}");
     let error = store
-        .quads(None, Some("not a term"), None, None, 0, None)
-        .unwrap_err()
+        .quads_cursor(None, Some("not a term"), None, None, Limits::DEFAULT)
+        .err()
+        .expect("a malformed predicate")
         .to_string();
     assert!(error.contains("pattern predicate"), "{error}");
     assert!(Store::open(dir.path().join("missing.vortex").to_str().unwrap(), false).is_err());
@@ -194,9 +297,16 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
                         .unwrap_or_else(|| panic!("{tag}: {t} has no code"))
                 })
                 .collect();
-            let decoded = store.decode_many(&codes).unwrap();
-            for (term, back) in distinct.iter().zip(&decoded) {
-                assert_eq!(back.as_deref(), Some(term.as_str()), "{tag}: round trip");
+            let (decoded, n) = store.decode_payload(&codes, Limits::DEFAULT).unwrap();
+            assert_eq!(n, codes.len(), "{tag}: one chunk");
+            let strings = store.decode_many(&codes).unwrap();
+            for (i, term) in distinct.iter().enumerate() {
+                assert_eq!(decoded.term(i), Some(term.as_str()), "{tag}: round trip");
+                assert_eq!(
+                    strings[i].as_deref(),
+                    Some(term.as_str()),
+                    "{tag}: a string apiece"
+                );
             }
             assert_eq!(
                 store.decode(codes[0]).unwrap().as_deref(),
@@ -273,6 +383,7 @@ fn a_store_without_a_dictionary_refuses_code_calls_only() {
         store.term_count().map(|_| ()),
         store.encode("<http://example.org/s1>").map(|_| ()),
         store.count_codes(CodePattern::default()).map(|_| ()),
+        store.decode_payload(&[0], Limits::DEFAULT).map(|_| ()),
     ] {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("no term dictionary"), "{error}");

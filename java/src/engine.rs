@@ -11,12 +11,16 @@ use vortex_rdf_core::{
     CodePattern, DictReader, KindRanges, Probe, Result, VortexRdfError, VortexRdfStore,
 };
 
+use crate::cursor::QuadCursor;
+use crate::payload::{Limits, Payload, encode_lookup};
+use crate::streams::{CodeStream, TermStream, check_batch_rows};
+
 /// Bytes per row [`Store::match_codes`] writes: four codes of eight bytes.
 pub const ROW_BYTES: usize = 32;
 
 /// One runtime for every store of the process, as in the Python bindings: a store's reads are async, the
 /// caller's threads block on them.
-static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -77,45 +81,44 @@ impl Store {
         Ok(RUNTIME.block_on(self.store.count_probe(&probe))? as u64)
     }
 
-    /// The quads matching a pattern as `(s, p, o, g)` N-Triples spellings, `limit` rows after `offset` in the
-    /// store's row order: a Dictionary store's matched codes decoded a column at a time, the matched quads'
-    /// terms otherwise.
-    pub fn quads(
+    /// The quads matching a pattern of N-Triples spellings, in the store's row order, as a cursor that hands
+    /// them out in packed chunks under `limits`: a Dictionary store's matched codes, gathered (in index order
+    /// when an index serves the pattern), or the matched quads' terms otherwise.
+    pub fn quads_cursor(
         &self,
         s: Option<&str>,
         p: Option<&str>,
         o: Option<&str>,
         g: Option<&str>,
-        offset: u64,
-        limit: Option<usize>,
-    ) -> Result<Vec<[String; 4]>> {
-        let probe = Probe::parse(s, p, o, g)?.window(offset as usize, limit);
+        limits: Limits,
+    ) -> Result<QuadCursor> {
+        let probe = Probe::parse(s, p, o, g)?;
         let view = RUNTIME.block_on(self.store.run_probe(&probe))?;
         if let Some(dict) = &self.dict
-            && let Some([s, p, o, g]) = RUNTIME.block_on(view.code_columns_gathered())?
+            && let Some(columns) = RUNTIME.block_on(view.code_columns_gathered())?
         {
-            let decode = |column| RUNTIME.block_on(dict.decode_many(column));
-            let rows = decode(&s)?
-                .into_iter()
-                .zip(decode(&p)?)
-                .zip(decode(&o)?)
-                .zip(decode(&g)?);
-            return rows
-                .map(|(((s, p), o), g)| Ok([spelled(s)?, spelled(p)?, spelled(o)?, spelled(g)?]))
-                .collect();
+            return Ok(QuadCursor::codes(dict.clone(), columns, limits));
         }
         let rows = RUNTIME.block_on(view.shared_quads_vec())?;
-        Ok(rows
-            .iter()
-            .map(|q| {
-                [
-                    q.s.to_string(),
-                    q.p.to_string(),
-                    q.o.to_string(),
-                    q.g.to_string(),
-                ]
-            })
-            .collect())
+        Ok(QuadCursor::shared(rows, limits))
+    }
+
+    /// The quads matching a pattern of N-Triples spellings as a stream, in the match's order (a
+    /// `secondary-by-copy` index's for a pattern it serves, else base row order), read in chunks of at most
+    /// `batch_rows` rows and sent as packed payloads ([`TermStream`]). The pattern is parsed and matched now; the
+    /// rows are read as the stream is pulled.
+    pub fn term_stream(
+        &self,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+        batch_rows: usize,
+    ) -> Result<TermStream> {
+        check_batch_rows(batch_rows)?;
+        let probe = Probe::parse(s, p, o, g)?;
+        let view = RUNTIME.block_on(self.store.run_probe(&probe))?;
+        TermStream::open(view, self.dict.clone(), batch_rows)
     }
 
     // ---- term codes, Dictionary layout ----
@@ -160,6 +163,27 @@ impl Store {
         RUNTIME.block_on(self.dict()?.decode_many(codes))
     }
 
+    /// The terms of `codes` from the first, as one packed chunk under `limits`, and how many codes it holds
+    /// (at least one, unless `codes` is empty). A code outside the dictionary holds no term.
+    pub fn decode_payload(&self, codes: &[u64], limits: Limits) -> Result<(Payload, usize)> {
+        RUNTIME.block_on(encode_lookup(self.dict()?, codes, limits))
+    }
+
+    /// The quads matching a code pattern as a stream of their codes, in the match's order (a
+    /// `secondary-by-copy` index's for a pattern it serves, else base row order), read in chunks of at most
+    /// `batch_rows` rows ([`CodeStream`]); empty for a pattern no quad can match (a code past the dictionary, or
+    /// one in a position its term's kind cannot take).
+    pub fn code_stream(&self, pattern: CodePattern, batch_rows: usize) -> Result<CodeStream> {
+        check_batch_rows(batch_rows)?;
+        self.dict()?;
+        match RUNTIME.block_on(self.store.code_probe(pattern))? {
+            None => Ok(CodeStream::empty()),
+            Some(probe) => {
+                CodeStream::open(&RUNTIME.block_on(self.store.run_probe(&probe))?, batch_rows)
+            }
+        }
+    }
+
     /// The number of quads matching a code pattern, exact and without reading rows.
     pub fn count_codes(&self, pattern: CodePattern) -> Result<u64> {
         RUNTIME.block_on(self.store.count_code_pattern(pattern))
@@ -186,11 +210,4 @@ impl Store {
         }
         Ok(rows)
     }
-}
-
-/// A matched row's decoded term; `None` is a code outside the dictionary.
-fn spelled(term: Option<String>) -> Result<String> {
-    term.ok_or_else(|| {
-        VortexRdfError::Deserialization("a matched row holds a code outside the dictionary".into())
-    })
 }

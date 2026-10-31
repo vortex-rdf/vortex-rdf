@@ -3,11 +3,13 @@
 //! that matches it, chains a match on a view that still holds a pattern's
 //! pending matches into one match of both, and decides what a view's ids may
 //! leave pending ([`IdsNeed`]); `memory` matches an in-memory base, `file` a
-//! file's, and `tail` the append tail.
+//! file's, `served` a narrowed served view's rows in its index's order, and
+//! `tail` the append tail.
 
 #[cfg(feature = "file-io")]
 mod file;
 mod memory;
+mod served;
 mod tail;
 
 use std::sync::Arc;
@@ -119,6 +121,14 @@ impl VortexRdfStore {
             && let Some(both) = first.and(pattern)
         {
             return self.match_both(both, need).await;
+        }
+        // A narrowed served view (a window, keep or partition of a served
+        // match) keeps its rows the pattern matches, in its index's order.
+        // Boxed, so every other match's future stays its own size.
+        if self.is_narrowed_served()
+            && let Some(chained) = Box::pin(self.served_chain(pattern)).await?
+        {
+            return Ok(chained);
         }
         let t = debug::timer();
 

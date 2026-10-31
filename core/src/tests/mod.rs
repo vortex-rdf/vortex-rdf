@@ -14,6 +14,7 @@ mod adoption;
 mod atomic_write;
 mod builders;
 mod chained;
+mod chunk_reads;
 mod chunks;
 mod dictionary;
 mod dictionary_file_backed;
@@ -22,6 +23,7 @@ mod dictionary_handle;
 // shared escaped-literal case list.
 pub(crate) mod escaping;
 mod file_backed;
+mod index_order;
 mod indexes;
 mod indexes_file;
 mod leaf_geometry;
@@ -207,7 +209,7 @@ async fn write_chunked_store_file(
     quads: &[Quad],
     chunk_rows: usize,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
-    write_chunked_store(quads, chunk_rows, false, false, None).await
+    write_chunked_store(quads, chunk_rows, None, false, None).await
 }
 
 /// [`write_chunked_store_file`] with the reference index built as well and
@@ -218,11 +220,13 @@ async fn write_chunked_reference_store_file(
     quads: &[Quad],
     chunk_rows: usize,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
-    write_chunked_store(quads, chunk_rows, true, false, None).await
+    let index = Some(IndexType::SecondaryByReference);
+    write_chunked_store(quads, chunk_rows, index, false, None).await
 }
 
 /// The file behind [`write_chunked_store_file`] and
-/// [`write_chunked_reference_store_file`]; with `flat_dictionary` its
+/// [`write_chunked_reference_store_file`], with `index`'s children, if any,
+/// written in `chunk_rows`-row flat leaves too; with `flat_dictionary` its
 /// dictionary child is one flat struct leaf, a shape the file-backed
 /// dictionary declines, so a mapped open holds the dictionary resident. With
 /// `unprobed`, that primary column is written as a dictionary whose codes are
@@ -231,7 +235,7 @@ async fn write_chunked_reference_store_file(
 async fn write_chunked_store(
     quads: &[Quad],
     chunk_rows: usize,
-    reference_index: bool,
+    index: Option<IndexType>,
     flat_dictionary: bool,
     unprobed: Option<&str>,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -262,14 +266,12 @@ async fn write_chunked_store(
         dictionary.strategy = std::sync::Arc::new(FlatLayoutStrategy::default());
     }
     let mut components = vec![dictionary];
-    if reference_index {
-        // The children's rows are the global `(value, row id)` sort of the
-        // codes, cut into `chunk_rows`-row chunks; each chunk is one flat leaf
-        // of each of its columns.
-        for component in IndexType::SecondaryByReference
-            .components(IndexInput::Codes(&codes))
-            .unwrap()
-        {
+    if let Some(index) = index {
+        // The children's rows in their own sort order (a reference child's
+        // the global `(value, row id)` sort of the codes), cut into
+        // `chunk_rows`-row chunks; each chunk is one flat leaf of each of its
+        // columns.
+        for component in index.components(IndexInput::Codes(&codes)).unwrap() {
             let rows = component.rows().unwrap().clone().into_array();
             let cut: Vec<vortex_array::ArrayRef> = (0..rows.len())
                 .step_by(chunk_rows)
@@ -1270,11 +1272,31 @@ async fn sorted_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     rows
 }
 
-/// The view's rows in base row order: a keep that admits every code drops
-/// any serve plan without dropping a row.
+/// The view's rows in base row order: the rows of the view with no serve
+/// plan ([`debug_unserved`](VortexRdfStore::debug_unserved)).
 async fn base_ordered_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let all = Keep::range(0..TermCode::MAX);
-    row_list(&view.keep(QuadColumn::S, &all).await.unwrap()).await
+    row_list(&view.debug_unserved().await.unwrap()).await
+}
+
+/// `rows` in `index:posg`'s order, (p, o, s, g): the order a served `?p??`
+/// view reads them in.
+fn posg(mut rows: Vec<[TermCode; 4]>) -> Vec<[TermCode; 4]> {
+    rows.sort_unstable_by_key(|r| (r[1], r[2], r[0], r[3]));
+    rows
+}
+
+/// The view's rows in the order its reads yield them: a view `index:posg`
+/// serves in (p, o, s, g) order ([`posg`]), any other in base row order
+/// ([`base_ordered_codes`]), the order of every view another index serves
+/// too, whose own order puts no unbound role ahead of the subject. Takes the
+/// view's statistics (see the note on [`served_component`]).
+async fn read_order_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    let stats = view.view_statistics().unwrap();
+    let base = base_ordered_codes(view).await;
+    match stats.served_component {
+        Some("index:posg") => posg(base),
+        _ => base,
+    }
 }
 
 /// The rows of one [`code_chunks`](VortexRdfStore::code_chunks) chunk over

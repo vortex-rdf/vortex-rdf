@@ -5,11 +5,13 @@ import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongFunction;
 import java.util.function.LongToIntFunction;
@@ -44,9 +46,16 @@ public final class VortexStore implements AutoCloseable {
 	/** Bytes per row written by {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)}: four longs. */
 	public static final int ROW_BYTES = 32;
 
+	/** The most rows {@link #iterateQuads} and {@link #matchCodeChunks} read at a time, unless told otherwise. */
+	public static final int DEFAULT_BATCH_ROWS = 65_536;
+
 	private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 	private long handle;
 	private final TermDictionary dictionary;
+	/** The native streams of this store's open iterators, not the iterators, so a forgotten one can be collected. */
+	private final Set<NativeStream> streams = new HashSet<>();
+	/** Set by {@link #close()}: an iterator that has not ended refuses to go on. */
+	private volatile boolean closed;
 
 	private VortexStore(long handle) {
 		this.handle = handle;
@@ -107,17 +116,47 @@ public final class VortexStore implements AutoCloseable {
 		return handle;
 	}
 
-	/** Closes the store, after the calls in progress; closing twice is harmless. */
+	/**
+	 * Closes the store, after the calls in progress, and frees its open iterators' native streams; closing twice is
+	 * harmless.
+	 */
 	@Override
 	public void close() {
 		lock.writeLock().lock();
 		try {
 			if (handle != 0) {
+				closed = true;
+				NativeStream[] open;
+				synchronized (streams) {
+					open = streams.toArray(new NativeStream[0]);
+				}
+				for (NativeStream stream : open) {
+					stream.free();
+				}
 				Native.close(handle);
 				handle = 0;
 			}
 		} finally {
 			lock.writeLock().unlock();
+		}
+	}
+
+	/** Whether {@link #close()} has run. */
+	boolean isClosed() {
+		return closed;
+	}
+
+	/** Tracks an iterator's native stream, for {@link #close()} to free. */
+	void track(NativeStream stream) {
+		synchronized (streams) {
+			streams.add(stream);
+		}
+	}
+
+	/** Stops tracking a freed native stream. */
+	void forget(NativeStream stream) {
+		synchronized (streams) {
+			streams.remove(stream);
 		}
 	}
 
@@ -166,23 +205,84 @@ public final class VortexStore implements AutoCloseable {
 
 	/** Every quad matching a pattern of terms, as {@code {s, p, o, g}} spellings, in the store's row order. */
 	public List<String[]> quads(String s, String p, String o, String g) {
-		return quads(s, p, o, g, 0, -1);
+		return quads(s, p, o, g, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
 	}
 
-	/** {@code limit} quads (all when negative) after {@code offset} rows of the match, in the store's row order. */
-	public List<String[]> quads(String s, String p, String o, String g, long offset, int limit) {
-		if (offset < 0) {
-			throw new IllegalArgumentException("offset < 0");
+	/**
+	 * {@link #quads(String, String, String, String)} with the chunk limits the rows cross in, which tests set small to
+	 * cut every chunk. The read's cursor lives within this call: freed before it returns or throws.
+	 */
+	List<String[]> quads(String s, String p, String o, String g, int chunkRows, int chunkBytes, int largeTerm) {
+		return call(h -> {
+			Object[] first = Native.quadsOpen(h, s, p, o, g, chunkRows, chunkBytes, largeTerm);
+			long cursor = Payload.cursor(first);
+			try {
+				List<String[]> rows = new ArrayList<>(Payload.rows(first));
+				Payload.addQuads(first, rows);
+				Object[] next;
+				while (cursor != 0 && (next = Native.cursorNext(cursor)) != null) {
+					Payload.addQuads(next, rows);
+				}
+				return rows;
+			} finally {
+				if (cursor != 0) {
+					Native.cursorClose(cursor);
+				}
+			}
+		});
+	}
+
+	/** {@link #iterateQuads(String, String, String, String, int)} {@link #DEFAULT_BATCH_ROWS} rows at a time. */
+	public QuadIterator iterateQuads(String s, String p, String o, String g) {
+		return iterateQuads(s, p, o, g, DEFAULT_BATCH_ROWS);
+	}
+
+	/**
+	 * The quads matching a pattern of terms, read at most {@code batchRows} rows at a time: the rows of
+	 * {@link #quads(String, String, String, String)} in its order, base row order ({@code (s, p, o, g)}) except on a
+	 * pattern a {@code secondary-by-copy} index serves, read in that index's order. The pattern is checked and matched
+	 * now; the rows are read as the iterator is pulled. Close the iterator, or drain it, when done.
+	 *
+	 * @param batchRows the most rows read at a time, at least 1
+	 */
+	public QuadIterator iterateQuads(String s, String p, String o, String g, int batchRows) {
+		checkBatchRows(batchRows);
+		return call(h -> {
+			NativeStream stream = new NativeStream(this, Native.termStreamOpen(h, s, p, o, g, batchRows));
+			track(stream);
+			return new QuadIterator(this, stream, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
+		});
+	}
+
+	private static void checkBatchRows(int batchRows) {
+		if (batchRows < 1) {
+			throw new IllegalArgumentException("batchRows must be at least 1");
 		}
-		String[] flat = call(h -> Native.quads(h, s, p, o, g, offset, limit));
-		List<String[]> rows = new ArrayList<>(flat.length / 4);
-		for (int i = 0; i < flat.length; i += 4) {
-			rows.add(new String[] { flat[i], flat[i + 1], flat[i + 2], flat[i + 3] });
-		}
-		return rows;
 	}
 
 	// ---- term codes ----
+
+	/** {@link #matchCodeChunks(long, long, long, long, int)} {@link #DEFAULT_BATCH_ROWS} rows at a time. */
+	public CodeChunks matchCodeChunks(long s, long p, long o, long g) {
+		return matchCodeChunks(s, p, o, g, DEFAULT_BATCH_ROWS);
+	}
+
+	/**
+	 * The quads matching a pattern of codes (negative is free) as their codes, read at most {@code batchRows} rows at
+	 * a time: the rows of {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)} in its order, base row
+	 * order except on a pattern a {@code secondary-by-copy} index serves, read in that index's order. A code that
+	 * cannot match gives no rows. Close the chunks, or drain them, when done.
+	 *
+	 * @param batchRows the most rows read at a time, at least 1
+	 */
+	public CodeChunks matchCodeChunks(long s, long p, long o, long g, int batchRows) {
+		checkBatchRows(batchRows);
+		return call(h -> {
+			NativeStream stream = new NativeStream(this, Native.codeStreamOpen(h, s, p, o, g, batchRows));
+			track(stream);
+			return new CodeChunks(this, stream);
+		});
+	}
 
 	/** The number of quads matching a pattern of codes, exact and without reading rows; negative is free. */
 	public long countCodes(long s, long p, long o, long g) {
@@ -202,22 +302,18 @@ public final class VortexStore implements AutoCloseable {
 	public int matchCodes(long s, long p, long o, long g, long offset, ByteBuffer out, int maxRows) {
 		Objects.requireNonNull(out, "out");
 		checkWindow(offset, maxRows);
+		checkCodeBuffer(out, maxRows);
+		return callInt(h -> Native.matchCodes(h, s, p, o, g, out, offset, maxRows));
+	}
+
+	/** Refuses a buffer codes cannot be written into: not writable, direct and native-order, or under maxRows rows. */
+	static void checkCodeBuffer(ByteBuffer out, int maxRows) {
+		Objects.requireNonNull(out, "out");
 		if (!out.isDirect() || out.isReadOnly() || out.order() != ByteOrder.nativeOrder()
 				|| out.capacity() < (long) maxRows * ROW_BYTES) {
 			throw new IllegalArgumentException("out must be a writable, direct, native-order buffer of at least maxRows * "
 					+ ROW_BYTES + " bytes");
 		}
-		return callInt(h -> Native.matchCodes(h, s, p, o, g, out, offset, maxRows));
-	}
-
-	/** {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)} into a new array of four codes per row. */
-	public long[] matchCodes(long s, long p, long o, long g, long offset, int limit) {
-		checkWindow(offset, limit);
-		ByteBuffer out = ByteBuffer.allocateDirect(Math.multiplyExact(limit, ROW_BYTES)).order(ByteOrder.nativeOrder());
-		int rows = matchCodes(s, p, o, g, offset, out, limit);
-		long[] codes = new long[4 * rows];
-		out.asLongBuffer().get(codes);
-		return codes;
 	}
 
 	private static void checkWindow(long offset, int rows) {

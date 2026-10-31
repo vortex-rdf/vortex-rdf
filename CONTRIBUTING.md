@@ -45,9 +45,10 @@ point at, and re-point the anchors it reports.
 The root `README.md` is a front page: it links only into `docs/`, the binding
 READMEs and this file, never into `core/src`, so it needs no regeneration when
 code moves. Its Rust snippets are compiled as doctests of `vortex-rdf-core`
-(`cargo test -p vortex-rdf-core --doc`); its Python and JavaScript snippets are
-byte-identical copies of the Quick start blocks in `python/README.md` and
-`js/README.md`, so change those first and copy.
+(`cargo test -p vortex-rdf-core --doc`); its Python, JavaScript and Java
+snippets are byte-identical copies of the Quick start blocks in
+`python/README.md`, `js/README.md` and `java/README.md`, so change those first
+and copy.
 
 ## Changelog
 

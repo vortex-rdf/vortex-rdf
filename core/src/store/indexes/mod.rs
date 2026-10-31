@@ -22,8 +22,10 @@ use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
+use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
@@ -43,11 +45,11 @@ pub(crate) mod serve;
 
 pub(crate) use components::{
     ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
-    indexes_from_components, known_component, sorted_row_ids,
+    indexes_from_components, known_component, run_order_row_ids, sorted_row_ids,
 };
 #[cfg(feature = "file-io")]
 pub(crate) use file::{FileServePlan, read_located_rids, scan_index_row_ids};
-pub(crate) use serve::InMemoryServePlan;
+pub(crate) use serve::{ComponentRows, InMemoryServePlan, ServedRows};
 
 /// The primary-row-id column every persisted index child carries beside its
 /// own columns: the currency every resolution answers in, and the one column
@@ -438,8 +440,37 @@ pub(crate) enum ResolvedRowIds {
 /// both return the stored buffer. No lock is held across the computation.
 #[derive(Clone)]
 pub(crate) struct LazyRowIds {
-    cell: Arc<OnceLock<Buffer<RowId>>>,
+    /// The caches a match's ids fill, shared with every clone and the serve
+    /// plan; `None` for a narrowed view's ids, which keep their own sort
+    /// beside them ([`LazyRowIdSource::Unsorted`]) and so cost a narrowing
+    /// no allocation.
+    cells: Option<Arc<LazyCells>>,
     source: LazyRowIdSource,
+}
+
+/// What a [`LazyRowIds`] computes on first need, kept for every clone of the
+/// view that carries it and, in memory, for its serve plan: the ids in base
+/// order, and a component run's ids in the component's own order. A served
+/// read takes the run order, decoded once; a consumer that needs base order
+/// sorts once, from the run order when that is decoded.
+#[derive(Default)]
+pub(crate) struct LazyCells {
+    sorted: OnceLock<Buffer<RowId>>,
+    run_order: OnceLock<Buffer<RowId>>,
+}
+
+impl LazyCells {
+    /// The ids of the component run `rids` (a rid-column slice), in the
+    /// component's order, decoded on the first call ([`run_order_row_ids`])
+    /// and kept: the one decode a served view's reads and its lazy ids
+    /// share.
+    pub(crate) fn run_order_of(&self, rids: &ArrayRef) -> Result<Buffer<RowId>> {
+        if let Some(ids) = self.run_order.get() {
+            return Ok(ids.clone());
+        }
+        let ids = run_order_row_ids(rids.clone())?;
+        Ok(self.run_order.get_or_init(|| ids).clone())
+    }
 }
 
 /// Where a [`LazyRowIds`]' ids come from, split by backend as the serve plans
@@ -452,6 +483,16 @@ enum LazyRowIdSource {
     /// rids are already in row id order, so a window of the run can be cut
     /// before anything is decoded.
     Component { rids: ArrayRef, ascending: bool },
+    /// A narrowed served view's ids, in any order (its index's), sorted into
+    /// base order only on first need, into `sorted`: a cache each clone made
+    /// before that copies rather than shares, as base-order consumers of a
+    /// narrowed view are rare. `live` when they leave out every tombstoned
+    /// row, so they count as they are.
+    Unsorted {
+        ids: Buffer<RowId>,
+        live: bool,
+        sorted: OnceLock<Buffer<RowId>>,
+    },
     /// File-backed: the rid-only pushed-down scan of the index child
     /// ([`scan_index_row_ids`]) the eager path would have run at match time.
     /// The child binds through its file's memo under its own name, so the
@@ -484,7 +525,31 @@ impl LazyRowIds {
     /// a read answered without them.
     #[cfg(test)]
     pub(crate) fn debug_materialized(&self) -> bool {
-        self.cell.get().is_some()
+        self.sorted_cell().get().is_some()
+    }
+
+    /// Where the ids sorted into base order are kept: a narrowed view's own
+    /// cache, else the match's shared one.
+    fn sorted_cell(&self) -> &OnceLock<Buffer<RowId>> {
+        match (&self.source, &self.cells) {
+            (LazyRowIdSource::Unsorted { sorted, .. }, _) => sorted,
+            (_, Some(cells)) => &cells.sorted,
+            (_, None) => unreachable!("a match's ids carry their caches"),
+        }
+    }
+
+    /// The caches a match's ids share with the view's clones and its serve
+    /// plan.
+    fn shared_cells(&self) -> &Arc<LazyCells> {
+        self.cells
+            .as_ref()
+            .expect("a match's ids carry their caches")
+    }
+
+    /// The caches these ids fill, for a serve plan reading the same run to
+    /// share ([`LazyCells`]).
+    pub(crate) fn cells(&self) -> Arc<LazyCells> {
+        Arc::clone(self.shared_cells())
     }
 
     /// Lazy ids over an in-memory component's matched rid run, in the
@@ -493,8 +558,22 @@ impl LazyRowIds {
     /// are ordered by `(val, rid)`).
     pub(crate) fn from_component_run(rids: ArrayRef, ascending: bool) -> Self {
         Self {
-            cell: Arc::new(OnceLock::new()),
+            cells: Some(Arc::default()),
             source: LazyRowIdSource::Component { rids, ascending },
+        }
+    }
+
+    /// Lazy ids of a narrowed served view: `ids` in any order, sorted into
+    /// base order on first need. `live` when they leave out every tombstoned
+    /// row.
+    pub(crate) fn from_unsorted_ids(ids: Buffer<RowId>, live: bool) -> Self {
+        Self {
+            cells: None,
+            source: LazyRowIdSource::Unsorted {
+                ids,
+                live,
+                sorted: OnceLock::new(),
+            },
         }
     }
 
@@ -508,7 +587,7 @@ impl LazyRowIds {
         located: Option<Range<u64>>,
     ) -> Self {
         Self {
-            cell: Arc::new(OnceLock::new()),
+            cells: Some(Arc::default()),
             source: LazyRowIdSource::IndexChild {
                 child,
                 constraints,
@@ -526,7 +605,7 @@ impl LazyRowIds {
         range: Range<u64>,
     ) -> Self {
         Self {
-            cell: Arc::new(OnceLock::new()),
+            cells: Some(Arc::default()),
             source: LazyRowIdSource::LocatedRun { file, child, range },
         }
     }
@@ -576,12 +655,26 @@ impl LazyRowIds {
     /// from the run itself or from the child scan it bounds; an unlocated
     /// child scan and a pending residual compare only once their ids are
     /// known.
+    /// The ids as they were handed over, in the index's order, when they
+    /// leave out every tombstone (a window's, keep's, partition's or
+    /// chained match's of a served view): what a read in the index's order
+    /// gathers at, with no run decoded. `None` for any other source.
+    pub(crate) fn live_index_order(&self) -> Option<&Buffer<RowId>> {
+        match &self.source {
+            LazyRowIdSource::Unsorted {
+                ids, live: true, ..
+            } => Some(ids),
+            _ => None,
+        }
+    }
+
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
             LazyRowIdSource::Component { rids, .. } => Some(rids.len()),
+            LazyRowIdSource::Unsorted { ids, .. } => Some(ids.len()),
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { located, .. } => self
-                .cell
+                .sorted_cell()
                 .get()
                 .map(Buffer::len)
                 .or_else(|| located.as_ref().map(|run| (run.end - run.start) as usize)),
@@ -590,29 +683,76 @@ impl LazyRowIds {
         }
     }
 
-    /// The ids, when they take no I/O: an in-memory run's or a pending
-    /// residual compare's, computed (and cached) here as
+    /// The ids, when they take no I/O: an in-memory run's or a narrowed
+    /// view's, computed (and cached) here as
     /// [`materialized`](Self::materialized) does, or a file child's once
     /// read. `None` for a file child's ids not read yet.
     pub(crate) fn ids_without_io(&self) -> Result<Option<Buffer<RowId>>> {
         match &self.source {
-            LazyRowIdSource::Component { .. } => self.materialized().map(Some),
+            LazyRowIdSource::Component { .. } | LazyRowIdSource::Unsorted { .. } => {
+                self.materialized().map(Some)
+            }
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
-                Ok(self.cell.get().cloned())
+                Ok(self.sorted_cell().get().cloned())
             }
         }
+    }
+
+    /// The ids in their source's own order, when that takes no I/O: an
+    /// in-memory run's in its component's order, decoded once and kept
+    /// ([`LazyCells::run_order_of`]); a narrowed view's as they are. `None`
+    /// for a file child's.
+    pub(crate) fn run_order_ids(&self) -> Result<Option<Buffer<RowId>>> {
+        match &self.source {
+            LazyRowIdSource::Component { rids, .. } => {
+                self.shared_cells().run_order_of(rids).map(Some)
+            }
+            LazyRowIdSource::Unsorted { ids, .. } => Ok(Some(ids.clone())),
+            #[cfg(feature = "file-io")]
+            LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => Ok(None),
+        }
+    }
+
+    /// How many of the ids are live under the tombstones `deleted`, counted
+    /// without sorting them: a narrowed view's that leave every tombstone
+    /// out are as many as they are; an in-memory run's, or a narrowed view's
+    /// that may not, are read against the mask in their own order (base
+    /// order where it is already kept). `None` for a file child's, whose
+    /// count needs its ids read.
+    pub(crate) fn live_len_without_sort(&self, deleted: &Mask) -> Result<Option<usize>> {
+        let ids = match (&self.source, self.sorted_cell().get()) {
+            (
+                LazyRowIdSource::Unsorted {
+                    ids, live: true, ..
+                },
+                _,
+            ) => return Ok(Some(ids.len())),
+            (LazyRowIdSource::Component { .. }, Some(sorted)) => sorted.clone(),
+            _ => match self.run_order_ids()? {
+                Some(ids) => ids,
+                None => return Ok(None),
+            },
+        };
+        observe!(LiveCount);
+        Ok(Some(
+            ids.iter()
+                .filter(|&&id| !deleted.value(id as usize))
+                .count(),
+        ))
     }
 
     /// The ids, computed and cached on the first call; the awaiting form,
     /// which also runs a file child's deferred read.
     #[cfg(feature = "file-io")]
     pub(crate) async fn materialized_async(&self) -> Result<Buffer<RowId>> {
-        if let Some(ids) = self.cell.get() {
+        if let Some(ids) = self.sorted_cell().get() {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component { .. } => return self.materialized(),
+            LazyRowIdSource::Component { .. } | LazyRowIdSource::Unsorted { .. } => {
+                return self.materialized();
+            }
             LazyRowIdSource::IndexChild {
                 child, constraints, ..
             } => scan_index_row_ids(child, constraints).await?,
@@ -620,7 +760,8 @@ impl LazyRowIds {
                 read_located_rids(file, child, range.clone()).await?
             }
         };
-        Ok(self.cell.get_or_init(|| ids).clone())
+        observe!(IdsSorted(ids.len()));
+        Ok(self.sorted_cell().get_or_init(|| ids).clone())
     }
 
     /// The ids, computed and cached on the first call; the synchronous form,
@@ -630,11 +771,17 @@ impl LazyRowIds {
     /// that `materialized_async` has already read come from the cache, which
     /// is how the file match folds them; unread ones never reach here.
     pub(crate) fn materialized(&self) -> Result<Buffer<RowId>> {
-        if let Some(ids) = self.cell.get() {
+        if let Some(ids) = self.sorted_cell().get() {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
+            // A run already decoded in its component's order sorts a copy of
+            // that, rather than decoding the rids again.
+            LazyRowIdSource::Component { rids, .. } => match self.shared_cells().run_order.get() {
+                Some(run_order) => components::sorted_copy(run_order)?,
+                None => sorted_row_ids(rids.clone())?,
+            },
+            LazyRowIdSource::Unsorted { ids, .. } => components::sorted_copy(ids)?,
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 unreachable!(
@@ -643,7 +790,8 @@ impl LazyRowIds {
                 )
             }
         };
-        Ok(self.cell.get_or_init(|| ids).clone())
+        observe!(IdsSorted(ids.len()));
+        Ok(self.sorted_cell().get_or_init(|| ids).clone())
     }
 }
 

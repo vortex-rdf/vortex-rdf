@@ -14,12 +14,14 @@
 //! carries only its own plan type, and both plans decode through
 //! [`ServeDecode`], so tombstone handling is shared.
 //!
-//! A plan reproduces exactly the rows the resolution's row ids name, so an
-//! operation that cannot honor it (chained matches, counts,
-//! materialization) reads through the ids instead. The store keeps a plan
-//! only while the resolution is a view's sole restriction (see `MemoryBase`,
-//! `FileBase`). A plan is what lets the resolution defer the ids
-//! (`LazyRowIds`): reads through the plan never touch them.
+//! A plan reproduces exactly the view's rows: the run the resolution's row
+//! ids name, or the part of it a window, keep, partition or chained match
+//! narrowed it to, so an operation that cannot honor it (materialization in
+//! base order) reads through the ids instead. A match keeps the plan only
+//! while its resolution is the view's sole restriction; the narrowings of a
+//! served view keep it, narrowed (see `MemoryBase`, `FileBase`). A plan is
+//! what lets the resolution defer the ids (`LazyRowIds`): reads through the
+//! plan never touch them.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -32,14 +34,18 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
-use super::COL_RID;
+use super::copy::CopyFamily;
+use super::{COL_RID, LazyCells};
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
+use crate::store::SortOrder;
+use crate::store::array::into_struct_array;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
 use crate::store::schema::{PRIMARY_COLUMNS, RowId, TermCode};
 use crate::store::view::selection::point_sized;
+use vortex_rdf_encoded_search::SortedProbe;
 
 /// The decode both serve plans share. A serving child holds the whole quad
 /// under the primary column names ([`PRIMARY_COLUMNS`]) beside the primary
@@ -123,7 +129,7 @@ impl ServeDecode {
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: the
     /// chunk's quad columns without the row id, then any row whose primary
     /// row id is tombstoned dropped.
-    fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
+    pub(super) fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx)?;
         let col = |name: &'static str| {
@@ -173,20 +179,148 @@ impl ServeDecode {
     }
 }
 
+/// Rows a narrowed served view keeps of its plan's run, in the index's
+/// order: each one's position in the serving component (in memory) or index
+/// child (on file) beside the base row id it mirrors. A keep's result, and
+/// the windows and partitions cut from it.
+#[derive(Clone)]
+pub(crate) struct ServedRows {
+    pub(crate) positions: Buffer<u64>,
+    pub(crate) rids: Buffer<RowId>,
+}
+
+impl ServedRows {
+    /// How many rows these are.
+    pub(crate) fn len(&self) -> usize {
+        self.rids.len()
+    }
+
+    /// Each row's position (as a `usize`) beside its base row id, in order.
+    fn positions_and_rids(&self) -> impl Iterator<Item = (usize, RowId)> + '_ {
+        self.positions
+            .iter()
+            .map(|&position| position as usize)
+            .zip(self.rids.iter().copied())
+    }
+
+    /// Rows `range` of these, sharing their buffers.
+    pub(crate) fn slice(&self, range: Range<usize>) -> Self {
+        Self {
+            positions: self.positions.slice(range.clone()),
+            rids: self.rids.slice(range),
+        }
+    }
+
+    /// These rows less the `deleted` tombstones: themselves, shared, when
+    /// nothing is tombstoned.
+    pub(crate) fn live(&self, deleted: Option<&Mask>) -> Self {
+        let Some(deleted) = deleted else {
+            return self.clone();
+        };
+        let (positions, rids): (Vec<u64>, Vec<RowId>) = self
+            .positions
+            .iter()
+            .zip(self.rids.iter())
+            .filter(|&(_, &rid)| !deleted.value(rid as usize))
+            .map(|(&position, &rid)| (position, rid))
+            .unzip();
+        Self {
+            positions: Buffer::from(positions),
+            rids: Buffer::from(rids),
+        }
+    }
+}
+
+/// The `rows` (positions beside base row ids, at most `capacity` of them)
+/// that `keep` admits, in order. Each kept row is pushed once to buffers
+/// reserved for every row: two allocations, which a doubling buffer would
+/// spend on its growth. A keep that admits fewer than a quarter of them gives
+/// the rest back (two more): the buffers live as long as the kept view and
+/// every window of it.
+fn collect_kept(
+    rows: impl Iterator<Item = (usize, RowId)>,
+    capacity: usize,
+    keep: impl Fn(usize, RowId) -> bool,
+) -> ServedRows {
+    let (mut positions, mut rids) = (Vec::with_capacity(capacity), Vec::with_capacity(capacity));
+    for (position, rid) in rows {
+        if keep(position, rid) {
+            positions.push(position as u64);
+            rids.push(rid);
+        }
+    }
+    if positions.len() < capacity / 4 {
+        positions.shrink_to_fit();
+        rids.shrink_to_fit();
+    }
+    ServedRows {
+        positions: Buffer::from(positions),
+        rids: Buffer::from(rids),
+    }
+}
+
+/// A served in-memory view's live rows in its component, as a stream reads
+/// them ([`InMemoryServePlan::live_component_rows`]).
+pub(crate) enum ComponentRows {
+    /// A run of the component with nothing kept or tombstoned.
+    Range(Range<usize>),
+    /// The live rows' positions in the component, in its order.
+    Positions(Buffer<u64>),
+}
+
+impl ComponentRows {
+    /// How many rows.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ComponentRows::Range(range) => range.len(),
+            ComponentRows::Positions(positions) => positions.len(),
+        }
+    }
+}
+
+/// The order a plan serving a run of the copy `component` reads in, its
+/// terms binding the object or not: `(p, o, s, g)` for the `index:posg` copy
+/// with the object unbound (`?p??`, `?p?g`); else base order,
+/// `(s, p, o, g)`, which every other served run's order reduces to (its
+/// bound columns lead the copy's sort).
+pub(super) fn served_order(component: &str, object_bound: bool) -> SortOrder {
+    if component == CopyFamily::Posg.identity().name && !object_bound {
+        SortOrder::Posg
+    } else {
+        SortOrder::Spog
+    }
+}
+
 /// An index's serving plan for an in-memory view: the matched rows are the
 /// contiguous run `range` of the index component's own array, bounded by a
 /// binary search over its sorted lead column, so `quads()` slices them from
 /// the component (an `Arc` bump) or point-reads a small run, instead of
-/// gathering the primary columns at scattered row ids. `MemoryBase` carries
-/// only this type; `FileServePlan` (in `file.rs`) is the file-backed half.
+/// gathering the primary columns at scattered row ids. Every read of the
+/// view follows the component's order. `MemoryBase` carries only this type;
+/// `FileServePlan` (in `file.rs`) is the file-backed half.
 #[derive(Clone)]
 pub(crate) struct InMemoryServePlan {
     decode: ServeDecode,
     /// The serving component's name (`index:posg`, `index:ospg`).
     component: &'static str,
+    /// The order the view's reads follow ([`served_order`]).
+    order: SortOrder,
     /// The index component's rows, in child schema.
     array: ArrayRef,
+    /// The rows of the component the match resolved: the run.
+    run: Range<usize>,
+    /// The rows of the component the view covers: the run, or the part of
+    /// it a window cut.
     range: Range<usize>,
+    /// The rows a keep kept of the range, in the component's order; when
+    /// set, the view covers these and not the whole range.
+    kept: Option<Arc<ServedRows>>,
+    /// The run's slice of the component's rid column, the slice the view's
+    /// lazy ids hold.
+    rids: ArrayRef,
+    /// The caches the view's lazy ids fill, shared, so the run's ids decode
+    /// once for the plan's reads and the ids alike.
+    cells: Arc<LazyCells>,
     /// The component's shared probe cache, so a small run reads
     /// point-by-point at its global positions instead of slicing (a slice's
     /// probe would be re-resolved per call).
@@ -196,25 +330,193 @@ pub(crate) struct InMemoryServePlan {
 impl InMemoryServePlan {
     /// A plan serving the contiguous `range` of the rows `array` of the
     /// in-memory index component named `component`, decoded through
-    /// `decode`.
+    /// `decode`, its keys binding the object or not (`object_bound`). `rids`
+    /// is the run's slice of the component's rid column and `cells` the
+    /// caches of the lazy ids built over it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         decode: ServeDecode,
         component: &'static str,
+        object_bound: bool,
         array: ArrayRef,
         range: Range<usize>,
+        rids: ArrayRef,
         probes: Arc<StructProbes>,
+        cells: Arc<LazyCells>,
     ) -> Self {
         Self {
             decode,
             component,
+            order: served_order(component, object_bound),
             array,
+            run: range.clone(),
             range,
+            kept: None,
+            rids,
+            cells,
             probes,
         }
     }
 
     pub(crate) fn component(&self) -> &'static str {
         self.component
+    }
+
+    /// The order the view's reads follow: the component's, `(p, o, s, g)`,
+    /// for an `index:posg` run with the object unbound, else base order (see
+    /// [`served_order`]).
+    pub(crate) fn read_order(&self) -> SortOrder {
+        self.order
+    }
+
+    /// The rows of the component the view covers: the run, or the part of
+    /// it a window cut.
+    pub(crate) fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    /// The rows a keep kept, when the view covers those and not its whole
+    /// range.
+    pub(crate) fn kept(&self) -> Option<&ServedRows> {
+        self.kept.as_deref()
+    }
+
+    /// Whether a window or a keep narrowed the view below the run the match
+    /// resolved.
+    pub(crate) fn is_narrowed(&self) -> bool {
+        self.kept.is_some() || self.range != self.run
+    }
+
+    /// This plan over `range`, a part of its own range: a window's of a view
+    /// that keeps no rows.
+    pub(crate) fn narrowed(&self, range: Range<usize>) -> Self {
+        debug_assert!(self.kept.is_none());
+        debug_assert!(self.range.start <= range.start && range.end <= self.range.end);
+        Self {
+            range,
+            ..self.clone()
+        }
+    }
+
+    /// This plan over `rows`, rows of its range: a keep's, or a window or
+    /// partition of them.
+    pub(crate) fn with_rows(&self, rows: ServedRows) -> Self {
+        Self {
+            kept: Some(Arc::new(rows)),
+            ..self.clone()
+        }
+    }
+
+    /// The view's live rows `admit` keeps, in the component's order: each
+    /// row's position in the component and base row id offered to `admit`,
+    /// the `deleted` tombstones skipped. What a keep of the view keeps.
+    pub(crate) fn kept_rows(
+        &self,
+        deleted: Option<&Mask>,
+        admit: impl Fn(usize, RowId) -> bool,
+    ) -> Result<ServedRows> {
+        let live = |rid: RowId| deleted.is_none_or(|d| !d.value(rid as usize));
+        Ok(match (&self.kept, deleted.is_some()) {
+            (Some(kept), false) => collect_kept(kept.positions_and_rids(), kept.len(), &admit),
+            (Some(kept), true) => collect_kept(kept.positions_and_rids(), kept.len(), |p, rid| {
+                live(rid) && admit(p, rid)
+            }),
+            (None, tombstoned) => {
+                let run = self.run_rids()?;
+                let rows = self
+                    .range
+                    .clone()
+                    .zip(run[self.run_slots()].iter().copied());
+                match tombstoned {
+                    false => collect_kept(rows, self.range.len(), &admit),
+                    true => {
+                        collect_kept(rows, self.range.len(), |p, rid| live(rid) && admit(p, rid))
+                    }
+                }
+            }
+        })
+    }
+
+    /// The component's `columns` at its rows `positions`, in that order, as
+    /// one struct array: what a filter of the view's rows compares (a pattern
+    /// chained on the view), the other columns never read.
+    pub(crate) fn columns_at(
+        &self,
+        columns: &[&'static str],
+        positions: &[u64],
+    ) -> Result<ArrayRef> {
+        let rows = into_struct_array(self.array.clone())?;
+        let indices = PrimitiveArray::new(
+            positions.iter().copied().collect::<Buffer<u64>>(),
+            Validity::NonNullable,
+        )
+        .into_array();
+        let fields = columns
+            .iter()
+            .map(|name| Ok(rows.unmasked_field_by_name(name)?.take(indices.clone())?))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(StructArray::try_new(
+            FieldNames::from(columns),
+            fields,
+            positions.len(),
+            Validity::NonNullable,
+        )?
+        .into_array())
+    }
+
+    /// The serving component's `name` column through its cached probe, which
+    /// reads it at the rows' positions; `None` when no probe resolves it.
+    pub(crate) fn component_probe(&self, name: &str) -> Option<&SortedProbe<'_>> {
+        Some(self.probes.by_name(&self.array, name).flatten()?.probe())
+    }
+
+    /// The run's base row ids in the component's order, decoded once into
+    /// the caches the view's lazy ids share ([`LazyCells::run_order_of`]).
+    pub(crate) fn run_rids(&self) -> Result<Buffer<RowId>> {
+        self.cells.run_order_of(&self.rids)
+    }
+
+    /// The base row ids of the view's rows in the component's order, less
+    /// the `deleted` tombstones: what a read gathers off the base in the
+    /// index's order. A slice of the run's own ids, shared, when nothing is
+    /// tombstoned.
+    pub(crate) fn live_rids(&self, deleted: Option<&Mask>) -> Result<Buffer<RowId>> {
+        if let Some(kept) = &self.kept {
+            return Ok(kept.live(deleted).rids);
+        }
+        let rids = self.run_rids()?.slice(self.run_slots());
+        Ok(match deleted {
+            None => rids,
+            Some(deleted) => rids
+                .iter()
+                .copied()
+                .filter(|&rid| !deleted.value(rid as usize))
+                .collect(),
+        })
+    }
+
+    /// The view's live rows in the component's order: each one's position in
+    /// the component beside its base row id, the `deleted` tombstones left
+    /// out.
+    pub(crate) fn live_rows(&self, deleted: Option<&Mask>) -> Result<(Vec<usize>, Vec<RowId>)> {
+        if let Some(kept) = &self.kept {
+            let live = kept.live(deleted);
+            let positions = live.positions.iter().map(|&position| position as usize);
+            return Ok((positions.collect(), live.rids.to_vec()));
+        }
+        let rids = self.run_rids()?;
+        Ok(self
+            .range
+            .clone()
+            .zip(rids[self.run_slots()].iter().copied())
+            .filter(|&(_, rid)| deleted.is_none_or(|d| !d.value(rid as usize)))
+            .unzip())
+    }
+
+    /// Where the view's range sits in the run: the slots of the run's ids
+    /// it covers.
+    fn run_slots(&self) -> Range<usize> {
+        self.range.start - self.run.start..self.range.end - self.run.start
     }
 
     /// The positions of a small run's live rows, for point reads through the
@@ -229,6 +531,15 @@ impl InMemoryServePlan {
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     fn live_positions(&self, deleted: Option<&Mask>) -> Option<Option<Vec<usize>>> {
+        if let Some(kept) = &self.kept {
+            if !point_sized(kept.len() as u64) {
+                return None;
+            }
+            let live = kept.live(deleted).positions;
+            return Some(Some(
+                live.iter().map(|&position| position as usize).collect(),
+            ));
+        }
         if !point_sized(self.range.len() as u64) {
             return None;
         }
@@ -320,6 +631,10 @@ impl InMemoryServePlan {
         if let Some(columns) = self.live_point_columns(deleted) {
             return Some(columns);
         }
+        if let Some(kept) = &self.kept {
+            let rows = self.kept_component_rows(kept, deleted).ok()?;
+            return self.decode.chunk_code_columns(&rows, None).ok();
+        }
         let rows = self.array.slice(self.range.clone()).ok()?;
         self.decode.chunk_code_columns(&rows, deleted).ok()
     }
@@ -334,9 +649,110 @@ impl InMemoryServePlan {
             Ok(None) => {}
             Err(e) => return vec![Err(e)],
         }
+        if let Some(kept) = &self.kept {
+            return match self.kept_component_rows(kept, deleted) {
+                Ok(rows) => self.decode.decode_columns(&rows, None),
+                Err(e) => vec![Err(e)],
+            };
+        }
         match self.array.slice(self.range.clone()) {
             Ok(rows) => self.decode.decode_columns(&rows, deleted),
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
         }
+    }
+
+    /// Whether the plan's decode reads codes off the component (the
+    /// Dictionary layout's copies hold codes; the string layouts', terms).
+    pub(crate) fn decodes_codes(&self) -> bool {
+        matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_))
+    }
+
+    /// The view's live rows in the component, in its order, as a stream reads
+    /// them a window at a time ([`window_rows`](Self::window_rows)): the
+    /// range, read by slices, when it keeps no rows and nothing is
+    /// tombstoned; else the live rows' positions, read by takes.
+    pub(crate) fn live_component_rows(&self, deleted: Option<&Mask>) -> Result<ComponentRows> {
+        Ok(match (&self.kept, deleted) {
+            (None, None) => ComponentRows::Range(self.range.clone()),
+            (Some(kept), deleted) => ComponentRows::Positions(kept.live(deleted).positions),
+            (None, Some(deleted)) => ComponentRows::Positions(
+                self.live_rows(Some(deleted))?
+                    .0
+                    .into_iter()
+                    .map(|position| position as u64)
+                    .collect(),
+            ),
+        })
+    }
+
+    /// The view's live rows `window` (positions in `rows`, as
+    /// [`live_component_rows`](Self::live_component_rows) lists them) off
+    /// the component's own columns, as a primary-named `(s, p, o, g)`
+    /// struct: a slice of the run, or one take at their positions. What a
+    /// served stream reads a chunk at a time when the base's columns are
+    /// encoded, where a gather at the view's ids, in the index's order,
+    /// would decode them out of order.
+    pub(crate) fn window_rows(
+        &self,
+        rows: &ComponentRows,
+        window: Range<usize>,
+    ) -> Result<ArrayRef> {
+        observe!(ServedComponentChunk(window.len()));
+        let chunk = match rows {
+            ComponentRows::Range(range) => self
+                .array
+                .slice(range.start + window.start..range.start + window.end)?,
+            ComponentRows::Positions(positions) => self.array.take(
+                PrimitiveArray::new(positions.slice(window), Validity::NonNullable).into_array(),
+            )?,
+        };
+        self.decode.chunk_rows(&chunk, None)
+    }
+
+    /// [`window_rows`](Self::window_rows) as the four code columns, under
+    /// the Dictionary layout ([`decodes_codes`](Self::decodes_codes)).
+    pub(crate) fn window_code_columns(
+        &self,
+        rows: &ComponentRows,
+        window: Range<usize>,
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        let chunk = self.window_rows(rows, window)?;
+        self.decode.chunk_code_columns(&chunk, None)
+    }
+
+    /// The component's rows at the kept rows' live positions, in their
+    /// order: one take.
+    fn kept_component_rows(&self, kept: &ServedRows, deleted: Option<&Mask>) -> Result<ArrayRef> {
+        let positions = kept.live(deleted).positions;
+        let indices = PrimitiveArray::new(positions, Validity::NonNullable).into_array();
+        self.array.take(indices).map_err(VortexRdfError::Vortex)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capacity of a uniquely owned buffer.
+    fn capacity<T>(buffer: Buffer<T>) -> usize {
+        match buffer.try_into_mut() {
+            Ok(owned) => owned.capacity(),
+            Err(_) => panic!("a kept buffer is uniquely owned"),
+        }
+    }
+
+    /// A keep that admits few of a view's rows holds buffers sized to the rows
+    /// it kept, not to the view it reserved for: they live as long as the kept
+    /// view and every window of it.
+    #[test]
+    fn sparse_keeps_hold_only_their_rows() {
+        let rows = || (0..10_000usize).map(|position| (position, position as RowId));
+        let sparse = collect_kept(rows(), 10_000, |position, _| position % 1_000 == 0);
+        assert_eq!(sparse.len(), 10);
+        assert!(capacity(sparse.positions) < 10_000 / 4, "positions");
+        assert!(capacity(sparse.rids) < 10_000 / 4, "row ids");
+        let dense = collect_kept(rows(), 10_000, |position, _| position % 2 == 0);
+        assert_eq!(dense.len(), 5_000);
+        assert_eq!(dense.positions.as_slice()[..3], [0, 2, 4]);
     }
 }
