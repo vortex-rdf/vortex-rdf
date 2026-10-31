@@ -147,7 +147,7 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 | [docs/matching.md](docs/matching.md) | how a quad pattern is resolved on each backend, and what each path costs |
 | [docs/serialization.md](docs/serialization.md) | how a store is built and written: both sort pipelines, columns per layout, index builds |
 | [docs/mutations.md](docs/mutations.md) | the merge-on-read model: tail, tombstones, compaction and auto-compaction |
-| [docs/interfaces.md](docs/interfaces.md) | the contract an external query engine reads the store through: data sources, component tables, chunk streams, runtimes, view statistics, identities |
+| [docs/interfaces.md](docs/interfaces.md) | the contract an external query engine reads the store through: chunk streams, runtimes, view statistics, native narrowing, snapshots, a store file through vortex's reader |
 | [js/README.md](js/README.md) | the JavaScript/WebAssembly bindings |
 | [python/README.md](python/README.md) | the Python bindings |
 | [java/README.md](java/README.md) | the Java bindings |

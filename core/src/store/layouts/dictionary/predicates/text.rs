@@ -237,30 +237,62 @@ impl TextPredicate {
         }
     }
 
-    pub(super) fn eval(&self, spelling: &str, kind: Kind) -> Verdict {
+    /// The prefix an IRI's `STR()` text must start with to pass, when that
+    /// is the whole test: `str_prefix`, or `STRSTARTS` with a plain string
+    /// constant, under `STR()` and no case wrapper. `None` for any other
+    /// test, and for a prefix holding a `>`: no IRI's text starts with one,
+    /// but the code range of `<` and that prefix would take in the IRI the
+    /// `>` closes.
+    pub(super) fn iri_prefix(&self) -> Option<&str> {
+        if !self.as_str || self.case.is_some() {
+            return None;
+        }
+        let prefix = match &self.test {
+            TextTest::Prefix(prefix) => prefix,
+            TextTest::StartsWith(TextConstant::Text { text, lang: None }) => text,
+            _ => return None,
+        };
+        (!prefix.contains('>')).then_some(prefix.as_str())
+    }
+
+    /// The verdict on a term's `spelling` of `kind`, its text case-mapped
+    /// into `scratch`, a buffer the caller reuses from candidate to
+    /// candidate.
+    pub(super) fn eval(&self, spelling: &str, kind: Kind, scratch: &mut String) -> Verdict {
         let (text, lang) = match self.text_of(spelling, kind) {
             Ok(text) => text,
             Err(verdict) => return verdict,
         };
-        let text = match self.case {
-            None => text,
-            Some(_) if !text.is_ascii() => return Verdict::Unknown,
-            Some(CaseMap::Lower) => Cow::Owned(text.to_ascii_lowercase()),
-            Some(CaseMap::Upper) => Cow::Owned(text.to_ascii_uppercase()),
-        };
+        match self.case {
+            None => self.test_text(&text, lang),
+            Some(_) if !text.is_ascii() => Verdict::Unknown,
+            Some(case) => {
+                scratch.clear();
+                scratch.push_str(&text);
+                match case {
+                    CaseMap::Lower => scratch.make_ascii_lowercase(),
+                    CaseMap::Upper => scratch.make_ascii_uppercase(),
+                }
+                self.test_text(scratch, lang)
+            }
+        }
+    }
+
+    /// The test over a term's `text` (case-mapped already) and language.
+    fn test_text(&self, text: &str, lang: Option<&str>) -> Verdict {
         let test = |constant: &TextConstant, holds: fn(&str, &str) -> bool| match constant {
             TextConstant::NotAString => Verdict::False,
             TextConstant::Text {
                 lang: Some(tag), ..
             } if lang != Some(tag.as_str()) => Verdict::False,
-            TextConstant::Text { text: c, .. } => Verdict::from(holds(&text, c)),
+            TextConstant::Text { text: c, .. } => Verdict::from(holds(text, c)),
         };
         match &self.test {
             TextTest::Prefix(prefix) => Verdict::from(text.starts_with(prefix.as_str())),
             TextTest::Contains(c) => test(c, |t, c| t.contains(c)),
             TextTest::StartsWith(c) => test(c, |t, c| t.starts_with(c)),
             TextTest::EndsWith(c) => test(c, |t, c| t.ends_with(c)),
-            TextTest::Regex(regex) => regex.eval(&text),
+            TextTest::Regex(regex) => regex.eval(text),
         }
     }
 

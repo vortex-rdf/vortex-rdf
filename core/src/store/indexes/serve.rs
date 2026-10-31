@@ -34,6 +34,7 @@ use vortex_mask::Mask;
 
 use super::COL_RID;
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
@@ -82,10 +83,24 @@ impl ServeDecode {
         }
     }
 
+    /// [`decode_columns_async`](Self::decode_columns_async) where it
+    /// finishes without waiting ([`ChunkDecode::decode_now`]); `None` leaves
+    /// the chunk to it.
+    #[cfg(feature = "file-io")]
+    pub(super) fn decode_columns_now<T: ChunkDecode>(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Option<Vec<Result<T>>> {
+        match self.chunk_rows(chunk, deleted) {
+            Ok(rows) => T::decode_now(&self.decode_layout, &rows),
+            Err(e) => Some(vec![Err(e)]),
+        }
+    }
+
     /// A chunk's live rows as four code columns, `(s, p, o, g)`: the
     /// code-payload counterpart of [`decode_columns`](Self::decode_columns)
     /// for a Dictionary decode layout, whose columns hold codes.
-    #[cfg(feature = "file-io")]
     pub(super) fn chunk_code_columns(
         &self,
         chunk: &ArrayRef,
@@ -260,11 +275,13 @@ impl InMemoryServePlan {
             return Some(None);
         };
         let rid = self.probes.by_name(&self.array, COL_RID).flatten()?.probe();
+        let mut rids = vec![0; self.range.len()];
+        rid.read_into(self.range.start, &mut rids);
         // A row id no `usize` holds declines to the slice path, whose
         // decode reports it.
         let mut live = Vec::with_capacity(self.range.len());
-        for pos in self.range.clone() {
-            let row = super::row_index(super::base_row(rid.value_at(pos))).ok()?;
+        for (pos, rid) in self.range.clone().zip(rids) {
+            let row = super::row_index(super::base_row(rid)).ok()?;
             if !deleted.value(row) {
                 live.push(pos);
             }
@@ -272,21 +289,29 @@ impl InMemoryServePlan {
         Some(Some(live))
     }
 
-    /// A small run's live rows read point by point at the run's global
-    /// positions through the component's cached probes, with no slice: the
-    /// four `(s, p, o, g)` columns, each as the `u64`s its probe reads, which
-    /// are the child's codes (a code column is `u64`, and a probe reads every
-    /// width as one). The point read behind both the decoded and the
-    /// code-payload serve. `None` declines (a wide run, or a column no probe
-    /// resolves, such as a string copy's); the caller keeps its slice or
-    /// gather path.
+    /// A small run's live rows read at the run's global positions through the
+    /// component's cached probes, with no slice: the four `(s, p, o, g)`
+    /// columns, each as the `u64`s its probe reads, which are the child's
+    /// codes (a code column is `u64`, and a probe reads every width as one),
+    /// each run of consecutive live positions in one pass. The point read
+    /// behind both the decoded and the code-payload serve. `None` declines (a
+    /// wide run, or a column no probe resolves, such as a string copy's); the
+    /// caller keeps its slice or gather path.
     fn live_point_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
         let live = self.live_positions(deleted)?;
         let read = |name: &str| -> Option<Buffer<TermCode>> {
             let probe = self.probes.by_name(&self.array, name).flatten()?.probe();
             Some(match &live {
-                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos))),
-                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos))),
+                None => {
+                    let mut codes = vec![0; self.range.len()];
+                    probe.read_into(self.range.start, &mut codes);
+                    Buffer::from(codes)
+                }
+                Some(live) => {
+                    let mut codes = vec![0; live.len()];
+                    probe.read_at(live, &mut codes);
+                    Buffer::from(codes)
+                }
             })
         };
         let [s, p, o, g] = PRIMARY_COLUMNS;
@@ -300,8 +325,7 @@ impl InMemoryServePlan {
         let Some(columns) = self.live_point_columns(deleted) else {
             return Ok(None);
         };
-        #[cfg(test)]
-        serve_hooks::note_point_read();
+        observe!(ServePointRead);
         let len = columns[0].len();
         Ok(Some(
             StructArray::try_new(
@@ -319,18 +343,24 @@ impl InMemoryServePlan {
     /// [`decode`](Self::decode), in the index's order as `decode` serves
     /// them. Under the Dictionary layout a copy holds the view's codes
     /// contiguously, so no row id is materialized and no primary column
-    /// gathered.
+    /// gathered: a run of at most [`POINT_GATHER_MAX_ROWS`] rows is read
+    /// point by point through the component's cached probes, and any other
+    /// is the component sliced to the run, each column decoded whole.
     ///
-    /// `None` declines to the caller's gather path: a run wider than
-    /// [`POINT_GATHER_MAX_ROWS`], a non-Dictionary decode layout (its columns
-    /// hold terms, not codes), or a column no probe resolves.
+    /// `None` declines to the caller's gather path: a non-Dictionary decode
+    /// layout (its columns hold terms, not codes), or a slice that fails to
+    /// decode (the gather path reports the error).
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return None;
         }
-        self.live_point_columns(deleted)
+        if let Some(columns) = self.live_point_columns(deleted) {
+            return Some(columns);
+        }
+        let rows = self.array.slice(self.range.clone()).ok()?;
+        self.decode.chunk_code_columns(&rows, deleted).ok()
     }
 
     /// The matched rows decoded from the index component's own rows as the
@@ -347,27 +377,5 @@ impl InMemoryServePlan {
             Ok(rows) => self.decode.decode_columns(&rows, deleted),
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
         }
-    }
-}
-
-/// Test hook: how many served in-memory runs this thread read point by point
-/// at their global positions ([`InMemoryServePlan::point_read_run_rows`]), not
-/// by slicing the component.
-#[cfg(test)]
-pub(crate) mod serve_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static POINT_READS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one run read point by point.
-    pub(super) fn note_point_read() {
-        POINT_READS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The runs read point by point on this thread so far.
-    pub(crate) fn point_reads() -> usize {
-        POINT_READS.with(Cell::get)
     }
 }

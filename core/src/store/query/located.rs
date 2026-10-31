@@ -202,7 +202,7 @@ impl VortexRdfStore {
         let Some(base) = self.quads.file() else {
             return Ok(None);
         };
-        if base.filter.is_some() || base.serve.is_some() {
+        if base.filter.over_selection().is_some() || base.serve.is_some() {
             return Ok(None);
         }
         let file = &base.file;
@@ -573,9 +573,9 @@ async fn read_codes(
     if rows.end - rows.start <= POINT_CODES as u64
         && let Some(leaf) = column.leaf_rows(rows.clone(), source, session).await?
     {
-        let mut codes = vortex_buffer::BufferMut::with_capacity((rows.end - rows.start) as usize);
-        codes.extend(rows.map(|row| leaf.value_at(row)));
-        return Ok(codes.freeze());
+        let mut codes = vec![0; (rows.end - rows.start) as usize];
+        leaf.read_into(rows.start, &mut codes);
+        return Ok(Buffer::from(codes));
     }
     let ids: Vec<u64> = rows.collect();
     take_codes(column, &ids, source, session).await
@@ -603,7 +603,11 @@ async fn take_codes(
             .leaf_rows(first..leaf_rows[inside - 1] + 1, source, session)
             .await?
         {
-            Some(leaf) => codes.extend(leaf_rows.iter().map(|&row| leaf.value_at(row))),
+            Some(leaf) => {
+                let mut values = vec![0; leaf_rows.len()];
+                leaf.values_at(leaf_rows, &mut values);
+                codes.extend_from_slice(&values);
+            }
             None => {
                 codes.extend_from_slice(&taken_codes(column, leaf_rows, source, session).await?)
             }

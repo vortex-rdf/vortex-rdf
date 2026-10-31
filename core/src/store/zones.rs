@@ -16,6 +16,7 @@ use vortex_array::scalar::Scalar;
 
 use crate::error::Result;
 use crate::io::zone_map::{ExactZoneMap, ZONE_ROWS};
+use crate::store::array::unsigned_value;
 use crate::store::schema::TermCode;
 
 /// The dtype of a code column that carries zone bounds.
@@ -234,10 +235,7 @@ impl ZoneTable {
     ) -> Option<Vec<Range<u64>>> {
         let mut keep: Option<Vec<bool>> = None;
         for (field, scalar) in eqs {
-            if !scalar.dtype().is_unsigned_int() {
-                continue;
-            }
-            let (Ok(code), Some(zones)) = (TermCode::try_from(scalar), self.get(field)) else {
+            let (Some(code), Some(zones)) = (unsigned_value(scalar), self.get(field)) else {
                 continue;
             };
             let keep = keep.get_or_insert_with(|| vec![true; zones.zones()]);

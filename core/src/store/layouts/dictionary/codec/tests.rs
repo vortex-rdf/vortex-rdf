@@ -50,7 +50,7 @@ fn skewed_chunk(quads: &[RawQuad]) -> (TermDictionary, ArrayRef) {
         .collect();
     terms.sort_unstable();
     terms.dedup();
-    let code_map: HashMap<&str, TermCode> = terms
+    let code_map: BorrowedTermCodeMap<'_> = terms
         .iter()
         .enumerate()
         .map(|(rank, &term)| (term, rank as TermCode))
@@ -105,7 +105,7 @@ async fn assert_file_backed_decodes(
     let (decoded, reads, resolves) = decode_counts(Quad::decode_async(&layout, chunk)).await;
     assert_eq!((reads, resolves), counts, "{case}: quads");
     let decoded: Vec<Quad> = decoded.into_iter().map(|row| row.unwrap()).collect();
-    let want: Vec<Quad> = decode_chunk(chunk, dict)
+    let want: Vec<Quad> = decode_resident::<Quad>(chunk, dict)
         .into_iter()
         .map(|row| row.unwrap())
         .collect();
@@ -115,23 +115,11 @@ async fn assert_file_backed_decodes(
     let (shared, reads, resolves) = decode_counts(SharedQuad::decode_async(&layout, chunk)).await;
     assert_eq!((reads, resolves), counts, "{case}: shared quads");
     let shared: Vec<SharedQuad> = shared.into_iter().map(|row| row.unwrap()).collect();
-    let want: Vec<SharedQuad> = decode_chunk_shared(chunk, dict)
+    let want: Vec<SharedQuad> = decode_resident::<SharedQuad>(chunk, dict)
         .into_iter()
         .map(|row| row.unwrap())
         .collect();
     assert_eq!(shared, want, "{case}: shared quads");
-
-    let (raw, reads, resolves) = decode_counts(RawQuad::decode_async(&layout, chunk)).await;
-    assert_eq!((reads, resolves), counts, "{case}: raw quads");
-    let terms = |q: RawQuad| [q.s, q.p, q.o, q.g];
-    let raw: Vec<[String; 4]> = raw.into_iter().map(|row| terms(row.unwrap())).collect();
-    let want: Vec<[String; 4]> = ResolvedLayout::Dictionary(DictAccess::Resident(Arc::clone(dict)))
-        .raw_quads(chunk)
-        .unwrap()
-        .into_iter()
-        .map(terms)
-        .collect();
-    assert_eq!(raw, want, "{case}: raw quads");
 
     assert_eq!(fb.debug_lifts(), 0, "{case}");
 }
@@ -149,7 +137,7 @@ async fn a_file_backed_chunk_decode_reads_its_windows_in_place() {
         let fb = file_backed(&dict).await;
         let case = format!("{} quads", quads.len());
         assert_file_backed_decodes(&fb, &dict, &chunk, false, &case).await;
-        assert!(!fb.debug_reads_wait(), "{case}");
+        assert!(!fb.reads_wait(), "{case}");
     }
 }
 
@@ -167,13 +155,64 @@ async fn a_chunk_decode_over_reads_that_wait_resolves_its_codes() {
         .await
         .unwrap()
         .expect("the written dictionary child must be window-searchable");
-    assert!(!fb.debug_reads_wait());
+    assert!(!fb.reads_wait());
     assert_file_backed_decodes(&fb, &dict, &chunk, true, "waiting reads").await;
-    assert!(fb.debug_reads_wait());
+    assert!(fb.reads_wait());
     // Every window the chunk touches is cached now, yet a decode still
     // resolves: once reads wait, none is tried in place.
     assert!(!fb.debug_cached_windows().is_empty());
     assert_file_backed_decodes(&fb, &dict, &chunk, true, "cached windows").await;
+}
+
+/// A decode that cannot await (a scan's split task) decodes a chunk whole
+/// over reads that complete when first polled, in place or, past the
+/// window budget, from its resolved codes, as `decode_async` does. Over
+/// reads that wait it leaves the chunk, and once the handle knows its
+/// reads wait, it leaves every chunk without reading its code columns.
+#[tokio::test]
+async fn a_decode_that_cannot_await_takes_only_the_chunks_it_can() {
+    use crate::store::layouts::ChunkDecode;
+
+    let quads = skewed_quads();
+    let (dict, chunk) = skewed_chunk(&quads);
+    let dict = Arc::new(dict);
+    let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&dict).await);
+    let want: Vec<Quad> = decode_resident::<Quad>(&chunk, &dict)
+        .into_iter()
+        .map(|row| row.unwrap())
+        .collect();
+    let roomy = FileBackedDict::open(&native).await.unwrap().unwrap();
+    let tight = FileBackedDict::open_with_budget(&native, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    for (fb, resolved, case) in [(roomy, 0, "in place"), (tight, 1, "resolved")] {
+        let layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(fb.clone()));
+        let (decoded, reads, resolves) =
+            decode_counts(async { Quad::decode_now(&layout, &chunk) }).await;
+        let decoded: Vec<Quad> = decoded
+            .expect(case)
+            .into_iter()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(decoded, want, "{case}");
+        assert_eq!((reads, resolves), (1, resolved), "{case}");
+        assert!(!fb.reads_wait(), "{case}");
+    }
+
+    let fb = FileBackedDict::open_with_waiting_reads(&native)
+        .await
+        .unwrap()
+        .unwrap();
+    let layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(fb.clone()));
+    let (decoded, reads, _) = decode_counts(async { Quad::decode_now(&layout, &chunk) }).await;
+    assert!(decoded.is_none());
+    assert_eq!(reads, 1);
+    assert!(fb.reads_wait());
+    let (decoded, reads, resolves) =
+        decode_counts(async { Quad::decode_now(&layout, &chunk) }).await;
+    assert!(decoded.is_none());
+    assert_eq!((reads, resolves), (0, 0));
 }
 
 /// An in-place decode holds its windows within the window cache's
@@ -199,7 +238,7 @@ async fn an_in_place_decode_holds_its_windows_within_the_cache_budget() {
             .unwrap();
         let case = format!("budget {budget} of {touched}");
         assert_file_backed_decodes(&fb, &dict, &chunk, resolved, &case).await;
-        assert!(!fb.debug_reads_wait(), "{case}");
+        assert!(!fb.reads_wait(), "{case}");
     }
 }
 
@@ -351,7 +390,7 @@ fn a_quad_decode_ends_where_its_source_gives_up() {
     // Rows 30..40 share their subject, which no row before them has.
     let code = columns[0][30];
     assert!(columns[0][..30].iter().all(|&c| c != code));
-    let want = decode_chunk(&chunk, &dict);
+    let want = decode_resident::<Quad>(&chunk, &dict);
 
     for gives_up in [true, false] {
         let mut src = FailingTerms {

@@ -37,8 +37,6 @@ async fn test_default_fixture_adopts() {
 /// uses one, which then searches through the probes it resolved.
 #[tokio::test]
 async fn test_dictionary_fixture_adopts() {
-    use crate::store::scan::typed_eq::probe_hooks;
-
     let quads = dictionary_test_quads();
     let store = VortexRdfStore::from_bytes(DICTIONARY_FIXTURE)
         .await
@@ -60,10 +58,10 @@ async fn test_dictionary_fixture_adopts() {
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
 
     let p1 = iri("p1");
-    let (cached, resolved) = probe_hooks::binds();
+    let rec = Recorder::start();
     let served = matched_view(&store, None, Some(&p1), None, None).await;
-    let after = probe_hooks::binds();
-    assert!(after.0 > cached && after.1 == resolved, "{after:?}");
+    let (cached, resolved) = probe_binds(&rec);
+    assert!(cached > 0 && resolved == 0, "({cached}, {resolved})");
     for name in components {
         assert_eq!(
             store.debug_index_component_probes_resolved(name),

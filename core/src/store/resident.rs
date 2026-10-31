@@ -7,6 +7,7 @@
 //! shared wrapper's cache, or only when an earlier read already did).
 
 use crate::error::Result;
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{column_is_sorted, stamp_is_sorted};
 use crate::store::schema;
@@ -155,6 +156,7 @@ pub(crate) fn shared_code_primitive(
     let shared = child.as_opt::<Shared>()?;
     let cached = shared
         .get_or_compute(|source| {
+            observe!(SharedDecoded);
             use vortex_rdf_encoded_search::counters::{SHARED_DECODED, note};
             note(SHARED_DECODED, source.len());
             let mut ctx = VORTEX_SESSION.create_execution_ctx();

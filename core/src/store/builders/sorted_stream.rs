@@ -245,22 +245,24 @@ pub(crate) async fn build_chunk_stream(
         spiller.push(ids, &terms)?;
         ingested += 1;
     }
-    let runs = spiller.finish(&terms)?;
+    let spilled = spiller.finish(&terms)?;
     log::debug!(
         "[SortedStreamBuilder] Ingested {} quads ({} distinct terms) into {} runs in {:?}",
         ingested,
         terms.len(),
-        runs.run_count(),
+        spilled.run_count(),
         debug::elapsed(start)
     );
 
     let freeze = debug::timer();
     let frozen = terms.finish();
-    let rank_of = Arc::new(frozen.rank_of);
+    let ranked_terms = frozen.rank_of.len();
     let encoding = Encoding::new(layout, frozen.sorted)?;
+    // A build that spilled nothing sorts its one run here, by rank.
+    let runs = spilled.ranked(Arc::new(frozen.rank_of))?;
     log::debug!(
         "[SortedStreamBuilder] Ranked {} terms in {:?}",
-        rank_of.len(),
+        ranked_terms,
         debug::elapsed(freeze)
     );
 
@@ -274,20 +276,20 @@ pub(crate) async fn build_chunk_stream(
         match &encoding {
             Encoding::Codes { dict } => {
                 let dict = Arc::clone(dict);
-                merge_feeding_indexes(&runs, &rank_of, &guard, sizes, &indexes, move |rank| {
+                merge_feeding_indexes(&runs, &guard, sizes, &indexes, move |rank| {
                     code_of_rank(&dict, rank)
                 })?
             }
             Encoding::Strings { terms, .. } => {
                 let terms = Arc::clone(terms);
-                merge_feeding_indexes(&runs, &rank_of, &guard, sizes, &indexes, move |rank| {
+                merge_feeding_indexes(&runs, &guard, sizes, &indexes, move |rank| {
                     term_of_rank(&terms, rank)
                 })?
             }
         }
     };
 
-    let merger = runs.merger(&rank_of)?;
+    let merger = runs.merger()?;
     let dict = encoding.dict();
     let strategy = encoding.strategy();
     let (dtype, chunks) = chunk_stream(

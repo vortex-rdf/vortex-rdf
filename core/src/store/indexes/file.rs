@@ -24,6 +24,7 @@ use super::resolve::IndexProbe;
 use super::serve::ServeDecode;
 use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, PatternCodes, ResolvedLayout};
 #[cfg(test)]
@@ -54,7 +55,7 @@ async fn locate_component_run(
     if !child.sorted {
         return Ok(None);
     }
-    let Ok(needle) = u64::try_from(native) else {
+    let Some(needle) = crate::store::array::unsigned_value(native) else {
         return Ok(None);
     };
     let Some(chunks) = file.component_column_chunks(child.name, column) else {
@@ -84,7 +85,8 @@ async fn rid_point_reads(
         return Ok(None);
     };
     // A point-read run is at most `POINT_GATHER_MAX_ROWS` wide.
-    let Some(mut ids) = values_at(file, &chunks, range).await? else {
+    let rows: Vec<u64> = range.collect();
+    let Some(mut ids) = values_at(file, &chunks, &rows).await? else {
         return Ok(None);
     };
     for id in &mut ids {
@@ -116,30 +118,8 @@ pub(crate) async fn scan_index_row_ids(
     };
     let filter = child.bind(&filter)?;
 
-    #[cfg(test)]
-    rid_scan_hooks::note();
+    observe!(RidScan);
     read_scanned_row_ids(child.scan(&[COL_RID])?.with_filter(filter)).await
-}
-
-/// Test hook: how many rid-only scans of an index child under its
-/// equalities ([`scan_index_row_ids`]) this thread ran.
-#[cfg(test)]
-pub(crate) mod rid_scan_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static SCANS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one rid-only child scan.
-    pub(super) fn note() {
-        SCANS.set(SCANS.get() + 1);
-    }
-
-    /// The rid-only child scans run on this thread so far.
-    pub(crate) fn scans() -> usize {
-        SCANS.get()
-    }
 }
 
 /// The row ids of a *located* index-child run (the rows a resolver bounded
@@ -644,6 +624,17 @@ impl FileServePlan {
     ) -> Vec<Result<T>> {
         self.decode.decode_columns_async(chunk, deleted).await
     }
+
+    /// [`decode_columns_async`](Self::decode_columns_async) where it
+    /// finishes without waiting, for a scan's split task; `None` leaves the
+    /// chunk to it.
+    pub(crate) fn decode_columns_now<T: ChunkDecode>(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Option<Vec<Result<T>>> {
+        self.decode.decode_columns_now(chunk, deleted)
+    }
 }
 
 /// The positions of `rows` ordered by their values, ascending. Each row's
@@ -727,8 +718,9 @@ mod tests {
     #[tokio::test]
     async fn index_row_id_scans_drive_inline_whatever_the_limit() {
         use crate::io::read::scan_all_reader;
+        use crate::observe::{Event, Recorder};
         use crate::store::array::{field_as, into_struct_array};
-        use crate::store::scan::file_scans::driver_hooks;
+        use crate::store::test_hooks::ForcedLimit;
         use crate::{IndexType, LayoutStrategy};
 
         let rows = 50;
@@ -744,12 +736,16 @@ mod tests {
             .child_reader("index:ref-p")
             .unwrap()
             .expect("the reference child of the predicate column");
-        let _limit = driver_hooks::ForcedLimit::set(0);
-        driver_hooks::take_spawned();
+        let _limit = ForcedLimit::set(0);
+        let mut spawned = Recorder::start();
 
         // The located-run scan: every row of the child.
         let ids = scan_located_row_ids(&child, 0..rows as u64).await.unwrap();
-        assert_eq!(driver_hooks::take_spawned(), 0, "located-run scan spawned");
+        assert_eq!(
+            spawned.take_count(&Event::SplitSpawned),
+            0,
+            "located-run scan spawned"
+        );
         assert_eq!(ids.as_slice(), (0..rows as RowId).collect::<Vec<_>>());
 
         // The pushed-down equality, probing the child's first value.
@@ -762,7 +758,11 @@ mod tests {
         let matched = scan_index_row_ids(&child, &[("val", Scalar::from(first))])
             .await
             .unwrap();
-        assert_eq!(driver_hooks::take_spawned(), 0, "equality scan spawned");
+        assert_eq!(
+            spawned.take_count(&Event::SplitSpawned),
+            0,
+            "equality scan spawned"
+        );
         assert!(!matched.is_empty() && matched.len() < rows);
         assert!(matched.as_slice().windows(2).all(|pair| pair[0] < pair[1]));
         // The rid projection both scans share, and the equality filter.
@@ -773,7 +773,7 @@ mod tests {
         let splits = file.scan().unwrap().build().unwrap().len();
         assert!(splits > 0);
         read_all_rows(file.scan().unwrap()).await.unwrap();
-        assert_eq!(driver_hooks::take_spawned(), splits);
+        assert_eq!(spawned.take_count(&Event::SplitSpawned), splits);
     }
 
     #[test]

@@ -7,18 +7,15 @@
 //! read or a capped count follow the row-scan driver's rule.
 
 use super::*;
+use crate::store::scan::read_plan::MaskedRead;
+use crate::store::test_hooks::ForcedLimit;
 
-/// The masked reads chosen on this thread since `before`, by kind.
-fn masked_reads_since(before: [usize; 3]) -> [usize; 3] {
-    let now = crate::store::scan::read_plan::masked_read_hooks::reads();
-    std::array::from_fn(|kind| now[kind] - before[kind])
-}
-
-/// One masked read of kind `read`, as [`masked_reads_since`] counts them.
-fn one_masked_read(read: crate::store::scan::read_plan::MaskedRead) -> [usize; 3] {
-    let mut reads = [0; 3];
-    reads[read as usize] = 1;
-    reads
+/// The masked reads `rec` saw since its last take, in order.
+fn masked_reads(rec: &mut Recorder) -> Vec<MaskedRead> {
+    rec.take_picked(|e| match e {
+        Event::MaskedRead(read) => Some(*read),
+        _ => None,
+    })
 }
 
 /// Each of [`masks_probes`] on `file` against `memory`: a view with a pending
@@ -26,7 +23,6 @@ fn one_masked_read(read: crate::store::scan::read_plan::MaskedRead) -> [usize; 3
 /// answers the rows, in order, of the view's scan (`row_chunks`) and of
 /// `memory`'s view.
 async fn assert_masks_first_reads(file: &VortexRdfStore, memory: &VortexRdfStore, tag: &str) {
-    use crate::store::scan::read_plan::masked_read_hooks;
     for MasksProbe {
         shape, probe, read, ..
     } in masks_probes()
@@ -37,13 +33,9 @@ async fn assert_masks_first_reads(file: &VortexRdfStore, memory: &VortexRdfStore
             view.view_statistics().unwrap().pending_filter,
             "{label}: a pending filter"
         );
-        let before = masked_read_hooks::reads();
+        let mut rec = Recorder::start();
         let rows = row_list(&view).await;
-        assert_eq!(
-            masked_reads_since(before),
-            one_masked_read(read),
-            "{label}: read as {read:?}"
-        );
+        assert_eq!(masked_reads(&mut rec), [read], "{label}: read as {read:?}");
         assert!(!rows.is_empty(), "{label}: the pattern matches");
         assert_eq!(
             struct_chunk_codes(&collect_row_chunks(&view, 4_096).await),
@@ -65,16 +57,12 @@ async fn assert_masks_first_reads(file: &VortexRdfStore, memory: &VortexRdfStore
 async fn assert_masked_reads_match(
     view: &VortexRdfStore,
     memory: &VortexRdfStore,
-    read: crate::store::scan::read_plan::MaskedRead,
+    read: MaskedRead,
     label: &str,
 ) {
-    let before = crate::store::scan::read_plan::masked_read_hooks::reads();
+    let mut rec = Recorder::start();
     let rows = row_list(view).await;
-    assert_eq!(
-        masked_reads_since(before),
-        one_masked_read(read),
-        "{label}: read as {read:?}"
-    );
+    assert_eq!(masked_reads(&mut rec), [read], "{label}: read as {read:?}");
     assert!(!rows.is_empty(), "{label}: rows to read");
     assert_eq!(
         struct_chunk_codes(&collect_row_chunks(view, 4_096).await),
@@ -126,7 +114,6 @@ fn clustered_quads() -> Vec<Quad> {
 #[tokio::test]
 async fn test_masks_first_reads_a_selection_clamped_inside_splits() {
     use crate::store::Keep;
-    use crate::store::scan::read_plan::MaskedRead;
 
     let (_envelope_dir, path) =
         write_store_file(clustered_quads(), LayoutStrategy::Dictionary, vec![]).await;
@@ -251,11 +238,6 @@ async fn test_masks_first_skips_tombstones() {
 /// another, where no tokio runtime is current.
 #[tokio::test]
 async fn test_quads_vec_over_a_filtered_file_matches_quads() {
-    use crate::store::scan::{
-        file_scans::driver_hooks,
-        read_plan::{MaskedRead, masked_read_hooks},
-    };
-
     let (_file_backed_dir, file_backed) = masks_file().await;
     let (_resident_dir, resident) = masks_file_resident_dictionary().await;
     for (dictionary, path, file_backed) in [
@@ -270,7 +252,7 @@ async fn test_quads_vec_over_a_filtered_file_matches_quads() {
         );
         let tailed = store.add_quads(masks_tail()).await.unwrap();
         for forced in [None, Some(0)] {
-            let _limit = forced.map(driver_hooks::ForcedLimit::set);
+            let _limit = forced.map(ForcedLimit::set);
             for MasksProbe {
                 shape,
                 probe,
@@ -289,15 +271,10 @@ async fn test_quads_vec_over_a_filtered_file_matches_quads() {
                         .starts_with("<http://example.org/tail")),
                     "{label}: the tail's rows last"
                 );
-                let before = masked_read_hooks::reads();
-                driver_hooks::take_spawned();
+                let mut rec = Recorder::start();
                 let quads = view.quads_vec().await.unwrap();
-                let spawned = driver_hooks::take_spawned();
-                assert_eq!(
-                    masked_reads_since(before),
-                    one_masked_read(read),
-                    "{label}: read as {read:?}"
-                );
+                let spawned = rec.count(&Event::SplitSpawned);
+                assert_eq!(masked_reads(&mut rec), [read], "{label}: read as {read:?}");
                 assert_eq!(quads, streamed, "{label}: the stream's quads, in order");
                 // The masks spawn every split under the forced limit; a take
                 // or a projection spawns each split with a match.
@@ -328,9 +305,9 @@ async fn test_quads_vec_over_a_filtered_file_matches_quads() {
             let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
             let (quads, spawned) = std::thread::spawn(move || {
                 futures::executor::block_on(async {
-                    driver_hooks::take_spawned();
+                    let rec = Recorder::start();
                     let quads = view.quads_vec().await.unwrap();
-                    (quads, driver_hooks::take_spawned())
+                    (quads, rec.count(&Event::SplitSpawned))
                 })
             })
             .join()
@@ -432,8 +409,6 @@ async fn test_window_that_cuts_a_filter_keeps_base_order() {
 #[tokio::test]
 async fn test_cutting_window_over_a_filter_stops_early() {
     use crate::io::read::available_parallelism;
-    use crate::store::scan::file_filter::split_hooks;
-    use crate::store::scan::file_scans::driver_hooks;
 
     let (_dir, path) = many_splits_file().await;
     assert_eq!(
@@ -451,14 +426,13 @@ async fn test_cutting_window_over_a_filter_stops_early() {
         .unwrap();
     let reach = (filled + available_parallelism().max(2) - 1).min(MANY_SPLITS);
     for (forced, inline) in [(MANY_SPLITS, true), (0, false)] {
-        let _limit = driver_hooks::ForcedLimit::set(forced);
-        let (evaluated, consumed) = (split_hooks::evaluated(), split_hooks::consumed());
-        driver_hooks::take_spawned();
+        let _limit = ForcedLimit::set(forced);
+        let rec = Recorder::start();
         let windowed = view.window(0, limit).await.unwrap();
-        let spawned = driver_hooks::take_spawned();
-        let evaluated = split_hooks::evaluated() - evaluated;
+        let spawned = rec.count(&Event::SplitSpawned);
+        let evaluated = rec.count(&Event::SplitEvaluated);
         assert_eq!(
-            split_hooks::consumed() - consumed,
+            rec.count_where(|e| matches!(e, Event::SplitConsumed(_))),
             filled,
             "limit {forced}: the splits up to the one that fills the window"
         );
@@ -488,8 +462,6 @@ async fn test_cutting_window_over_a_filter_stops_early() {
 /// under every limit.
 #[tokio::test]
 async fn test_masks_driver_follows_the_row_scan_rule() {
-    use crate::store::scan::{file_scans::driver_hooks, read_plan::MaskedRead};
-
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     for MasksProbe {
@@ -510,17 +482,17 @@ async fn test_masks_driver_follows_the_row_scan_rule() {
             } else {
                 0
             };
-            let _limit = driver_hooks::ForcedLimit::set(limit);
-            driver_hooks::take_spawned();
+            let _limit = ForcedLimit::set(limit);
+            let mut rec = Recorder::start();
             let rows = row_list(&view).await;
             assert_eq!(
-                driver_hooks::take_spawned(),
+                rec.take_count(&Event::SplitSpawned),
                 masks + projection,
                 "{label}: the read's masks and split reads"
             );
             let count = view.size_capped(usize::MAX).await.unwrap();
             assert_eq!(
-                driver_hooks::take_spawned(),
+                rec.take_count(&Event::SplitSpawned),
                 masks,
                 "{label}: the capped count's masks"
             );
@@ -540,16 +512,13 @@ async fn test_masks_driver_follows_the_row_scan_rule() {
 #[tokio::test]
 async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
     use crate::io::read::available_parallelism;
-    use crate::store::scan::file_filter::split_hooks;
-    use crate::store::scan::file_scans::driver_hooks;
 
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p0 = iri("p0");
     let view = matched_view(&store, None, Some(&p0), None, None).await;
-    let _limit = driver_hooks::ForcedLimit::set(0);
-    driver_hooks::take_spawned();
-    let evaluated = split_hooks::evaluated();
+    let _limit = ForcedLimit::set(0);
+    let rec = Recorder::start();
     {
         let mut count = std::pin::pin!(view.size_capped(usize::MAX));
         assert!(
@@ -557,7 +526,7 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
             "the spawned splits have not run"
         );
         assert_eq!(
-            driver_hooks::take_spawned(),
+            rec.count(&Event::SplitSpawned),
             available_parallelism().clamp(2, MANY_SPLITS),
             "a lookahead of splits spawned"
         );
@@ -566,8 +535,210 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
         tokio::task::yield_now().await;
     }
     assert_eq!(
-        split_hooks::evaluated(),
-        evaluated,
+        rec.count(&Event::SplitEvaluated),
+        0,
         "the dropped count's splits never ran"
     );
+}
+
+/// A read of the rows a filter's masks keep reads only the columns the
+/// filter leaves free and fills the ones it pins with their codes, where the
+/// read pins: every take and projection, and a point read of at least
+/// [`PIN_POINT_MIN_ROWS`] rows. The one-shot reads (the code read and
+/// `quads_vec`) of `O` (30 rows, point by point) read every column, of `PO`
+/// (about 75, point by point) `s` and `g`, of `P` (taken) `s`, `o` and `g`,
+/// of `G` (projected) `s`, `p` and `o`, of `pm` in the default graph (taken)
+/// `s` and `o`, and of a window that keeps `P`'s masks as `P`'s. The streams
+/// read a split at a time, so the 32 rows a split of `P` and of `pm` in the
+/// default graph keep are read point by point, every column, as are `O`'s
+/// and `PO`'s few; `G`'s 512 a split are projected, its pinned graph left
+/// out. A window keeps the codes its filter pinned for its reads by id,
+/// one-shot and streamed: the streams of the window that keeps `P`'s masks
+/// take its ids without `p`; `G` cut to 100 rows reads `s`, `p` and `o`
+/// point by point, cut to 10 (too few to keep the pins) every column; and
+/// the first 300 rows of `pm` in the default graph are taken without `p`
+/// and `g`. Every answer is the in-memory store's.
+///
+/// [`PIN_POINT_MIN_ROWS`]: crate::store::scan::file_exprs::PIN_POINT_MIN_ROWS
+#[tokio::test]
+async fn test_masked_reads_skip_the_columns_the_filter_pins() {
+    /// The columns of each read by id or of kept rows `rec` saw since its
+    /// last take, in order.
+    fn columns_read(rec: &mut Recorder) -> Vec<Vec<String>> {
+        rec.take_picked(|e| match e {
+            Event::ColumnsRead(columns) => Some(columns.clone()),
+            _ => None,
+        })
+    }
+
+    /// Asserts `reads` holds at least one read and only reads of `want`.
+    fn assert_reads(reads: Vec<Vec<String>>, want: &[&str], label: &str) {
+        assert!(!reads.is_empty(), "{label}: reads");
+        for columns in &reads {
+            let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+            assert_eq!(columns, want, "{label}: the columns read");
+        }
+    }
+
+    let (_dir, path) = masks_file().await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let pm = iri("pm");
+    let p = Probe::new(None, Some(pm.clone()), None, None);
+    let every: &[&str] = &["s", "p", "o", "g"];
+    let all_rows = MASKS_SPLITS * MASKS_SPLIT_ROWS;
+    for (shape, probe, one_shot, streamed) in [
+        (
+            "O",
+            Probe::new(None, None, Some(plain_literal("sparse")), None),
+            every,
+            Some(every),
+        ),
+        (
+            "PO",
+            Probe::new(None, Some(pm.clone()), Some(plain_literal("o0")), None),
+            ["s", "g"].as_slice(),
+            Some(every),
+        ),
+        ("P", p.clone(), ["s", "o", "g"].as_slice(), Some(every)),
+        (
+            "G",
+            Probe::new(None, None, None, Some(iri_graph("gd"))),
+            ["s", "p", "o"].as_slice(),
+            Some(["s", "p", "o"].as_slice()),
+        ),
+        (
+            "PG",
+            Probe::new(None, Some(pm.clone()), None, Some(GraphName::DefaultGraph)),
+            ["s", "o"].as_slice(),
+            Some(every),
+        ),
+        // The window's streams take its kept ids, filling the code its
+        // filter pins.
+        (
+            "P windowed",
+            p.window(0, Some(all_rows)),
+            ["s", "o", "g"].as_slice(),
+            Some(["s", "o", "g"].as_slice()),
+        ),
+        // A window that keeps its matches' ids keeps the codes its filter
+        // pinned: `G`'s first 100 rows are read point by point, and `PG`'s
+        // first 300 (32 a split) taken, without the columns their filters
+        // pin.
+        (
+            "G windowed to 100",
+            Probe::new(None, None, None, Some(iri_graph("gd"))).window(0, Some(100)),
+            ["s", "p", "o"].as_slice(),
+            Some(["s", "p", "o"].as_slice()),
+        ),
+        // Too few rows for the window to keep the pins.
+        (
+            "G windowed to 10",
+            Probe::new(None, None, None, Some(iri_graph("gd"))).window(0, Some(10)),
+            every,
+            Some(every),
+        ),
+        (
+            "PG windowed to 300",
+            Probe::new(None, Some(pm), None, Some(GraphName::DefaultGraph)).window(0, Some(300)),
+            ["s", "o"].as_slice(),
+            Some(["s", "o"].as_slice()),
+        ),
+    ] {
+        let view = file.run_probe(&probe).await.unwrap();
+        let in_memory = memory.run_probe(&probe).await.unwrap();
+        let want = row_list(&in_memory).await;
+        assert!(!want.is_empty(), "{shape}: the pattern matches");
+        let mut rec = Recorder::start();
+        assert_eq!(row_list(&view).await, want, "{shape}: the code read");
+        assert_eq!(
+            view.quads_vec().await.unwrap(),
+            in_memory.quads_vec().await.unwrap(),
+            "{shape}: quads_vec"
+        );
+        assert_reads(
+            columns_read(&mut rec),
+            one_shot,
+            &format!("{shape} one-shot"),
+        );
+        let (codes, _) = collect_code_chunks(&view, &QuadColumn::ALL, 4_096).await;
+        assert_eq!(codes, want, "{shape}: the code chunks");
+        assert_eq!(
+            struct_chunk_codes(&collect_row_chunks(&view, 4_096).await),
+            want,
+            "{shape}: the row chunks"
+        );
+        let reads = columns_read(&mut rec);
+        if let Some(streamed) = streamed {
+            assert_reads(reads, streamed, &format!("{shape} streamed"));
+        }
+    }
+}
+
+/// A count, a delete and a `keep` on the object column evaluate their
+/// pattern's filter over every split of the file, the splits spawned onto the
+/// runtime's workers rather than all evaluated on the calling thread, and
+/// answer as the in-memory store over the same quads does.
+#[tokio::test]
+async fn test_whole_file_filter_evaluations_spawn_their_splits() {
+    let (_dir, path) = masks_file().await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = built_store(masks_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    for MasksProbe { shape, probe, .. } in masks_probes() {
+        let (s, p, o, g) = (
+            probe.subject.as_ref(),
+            probe.predicate.as_ref(),
+            probe.object.as_ref(),
+            probe.graph.as_ref(),
+        );
+        let mut rec = Recorder::start();
+        let count = file.count_probe(&probe).await.unwrap();
+        assert!(
+            rec.take_count(&Event::SplitSpawned) > 1,
+            "{shape}: count spawns"
+        );
+        assert_eq!(count, memory.count_probe(&probe).await.unwrap(), "{shape}");
+
+        let view = matched_view(&file, s, p, o, g).await;
+        let objects = object_keep(&file).await;
+        rec.take();
+        let kept = view.keep(QuadColumn::O, &objects).await.unwrap();
+        assert!(
+            rec.take_count(&Event::SplitSpawned) > 1,
+            "{shape}: keep spawns"
+        );
+        let memory_kept = matched_view(&memory, s, p, o, g)
+            .await
+            .keep(QuadColumn::O, &object_keep(&memory).await)
+            .await
+            .unwrap();
+        let kept_rows = sorted_rows(&kept).await;
+        assert!(!kept_rows.is_empty(), "{shape}: keep");
+        assert_eq!(kept_rows, sorted_rows(&memory_kept).await, "{shape}: keep");
+
+        rec.take();
+        let deleted = file.delete_matching(s, p, o, g).await.unwrap();
+        assert!(
+            rec.take_count(&Event::SplitSpawned) > 1,
+            "{shape}: delete spawns"
+        );
+        let kept = memory.delete_matching(s, p, o, g).await.unwrap();
+        assert_eq!(
+            deleted.size().await.unwrap(),
+            kept.size().await.unwrap(),
+            "{shape}"
+        );
+    }
+}
+
+/// A keep of the objects `"o0"`, `"o1"` and `"sparse"`, in `store`'s codes.
+async fn object_keep(store: &VortexRdfStore) -> Keep {
+    let dict = store.dict_reader().unwrap();
+    let mut codes = Vec::new();
+    for object in ["o0", "o1", "sparse"] {
+        let term = plain_literal(object).to_string();
+        codes.extend(dict.encode(&term).await.unwrap());
+    }
+    assert_eq!(codes.len(), 3, "every object has a code");
+    Keep::set(codes)
 }

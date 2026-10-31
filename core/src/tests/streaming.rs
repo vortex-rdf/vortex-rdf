@@ -11,8 +11,6 @@ use super::*;
 /// `streams` chunk streams for it: none in memory, where the view decodes
 /// as one chunk, and one on file.
 async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str, streams: usize) {
-    use crate::store::read::quads::chunk_stream_hooks;
-
     let p0 = iri("p0");
     let extra = make_quad(
         "http://example.org/tail-subject",
@@ -30,10 +28,10 @@ async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str, streams
     ];
     for (tag, view) in views {
         let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
-        let built = chunk_stream_hooks::streams();
+        let rec = Recorder::start();
         let collected = view.quads_vec().await.unwrap();
         assert_eq!(
-            chunk_stream_hooks::streams() - built,
+            rec.count(&Event::ChunkStream),
             streams,
             "{kind}: {tag}: chunk streams quads_vec built"
         );
@@ -97,6 +95,49 @@ async fn test_shared_quads_share_repeated_terms() {
                 );
             }
         }
+    }
+}
+
+/// Under the string layouts each term is read in place and shared down a
+/// run of rows repeating it: a subject's rows hold one allocation of it, as
+/// do the runs of an object (a typed literal the TypedObject layout spells
+/// from its sub-columns) and of the graph, while the predicate, which
+/// changes from row to row, is one allocation per row. The rows are
+/// `quads_vec`'s.
+#[tokio::test]
+async fn test_shared_quads_share_runs_under_the_string_layouts() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let quads: Vec<Quad> = (0..4)
+        .flat_map(|s| {
+            (0..3).map(move |p| {
+                Quad::new(
+                    iri_subject(&format!("s{s}")),
+                    iri(&format!("p{p}")),
+                    Term::Literal(Literal::new_typed_literal(
+                        format!("{s}"),
+                        oxrdf::vocab::xsd::INTEGER,
+                    )),
+                    iri_graph("g"),
+                )
+            })
+        })
+        .collect();
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let store = built_store(quads.clone(), layout, vec![]).await;
+        let rows = store.shared_quads_vec().await.unwrap();
+        assert_shared_matches_quads(&store, &format!("{layout:?}")).await;
+        let allocations = |role: fn(&crate::store::SharedQuad) -> &Arc<str>| {
+            rows.iter()
+                .map(|row| Arc::as_ptr(role(row)) as *const u8)
+                .collect::<HashSet<_>>()
+                .len()
+        };
+        assert_eq!(allocations(|row| &row.s), 4, "{layout:?}: subjects");
+        assert_eq!(allocations(|row| &row.p), 12, "{layout:?}: predicates");
+        assert_eq!(allocations(|row| &row.o), 4, "{layout:?}: objects");
+        assert_eq!(allocations(|row| &row.g), 1, "{layout:?}: graphs");
     }
 }
 

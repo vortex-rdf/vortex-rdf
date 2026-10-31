@@ -95,6 +95,13 @@ impl Probe {
         self.limit = limit;
         self
     }
+
+    /// The rows of the match this probe's window reaches: the offset's and
+    /// the limit's, or every row without a limit.
+    fn reach(&self) -> usize {
+        self.limit
+            .map_or(usize::MAX, |limit| self.offset.saturating_add(limit))
+    }
 }
 
 impl VortexRdfStore {
@@ -116,11 +123,13 @@ impl VortexRdfStore {
     /// The row count of one probe's view, its window included: with a limit,
     /// [`size_capped`](Self::size_capped) at `offset + limit`, which stops
     /// reading at the cap, less the offset; without one, [`size`](Self::size)
-    /// less the offset.
+    /// less the offset. The match knows the cap, so an in-memory compare it
+    /// may stop short of is left to the count.
     pub async fn count_probe(&self, probe: &Probe) -> Result<usize> {
-        let view = self
-            .run_pattern_and_keeps(probe, IdsNeed::CountOrWindow)
-            .await?;
+        let need = IdsNeed::CountOrWindow {
+            reach: probe.reach(),
+        };
+        let view = self.run_pattern_and_keeps(probe, need).await?;
         match probe.limit {
             // An offset consumes rows before the cap counts them.
             Some(limit) => Ok(view
@@ -137,7 +146,9 @@ impl VortexRdfStore {
         // reaches, so its ids may wait; an unwindowed one is read row by row.
         let windowed = probe.offset != 0 || probe.limit.is_some();
         let need = if windowed {
-            IdsNeed::CountOrWindow
+            IdsNeed::CountOrWindow {
+                reach: probe.reach(),
+            }
         } else {
             IdsNeed::Rows
         };
@@ -162,6 +173,14 @@ impl VortexRdfStore {
 
     /// One probe's view before its window: the pattern and the keeps.
     async fn run_pattern_and_keeps(&self, probe: &Probe, need: IdsNeed) -> Result<Self> {
+        // The keeps resolve the match's whole selection, whatever the window
+        // takes of what they keep.
+        let need = match need {
+            IdsNeed::CountOrWindow { .. } if !probe.keeps.is_empty() => {
+                IdsNeed::CountOrWindow { reach: usize::MAX }
+            }
+            need => need,
+        };
         let matched = self
             .match_pattern_for(
                 probe.subject.as_ref(),

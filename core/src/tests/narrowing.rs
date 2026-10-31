@@ -5,6 +5,16 @@
 use super::*;
 use crate::store::{Keep, QuadColumn, TermCode};
 
+/// The selected rows the keeps `rec` saw read one by one through a probe.
+fn probed_rows(rec: &Recorder) -> usize {
+    rec.picked(|e| match e {
+        Event::KeepRowsProbed(rows) => Some(*rows),
+        _ => None,
+    })
+    .iter()
+    .sum()
+}
+
 fn brute_keep(rows: &[[TermCode; 4]], column: QuadColumn, keep: &Keep) -> Vec<[TermCode; 4]> {
     rows.iter()
         .copied()
@@ -255,7 +265,6 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
 /// answered by binary search inside the run; a set of two codes (8 steps)
 /// takes the pass over the run. Every keep equals brute force.
 async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
-    use crate::store::query::keep::keep_hooks::sorted_run_keeps;
     let quads: Vec<Quad> = (0..64)
         .map(|i| {
             make_quad(
@@ -283,10 +292,10 @@ async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
         (Keep::set([p[7]]), true),
         (Keep::set([p[1], p[6]]), false),
     ] {
-        let before = sorted_run_keeps();
+        let rec = Recorder::start();
         let narrowed = run.keep(QuadColumn::P, &keep).await.unwrap();
         assert_eq!(
-            sorted_run_keeps() - before,
+            rec.count(&Event::SortedRunKeep),
             usize::from(searched),
             "{tag}: keep {keep:?}"
         );
@@ -339,7 +348,6 @@ async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
 /// of more codes than its searches would beat takes the pass.
 #[tokio::test]
 async fn test_subject_keep_over_every_row_searches_the_sorted_column() {
-    use crate::store::query::keep::keep_hooks::sorted_run_keeps;
     let store = streamed_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let rows = row_list(&store).await;
     let (lo, hi) = store
@@ -356,10 +364,10 @@ async fn test_subject_keep_over_every_row_searches_the_sorted_column() {
         (Keep::set([lo, lo + 41, mid, hi - 1]), true),
         (Keep::set(lo..hi), false),
     ] {
-        let before = sorted_run_keeps();
+        let rec = Recorder::start();
         let narrowed = store.keep(QuadColumn::S, &keep).await.unwrap();
         assert_eq!(
-            sorted_run_keeps() - before,
+            rec.count(&Event::SortedRunKeep),
             usize::from(searched),
             "keep {keep:?}"
         );
@@ -380,7 +388,6 @@ async fn test_subject_keep_over_every_row_searches_the_sorted_column() {
 /// or more takes the pass.
 #[tokio::test]
 async fn test_subject_keep_over_an_id_list_searches_the_sorted_column() {
-    use crate::store::query::keep::keep_hooks::{probed_rows, sorted_run_keeps};
     let store = streamed_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
@@ -402,15 +409,15 @@ async fn test_subject_keep_over_an_id_list_searches_the_sorted_column() {
         (Keep::set([lo + 1, lo + 41, mid, hi - 1]), false),
         (Keep::set(lo..hi), false),
     ] {
-        let (searches, probed) = (sorted_run_keeps(), probed_rows());
+        let rec = Recorder::start();
         let narrowed = by_p.keep(QuadColumn::S, &keep).await.unwrap();
         assert_eq!(
-            sorted_run_keeps() - searches,
+            rec.count(&Event::SortedRunKeep),
             usize::from(searched),
             "keep {keep:?}"
         );
         if searched {
-            assert_eq!(probed_rows(), probed, "keep {keep:?}: no row read");
+            assert_eq!(probed_rows(&rec), 0, "keep {keep:?}: no row read");
         }
         assert_eq!(
             row_list(&narrowed).await,
@@ -429,7 +436,6 @@ async fn test_subject_keep_over_an_id_list_searches_the_sorted_column() {
 /// nothing.
 #[tokio::test]
 async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
-    use crate::store::query::keep::keep_hooks::{decoded_pieces, probed_rows};
     let (_dir, path) = write_chunked_store_file(&fixture_quads(), 500).await;
     let store = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     for column in ["p", "g"] {
@@ -453,15 +459,15 @@ async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
     for (tag, view) in [("whole", store.clone()), ("p-bound", by_p)] {
         let rows = row_list(&view).await;
         for (column, keep) in &keeps {
-            let (pieces, probed) = (decoded_pieces(), probed_rows());
+            let rec = Recorder::start();
             let narrowed = view.keep(*column, keep).await.unwrap();
             assert!(
-                decoded_pieces() > pieces,
+                rec.count(&Event::KeepPieceDecoded) > 0,
                 "{tag}: {column:?} {keep:?} decodes"
             );
             assert_eq!(
-                probed_rows(),
-                probed,
+                probed_rows(&rec),
+                0,
                 "{tag}: {column:?} {keep:?} probes no row"
             );
             assert_eq!(
@@ -480,18 +486,14 @@ async fn test_keep_over_chunked_columns_decodes_dense_pieces() {
         rows.len()
     );
     let keep = Keep::range(g_lo..g_hi);
-    let (pieces, probed) = (decoded_pieces(), probed_rows());
+    let rec = Recorder::start();
     let narrowed = point.keep(QuadColumn::G, &keep).await.unwrap();
     assert_eq!(
-        decoded_pieces(),
-        pieces,
+        rec.count(&Event::KeepPieceDecoded),
+        0,
         "a point-sized view decodes nothing"
     );
-    assert_eq!(
-        probed_rows() - probed,
-        rows.len(),
-        "each of its rows probed"
-    );
+    assert_eq!(probed_rows(&rec), rows.len(), "each of its rows probed");
     assert_eq!(
         row_list(&narrowed).await,
         brute_keep(&rows, QuadColumn::G, &keep)
@@ -1043,8 +1045,6 @@ async fn test_window_that_the_run_width_cannot_clear_evaluates_the_filter() {
 /// plain rows, in order, known exactly.
 #[tokio::test]
 async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
-    use crate::store::query::window::window_hooks;
-
     let stores = window_stores().await;
     for fixture in stores.iter().filter(|f| f.index != IndexConfig::Reference) {
         let (tag, store) = (fixture.tag(), &fixture.store);
@@ -1067,7 +1067,7 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
                 "{label}: read by the filter's masks first"
             );
             for limit in [bound, bound + 1, usize::MAX] {
-                let windows = window_hooks::windows();
+                let rec = Recorder::start();
                 let windowed = store
                     .run_probe(&probe.clone().window(0, Some(limit)))
                     .await
@@ -1079,8 +1079,8 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
                 let got = windowed.view_statistics().unwrap();
                 if masks_first {
                     assert_eq!(
-                        window_hooks::windows(),
-                        windows + 1,
+                        rec.count(&Event::Window),
+                        1,
                         "{label} limit {limit}: the filter's window"
                     );
                     assert!(!got.pending_filter, "{label} limit {limit}: evaluated");
@@ -1091,8 +1091,8 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
                     );
                 } else {
                     assert_eq!(
-                        window_hooks::windows(),
-                        windows,
+                        rec.count(&Event::Window),
+                        0,
                         "{label} limit {limit}: no window built"
                     );
                     assert_eq!(
@@ -1121,7 +1121,6 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
 #[tokio::test]
 async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
     use crate::store::IdsNeed;
-    use crate::store::indexes::file::rid_scan_hooks;
 
     let p1 = iri("p1");
     let probe = Probe::new(None, Some(p1.clone()), None, None);
@@ -1170,13 +1169,19 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
             for (limit, cuts) in [(n - 1, true), (n, false), (n + 1, false)] {
                 let label = format!("{label} limit {limit}");
                 let view = store
-                    .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+                    .match_pattern_for(
+                        None,
+                        Some(&p1),
+                        None,
+                        None,
+                        IdsNeed::CountOrWindow { reach: usize::MAX },
+                    )
                     .await
                     .unwrap();
                 assert_eq!(view.debug_pending_len(), Some(None), "{label}: unread");
-                let scans = rid_scan_hooks::scans();
+                let rec = Recorder::start();
                 let windowed = view.window(0, limit).await.unwrap();
-                assert_eq!(rid_scan_hooks::scans() - scans, 1, "{label}: one id read");
+                assert_eq!(rec.count(&Event::RidScan), 1, "{label}: one id read");
                 assert_eq!(
                     view.debug_pending_len(),
                     Some(Some(matching.len())),

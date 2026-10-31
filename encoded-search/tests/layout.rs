@@ -202,6 +202,26 @@ async fn column_chunks_match_canonical() {
         assert_eq!(got, u64::from(data[row as usize]), "row {row}");
     }
 
+    // Bulk reads agree with the point reads: runs of consecutive rows inside
+    // a leaf and across the input-chunk boundaries, scattered rows, and rows
+    // out of order.
+    let rows: Vec<u64> = (199_990..200_010)
+        .chain(5..9)
+        .chain((0..data.len() as u64).step_by(9973))
+        .chain([400_000, 3, 399_999, 400_001])
+        .chain([9, 11, 13, 13, 14])
+        .collect();
+    let got = column
+        .values_at(&rows, &source, &session)
+        .await
+        .unwrap()
+        .expect("all chunks are probeable");
+    let want: Vec<u64> = rows
+        .iter()
+        .map(|&row| u64::from(data[row as usize]))
+        .collect();
+    assert_eq!(got, want, "values_at");
+
     // Windowed bounds: search inside sub-ranges (including ones spanning a
     // chunk boundary) and compare against the canonical floor of the window.
     for window in [0u64..50_000, 150_000..250_000, 380_000..420_000, 5..6, 9..9] {
@@ -265,6 +285,14 @@ async fn column_chunks_match_canonical() {
                 "row {row}"
             );
         }
+        let value = |row: u64| u64::from(data[row as usize]);
+        let mut run = vec![0; 20];
+        inside.read_into(b - 20, &mut run);
+        assert_eq!(run, (b - 20..b).map(value).collect::<Vec<_>>(), "leaf run");
+        let scattered = [b - 20, b - 19, b - 9, b - 7, b - 7, b - 6, b - 5, b - 1];
+        let mut out = vec![0; scattered.len()];
+        inside.values_at(&scattered, &mut out);
+        assert_eq!(out, scattered.map(value), "leaf rows");
         let needle = u64::from(data[(b - 5) as usize]);
         let want = canonical_bounds(&data[(b - 20) as usize..b as usize], needle);
         assert_eq!(

@@ -2,30 +2,23 @@
 //! through ([`BaseRead`]), code columns, and the selected-rows plumbing the
 //! serialization and compaction paths share.
 
-#[cfg(feature = "file-io")]
-use std::borrow::Cow;
-#[cfg(feature = "file-io")]
-use std::sync::Arc;
-
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
 use crate::store::RawQuad;
 use crate::store::array::{rechunk, with_subject_stamp};
-#[cfg(feature = "file-io")]
-use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::read::chunks::{RowChunkStream, extract_codes};
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_filter::{self, SplitMasks};
+use crate::store::read::file_plan::{CollectedPlan, masked_codes};
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
-use crate::store::scan::read_plan::{ExactRead, MaskedRead};
+use crate::store::scan::read_plan::ExactRead;
 #[cfg(feature = "file-io")]
-use crate::store::scan::{file_exprs, file_reads, file_scans};
-use crate::store::schema::{self, RowId, TermCode};
+use crate::store::scan::{file_reads, file_scans};
+use crate::store::schema::{self, QuadColumn, RowId, TermCode};
 use crate::store::view::selection::SelectedRows;
 #[cfg(feature = "file-io")]
-use crate::store::view::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::ViewSelection;
 use crate::store::{Backend, MemoryBase};
 
 use futures::stream::{self, StreamExt};
@@ -35,12 +28,9 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_buffer::Buffer;
 
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{Expression, root, select};
-#[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
-#[cfg(feature = "file-io")]
-use vortex_mask::Mask;
 
+use crate::observe::observe;
 use crate::store::VortexRdfStore;
 
 /// A view's base rows as [`base_read`](VortexRdfStore::base_read) reads
@@ -82,22 +72,31 @@ impl BaseRead {
 }
 
 /// The codes at `ids` of each of the four code primitives `prims`, in the
-/// order of `ids`: one gather per column.
+/// order of `ids`: one gather per column. Called column by column rather
+/// than mapped over the columns, so that each gather stays a loop of its
+/// own: mapped, it can be inlined into the array map's iteration, at 9 %
+/// more instructions.
 pub(in crate::store) fn gather_codes(
     prims: &[PrimitiveArray; 4],
     ids: &[RowId],
 ) -> [Buffer<TermCode>; 4] {
-    #[cfg(test)]
-    column_hooks::note(true);
-    prims.each_ref().map(|prim| {
-        let slice = prim.as_slice::<TermCode>();
-        Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
-    })
+    observe!(CodeGather { all_four: true });
+    let [s, p, o, g] = prims;
+    [
+        gather(s, ids),
+        gather(p, ids),
+        gather(o, ids),
+        gather(g, ids),
+    ]
 }
 
 pub(in crate::store) fn gather_column(prim: &PrimitiveArray, ids: &[RowId]) -> Buffer<TermCode> {
-    #[cfg(test)]
-    column_hooks::note(false);
+    observe!(CodeGather { all_four: false });
+    gather(prim, ids)
+}
+
+/// The codes of `prim` at `ids`, in the order of `ids`.
+fn gather(prim: &PrimitiveArray, ids: &[RowId]) -> Buffer<TermCode> {
     let slice = prim.as_slice::<TermCode>();
     Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
 }
@@ -183,16 +182,29 @@ impl VortexRdfStore {
     /// cache cannot hand out as a non-nullable code primitive (chunked or
     /// wire-encoded).
     pub(in crate::store) fn base_code_primitives(&self) -> Option<[PrimitiveArray; 4]> {
+        let [s, p, o, g] = QuadColumn::ALL;
+        Some([
+            self.base_code_primitive(s)?,
+            self.base_code_primitive(p)?,
+            self.base_code_primitive(o)?,
+            self.base_code_primitive(g)?,
+        ])
+    }
+
+    /// The base's `column` code column as a canonical primitive, as
+    /// [`base_code_primitives`](Self::base_code_primitives) reads each of
+    /// the four: a builder-compressed column is decoded into its own shared
+    /// cache, the other columns' caches left as they are.
+    pub(in crate::store) fn base_code_primitive(
+        &self,
+        column: QuadColumn,
+    ) -> Option<PrimitiveArray> {
         use vortex_array::arrays::Struct;
         let base = &self.quads.in_memory()?.base;
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
-        let primitive = |name: &str| {
-            crate::store::resident::shared_code_primitive(
-                struct_arr.unmasked_field_by_name(name).ok()?,
-            )
-        };
-        let [s, p, o, g] = schema::PRIMARY_COLUMNS;
-        Some([primitive(s)?, primitive(p)?, primitive(o)?, primitive(g)?])
+        crate::store::resident::shared_code_primitive(
+            struct_arr.unmasked_field_by_name(column.name()).ok()?,
+        )
     }
 
     /// The rows this view selects as four [`TermCode`] columns (`s`, `p`,
@@ -216,7 +228,7 @@ impl VortexRdfStore {
         }
         // Codes off the index's run: no row ids computed, no gather.
         #[cfg(feature = "file-io")]
-        if let ViewSelection::Pending(_) = &self.quads.selection
+        if let ViewSelection::Pending { .. } = &self.quads.selection
             && let Some(FileBase {
                 serve: Some(plan), ..
             }) = self.quads.file()
@@ -224,38 +236,29 @@ impl VortexRdfStore {
         {
             return Ok(Some(columns));
         }
-        // On file the read is the one `base_read` makes, decided once; a
-        // point-sized read by id fills the code buffers straight from the
-        // chunk probes, with the same rows and filter checks, and a pending
-        // filter the reads by id leave to the scan is evaluated to its masks
-        // first, the rows they keep read after. A window's kept masks are
-        // read the same way, the filter not run again.
+        // On file the read is a one-shot read's plan (`collected_plan`): a
+        // filter's kept rows read straight into the code buffers, point by
+        // point or read whole; a point-sized read by id fills the code
+        // buffers straight from the chunk probes, with the same rows and
+        // filter checks; anything else the rows `base_read` reads.
         #[cfg(feature = "file-io")]
         if let Backend::File(base) = &self.quads.backend {
-            if let Some(masks) = &base.masks {
-                let primary = self.layout.strategy().primary_column_names();
-                return Self::masked_codes(&base.file, primary, masks)
-                    .await
-                    .map(Some);
-            }
-            let (scope, read) = self.file_read(base, &schema::PRIMARY_COLUMNS).await?;
-            if let Some(masks) = scope.masks_first(&read).await? {
-                return Self::masked_codes(scope.file, scope.by_id_columns, &masks)
-                    .await
-                    .map(Some);
-            }
+            let (scope, read) = match self.collected_plan(base, &schema::PRIMARY_COLUMNS).await? {
+                CollectedPlan::Masked(masked) => return masked_codes(&masked).await.map(Some),
+                CollectedPlan::Exact(scope, read) => (scope, read),
+            };
             let rows = match read {
                 ExactRead::Points(rows) => {
-                    if let Some(codes) = file_reads::file_point_codes(
-                        scope.file,
-                        scope.by_id_columns,
-                        scope.filter,
-                        rows,
-                    )
-                    .await?
-                        && let Some(codes) = primary_order(scope.by_id_columns, codes)
+                    let pins = scope.pins.for_points(rows.len());
+                    let read_columns = pins.columns_to_read(scope.by_id_columns);
+                    if let Some(codes) =
+                        file_reads::file_point_codes(scope.file, &read_columns, scope.filter, rows)
+                            .await?
                     {
-                        return Ok(Some(codes));
+                        // The read columns in `(s, p, o, g)` order, the pinned
+                        // ones filled: every primary column is read or pinned.
+                        let kept = codes.first().map_or(0, Buffer::len);
+                        return pins.fill_codes(&read_columns, codes, kept).map(Some);
                     }
                     // Declined as the row read would decline: the scan reads.
                     BaseRead::Scan(Box::new(scope.scan()?))
@@ -275,81 +278,33 @@ impl VortexRdfStore {
     }
 
     /// The base rows this view covers, without the tail, in base row order,
-    /// as [`BaseRead`] carries them: at least the `columns` (primary column
-    /// names), each found by name. Every row reader reads the base through
-    /// here; the served fast paths read the answering index instead.
+    /// as [`BaseRead`] carries them, read whole: at least the `columns`
+    /// (primary column names), each found by name. The whole-base reads
+    /// (compaction, serialization) read the base through here; the served
+    /// fast paths read the answering index instead.
     ///
     /// The read is over the exact selection: a served view's pending
     /// selection materializes here, since its plan orders the rows by the
     /// index; a pending one without a plan sits only on a view built to be
     /// counted or windowed, which is never read (`expect_exact`). In memory
     /// the live selected rows are gathered, every primary column
-    /// ([`in_memory_base_rows`](Self::in_memory_base_rows)). On file a
-    /// selection the reads by id serve is read by id, through every primary
-    /// column while a filter is pending (the read checks it on the columns it
-    /// reads); anything else, or a read by id that declines, is the restricted
-    /// scan of `columns` ([`FileReadScope::rows`]).
+    /// ([`in_memory_base_rows`](Self::in_memory_base_rows)). On file it is a
+    /// one-shot read's plan ([`collected_plan`](Self::collected_plan)): a
+    /// filter's kept rows, a window's masks or a pending filter's evaluated
+    /// first; rows by id, through every primary column while a filter is
+    /// pending (the read checks it on the columns it reads); anything else,
+    /// or a read by id that declines, the restricted scan of `columns`
+    /// ([`FileReadScope::rows`](crate::store::read::file_plan::FileReadScope::rows)).
     #[cfg_attr(not(feature = "file-io"), allow(unused_variables))]
     pub(in crate::store) async fn base_read(&self, columns: &[&'static str]) -> Result<BaseRead> {
         match &self.quads.backend {
             Backend::InMemory(memory) => Ok(BaseRead::Rows(self.in_memory_base_rows(memory)?)),
             #[cfg(feature = "file-io")]
-            Backend::File(base) => {
-                let (scope, read) = self.file_read(base, columns).await?;
-                scope.rows(read).await
-            }
+            Backend::File(base) => match self.collected_plan(base, columns).await? {
+                CollectedPlan::Masked(masked) => Ok(BaseRead::Rows(masked.rows().await?)),
+                CollectedPlan::Exact(scope, read) => scope.rows(read).await,
+            },
         }
-    }
-
-    /// What a read of this file view's `base` rows covers, and the
-    /// [`ExactRead`] that reads them, chosen once: its exact selection, a
-    /// served view's pending one materialized here (the plan orders the rows
-    /// by the index, and the read needs base order); the columns a read by id
-    /// reads, every primary column while a filter is pending (the read checks
-    /// it on the columns it reads), else `columns`; and the filter still to
-    /// run. A view whose window kept its filter's masks ([`FileBase::masks`])
-    /// covers the ids the masks keep, with no filter to run.
-    #[cfg(feature = "file-io")]
-    pub(in crate::store) async fn file_read<'a>(
-        &'a self,
-        base: &'a FileBase,
-        columns: &'a [&'static str],
-    ) -> Result<(FileReadScope<'a>, ExactRead)> {
-        let (selection, by_id_columns, filter) = match &base.masks {
-            Some(masks) => {
-                let ids = Buffer::from(masks.first_ids(usize::MAX));
-                (Cow::Owned(RowSelection::from_ids(ids)), columns, None)
-            }
-            None => {
-                let selection = match base.serve {
-                    // Runs the deferred index-child read once, cached on the view.
-                    Some(_) => Cow::Owned(self.quads.selection.materialized_async().await?),
-                    None => Cow::Borrowed(self.quads.selection.expect_exact()),
-                };
-                let filter = base.filter.as_ref();
-                let by_id_columns = match filter {
-                    Some(_) => self.layout.strategy().primary_column_names(),
-                    None => columns,
-                };
-                (selection, by_id_columns, filter)
-            }
-        };
-        let scope = FileReadScope {
-            file: &base.file,
-            columns,
-            by_id_columns,
-            filter,
-            selection,
-            deleted: self.quads.deleted.as_ref(),
-        };
-        let read = ExactRead::of(
-            scope.file,
-            scope.by_id_columns,
-            scope.filter,
-            &scope.selection,
-            scope.deleted,
-        )?;
-        Ok((scope, read))
     }
 
     /// An in-memory view's live base rows in base row order, every primary
@@ -390,45 +345,12 @@ impl VortexRdfStore {
         with_subject_stamp(rows, self.quads.subject_sorted())
     }
 
-    /// The `(s, p, o, g)` code columns of the rows `masks` keep (a pending
-    /// filter's split masks, in file order), `columns` the layout's primary
-    /// columns, read as [`MaskedRead`] chooses with no filter left to check:
-    /// point by point straight into the code buffers, by one take through the
-    /// chunk probes, or each split projected at its mask. A read by id that a
-    /// chunk declines falls to the next.
-    #[cfg(feature = "file-io")]
-    async fn masked_codes(
-        file: &Arc<NativeStoreFile>,
-        columns: &[&'static str],
-        masks: &SplitMasks,
-    ) -> Result<[Buffer<TermCode>; 4]> {
-        let read = MaskedRead::of(file, masks)?;
-        if read != MaskedRead::Project {
-            let ids = masks.first_ids(usize::MAX);
-            if read == MaskedRead::Points
-                && let Some(codes) =
-                    file_reads::file_point_codes(file, columns, None, ids.clone()).await?
-                && let Some(codes) = primary_order(columns, codes)
-            {
-                return Ok(codes);
-            }
-            if let Some(rows) = file_reads::take_file_rows(file, columns, &ids).await?
-                && let Some(codes) = primary_order(columns, extract_codes(rows, columns)?)
-            {
-                return Ok(codes);
-            }
-        }
-        let rows = file_reads::masked_projection(file, &schema::PRIMARY_COLUMNS, masks).await?;
-        primary_codes(rows)
-    }
-
     /// Every live quad this view covers, decoded to raw N-Triples term strings
     /// (a file-backed dictionary lifted resident for the decode), base rows
     /// first in base row order, then the tail's live rows, and how many of
     /// them came from the base.
     pub(in crate::store) async fn live_raw_quads(&self) -> Result<(Vec<RawQuad>, usize)> {
-        #[cfg(test)]
-        crate::store::test_hooks::note_gather();
+        observe!(RawQuadsGathered);
         let base = self.base_selected_rows().await?;
         let mut raws = self.layout.raw_quads_async(&base).await?;
         let base_rows = raws.len();
@@ -439,161 +361,9 @@ impl VortexRdfStore {
     }
 }
 
-/// A file view's base read, as [`VortexRdfStore::file_read`] scopes it: the
-/// file, the columns the scan projects, the columns a read by id reads, the
-/// filter still to run, the exact selection and the tombstones. The
-/// [`ExactRead`] chosen for it travels beside it, so its id list moves into
-/// the read that takes it.
-#[cfg(feature = "file-io")]
-pub(in crate::store) struct FileReadScope<'a> {
-    pub(in crate::store) file: &'a Arc<NativeStoreFile>,
-    /// The primary columns the scan projects, in the order its chunks carry
-    /// them.
-    pub(in crate::store) columns: &'a [&'static str],
-    /// The columns a read by id reads: every primary column while a filter
-    /// is pending, which the read checks on the columns it reads.
-    pub(in crate::store) by_id_columns: &'a [&'static str],
-    pub(in crate::store) filter: Option<&'a Expression>,
-    pub(in crate::store) selection: Cow<'a, RowSelection>,
-    pub(in crate::store) deleted: Option<&'a Mask>,
-}
-
-#[cfg(feature = "file-io")]
-impl FileReadScope<'_> {
-    /// The base rows `read` reads by id: point by point through the file's
-    /// cached chunk probes ([`file_reads::file_point_rows`]), or taken at the
-    /// ids ([`file_reads::take_file_rows`]). [`ExactRead::Scan`] and
-    /// [`ExactRead::Masks`], which a streaming reader scans, and a read by id
-    /// that declines are the restricted scan ([`scan`](Self::scan)).
-    pub(in crate::store) async fn rows(&self, read: ExactRead) -> Result<BaseRead> {
-        let rows = match read {
-            ExactRead::Points(rows) => {
-                file_reads::file_point_rows(self.file, self.by_id_columns, self.filter, rows)
-                    .await?
-            }
-            ExactRead::Take(ids) => {
-                file_reads::take_file_rows(self.file, self.by_id_columns, &ids).await?
-            }
-            ExactRead::Scan | ExactRead::Masks => None,
-        };
-        Ok(match rows {
-            Some(rows) => BaseRead::Rows(rows),
-            None => BaseRead::Scan(Box::new(self.scan()?)),
-        })
-    }
-
-    /// The pending filter's masks over the selection, tombstones cleared,
-    /// every split evaluated in file order as a window evaluates them, when
-    /// `read` leaves the filter to the restricted scan
-    /// ([`ExactRead::Masks`]): the first step of a one-shot read. `None` for
-    /// any other read.
-    pub(in crate::store) async fn masks_first(
-        &self,
-        read: &ExactRead,
-    ) -> Result<Option<SplitMasks>> {
-        match (read, self.filter) {
-            (ExactRead::Masks, Some(filter)) => Ok(Some(
-                file_filter::split_masks(self.file, filter, &self.selection, self.deleted).await?,
-            )),
-            _ => Ok(None),
-        }
-    }
-
-    /// The scan every unserved file read starts from: a projection of the
-    /// scope's columns (index columns never surface), the view's pushed-down
-    /// filter for the pattern components no index resolved, and its row
-    /// selection, with tombstoned rows excluded, for those one did. The scan
-    /// decodes the projected columns and the columns the filter references.
-    pub(in crate::store) fn scan(&self) -> Result<ScanBuilder<ArrayRef>> {
-        let mut scan = self.file.scan()?;
-        // Filters and projections bind against the scan's scope (the root
-        // dtype), so it is read before the projection replaces it. Binding
-        // through the handle's memo keeps one identity per repeated shape
-        // (see `BoundExprMemo`).
-        let scope = scan.dtype()?;
-        let memo = self.file.bound_exprs();
-        scan = scan.with_projection(memo.bind(
-            file_exprs::QUAD_SCOPE,
-            &select(self.columns, root()),
-            &scope,
-        )?);
-        if let Some(f) = self.filter {
-            #[cfg(test)]
-            restricted_scan_hooks::note_filtered();
-            scan = scan.with_filter(memo.bind(file_exprs::QUAD_SCOPE, f, &scope)?);
-        }
-        Ok(self.selection.restrict_scan(scan, self.deleted))
-    }
-}
-
 /// The `(s, p, o, g)` code columns of a read of the primary columns.
 fn primary_codes(rows: ArrayRef) -> Result<[Buffer<TermCode>; 4]> {
     Ok(extract_codes(rows, &schema::PRIMARY_COLUMNS)?
         .try_into()
         .expect("one code buffer per primary column"))
-}
-
-/// `codes`, one buffer per column of `columns`, as the `(s, p, o, g)` code
-/// columns; `None` when a primary column is missing.
-#[cfg(feature = "file-io")]
-fn primary_order(
-    columns: &[&str],
-    mut codes: Vec<vortex_buffer::Buffer<TermCode>>,
-) -> Option<[vortex_buffer::Buffer<TermCode>; 4]> {
-    let mut take = |name: &str| {
-        let idx = columns.iter().position(|c| *c == name)?;
-        Some(std::mem::take(&mut codes[idx]))
-    };
-    Some([
-        take(schema::COL_S)?,
-        take(schema::COL_P)?,
-        take(schema::COL_O)?,
-        take(schema::COL_G)?,
-    ])
-}
-
-/// Test hook: how many gathers this thread made from code primitives, by
-/// path: all four columns in one pass ([`gather_codes`]), or one column
-/// ([`gather_column`]).
-#[cfg(test)]
-pub(crate) mod column_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static FOUR: Cell<usize> = const { Cell::new(0) };
-        static ONE: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one gather, of all four columns or of one.
-    pub(super) fn note(four: bool) {
-        let cell = if four { &FOUR } else { &ONE };
-        cell.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The gathers on this thread so far: `(of all four columns, of one)`.
-    pub(crate) fn gathers() -> (usize, usize) {
-        (FOUR.with(Cell::get), ONE.with(Cell::get))
-    }
-}
-
-/// Test hook: how many restricted file scans this thread built with a filter
-/// pushed down ([`FileReadScope::scan`]), each evaluating that filter split by
-/// split as it is read.
-#[cfg(all(test, feature = "file-io"))]
-pub(crate) mod restricted_scan_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static FILTERED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one restricted scan built with a filter.
-    pub(super) fn note_filtered() {
-        FILTERED.set(FILTERED.get() + 1);
-    }
-
-    /// The restricted scans built with a filter on this thread so far.
-    pub(crate) fn filtered() -> usize {
-        FILTERED.get()
-    }
 }

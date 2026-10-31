@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use super::*;
-use crate::store::read::chunks::chunk_path_hooks::{self, ForceLegacy};
+use crate::store::test_hooks::{LegacyChunkPaths, legacy_chunk_paths};
 use crate::store::{CodePattern, QuadColumn, TermCode};
 use oxrdf::BlankNode;
 use vortex_buffer::Buffer;
@@ -153,7 +153,7 @@ async fn decode_row_chunk_refuses_a_dictionary_store() {
 }
 
 /// Drains `view`'s `code_chunks` over `columns` at `batch_rows` as it reads
-/// now and on its pre-fix path ([`ForceLegacy`]): the same rows, in the same
+/// now and on its pre-fix path ([`LegacyChunkPaths`]): the same rows, in the same
 /// order.
 async fn assert_code_chunks_equal_legacy<const N: usize>(
     view: &VortexRdfStore,
@@ -163,11 +163,11 @@ async fn assert_code_chunks_equal_legacy<const N: usize>(
 ) {
     let (rows, _) = collect_code_chunks(view, columns, batch_rows).await;
     let legacy = {
-        let _legacy = ForceLegacy::set();
-        assert!(chunk_path_hooks::legacy());
+        let _legacy = LegacyChunkPaths::set();
+        assert!(legacy_chunk_paths());
         collect_code_chunks(view, columns, batch_rows).await.0
     };
-    assert!(!chunk_path_hooks::legacy());
+    assert!(!legacy_chunk_paths());
     assert_eq!(
         rows, legacy,
         "{tag}: code_chunks {columns:?} at {batch_rows}"
@@ -178,7 +178,7 @@ async fn assert_code_chunks_equal_legacy<const N: usize>(
 async fn assert_row_chunks_equal_legacy(view: &VortexRdfStore, batch_rows: usize, tag: &str) {
     let rows = struct_chunk_codes(&collect_row_chunks(view, batch_rows).await);
     let legacy = {
-        let _legacy = ForceLegacy::set();
+        let _legacy = LegacyChunkPaths::set();
         struct_chunk_codes(&collect_row_chunks(view, batch_rows).await)
     };
     assert_eq!(rows, legacy, "{tag}: row_chunks at {batch_rows}");
@@ -290,11 +290,21 @@ async fn drain_counting_served(
     view: &VortexRdfStore,
     batch_rows: usize,
 ) -> (Vec<[TermCode; 4]>, bool) {
-    let before = chunk_path_hooks::served_runs();
+    let (rows, served, _) = drain_served_and_base_reads(view, batch_rows).await;
+    (rows, served)
+}
+
+/// [`drain_counting_served`], beside how many reads of the base it chose
+/// ([`Event::ExactRead`]).
+async fn drain_served_and_base_reads(
+    view: &VortexRdfStore,
+    batch_rows: usize,
+) -> (Vec<[TermCode; 4]>, bool, usize) {
+    let rec = Recorder::start();
     let (rows, _) = collect_code_chunks(view, &QuadColumn::ALL, batch_rows).await;
-    let after = chunk_path_hooks::served_runs();
-    assert!(after - before <= 1, "one stream, one run");
-    (rows, after > before)
+    let served = rec.count(&Event::ServedRunChunks);
+    assert!(served <= 1, "one stream, one run");
+    (rows, served == 1, rec.count(&Event::ExactRead))
 }
 
 /// The matched view of a pattern of spellings.
@@ -324,12 +334,10 @@ async fn served_runs_are_read_off_the_index() {
             "{name}: an index serves it"
         );
         for batch_rows in [256, 65_536] {
-            let chosen = crate::store::scan::read_plan::exact_read_hooks::chosen();
-            let (_, served) = drain_counting_served(&view, batch_rows).await;
+            let (_, served, base_reads) = drain_served_and_base_reads(&view, batch_rows).await;
             assert!(served, "{name} at {batch_rows}: read off the index");
             assert_eq!(
-                crate::store::scan::read_plan::exact_read_hooks::chosen(),
-                chosen,
+                base_reads, 0,
                 "{name} at {batch_rows}: no read of the base chosen"
             );
         }
@@ -464,28 +472,34 @@ async fn rare_tail_file(rows: usize) -> (tempfile::TempDir, std::path::PathBuf) 
     write_chunked_store_file(&quads, 32).await
 }
 
+/// Masked reads of kept rows, among the events since `rec` last took.
+fn masked_reads(rec: &mut Recorder) -> usize {
+    rec.take()
+        .iter()
+        .filter(|event| matches!(event, Event::MaskedRead(_)))
+        .count()
+}
+
 #[tokio::test]
 async fn masked_streams_of_rare_and_absent_codes() {
-    use crate::store::scan::read_plan::masked_read_hooks;
-
     let (_dir, path) = rare_tail_file(8_192).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     // Held only by the last split's rows: the whole file is evaluated before
     // the first chunk, which holds them.
     let rare = probe_view(&store, [None, None, Some("\"rare\""), None]).await;
-    let streams = chunk_path_hooks::masked_streams();
+    let mut rec = Recorder::start();
     let mut chunks = rare.code_chunks(&QuadColumn::ALL, 256).unwrap();
     let first = chunks.next().await.unwrap().unwrap();
     assert_eq!(first[0].len(), 3, "the rare rows in the first chunk");
     assert!(chunks.next().await.is_none());
-    assert_eq!(chunk_path_hooks::masked_streams(), streams + 1);
+    assert_eq!(rec.take_count(&Event::MasksFirstStream), 1);
     // A dictionary code no quad holds as an object (an IRI only predicates
     // hold, which the object column's zones rule out): no chunk, no read.
     let absent = probe_view(&store, [None, None, Some("<http://example.org/p0>"), None]).await;
-    let reads = masked_read_hooks::reads();
+    rec.take();
     let mut chunks = absent.code_chunks(&QuadColumn::ALL, 256).unwrap();
     assert!(chunks.next().await.is_none(), "no chunk");
-    assert_eq!(masked_read_hooks::reads(), reads, "no read of kept rows");
+    assert_eq!(masked_reads(&mut rec), 0, "no read of kept rows");
     // Every row the filter keeps deleted: the masked streams are taken and
     // their masks keep nothing, so no batch yields a chunk or reads a row.
     let tombstoned = store
@@ -498,10 +512,7 @@ async fn masked_streams_of_rare_and_absent_codes() {
     );
     let gone = probe_view(&tombstoned, [None, None, Some("\"rare\""), None]).await;
     for batch_rows in [1, 256, 65_536] {
-        let (streams, reads) = (
-            chunk_path_hooks::masked_streams(),
-            masked_read_hooks::reads(),
-        );
+        rec.take();
         let mut codes = gone.code_chunks(&QuadColumn::ALL, batch_rows).unwrap();
         assert!(
             codes.next().await.is_none(),
@@ -512,51 +523,22 @@ async fn masked_streams_of_rare_and_absent_codes() {
             rows.next().await.is_none(),
             "no row chunk, batch {batch_rows}"
         );
+        let events = rec.take();
         assert_eq!(
-            chunk_path_hooks::masked_streams(),
-            streams + 2,
+            events
+                .iter()
+                .filter(|event| **event == Event::MasksFirstStream)
+                .count(),
+            2,
             "both streams masked, batch {batch_rows}"
         );
-        assert_eq!(
-            masked_read_hooks::reads(),
-            reads,
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::MaskedRead(_))),
             "no read of kept rows, batch {batch_rows}"
         );
     }
-}
-
-#[tokio::test]
-async fn a_masked_stream_dropped_after_its_first_chunk_evaluates_no_further() {
-    use crate::io::read::available_parallelism;
-    use crate::store::scan::file_filter::split_hooks;
-
-    let (_dir, path) = super::masks_first::many_splits_file().await;
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let view = probe_view(&store, [None, Some("<http://example.org/p0>"), None, None]).await;
-    let lookahead = available_parallelism().max(2);
-    let (evaluated, consumed) = (split_hooks::evaluated(), split_hooks::consumed());
-    let streams = chunk_path_hooks::masked_streams();
-    let mut chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
-    assert_eq!(chunks.next().await.unwrap().unwrap()[0].len(), 256);
-    assert_eq!(
-        chunk_path_hooks::masked_streams(),
-        streams + 1,
-        "a masked stream"
-    );
-    drop(chunks);
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    let evaluated = split_hooks::evaluated() - evaluated;
-    let consumed = split_hooks::consumed() - consumed;
-    assert!(
-        evaluated <= consumed + lookahead,
-        "{evaluated} splits evaluated for {consumed} consumed"
-    );
-    assert!(
-        evaluated < super::masks_first::MANY_SPLITS / 2,
-        "most splits never evaluated"
-    );
 }
 
 #[tokio::test]
@@ -574,20 +556,20 @@ async fn masked_streams_are_taken() {
     ] {
         let view = probe_view(&store, pattern).await;
         for batch_rows in [1, 256, 65_536] {
-            let streams = chunk_path_hooks::masked_streams();
+            let mut rec = Recorder::start();
             collect_code_chunks(&view, &QuadColumn::ALL, batch_rows).await;
             assert_eq!(
-                chunk_path_hooks::masked_streams(),
-                streams + 1,
+                rec.take_count(&Event::MasksFirstStream),
+                1,
                 "{name}: code_chunks at {batch_rows}"
             );
-            let streams = chunk_path_hooks::masked_streams();
             collect_row_chunks(&view, batch_rows).await;
             assert_eq!(
-                chunk_path_hooks::masked_streams(),
-                streams + 1,
+                rec.take_count(&Event::MasksFirstStream),
+                1,
                 "{name}: row_chunks at {batch_rows}"
             );
+            drop(rec);
             assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, batch_rows, name).await;
             assert_row_chunks_equal_legacy(&view, batch_rows, name).await;
         }

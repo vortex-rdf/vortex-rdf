@@ -8,6 +8,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 
 /// Environment variable overriding where spill directories are created: a
 /// volume with room for runs that exist because the data outgrew memory (the
@@ -108,8 +109,7 @@ impl TempRunsGuard {
         let dir = parent.join(name);
         std::fs::create_dir_all(&dir)
             .map_err(|e| spill_io_error(&parent, "directory creation", e))?;
-        #[cfg(test)]
-        spill_hooks::note(&dir);
+        observe!(Spilled(dir.clone()));
         Ok(Self { dir })
     }
 
@@ -122,29 +122,6 @@ impl TempRunsGuard {
 impl Drop for TempRunsGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Test hook: the run directory the last [`TempRunsGuard`] this thread
-/// created, which the tests read to pin where a build spilled and what the
-/// directory is called.
-#[cfg(test)]
-pub(crate) mod spill_hooks {
-    use std::cell::RefCell;
-    use std::path::{Path, PathBuf};
-
-    thread_local! {
-        static LAST_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    }
-
-    /// Record the run directory a guard created.
-    pub(super) fn note(dir: &Path) {
-        LAST_DIR.with(|last| *last.borrow_mut() = Some(dir.to_path_buf()));
-    }
-
-    /// The run directory the last guard created on this thread, if any.
-    pub(crate) fn last_dir() -> Option<PathBuf> {
-        LAST_DIR.with(|last| last.borrow().clone())
     }
 }
 

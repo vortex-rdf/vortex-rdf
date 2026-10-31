@@ -2,9 +2,10 @@
 //! [`RawQuad`] (owned N-Triples strings, the builders' input) and
 //! [`SharedQuad`] (`Arc<str>` terms, the shared-string read output).
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
-use oxrdf::Quad;
+use oxrdf::{Quad, TermRef};
 
 use crate::common::terms::{Trust, at, graph_name, named_node, quad_from_terms, subject, term};
 use crate::error::Result;
@@ -40,6 +41,52 @@ impl From<RawQuad> for SharedQuad {
             o: Arc::from(raw.o),
             g: Arc::from(raw.g),
         }
+    }
+}
+
+/// A chunk's rows written as N-Triples/N-Quads lines, `s p o [g] .` each with
+/// every term spelled as the columns store it: the shape the
+/// N-Triples/N-Quads export reads a chunk in, built straight from the
+/// columns with no string per row.
+pub(crate) struct NQuadLines {
+    /// The lines, each ending in a newline.
+    pub(crate) text: String,
+    /// Whether some line names a graph, which N-Triples cannot hold.
+    pub(crate) named_graph: bool,
+}
+
+impl NQuadLines {
+    /// No lines yet, with room for `rows` lines of usual length.
+    pub(crate) fn with_capacity(rows: usize) -> Self {
+        Self {
+            text: String::with_capacity(rows.saturating_mul(96)),
+            named_graph: false,
+        }
+    }
+
+    /// Append `term` (a subject, a predicate or an object) and the space
+    /// after it.
+    pub(crate) fn term(&mut self, term: &str) {
+        self.text.push_str(term);
+        self.text.push(' ');
+    }
+
+    /// End the line: `graph` and a space unless it is the default graph's
+    /// `""`, then `.` and a newline.
+    pub(crate) fn end(&mut self, graph: &str) {
+        if !graph.is_empty() {
+            self.named_graph = true;
+            self.term(graph);
+        }
+        self.text.push_str(".\n");
+    }
+
+    /// Append one row's line.
+    pub(crate) fn push(&mut self, [s, p, o, g]: [&str; 4]) {
+        self.term(s);
+        self.term(p);
+        self.term(o);
+        self.end(g);
     }
 }
 
@@ -119,6 +166,24 @@ impl RawQuad {
                 oxrdf::GraphName::BlankNode(b) => blank_node_string(b),
             },
         }
+    }
+}
+
+/// Append `term`'s canonical spelling to `out`: the one
+/// [`RawQuad::from_quad`] renders for it, `<iri>`, `_:id` or a literal's
+/// Display form.
+pub(crate) fn push_spelling(out: &mut String, term: TermRef<'_>) {
+    match term {
+        TermRef::NamedNode(n) => {
+            out.push('<');
+            out.push_str(n.as_str());
+            out.push('>');
+        }
+        TermRef::BlankNode(b) => {
+            out.push_str("_:");
+            out.push_str(b.as_str());
+        }
+        TermRef::Literal(l) => write!(out, "{l}").expect("a String takes every write"),
     }
 }
 

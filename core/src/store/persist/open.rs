@@ -15,7 +15,7 @@ use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{DictAccess, LayoutStrategy};
 #[cfg(feature = "file-io")]
 use crate::store::{
-    Backend, FileBase, QuadsSource, array::into_struct_array, indexes::Indexes,
+    Backend, FileBase, FileFilter, QuadsSource, array::into_struct_array, indexes::Indexes,
     layouts::dictionary::FileBackedDict, persist::native_file::NativeStoreFile,
 };
 
@@ -150,6 +150,8 @@ pub(super) struct ComponentRoster {
     /// decides the layout, so a dictionary child beside string columns is
     /// left out like a skipped component.
     pub(super) dict: Option<usize>,
+    /// That child's `bracketed_iris` provenance; `false` without one.
+    pub(super) dict_bracketed_iris: bool,
     /// The known index children, in inventory order.
     pub(super) index_children: Vec<IndexChild>,
 }
@@ -177,11 +179,15 @@ impl ComponentRoster {
             LayoutStrategy::from_dtype(file.dtype()) == LayoutStrategy::Dictionary;
         let mut roster = Self {
             dict: None,
+            dict_bracketed_iris: false,
             index_children: Vec::new(),
         };
         for (slot, descriptor) in descriptors.iter().enumerate() {
             match classify_component(descriptor)? {
-                ComponentKind::Dict if dictionary_layout => roster.dict = Some(slot),
+                ComponentKind::Dict if dictionary_layout => {
+                    roster.dict = Some(slot);
+                    roster.dict_bracketed_iris = descriptor.bracketed_iris;
+                }
                 ComponentKind::Index(identity) => roster.index_children.push(IndexChild {
                     identity,
                     slot,
@@ -302,7 +308,7 @@ impl VortexRdfStore {
             // FSST.
             None => match file.component_reader(container::DICT_COMPONENT_NAME)? {
                 Some(reader) => Some(DictAccess::Resident(Arc::new(
-                    TermDictionary::from_child_reader(reader).await?,
+                    TermDictionary::from_child_reader(reader, file.dict_bracketed_iris()).await?,
                 ))),
                 None => None,
             },
@@ -318,9 +324,8 @@ impl VortexRdfStore {
             generation: crate::store::next_generation(),
             quads: QuadsSource::new(Backend::File(FileBase {
                 file,
-                filter: None,
+                filter: FileFilter::None,
                 serve: None,
-                masks: None,
             })),
             tail: None,
         })
@@ -373,7 +378,8 @@ impl VortexRdfStore {
         let reader = |slot: usize| container::component_reader(&file, slot);
         let dict = match roster.dict {
             Some(slot) => Some(DictAccess::Resident(Arc::new(
-                TermDictionary::from_child_reader(reader(slot)?).await?,
+                TermDictionary::from_child_reader(reader(slot)?, roster.dict_bracketed_iris)
+                    .await?,
             ))),
             None => None,
         };

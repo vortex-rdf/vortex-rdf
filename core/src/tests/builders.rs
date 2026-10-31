@@ -61,7 +61,10 @@ async fn test_default_streaming_chunk_boundaries() {
     // Decode all chunks in order and verify global subject sort.
     let subjects: Vec<String> = chunks
         .iter()
-        .flat_map(|c| store::layouts::ResolvedLayout::Default.decode_chunk(c))
+        .flat_map(|c| {
+            use store::layouts::{ChunkDecode as _, ResolvedLayout};
+            Quad::decode(&ResolvedLayout::Default, c)
+        })
         .map(|q| q.unwrap().subject.to_string())
         .collect();
     let mut sorted = subjects.clone();
@@ -497,11 +500,10 @@ async fn test_spilled_string_layouts_decode_terms_verbatim() {
 /// builds emit every quad.
 #[tokio::test]
 async fn test_run_capacity_boundary_spills_only_past_it() {
-    use crate::store::builders::spill::spill_hooks;
-
     for layout in LAYOUTS {
         for (n, files) in [(4usize, 0usize), (5, 2)] {
             let quads = modular_quads(n, 3, 4);
+            let rec = Recorder::start();
             let built = sorted_stream::build_chunk_stream(
                 Box::new(quad_stream(quads)),
                 layout,
@@ -511,7 +513,7 @@ async fn test_run_capacity_boundary_spills_only_past_it() {
             )
             .await
             .unwrap();
-            let dir = spill_hooks::last_dir().expect("the build made a run directory");
+            let dir = last_spill_dir(&rec);
             let mut names: Vec<String> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -536,8 +538,6 @@ async fn test_run_capacity_boundary_spills_only_past_it() {
 /// error, and the run directory is gone.
 #[tokio::test]
 async fn test_input_error_after_spilling_removes_the_runs() {
-    use crate::store::builders::spill::spill_hooks;
-
     for layout in LAYOUTS {
         let raws: Vec<_> = modular_quads(10, 3, 4)
             .iter()
@@ -547,6 +547,7 @@ async fn test_input_error_after_spilling_removes_the_runs() {
                 "boom".to_owned(),
             ))))
             .collect();
+        let rec = Recorder::start();
         let result = sorted_stream::build_chunk_stream(
             Box::new(stream::iter(raws)),
             layout,
@@ -559,7 +560,7 @@ async fn test_input_error_after_spilling_removes_the_runs() {
             matches!(&result, Err(VortexRdfError::InvalidInput(m)) if m == "boom"),
             "{layout:?}"
         );
-        let dir = spill_hooks::last_dir().expect("the build made a run directory");
+        let dir = last_spill_dir(&rec);
         assert!(!dir.exists(), "{layout:?}: {} is left", dir.display());
     }
 }
@@ -571,12 +572,11 @@ async fn test_input_error_after_spilling_removes_the_runs() {
 /// with no merged copy of the quads, under every layout.
 #[tokio::test]
 async fn test_peak_spill_is_term_ids_and_compact_entries() {
-    use crate::store::builders::spill::spill_hooks;
-
     for layout in LAYOUTS {
         for indexes in index_sets() {
             let who = format!("{layout:?} / {indexes:?}");
             // 10 distinct quads in runs of 3: 4 runs of each kind (3, 3, 3, 1).
+            let rec = Recorder::start();
             let built = sorted_stream::build_chunk_stream(
                 Box::new(quad_stream(modular_quads(10, 3, 4))),
                 layout,
@@ -586,7 +586,7 @@ async fn test_peak_spill_is_term_ids_and_compact_entries() {
             )
             .await
             .unwrap();
-            let dir = spill_hooks::last_dir().expect("the build made a run directory");
+            let dir = last_spill_dir(&rec);
             let files: Vec<(String, u64)> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| {
@@ -633,4 +633,57 @@ async fn test_dictionary_quad_sink_serializes_like_the_builder() {
         built.to_bytes().await.unwrap(),
         "the sink's wire form must be the builder's"
     );
+}
+
+/// A sink fed borrowed quads (`push_quad`) builds the bytes a sink fed the
+/// same quads spelled out (`push` of `RawQuad::from_quad`) builds, over every
+/// kind of term: IRIs and blank nodes in each role, simple, escaped,
+/// language-tagged and typed literals (an `xsd:string` one spelled as the
+/// simple literal it is), and the default, a named and a blank graph. Only a
+/// term seen for the first time is copied out of the sink's spelling buffer.
+#[tokio::test]
+async fn test_dictionary_quad_sink_interns_borrowed_quads() {
+    use crate::store::RawQuad;
+
+    let mut quads = term_kind_quads();
+    let s = iri_subject("escapes");
+    let p = iri("p1");
+    for o in [
+        Literal::new_simple_literal("quote \" and newline\n and tab\t"),
+        Literal::new_simple_literal("control \u{1} and \u{7f}"),
+        Literal::new_typed_literal("typed", oxrdf::vocab::xsd::STRING),
+        Literal::new_language_tagged_literal("hello", "EN-gb").unwrap(),
+    ] {
+        quads.push(Quad::new(s.clone(), p.clone(), o, GraphName::DefaultGraph));
+    }
+    // Every term again, so each is met a second time.
+    quads.extend(dictionary_test_quads());
+    quads.extend(dictionary_test_quads());
+    let raws: Vec<RawQuad> = quads.iter().map(RawQuad::from_quad).collect();
+    let distinct: std::collections::HashSet<&str> = raws
+        .iter()
+        .flat_map(|q| [q.s.as_str(), q.p.as_str(), q.o.as_str(), q.g.as_str()])
+        .collect();
+
+    let indexes = vec![IndexType::SecondaryByCopy];
+    let mut spelled = DictionaryQuadSink::new(indexes.clone());
+    for raw in raws.iter().cloned() {
+        spelled.push(raw);
+    }
+    let mut borrowed = DictionaryQuadSink::new(indexes);
+    let rec = Recorder::start();
+    for quad in &quads {
+        borrowed.push_quad(quad.as_ref());
+    }
+    assert_eq!(rec.count(&Event::TermInterned), distinct.len());
+
+    let spelled = VortexRdfStore::from_built(spelled.finish().unwrap()).unwrap();
+    let borrowed = VortexRdfStore::from_built(borrowed.finish().unwrap()).unwrap();
+    assert_eq!(
+        borrowed.to_bytes().await.unwrap(),
+        spelled.to_bytes().await.unwrap()
+    );
+    let mut expected = quad_strings(&quads);
+    expected.dedup();
+    assert_eq!(view_strings(&borrowed).await, expected);
 }

@@ -6,7 +6,7 @@
 
 use super::BuildSizes;
 use super::runs::{
-    CopyEntry, EntryRunReader, EntrySpiller, IndexEntry, QuadRuns, RankTable, RefEntry, RunMerger,
+    CopyEntry, EntryRunReader, EntrySpiller, IndexEntry, QuadRuns, RefEntry, RunMerger,
 };
 use super::spill::TempRunsGuard;
 use crate::error::Result;
@@ -105,7 +105,7 @@ fn finish_pair<E: IndexEntry>(pair: Pair<EntrySpiller<E>>) -> Result<Pair<EntryM
 }
 
 /// The indexed pipeline's first pass and its index children: run a merge of
-/// `runs` (their ids ranked through `rank_of`) to the end while the spillers
+/// `runs` to the end while the spillers
 /// of the families `indexes` requests take each quad's ranks, then stream
 /// each family's child off its merger ([`merger_components`]), every rank
 /// spelled as `V` by `decode` (a dictionary code, or the term's string). The
@@ -114,7 +114,6 @@ fn finish_pair<E: IndexEntry>(pair: Pair<EntrySpiller<E>>) -> Result<Pair<EntryM
 /// size; `runs` stays readable for the quad chunks' own merge.
 pub(super) fn merge_feeding_indexes<V>(
     runs: &QuadRuns,
-    rank_of: &RankTable,
     guard: &Arc<TempRunsGuard>,
     sizes: BuildSizes,
     indexes: &[IndexType],
@@ -123,7 +122,7 @@ pub(super) fn merge_feeding_indexes<V>(
 where
     V: TermColumn + Send + 'static,
 {
-    let mut merger = runs.merger(rank_of)?;
+    let mut merger = runs.merger()?;
     let mut spillers = IndexSpillers::new(indexes, guard.path(), sizes.run_rows)?;
     // Rows are numbered as the merge emits them, so the count is unknown up
     // front: each id is a checked increment, refusing the store at the first

@@ -6,7 +6,15 @@
 //! joined.
 
 use super::*;
-use crate::store::scan::file_filter::split_hooks;
+
+/// The ranges of the split masks the in-order fold handed on that `rec`
+/// saw since its last take, in order.
+fn consumed_ranges(rec: &mut Recorder) -> Vec<std::ops::Range<u64>> {
+    rec.take_picked(|e| match e {
+        Event::SplitConsumed(range) => Some(range.clone()),
+        _ => None,
+    })
+}
 
 /// The rows of one leaf, and so of one split, of [`pieces_file`]: three
 /// zones.
@@ -89,17 +97,13 @@ async fn a_capped_count_stops_at_the_piece_that_reaches_it() {
         (per_zone + 1, vec![0..FIRST_PIECE, rest]),
         (FIRST_PIECE as usize, vec![0..PIECES_SPLIT_ROWS]),
     ] {
-        split_hooks::take_consumed_ranges();
+        let mut rec = Recorder::start();
         assert_eq!(view.size_capped(cap).await.unwrap(), cap, "cap {cap}");
-        assert_eq!(split_hooks::take_consumed_ranges(), consumed, "cap {cap}");
+        assert_eq!(consumed_ranges(&mut rec), consumed, "cap {cap}");
     }
-    split_hooks::take_consumed_ranges();
+    let mut rec = Recorder::start();
     assert!(view.exists().await.unwrap());
-    assert_eq!(
-        split_hooks::take_consumed_ranges(),
-        vec![0..FIRST_PIECE],
-        "exists"
-    );
+    assert_eq!(consumed_ranges(&mut rec), vec![0..FIRST_PIECE], "exists");
 }
 
 /// A window of fewer rows than a zone stops at the piece that fills it: the
@@ -128,9 +132,9 @@ async fn a_window_stops_at_the_piece_that_fills_it() {
         let view = matched_view(&store, None, None, o, g).await;
         let rows = row_list(&view).await;
         assert!(rows.len() > limit, "{label}: the window cuts");
-        split_hooks::take_consumed_ranges();
+        let mut rec = Recorder::start();
         let windowed = view.window(0, limit).await.unwrap();
-        assert_eq!(split_hooks::take_consumed_ranges(), consumed, "{label}");
+        assert_eq!(consumed_ranges(&mut rec), consumed, "{label}");
         assert_eq!(
             row_list(&windowed).await,
             rows[..limit],
@@ -154,10 +158,10 @@ async fn a_window_keeps_one_mask_a_split_whatever_its_pieces() {
     assert_eq!(n as u64, PIECES_SPLITS * PIECES_SPLIT_ROWS / 8);
     assert!(((n + 1) as u64) < FIRST_PIECE);
     let second = PIECES_SPLIT_ROWS..2 * PIECES_SPLIT_ROWS;
-    split_hooks::take_consumed_ranges();
+    let mut rec = Recorder::start();
     let windowed = view.window(0, n + 1).await.unwrap();
     assert_eq!(
-        split_hooks::take_consumed_ranges(),
+        consumed_ranges(&mut rec),
         vec![
             0..FIRST_PIECE,
             FIRST_PIECE..PIECES_SPLIT_ROWS,
@@ -172,24 +176,4 @@ async fn a_window_keeps_one_mask_a_split_whatever_its_pieces() {
     );
     assert_eq!(windowed.debug_evaluated_len(), Some(n));
     assert_eq!(row_list(&windowed).await, rows, "the plain rows");
-}
-
-/// A chunk stream of fewer rows a chunk than a zone holds evaluates the
-/// filter's first split in pieces, its first zone first, as a fold that may
-/// stop early does.
-#[tokio::test]
-async fn small_batches_evaluate_the_first_split_in_pieces() {
-    let (_dir, store) = pieces_store().await;
-    let view = matched_view(&store, None, None, None, Some(&iri_graph("gd"))).await;
-    assert!(view.view_statistics().unwrap().pending_filter);
-    split_hooks::take_consumed_ranges();
-    let mut chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
-    assert_eq!(chunks.next().await.unwrap().unwrap()[0].len(), 256);
-    drop(chunks);
-    let ranges = split_hooks::take_consumed_ranges();
-    assert_eq!(
-        ranges.first(),
-        Some(&(0..FIRST_PIECE)),
-        "the first zone first"
-    );
 }

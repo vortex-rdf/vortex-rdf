@@ -56,15 +56,16 @@ pub(crate) fn js_array_to_raw_quads(quads: &Array) -> Result<Vec<RawQuad>, JsVal
 /// interning [`DictionaryQuadSink`] and build the array from it.
 ///
 /// Unlike [`js_array_to_raw_quads`], nothing accumulates per quad but four
-/// term codes — each `RawQuad`'s Strings die inside `push` — so the ingest
-/// high-water holds one packed chunk plus one copy of every distinct term
-/// instead of four owned Strings per quad.
+/// term codes, so the ingest high-water holds one packed chunk plus one copy
+/// of every distinct term instead of four owned Strings per quad. The sink
+/// spells each term into one buffer it reuses, so only a term seen for the
+/// first time is copied.
 pub(crate) fn js_array_to_dictionary_array(
     quads: &Array,
     indexes: Indexes,
 ) -> Result<BuiltArray, JsValue> {
     let mut sink = DictionaryQuadSink::new(indexes);
-    js_array_decode(quads, |q| sink.push(RawQuad::from_quad(&q)))?;
+    js_array_decode(quads, |q| sink.push_quad(q.as_ref()))?;
     sink.finish().map_err(js_err)
 }
 

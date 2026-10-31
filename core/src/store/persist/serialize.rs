@@ -5,9 +5,11 @@ use crate::error::Result;
 use crate::store::Backend;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
-use crate::store::builders::{BuiltArray, build_parts_from_raws};
+use crate::store::builders::BuiltArray;
 use crate::store::layouts::ResolvedLayout;
 
+#[cfg(feature = "file-io")]
+use crate::observe::observe;
 use crate::store::VortexRdfStore;
 #[cfg(feature = "file-io")]
 use crate::store::persist::open::scanned_index_components;
@@ -95,8 +97,7 @@ impl VortexRdfStore {
             // each once, as every builder's output is, so the written
             // artifact carries the subject stamp and readers keep the
             // subject binary search and, on a file, the subject chunk probe.
-            let raws = self.sorted_live_raw_quads().await?;
-            return build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes);
+            return self.rebuilt_parts(&self.indexes).await;
         }
         let base = self.base_selected_rows().await?;
         let components = if owner_shaped && !tombstoned {
@@ -126,7 +127,16 @@ impl VortexRdfStore {
     /// the quad table as the transparent root child, the dictionary and index
     /// children as auxiliary children. Read back with
     /// [`from_bytes`](Self::from_bytes), or written as a `.vortex` file.
+    ///
+    /// A store opened from a file it has not changed since (no tail, no
+    /// tombstone, no narrowing) is that file: its mapped bytes are copied as
+    /// they are, with no row read or written.
     pub async fn to_bytes(&self) -> Result<Vec<u8>> {
+        #[cfg(feature = "file-io")]
+        if let Some(bytes) = self.untouched_file_bytes() {
+            observe!(BytesCopied);
+            return Ok(bytes.as_slice().to_vec());
+        }
         let parts = self.to_serializable_parts().await?;
         let start = crate::debug::timer();
         let mut bytes = Vec::new();
@@ -136,5 +146,19 @@ impl VortexRdfStore {
             crate::debug::elapsed(start)
         );
         Ok(bytes)
+    }
+
+    /// The bytes of the file this store was opened from, while the store is
+    /// still exactly that file's: a mapped file's base with no pushed-down
+    /// filter, an all-rows selection, no tombstone and no tail. `None`
+    /// otherwise, and for a file not mapped.
+    #[cfg(feature = "file-io")]
+    fn untouched_file_bytes(&self) -> Option<&vortex_buffer::ByteBuffer> {
+        let Backend::File(FileBase { file, .. }) = &self.quads.backend else {
+            return None;
+        };
+        let untouched =
+            self.quads.is_unrefined() && self.quads.deleted.is_none() && self.tail.is_none();
+        if untouched { file.bytes() } else { None }
     }
 }

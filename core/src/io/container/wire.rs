@@ -140,6 +140,14 @@ pub(crate) struct StoreComponentDescriptor {
     /// results, so absent means `false`.
     #[serde(default)]
     pub(crate) sorted: bool,
+    /// Dictionary children only: whether every IRI term (every term starting
+    /// with `<`) is spelled `<`, its text, `>`. Provenance like `sorted`,
+    /// recorded by the writer from the terms it wrote: a reader may then
+    /// decide a `STR()` prefix over the IRIs by the code range of `<` and the
+    /// prefix instead of reading them. Absent means `false`, and a `false`
+    /// is written absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) bracketed_iris: bool,
     /// The column shape, written as `fields` in the kind vocabulary.
     #[serde(rename = "fields", with = "wire_fields")]
     pub(crate) dtype: DType,

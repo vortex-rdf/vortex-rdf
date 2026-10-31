@@ -3,6 +3,7 @@
 //! and slicing, sorted-column binary search, and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::schema;
 
@@ -135,8 +136,9 @@ pub(crate) fn rechunk(
         if fits {
             return Ok(rows.clone());
         }
+        observe!(RechunkCut);
         #[cfg(test)]
-        rechunk_hooks::note()?;
+        crate::store::test_hooks::rechunk_cut()?;
         rows.slice(start..start.saturating_add(batch_rows).min(len))
             .map_err(VortexRdfError::Vortex)
     })
@@ -197,6 +199,18 @@ pub(crate) fn decoded_for_search(arr: &ArrayRef) -> Result<ArrayRef> {
         .into_array())
 }
 
+/// `scalar` as a `u64` when it is a non-null unsigned integer; `None` for
+/// any other scalar, decided on its type before any conversion is tried. A
+/// failed conversion builds an error, and an error captures a backtrace when
+/// `RUST_BACKTRACE` is set: tried on every probe of a string layout, that
+/// made a warm in-memory Default-layout match cost several times its work.
+pub(crate) fn unsigned_value(scalar: &vortex_array::scalar::Scalar) -> Option<u64> {
+    if !scalar.dtype().is_unsigned_int() || scalar.is_null() {
+        return None;
+    }
+    u64::try_from(scalar).ok()
+}
+
 /// Binary-search a sorted column for the `[lo, hi)` run of rows equal to
 /// `probe` (empty, at the insertion point, when the value is absent). Only
 /// meaningful on columns [`column_is_sorted`] reports as sorted.
@@ -213,7 +227,7 @@ pub(crate) fn search_sorted_bounds(
     // decoding it; declines fall through to the generic kernel.
     if arr.dtype().is_unsigned_int()
         && !arr.dtype().is_nullable()
-        && let Ok(needle) = u64::try_from(probe)
+        && let Some(needle) = unsigned_value(probe)
     {
         // VORTEX_RDF_ENCODED_SEARCH=0: the column is decoded first and its decoded values searched.
         let decoded;
@@ -268,49 +282,24 @@ pub(crate) fn trusted_str(buf: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(buf) }
 }
 
-/// Test hook: how many slices this thread's [`rechunk`] iterators cut, and a
-/// guard that fails one of the next cuts.
 #[cfg(test)]
-pub(crate) mod rechunk_hooks {
-    use std::cell::Cell;
+mod tests {
+    use super::unsigned_value;
+    use vortex_array::dtype::{DType, Nullability, PType};
+    use vortex_array::scalar::Scalar;
 
-    use crate::error::{Result, VortexRdfError};
-    use crate::store::test_hooks::Override;
-
-    thread_local! {
-        static CUTS: Cell<usize> = const { Cell::new(0) };
-        static FAILING: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    /// Record one cut: an error, the cut's, when a [`FailingCut`] names it.
-    pub(super) fn note() -> Result<()> {
-        let cut = CUTS.with(|c| c.replace(c.get() + 1));
-        if FAILING.with(Cell::get) == Some(cut) {
-            return Err(VortexRdfError::Vortex(vortex_error::vortex_err!(
-                "cut {cut} failed (test hook)"
-            )));
-        }
-        Ok(())
-    }
-
-    /// The slices cut on this thread so far.
-    pub(crate) fn cuts() -> usize {
-        CUTS.with(Cell::get)
-    }
-
-    /// While alive, the cut this thread's `rechunk` iterators make `n` cuts
-    /// from now (`0`: the next) fails. Dropping it restores the failure it
-    /// replaced.
-    pub(crate) struct FailingCut {
-        _guard: Override<usize>,
-    }
-
-    impl FailingCut {
-        /// Fail the cut `n` cuts from now.
-        pub(crate) fn after(n: usize) -> Self {
-            Self {
-                _guard: Override::set(&FAILING, cuts() + n),
-            }
-        }
+    /// An unsigned integer of every width converts, a valid nullable one
+    /// too; a string, a signed integer and a null are refused on their type.
+    #[test]
+    fn unsigned_value_takes_only_unsigned_integers() {
+        assert_eq!(unsigned_value(&Scalar::from(7u8)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(7u16)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(7u32)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(u64::MAX)), Some(u64::MAX));
+        assert_eq!(unsigned_value(&Scalar::from(7u64).into_nullable()), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from("7")), None);
+        assert_eq!(unsigned_value(&Scalar::from(7i64)), None);
+        let null = Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable));
+        assert_eq!(unsigned_value(&null), None);
     }
 }
