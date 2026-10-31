@@ -611,3 +611,118 @@ async fn served_reads_without_the_code_cache() {
     );
     assert_eq!(row_list(&kept).await, filtered);
 }
+
+/// The by-copy Dictionary store of `modular_quads(20_000, 7, 11)`, written
+/// once per process (see [`cached_store_file`]) and opened from its file.
+async fn file_store() -> (tempfile::TempDir, VortexRdfStore) {
+    static FILE: OnceLock<Vec<u8>> = OnceLock::new();
+    let quads = || modular_quads(20_000, 7, 11);
+    let indexes = vec![IndexType::SecondaryByCopy];
+    let (dir, path) = cached_store_file(&FILE, quads, LayoutStrategy::Dictionary, indexes).await;
+    (dir, VortexRdfStore::from_file(&path).await.unwrap())
+}
+
+/// How many served streams `rec` saw read off their plans.
+fn served_streams(rec: &Recorder) -> usize {
+    rec.count(&Event::ServedRunChunks)
+}
+
+/// Every stream of a served file view reads its rows off the index, in its
+/// order: `?p2??` over the run the index locates, `?p2?g` (the default
+/// graph, every row's) over the rows the plan's filter keeps, both in
+/// `index:posg`'s (o, s) order; `??o?` and `?po?`, whose index order is base
+/// order, in base order.
+#[tokio::test]
+async fn file_streams_follow_index_order() {
+    let (_dir, store) = file_store().await;
+    let (p2, o3) = (iri("p2"), plain_literal("object 3"));
+    let default = GraphName::DefaultGraph;
+    let views = [
+        (
+            "?p2??",
+            matched_view(&store, None, Some(&p2), None, None).await,
+            true,
+        ),
+        (
+            "?p2?g",
+            matched_view(&store, None, Some(&p2), None, Some(&default)).await,
+            true,
+        ),
+        (
+            "??o?",
+            matched_view(&store, None, None, Some(&o3), None).await,
+            false,
+        ),
+        (
+            "?po?",
+            matched_view(&store, None, Some(&p2), Some(&o3), None).await,
+            false,
+        ),
+    ];
+    for (name, view, object_free) in views {
+        assert!(served_component(&view).is_some(), "{name}: served");
+        let base = base_ordered_codes(&view).await;
+        let want = if object_free {
+            posg(base.clone())
+        } else {
+            base.clone()
+        };
+        if object_free {
+            assert_ne!(want, base, "{name}: the orders differ");
+        }
+        for batch in [64, 65_536] {
+            let rec = Recorder::start();
+            assert_eq!(
+                collect_code_chunks(&view, &QuadColumn::ALL, batch).await.0,
+                want,
+                "{name} at {batch}"
+            );
+            assert_eq!(served_streams(&rec), 1, "{name} at {batch}: off the plan");
+        }
+        let objects: Vec<[TermCode; 1]> = want.iter().map(|r| [r[2]]).collect();
+        assert_eq!(
+            collect_code_chunks(&view, &[QuadColumn::O], 64).await.0,
+            objects,
+            "{name}: o"
+        );
+        let rec = Recorder::start();
+        assert_eq!(
+            struct_chunk_codes(&collect_row_chunks(&view, 256).await),
+            want,
+            "{name}: rows"
+        );
+        assert_eq!(served_streams(&rec), 1, "{name}: rows off the plan");
+    }
+}
+
+/// On file too, a served view's streams drop its tombstoned rows and keep
+/// the index's order, and a string layout's row chunks decode, in order, to
+/// the quads `quads_vec` reads.
+#[tokio::test]
+async fn file_streams_under_tombstones_and_strings() {
+    let (_dir, store) = file_store().await;
+    let store = store
+        .delete_matching(None, None, Some(&plain_literal("object 3")), None)
+        .await
+        .unwrap();
+    let (p, want) = p2_view(&store).await;
+    assert!(want.len() < 20_000 / 7, "tombstones fall inside the run");
+    assert_eq!(collect_code_chunks(&p, &QuadColumn::ALL, 100).await.0, want);
+    assert_eq!(struct_chunk_codes(&collect_row_chunks(&p, 100).await), want);
+
+    let (_dir, path) = write_store_file(
+        modular_quads(2_000, 7, 11),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    assert_eq!(served_component(&p), Some("index:posg"));
+    let mut decoded = Vec::new();
+    let mut chunks = p.row_chunks(50).unwrap();
+    while let Some(chunk) = chunks.next().await {
+        decoded.extend(p.decode_row_chunk(&chunk.unwrap()).unwrap());
+    }
+    assert_eq!(decoded, p.shared_quads_vec().await.unwrap());
+}

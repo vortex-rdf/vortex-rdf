@@ -560,9 +560,15 @@ const PAST_THE_ROWS_VIEW_ROWS: usize = 256;
 /// Partitions tile `view`: at each of [`PARTITION_COUNTS`], and at
 /// [`PAST_THE_ROWS`] on a small view, at most that many and never none, read
 /// in turn they give the view's codes in the order its reads yield them
-/// ([`read_order_codes`]), and their sizes add up to its size.
+/// ([`read_order_codes`]), a file view's in base order, the order of its
+/// partitions' pieces, and their sizes add up to its size.
 async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
-    let expected = read_order_codes(view).await;
+    let file = view.view_statistics().unwrap().file_backed;
+    let expected = if file {
+        base_ordered_codes(view).await
+    } else {
+        read_order_codes(view).await
+    };
     let past_the_rows = (expected.len() <= PAST_THE_ROWS_VIEW_ROWS).then_some(PAST_THE_ROWS);
     for n in PARTITION_COUNTS.into_iter().chain(past_the_rows) {
         let parts = view
@@ -577,7 +583,11 @@ async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
         let mut got = Vec::new();
         let mut total = 0;
         for part in &parts {
-            got.extend(read_order_codes(part).await);
+            got.extend(if file {
+                base_ordered_codes(part).await
+            } else {
+                read_order_codes(part).await
+            });
             total += part.size().await.unwrap();
         }
         assert_eq!(got, expected, "{tag}: partitions({n}) tile the view");

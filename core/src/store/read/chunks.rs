@@ -34,8 +34,12 @@ use super::rows::{gather_codes, gather_column};
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::MemoryBase;
 use crate::store::array::{field_as, into_struct_array, rechunk};
+#[cfg(feature = "file-io")]
+use crate::store::indexes::FileServePlan;
 use crate::store::indexes::InMemoryServePlan;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
@@ -46,19 +50,8 @@ use crate::store::scan::{
     file_reads::take_file_rows, file_scans::stream_split_reads, read_plan::ExactRead,
 };
 use crate::store::schema::{QuadColumn, RowId, TermCode};
-#[cfg(feature = "file-io")]
-use crate::store::view::selection::ViewSelection;
 use crate::store::view::selection::{RowSelection, SelectedRows};
-#[cfg(feature = "file-io")]
-use crate::store::{FileBase, FileFilter};
 use crate::store::{SharedQuad, VortexRdfStore};
-
-/// The longest served run, in chunks, a code-chunk stream reads off its
-/// index at once ([`VortexRdfStore::code_chunks`]): the run is held whole, at
-/// about 48 bytes a row (four codes, a row id and its sort slot) against the
-/// 8 of the row ids a read by id holds, so a longer run is read by id.
-#[cfg(feature = "file-io")]
-const SERVED_RUN_BATCHES: usize = 16;
 
 /// A view's rows as struct chunks in the layout's primary dtype, each of at
 /// most the requested `batch_rows` rows.
@@ -202,22 +195,6 @@ impl VortexRdfStore {
                 MemoryRows::Windows(windows) => gathered_code_chunks(all, asked, columns, windows),
             });
         }
-        // A file view its index serves from a short located run: the run off
-        // the index's own columns, in base row order, sliced into chunks.
-        #[cfg(feature = "file-io")]
-        if let Some(codes) = self.served_run_codes(batch_rows).await? {
-            observe!(ServedRunChunks);
-            let picked: Vec<Buffer<TermCode>> =
-                columns.iter().map(|c| codes[c.index()].clone()).collect();
-            let rows = picked[0].len();
-            return Ok(
-                stream::iter((0..rows).step_by(batch_rows).map(move |start| {
-                    let end = start.saturating_add(batch_rows).min(rows);
-                    Ok(picked.iter().map(|b| b.slice(start..end)).collect())
-                }))
-                .boxed(),
-            );
-        }
         // A file view, or a base whose code columns the shared cache cannot
         // hand out: its rows, chunked, their codes read per chunk by name.
         let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
@@ -225,18 +202,41 @@ impl VortexRdfStore {
         Ok(base.map(move |chunk| extract_codes(chunk?, &names)).boxed())
     }
 
-    /// A served in-memory view's code chunks in its index's order: the base's
-    /// code columns gathered at the view's row ids as the index keeps them
+    /// A served view's code chunks in its index's order. On file, the plan's
+    /// child chunks ([`FileServePlan::child_chunks`]), their live rows' codes
+    /// cut to `batch_rows`. In memory, the base's code columns gathered at
+    /// the view's row ids as the index keeps them
     /// ([`InMemoryServePlan::live_rids`]), one window of ids per chunk, the
     /// run's ids decoded once and never sorted; where the shared cache cannot
     /// hand the code columns out, the [served rows](Self::served_rows)' codes,
-    /// read per chunk. `None` for a view no in-memory plan serves.
+    /// read per chunk. `None` for a view no plan serves.
     ///
+    /// [`FileServePlan::child_chunks`]: crate::store::indexes::FileServePlan::child_chunks
     fn served_code_chunks(
         &self,
         columns: &[QuadColumn],
         batch_rows: usize,
     ) -> Result<Option<CodeChunkStream>> {
+        #[cfg(feature = "file-io")]
+        if let Some((base, plan)) = self.served_file_plan() {
+            observe!(ServedRunChunks);
+            let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
+            let deleted = self.quads.deleted.clone();
+            let chunks = plan.child_chunks(Arc::clone(&base.file))?;
+            let plan = plan.clone();
+            return Ok(Some(
+                chunks
+                    .flat_map(move |chunk| {
+                        let codes =
+                            chunk.and_then(|chunk| plan.chunk_codes(&chunk, deleted.as_ref()));
+                        stream::iter(match codes {
+                            Ok(codes) => code_slices(codes, &picked, batch_rows),
+                            Err(e) => vec![Err(e)],
+                        })
+                    })
+                    .boxed(),
+            ));
+        }
         let Some((_, plan)) = self.served_memory_plan() else {
             return Ok(None);
         };
@@ -256,16 +256,40 @@ impl VortexRdfStore {
         )))
     }
 
-    /// A served in-memory view's base rows, at least `columns` (primary
-    /// column names), in its index's order: the base's rows at the view's
-    /// row ids as the index keeps them, one window of ids per chunk, each
-    /// read when its chunk is pulled. `None` for a view no in-memory plan
-    /// serves.
+    /// A served view's base rows, at least `columns` (primary column names),
+    /// in its index's order. On file, the plan's child chunks, their live
+    /// rows as the primary columns, cut to `batch_rows` (not for TypedObject,
+    /// whose primary dtype its copies' string objects do not have). In
+    /// memory, the base's rows at the view's row ids as the index keeps them,
+    /// one window of ids per chunk, each read when its chunk is pulled.
+    /// `None` for a view no plan serves.
     fn served_rows(
         &self,
         columns: &[&'static str],
         batch_rows: usize,
     ) -> Result<Option<RowChunkStream>> {
+        #[cfg(feature = "file-io")]
+        if let Some((base, plan)) = self.served_file_plan() {
+            if self.layout.strategy() == crate::store::LayoutStrategy::TypedObject {
+                return Ok(None);
+            }
+            observe!(ServedRunChunks);
+            let deleted = self.quads.deleted.clone();
+            let chunks = plan.child_chunks(Arc::clone(&base.file))?;
+            let plan = plan.clone();
+            return Ok(Some(
+                chunks
+                    .flat_map(move |chunk| {
+                        let rows = chunk
+                            .and_then(|chunk| plan.chunk_primary_rows(&chunk, deleted.as_ref()));
+                        stream::iter(match rows {
+                            Ok(rows) => rechunk(rows, batch_rows).collect(),
+                            Err(e) => vec![Err(e)],
+                        })
+                    })
+                    .boxed(),
+            ));
+        }
         let Some((memory, plan)) = self.served_memory_plan() else {
             return Ok(None);
         };
@@ -282,6 +306,22 @@ impl VortexRdfStore {
             }))
             .boxed(),
         ))
+    }
+
+    /// This file view's base beside the serve plan its chunk streams read in
+    /// its index's order: the plan reads exactly the view's rows, its
+    /// constraints covering any residual term the view keeps as a filter for
+    /// the base's reads. `None` for a view no plan serves (or while a
+    /// [`LegacyChunkPaths`](crate::store::test_hooks::LegacyChunkPaths) guard
+    /// sends every stream down the base-order paths).
+    #[cfg(feature = "file-io")]
+    fn served_file_plan(&self) -> Option<(&FileBase, &FileServePlan)> {
+        #[cfg(test)]
+        if crate::store::test_hooks::legacy_chunk_paths() {
+            return None;
+        }
+        let base = self.quads.file()?;
+        Some((base, base.serve.as_ref()?))
     }
 
     /// This in-memory view's base beside the serve plan its chunk streams
@@ -320,38 +360,6 @@ impl VortexRdfStore {
                 .collect::<Option<_>>()?,
         };
         Some((all, asked))
-    }
-
-    /// The live codes of this file view's served run in base row order,
-    /// when its index serves it (nothing else narrowing it: no masks, no
-    /// filter) from a located run of at most [`SERVED_RUN_BATCHES`] chunks
-    /// whose row ids are still pending: read off the index's own columns, no
-    /// row id taken from the base. `None` otherwise, for the reads by id,
-    /// which also take a point-sized run, resolved to its ids at once and
-    /// read point by point for less than a scan of the index costs.
-    #[cfg(feature = "file-io")]
-    async fn served_run_codes(&self, batch_rows: usize) -> Result<Option<[Buffer<TermCode>; 4]>> {
-        #[cfg(test)]
-        if crate::store::test_hooks::legacy_chunk_paths() {
-            return Ok(None);
-        }
-        let (
-            ViewSelection::Pending { .. },
-            Some(FileBase {
-                serve: Some(plan),
-                filter: FileFilter::None,
-                ..
-            }),
-        ) = (&self.quads.selection, self.quads.file())
-        else {
-            return Ok(None);
-        };
-        let cap = SERVED_RUN_BATCHES.saturating_mul(batch_rows) as u64;
-        if plan.located_rows().is_none_or(|rows| rows > cap) {
-            return Ok(None);
-        }
-        plan.code_columns_in_row_order(self.quads.deleted.as_ref())
-            .await
     }
 
     /// The base rows this view covers, without the tail, in chunks of at
@@ -441,7 +449,7 @@ impl VortexRdfStore {
         let file = Arc::clone(&base.file);
         let columns: Arc<[&'static str]> = Arc::from(scope.by_id_columns);
         // Each take reads the columns a window's filter left free and fills
-        // the ones it pinned ([`FileFilter::pins`]).
+        // the ones it pinned ([`FileFilter::pins`](crate::store::FileFilter::pins)).
         let pins = scope.pins.clone();
         let read_columns: Arc<[&'static str]> = Arc::from(pins.columns_to_read(&columns));
         Ok(stream::iter(id_windows(ids, batch_rows).enumerate())
@@ -496,6 +504,24 @@ enum MemoryRows {
 
 /// Windows of base row ids, a chunk's rows each.
 type IdWindows = Box<dyn Iterator<Item = Buffer<RowId>> + Send>;
+
+/// The `picked` columns of `codes` cut into slices of at most `batch_rows`
+/// rows, sharing their buffers: a served file chunk's code chunks.
+#[cfg(feature = "file-io")]
+fn code_slices(
+    codes: [Buffer<TermCode>; 4],
+    picked: &[usize],
+    batch_rows: usize,
+) -> Vec<Result<Vec<Buffer<TermCode>>>> {
+    let rows = codes[0].len();
+    (0..rows)
+        .step_by(batch_rows)
+        .map(|start| {
+            let end = start.saturating_add(batch_rows).min(rows);
+            Ok(picked.iter().map(|&k| codes[k].slice(start..end)).collect())
+        })
+        .collect()
+}
 
 /// Code chunks of `columns`, one per window of base row ids, each gathered
 /// when its chunk is pulled: from `all` four primitives in one pass when

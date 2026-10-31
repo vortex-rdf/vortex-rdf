@@ -1286,15 +1286,15 @@ fn posg(mut rows: Vec<[TermCode; 4]>) -> Vec<[TermCode; 4]> {
 }
 
 /// The view's rows in the order its reads yield them: a view `index:posg`
-/// serves in memory in (p, o, s, g) order ([`posg`]), any other in base row
-/// order ([`base_ordered_codes`]), the order of every view another index
-/// serves too, whose own order puts no unbound role ahead of the subject.
-/// Takes the view's statistics (see the note on [`served_component`]).
+/// serves in (p, o, s, g) order ([`posg`]), any other in base row order
+/// ([`base_ordered_codes`]), the order of every view another index serves
+/// too, whose own order puts no unbound role ahead of the subject. Takes the
+/// view's statistics (see the note on [`served_component`]).
 async fn read_order_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     let stats = view.view_statistics().unwrap();
     let base = base_ordered_codes(view).await;
-    match (stats.served_component, stats.file_backed) {
-        (Some("index:posg"), false) => posg(base),
+    match stats.served_component {
+        Some("index:posg") => posg(base),
         _ => base,
     }
 }

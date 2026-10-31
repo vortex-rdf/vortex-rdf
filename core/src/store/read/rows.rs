@@ -17,8 +17,6 @@ use crate::store::scan::read_plan::ExactRead;
 use crate::store::scan::{file_reads, file_scans};
 use crate::store::schema::{self, QuadColumn, RowId, TermCode};
 use crate::store::view::selection::SelectedRows;
-#[cfg(feature = "file-io")]
-use crate::store::view::selection::ViewSelection;
 use crate::store::{Backend, MemoryBase};
 
 use futures::stream::{self, StreamExt};
@@ -239,13 +237,15 @@ impl VortexRdfStore {
         if !self.is_code_view() {
             return Ok(None);
         }
-        // Codes off the index's run: no row ids computed, no gather.
+        // Codes off the index's run, in its order: no row ids read, no
+        // gather.
         #[cfg(feature = "file-io")]
-        if let ViewSelection::Pending { .. } = &self.quads.selection
-            && let Some(FileBase {
-                serve: Some(plan), ..
-            }) = self.quads.file()
-            && let Some(columns) = plan.code_columns(self.quads.deleted.as_ref()).await?
+        if let Some(FileBase {
+            file,
+            serve: Some(plan),
+            ..
+        }) = self.quads.file()
+            && let Some(columns) = plan.code_columns(file, self.quads.deleted.as_ref()).await?
         {
             return Ok(Some(columns));
         }

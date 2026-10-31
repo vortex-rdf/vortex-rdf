@@ -361,13 +361,21 @@ async fn served_runs_are_read_off_the_index() {
             assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, batch_rows, name).await;
         }
         assert_code_chunks_equal_legacy(&view, &[QuadColumn::O, QuadColumn::S], 256, name).await;
+        // The stream's own order is the index's: (o, s, g) under the predicate.
+        let (rows, _) = collect_code_chunks(&view, &QuadColumn::ALL, 256).await;
+        let base = base_ordered_codes(&view).await;
+        let want = if name == "P" { posg(base) } else { base };
+        assert_eq!(rows, want, "{name}: the index's order");
     }
 }
 
+/// A served file run of any width streams off the index, whatever the
+/// batch, and its tombstoned rows are dropped.
 #[tokio::test]
-async fn served_runs_at_the_cap_and_with_tombstones() {
-    // p0 holds every even row: a run of 4,096 rows, exactly 16 chunks of 256;
-    // its objects cycle 0, 2, 1, so "object 0" is every third of its rows.
+async fn served_runs_of_any_width_and_with_tombstones() {
+    // p0 holds every even row: a run of 4,096 rows, 16 chunks of 256 and
+    // more of 255; its objects cycle 0, 2, 1, so "object 0" is every third of
+    // its rows.
     let (_dir, path) = write_store_file(
         modular_quads(8_192, 2, 3),
         LayoutStrategy::Dictionary,
@@ -379,11 +387,11 @@ async fn served_runs_at_the_cap_and_with_tombstones() {
     let view = probe_view(&store, p0).await;
     let (rows, served) = drain_counting_served(&view, 256).await;
     assert_eq!(rows.len(), 4_096);
-    assert!(served, "a run of exactly 16 chunks is read off the index");
+    assert!(served, "a run of 16 chunks is read off the index");
     let (_, served) = drain_counting_served(&view, 255).await;
-    assert!(!served, "a run a row past 16 chunks keeps the legacy path");
-    assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 256, "at the cap").await;
-    assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 255, "past the cap").await;
+    assert!(served, "a run past 16 chunks is read off the index too");
+    assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 256, "16 chunks").await;
+    assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 255, "past 16 chunks").await;
 
     let tombstoned = store
         .delete_matching(None, None, Some(&plain_literal("object 0")), None)
@@ -438,8 +446,8 @@ async fn other_served_views_keep_their_path() {
             assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, batch_rows, name).await;
         }
     }
-    // A point-sized run's ids are resolved at once and read point by point,
-    // which costs less than scanning the run off the index.
+    // A point-sized run is read off the index point by point, which costs no
+    // scan of the run.
     let mut quads = modular_quads(2_000, 7, 11);
     for s in ["rare-a", "rare-b"] {
         quads.push(make_quad(
@@ -457,9 +465,15 @@ async fn other_served_views_keep_their_path() {
     .await;
     let store = VortexRdfStore::from_file(&rare).await.unwrap();
     let view = probe_view(&store, [None, None, Some("\"rare\""), None]).await;
+    let rec = Recorder::start();
     let (rows, served) = drain_counting_served(&view, 256).await;
     assert_eq!(rows.len(), 2);
-    assert!(!served, "a point-sized run is read by id");
+    assert!(served, "a point-sized run is read off the index");
+    assert_eq!(
+        rec.count(&Event::RowScan),
+        0,
+        "point by point, with no scan"
+    );
     assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, 256, "point-sized").await;
 }
 

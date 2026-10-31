@@ -121,49 +121,10 @@ impl ServeDecode {
         Ok([column(s)?, column(p)?, column(o)?, column(g)?])
     }
 
-    /// [`chunk_code_columns`](Self::chunk_code_columns) beside each live
-    /// row's base row id ([`base_row`](super::base_row) of its row-id
-    /// column), for a reader that puts the rows back in base order.
-    #[cfg(feature = "file-io")]
-    pub(super) fn chunk_code_columns_with_rids(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Result<([Buffer<TermCode>; 4], Buffer<RowId>)> {
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let rows = chunk.clone().execute::<StructArray>(&mut ctx)?;
-        let mut column = |name: &str| -> Result<Buffer<u64>> {
-            Ok(
-                crate::store::array::field_as::<PrimitiveArray>(&rows, name, &mut ctx)?
-                    .into_buffer::<u64>(),
-            )
-        };
-        let [s, p, o, g] = PRIMARY_COLUMNS;
-        let codes = [column(s)?, column(p)?, column(o)?, column(g)?];
-        let base_rows: Buffer<RowId> = column(COL_RID)?
-            .iter()
-            .map(|&rid| super::base_row(rid))
-            .collect();
-        let Some(deleted) = deleted else {
-            return Ok((codes, base_rows));
-        };
-        let mut live = Vec::with_capacity(base_rows.len());
-        for (position, &row) in base_rows.iter().enumerate() {
-            if !deleted.value(super::row_index(row)?) {
-                live.push(position);
-            }
-        }
-        if live.len() == base_rows.len() {
-            return Ok((codes, base_rows));
-        }
-        let keep = |column: &Buffer<u64>| live.iter().map(|&i| column[i]).collect::<Buffer<u64>>();
-        Ok((codes.each_ref().map(keep), keep(&base_rows)))
-    }
-
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: the
     /// chunk's quad columns without the row id, then any row whose primary
     /// row id is tombstoned dropped.
-    fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
+    pub(super) fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx)?;
         let col = |name: &'static str| {
