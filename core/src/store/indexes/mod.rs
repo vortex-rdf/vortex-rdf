@@ -41,6 +41,8 @@ pub(crate) mod copy;
 pub(crate) mod file;
 pub(crate) mod reference;
 mod resolve;
+#[cfg(feature = "file-io")]
+mod rid_reads;
 pub(crate) mod serve;
 
 pub(crate) use components::{
@@ -48,7 +50,9 @@ pub(crate) use components::{
     indexes_from_components, known_component, run_order_row_ids, sorted_row_ids,
 };
 #[cfg(feature = "file-io")]
-pub(crate) use file::{FileServePlan, read_located_rids, scan_index_row_ids};
+pub(crate) use rid_reads::{read_located_rids, scan_index_row_ids};
+#[cfg(feature = "file-io")]
+pub(crate) use serve::FileServePlan;
 pub(crate) use serve::{ComponentRows, InMemoryServePlan, ServedRows};
 
 /// The primary-row-id column every persisted index child carries beside its

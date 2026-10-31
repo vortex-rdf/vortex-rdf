@@ -359,8 +359,8 @@ Shared rules:
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L110)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L124))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L114)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L128))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
@@ -388,7 +388,7 @@ row ids.
 On a file-backed store an index child is never lifted into memory. Under the
 `Dictionary` layout its run is located by binary-searching the child's
 encoded chunks through the chunk probes of [§4](#4-the-quad-table)
-([`locate_component_run`](../core/src/store/indexes/file.rs#L58)): a
+([`locate_component_run`](../core/src/store/indexes/file.rs#L31)): a
 located run of at most `POINT_GATHER_MAX_ROWS` rows is point-read, a wider
 one is read as a scan of exactly that row range. A run the probes cannot
 locate — a string-keyed child under the other layouts — is answered by a
@@ -685,6 +685,6 @@ open rather than being read around.
 | Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`held.rs`](../core/src/store/layouts/dictionary/file_backed/held.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
-| Locating and point-reading index runs on file | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
+| Locating and point-reading index runs on file | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`rid_reads.rs`](../core/src/store/indexes/rid_reads.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
 | In-memory forms: compressed-resident columns, probes, view state | [`core/src/store/resident.rs`](../core/src/store/resident.rs), [`probes.rs`](../core/src/store/probes.rs), [`view/mod.rs`](../core/src/store/view/mod.rs) |
 | Session: registered encodings and zone aggregates | [`core/src/session.rs`](../core/src/session.rs) |
