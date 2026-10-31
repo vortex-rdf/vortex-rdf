@@ -15,6 +15,7 @@
 #[cfg(feature = "file-io")]
 mod file;
 mod memory;
+mod served;
 
 use std::ops::Range;
 
@@ -240,14 +241,21 @@ impl VortexRdfStore {
     /// the view's rows touch: each evaluates the view's pending filter, reads
     /// the column at the rows it left and tests them (a range by Vortex's
     /// `between` kernel, a set against the decoded codes), never as a scan
-    /// expression. A pending view's deferred row ids (a served match's, or a
-    /// run held for a count) materialize first.
+    /// expression. A view a by-copy index serves in memory is kept in its
+    /// index's order and stays served: its rows are tested in that order and
+    /// the kept ones read off the index. Any other pending view's deferred
+    /// row ids (a served file match's, or a run held for a count)
+    /// materialize first.
     ///
     /// [`match_pattern`]: Self::match_pattern
     pub async fn keep(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
         self.ensure_code_view("keep")?;
         if keep.is_empty() {
             return Ok(self.empty_view());
+        }
+        // A served view's keep is served too, in the index's order.
+        if let Some(kept) = self.served_keep(column, keep)? {
+            return Ok(kept);
         }
         match &self.quads.backend {
             Backend::InMemory(memory) => self.keep_in_memory(memory, column, keep),

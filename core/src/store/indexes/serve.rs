@@ -40,6 +40,7 @@ use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
 use crate::store::schema::{PRIMARY_COLUMNS, RowId, TermCode};
 use crate::store::view::selection::point_sized;
+use vortex_rdf_encoded_search::SortedProbe;
 
 /// The decode both serve plans share. A serving child holds the whole quad
 /// under the primary column names ([`PRIMARY_COLUMNS`]) beside the primary
@@ -212,6 +213,50 @@ impl ServeDecode {
     }
 }
 
+/// Rows a narrowed served view keeps of its plan's run, in the index's
+/// order: each one's position in the serving component (in memory) or index
+/// child (on file) beside the base row id it mirrors. A keep's result, and
+/// the windows and partitions cut from it.
+#[derive(Clone)]
+pub(crate) struct ServedRows {
+    pub(crate) positions: Buffer<u64>,
+    pub(crate) rids: Buffer<RowId>,
+}
+
+impl ServedRows {
+    /// How many rows these are.
+    pub(crate) fn len(&self) -> usize {
+        self.rids.len()
+    }
+
+    /// Rows `range` of these, sharing their buffers.
+    pub(crate) fn slice(&self, range: Range<usize>) -> Self {
+        Self {
+            positions: self.positions.slice(range.clone()),
+            rids: self.rids.slice(range),
+        }
+    }
+
+    /// These rows less the `deleted` tombstones: themselves, shared, when
+    /// nothing is tombstoned.
+    pub(crate) fn live(&self, deleted: Option<&Mask>) -> Self {
+        let Some(deleted) = deleted else {
+            return self.clone();
+        };
+        let (positions, rids): (Vec<u64>, Vec<RowId>) = self
+            .positions
+            .iter()
+            .zip(self.rids.iter())
+            .filter(|&(_, &rid)| !deleted.value(rid as usize))
+            .map(|(&position, &rid)| (position, rid))
+            .unzip();
+        Self {
+            positions: Buffer::from(positions),
+            rids: Buffer::from(rids),
+        }
+    }
+}
+
 /// An index's serving plan for an in-memory view: the matched rows are the
 /// contiguous run `range` of the index component's own array, bounded by a
 /// binary search over its sorted lead column, so `quads()` slices them from
@@ -231,6 +276,9 @@ pub(crate) struct InMemoryServePlan {
     /// The rows of the component the view covers: the run, or the part of
     /// it a window cut.
     range: Range<usize>,
+    /// The rows a keep kept of the range, in the component's order; when
+    /// set, the view covers these and not the whole range.
+    kept: Option<Arc<ServedRows>>,
     /// The run's slice of the component's rid column, the slice the view's
     /// lazy ids hold.
     rids: ArrayRef,
@@ -263,6 +311,7 @@ impl InMemoryServePlan {
             array,
             run: range.clone(),
             range,
+            kept: None,
             rids,
             cells,
             probes,
@@ -279,18 +328,85 @@ impl InMemoryServePlan {
         self.range.clone()
     }
 
-    /// Whether a window narrowed the view below the run the match resolved.
-    pub(crate) fn is_narrowed(&self) -> bool {
-        self.range != self.run
+    /// The rows a keep kept, when the view covers those and not its whole
+    /// range.
+    pub(crate) fn kept(&self) -> Option<&ServedRows> {
+        self.kept.as_deref()
     }
 
-    /// This plan over `range`, a part of its own: a window's.
+    /// Whether a window or a keep narrowed the view below the run the match
+    /// resolved.
+    pub(crate) fn is_narrowed(&self) -> bool {
+        self.kept.is_some() || self.range != self.run
+    }
+
+    /// This plan over `range`, a part of its own range: a window's of a view
+    /// that keeps no rows.
     pub(crate) fn narrowed(&self, range: Range<usize>) -> Self {
+        debug_assert!(self.kept.is_none());
         debug_assert!(self.range.start <= range.start && range.end <= self.range.end);
         Self {
             range,
             ..self.clone()
         }
+    }
+
+    /// This plan over `rows`, rows of its range: a keep's, or a window or
+    /// partition of them.
+    pub(crate) fn with_rows(&self, rows: ServedRows) -> Self {
+        Self {
+            kept: Some(Arc::new(rows)),
+            ..self.clone()
+        }
+    }
+
+    /// The view's live rows `admit` keeps, in the component's order: each
+    /// row's position in the component and base row id offered to `admit`,
+    /// the `deleted` tombstones skipped. What a keep of the view keeps.
+    pub(crate) fn kept_rows(
+        &self,
+        deleted: Option<&Mask>,
+        mut admit: impl FnMut(usize, RowId) -> bool,
+    ) -> Result<ServedRows> {
+        let rows = self
+            .kept
+            .as_ref()
+            .map_or(self.range.len(), |kept| kept.len());
+        let (mut positions, mut rids) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+        let mut visit = |position: usize, rid: RowId| {
+            if deleted.is_none_or(|d| !d.value(rid as usize)) && admit(position, rid) {
+                positions.push(position as u64);
+                rids.push(rid);
+            }
+        };
+        match &self.kept {
+            Some(kept) => {
+                for (&position, &rid) in kept.positions.iter().zip(kept.rids.iter()) {
+                    visit(position as usize, rid);
+                }
+            }
+            None => {
+                let run = self.run_rids()?;
+                for (position, &rid) in self.range.clone().zip(&run[self.run_slots()]) {
+                    visit(position, rid);
+                }
+            }
+        }
+        // A sparse keep gives back what it reserved past a quarter used.
+        if positions.len() < positions.capacity() / 4 {
+            positions.shrink_to_fit();
+            rids.shrink_to_fit();
+        }
+        Ok(ServedRows {
+            positions: Buffer::from(positions),
+            rids: Buffer::from(rids),
+        })
+    }
+
+    /// The serving component's `name` column through its cached probe, which
+    /// reads it at the rows' positions; `None` when no probe resolves it.
+    pub(crate) fn component_probe(&self, name: &str) -> Option<&SortedProbe<'_>> {
+        Some(self.probes.by_name(&self.array, name).flatten()?.probe())
     }
 
     /// The run's base row ids in the component's order, decoded once into
@@ -304,6 +420,9 @@ impl InMemoryServePlan {
     /// index's order. A slice of the run's own ids, shared, when nothing is
     /// tombstoned.
     pub(crate) fn live_rids(&self, deleted: Option<&Mask>) -> Result<Buffer<RowId>> {
+        if let Some(kept) = &self.kept {
+            return Ok(kept.live(deleted).rids);
+        }
         let rids = self.run_rids()?.slice(self.run_slots());
         Ok(match deleted {
             None => rids,
@@ -319,6 +438,11 @@ impl InMemoryServePlan {
     /// the component beside its base row id, the `deleted` tombstones left
     /// out.
     pub(crate) fn live_rows(&self, deleted: Option<&Mask>) -> Result<(Vec<usize>, Vec<RowId>)> {
+        if let Some(kept) = &self.kept {
+            let live = kept.live(deleted);
+            let positions = live.positions.iter().map(|&position| position as usize);
+            return Ok((positions.collect(), live.rids.to_vec()));
+        }
         let rids = self.run_rids()?;
         Ok(self
             .range
@@ -346,6 +470,15 @@ impl InMemoryServePlan {
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     fn live_positions(&self, deleted: Option<&Mask>) -> Option<Option<Vec<usize>>> {
+        if let Some(kept) = &self.kept {
+            if !point_sized(kept.len() as u64) {
+                return None;
+            }
+            let live = kept.live(deleted).positions;
+            return Some(Some(
+                live.iter().map(|&position| position as usize).collect(),
+            ));
+        }
         if !point_sized(self.range.len() as u64) {
             return None;
         }
@@ -437,6 +570,10 @@ impl InMemoryServePlan {
         if let Some(columns) = self.live_point_columns(deleted) {
             return Some(columns);
         }
+        if let Some(kept) = &self.kept {
+            let rows = self.kept_component_rows(kept, deleted).ok()?;
+            return self.decode.chunk_code_columns(&rows, None).ok();
+        }
         let rows = self.array.slice(self.range.clone()).ok()?;
         self.decode.chunk_code_columns(&rows, deleted).ok()
     }
@@ -451,9 +588,23 @@ impl InMemoryServePlan {
             Ok(None) => {}
             Err(e) => return vec![Err(e)],
         }
+        if let Some(kept) = &self.kept {
+            return match self.kept_component_rows(kept, deleted) {
+                Ok(rows) => self.decode.decode_columns(&rows, None),
+                Err(e) => vec![Err(e)],
+            };
+        }
         match self.array.slice(self.range.clone()) {
             Ok(rows) => self.decode.decode_columns(&rows, deleted),
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
         }
+    }
+
+    /// The component's rows at the kept rows' live positions, in their
+    /// order: one take.
+    fn kept_component_rows(&self, kept: &ServedRows, deleted: Option<&Mask>) -> Result<ArrayRef> {
+        let positions = kept.live(deleted).positions;
+        let indices = PrimitiveArray::new(positions, Validity::NonNullable).into_array();
+        self.array.take(indices).map_err(VortexRdfError::Vortex)
     }
 }

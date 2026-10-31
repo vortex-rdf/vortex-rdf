@@ -142,8 +142,9 @@ impl VortexRdfStore {
 
     /// The window of a view an in-memory plan serves, itself served: rows
     /// `offset..offset + limit` of the view in its index's order, a part of
-    /// the plan's range ([`narrowed`](crate::store::indexes::InMemoryServePlan::narrowed)),
-    /// their row ids kept unsorted on the window
+    /// the plan's range ([`narrowed`](crate::store::indexes::InMemoryServePlan::narrowed))
+    /// or a slice of the rows a keep kept, their row ids kept unsorted on
+    /// the window
     /// ([`LazyRowIds::from_unsorted_ids`]); under tombstones the cut counts
     /// live rows. The tail is windowed with what the base did not fill, as
     /// [`window_cutting`](Self::window_cutting) windows it. A window that
@@ -161,8 +162,19 @@ impl VortexRdfStore {
             return Ok(None);
         };
         let range = plan.range();
-        let (window, base_live) = match &self.quads.deleted {
-            None => {
+        let (window, base_live) = match (plan.kept(), &self.quads.deleted) {
+            // A kept view's window: a slice of its live kept rows.
+            (Some(kept), deleted) => {
+                let rows = kept.live(deleted.as_ref());
+                let base_live = rows.len();
+                let window = window_rows(offset, limit, base_live as u64).map(|cut| {
+                    let rows = rows.slice(cut.start as usize..cut.end as usize);
+                    let ids = rows.rids.clone();
+                    (plan.with_rows(rows), ids)
+                });
+                (window, base_live)
+            }
+            (None, None) => {
                 let base_live = range.len();
                 let window = match window_rows(offset, limit, base_live as u64) {
                     Some(rows) => {
@@ -175,7 +187,7 @@ impl VortexRdfStore {
                 };
                 (window, base_live)
             }
-            Some(deleted) => {
+            (None, Some(deleted)) => {
                 let (positions, rids) = plan.live_rows(Some(deleted))?;
                 let base_live = positions.len();
                 let window = window_rows(offset, limit, base_live as u64).map(|rows| {

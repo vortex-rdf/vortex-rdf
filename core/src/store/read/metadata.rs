@@ -300,8 +300,8 @@ impl VortexRdfStore {
 impl VortexRdfStore {
     /// A view an in-memory plan serves cut into at most `n` served windows
     /// of `ceil(rows / n)` of its live rows each, in its index's order, the
-    /// tail with the last; each window a part of the plan's range with its
-    /// row ids kept unsorted, as [`served_window_in_memory`](Self::served_window_in_memory)
+    /// tail with the last; each window a part of the plan's range, or a slice
+    /// of the rows a keep kept, with its row ids kept unsorted, as [`served_window_in_memory`](Self::served_window_in_memory)
     /// builds one. `None` for a view no in-memory plan serves, or one whose
     /// base holds no live row.
     fn served_partitions(&self, n: usize) -> Result<Option<Vec<Self>>> {
@@ -311,12 +311,19 @@ impl VortexRdfStore {
         let Some(plan) = &memory.serve else {
             return Ok(None);
         };
-        // The live rows' positions, under tombstones; without, the range's.
-        let (positions, rids) = match &self.quads.deleted {
-            None => (None, plan.live_rids(None)?),
-            Some(deleted) => {
+        // The view's live rows: the rows a keep kept, or the live positions
+        // under tombstones, or else the range's.
+        let deleted = self.quads.deleted.as_ref();
+        let (kept, positions, rids) = match (plan.kept(), deleted) {
+            (Some(kept), deleted) => {
+                let kept = kept.live(deleted);
+                let rids = kept.rids.clone();
+                (Some(kept), None, rids)
+            }
+            (None, None) => (None, None, plan.live_rids(None)?),
+            (None, Some(deleted)) => {
                 let (positions, rids) = plan.live_rows(Some(deleted))?;
-                (Some(positions), Buffer::from(rids))
+                (None, Some(positions), Buffer::from(rids))
             }
         };
         let rows = rids.len();
@@ -335,15 +342,20 @@ impl VortexRdfStore {
                 .into_iter()
                 .enumerate()
                 .map(|(i, piece)| {
-                    let span = match &positions {
-                        None => range.start + piece.start..range.start + piece.end,
-                        Some(positions) => positions[piece.start]..positions[piece.end - 1] + 1,
+                    let narrowed = match (&kept, &positions) {
+                        (Some(kept), _) => plan.with_rows(kept.slice(piece.clone())),
+                        (None, None) => {
+                            plan.narrowed(range.start + piece.start..range.start + piece.end)
+                        }
+                        (None, Some(positions)) => {
+                            plan.narrowed(positions[piece.start]..positions[piece.end - 1] + 1)
+                        }
                     };
                     let ids = LazyRowIds::from_unsorted_ids(rids.slice(piece), true);
                     let quads = self.quads.in_memory_with(
                         memory,
                         ViewSelection::pending(ids),
-                        Some(plan.narrowed(span)),
+                        Some(narrowed),
                     );
                     let tail = self.tail.as_ref().map(|tail| {
                         if i == last {

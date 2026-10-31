@@ -209,6 +209,10 @@ impl VortexRdfStore {
         column: QuadColumn,
     ) -> Option<PrimitiveArray> {
         use vortex_array::arrays::Struct;
+        #[cfg(test)]
+        if crate::store::test_hooks::no_code_cache() {
+            return None;
+        }
         let base = &self.quads.in_memory()?.base;
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
         crate::store::resident::shared_code_primitive(

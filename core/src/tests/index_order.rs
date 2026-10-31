@@ -436,3 +436,178 @@ async fn probe_windows_follow_index_order() {
         p.size().await.unwrap()
     );
 }
+
+/// The objects of `rows`, each once, ascending.
+fn objects_of(rows: &[[TermCode; 4]]) -> Vec<TermCode> {
+    let objects: std::collections::BTreeSet<TermCode> = rows.iter().map(|r| r[2]).collect();
+    objects.into_iter().collect()
+}
+
+/// A keep of a served in-memory view filters its rows in the index's order
+/// and stays served: its count sorts no ids, a window of it slices the
+/// filtered rows, and a keep of a window filters the window.
+#[tokio::test]
+async fn memory_keeps_filter_index_order() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let (p, want) = p2_view(&store).await;
+    let sparse = Keep::set(objects_of(&want).into_iter().step_by(3));
+    let kept = p.keep(QuadColumn::O, &sparse).await.unwrap();
+    let filtered: Vec<_> = want
+        .iter()
+        .copied()
+        .filter(|r| sparse.admits(r[2]))
+        .collect();
+    assert!(!filtered.is_empty() && filtered.len() < want.len());
+    assert_eq!(row_list(&kept).await, filtered);
+    assert_eq!(served_component(&kept), Some("index:posg"));
+    let rec = Recorder::start();
+    assert_eq!(kept.size().await.unwrap(), filtered.len());
+    assert_eq!(ids_sorted(&rec), 0, "a kept view counts without a sort");
+    let window = kept.window(2, 7).await.unwrap();
+    assert_eq!(row_list(&window).await, filtered[2..9]);
+    assert_eq!(served_component(&window), Some("index:posg"));
+    let window_then_keep = p
+        .window(5, 300)
+        .await
+        .unwrap()
+        .keep(QuadColumn::O, &sparse)
+        .await
+        .unwrap();
+    let want_window: Vec<_> = want[5..305]
+        .iter()
+        .copied()
+        .filter(|r| sparse.admits(r[2]))
+        .collect();
+    assert_eq!(row_list(&window_then_keep).await, want_window);
+}
+
+/// Keeps compose: `keep_many`, partitions of a kept view, its code chunks
+/// and decoded quads all follow the filtered index order, and a keep that
+/// admits none of the view's rows is empty.
+#[tokio::test]
+async fn memory_keeps_compose() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let (p, want) = p2_view(&store).await;
+    let objects = objects_of(&want);
+    let sparse = Keep::set(objects.iter().step_by(2).copied());
+    let subjects: Vec<TermCode> = want
+        .iter()
+        .map(|r| r[0])
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let lower = Keep::range(subjects[0]..subjects[subjects.len() / 2]);
+    let both = p
+        .keep_many(&[
+            (QuadColumn::O, sparse.clone()),
+            (QuadColumn::S, lower.clone()),
+        ])
+        .await
+        .unwrap();
+    let filtered: Vec<_> = want
+        .iter()
+        .copied()
+        .filter(|r| sparse.admits(r[2]) && lower.admits(r[0]))
+        .collect();
+    assert!(!filtered.is_empty());
+    assert_eq!(row_list(&both).await, filtered);
+    assert_eq!(served_component(&both), Some("index:posg"));
+    assert_eq!(
+        collect_code_chunks(&both, &QuadColumn::ALL, 64).await.0,
+        filtered
+    );
+    let parts = both
+        .partitions(std::num::NonZeroUsize::new(3).unwrap())
+        .await
+        .unwrap();
+    let mut got = vec![];
+    for part in &parts {
+        assert_eq!(served_component(part), Some("index:posg"));
+        got.extend(row_list(part).await);
+    }
+    assert_eq!(got, filtered);
+    let dict = both.dict_reader().unwrap();
+    let codes: [vortex_buffer::Buffer<TermCode>; 4] =
+        std::array::from_fn(|c| filtered.iter().map(|r| r[c]).collect());
+    let rows: Vec<Row> = decoded_rows(&codes, &dict).await;
+    let quads: Vec<Row> = both
+        .quads_vec()
+        .await
+        .unwrap()
+        .iter()
+        .map(|q| {
+            let [s, p, o, g] = spellings(q);
+            (s, p, o, g)
+        })
+        .collect();
+    assert_eq!(quads, rows, "the decoded quads, in order");
+    // A window of the kept rows small enough to read point by point.
+    let small: Vec<Row> = both
+        .window(3, 10)
+        .await
+        .unwrap()
+        .quads_vec()
+        .await
+        .unwrap()
+        .iter()
+        .map(|q| {
+            let [s, p, o, g] = spellings(q);
+            (s, p, o, g)
+        })
+        .collect();
+    assert_eq!(small, rows[3..13], "a small kept window's quads, in order");
+
+    let outside = Keep::set([objects[0] + 1_000_000]);
+    let none = p.keep(QuadColumn::O, &outside).await.unwrap();
+    assert_eq!(none.size().await.unwrap(), 0);
+}
+
+/// Under tombstones inside the run, a keep of a served view keeps only its
+/// live rows, in the index's order.
+#[tokio::test]
+async fn memory_keeps_under_tombstones() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let store = store
+        .delete_matching(None, None, Some(&plain_literal("object 3")), None)
+        .await
+        .unwrap();
+    let (p, want) = p2_view(&store).await;
+    let sparse = Keep::set(objects_of(&want).into_iter().step_by(2));
+    let kept = p.keep(QuadColumn::O, &sparse).await.unwrap();
+    let filtered: Vec<_> = want
+        .iter()
+        .copied()
+        .filter(|r| sparse.admits(r[2]))
+        .collect();
+    assert_eq!(row_list(&kept).await, filtered);
+    assert_eq!(kept.size().await.unwrap(), filtered.len());
+    assert_eq!(
+        row_list(&kept.window(1, 5).await.unwrap()).await,
+        filtered[1..6]
+    );
+}
+
+/// Over a base whose code columns the shared cache cannot hand out (as a
+/// chunked or wire-encoded one), a served view's code chunks read its rows
+/// and its keeps test the serving component's column at the rows'
+/// positions: both still in the index's order.
+#[tokio::test]
+async fn served_reads_without_the_code_cache() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let (p, want) = p2_view(&store).await;
+    let sparse = Keep::set(objects_of(&want).into_iter().step_by(3));
+    let filtered: Vec<_> = want
+        .iter()
+        .copied()
+        .filter(|r| sparse.admits(r[2]))
+        .collect();
+    let _uncached = crate::store::test_hooks::NoCodeCache::set();
+    assert_eq!(collect_code_chunks(&p, &QuadColumn::ALL, 64).await.0, want);
+    let kept = p.keep(QuadColumn::O, &sparse).await.unwrap();
+    assert_eq!(served_component(&kept), Some("index:posg"));
+    assert_eq!(
+        collect_code_chunks(&kept, &QuadColumn::ALL, 64).await.0,
+        filtered
+    );
+    assert_eq!(row_list(&kept).await, filtered);
+}
