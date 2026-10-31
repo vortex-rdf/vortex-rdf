@@ -8,6 +8,7 @@ pub(crate) mod file_plan;
 pub(crate) mod metadata;
 pub(crate) mod quads;
 pub(crate) mod rows;
+pub(crate) mod served;
 
 use std::future::Future;
 

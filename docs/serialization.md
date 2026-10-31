@@ -53,7 +53,7 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L66), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L112) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L67), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L113) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L134) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
 | Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L254) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
@@ -535,9 +535,9 @@ inode stays alive for the mapping.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/construct.rs#L112) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/construct.rs#L113) turns a `BuiltArray` into the
 store's *compressed-resident* form (through
-[`adopt`](../core/src/store/construct.rs#L125), the step it shares with
+[`adopt`](../core/src/store/construct.rs#L126), the step it shares with
 `from_parts`):
 
 - every non-nullable `u64` code child and row-id child of the base and of
@@ -561,7 +561,7 @@ store's *compressed-resident* form (through
   only the zones that may hold its code
   ([matching.md §6.3](matching.md#63-residual-column-filtering)).
 
-The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L95)
+The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L96)
 (crate-private; `from_file_in_memory` calls it), takes a store's split parts:
 it keeps each integer child's existing encoding wherever a probe binds it and
 decodes only the ones that decline. Its zone bounds are the file's own zone

@@ -358,20 +358,16 @@ impl InMemoryServePlan {
     /// point by point through the component's cached probes, and any other
     /// is the component sliced to the run, each column decoded whole.
     ///
-    /// `None` declines to the caller's gather path: a non-Dictionary decode
-    /// layout (its columns hold terms, not codes), or a slice that fails to
-    /// decode (the gather path reports the error).
+    /// Under a Dictionary decode layout only ([`ServeDecode::decodes_codes`]):
+    /// the string layouts' copies hold terms, not codes.
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
-    pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
-        if !self.decode.decodes_codes() {
-            return None;
-        }
+    pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Result<[Buffer<TermCode>; 4]> {
         if let Some(columns) = self.live_point_columns(deleted) {
-            return Some(columns);
+            return Ok(columns);
         }
-        let (rows, deleted) = self.covered_rows(deleted).ok()?;
-        self.decode.chunk_code_columns(&rows, deleted).ok()
+        let (rows, deleted) = self.covered_rows(deleted)?;
+        self.decode.chunk_code_columns(&rows, deleted)
     }
 
     /// The matched rows decoded from the index component's own rows as the

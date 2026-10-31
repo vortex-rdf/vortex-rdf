@@ -64,6 +64,17 @@ impl ViewSelection {
         ViewSelection::Pending { ids, matches: None }
     }
 
+    /// The ids a narrowing of a served view (a window, keep, partition or
+    /// chained match) holds, live and in the index's order: what a read in
+    /// the index's order gathers at, with no run decoded. `None` for any
+    /// other selection.
+    pub(crate) fn held_index_order(&self) -> Option<&Buffer<RowId>> {
+        match self {
+            ViewSelection::Pending { ids, .. } => ids.live_index_order(),
+            ViewSelection::Exact(_) | ViewSelection::Residual(_) => None,
+        }
+    }
+
     /// Whether every base row is selected. A pending selection never is: it
     /// exists only on a view an index resolution restricted.
     pub(crate) fn is_all(&self) -> bool {

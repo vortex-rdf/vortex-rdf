@@ -877,6 +877,7 @@ async fn test_in_memory_copy_index_serving() {
 
             let codes = by_p
                 .code_columns()
+                .unwrap()
                 .expect("a served Dictionary view reads codes");
             assert_eq!(by_p.debug_row_ids_materialized(), Some(false), "{tag}");
             assert_eq!(
@@ -935,6 +936,7 @@ async fn test_built_store_compresses_resident_form() {
     let matched = matched_view(&store, None, Some(&p1), None, None).await;
     let cols = matched
         .code_columns()
+        .unwrap()
         .expect("compressed base still serves codes through its shared wrappers");
     let mut got = decoded_rows(&cols, &matched.dict_reader().unwrap()).await;
     got.sort();
@@ -999,6 +1001,7 @@ async fn test_code_columns_serves_from_the_answering_index() {
 
     let cols = matched
         .code_columns()
+        .unwrap()
         .expect("an in-memory Dictionary view answers codes");
     assert_eq!(
         matched.debug_row_ids_materialized(),

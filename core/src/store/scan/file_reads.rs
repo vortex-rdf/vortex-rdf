@@ -582,6 +582,27 @@ fn u64_struct(
     Ok(Some(named_struct(columns, children, len)?.into_array()))
 }
 
+/// The rows of a serving `component` at its child rows `positions`
+/// (ascending), every column of `columns` read, under no filter: what the
+/// component's point reads take. `None` for a column the file holds no chunk
+/// probes of.
+fn component_points(
+    file: &NativeStoreFile,
+    component: &str,
+    columns: &[&'static str],
+    positions: Vec<u64>,
+) -> Option<PointRows> {
+    let handles = columns
+        .iter()
+        .map(|c| file.component_column_chunks(component, c))
+        .collect::<Option<Vec<_>>>()?;
+    Some(PointRows {
+        handles,
+        eqs: CodeEqs::default(),
+        live: positions,
+    })
+}
+
 /// [`component_point_rows`] as one value column per column of `columns`, in
 /// that order, without building the chunk: the values a code read of a
 /// served run takes. `Ok(None)` declines as [`component_point_rows`] does.
@@ -591,20 +612,10 @@ pub(crate) async fn component_point_values(
     columns: &[&'static str],
     positions: Vec<u64>,
 ) -> Result<Option<Vec<Vec<u64>>>> {
-    let Some(handles) = columns
-        .iter()
-        .map(|c| file.component_column_chunks(component, c))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(None);
-    };
-    // The rows, under no filter: every column is read.
-    let run = PointRows {
-        handles,
-        eqs: CodeEqs::default(),
-        live: positions,
-    };
-    run.columns(file, columns).await
+    match component_points(file, component, columns, positions) {
+        Some(rows) => rows.columns(file, columns).await,
+        None => Ok(None),
+    }
 }
 
 /// The component's `columns` at the child rows `positions` (ascending),
@@ -618,21 +629,11 @@ pub(crate) async fn component_point_rows(
     columns: &[&'static str],
     positions: Vec<u64>,
 ) -> Result<Option<ArrayRef>> {
-    let Some(handles) = columns
-        .iter()
-        .map(|c| file.component_column_chunks(component, c))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let Some(rows) = component_points(file, component, columns, positions) else {
         return Ok(None);
     };
-    // The rows, under no filter: every column is read.
-    let run = PointRows {
-        handles,
-        eqs: CodeEqs::default(),
-        live: positions,
-    };
-    let Some(values) = run.columns(file, columns).await? else {
+    let Some(values) = rows.columns(file, columns).await? else {
         return Ok(None);
     };
-    u64_struct(&run.handles, columns, values, run.live.len())
+    u64_struct(&rows.handles, columns, values, rows.live.len())
 }

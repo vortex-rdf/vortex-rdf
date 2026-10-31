@@ -23,6 +23,7 @@ use crate::store::array::subject_sorted;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout, StringLayout};
 use crate::store::probes::StructProbes;
+use crate::store::resident::CodeAccess;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::view::tail_keys::TailKeys;
@@ -86,6 +87,9 @@ pub(crate) struct MemoryBase {
     /// The per-zone code bounds of `base`'s code columns ([`ZoneTable`]),
     /// shared by every view of this base; empty when the base has none.
     pub(crate) zones: Arc<ZoneTable>,
+    /// How `base`'s code columns read ([`CodeAccess`]), fixed when the base
+    /// was built; the reads ask `MemoryBase::code_access()`.
+    pub(crate) code_access: CodeAccess,
     /// The index's plan for reading this view's rows from the index's own
     /// columns ([`InMemoryServePlan`]), in its order. A match keeps it only
     /// when its resolution is the view's sole restriction; a window, keep,
@@ -93,6 +97,19 @@ pub(crate) struct MemoryBase {
     /// the rows it kept), the selection staying pending beside it (see
     /// [`ViewSelection`]).
     pub(crate) serve: Option<InMemoryServePlan>,
+}
+
+impl MemoryBase {
+    /// How the base's code columns read, as the base was built, or as
+    /// encoded while a [`NoCodeCache`](crate::store::test_hooks::NoCodeCache)
+    /// guard emulates an encoded base.
+    pub(crate) fn code_access(&self) -> CodeAccess {
+        #[cfg(test)]
+        if crate::store::test_hooks::no_code_cache() {
+            return CodeAccess::Encoded;
+        }
+        self.code_access
+    }
 }
 
 /// A file base: the file handle, the filter a match pushed down to its
@@ -436,6 +453,7 @@ impl QuadsSource {
                 components: Arc::clone(&memory.components),
                 probes: Arc::clone(&memory.probes),
                 zones: Arc::clone(&memory.zones),
+                code_access: memory.code_access,
                 serve,
             }),
         }

@@ -545,33 +545,31 @@ impl FileServePlan {
     }
 
     /// The served rows as chunks of the child's columns, in the index's
-    /// order, as the plan reads its rows ([`read`](Self::read)): rows taken
-    /// point by point `batch_rows` a chunk, or the plan's scan split by
-    /// split; beside the tombstones each chunk's decode still drops, of the
-    /// view's `deleted`. Nothing is read until the stream is polled.
-    pub(crate) fn child_chunks<'a>(
+    /// order, as `read` (the plan's [`read`](Self::read)) takes them: rows
+    /// taken point by point `batch_rows` a chunk, or the plan's scan split by
+    /// split. Nothing is read until the stream is polled.
+    pub(crate) fn read_chunks(
         &self,
+        read: PlanRead,
         file: Arc<NativeStoreFile>,
         batch_rows: usize,
-        deleted: Option<&'a Mask>,
-    ) -> Result<(BoxStream<'static, Result<ArrayRef>>, Option<&'a Mask>)> {
-        let read = self.read()?;
-        let deleted = read.tombstones(deleted);
-        let chunks = match read {
+    ) -> Result<BoxStream<'static, Result<ArrayRef>>> {
+        Ok(match read {
             PlanRead::Kept(positions) | PlanRead::Points(positions) => {
-                let (plan, rows) = (self.clone(), positions.len());
-                stream::iter((0..rows).step_by(batch_rows))
-                    .then(move |start| {
-                        let (plan, file) = (plan.clone(), Arc::clone(&file));
-                        let end = start.saturating_add(batch_rows).min(rows);
-                        let batch = positions.slice(start..end);
-                        async move { plan.rows_at(&file, &batch).await }
-                    })
-                    .boxed()
+                let plan = self.clone();
+                stream::iter(crate::store::read::chunks::batch_ranges(
+                    positions.len(),
+                    batch_rows,
+                ))
+                .then(move |batch| {
+                    let (plan, file) = (plan.clone(), Arc::clone(&file));
+                    let batch = positions.slice(batch);
+                    async move { plan.rows_at(&file, &batch).await }
+                })
+                .boxed()
             }
             PlanRead::Scan(scan) => stream_rows(scan)?,
-        };
-        Ok((chunks, deleted))
+        })
     }
 }
 

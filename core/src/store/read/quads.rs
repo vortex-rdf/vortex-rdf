@@ -50,27 +50,18 @@ use vortex_mask::Mask;
 #[cfg(feature = "file-io")]
 type Chunks<T> = BoxStream<'static, Vec<Result<T>>>;
 
-/// How a read takes a view's rows: the three ways the readers above ask
-/// for them.
+/// How a file read takes a view's rows, a served view's off its serve plan
+/// in its index's order either way. In memory every read is the view's one
+/// chunk, so only a file read tells the two apart.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "file-io"), allow(dead_code))]
 enum QuadRead {
-    /// Streamed, a served view's rows read off its serve plan's run
-    /// (`quads`, `shared_quad_chunks`).
-    Served,
-    /// Streamed in base row order, a serve plan never consulted (the raw
-    /// export of an unserved view).
-    BaseOrder,
-    /// Collected whole and served as [`Served`](Self::Served) is (`quads_vec`,
-    /// `shared_quads_vec`): a one-shot read, which on file reads a pending
-    /// filter's masks first.
+    /// Streamed a chunk at a time (`quads`, `shared_quad_chunks`, the
+    /// N-Triples/N-Quads export).
+    Streamed,
+    /// Collected whole (`quads_vec`, `shared_quads_vec`): a one-shot read,
+    /// which on file reads a pending filter's masks first.
     Collected,
-}
-
-impl QuadRead {
-    /// Whether a serve plan, when the view carries one, answers the read.
-    fn serves(self) -> bool {
-        self != QuadRead::BaseOrder
-    }
 }
 
 impl VortexRdfStore {
@@ -82,7 +73,7 @@ impl VortexRdfStore {
     /// failure to set the read up arrives as the stream's first item.
     pub fn quads(&self) -> Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_> {
         Box::new(
-            self.chunk_stream::<Quad>(QuadRead::Served)
+            self.chunk_stream::<Quad>(QuadRead::Streamed)
                 .flat_map(stream::iter),
         )
     }
@@ -112,7 +103,7 @@ impl VortexRdfStore {
     pub fn shared_quad_chunks(
         &self,
     ) -> Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_> {
-        Box::new(self.chunk_stream::<SharedQuad>(QuadRead::Served))
+        Box::new(self.chunk_stream::<SharedQuad>(QuadRead::Streamed))
     }
 
     /// This view's chunks as N-Triples/N-Quads lines ([`NQuadLines`]), each
@@ -125,11 +116,7 @@ impl VortexRdfStore {
     /// index's order, read off its serve plan, any other's in base row
     /// order.
     pub(in crate::store) fn nquad_line_chunks(&self) -> BoxStream<'_, Vec<Result<NQuadLines>>> {
-        let mode = match self.quads.served_component() {
-            Some(_) => QuadRead::Served,
-            None => QuadRead::BaseOrder,
-        };
-        self.chunk_stream::<NQuadLines>(mode)
+        self.chunk_stream::<NQuadLines>(QuadRead::Streamed)
     }
 
     /// Collect every decoded chunk, then flatten into one exactly-sized `Vec`.
@@ -139,7 +126,7 @@ impl VortexRdfStore {
     async fn decoded_vec<T: ChunkDecode>(&self) -> Result<Vec<T>> {
         match &self.quads.backend {
             Backend::InMemory(memory) => {
-                let chunk = self.in_memory_chunk::<T>(memory, QuadRead::Collected)?;
+                let chunk = self.in_memory_chunk::<T>(memory)?;
                 flattened(chunk.len(), [chunk])
             }
             #[cfg(feature = "file-io")]
@@ -155,14 +142,17 @@ impl VortexRdfStore {
     /// a build failure as one error chunk: in memory the view's one chunk
     /// ([`in_memory_chunk`](Self::in_memory_chunk)), decoded without
     /// suspending; on file the chunks of `file_chunks`, read as `mode` asks.
-    fn chunk_stream<T: ChunkDecode>(&self, mode: QuadRead) -> BoxStream<'_, Vec<Result<T>>> {
+    fn chunk_stream<T: ChunkDecode>(
+        &self,
+        #[cfg_attr(not(feature = "file-io"), allow(unused_variables))] mode: QuadRead,
+    ) -> BoxStream<'_, Vec<Result<T>>> {
         observe!(ChunkStream);
         match &self.quads.backend {
-            Backend::InMemory(memory) => stream::once(future::lazy(move |_| {
-                self.in_memory_chunk::<T>(memory, mode)
-            }))
-            .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(e)]))
-            .boxed(),
+            Backend::InMemory(memory) => {
+                stream::once(future::lazy(move |_| self.in_memory_chunk::<T>(memory)))
+                    .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(e)]))
+                    .boxed()
+            }
             #[cfg(feature = "file-io")]
             Backend::File(base) => deferred(self.file_chunks::<T>(base, mode), |e| vec![Err(e)]),
         }
@@ -172,22 +162,18 @@ impl VortexRdfStore {
     /// tail's live rows appended, tombstones applied, without suspending: the
     /// rows are in memory and an in-memory store's dictionary is resident.
     ///
-    /// When `mode` serves, a served view reads its plan's run, a slice or
+    /// A served view reads its plan's run, a slice or
     /// point reads of the component's run. Every other read is the base's rows
     /// in base row order, gathered over the exact selection
     /// ([`in_memory_base_rows`](Self::in_memory_base_rows)).
-    fn in_memory_chunk<T: ChunkDecode>(
-        &self,
-        memory: &MemoryBase,
-        mode: QuadRead,
-    ) -> Result<Vec<Result<T>>> {
+    fn in_memory_chunk<T: ChunkDecode>(&self, memory: &MemoryBase) -> Result<Vec<Result<T>>> {
         let mut quads = match &memory.serve {
             // A served view decodes the matched quads from the index
             // component's contiguous run instead of gathering the primary
             // columns at scattered row ids; tombstones apply through the
             // run's rid column, and the selection may stay pending (the plan
             // never needs it).
-            Some(plan) if mode.serves() => plan.decode::<T>(self.quads.deleted.as_ref()),
+            Some(plan) => plan.decode::<T>(self.quads.deleted.as_ref()),
             _ => T::decode(&self.layout, &self.in_memory_base_rows(memory)?),
         };
         // Tail rows are in memory and few: they follow the base's.
@@ -198,12 +184,12 @@ impl VortexRdfStore {
     /// A file view's rows as decoded chunks: the base's, then the tail's live
     /// rows as one more chunk. Tombstones are applied on every path.
     ///
-    /// When `mode` serves, a served view reads its plan's run: point reads for a
-    /// point-sized located run, a row-count-split scan for a wide one, the
-    /// plan's filter scan for an unlocated one. Every other read is the base's
-    /// rows in base row order, read as the file read's plan has it
+    /// A served view reads its plan's run: point reads for a point-sized
+    /// located run, a row-count-split scan for a wide one, the plan's filter
+    /// scan for an unlocated one. Every other read is the base's rows in base
+    /// row order, read as the file read's plan has it
     /// ([`file_plan`](crate::store::read::file_plan)), one-shot for a
-    /// collected read and streamed otherwise: a filter's kept rows
+    /// collected read (`mode`) and streamed otherwise: a filter's kept rows
     /// ([`masked_chunks`](Self::masked_chunks)), or a stream's split by split
     /// ([`decoded_split_reads`](Self::decoded_split_reads)); rows read by id
     /// ([`ExactRead`](crate::store::scan::read_plan::ExactRead)) as one chunk,
@@ -228,9 +214,7 @@ impl VortexRdfStore {
         // The plan's filter selects exactly the rows this view's selection
         // names (see `FileServePlan`); tombstones apply through its rid
         // column.
-        if let Some(plan) = plan
-            && mode.serves()
-        {
+        if let Some(plan) = plan {
             let read = plan.read()?;
             let deleted = read.tombstones(deleted.as_ref()).cloned();
             return match read {

@@ -101,7 +101,8 @@ pub(crate) enum Event {
     /// of its run, or a take at its live rows), the base's code columns being
     /// encoded (a store read off a file), this many rows.
     ServedComponentChunk(usize),
-    /// A code-chunk stream read off its serving index's located run.
+    /// A chunk stream (code or row chunks) of a served view, read in its
+    /// index's order as its serve plan decides ([`ServedRead`](crate::store::read::served::ServedRead)).
     ServedRunChunks,
     /// A served file run its index did not locate read once by row index,
     /// its rows' child positions and row ids.

@@ -667,12 +667,6 @@ impl LazyRowIds {
         Ok(Some(ids))
     }
 
-    /// How many rows the ids cover, when knowable without computing them: an
-    /// in-memory run knows its width up front (so a count on a served match
-    /// never decodes), and so does a located file run, whether its ids come
-    /// from the run itself or from the child scan it bounds; an unlocated
-    /// child scan and a pending residual compare only once their ids are
-    /// known.
     /// The ids as they were handed over, in the index's order, when they
     /// leave out every tombstone (a window's, keep's, partition's or
     /// chained match's of a served view): what a read in the index's order
@@ -686,6 +680,12 @@ impl LazyRowIds {
         }
     }
 
+    /// How many rows the ids cover, when knowable without computing them: an
+    /// in-memory run knows its width up front (so a count on a served match
+    /// never decodes), and so does a located file run, whether its ids come
+    /// from the run itself or from the child scan it bounds; an unlocated
+    /// child scan and a pending residual compare only once their ids are
+    /// known.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
             LazyRowIdSource::Component { rids, .. } => Some(rids.len()),

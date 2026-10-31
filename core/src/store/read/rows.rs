@@ -10,13 +10,14 @@ use crate::store::array::{rechunk, with_subject_stamp};
 use crate::store::read::chunks::{RowChunkStream, extract_codes};
 #[cfg(feature = "file-io")]
 use crate::store::read::file_plan::{CollectedPlan, masked_codes};
+use crate::store::resident::CodeAccess;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::scan::read_plan::ExactRead;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_reads, file_scans};
 use crate::store::schema::{self, QuadColumn, RowId, TermCode};
-use crate::store::view::selection::{SelectedRows, ViewSelection};
+use crate::store::view::selection::SelectedRows;
 use crate::store::{Backend, MemoryBase};
 
 use futures::stream::{self, StreamExt};
@@ -108,50 +109,43 @@ impl VortexRdfStore {
     /// its primitive is decoded once into the wrapper's cache
     /// (`shared_code_primitive`) and shared zero-copy from then on.
     ///
-    /// `None` for a non-Dictionary layout, a non-empty tail (its strings are
-    /// not in the dictionary), a file-backed source, or base columns the
-    /// cache cannot hand out as non-nullable code primitives (chunked or
-    /// wire-encoded); callers then read the rows, as
+    /// A served in-memory view's codes are read here, in its index's order,
+    /// or the read's error is returned: never the base's codes in base
+    /// order. `Ok(None)` for a non-Dictionary layout, a non-empty tail (its
+    /// strings are not in the dictionary), a file-backed source, or an
+    /// unserved view over base columns the cache cannot hand out as
+    /// non-nullable code primitives (encoded); callers then read the rows, as
     /// [`code_columns_gathered`](Self::code_columns_gathered) does after
     /// trying this.
-    pub(crate) fn code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
+    pub(crate) fn code_columns(&self) -> Result<Option<[Buffer<TermCode>; 4]>> {
         if !self.is_code_view() {
-            return None;
+            return Ok(None);
         }
-        if let Some(plan) = &self.quads.in_memory()?.serve {
-            let deleted = self.quads.deleted.as_ref();
-            // A window of a served view: the base's code columns gathered at
-            // its row ids, in the index's order (the view's own when it holds
-            // them so, else the plan's).
-            if plan.is_narrowed()
-                && let Some(prims) = self.base_code_primitives()
-            {
-                let held = match &self.quads.selection {
-                    ViewSelection::Pending { ids, .. } => ids.live_index_order(),
-                    _ => None,
-                };
-                if let Some(ids) = held {
-                    return Some(gather_codes(&prims, ids));
-                }
-                if let Ok(ids) = plan.live_rids(deleted) {
-                    return Some(gather_codes(&prims, &ids));
-                }
-            }
-            // The answering index's columns hold this view's codes as one
-            // contiguous run: no deferred row ids to compute, no scattered
-            // gather over the primaries.
-            if let Some(columns) = plan.code_columns(deleted) {
-                return Some(columns);
-            }
+        let Some(memory) = self.quads.in_memory() else {
+            return Ok(None);
+        };
+        let Some(plan) = &memory.serve else {
+            return Ok(self.base_code_columns());
+        };
+        // A narrowing of a served view (a window, keep, partition or chained
+        // match) holds its rows' ids in the index's order: over a base whose
+        // code columns decode once, its codes are gathered at them.
+        if let Some(ids) = self.quads.selection.held_index_order()
+            && let Some(prims) = self.base_code_primitives()
+        {
+            return Ok(Some(gather_codes(&prims, ids)));
         }
-        self.base_code_columns()
+        // The answering index's columns hold this view's codes: no row ids
+        // computed, no scattered gather over the primaries.
+        plan.code_columns(self.quads.deleted.as_ref()).map(Some)
     }
 
     /// [`code_columns`](Self::code_columns) without the served path: the
     /// view's codes from the base's own columns in base row order, whatever
-    /// answered the match (the order [`code_chunks`](Self::code_chunks)
-    /// yields). A served match's pending selection materializes here. `None`
-    /// under the same conditions as `code_columns`.
+    /// answered the match (an unserved view's order, and a served view's
+    /// base-order twin in tests). A served match's pending selection
+    /// materializes here. `None` under the same conditions as
+    /// `code_columns`.
     pub(crate) fn base_code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
         if !self.is_code_view() {
             return None;
@@ -207,49 +201,22 @@ impl VortexRdfStore {
         ])
     }
 
-    /// Whether every base code column of an in-memory view keeps its decode
-    /// once made ([`decodes_once`](crate::store::resident::decodes_once)),
-    /// so a gather at the view's scattered ids decodes nothing twice: a
-    /// built store's. `false` for a store read off a file or adopted from
-    /// bytes, whose encoded columns every take decodes again, and on file.
-    pub(in crate::store) fn base_codes_decode_once(&self) -> bool {
-        use vortex_array::arrays::Struct;
-
-        let Some(memory) = self.quads.in_memory() else {
-            return false;
-        };
-        let Some(base) = memory.base.as_opt::<Struct>() else {
-            return false;
-        };
-        // Each code column at its schema position, its name checked rather
-        // than looked up: a base of another shape reads as encoded.
-        let names = base.names();
-        QuadColumn::ALL.iter().all(|column| {
-            let k = column.index();
-            names
-                .iter()
-                .nth(k)
-                .is_some_and(|name| name.as_ref() == column.name())
-                && base
-                    .unmasked_field_opt(k)
-                    .is_some_and(crate::store::resident::decodes_once)
-        })
-    }
-
     /// The base's `column` code column as a canonical primitive, as
     /// [`base_code_primitives`](Self::base_code_primitives) reads each of
     /// the four: a builder-compressed column is decoded into its own shared
-    /// cache, the other columns' caches left as they are.
+    /// cache, the other columns' caches left as they are. `None` off memory,
+    /// or for a base whose code columns are encoded
+    /// ([`CodeAccess::Encoded`]), which a gather would decode again.
     pub(in crate::store) fn base_code_primitive(
         &self,
         column: QuadColumn,
     ) -> Option<PrimitiveArray> {
         use vortex_array::arrays::Struct;
-        #[cfg(test)]
-        if crate::store::test_hooks::no_code_cache() {
+        let memory = self.quads.in_memory()?;
+        if memory.code_access() == CodeAccess::Encoded {
             return None;
         }
-        let base = &self.quads.in_memory()?.base;
+        let base = &memory.base;
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
         crate::store::resident::shared_code_primitive(
             struct_arr.unmasked_field_by_name(column.name()).ok()?,
@@ -269,7 +236,7 @@ impl VortexRdfStore {
     /// non-Dictionary layout, or a non-empty tail, whose terms the dictionary
     /// lacks. The bindings' code-column reads go through here.
     pub async fn code_columns_gathered(&self) -> Result<Option<[Buffer<TermCode>; 4]>> {
-        if let Some(columns) = self.code_columns() {
+        if let Some(columns) = self.code_columns()? {
             return Ok(Some(columns));
         }
         if !self.is_code_view() {
