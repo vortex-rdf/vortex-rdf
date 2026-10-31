@@ -16,7 +16,7 @@ use crate::store::scan::read_plan::ExactRead;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_reads, file_scans};
 use crate::store::schema::{self, QuadColumn, RowId, TermCode};
-use crate::store::view::selection::SelectedRows;
+use crate::store::view::selection::{SelectedRows, ViewSelection};
 use crate::store::{Backend, MemoryBase};
 
 use futures::stream::{self, StreamExt};
@@ -121,12 +121,21 @@ impl VortexRdfStore {
         if let Some(plan) = &self.quads.in_memory()?.serve {
             let deleted = self.quads.deleted.as_ref();
             // A window of a served view: the base's code columns gathered at
-            // its row ids, in the index's order.
+            // its row ids, in the index's order (the view's own when it holds
+            // them so, else the plan's).
             if plan.is_narrowed()
                 && let Some(prims) = self.base_code_primitives()
-                && let Ok(ids) = plan.live_rids(deleted)
             {
-                return Some(gather_codes(&prims, &ids));
+                let held = match &self.quads.selection {
+                    ViewSelection::Pending { ids, .. } => ids.live_index_order(),
+                    _ => None,
+                };
+                if let Some(ids) = held {
+                    return Some(gather_codes(&prims, ids));
+                }
+                if let Ok(ids) = plan.live_rids(deleted) {
+                    return Some(gather_codes(&prims, &ids));
+                }
             }
             // The answering index's columns hold this view's codes as one
             // contiguous run: no deferred row ids to compute, no scattered

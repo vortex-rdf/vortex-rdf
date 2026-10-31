@@ -655,6 +655,19 @@ impl LazyRowIds {
     /// from the run itself or from the child scan it bounds; an unlocated
     /// child scan and a pending residual compare only once their ids are
     /// known.
+    /// The ids as they were handed over, in the index's order, when they
+    /// leave out every tombstone (a window's, keep's, partition's or
+    /// chained match's of a served view): what a read in the index's order
+    /// gathers at, with no run decoded. `None` for any other source.
+    pub(crate) fn live_index_order(&self) -> Option<&Buffer<RowId>> {
+        match &self.source {
+            LazyRowIdSource::Unsorted {
+                ids, live: true, ..
+            } => Some(ids),
+            _ => None,
+        }
+    }
+
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
             LazyRowIdSource::Component { rids, .. } => Some(rids.len()),
