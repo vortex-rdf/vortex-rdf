@@ -22,7 +22,7 @@ pub(crate) fn check_batch_rows(batch_rows: usize) -> Result<()> {
     Ok(())
 }
 
-/// A match's terms in base row order, a payload a call: a Dictionary store's code chunks encoded with
+/// A match's terms in the match's order, a payload a call: a Dictionary store's code chunks encoded with
 /// [`encode_codes`], any other store's row chunks decoded with `decode_row_chunk` and encoded with
 /// [`encode_shared`]. A core chunk larger than one payload is sent over several calls.
 pub struct TermStream {
@@ -152,7 +152,7 @@ impl TermStream {
     }
 }
 
-/// A match's term codes in base row order, written into the caller's rows as `match_codes` writes them: the
+/// A match's term codes in the match's order, written into the caller's rows as `match_codes` writes them: the
 /// current chunk's rest is kept for the next call, so the rows a call takes are independent of the chunks'.
 pub struct CodeStream {
     /// The chunks; `None` once the last was read, or for a pattern no quad can match.

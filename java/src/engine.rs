@@ -103,9 +103,10 @@ impl Store {
         Ok(QuadCursor::shared(rows, limits))
     }
 
-    /// The quads matching a pattern of N-Triples spellings as a stream, in base row order, read in chunks of
-    /// at most `batch_rows` rows and sent as packed payloads ([`TermStream`]). The pattern is parsed and matched
-    /// now; the rows are read as the stream is pulled.
+    /// The quads matching a pattern of N-Triples spellings as a stream, in the match's order (a
+    /// `secondary-by-copy` index's for a pattern it serves, else base row order), read in chunks of at most
+    /// `batch_rows` rows and sent as packed payloads ([`TermStream`]). The pattern is parsed and matched now; the
+    /// rows are read as the stream is pulled.
     pub fn term_stream(
         &self,
         s: Option<&str>,
@@ -168,9 +169,10 @@ impl Store {
         RUNTIME.block_on(encode_lookup(self.dict()?, codes, limits))
     }
 
-    /// The quads matching a code pattern as a stream of their codes, in base row order, read in chunks of at
-    /// most `batch_rows` rows ([`CodeStream`]); empty for a pattern no quad can match (a code past the
-    /// dictionary, or one in a position its term's kind cannot take).
+    /// The quads matching a code pattern as a stream of their codes, in the match's order (a
+    /// `secondary-by-copy` index's for a pattern it serves, else base row order), read in chunks of at most
+    /// `batch_rows` rows ([`CodeStream`]); empty for a pattern no quad can match (a code past the dictionary, or
+    /// one in a position its term's kind cannot take).
     pub fn code_stream(&self, pattern: CodePattern, batch_rows: usize) -> Result<CodeStream> {
         check_batch_rows(batch_rows)?;
         self.dict()?;

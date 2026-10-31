@@ -116,7 +116,7 @@ try (Stream<String[]> rows = store.iterateQuads(s, p, o, g, 4096).stream()) {  /
 
 The pattern is checked and matched when `iterateQuads` is called, so a malformed term raises there; the rows are read as the iterator is pulled, at most `batchRows` at a time: a smaller batch brings the first rows sooner, at the cost of more native calls over the whole match. `matchCodeChunks`, shown under [Term codes](#term-codes-low-level), does the same for a pattern of codes: each `next(out, maxRows)` writes the next rows into the buffer as `matchCodes` writes them, and returns 0 once the match is spent.
 
-Both read a match in base row order, `(s, p, o, g)`. `quads` and `matchCodes` return the same rows in the same order, except on a pattern a `secondary-by-copy` index serves, where they may come in that index's order.
+Both read a match in the order `quads` and `matchCodes` return it: base row order, `(s, p, o, g)`, except on a pattern a `secondary-by-copy` index serves, read in that index's order (a predicate's rows by object, then subject). The order is the same on every call.
 
 ## Threads, memory and lifetime
 

@@ -447,7 +447,8 @@ pub extern "system" fn Java_org_vortexrdf_Native_termStreamNext<'local>(
 }
 
 /// A read of the quads matching a code pattern (`-1` is free) as a stream of their codes, in chunks of at
-/// most `batchRows` rows, in base row order. Returns the stream's handle.
+/// most `batchRows` rows, in the match's order (a `secondary-by-copy` index's for a pattern it serves, else
+/// base row order). Returns the stream's handle.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_vortexrdf_Native_codeStreamOpen<'local>(
     mut env: EnvUnowned<'local>,

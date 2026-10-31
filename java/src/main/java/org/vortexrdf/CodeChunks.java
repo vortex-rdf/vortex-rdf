@@ -5,7 +5,7 @@ import java.nio.ByteBuffer;
 
 /**
  * The term codes of the quads matching a pattern of codes, read a chunk at a time
- * ({@link VortexStore#matchCodeChunks}), in base row order, written into the caller's buffer as
+ * ({@link VortexStore#matchCodeChunks}), in the match's order, written into the caller's buffer as
  * {@link VortexStore#matchCodes(long, long, long, long, long, ByteBuffer, int)} writes them. Close it when done, or
  * drain it: either frees its native stream, as does closing its store, and one left unreachable unclosed is freed by a
  * cleaner.
