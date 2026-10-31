@@ -490,7 +490,8 @@ pub extern "system" fn Java_org_vortexrdf_Native_codeStreamNext<'local>(
 ) -> jint {
     call(&mut env, |env| {
         let out = direct_rows(env, &buf, max_rows, "codeStreamNext")?;
-        // SAFETY: as for `termStreamNext`.
+        // SAFETY: the Java side passes a stream `codeStreamOpen` returned, before freeing it, one call at a
+        // time (its `NativeStream` serializes them).
         let codes = unsafe { Stream::codes(stream, "codeStreamNext") }?;
         Ok(codes.next(out)? as jint)
     })
@@ -504,7 +505,8 @@ pub extern "system" fn Java_org_vortexrdf_Native_streamClose<'local>(
     stream: jlong,
 ) {
     call(&mut env, |_| {
-        // SAFETY: as for `termStreamNext`, and nothing uses the stream afterwards.
+        // SAFETY: the Java side passes a stream `quadsOpen`, `termStreamOpen` or `codeStreamOpen` returned, once
+        // (the call that opened it, or its `NativeStream`), and nothing uses the stream afterwards.
         unsafe { Handle::<Stream>::close(stream) };
         Ok(())
     })
