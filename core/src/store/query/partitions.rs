@@ -32,7 +32,11 @@ impl VortexRdfStore {
         if n == 1 {
             return Ok(vec![self.clone()]);
         }
-        if let Some(parts) = self.served_partitions(n).await? {
+        if let Some(parts) = self.served_partitions_in_memory(n)? {
+            return Ok(parts);
+        }
+        #[cfg(feature = "file-io")]
+        if let Some(parts) = self.served_partitions_file(n).await? {
             return Ok(parts);
         }
         let pieces = self

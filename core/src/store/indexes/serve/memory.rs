@@ -107,6 +107,7 @@ impl InMemoryServePlan {
 
     /// The rows of the component the view covers: the run, or what a
     /// narrowing left of it.
+    #[inline]
     pub(crate) fn span(&self) -> ServedSpan {
         self.narrowed
             .clone()
@@ -120,10 +121,18 @@ impl InMemoryServePlan {
     }
 
     /// This plan over `span`, what a narrowing left of the view's rows.
+    #[inline]
     pub(crate) fn with_span(&self, span: ServedSpan) -> Self {
         Self {
+            decode: self.decode.clone(),
+            component: self.component,
+            order: self.order,
+            array: self.array.clone(),
+            run: self.run.clone(),
             narrowed: Some(span),
-            ..self.clone()
+            rids: self.rids.clone(),
+            cells: Arc::clone(&self.cells),
+            probes: Arc::clone(&self.probes),
         }
     }
 
@@ -203,6 +212,7 @@ impl InMemoryServePlan {
     /// The base row ids of the component rows `range` (a part of the run), in
     /// its order: a slice of the run's ids, shared. What a window or
     /// partition of a range holds.
+    #[inline]
     pub(crate) fn range_rids(&self, range: Range<u64>) -> Result<Buffer<RowId>> {
         let range = range.start as usize..range.end as usize;
         Ok(self.run_rids()?.slice(self.slots(&range)))

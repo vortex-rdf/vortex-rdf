@@ -76,8 +76,16 @@ impl VortexRdfStore {
         };
         observe!(Window);
         // A served view's window is served too, in its index's order.
-        if let Some(windowed) = self.served_window(offset, limit).await? {
+        if let Some(windowed) = self.served_window_in_memory(offset, limit)? {
             debug::step!(t, "[window] offset {offset} limit {limit} of a served run");
+            return Ok(Some(windowed));
+        }
+        #[cfg(feature = "file-io")]
+        if let Some(windowed) = self.served_window_file(offset, limit).await? {
+            debug::step!(
+                t,
+                "[window] offset {offset} limit {limit} of a served file run"
+            );
             return Ok(Some(windowed));
         }
         #[cfg(feature = "file-io")]
@@ -118,6 +126,7 @@ impl VortexRdfStore {
     /// and gave `base_taken` of them: whatever the base could not fill falls
     /// to the tail, the offset it did not consume, the limit it did not
     /// take.
+    #[inline]
     pub(in crate::store) fn windowed_tail(
         &self,
         offset: usize,
