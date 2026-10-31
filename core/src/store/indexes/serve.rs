@@ -233,7 +233,9 @@ impl ServedRows {
 /// The `rows` (positions beside base row ids, at most `capacity` of them)
 /// that `keep` admits, in order. Each kept row is pushed once to buffers
 /// reserved for every row: two allocations, which a doubling buffer would
-/// spend on its growth.
+/// spend on its growth. A keep that admits fewer than a quarter of them gives
+/// the rest back (two more): the buffers live as long as the kept view and
+/// every window of it.
 fn collect_kept(
     rows: impl Iterator<Item = (usize, RowId)>,
     capacity: usize,
@@ -245,6 +247,10 @@ fn collect_kept(
             positions.push(position as u64);
             rids.push(rid);
         }
+    }
+    if positions.len() < capacity / 4 {
+        positions.shrink_to_fit();
+        rids.shrink_to_fit();
     }
     ServedRows {
         positions: Buffer::from(positions),
@@ -641,5 +647,33 @@ impl InMemoryServePlan {
         let positions = kept.live(deleted).positions;
         let indices = PrimitiveArray::new(positions, Validity::NonNullable).into_array();
         self.array.take(indices).map_err(VortexRdfError::Vortex)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capacity of a uniquely owned buffer.
+    fn capacity<T>(buffer: Buffer<T>) -> usize {
+        match buffer.try_into_mut() {
+            Ok(owned) => owned.capacity(),
+            Err(_) => panic!("a kept buffer is uniquely owned"),
+        }
+    }
+
+    /// A keep that admits few of a view's rows holds buffers sized to the rows
+    /// it kept, not to the view it reserved for: they live as long as the kept
+    /// view and every window of it.
+    #[test]
+    fn sparse_keeps_hold_only_their_rows() {
+        let rows = || (0..10_000usize).map(|position| (position, position as RowId));
+        let sparse = collect_kept(rows(), 10_000, |position, _| position % 1_000 == 0);
+        assert_eq!(sparse.len(), 10);
+        assert!(capacity(sparse.positions) < 10_000 / 4, "positions");
+        assert!(capacity(sparse.rids) < 10_000 / 4, "row ids");
+        let dense = collect_kept(rows(), 10_000, |position, _| position % 2 == 0);
+        assert_eq!(dense.len(), 5_000);
+        assert_eq!(dense.positions.as_slice()[..3], [0, 2, 4]);
     }
 }
