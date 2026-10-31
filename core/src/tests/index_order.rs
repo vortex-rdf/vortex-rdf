@@ -331,10 +331,24 @@ async fn memory_partitions_concatenate_to_index_order() {
 
 /// Windows of a served view with an append tail run past the base's rows,
 /// in the index's order, into the tail's: each window is the slice of the
-/// view's quads, and the counts add up.
+/// view's quads, and the counts add up, in memory and on file.
 #[tokio::test]
 async fn window_crosses_into_the_tail() {
-    let (_dir, store) = memory_store(LayoutStrategy::Default).await;
+    let (_dir, memory) = memory_store(LayoutStrategy::Default).await;
+    let (_file_dir, path) = write_store_file(
+        modular_quads(20_000, 7, 11),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    for store in [memory, file] {
+        window_crosses_into_the_tail_of(store).await;
+    }
+}
+
+async fn window_crosses_into_the_tail_of(store: VortexRdfStore) {
+    let file = store.view_statistics().unwrap().file_backed;
     let extra: Vec<Quad> = (0..3)
         .map(|k| {
             make_quad(
@@ -361,9 +375,13 @@ async fn window_crosses_into_the_tail() {
         assert_eq!(
             w.quads_vec().await.unwrap(),
             want,
-            "offset {offset}: the order"
+            "file {file} offset {offset}: the order"
         );
-        assert_eq!(w.size().await.unwrap(), want.len(), "offset {offset}");
+        assert_eq!(
+            w.size().await.unwrap(),
+            want.len(),
+            "file {file} offset {offset}"
+        );
     }
 }
 
@@ -400,6 +418,40 @@ async fn wide_row_ids_through_served_windows() {
         got.extend(row_list(part).await);
     }
     assert_eq!(got, want);
+    // A keep of half the objects, and a chain of one, filter the same rows.
+    let objects = objects_of(&want);
+    let kept_objects: Vec<TermCode> = objects.iter().copied().step_by(2).collect();
+    let kept = p
+        .keep(QuadColumn::O, &Keep::set(kept_objects.iter().copied()))
+        .await
+        .unwrap();
+    let filtered: Vec<[TermCode; 4]> = want
+        .iter()
+        .copied()
+        .filter(|row| kept_objects.contains(&row[2]))
+        .collect();
+    assert_eq!(row_list(&kept).await, filtered, "a keep");
+    assert_eq!(kept.size().await.unwrap(), filtered.len(), "its count");
+    let o3 = plain_literal("object 3");
+    let o3_code = store
+        .dict_reader()
+        .unwrap()
+        .encode(&o3.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let window = p.window(0, want.len()).await.unwrap();
+    let chained = window
+        .match_pattern(None, None, Some(&o3), None)
+        .await
+        .unwrap();
+    let o3_rows: Vec<[TermCode; 4]> = want
+        .iter()
+        .copied()
+        .filter(|row| row[2] == o3_code)
+        .collect();
+    assert!(!o3_rows.is_empty());
+    assert_eq!(row_list(&chained).await, o3_rows, "a chain");
 }
 
 /// What does not depend on order reads a narrowed served view as before:
@@ -1084,10 +1136,11 @@ async fn typed_object_row_chunks_follow_index_order() {
 /// A pattern chained on a narrowed served view (a window of `?p2??`) keeps
 /// the window's rows its bound terms match, compared on the copy's own
 /// columns (codes or strings), in the window's order, and stays served: in
-/// both residencies, on the Dictionary and Default layouts, as written and
-/// under tombstones. The object chain keeps one object's rows; the graph
-/// chain keeps rows of every object, so its order is the index's, not
-/// base order.
+/// both residencies, on every layout (TypedObject's copies hold the object as
+/// a string, its base as a typed value), as written and under tombstones.
+/// The object chain keeps one object's rows; the graph chain keeps rows of
+/// every object, so its order is the index's, not base order. The window's
+/// own predicate keeps every row; another, none.
 #[tokio::test]
 async fn chained_match_on_a_window_filters_in_index_order() {
     // Every third quad in a named graph.
@@ -1110,7 +1163,11 @@ async fn chained_match_on_a_window_filters_in_index_order() {
         .step_by(5)
         .cloned()
         .collect();
-    for layout in [LayoutStrategy::Dictionary, LayoutStrategy::Default] {
+    for layout in [
+        LayoutStrategy::Dictionary,
+        LayoutStrategy::Default,
+        LayoutStrategy::TypedObject,
+    ] {
         let (_dir, path) =
             write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
         let file = VortexRdfStore::from_file(&path).await.unwrap();
@@ -1171,6 +1228,27 @@ async fn chained_match_on_a_window_filters_in_index_order() {
                 .unwrap();
             assert_eq!(none.size().await.unwrap(), 0, "{tag}: an absent object");
             assert!(none.quads_vec().await.unwrap().is_empty(), "{tag}: no rows");
+            // The window's own predicate again keeps every row, in order;
+            // another predicate keeps none.
+            let same = window
+                .match_pattern(None, Some(&p2), None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                same.quads_vec().await.unwrap(),
+                rows,
+                "{tag}: the same predicate"
+            );
+            assert_eq!(same.size().await.unwrap(), rows.len(), "{tag}: its count");
+            let other = window
+                .match_pattern(None, Some(&iri("p3")), None, None)
+                .await
+                .unwrap();
+            assert_eq!(other.size().await.unwrap(), 0, "{tag}: another predicate");
+            assert!(
+                other.quads_vec().await.unwrap().is_empty(),
+                "{tag}: its rows"
+            );
         }
     }
 }
