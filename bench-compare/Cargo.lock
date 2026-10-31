@@ -3997,6 +3997,7 @@ dependencies = [
  "vortex-buffer",
  "vortex-edition",
  "vortex-error",
+ "vortex-fastlanes",
  "vortex-file",
  "vortex-fsst",
  "vortex-io",

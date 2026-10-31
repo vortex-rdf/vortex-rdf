@@ -24,6 +24,8 @@ vortex-edition.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-buffer.workspace = true
+# Encodings the store session's own kernels execute (`kernels.rs`).
+vortex-fastlanes.workspace = true
 # Memory-mapped store files (`VortexRdfStore::from_file`); enabled by `file-io`
 # together with vortex-buffer's `memmap2` feature (`ByteBuffer: From<Mmap>`).
 memmap2 = { version = "0.9", optional = true }

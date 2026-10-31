@@ -80,9 +80,9 @@ of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
 The writer is limited to two editions: Vortex's frozen `core` edition
-`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L63)) — every
+`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L67)) — every
 encoding, layout, extension dtype and zone-map aggregate a store file may hold
-— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L74)), whose
+— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L78)), whose
 one member is the root layout. A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
 per-chunk frame-of-reference (`fastlanes.for.v2`) or bit-packing with a width
@@ -542,6 +542,20 @@ once, as over a mapping they always do, and at the stream's consumer
 otherwise. A file-backed chunk of fewer than 1,024 rows decodes at the
 consumer too, against the windows its core has in cache, where a worker would
 gain it no parallelism.
+
+**Kernels.** The store's Vortex session adds fused executions of its own for
+cases Vortex 0.90 runs the slow way, registered before the default encodings
+register theirs ([`register`](../core/src/kernels.rs#L23)), so that each is
+tried first and declines whatever Vortex's own kernel does as well. A
+comparison against a constant of a slice of a bit-packed leaf with patches
+slices the leaf, patches and all, and compares it packed
+([`CompareSlicedPatches`](../core/src/kernels.rs#L42)): Vortex cannot slice
+such a leaf without reading its patches, so it leaves the slice lazy and then
+decodes it to compare it value by value. A leaf is sliced whenever a filter
+evaluates part of it (a zone-pruned range, a split that cuts it, an
+early-exit piece), and a column of codes bit-packs with patches when a few
+of its codes pass a power of two: the object column, whose codes start at 0,
+under an `O` or `PO` match. Each kernel goes once Vortex covers its case.
 
 **Platforms and limits.** Mapping works on Linux, macOS and Windows. A store
 file is read in place while open: truncating or rewriting it in place is

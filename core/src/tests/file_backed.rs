@@ -855,3 +855,73 @@ async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], s
         "{tag}: tombstones"
     );
 }
+
+/// Object codes of 12 bits but for a few past them, which the writer packs at
+/// 12 bits with patches: an `O` or `PO` match over the mapped file compares a
+/// zone-pruned slice of the object leaf through the store session's kernel
+/// ([`crate::kernels`]), and answers as the store built in memory, whose code
+/// columns pack at their full width without patches, does.
+#[tokio::test]
+async fn test_patched_object_codes_compare_through_the_kernel() {
+    use crate::kernels::hooks::{self, Kernel};
+
+    // 4,096 literal objects, each 8,192-row zone holding its own 1,024 of
+    // them, scattered through the zone so that no run repeats one; in the
+    // last zone every 64th row's object is its subject instead, an IRI,
+    // whose code passes the literals' 12 bits (literals sort first).
+    const ZONE: usize = 8_192;
+    let quads: Vec<Quad> = (0..4 * ZONE)
+        .map(|i| {
+            let subject = format!("http://example.org/s{:05}", i / 8);
+            let object = if i >= 3 * ZONE && i % 64 == 0 {
+                Term::NamedNode(NamedNode::new(&subject).unwrap())
+            } else {
+                plain_literal(&format!("v{:04}", (i / ZONE) * 1_024 + (i * 37) % 1_024))
+            };
+            Quad::new(
+                NamedOrBlankNode::NamedNode(NamedNode::new(&subject).unwrap()),
+                iri(&format!("p{}", i % 4)),
+                object,
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    hooks::take();
+    for (object, predicate) in [
+        (plain_literal("v0000"), None),
+        (plain_literal("v0000"), Some(iri("p0"))),
+        (plain_literal("v1234"), None),
+        (plain_literal("v1234"), Some(iri("p2"))),
+        (plain_literal("v3500"), Some(iri("p0"))),
+        (Term::NamedNode(iri("s03200")), None),
+        (Term::NamedNode(iri("s03200")), Some(iri("p0"))),
+    ] {
+        let label = format!("{object} {predicate:?}");
+        let probe = Probe::new(None, predicate, Some(object), None);
+        let mut got = file
+            .run_probe(&probe)
+            .await
+            .unwrap()
+            .quads_vec()
+            .await
+            .unwrap();
+        let mut want = memory
+            .run_probe(&probe)
+            .await
+            .unwrap()
+            .quads_vec()
+            .await
+            .unwrap();
+        got.sort_by_key(ToString::to_string);
+        want.sort_by_key(ToString::to_string);
+        assert!(!want.is_empty(), "{label}: the pattern matches");
+        assert_eq!(got, want, "{label}: the rows");
+    }
+    assert!(
+        hooks::take().contains(&Kernel::CompareSlicedPatches),
+        "the object leaf's slices compared through the kernel"
+    );
+}
