@@ -40,9 +40,10 @@ Three pieces of vocabulary recur below:
   `matches` names the pattern they are the matches of when a match over
   every base row left them. Residual is an in-memory residual compare left
   for a count or a window to run only as far as it reaches.
-- **Serve plan** ([`indexes/serve/`](../core/src/store/indexes/serve/mod.rs) in
-  memory, `FileServePlan` in
-  [`indexes/file.rs`](../core/src/store/indexes/file.rs) on file) — the
+- **Serve plan** ([`indexes/serve/`](../core/src/store/indexes/serve/mod.rs):
+  `InMemoryServePlan` in
+  [`memory.rs`](../core/src/store/indexes/serve/memory.rs), `FileServePlan` in
+  [`file.rs`](../core/src/store/indexes/serve/file.rs)) — the
   matched quads read straight out of the answering index's own columns (a
   contiguous run) instead of gathering the primary columns at scattered row
   ids. Purely an optimization; the row ids alone are always sufficient.

@@ -51,9 +51,9 @@ pub(crate) use components::{
 };
 #[cfg(feature = "file-io")]
 pub(crate) use rid_reads::{read_located_rids, scan_index_row_ids};
-pub(crate) use serve::{ComponentRows, InMemoryServePlan, ServedRows, ServedSpan};
 #[cfg(feature = "file-io")]
 pub(crate) use serve::{FileServePlan, PlanRead};
+pub(crate) use serve::{InMemoryServePlan, ServedRows, ServedSpan};
 
 /// The primary-row-id column every persisted index child carries beside its
 /// own columns: the currency every resolution answers in, and the one column
@@ -605,8 +605,8 @@ impl LazyRowIds {
     /// Lazy ids over the located run `range` of a file index `child`;
     /// `ascending` when the run's rids are already in row order, as a
     /// [`window`](Self::window) of them requires (a reference child's within
-    /// one value, a copy child's where its order within the run is base
-    /// order).
+    /// one value; a copy child's follow its own sort order, never taken to
+    /// ascend).
     #[cfg(feature = "file-io")]
     pub(crate) fn from_located_run(
         file: Arc<crate::store::persist::native_file::NativeStoreFile>,

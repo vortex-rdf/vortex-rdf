@@ -1,12 +1,12 @@
-//! A served view's chunk streams, in its index's order: how they read the
-//! view's rows, decided once per stream ([`ServedRead`]), and the code and
-//! row chunks each way yields.
+//! How a served view's rows are read in its index's order, decided once per
+//! read: an in-memory view's for its chunk streams and its one-shot code read
+//! alike ([`MemoryRead`]), a file view's for its chunk streams beside it
+//! ([`ServedRead`]); and the code and row chunks each way yields.
 
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 use vortex_buffer::Buffer;
-#[cfg(feature = "file-io")]
 use vortex_mask::Mask;
 
 use super::chunks::{
@@ -14,7 +14,7 @@ use super::chunks::{
 };
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
-use crate::store::indexes::{ComponentRows, InMemoryServePlan};
+use crate::store::indexes::InMemoryServePlan;
 #[cfg(feature = "file-io")]
 use crate::store::indexes::{FileServePlan, PlanRead};
 use crate::store::resident::CodeAccess;
@@ -27,28 +27,48 @@ use crate::store::{
 };
 use crate::store::{MemoryBase, VortexRdfStore};
 
-/// How a served view's chunk streams read its rows in its index's order,
+/// What a read of an in-memory served view takes at once, which decides
+/// where it takes the rows from ([`VortexRdfStore::memory_read`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadShape {
+    /// A chunk at a time: the row and code chunk streams.
+    Chunks,
+    /// The view's codes in one piece: [`code_columns`](VortexRdfStore::code_columns).
+    Whole,
+}
+
+/// Where a read takes an in-memory served view's rows from, in its index's
+/// order, decided once per read ([`VortexRdfStore::memory_read`]) for chunk
+/// streams and one-shot code reads alike.
+pub(super) enum MemoryRead<'a> {
+    /// The base gathered at the view's live row ids in the index's order
+    /// (the ids a narrowing of the view holds, else the plan's): a base whose
+    /// code columns decode once ([`CodeAccess::Resident`]), or a string
+    /// layout's.
+    Gather {
+        memory: &'a MemoryBase,
+        ids: Buffer<RowId>,
+    },
+    /// The serving component's own columns at the view's live rows (the
+    /// `deleted` tombstones left out): a Dictionary base whose code columns
+    /// are encoded ([`CodeAccess::Encoded`]), which a gather at the view's
+    /// scattered ids would decode again, or a whole read of a view that
+    /// holds no ids, which reads the plan's run once rather than computing
+    /// them.
+    Component {
+        plan: &'a InMemoryServePlan,
+        deleted: Option<&'a Mask>,
+    },
+}
+
+/// How a chunk stream takes a served view's rows in its index's order,
 /// decided once per stream ([`VortexRdfStore::served_read`]).
 // Built once per stream and matched at once: boxing the file read's scan
 // would cost every served file stream an allocation for nothing.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum ServedRead<'a> {
-    /// In memory, the base gathered at the view's live row ids in the
-    /// index's order (the ids a narrowing of the view holds, else the
-    /// plan's): a base whose code columns decode once
-    /// ([`CodeAccess::Resident`]), or a string layout's.
-    Gather {
-        memory: &'a MemoryBase,
-        ids: Buffer<RowId>,
-    },
-    /// In memory, the serving component's own columns, a window of the
-    /// view's live rows at a time: a Dictionary base whose code columns are
-    /// encoded ([`CodeAccess::Encoded`]), which a gather at the view's
-    /// scattered ids would decode again per chunk.
-    Component {
-        plan: &'a InMemoryServePlan,
-        rows: ComponentRows,
-    },
+    /// In memory, as a chunk read takes the rows ([`MemoryRead`]).
+    Memory(MemoryRead<'a>),
     /// On file, the plan's rows as it reads them ([`PlanRead`]), beside the
     /// tombstones each chunk's decode still drops.
     #[cfg(feature = "file-io")]
@@ -58,11 +78,12 @@ pub(super) enum ServedRead<'a> {
         read: PlanRead,
         deleted: Option<Mask>,
     },
-    /// On file, a TypedObject view's rows: its copies hold string objects,
-    /// not the layout's typed ones, so each batch of the view's ids in the
-    /// index's order ([`FileServePlan::live_rows`]) is taken from the base.
+    /// On file, a TypedObject view's chunks: its copies hold string
+    /// objects, not the layout's typed ones, so each batch of the view's ids
+    /// in the index's order ([`FileServePlan::live_rows`]) is taken from the
+    /// base.
     #[cfg(feature = "file-io")]
-    FileBase {
+    TypedObject {
         file: &'a Arc<NativeStoreFile>,
         plan: &'a FileServePlan,
         deleted: Option<Mask>,
@@ -71,7 +92,10 @@ pub(super) enum ServedRead<'a> {
 
 impl VortexRdfStore {
     /// How this view's chunk streams read it in its index's order: the one
-    /// place a stream asks whether and how a plan serves the view. `None`
+    /// place a stream asks whether and how a plan serves the view. On file
+    /// the plan reads its own rows ([`FileServePlan::read`]), and a
+    /// TypedObject view's chunks are taken from the base; in memory, as
+    /// [`memory_read`](Self::memory_read) decides for a chunk read. `None`
     /// for a view no plan serves (or while a
     /// [`LegacyChunkPaths`](crate::store::test_hooks::LegacyChunkPaths)
     /// guard sends every stream down the base-order paths).
@@ -80,15 +104,14 @@ impl VortexRdfStore {
         if crate::store::test_hooks::legacy_chunk_paths() {
             return Ok(None);
         }
-        let deleted = self.quads.deleted.as_ref();
         #[cfg(feature = "file-io")]
         if let Some(base) = self.quads.file() {
             let Some(plan) = &base.serve else {
                 return Ok(None);
             };
-            observe!(ServedRunChunks);
+            let deleted = self.quads.deleted.as_ref();
             if self.layout.strategy() == LayoutStrategy::TypedObject {
-                return Ok(Some(ServedRead::FileBase {
+                return Ok(Some(ServedRead::TypedObject {
                     file: &base.file,
                     plan,
                     deleted: deleted.cloned(),
@@ -103,22 +126,38 @@ impl VortexRdfStore {
                 deleted,
             }));
         }
+        Ok(self.memory_read(ReadShape::Chunks)?.map(ServedRead::Memory))
+    }
+
+    /// Where a read of `shape` takes this in-memory served view's rows from,
+    /// in its index's order: the one place an in-memory read, a chunk stream
+    /// or the one-shot code read, asks whether and how a plan serves the
+    /// view. A Dictionary view reads the serving component's columns when
+    /// its base's code columns are encoded, and in a whole read of a view
+    /// that holds no ids (the plan's run read once, its ids never computed);
+    /// any other read gathers the base at the view's ids, those a narrowing
+    /// holds, else the plan's. `None` for a view no in-memory plan serves.
+    #[inline]
+    pub(super) fn memory_read(&self, shape: ReadShape) -> Result<Option<MemoryRead<'_>>> {
         let Some(memory) = self.quads.in_memory() else {
             return Ok(None);
         };
         let Some(plan) = &memory.serve else {
             return Ok(None);
         };
-        observe!(ServedRunChunks);
-        if plan.decoder().decodes_codes() && memory.code_access() == CodeAccess::Encoded {
-            let rows = plan.live_component_rows(deleted)?;
-            return Ok(Some(ServedRead::Component { plan, rows }));
+        let deleted = self.quads.deleted.as_ref();
+        let held = self.quads.selection.held_index_order();
+        if plan.decoder().decodes_codes()
+            && (memory.code_access() == CodeAccess::Encoded
+                || (shape == ReadShape::Whole && held.is_none()))
+        {
+            return Ok(Some(MemoryRead::Component { plan, deleted }));
         }
-        let ids = match self.quads.selection.held_index_order() {
+        let ids = match held {
             Some(ids) => ids.clone(),
             None => plan.live_rids(deleted)?,
         };
-        Ok(Some(ServedRead::Gather { memory, ids }))
+        Ok(Some(MemoryRead::Gather { memory, ids }))
     }
 }
 
@@ -134,9 +173,10 @@ impl ServedRead<'_> {
         columns: &[QuadColumn],
         batch_rows: usize,
     ) -> Result<CodeChunkStream> {
+        observe!(ServedRunChunks);
         let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
         Ok(match self {
-            ServedRead::Gather { ids, .. } => {
+            ServedRead::Memory(MemoryRead::Gather { ids, .. }) => {
                 // A base whose code columns decode once hands them out.
                 let (all, asked) = store.base_code_sources(columns).ok_or_else(|| {
                     VortexRdfError::Vortex(vortex_error::vortex_err!(
@@ -145,7 +185,8 @@ impl ServedRead<'_> {
                 })?;
                 gathered_code_chunks(all, asked, columns, id_windows(ids, batch_rows))
             }
-            ServedRead::Component { plan, rows } => {
+            ServedRead::Memory(MemoryRead::Component { plan, deleted }) => {
+                let rows = plan.live_component_rows(deleted)?;
                 let plan = plan.clone();
                 stream::iter(batch_ranges(rows.len(), batch_rows))
                     .map(move |window| {
@@ -171,15 +212,7 @@ impl ServedRead<'_> {
                                 let (plan, file, deleted) =
                                     (plan.clone(), Arc::clone(&file), deleted.clone());
                                 let batch = positions.slice(batch);
-                                async move {
-                                    match plan.point_codes(&file, &batch, deleted.as_ref()).await? {
-                                        Some(codes) => Ok(codes),
-                                        None => plan.decoder().chunk_code_columns(
-                                            &plan.rows_at(&file, &batch).await?,
-                                            deleted.as_ref(),
-                                        ),
-                                    }
-                                }
+                                async move { plan.codes_at(&file, &batch, deleted.as_ref()).await }
                             })
                             .boxed()
                     }
@@ -201,7 +234,7 @@ impl ServedRead<'_> {
                     .boxed()
             }
             #[cfg(feature = "file-io")]
-            ServedRead::FileBase { .. } => {
+            ServedRead::TypedObject { .. } => {
                 return Err(VortexRdfError::InvalidOperation(
                     "a TypedObject store's rows hold terms, not codes".into(),
                 ));
@@ -220,8 +253,9 @@ impl ServedRead<'_> {
         columns: &[&'static str],
         batch_rows: usize,
     ) -> Result<RowChunkStream> {
+        observe!(ServedRunChunks);
         Ok(match self {
-            ServedRead::Gather { memory, ids } => {
+            ServedRead::Memory(MemoryRead::Gather { memory, ids }) => {
                 let base = projected(&memory.base, columns)?;
                 let probes = Arc::clone(&memory.probes);
                 stream::iter(id_windows(ids, batch_rows).map(move |ids| {
@@ -232,7 +266,8 @@ impl ServedRead<'_> {
                 }))
                 .boxed()
             }
-            ServedRead::Component { plan, rows } => {
+            ServedRead::Memory(MemoryRead::Component { plan, deleted }) => {
+                let rows = plan.live_component_rows(deleted)?;
                 let plan = plan.clone();
                 stream::iter(batch_ranges(rows.len(), batch_rows))
                     .map(move |window| plan.window_rows(&rows, window))
@@ -259,7 +294,7 @@ impl ServedRead<'_> {
                     .boxed()
             }
             #[cfg(feature = "file-io")]
-            ServedRead::FileBase {
+            ServedRead::TypedObject {
                 file,
                 plan,
                 deleted,

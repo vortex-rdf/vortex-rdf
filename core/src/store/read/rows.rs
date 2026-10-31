@@ -2,7 +2,7 @@
 //! through ([`BaseRead`]), code columns, and the selected-rows plumbing the
 //! serialization and compaction paths share.
 
-use crate::error::Result;
+use crate::error::{Result, VortexRdfError};
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
 use crate::store::RawQuad;
@@ -10,6 +10,7 @@ use crate::store::array::{rechunk, with_subject_stamp};
 use crate::store::read::chunks::{RowChunkStream, extract_codes};
 #[cfg(feature = "file-io")]
 use crate::store::read::file_plan::{CollectedPlan, masked_codes};
+use crate::store::read::served::{MemoryRead, ReadShape};
 use crate::store::resident::CodeAccess;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
@@ -121,23 +122,23 @@ impl VortexRdfStore {
         if !self.is_code_view() {
             return Ok(None);
         }
-        let Some(memory) = self.quads.in_memory() else {
-            return Ok(None);
-        };
-        let Some(plan) = &memory.serve else {
-            return Ok(self.base_code_columns());
-        };
-        // A narrowing of a served view (a window, keep, partition or chained
-        // match) holds its rows' ids in the index's order: over a base whose
-        // code columns decode once, its codes are gathered at them.
-        if let Some(ids) = self.quads.selection.held_index_order()
-            && let Some(prims) = self.base_code_primitives()
-        {
-            return Ok(Some(gather_codes(&prims, ids)));
+        match self.memory_read(ReadShape::Whole)? {
+            // An unserved in-memory view's codes off the base's own columns;
+            // none for a file view, whose codes the caller reads off its rows.
+            None => Ok(self.base_code_columns()),
+            // The base's codes gathered at the ids a narrowing holds.
+            Some(MemoryRead::Gather { ids, .. }) => {
+                let prims = self.base_code_primitives().ok_or_else(|| {
+                    VortexRdfError::Vortex(vortex_error::vortex_err!(
+                        "the base's code columns failed to decode"
+                    ))
+                })?;
+                Ok(Some(gather_codes(&prims, &ids)))
+            }
+            // The answering index's columns hold this view's codes: no row ids
+            // computed, no scattered gather over the primaries.
+            Some(MemoryRead::Component { plan, deleted }) => plan.code_columns(deleted).map(Some),
         }
-        // The answering index's columns hold this view's codes: no row ids
-        // computed, no scattered gather over the primaries.
-        plan.code_columns(self.quads.deleted.as_ref()).map(Some)
     }
 
     /// [`code_columns`](Self::code_columns) without the served path: the

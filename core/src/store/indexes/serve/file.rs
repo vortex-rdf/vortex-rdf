@@ -468,16 +468,32 @@ impl FileServePlan {
         }
         let read = self.read()?;
         let deleted = read.tombstones(deleted);
-        let chunk = match read {
+        match read {
             PlanRead::Kept(positions) | PlanRead::Points(positions) => {
-                if let Some(codes) = self.point_codes(file, &positions, deleted).await? {
-                    return Ok(Some(codes));
-                }
-                self.rows_at(file, &positions).await?
+                self.codes_at(file, &positions, deleted).await.map(Some)
             }
-            PlanRead::Scan(scan) => read_all_rows(scan).await?,
-        };
-        self.decode.chunk_code_columns(&chunk, deleted).map(Some)
+            PlanRead::Scan(scan) => self
+                .decode
+                .chunk_code_columns(&read_all_rows(scan).await?, deleted)
+                .map(Some),
+        }
+    }
+
+    /// The four code columns of the child rows `positions` (ascending, rows
+    /// of the view's run, not empty), in that order, the `deleted` tombstones
+    /// dropped: point by point straight into code buffers
+    /// ([`point_codes`](Self::point_codes)), else off the rows' chunk.
+    pub(crate) async fn codes_at(
+        &self,
+        file: &NativeStoreFile,
+        positions: &Buffer<u64>,
+        deleted: Option<&Mask>,
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        if let Some(codes) = self.point_codes(file, positions, deleted).await? {
+            return Ok(codes);
+        }
+        self.decode
+            .chunk_code_columns(&self.rows_at(file, positions).await?, deleted)
     }
 
     /// The four code columns of the child rows `positions` (ascending, rows

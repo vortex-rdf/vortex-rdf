@@ -188,10 +188,12 @@ impl ServeDecode {
     }
 }
 
-/// Rows a narrowed served view keeps of its plan's run, in the index's
-/// order: each one's position in the serving component (in memory) or index
-/// child (on file) beside the base row id it mirrors. A keep's result, and
-/// the windows and partitions cut from it.
+/// Rows of a plan's run in the index's order: each one's position in the
+/// serving component (in memory) or index child (on file) beside the base
+/// row id it mirrors. As a narrowing keeps them (a keep's result, and the
+/// windows and partitions cut from it) every row is live; as an unlocated
+/// file run is first read, before its narrowing filters them
+/// ([`ServedRows::live`]), tombstoned rows are among them.
 #[derive(Clone)]
 pub(crate) struct ServedRows {
     pub(crate) positions: Buffer<u64>,
