@@ -925,3 +925,62 @@ async fn test_patched_object_codes_compare_through_the_kernel() {
         "the object leaf's slices compared through the kernel"
     );
 }
+
+/// Subjects in runs of ten rows, which the writer run-end encodes, and the
+/// graph `gd` on every ninth row: a `G` match over the mapped file projects
+/// its kept rows (more than one per 16 rows of the split) and filters the
+/// subject column by its mask through the store session's run-end filter
+/// ([`crate::kernels`]), and answers as the store built in memory does.
+#[tokio::test]
+async fn test_run_end_subjects_filter_through_the_kernel() {
+    use crate::kernels::hooks::{self, Kernel};
+
+    let gd = iri_graph("gd");
+    let quads: Vec<Quad> = (0..16_384usize)
+        .map(|i| {
+            let graph = if i % 9 == 0 {
+                gd.clone()
+            } else {
+                GraphName::DefaultGraph
+            };
+            make_quad(
+                &format!("http://example.org/s{:05}", i / 10),
+                &format!("http://example.org/p{}", i % 4),
+                &format!("o{}", i % 7),
+                graph,
+            )
+        })
+        .collect();
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    hooks::take();
+    for probe in [
+        Probe::new(None, None, None, Some(gd.clone())),
+        Probe::new(None, Some(iri("p0")), None, Some(gd)),
+    ] {
+        let label = format!("{probe:?}");
+        let mut got = file
+            .run_probe(&probe)
+            .await
+            .unwrap()
+            .quads_vec()
+            .await
+            .unwrap();
+        let mut want = memory
+            .run_probe(&probe)
+            .await
+            .unwrap()
+            .quads_vec()
+            .await
+            .unwrap();
+        got.sort_by_key(ToString::to_string);
+        want.sort_by_key(ToString::to_string);
+        assert!(!want.is_empty(), "{label}: the pattern matches");
+        assert_eq!(got, want, "{label}: the rows");
+    }
+    assert!(
+        hooks::take().contains(&Kernel::RunEndFilter),
+        "the subject column filtered through the kernel"
+    );
+}

@@ -6,23 +6,32 @@
 //! whatever it does not do better, which Vortex's own kernel then takes.
 //! Each goes once Vortex covers its case.
 
-use vortex_array::arrays::Slice;
 use vortex_array::arrays::scalar_fn::{ExactScalarFn, ScalarFnArrayView};
 use vortex_array::arrays::slice::{SliceArraySlotsExt as _, SliceKernel as _};
+use vortex_array::arrays::{Filter, PrimitiveArray, Slice};
 use vortex_array::kernel::ExecuteParentKernel;
 use vortex_array::optimizer::kernels::ArrayKernelsExt as _;
 use vortex_array::scalar_fn::ScalarFnVTable as _;
 use vortex_array::scalar_fn::fns::binary::{Binary, CompareExecuteAdaptor};
-use vortex_array::{ArrayRef, ArrayView, ExecutionCtx};
+use vortex_array::validity::Validity;
+use vortex_array::{
+    ArrayRef, ArrayVTable as _, ArrayView, ExecutionCtx, IntoArray as _,
+    match_each_unsigned_integer_ptype,
+};
+use vortex_buffer::{BitBuffer, BufferMut};
 use vortex_error::VortexResult;
 use vortex_fastlanes::{BitPacked, BitPackedArrayExt as _};
+use vortex_mask::Mask;
+use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndArraySlotsExt as _};
 use vortex_session::VortexSession;
 
 /// Registers the store's kernels with `session`, before the default
-/// encodings register theirs.
+/// encodings register theirs: [`RunEndFilter`] is then tried ahead of
+/// vortex-runend's own filter kernel.
 pub(crate) fn register(session: &VortexSession) {
     let kernels = session.kernels();
     kernels.register_execute_parent_kernel(Binary.id(), Slice, CompareSlicedPatches);
+    kernels.register_execute_parent_kernel(Filter.id(), RunEnd, RunEndFilter);
 }
 
 /// A comparison against a constant of a slice of a bit-packed array with
@@ -86,6 +95,110 @@ impl ExecuteParentKernel<Slice> for CompareSlicedPatches {
     }
 }
 
+/// Below this many kept rows vortex-runend's filter takes them directly,
+/// which [`RunEndFilter`] leaves to it.
+const RUN_FILTER_MIN_KEPT: usize = 25;
+/// Below this many kept rows a run vortex-runend's filter takes the kept
+/// rows directly, which [`RunEndFilter`] leaves to it.
+const RUN_FILTER_MIN_KEPT_PER_RUN: f64 = 0.1;
+
+/// A filter of a run-end array that keeps enough rows a run to filter the
+/// runs: each run's kept rows counted as the rank of its end in the mask (the
+/// mask's set bits before it), the ranks read in one pass over the mask's
+/// 64-bit words as the ends rise.
+///
+/// Vortex 0.90's run-end filter counts each run's kept rows with a population
+/// count of the run's own range of the mask, some 30 instructions a run, more
+/// than expanding the runs costs: on the subject column of a sorted store
+/// file, runs of a few rows filtered at a dense pattern's masks, a fifth of
+/// the read. This kernel declines the filters vortex-runend takes directly
+/// (fewer than 25 rows kept, or fewer than one a ten runs), and the masks the
+/// filter adaptor answers without a kernel (every row kept, or none).
+#[derive(Debug)]
+struct RunEndFilter;
+
+impl ExecuteParentKernel<RunEnd> for RunEndFilter {
+    type Parent = Filter;
+
+    fn execute_parent(
+        &self,
+        array: ArrayView<'_, RunEnd>,
+        parent: ArrayView<'_, Filter>,
+        _child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let Some(mask) = parent.filter_mask().values() else {
+            return Ok(None);
+        };
+        let kept = mask.true_count();
+        let runs = array.ends().len();
+        if kept < RUN_FILTER_MIN_KEPT || (kept as f64 / runs as f64) < RUN_FILTER_MIN_KEPT_PER_RUN {
+            return Ok(None);
+        }
+        let ends = array.ends().clone().execute::<PrimitiveArray>(ctx)?;
+        let (offset, len) = (array.offset(), array.len());
+        let (kept_ends, kept_runs) = match_each_unsigned_integer_ptype!(ends.ptype(), |P| {
+            let ends = ends.as_slice::<P>();
+            let mut kept_ends = BufferMut::<P>::with_capacity(ends.len());
+            let kept_runs = kept_run_ends(
+                ends.len(),
+                |run| ends[run] as usize,
+                offset,
+                len,
+                mask.bit_buffer(),
+                |rank| kept_ends.push(rank as P),
+            );
+            (
+                PrimitiveArray::new(kept_ends.freeze(), Validity::NonNullable).into_array(),
+                kept_runs,
+            )
+        });
+        let values = array.values().filter(kept_runs)?;
+        #[cfg(test)]
+        hooks::note(hooks::Kernel::RunEndFilter);
+        // SAFETY: `kept_run_ends` pushes one end per run that keeps a row,
+        // each past the one before and the last `kept`, and `values` holds
+        // those runs' values.
+        Ok(Some(
+            unsafe { RunEnd::new_unchecked(kept_ends, values, 0, kept) }.into_array(),
+        ))
+    }
+}
+
+/// Which of `runs` runs, ending at `end(run)` (in rows from `offset`, over
+/// `len` rows), keep a row of `mask`, each run that does pushing its end
+/// among the kept rows: the rank of its end in `mask`. One pass over the
+/// mask's 64-bit words, as the ends rise.
+fn kept_run_ends(
+    runs: usize,
+    end: impl Fn(usize) -> usize,
+    offset: usize,
+    len: usize,
+    mask: &BitBuffer,
+    mut push: impl FnMut(usize),
+) -> Mask {
+    let mut words = mask.chunks().iter_padded();
+    // The word holding bit `64 * at`, and the set bits of the words before.
+    let (mut at, mut word, mut before) = (0usize, words.next().unwrap_or(0), 0usize);
+    let mut ranked = 0usize;
+    BitBuffer::collect_bool(runs, |run| {
+        let end = end(run).saturating_sub(offset).min(len);
+        while (at + 1) * 64 <= end {
+            before += word.count_ones() as usize;
+            word = words.next().unwrap_or(0);
+            at += 1;
+        }
+        let rank = before + (word & ((1u64 << (end - at * 64)) - 1)).count_ones() as usize;
+        let keeps = rank > ranked;
+        if keeps {
+            push(rank);
+        }
+        ranked = rank;
+        keeps
+    })
+    .into()
+}
+
 /// Test hook: which of the store's kernels ran on this thread.
 #[cfg(test)]
 pub(crate) mod hooks {
@@ -95,6 +208,7 @@ pub(crate) mod hooks {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Kernel {
         CompareSlicedPatches,
+        RunEndFilter,
     }
 
     thread_local! {
@@ -119,11 +233,15 @@ mod tests {
     use vortex_array::arrays::{BoolArray, ConstantArray, PrimitiveArray, Slice};
     use vortex_array::builtins::ArrayBuiltins as _;
     use vortex_array::scalar_fn::fns::operators::Operator;
-    use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+    use vortex_array::{ArrayRef, IntoArray as _, VortexSessionExecute as _};
+    use vortex_buffer::BitBuffer;
     use vortex_fastlanes::BitPackedArrayExt as _;
     use vortex_fastlanes::bitpack_compress::bitpack_encode;
+    use vortex_mask::Mask;
+    use vortex_runend::RunEnd;
 
     use super::hooks::{self, Kernel};
+    use super::kept_run_ends;
     use crate::session::VORTEX_SESSION;
 
     /// A comparison of a slice of a bit-packed array with patches against a
@@ -217,6 +335,106 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A deterministic stream of pseudo-random numbers (xorshift).
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// The runs a filter keeps, and their ends among the kept rows, are
+    /// vortex-runend's: runs of one row to dozens, from an offset into the
+    /// first and cut short of the last, under masks of every density, of
+    /// lengths off a word's multiple and starting off a byte.
+    #[test]
+    fn kept_run_ends_are_vortexs() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for case in 0..400 {
+            let runs = 1 + rng.below(300) as usize;
+            let longest = 1 + rng.below(40);
+            let mut end = 0u32;
+            let ends: Vec<u32> = (0..runs)
+                .map(|_| {
+                    end += 1 + rng.below(longest) as u32;
+                    end
+                })
+                .collect();
+            let offset = rng.below(u64::from(ends[0])) as usize;
+            let len = end as usize
+                - offset
+                - rng
+                    .below(u64::from(*ends.last().unwrap()) - offset as u64)
+                    .min(5) as usize;
+            let density = rng.below(101);
+            let skip = rng.below(13) as usize;
+            let bits = BitBuffer::from_iter((0..skip + len).map(|_| rng.below(100) < density));
+            let mask = bits.slice(skip..skip + len);
+            let (want_ends, want_runs) = vortex_runend::_benchmarking::filter_run_end_primitive(
+                &ends,
+                offset as u64,
+                len as u64,
+                &mask,
+            )
+            .unwrap();
+            let mut got_ends = Vec::new();
+            let got_runs = kept_run_ends(
+                ends.len(),
+                |run| ends[run] as usize,
+                offset,
+                len,
+                &mask,
+                |rank| got_ends.push(rank as u32),
+            );
+            assert_eq!(
+                got_ends,
+                want_ends.as_slice::<u32>(),
+                "case {case}: the kept ends"
+            );
+            assert_eq!(got_runs, want_runs, "case {case}: the kept runs");
+        }
+    }
+
+    /// A filter of a run-end array keeping enough rows a run is answered by
+    /// the store's kernel, ahead of vortex-runend's; one keeping fewer than
+    /// 25 rows, or fewer than one a ten runs, is left to vortex-runend's
+    /// take. Either keeps the rows the decoded values keep.
+    #[test]
+    fn a_dense_run_end_filter_runs_the_store_kernel() {
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let values: Vec<u64> = (0..10_000u64).map(|i| i / 10).collect();
+        let runs: ArrayRef = RunEnd::encode(
+            PrimitiveArray::from_iter(values.iter().copied()).into_array(),
+            &mut ctx,
+        )
+        .unwrap()
+        .into_array();
+        hooks::take();
+        for (every, kernel) in [(9, true), (3, true), (150, false), (1_000, false)] {
+            let mask = Mask::from_iter((0..values.len()).map(|i| i % every == 2));
+            let kept = runs
+                .filter(mask)
+                .unwrap()
+                .execute::<PrimitiveArray>(&mut ctx)
+                .unwrap();
+            let want: Vec<u64> = values.iter().copied().skip(2).step_by(every).collect();
+            assert_eq!(
+                kept.as_slice::<u64>(),
+                want,
+                "every {every}th row: the kept rows"
+            );
+            assert_eq!(
+                hooks::take().contains(&Kernel::RunEndFilter),
+                kernel,
+                "every {every}th row: the kernel"
+            );
         }
     }
 }

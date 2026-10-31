@@ -3653,6 +3653,7 @@ dependencies = [
  "vortex-layout",
  "vortex-mask",
  "vortex-rdf-encoded-search",
+ "vortex-runend",
  "vortex-scan",
  "vortex-session",
  "web-time",

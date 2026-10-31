@@ -545,17 +545,24 @@ gain it no parallelism.
 
 **Kernels.** The store's Vortex session adds fused executions of its own for
 cases Vortex 0.90 runs the slow way, registered before the default encodings
-register theirs ([`register`](../core/src/kernels.rs#L23)), so that each is
+register theirs ([`register`](../core/src/kernels.rs#L31)), so that each is
 tried first and declines whatever Vortex's own kernel does as well. A
 comparison against a constant of a slice of a bit-packed leaf with patches
 slices the leaf, patches and all, and compares it packed
-([`CompareSlicedPatches`](../core/src/kernels.rs#L42)): Vortex cannot slice
+([`CompareSlicedPatches`](../core/src/kernels.rs#L51)): Vortex cannot slice
 such a leaf without reading its patches, so it leaves the slice lazy and then
 decodes it to compare it value by value. A leaf is sliced whenever a filter
 evaluates part of it (a zone-pruned range, a split that cuts it, an
 early-exit piece), and a column of codes bit-packs with patches when a few
 of its codes pass a power of two: the object column, whose codes start at 0,
-under an `O` or `PO` match. Each kernel goes once Vortex covers its case.
+under an `O` or `PO` match. A filter of a run-end leaf that keeps a row in
+ten runs or more, and 25 rows or more, counts each run's kept rows as the
+rank of its end in the mask, one pass over the mask's words
+([`RunEndFilter`](../core/src/kernels.rs#L118)): Vortex counts each run's
+range of the mask on its own, some 30 instructions a run, which is most of
+filtering a sorted file's subject column under a dense pattern's masks.
+Vortex's own kernel keeps the sparser filters, which it answers by taking
+the kept rows. Each kernel goes once Vortex covers its case.
 
 **Platforms and limits.** Mapping works on Linux, macOS and Windows. A store
 file is read in place while open: truncating or rewriting it in place is
