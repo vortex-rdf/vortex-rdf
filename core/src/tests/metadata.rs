@@ -560,16 +560,14 @@ const PAST_THE_ROWS_VIEW_ROWS: usize = 256;
 /// Partitions tile `view`: at each of [`PARTITION_COUNTS`], and at
 /// [`PAST_THE_ROWS`] on a small view, at most that many and never none, read
 /// in turn they give the view's codes in the order its reads yield them
-/// ([`read_order_codes`]), a file view's in base order, the order of its
-/// partitions' pieces, and their sizes add up to its size.
+/// ([`read_order_codes`]) when they are served (an in-memory served view's
+/// always are), else in base order, and their sizes add up to its size.
 async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
-    let file = view.view_statistics().unwrap().file_backed;
-    let expected = if file {
-        base_ordered_codes(view).await
-    } else {
-        read_order_codes(view).await
-    };
-    let past_the_rows = (expected.len() <= PAST_THE_ROWS_VIEW_ROWS).then_some(PAST_THE_ROWS);
+    let stats = view.view_statistics().unwrap();
+    let (file, served) = (stats.file_backed, stats.served_component.is_some());
+    let in_order = read_order_codes(view).await;
+    let base = base_ordered_codes(view).await;
+    let past_the_rows = (base.len() <= PAST_THE_ROWS_VIEW_ROWS).then_some(PAST_THE_ROWS);
     for n in PARTITION_COUNTS.into_iter().chain(past_the_rows) {
         let parts = view
             .partitions(NonZeroUsize::new(n).unwrap())
@@ -580,17 +578,21 @@ async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
             "{tag}: {n} -> {}",
             parts.len()
         );
+        let parts_served = parts.iter().all(|part| served_component(part).is_some());
+        if served && !file {
+            assert!(
+                parts_served,
+                "{tag}: partitions({n}) of an in-memory served view"
+            );
+        }
+        let expected = if parts_served { &in_order } else { &base };
         let mut got = Vec::new();
         let mut total = 0;
         for part in &parts {
-            got.extend(if file {
-                base_ordered_codes(part).await
-            } else {
-                read_order_codes(part).await
-            });
+            got.extend(read_order_codes(part).await);
             total += part.size().await.unwrap();
         }
-        assert_eq!(got, expected, "{tag}: partitions({n}) tile the view");
+        assert_eq!(&got, expected, "{tag}: partitions({n}) tile the view");
         assert_eq!(total, expected.len(), "{tag}: sizes add up");
     }
 }

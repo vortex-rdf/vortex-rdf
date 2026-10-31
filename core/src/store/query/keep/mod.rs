@@ -254,7 +254,7 @@ impl VortexRdfStore {
             return Ok(self.empty_view());
         }
         // A served view's keep is served too, in the index's order.
-        if let Some(kept) = self.served_keep(column, keep)? {
+        if let Some(kept) = self.served_keep(column, keep).await? {
             return Ok(kept);
         }
         match &self.quads.backend {

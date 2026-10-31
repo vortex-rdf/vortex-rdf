@@ -73,11 +73,19 @@ impl VortexRdfStore {
             debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
             return Ok(None);
         };
-        // A served in-memory view's window is served too, in its index's
-        // order.
+        // A served view's window is served too, in its index's order.
         if let Some(windowed) = self.served_window_in_memory(offset, limit)? {
             observe!(Window);
             debug::step!(t, "[window] offset {offset} limit {limit} of a served run");
+            return Ok(Some(windowed));
+        }
+        #[cfg(feature = "file-io")]
+        if let Some(windowed) = self.served_window_file(offset, limit).await? {
+            observe!(Window);
+            debug::step!(
+                t,
+                "[window] offset {offset} limit {limit} of a served file run"
+            );
             return Ok(Some(windowed));
         }
         // A served file run whose width is unknown until its ids are read
@@ -206,6 +214,91 @@ impl VortexRdfStore {
                 self.quads
                     .in_memory_with(memory, ViewSelection::pending(ids), Some(narrowed))
             }
+            None => self
+                .quads
+                .with_selection(ViewSelection::Exact(RowSelection::empty())),
+        };
+        let tail = self.tail.as_ref().map(|tail| {
+            tail.window(
+                offset.saturating_sub(base_live),
+                limit.saturating_sub(base_taken),
+            )
+        });
+        Ok(Some(self.derived(quads, tail)))
+    }
+
+    /// The window of a view a file plan serves over a located run, itself
+    /// served: rows `offset..offset + limit` of the view in its index's
+    /// order, a part of the plan's located range
+    /// ([`narrowed`](crate::store::indexes::FileServePlan::narrowed)), whose
+    /// ids read on first need from those rows of the child's rid column
+    /// ([`LazyRowIds::from_located_run`]), or a slice of the rows a keep
+    /// kept, their ids kept unsorted. Under tombstones the cut counts live
+    /// rows, the range's rid column read. The tail is windowed with what the
+    /// base did not fill, as [`window_cutting`](Self::window_cutting)
+    /// windows it. A window that holds no base row selects none, with no
+    /// plan. `None` for a view no file plan serves, or one whose run is not
+    /// located.
+    #[cfg(feature = "file-io")]
+    pub(in crate::store) async fn served_window_file(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Self>> {
+        let Some(base) = self.quads.file() else {
+            return Ok(None);
+        };
+        let Some(plan) = &base.serve else {
+            return Ok(None);
+        };
+        let deleted = self.quads.deleted.as_ref();
+        // The window's plan and lazy ids, or `None` for no base row, beside
+        // the base's live rows.
+        let (window, base_live) = match (plan.kept(), plan.located_range(), deleted) {
+            (None, None, _) => return Ok(None),
+            (None, Some(range), None) => {
+                let base_live = (range.end - range.start) as usize;
+                let window = window_rows(offset, limit, base_live as u64).map(|cut| {
+                    let cut = range.start + cut.start..range.start + cut.end;
+                    let ids = LazyRowIds::from_located_run(
+                        Arc::clone(&base.file),
+                        plan.child().clone(),
+                        cut.clone(),
+                    );
+                    (plan.narrowed(cut), ids)
+                });
+                (window, base_live)
+            }
+            (kept, _, deleted) => {
+                let rows = plan.live_rows(&base.file, deleted).await?;
+                let base_live = rows.len();
+                let window = window_rows(offset, limit, base_live as u64).map(|cut| {
+                    let rows = rows.slice(cut.start as usize..cut.end as usize);
+                    // The ids leave out every tombstone: the window took live
+                    // rows.
+                    let ids = LazyRowIds::from_unsorted_ids(rows.rids.clone(), true);
+                    let narrowed = match kept {
+                        Some(_) => plan.with_rows(rows),
+                        None => {
+                            let (first, last) = (rows.positions[0], rows.positions[rows.len() - 1]);
+                            plan.narrowed(first..last + 1)
+                        }
+                    };
+                    (narrowed, ids)
+                });
+                (window, base_live)
+            }
+        };
+        let base_taken = window
+            .as_ref()
+            .map_or(0, |(_, ids)| ids.len_if_known().unwrap_or(0));
+        let quads = match window {
+            Some((narrowed, ids)) => self.quads.file_with(
+                base,
+                base.filter.clone(),
+                ViewSelection::pending(ids),
+                Some(narrowed),
+            ),
             None => self
                 .quads
                 .with_selection(ViewSelection::Exact(RowSelection::empty())),

@@ -726,3 +726,201 @@ async fn file_streams_under_tombstones_and_strings() {
     }
     assert_eq!(decoded, p.shared_quads_vec().await.unwrap());
 }
+
+/// Task 4's window matrix on a served file view, with and without
+/// tombstones inside its run: each window is the slice of the view's rows in
+/// the index's order and stays served, and windows nest and stream.
+#[tokio::test]
+async fn file_windows_are_slices_of_index_order() {
+    let (_dir, store) = file_store().await;
+    let tombstoned = store
+        .delete_matching(None, Some(&iri("p0")), None, None)
+        .await
+        .unwrap()
+        .delete_matching(None, None, Some(&plain_literal("object 3")), None)
+        .await
+        .unwrap();
+    for (tag, store) in [("plain", &store), ("tombstoned", &tombstoned)] {
+        let (p, want) = p2_view(store).await;
+        let n = want.len();
+        for (offset, limit) in [
+            (0, 10),
+            (10, 100),
+            (n / 2, n / 4),
+            (n - 1, 5),
+            (n, 5),
+            (0, 0),
+        ] {
+            let w = p.window(offset, limit).await.unwrap();
+            let got = window_rows(&w).await;
+            assert_eq!(
+                got,
+                slice_of(&want, offset, limit),
+                "{tag} ({offset}, {limit})"
+            );
+            assert_eq!(
+                w.size().await.unwrap(),
+                got.len(),
+                "{tag} ({offset}, {limit}) size"
+            );
+            if !got.is_empty() {
+                assert_eq!(
+                    served_component(&w),
+                    Some("index:posg"),
+                    "{tag} ({offset}, {limit})"
+                );
+            }
+        }
+        let w = p.window(10, 100).await.unwrap();
+        assert_eq!(
+            row_list(&w.window(5, 50).await.unwrap()).await,
+            want[15..65],
+            "{tag} nested"
+        );
+        assert_eq!(
+            collect_code_chunks(&w, &QuadColumn::ALL, 32).await.0,
+            want[10..110],
+            "{tag} chunks"
+        );
+        assert_eq!(
+            struct_chunk_codes(&collect_row_chunks(&w, 32).await),
+            want[10..110],
+            "{tag} rows"
+        );
+        let quads = p.quads_vec().await.unwrap();
+        assert_eq!(w.quads_vec().await.unwrap(), quads[10..110], "{tag} quads");
+    }
+}
+
+/// The partitions of a served file view are served windows that read, in
+/// turn, the view in the index's order.
+#[tokio::test]
+async fn file_partitions_concatenate_to_index_order() {
+    let (_dir, store) = file_store().await;
+    let (p, want) = p2_view(&store).await;
+    let parts = p
+        .partitions(std::num::NonZeroUsize::new(4).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(parts.len(), 4);
+    let mut got = vec![];
+    for part in &parts {
+        assert_eq!(served_component(part), Some("index:posg"));
+        got.extend(row_list(part).await);
+    }
+    assert_eq!(got, want);
+}
+
+/// Task 5's keeps on a served file view: the keep filters the view's rows in
+/// the index's order and stays served, counts without a sort, and composes
+/// with windows either way round; under tombstones it keeps live rows only.
+#[tokio::test]
+async fn file_keeps_filter_index_order() {
+    let (_dir, store) = file_store().await;
+    let (p, want) = p2_view(&store).await;
+    let sparse = Keep::set(objects_of(&want).into_iter().step_by(3));
+    let filtered: Vec<_> = want
+        .iter()
+        .copied()
+        .filter(|r| sparse.admits(r[2]))
+        .collect();
+    let kept = p.keep(QuadColumn::O, &sparse).await.unwrap();
+    assert_eq!(row_list(&kept).await, filtered);
+    assert_eq!(served_component(&kept), Some("index:posg"));
+    let rec = Recorder::start();
+    assert_eq!(kept.size().await.unwrap(), filtered.len());
+    assert_eq!(ids_sorted(&rec), 0, "a kept view counts without a sort");
+    assert_eq!(
+        collect_code_chunks(&kept, &QuadColumn::ALL, 64).await.0,
+        filtered
+    );
+    assert_eq!(
+        row_list(&kept.window(2, 7).await.unwrap()).await,
+        filtered[2..9]
+    );
+    let window_then_keep = p
+        .window(5, 300)
+        .await
+        .unwrap()
+        .keep(QuadColumn::O, &sparse)
+        .await
+        .unwrap();
+    let want_window: Vec<_> = want[5..305]
+        .iter()
+        .copied()
+        .filter(|r| sparse.admits(r[2]))
+        .collect();
+    assert_eq!(row_list(&window_then_keep).await, want_window);
+    let quads = p.quads_vec().await.unwrap();
+    let kept_quads = kept.quads_vec().await.unwrap();
+    let positions: Vec<usize> = want
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| sparse.admits(r[2]))
+        .map(|(i, _)| i)
+        .collect();
+    let want_quads: Vec<Quad> = positions.iter().map(|&i| quads[i].clone()).collect();
+    assert_eq!(kept_quads, want_quads, "the kept quads, in order");
+
+    let tombstoned = store
+        .delete_matching(None, None, Some(&plain_literal("object 3")), None)
+        .await
+        .unwrap();
+    let (p, want) = p2_view(&tombstoned).await;
+    let filtered: Vec<_> = want
+        .iter()
+        .copied()
+        .filter(|r| sparse.admits(r[2]))
+        .collect();
+    let kept = p.keep(QuadColumn::O, &sparse).await.unwrap();
+    assert_eq!(row_list(&kept).await, filtered, "tombstoned");
+    assert_eq!(
+        kept.size().await.unwrap(),
+        filtered.len(),
+        "tombstoned size"
+    );
+}
+
+/// A located file run spanning several child leaves, windowed across their
+/// boundaries: each window is the index-order slice.
+#[tokio::test]
+async fn windows_across_child_chunks() {
+    let quads = modular_quads(2_000, 7, 11);
+    let (_dir, path) =
+        write_chunked_store(&quads, 32, Some(IndexType::SecondaryByCopy), false, None).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let (p, want) = p2_view(&store).await;
+    assert_eq!(served_component(&p), Some("index:posg"));
+    let n = want.len();
+    for (offset, limit) in [(31, 2), (30, 70), (0, n)] {
+        let w = p.window(offset, limit).await.unwrap();
+        assert_eq!(
+            row_list(&w).await,
+            slice_of(&want, offset, limit),
+            "({offset}, {limit})"
+        );
+        assert_eq!(
+            collect_code_chunks(&w, &QuadColumn::ALL, 16).await.0,
+            slice_of(&want, offset, limit),
+            "({offset}, {limit}) chunks"
+        );
+    }
+}
+
+/// The probe API on a served file pattern: a windowed probe is the
+/// index-order slice, and its count is the view's size.
+#[tokio::test]
+async fn file_probe_windows_follow_index_order() {
+    let (_dir, store) = file_store().await;
+    let (p, want) = p2_view(&store).await;
+    let probe = Probe::parse(None, Some("<http://example.org/p2>"), None, None).unwrap();
+    let w = store
+        .run_probe(&probe.clone().window(10, Some(100)))
+        .await
+        .unwrap();
+    assert_eq!(row_list(&w).await, want[10..110]);
+    assert_eq!(
+        store.count_probe(&probe).await.unwrap(),
+        p.size().await.unwrap()
+    );
+}

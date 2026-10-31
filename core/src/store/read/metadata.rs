@@ -271,6 +271,10 @@ impl VortexRdfStore {
         if let Some(parts) = self.served_partitions(n)? {
             return Ok(parts);
         }
+        #[cfg(feature = "file-io")]
+        if let Some(parts) = self.served_file_partitions(n).await? {
+            return Ok(parts);
+        }
         let pieces = self
             .quads
             .materialized_selection()
@@ -354,6 +358,97 @@ impl VortexRdfStore {
                     let ids = LazyRowIds::from_unsorted_ids(rids.slice(piece), true);
                     let quads = self.quads.in_memory_with(
                         memory,
+                        ViewSelection::pending(ids),
+                        Some(narrowed),
+                    );
+                    let tail = self.tail.as_ref().map(|tail| {
+                        if i == last {
+                            tail.clone()
+                        } else {
+                            tail.with_selection(RowSelection::empty())
+                        }
+                    });
+                    self.derived(quads, tail)
+                })
+                .collect(),
+        ))
+    }
+}
+
+impl VortexRdfStore {
+    /// [`served_partitions`](Self::served_partitions) of a view a file plan
+    /// serves over a located run: at most `n` served windows of its live
+    /// rows in its index's order, each a part of the located range whose ids
+    /// read on first need from those rows of the child's rid column, or,
+    /// under tombstones or over kept rows, a slice of its live rows with
+    /// their ids unsorted. The tail goes with the last. `None` for a view no
+    /// file plan serves, one whose run is not located, or one whose base
+    /// holds no live row.
+    #[cfg(feature = "file-io")]
+    async fn served_file_partitions(&self, n: usize) -> Result<Option<Vec<Self>>> {
+        use std::sync::Arc;
+
+        let Some(base) = self.quads.file() else {
+            return Ok(None);
+        };
+        let Some(plan) = &base.serve else {
+            return Ok(None);
+        };
+        let deleted = self.quads.deleted.as_ref();
+        let range = plan.located_range();
+        // The live rows: the located range whole, or listed.
+        let listed = match (plan.kept(), &range, deleted) {
+            (None, None, _) => return Ok(None),
+            (None, Some(_), None) => None,
+            _ => Some(plan.live_rows(&base.file, deleted).await?),
+        };
+        let rows = match (&listed, &range) {
+            (Some(listed), _) => listed.len(),
+            (None, Some(range)) => (range.end - range.start) as usize,
+            (None, None) => unreachable!("an unlocated run without kept rows declined"),
+        };
+        if rows == 0 {
+            return Ok(None);
+        }
+        let size = rows.div_ceil(n);
+        let pieces: Vec<Range<usize>> = (0..rows)
+            .step_by(size)
+            .map(|start| start..(start + size).min(rows))
+            .collect();
+        let last = pieces.len() - 1;
+        Ok(Some(
+            pieces
+                .into_iter()
+                .enumerate()
+                .map(|(i, piece)| {
+                    let (narrowed, ids) = match (&listed, &range) {
+                        (Some(listed), _) => {
+                            let rows = listed.slice(piece);
+                            let ids = LazyRowIds::from_unsorted_ids(rows.rids.clone(), true);
+                            let narrowed = match plan.kept() {
+                                Some(_) => plan.with_rows(rows),
+                                None => {
+                                    let first = rows.positions[0];
+                                    plan.narrowed(first..rows.positions[rows.len() - 1] + 1)
+                                }
+                            };
+                            (narrowed, ids)
+                        }
+                        (None, Some(range)) => {
+                            let start = range.start + piece.start as u64;
+                            let cut = start..range.start + piece.end as u64;
+                            let ids = LazyRowIds::from_located_run(
+                                Arc::clone(&base.file),
+                                plan.child().clone(),
+                                cut.clone(),
+                            );
+                            (plan.narrowed(cut), ids)
+                        }
+                        (None, None) => unreachable!("an unlocated run without kept rows declined"),
+                    };
+                    let quads = self.quads.file_with(
+                        base,
+                        base.filter.clone(),
                         ViewSelection::pending(ids),
                         Some(narrowed),
                     );

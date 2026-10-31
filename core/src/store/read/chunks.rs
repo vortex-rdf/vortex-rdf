@@ -222,7 +222,7 @@ impl VortexRdfStore {
             observe!(ServedRunChunks);
             let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
             let deleted = self.quads.deleted.clone();
-            let chunks = plan.child_chunks(Arc::clone(&base.file))?;
+            let chunks = plan.child_chunks(Arc::clone(&base.file), batch_rows)?;
             let plan = plan.clone();
             return Ok(Some(
                 chunks
@@ -275,7 +275,7 @@ impl VortexRdfStore {
             }
             observe!(ServedRunChunks);
             let deleted = self.quads.deleted.clone();
-            let chunks = plan.child_chunks(Arc::clone(&base.file))?;
+            let chunks = plan.child_chunks(Arc::clone(&base.file), batch_rows)?;
             let plan = plan.clone();
             return Ok(Some(
                 chunks

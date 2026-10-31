@@ -209,7 +209,7 @@ async fn write_chunked_store_file(
     quads: &[Quad],
     chunk_rows: usize,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
-    write_chunked_store(quads, chunk_rows, false, false, None).await
+    write_chunked_store(quads, chunk_rows, None, false, None).await
 }
 
 /// [`write_chunked_store_file`] with the reference index built as well and
@@ -220,11 +220,13 @@ async fn write_chunked_reference_store_file(
     quads: &[Quad],
     chunk_rows: usize,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
-    write_chunked_store(quads, chunk_rows, true, false, None).await
+    let index = Some(IndexType::SecondaryByReference);
+    write_chunked_store(quads, chunk_rows, index, false, None).await
 }
 
 /// The file behind [`write_chunked_store_file`] and
-/// [`write_chunked_reference_store_file`]; with `flat_dictionary` its
+/// [`write_chunked_reference_store_file`], with `index`'s children, if any,
+/// written in `chunk_rows`-row flat leaves too; with `flat_dictionary` its
 /// dictionary child is one flat struct leaf, a shape the file-backed
 /// dictionary declines, so a mapped open holds the dictionary resident. With
 /// `unprobed`, that primary column is written as a dictionary whose codes are
@@ -233,7 +235,7 @@ async fn write_chunked_reference_store_file(
 async fn write_chunked_store(
     quads: &[Quad],
     chunk_rows: usize,
-    reference_index: bool,
+    index: Option<IndexType>,
     flat_dictionary: bool,
     unprobed: Option<&str>,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -264,14 +266,12 @@ async fn write_chunked_store(
         dictionary.strategy = std::sync::Arc::new(FlatLayoutStrategy::default());
     }
     let mut components = vec![dictionary];
-    if reference_index {
-        // The children's rows are the global `(value, row id)` sort of the
-        // codes, cut into `chunk_rows`-row chunks; each chunk is one flat leaf
-        // of each of its columns.
-        for component in IndexType::SecondaryByReference
-            .components(IndexInput::Codes(&codes))
-            .unwrap()
-        {
+    if let Some(index) = index {
+        // The children's rows in their own sort order (a reference child's
+        // the global `(value, row id)` sort of the codes), cut into
+        // `chunk_rows`-row chunks; each chunk is one flat leaf of each of its
+        // columns.
+        for component in index.components(IndexInput::Codes(&codes)).unwrap() {
             let rows = component.rows().unwrap().clone().into_array();
             let cut: Vec<vortex_array::ArrayRef> = (0..rows.len())
                 .step_by(chunk_rows)

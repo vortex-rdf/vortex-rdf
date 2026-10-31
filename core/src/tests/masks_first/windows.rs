@@ -127,7 +127,7 @@ async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
 #[tokio::test]
 async fn test_window_over_a_column_without_chunk_probes_keeps_ids() {
     let (_dir, path) =
-        write_chunked_store(&masks_quads(), MASKS_SPLIT_ROWS, false, false, Some("o")).await;
+        write_chunked_store(&masks_quads(), MASKS_SPLIT_ROWS, None, false, Some("o")).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let twin = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     assert_eq!(store.debug_quad_column_chunks("o"), None, "o: no probes");

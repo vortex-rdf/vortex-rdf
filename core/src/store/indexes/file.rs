@@ -5,15 +5,18 @@
 //! from an index child; and [`FileServePlan`], which reads a resolved view's
 //! quads out of the child's own columns.
 
-use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt};
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::expr::{root, select};
 use vortex_array::scalar::Scalar;
-use vortex_array::{ArrayRef, VortexSessionExecute};
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
@@ -22,7 +25,7 @@ use vortex_mask::Mask;
 use super::components::{check_addressable, sorted_row_ids};
 use super::copy::CHILD_COLUMNS;
 use super::resolve::IndexProbe;
-use super::serve::ServeDecode;
+use super::serve::{ServeDecode, ServedRows};
 use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
@@ -31,8 +34,9 @@ use crate::store::layouts::{ChunkDecode, PatternCodes, ResolvedLayout};
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
+use crate::store::read::chunks::extract_codes;
 use crate::store::scan::file_exprs::eq_conjunction;
-use crate::store::scan::file_reads::{component_point_chunk, values_at};
+use crate::store::scan::file_reads::{component_point_chunk, component_point_rows, values_at};
 use crate::store::scan::file_scans::{read_all_rows, stream_rows};
 use crate::store::schema::{RowId, TermCode};
 use crate::store::view::selection::point_sized;
@@ -407,13 +411,17 @@ pub(crate) struct FileServePlan {
             vortex_array::expr::BoundExpression,
         )>,
     >,
-    /// The child rows the constraints select, when the resolution located
-    /// them by chunk probes: exactly the constrained rows, letting a small
-    /// run be point-read ([`Self::point_run`]) and a wide one scanned by
-    /// range ([`Self::scan`]) instead of filtered. `None` when
-    /// unlocated, or when a constraint the location did not cover would make
-    /// the range over-approximate.
+    /// The child rows the view covers, when the resolution located them by
+    /// chunk probes: exactly constrained rows, the located run or the part of
+    /// it a window cut, letting a small run be point-read
+    /// ([`Self::point_run`]) and a wide one scanned by range
+    /// ([`Self::scan`]) instead of filtered. `None` when unlocated, or when a
+    /// constraint the location did not cover would make the range
+    /// over-approximate.
     row_range: Option<Range<u64>>,
+    /// The rows a keep kept of the range, in the child's order; when set,
+    /// the view covers these and not the whole range.
+    kept: Option<Arc<ServedRows>>,
 }
 
 /// The fewest rows a located run's scan split carries: below this the
@@ -448,7 +456,143 @@ impl FileServePlan {
             constraints,
             bound: Arc::new(std::sync::OnceLock::new()),
             row_range,
+            kept: None,
         }
+    }
+
+    /// The child rows the view covers, when located: the run the resolution
+    /// located, or the part of it a window cut. `None` for an unlocated run.
+    pub(crate) fn located_range(&self) -> Option<Range<u64>> {
+        self.row_range.clone()
+    }
+
+    /// The rows a keep kept, when the view covers those and not its whole
+    /// range.
+    pub(crate) fn kept(&self) -> Option<&ServedRows> {
+        self.kept.as_deref()
+    }
+
+    /// This plan over `range`, a part of its located range: a window's of a
+    /// view that keeps no rows.
+    pub(crate) fn narrowed(&self, range: Range<u64>) -> Self {
+        debug_assert!(self.kept.is_none());
+        debug_assert!(
+            self.row_range
+                .as_ref()
+                .is_some_and(|run| run.start <= range.start && range.end <= run.end)
+        );
+        Self {
+            row_range: Some(range),
+            ..self.clone()
+        }
+    }
+
+    /// This plan over `rows`, rows of its range: a keep's, or a window or
+    /// partition of them.
+    pub(crate) fn with_rows(&self, rows: ServedRows) -> Self {
+        Self {
+            kept: Some(Arc::new(rows)),
+            ..self.clone()
+        }
+    }
+
+    /// The serving index child, which the view's lazy ids read.
+    pub(crate) fn child(&self) -> &ChildReader {
+        &self.child
+    }
+
+    /// The child's `columns` at the child rows `positions` (ascending, not
+    /// empty), in that order: point by point through the child's cached
+    /// chunk probes, or, where a probe declines, the rows they span scanned
+    /// and the positions taken.
+    pub(crate) async fn columns_at(
+        &self,
+        file: &NativeStoreFile,
+        columns: &[&'static str],
+        positions: &[u64],
+    ) -> Result<ArrayRef> {
+        if let Some(rows) =
+            component_point_rows(file, self.child.name, columns, positions.to_vec()).await?
+        {
+            return Ok(rows);
+        }
+        let (first, last) = (positions[0], positions[positions.len() - 1]);
+        let projection = self.child.bind(&select(columns.to_vec(), root()))?;
+        let span = read_all_rows(
+            self.child_scan()
+                .with_projection(projection)
+                .with_row_range(first..last + 1),
+        )
+        .await?;
+        let indices: Buffer<u64> = positions.iter().map(|&position| position - first).collect();
+        span.take(PrimitiveArray::new(indices, Validity::NonNullable).into_array())
+            .map_err(VortexRdfError::Vortex)
+    }
+
+    /// The child's rows at `positions` (ascending, not empty), every child
+    /// column, in that order ([`columns_at`](Self::columns_at)).
+    pub(crate) async fn rows_at(
+        &self,
+        file: &NativeStoreFile,
+        positions: &[u64],
+    ) -> Result<ArrayRef> {
+        self.columns_at(file, &CHILD_COLUMNS, positions).await
+    }
+
+    /// The child's `columns` over the located range, as `u64` buffers in the
+    /// child's order: point by point when the range is point-sized, else a
+    /// scan of the range projecting them.
+    pub(crate) async fn range_columns(
+        &self,
+        file: &NativeStoreFile,
+        columns: &[&'static str],
+    ) -> Result<Vec<Buffer<u64>>> {
+        let range = self
+            .row_range
+            .clone()
+            .expect("only a located range's columns are read");
+        if range.is_empty() {
+            return Ok(columns.iter().map(|_| Buffer::empty()).collect());
+        }
+        let rows = if point_sized(range.end - range.start) {
+            let positions: Vec<u64> = range.collect();
+            self.columns_at(file, columns, &positions).await?
+        } else {
+            let projection = self.child.bind(&select(columns.to_vec(), root()))?;
+            read_all_rows(
+                self.child_scan()
+                    .with_projection(projection)
+                    .with_row_range(range),
+            )
+            .await?
+        };
+        extract_codes(rows, columns)
+    }
+
+    /// The view's live rows in the child's order: the kept rows, or the
+    /// located range's (its rid column read), each with its base row id, the
+    /// `deleted` tombstones left out.
+    pub(crate) async fn live_rows(
+        &self,
+        file: &NativeStoreFile,
+        deleted: Option<&Mask>,
+    ) -> Result<ServedRows> {
+        if let Some(kept) = &self.kept {
+            return Ok(kept.live(deleted));
+        }
+        let range = self
+            .row_range
+            .clone()
+            .expect("only a located range's rows are read");
+        let rids = self.range_columns(file, &[COL_RID]).await?.remove(0);
+        let (positions, rids): (Vec<u64>, Vec<RowId>) = range
+            .zip(rids.iter().map(|&rid| super::base_row(rid)))
+            .filter(|&(_, rid)| deleted.is_none_or(|d| !d.value(rid as usize)))
+            .unzip();
+        Ok(ServedRows {
+            positions: Buffer::from(positions),
+            rids: Buffer::from(rids),
+        })
     }
 
     /// The plan's (projection, filter), bound through the handle's memo on
@@ -487,28 +631,39 @@ impl FileServePlan {
         self.row_range.clone()
     }
 
-    /// The served rows read point by point as one chunk, when the run is
-    /// located and point-sized: the projected columns through the
-    /// component's cached chunk probes ([`component_point_chunk`]), or the
-    /// [`filtered_scan`](Self::filtered_scan)'s rows when a probe declines
-    /// mid-fetch. `None` for every other run, which [`Self::scan`] streams.
-    /// The fallback scan is built, and the plan bound, before the read
-    /// starts, so a bind failure fails this call rather than the read.
+    /// The served rows read point by point as one chunk, when the view keeps
+    /// rows ([`rows_at`](Self::rows_at) their positions) or covers a located,
+    /// point-sized range: the projected columns through the component's
+    /// cached chunk probes ([`component_point_chunk`]), or the range's
+    /// [`scan`](Self::scan) when a probe declines a run's read mid-fetch.
+    /// `None` for every other view, which [`Self::scan`] streams. The plan is
+    /// bound before the read starts, so a bind failure fails this call rather
+    /// than the read.
     pub(crate) fn point_run<'a>(
         &'a self,
         file: &'a NativeStoreFile,
-    ) -> Result<Option<impl Future<Output = Result<ArrayRef>> + Send + 'a>> {
+    ) -> Result<Option<BoxFuture<'a, Result<ArrayRef>>>> {
+        if let Some(kept) = &self.kept {
+            self.bound_exprs()?;
+            let positions = kept.positions.clone();
+            return Ok(Some(
+                async move { self.rows_at(file, &positions).await }.boxed(),
+            ));
+        }
         let range = match &self.row_range {
             Some(run) if point_sized(run.end - run.start) => run.clone(),
             _ => return Ok(None),
         };
-        let fallback = self.filtered_scan()?;
-        Ok(Some(async move {
-            match component_point_chunk(file, self.child.name, &CHILD_COLUMNS, range).await? {
-                Some(rows) => Ok(rows),
-                None => read_all_rows(fallback).await,
+        let fallback = self.scan()?;
+        Ok(Some(
+            async move {
+                match component_point_chunk(file, self.child.name, &CHILD_COLUMNS, range).await? {
+                    Some(rows) => Ok(rows),
+                    None => read_all_rows(fallback).await,
+                }
             }
-        }))
+            .boxed(),
+        ))
     }
 
     /// The scan the served rows stream from: the serving index child with
@@ -581,14 +736,28 @@ impl FileServePlan {
     }
 
     /// The served rows as chunks of the child's columns, in the index's
-    /// order: a point-sized located run read point by point as one chunk
-    /// ([`point_run`](Self::point_run)), any other the plan's
+    /// order: kept rows read point by point, `batch_rows` a chunk; a
+    /// point-sized located run read point by point as one chunk
+    /// ([`point_run`](Self::point_run)); any other the plan's
     /// [`scan`](Self::scan), split by split. Nothing is read until the
     /// stream is polled.
     pub(crate) fn child_chunks(
         &self,
         file: Arc<NativeStoreFile>,
+        batch_rows: usize,
     ) -> Result<BoxStream<'static, Result<ArrayRef>>> {
+        if let Some(kept) = &self.kept {
+            let (plan, positions) = (self.clone(), kept.positions.clone());
+            let rows = positions.len();
+            return Ok(stream::iter((0..rows).step_by(batch_rows))
+                .then(move |start| {
+                    let (plan, file) = (plan.clone(), Arc::clone(&file));
+                    let end = start.saturating_add(batch_rows).min(rows);
+                    let batch = positions.slice(start..end);
+                    async move { plan.rows_at(&file, &batch).await }
+                })
+                .boxed());
+        }
         if self
             .row_range
             .as_ref()
