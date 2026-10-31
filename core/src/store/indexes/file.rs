@@ -13,11 +13,13 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt};
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::expr::{root, select};
+use vortex_array::dtype::Nullability;
+use vortex_array::expr::{col, pack, root, select};
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
+use vortex_layout::layouts::row_idx::row_idx;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
 use vortex_mask::Mask;
@@ -422,6 +424,9 @@ pub(crate) struct FileServePlan {
     /// The rows a keep kept of the range, in the child's order; when set,
     /// the view covers these and not the whole range.
     kept: Option<Arc<ServedRows>>,
+    /// An unlocated run's rows, read once by row index for its first
+    /// narrowing ([`run_rows`](Self::run_rows)), shared across clones.
+    run_rows_cell: Arc<std::sync::OnceLock<ServedRows>>,
 }
 
 /// The fewest rows a located run's scan split carries: below this the
@@ -457,7 +462,61 @@ impl FileServePlan {
             bound: Arc::new(std::sync::OnceLock::new()),
             row_range,
             kept: None,
+            run_rows_cell: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// The rows of an unlocated run in the child's order, which is the
+    /// index's: one scan of the child under the plan's filter, projecting
+    /// each row's child position (vortex's `#row_idx`) beside its base row
+    /// id, read on the first call and kept for every clone of the plan. What
+    /// a narrowing of a run the resolution did not locate starts from.
+    pub(crate) async fn run_rows(&self) -> Result<ServedRows> {
+        if let Some(rows) = self.run_rows_cell.get() {
+            return Ok(rows.clone());
+        }
+        observe!(ServedRunLocated);
+        let (_, filter) = self.bound_exprs()?;
+        let projection = self.child.bind(&pack(
+            [("position", row_idx()), ("rid", col(COL_RID))],
+            Nullability::NonNullable,
+        ))?;
+        let rows = read_all_rows(
+            self.child_scan()
+                .with_projection(projection)
+                .with_filter(filter),
+        )
+        .await?;
+        let mut columns = extract_codes(rows, &["position", "rid"])?;
+        let rids = columns
+            .remove(1)
+            .iter()
+            .map(|&rid| super::base_row(rid))
+            .collect();
+        let rows = ServedRows {
+            positions: columns.remove(0),
+            rids,
+        };
+        Ok(self.run_rows_cell.get_or_init(|| rows).clone())
+    }
+
+    /// This plan with its run located, what a narrowing cuts: a located or
+    /// kept plan as it is; an unlocated run read once by row index
+    /// ([`run_rows`](Self::run_rows)), then the child range its rows span
+    /// when they are contiguous there (a run no residual term filters, such
+    /// as a string layout's), else kept rows.
+    pub(crate) async fn located(&self) -> Result<Self> {
+        if self.kept.is_some() || self.row_range.is_some() {
+            return Ok(self.clone());
+        }
+        let rows = self.run_rows().await?;
+        Ok(match (rows.positions.first(), rows.positions.last()) {
+            (Some(&first), Some(&last)) if last - first + 1 == rows.len() as u64 => Self {
+                row_range: Some(first..last + 1),
+                ..self.clone()
+            },
+            _ => self.with_rows(rows),
+        })
     }
 
     /// The child rows the view covers, when located: the run the resolution
@@ -569,8 +628,9 @@ impl FileServePlan {
         extract_codes(rows, columns)
     }
 
-    /// The view's live rows in the child's order: the kept rows, or the
-    /// located range's (its rid column read), each with its base row id, the
+    /// The view's live rows in the child's order: the kept rows, the located
+    /// range's (its rid column read), or an unlocated run's
+    /// ([`run_rows`](Self::run_rows)), each with its base row id, the
     /// `deleted` tombstones left out.
     pub(crate) async fn live_rows(
         &self,
@@ -580,10 +640,9 @@ impl FileServePlan {
         if let Some(kept) = &self.kept {
             return Ok(kept.live(deleted));
         }
-        let range = self
-            .row_range
-            .clone()
-            .expect("only a located range's rows are read");
+        let Some(range) = self.row_range.clone() else {
+            return Ok(self.run_rows().await?.live(deleted));
+        };
         let rids = self.range_columns(file, &[COL_RID]).await?.remove(0);
         let (positions, rids): (Vec<u64>, Vec<RowId>) = range
             .zip(rids.iter().map(|&rid| super::base_row(rid)))

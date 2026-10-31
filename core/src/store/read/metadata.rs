@@ -380,10 +380,10 @@ impl VortexRdfStore {
     /// serves over a located run: at most `n` served windows of its live
     /// rows in its index's order, each a part of the located range whose ids
     /// read on first need from those rows of the child's rid column, or,
-    /// under tombstones or over kept rows, a slice of its live rows with
-    /// their ids unsorted. The tail goes with the last. `None` for a view no
-    /// file plan serves, one whose run is not located, or one whose base
-    /// holds no live row.
+    /// under tombstones, over kept rows or over an unlocated run (read once by
+    /// row index), a slice of its live rows with their ids unsorted. The tail
+    /// goes with the last. `None` for a view no file plan serves, or one
+    /// whose base holds no live row.
     #[cfg(feature = "file-io")]
     async fn served_file_partitions(&self, n: usize) -> Result<Option<Vec<Self>>> {
         use std::sync::Arc;
@@ -394,18 +394,20 @@ impl VortexRdfStore {
         let Some(plan) = &base.serve else {
             return Ok(None);
         };
+        // An unlocated run is located first, read once by row index.
+        let plan = &plan.located().await?;
         let deleted = self.quads.deleted.as_ref();
         let range = plan.located_range();
-        // The live rows: the located range whole, or listed.
+        // The live rows: the located range whole, or listed (the kept rows,
+        // or a located range's under tombstones).
         let listed = match (plan.kept(), &range, deleted) {
-            (None, None, _) => return Ok(None),
             (None, Some(_), None) => None,
             _ => Some(plan.live_rows(&base.file, deleted).await?),
         };
         let rows = match (&listed, &range) {
             (Some(listed), _) => listed.len(),
             (None, Some(range)) => (range.end - range.start) as usize,
-            (None, None) => unreachable!("an unlocated run without kept rows declined"),
+            (None, None) => unreachable!("a located plan's rows are listed or ranged"),
         };
         if rows == 0 {
             return Ok(None);
@@ -425,12 +427,12 @@ impl VortexRdfStore {
                         (Some(listed), _) => {
                             let rows = listed.slice(piece);
                             let ids = LazyRowIds::from_unsorted_ids(rows.rids.clone(), true);
-                            let narrowed = match plan.kept() {
-                                Some(_) => plan.with_rows(rows),
-                                None => {
+                            let narrowed = match (plan.kept(), &range) {
+                                (None, Some(_)) => {
                                     let first = rows.positions[0];
                                     plan.narrowed(first..rows.positions[rows.len() - 1] + 1)
                                 }
+                                _ => plan.with_rows(rows),
                             };
                             (narrowed, ids)
                         }
@@ -444,7 +446,7 @@ impl VortexRdfStore {
                             );
                             (plan.narrowed(cut), ids)
                         }
-                        (None, None) => unreachable!("an unlocated run without kept rows declined"),
+                        (None, None) => unreachable!("a located plan's rows are listed or ranged"),
                     };
                     let quads = self.quads.file_with(
                         base,

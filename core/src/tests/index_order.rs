@@ -924,3 +924,156 @@ async fn file_probe_windows_follow_index_order() {
         p.size().await.unwrap()
     );
 }
+
+/// The quads of `quads` in `index:posg`'s order over their N-Triples
+/// spellings, (p, o, s, g): a served `?p??` view's order on a string layout.
+fn posg_quads(quads: &[Quad]) -> Vec<[String; 4]> {
+    let mut rows: Vec<[String; 4]> = quads.iter().map(spellings).collect();
+    rows.sort_by(|a, b| (&a[1], &a[2], &a[0], &a[3]).cmp(&(&b[1], &b[2], &b[0], &b[3])));
+    rows
+}
+
+/// A served file run the index cannot locate (a string layout's, whose
+/// keys are not binary-searched, or a run a residual graph filters) is read
+/// once by row index, then narrowed: a run whose rows are contiguous in the
+/// child (no residual) as a located range, a residual one's scattered rows
+/// as kept rows. Two windows and a partitioning of each give the quads in
+/// the index's order, and the run is located once across them.
+#[tokio::test]
+async fn unlocated_runs_read_once_then_narrow() {
+    let quads = modular_quads(5_000, 7, 11);
+    // Every third quad in a named graph: the default graph's rows of a
+    // predicate are scattered over its run in (p, o, s, g) order.
+    let graphed: Vec<Quad> = quads
+        .iter()
+        .enumerate()
+        .map(|(i, quad)| {
+            let mut quad = quad.clone();
+            if i % 3 == 0 {
+                quad.graph_name = iri_graph("g1");
+            }
+            quad
+        })
+        .collect();
+    let p2 = iri("p2");
+    let default = GraphName::DefaultGraph;
+    // Each view beside the unindexed twin's match, sorted (p, o, s, g), and
+    // whether its narrowings are located ranges.
+    let mut views = Vec::new();
+    let mut dirs = Vec::new();
+    let twin = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
+    let want = posg_quads(
+        &matched_view(&twin, None, Some(&p2), None, None)
+            .await
+            .quads_vec()
+            .await
+            .unwrap(),
+    );
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let (dir, path) =
+            write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        views.push((
+            format!("{layout:?} ?p2??"),
+            matched_view(&store, None, Some(&p2), None, None).await,
+            want.clone(),
+            true,
+        ));
+        dirs.push(dir);
+    }
+    let (dir, path) = write_store_file(
+        graphed.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let twin = built_store(graphed, LayoutStrategy::Default, vec![]).await;
+    views.push((
+        "Dictionary ?p2?g".into(),
+        matched_view(&store, None, Some(&p2), None, Some(&default)).await,
+        posg_quads(
+            &matched_view(&twin, None, Some(&p2), None, Some(&default))
+                .await
+                .quads_vec()
+                .await
+                .unwrap(),
+        ),
+        false,
+    ));
+    dirs.push(dir);
+
+    for (tag, view, want, located) in views {
+        let n = want.len();
+        assert!(n > 100, "{tag}: a run to narrow");
+        assert!(served_component(&view).is_some(), "{tag}: served");
+        assert_eq!(view.debug_serve_row_range(), None, "{tag}: unlocated");
+        let rec = Recorder::start();
+        for (offset, limit) in [(10, 100), (n / 2, n / 4)] {
+            let w = view.window(offset, limit).await.unwrap();
+            let got: Vec<[String; 4]> =
+                w.quads_vec().await.unwrap().iter().map(spellings).collect();
+            assert_eq!(
+                got,
+                slice_of(&want, offset, limit),
+                "{tag} ({offset}, {limit})"
+            );
+            assert!(
+                served_component(&w).is_some(),
+                "{tag} ({offset}, {limit}): served"
+            );
+            assert_eq!(
+                w.debug_serve_row_range().is_some(),
+                located,
+                "{tag} ({offset}, {limit}): a located range, else kept rows"
+            );
+        }
+        let parts = view
+            .partitions(std::num::NonZeroUsize::new(3).unwrap())
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        for part in &parts {
+            assert!(served_component(part).is_some(), "{tag}: a served partition");
+            got.extend(part.quads_vec().await.unwrap().iter().map(spellings));
+        }
+        assert_eq!(got, want, "{tag}: partitions");
+        assert_eq!(
+            rec.count(&Event::ServedRunLocated),
+            1,
+            "{tag}: located once"
+        );
+    }
+}
+
+/// TypedObject's row chunks, in both residencies, read a served view in the
+/// index's order: decoded, they are `quads_vec`'s rows in its order.
+#[tokio::test]
+async fn typed_object_row_chunks_follow_index_order() {
+    let (_dir, path) = write_store_file(
+        modular_quads(5_000, 7, 11),
+        LayoutStrategy::TypedObject,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    for in_memory in [false, true] {
+        let store = if in_memory {
+            VortexRdfStore::from_file_in_memory(&path).await
+        } else {
+            VortexRdfStore::from_file(&path).await
+        }
+        .unwrap();
+        let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+        assert_eq!(served_component(&p), Some("index:posg"));
+        let mut decoded = Vec::new();
+        let mut chunks = p.row_chunks(256).unwrap();
+        while let Some(chunk) = chunks.next().await {
+            decoded.extend(p.decode_row_chunk(&chunk.unwrap()).unwrap());
+        }
+        assert_eq!(
+            decoded,
+            p.shared_quads_vec().await.unwrap(),
+            "in_memory={in_memory}"
+        );
+    }
+}

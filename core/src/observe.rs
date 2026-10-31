@@ -95,6 +95,9 @@ pub(crate) enum Event {
     ServePointRead,
     /// A code-chunk stream read off its serving index's located run.
     ServedRunChunks,
+    /// A served file run its index did not locate read once by row index,
+    /// its rows' child positions and row ids.
+    ServedRunLocated,
     /// A stream's pending filter read by its masks, a split at a time.
     MasksFirstStream,
 

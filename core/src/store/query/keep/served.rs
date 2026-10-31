@@ -64,8 +64,9 @@ impl VortexRdfStore {
     /// view's live rows tested in the child's order against the child's
     /// `column` (read over its located range, or at its kept rows'
     /// positions), the admitted ones kept on the plan with their row ids
-    /// unsorted. None admitted is the empty view. `None` for a view no file
-    /// plan serves, or one whose run is not located.
+    /// unsorted (an unlocated run located first, read once by row index).
+    /// None admitted is the empty view. `None` for a view no file plan
+    /// serves.
     #[cfg(feature = "file-io")]
     async fn served_keep_file(&self, column: QuadColumn, keep: &Keep) -> Result<Option<Self>> {
         use vortex_buffer::Buffer;
@@ -80,25 +81,28 @@ impl VortexRdfStore {
         let Some(plan) = &base.serve else {
             return Ok(None);
         };
+        let plan = &plan.located().await?;
         let deleted = self.quads.deleted.as_ref();
         let name = column.name();
         // The rows' codes in `column` beside their positions and row ids: the
         // kept rows', or the located range's.
         let (positions, codes, rids): (Option<Buffer<u64>>, Buffer<u64>, Buffer<RowId>) =
-            match (plan.kept(), plan.located_range()) {
-                (Some(kept), _) => {
-                    let rows = plan
-                        .columns_at(&base.file, &[name], &kept.positions)
-                        .await?;
-                    let codes = extract_codes(rows, &[name])?.remove(0);
-                    (Some(kept.positions.clone()), codes, kept.rids.clone())
-                }
-                (None, Some(_)) => {
+            match plan.kept() {
+                None => {
                     let mut columns = plan.range_columns(&base.file, &[name, COL_RID]).await?;
                     let rids = columns.remove(1).iter().map(|&rid| base_row(rid)).collect();
                     (None, columns.remove(0), rids)
                 }
-                (None, None) => return Ok(None),
+                Some(kept) => {
+                    if kept.len() == 0 {
+                        return Ok(Some(self.empty_view()));
+                    }
+                    let read = plan
+                        .columns_at(&base.file, &[name], &kept.positions)
+                        .await?;
+                    let codes = extract_codes(read, &[name])?.remove(0);
+                    (Some(kept.positions.clone()), codes, kept.rids.clone())
+                }
             };
         let start = plan.located_range().map_or(0, |range| range.start);
         let position = |row: usize| positions.as_ref().map_or(start + row as u64, |p| p[row]);

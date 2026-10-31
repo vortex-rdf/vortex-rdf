@@ -1145,15 +1145,15 @@ async fn test_run_probe_window_that_cannot_cut_is_the_matched_view() {
 }
 
 /// On file, a copy index's run under a string layout is unlocated: its width
-/// is unknown until its ids are read. A window with no offset reads them once,
-/// into the view's shared cell: under a limit they fit (the match's rows, or
-/// one more, short of the base's) it is the served view as it is, the plain
-/// match's rows in the index's order, while one row short it cuts in base
-/// order, taking the ids from the cell. Under tombstones the ids read are the
-/// run's width, and its live rows are what fits the limit. `run_probe` takes
-/// the same routes.
+/// is unknown until its rows are read. A window with no offset reads them
+/// once by row index (each row's child position beside its row id, kept on
+/// the view's plan), leaving the view's ids unread, and cuts the run in the
+/// index's order, a located range from then on, whether or not the limit
+/// cuts: under a limit they fit (the match's rows, or one more) it holds the
+/// whole run. Under tombstones the cut counts live rows. `run_probe` takes
+/// the same route.
 #[tokio::test]
-async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
+async fn test_window_over_an_unlocated_served_run_reads_its_rows_once() {
     use crate::store::IdsNeed;
 
     let p1 = iri("p1");
@@ -1185,12 +1185,8 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
                 0
             };
             assert_eq!(n, matching.len() - deleted, "{label}: the live rows");
-            assert!(
-                n + 1 < store.size().await.unwrap(),
-                "{label}: a base to cut"
-            );
-            // The plain match's rows in base order: the store's own, in its
-            // order.
+            // The plain match's rows in base order, the store's own: not the
+            // index's.
             let matched: std::collections::HashSet<&Quad> = rows.iter().collect();
             let base: Vec<Quad> = store
                 .quads_vec()
@@ -1200,8 +1196,9 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
                 .filter(|quad| matched.contains(quad))
                 .collect();
             assert_ne!(base, rows, "{label}: the index's order is not base order");
-            for (limit, cuts) in [(n - 1, true), (n, false), (n + 1, false)] {
+            for limit in [n - 1, n, n + 1] {
                 let label = format!("{label} limit {limit}");
+                let want = &rows[..limit.min(n)];
                 let view = store
                     .match_pattern_for(
                         None,
@@ -1215,28 +1212,42 @@ async fn test_window_over_an_unlocated_served_run_reads_its_ids_once() {
                 assert_eq!(view.debug_pending_len(), Some(None), "{label}: unread");
                 let rec = Recorder::start();
                 let windowed = view.window(0, limit).await.unwrap();
-                assert_eq!(rec.count(&Event::RidScan), 1, "{label}: one id read");
+                assert_eq!(
+                    rec.count(&Event::ServedRunLocated),
+                    1,
+                    "{label}: one read by row index"
+                );
+                assert_eq!(rec.count(&Event::RidScan), 0, "{label}: no id read");
                 assert_eq!(
                     view.debug_pending_len(),
-                    Some(Some(matching.len())),
-                    "{label}: the run's ids in the shared cell"
+                    Some(None),
+                    "{label}: the view's ids stay unread"
                 );
-                let (plan, want) = if cuts {
-                    (None, &base[..limit])
-                } else {
-                    (Some("index:posg"), &rows[..])
-                };
-                assert_eq!(served_component(&windowed), plan, "{label}: the plan");
                 assert_eq!(
-                    windowed.quads_vec().await.unwrap(),
-                    want,
-                    "{label}: the rows"
+                    served_component(&windowed),
+                    Some("index:posg"),
+                    "{label}: the plan"
                 );
+                assert!(
+                    windowed.debug_serve_row_range().is_some(),
+                    "{label}: located from then on"
+                );
+                assert_eq!(windowed.quads_vec().await.unwrap(), want, "{label}: the rows");
+                let rec = Recorder::start();
                 let probed = store
                     .run_probe(&probe.clone().window(0, Some(limit)))
                     .await
                     .unwrap();
-                assert_eq!(served_component(&probed), plan, "{label}: run_probe's plan");
+                assert_eq!(
+                    rec.count(&Event::ServedRunLocated),
+                    1,
+                    "{label}: run_probe reads by row index once"
+                );
+                assert_eq!(
+                    served_component(&probed),
+                    Some("index:posg"),
+                    "{label}: run_probe's plan"
+                );
                 assert_eq!(
                     probed.quads_vec().await.unwrap(),
                     want,

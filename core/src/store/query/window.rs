@@ -32,23 +32,22 @@ impl VortexRdfStore {
     /// pending filter and row order included: one with no `offset` whose
     /// `limit` is at least the view's row count, or a bound on it, known
     /// without reading (the `rows.upper_bound` of
-    /// [`view_statistics`](Self::view_statistics)). With no `offset`, a
-    /// served file view whose run's width is unknown reads the run's ids
-    /// first, kept on the view for the window below, and is the view as it
-    /// is when they fit. A file view whose reads take a pending filter of
-    /// code equalities by its masks first is never the view as it is: its
-    /// window evaluates the filter whatever the bound, as below, and so finds
-    /// whether it cuts.
+    /// [`view_statistics`](Self::view_statistics)). A file view whose reads
+    /// take a pending filter of code equalities by its masks first is never
+    /// the view as it is: its window evaluates the filter whatever the bound,
+    /// as below, and so finds whether it cuts.
     ///
-    /// A window of a view a by-copy index serves in memory is served too:
-    /// rows `offset..offset + limit` of the view in its index's order, then
-    /// the tail's, read off the index as the view's are. Any other window is
+    /// A window of a view a by-copy index serves is served too: rows
+    /// `offset..offset + limit` of the view in its index's order, then the
+    /// tail's, read off the index as the view's are. A served file run whose
+    /// width is unknown (a string layout's, or one a residual term filters)
+    /// is read once by row index first, kept on the view for every narrowing
+    /// of it, and windowed whether or not the limit cuts. Any other window is
     /// a position range over base order: base rows in base row order, then
     /// the tail's, with no serve plan. A pending file filter is resolved only
-    /// as far as the window reaches
-    /// (its splits evaluated in file order, stopping at the first that fills
-    /// the window), so `LIMIT` over a filtered scan costs the matching prefix
-    /// of the file. A window with no `offset` whose filter matches fewer rows
+    /// as far as the window reaches (its splits evaluated in file order,
+    /// stopping at the first that fills the window), so `LIMIT` over a
+    /// filtered scan costs the matching prefix of the file. A window with no `offset` whose filter matches fewer rows
     /// than its limit finds that it cuts no base row: the view keeps its rows,
     /// known exactly from then on, its reads and counts taking them from the
     /// filter's evaluation, which is never run again, and its tail is
@@ -88,24 +87,6 @@ impl VortexRdfStore {
             );
             return Ok(Some(windowed));
         }
-        // A served file run whose width is unknown until its ids are read
-        // reads them into the view's shared cell, where any window below
-        // takes them from, and is the view as it is when they fit.
-        #[cfg(feature = "file-io")]
-        let base_live = if offset == 0
-            && let Some(FileBase { serve: Some(_), .. }) = self.quads.file()
-            && let ViewSelection::Pending { ids: lazy, .. } = &self.quads.selection
-            && lazy.len_if_known().is_none()
-        {
-            lazy.materialized_async().await?;
-            let WindowCheck::MayCut { base_live } = self.window_check(offset, limit)? else {
-                debug::step!(t, "[window] limit {limit} cuts no row of the served run");
-                return Ok(None);
-            };
-            base_live
-        } else {
-            base_live
-        };
         observe!(Window);
         #[cfg(feature = "file-io")]
         if offset == 0
@@ -236,9 +217,12 @@ impl VortexRdfStore {
     /// kept, their ids kept unsorted. Under tombstones the cut counts live
     /// rows, the range's rid column read. The tail is windowed with what the
     /// base did not fill, as [`window_cutting`](Self::window_cutting)
-    /// windows it. A window that holds no base row selects none, with no
-    /// plan. `None` for a view no file plan serves, or one whose run is not
-    /// located.
+    /// windows it. An unlocated run (a string layout's, or one a residual
+    /// term filters) is located first
+    /// ([`located`](crate::store::indexes::FileServePlan::located)): read
+    /// once by row index, a located range when its rows are contiguous in
+    /// the child, else kept rows. A window that holds no base row selects none,
+    /// with no plan. `None` for a view no file plan serves.
     #[cfg(feature = "file-io")]
     pub(in crate::store) async fn served_window_file(
         &self,
@@ -251,11 +235,11 @@ impl VortexRdfStore {
         let Some(plan) = &base.serve else {
             return Ok(None);
         };
+        let plan = &plan.located().await?;
         let deleted = self.quads.deleted.as_ref();
         // The window's plan and lazy ids, or `None` for no base row, beside
         // the base's live rows.
         let (window, base_live) = match (plan.kept(), plan.located_range(), deleted) {
-            (None, None, _) => return Ok(None),
             (None, Some(range), None) => {
                 let base_live = (range.end - range.start) as usize;
                 let window = window_rows(offset, limit, base_live as u64).map(|cut| {
@@ -269,7 +253,8 @@ impl VortexRdfStore {
                 });
                 (window, base_live)
             }
-            (kept, _, deleted) => {
+            (kept, located, deleted) => {
+                // The kept rows, or a located range's live rows.
                 let rows = plan.live_rows(&base.file, deleted).await?;
                 let base_live = rows.len();
                 let window = window_rows(offset, limit, base_live as u64).map(|cut| {
@@ -277,12 +262,12 @@ impl VortexRdfStore {
                     // The ids leave out every tombstone: the window took live
                     // rows.
                     let ids = LazyRowIds::from_unsorted_ids(rows.rids.clone(), true);
-                    let narrowed = match kept {
-                        Some(_) => plan.with_rows(rows),
-                        None => {
+                    let narrowed = match (kept, located) {
+                        (None, Some(_)) => {
                             let (first, last) = (rows.positions[0], rows.positions[rows.len() - 1]);
                             plan.narrowed(first..last + 1)
                         }
+                        _ => plan.with_rows(rows),
                     };
                     (narrowed, ids)
                 });

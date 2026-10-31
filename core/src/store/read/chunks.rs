@@ -271,7 +271,9 @@ impl VortexRdfStore {
         #[cfg(feature = "file-io")]
         if let Some((base, plan)) = self.served_file_plan() {
             if self.layout.strategy() == crate::store::LayoutStrategy::TypedObject {
-                return Ok(None);
+                return Ok(Some(
+                    self.served_typed_rows(base, plan, columns, batch_rows),
+                ));
             }
             observe!(ServedRunChunks);
             let deleted = self.quads.deleted.clone();
@@ -306,6 +308,44 @@ impl VortexRdfStore {
             }))
             .boxed(),
         ))
+    }
+
+    /// A served TypedObject file view's base rows in its index's order, at
+    /// least `columns`: its copies hold string objects, not the layout's
+    /// typed ones, so each batch of the view's ids in the index's order
+    /// ([`FileServePlan::live_rows`]) is taken from the base
+    /// ([`file_rows_in_order`]), one batch a chunk.
+    ///
+    /// [`FileServePlan::live_rows`]: crate::store::indexes::FileServePlan::live_rows
+    #[cfg(feature = "file-io")]
+    fn served_typed_rows(
+        &self,
+        base: &FileBase,
+        plan: &FileServePlan,
+        columns: &[&'static str],
+        batch_rows: usize,
+    ) -> RowChunkStream {
+        observe!(ServedRunChunks);
+        let (plan, file) = (plan.clone(), Arc::clone(&base.file));
+        let deleted = self.quads.deleted.clone();
+        let columns: Arc<[&'static str]> = Arc::from(columns);
+        stream::once(async move {
+            let rows = plan.live_rows(&file, deleted.as_ref()).await?;
+            Ok::<_, VortexRdfError>((rows.rids, file))
+        })
+        .flat_map(move |read| match read {
+            Ok((ids, file)) => {
+                let columns = Arc::clone(&columns);
+                stream::iter(id_windows(ids, batch_rows))
+                    .then(move |window| {
+                        let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
+                        async move { file_rows_in_order(&file, &columns, &window).await }
+                    })
+                    .left_stream()
+            }
+            Err(e) => stream::iter([Err(e)]).right_stream(),
+        })
+        .boxed()
     }
 
     /// This file view's base beside the serve plan its chunk streams read in
@@ -504,6 +544,37 @@ enum MemoryRows {
 
 /// Windows of base row ids, a chunk's rows each.
 type IdWindows = Box<dyn Iterator<Item = Buffer<RowId>> + Send>;
+
+/// The base's `columns` at the base row ids `ids` (any order, each once, not
+/// empty), in the order of `ids`: the ids sorted beside their slots, taken
+/// from the file ([`take_file_rows`]), the rows put back in the ids' order.
+#[cfg(feature = "file-io")]
+async fn file_rows_in_order(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    columns: &[&'static str],
+    ids: &[RowId],
+) -> Result<ArrayRef> {
+    use vortex_array::IntoArray as _;
+    use vortex_array::validity::Validity;
+
+    let mut slots: Vec<usize> = (0..ids.len()).collect();
+    slots.sort_unstable_by_key(|&slot| ids[slot]);
+    let sorted: Vec<RowId> = slots.iter().map(|&slot| ids[slot]).collect();
+    let rows = take_file_rows(file, columns, &sorted)
+        .await?
+        .ok_or_else(|| {
+            VortexRdfError::Vortex(vortex_error::vortex_err!(
+                "the take of {} served ids declined",
+                ids.len()
+            ))
+        })?;
+    let mut back = vec![0u64; ids.len()];
+    for (taken, &slot) in slots.iter().enumerate() {
+        back[slot] = taken as u64;
+    }
+    rows.take(PrimitiveArray::new(Buffer::from(back), Validity::NonNullable).into_array())
+        .map_err(VortexRdfError::Vortex)
+}
 
 /// The `picked` columns of `codes` cut into slices of at most `batch_rows`
 /// rows, sharing their buffers: a served file chunk's code chunks.
