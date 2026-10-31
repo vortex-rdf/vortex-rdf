@@ -190,6 +190,14 @@ impl ServedRows {
         self.rids.len()
     }
 
+    /// Each row's position (as a `usize`) beside its base row id, in order.
+    fn positions_and_rids(&self) -> impl Iterator<Item = (usize, RowId)> + '_ {
+        self.positions
+            .iter()
+            .map(|&position| position as usize)
+            .zip(self.rids.iter().copied())
+    }
+
     /// Rows `range` of these, sharing their buffers.
     pub(crate) fn slice(&self, range: Range<usize>) -> Self {
         Self {
@@ -215,6 +223,28 @@ impl ServedRows {
             positions: Buffer::from(positions),
             rids: Buffer::from(rids),
         }
+    }
+}
+
+/// The `rows` (positions beside base row ids, at most `capacity` of them)
+/// that `keep` admits, in order. Each kept row is pushed once to buffers
+/// reserved for every row: two allocations, which a doubling buffer would
+/// spend on its growth.
+fn collect_kept(
+    rows: impl Iterator<Item = (usize, RowId)>,
+    capacity: usize,
+    keep: impl Fn(usize, RowId) -> bool,
+) -> ServedRows {
+    let (mut positions, mut rids) = (Vec::with_capacity(capacity), Vec::with_capacity(capacity));
+    for (position, rid) in rows {
+        if keep(position, rid) {
+            positions.push(position as u64);
+            rids.push(rid);
+        }
+    }
+    ServedRows {
+        positions: Buffer::from(positions),
+        rids: Buffer::from(rids),
     }
 }
 
@@ -327,40 +357,27 @@ impl InMemoryServePlan {
     pub(crate) fn kept_rows(
         &self,
         deleted: Option<&Mask>,
-        mut admit: impl FnMut(usize, RowId) -> bool,
+        admit: impl Fn(usize, RowId) -> bool,
     ) -> Result<ServedRows> {
-        let rows = self
-            .kept
-            .as_ref()
-            .map_or(self.range.len(), |kept| kept.len());
-        let (mut positions, mut rids) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
-        let mut visit = |position: usize, rid: RowId| {
-            if deleted.is_none_or(|d| !d.value(rid as usize)) && admit(position, rid) {
-                positions.push(position as u64);
-                rids.push(rid);
-            }
-        };
-        match &self.kept {
-            Some(kept) => {
-                for (&position, &rid) in kept.positions.iter().zip(kept.rids.iter()) {
-                    visit(position as usize, rid);
-                }
-            }
-            None => {
+        let live = |rid: RowId| deleted.is_none_or(|d| !d.value(rid as usize));
+        Ok(match (&self.kept, deleted.is_some()) {
+            (Some(kept), false) => collect_kept(kept.positions_and_rids(), kept.len(), &admit),
+            (Some(kept), true) => collect_kept(kept.positions_and_rids(), kept.len(), |p, rid| {
+                live(rid) && admit(p, rid)
+            }),
+            (None, tombstoned) => {
                 let run = self.run_rids()?;
-                for (position, &rid) in self.range.clone().zip(&run[self.run_slots()]) {
-                    visit(position, rid);
+                let rows = self
+                    .range
+                    .clone()
+                    .zip(run[self.run_slots()].iter().copied());
+                match tombstoned {
+                    false => collect_kept(rows, self.range.len(), &admit),
+                    true => {
+                        collect_kept(rows, self.range.len(), |p, rid| live(rid) && admit(p, rid))
+                    }
                 }
             }
-        }
-        // A sparse keep gives back what it reserved past a quarter used.
-        if positions.len() < positions.capacity() / 4 {
-            positions.shrink_to_fit();
-            rids.shrink_to_fit();
-        }
-        Ok(ServedRows {
-            positions: Buffer::from(positions),
-            rids: Buffer::from(rids),
         })
     }
 
