@@ -6,6 +6,7 @@
 //! ([`QuadsSource::in_memory_with`], [`QuadsSource::with_selection`], …),
 //! never field by field.
 
+pub(crate) mod pending;
 pub(crate) mod selection;
 pub(crate) mod tail_keys;
 
@@ -250,7 +251,7 @@ impl QuadsSource {
     /// windowing or keeping resolves it; nothing that reads rows holds one,
     /// so no view a caller gets back is in this state.
     pub(crate) fn is_pending_without_plan(&self) -> bool {
-        matches!(self.selection, ViewSelection::Pending(_)) && self.served_component().is_none()
+        !matches!(self.selection, ViewSelection::Exact(_)) && self.served_component().is_none()
     }
 
     /// Whether this source still covers every base row: no pushed-down
@@ -357,7 +358,7 @@ impl QuadsSource {
     /// for a window (`IdsNeed::CountOrWindow`), beside the base's live rows
     /// as far as the window knows them, read without the selection's other
     /// ids. A residual compare left pending compares its pieces only until
-    /// the window's last live row is found ([`LazyRowIds::residual_window`]).
+    /// the window's last live row is found ([`PendingResidual::window`]).
     /// A run, with no tombstones, has its width as the base's live size and
     /// reads its window's rows alone ([`LazyRowIds::window`]): in memory cut,
     /// before decoding, from a rid column whose rids ascend; on file read
@@ -367,18 +368,20 @@ impl QuadsSource {
     /// window comes from its materialized selection.
     ///
     /// [`LazyRowIds::window`]: crate::store::indexes::LazyRowIds::window
-    /// [`LazyRowIds::residual_window`]: crate::store::indexes::LazyRowIds::residual_window
+    /// [`PendingResidual::window`]: crate::store::view::pending::PendingResidual::window
     pub(crate) async fn located_window(
         &self,
         offset: usize,
         limit: usize,
     ) -> Result<Option<(RowSelection, usize)>> {
-        let ViewSelection::Pending(lazy) = &self.selection else {
-            return Ok(None);
+        let lazy = match &self.selection {
+            ViewSelection::Residual(residual) => {
+                let (ids, live) = residual.window(offset, limit, self.deleted.as_ref())?;
+                return Ok(Some((RowSelection::from_ids(ids), live)));
+            }
+            ViewSelection::Pending { ids, .. } => ids,
+            ViewSelection::Exact(_) => return Ok(None),
         };
-        if let Some((ids, live)) = lazy.residual_window(offset, limit, self.deleted.as_ref())? {
-            return Ok(Some((RowSelection::from_ids(ids), live)));
-        }
         let Some(live) = lazy
             .len_if_known()
             .filter(|_| self.deleted.is_none() && !self.has_filter())

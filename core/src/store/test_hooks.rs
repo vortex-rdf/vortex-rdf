@@ -217,7 +217,8 @@ impl VortexRdfStore {
     pub(crate) fn debug_row_ids_materialized(&self) -> Option<bool> {
         match &self.quads.selection {
             ViewSelection::Exact(_) => None,
-            ViewSelection::Pending(lazy) => Some(lazy.debug_materialized()),
+            ViewSelection::Pending { ids, .. } => Some(ids.debug_materialized()),
+            ViewSelection::Residual(residual) => Some(residual.debug_materialized()),
         }
     }
 
@@ -236,7 +237,8 @@ impl VortexRdfStore {
     /// whose width is unknown, `None` for an exact selection.
     pub(crate) fn debug_pending_len(&self) -> Option<Option<usize>> {
         match &self.quads.selection {
-            ViewSelection::Pending(lazy) => Some(lazy.len_if_known()),
+            ViewSelection::Pending { ids, .. } => Some(ids.len_if_known()),
+            ViewSelection::Residual(residual) => Some(residual.len_if_known()),
             ViewSelection::Exact(_) => None,
         }
     }

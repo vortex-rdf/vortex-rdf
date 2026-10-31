@@ -1,7 +1,8 @@
 //! Executing a view against a backend: a selection plus residual constraints
 //! turned into the rows that match. In memory, `typed_eq` holds the typed
 //! residual-equality paths (slice compares over canonical code columns,
-//! encoded-search point reads otherwise, view compares for strings) and
+//! encoded-search point reads otherwise, view compares for strings),
+//! `residual` the residual compare that tries them before its mask scan, and
 //! `gather` the tombstone-aware gather of a selection's rows. On file,
 //! `file_exprs` builds the pushed-down filters, `file_scans` drives row scans
 //! and maps a [`RowSelection`] onto vortex's scan knobs, `file_filter`
@@ -26,6 +27,7 @@ pub(crate) mod file_scans;
 pub(crate) mod gather;
 #[cfg(feature = "file-io")]
 pub(crate) mod read_plan;
+pub(crate) mod residual;
 #[cfg(feature = "file-io")]
 pub(crate) mod subject_runs;
 pub(crate) mod typed_eq;

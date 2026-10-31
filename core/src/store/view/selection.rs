@@ -1,15 +1,17 @@
 //! Which base rows a view covers, on both backends: [`RowSelection`], base
 //! row ids that refinements narrow and never re-base, so the index
 //! components' `rid` columns keep addressing them; and [`ViewSelection`],
-//! which adds the *pending* state of an index-resolved match whose ids the
+//! which adds the *pending* states: an index-resolved match whose ids the
 //! first consumer that needs them computes (serving reads never do, nor does
-//! a count of a located run).
+//! a count of a located run), and an in-memory residual compare a count or a
+//! window runs only as far as it reaches.
 //!
 //! A range and an id list are mutually exclusive: a file scan given both
 //! loses vortex's exact-range planning (`attempt_split_ranges` bails when a
 //! row range is also set).
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::validity::Validity;
@@ -19,26 +21,46 @@ use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::indexes::LazyRowIds;
+use crate::store::layouts::OwnedQuadPattern;
 use crate::store::schema::RowId;
+use crate::store::view::pending::PendingResidual;
 
 /// A view's base-row selection, exact or *pending*: an index resolution's
-/// uncomputed ids ([`LazyRowIds`]). A pending selection rides with a serve
-/// plan that reads without the ids (`serve: Some` on its `QuadsSource`), or
-/// sits alone over a located run of known width on a view built only to be
-/// counted or windowed (`IdsNeed::CountOrWindow`), which is counted,
-/// windowed or kept and never streamed. Every consumer either reads through
-/// the plan or materializes first, and a pending selection materializes to
-/// the ids the eager path would have produced, so laziness changes only
-/// when the ids are paid for, never what a view covers.
+/// uncomputed ids ([`LazyRowIds`]), or a residual compare not yet run
+/// ([`PendingResidual`]). A pending index run rides with a serve plan that
+/// reads without the ids (`serve: Some` on its `QuadsSource`), or sits alone
+/// over a located run of known width on a view built only to be counted or
+/// windowed (`IdsNeed::CountOrWindow`), where a pending residual sits too:
+/// such a view is counted, windowed or kept and never streamed. Every
+/// consumer either reads through the plan or materializes first, and a
+/// pending selection materializes to the ids the eager path would have
+/// produced, so laziness changes only when the ids are paid for, never what
+/// a view covers.
 #[derive(Clone)]
 pub(crate) enum ViewSelection {
     Exact(RowSelection),
-    Pending(LazyRowIds),
+    /// An index resolution's ids, computed on first need, and the pattern
+    /// they are the matches of when a match over every base row left them
+    /// for its rows (`matches`, with whatever filter the match left beside
+    /// them): a chained match on such a view is one match of both patterns,
+    /// which never computes the ids.
+    Pending {
+        ids: LazyRowIds,
+        matches: Option<Arc<OwnedQuadPattern>>,
+    },
+    /// An in-memory residual compare left pending on a view only counted or
+    /// windowed, compared only as far as the count or the window reaches.
+    Residual(Arc<PendingResidual>),
 }
 
 impl ViewSelection {
     pub(crate) fn all() -> Self {
         ViewSelection::Exact(RowSelection::All)
+    }
+
+    /// `ids` pending, naming no pattern.
+    pub(crate) fn pending(ids: LazyRowIds) -> Self {
+        ViewSelection::Pending { ids, matches: None }
     }
 
     /// Whether every base row is selected. A pending selection never is: it
@@ -54,7 +76,10 @@ impl ViewSelection {
     pub(crate) async fn materialized_async(&self) -> Result<RowSelection> {
         match self {
             ViewSelection::Exact(selection) => Ok(selection.clone()),
-            ViewSelection::Pending(lazy) => Ok(RowSelection::Ids(lazy.materialized_async().await?)),
+            ViewSelection::Pending { ids, .. } => {
+                Ok(RowSelection::Ids(ids.materialized_async().await?))
+            }
+            ViewSelection::Residual(residual) => Ok(RowSelection::Ids(residual.materialized()?)),
         }
     }
 
@@ -64,7 +89,8 @@ impl ViewSelection {
     pub(crate) fn materialized(&self) -> Result<RowSelection> {
         match self {
             ViewSelection::Exact(selection) => Ok(selection.clone()),
-            ViewSelection::Pending(lazy) => Ok(RowSelection::Ids(lazy.materialized()?)),
+            ViewSelection::Pending { ids, .. } => Ok(RowSelection::Ids(ids.materialized()?)),
+            ViewSelection::Residual(residual) => Ok(RowSelection::Ids(residual.materialized()?)),
         }
     }
 
@@ -73,8 +99,10 @@ impl ViewSelection {
     /// a pending run's width while nothing is tombstoned
     /// ([`LazyRowIds::len_if_known`]); under tombstones, its ids less them
     /// when they take no I/O ([`LazyRowIds::ids_without_io`]). An in-memory
-    /// run's ids are decoded and cached here, the one way this fails. Passed
-    /// no tombstones, it counts the selection's rows, a bound on its live ones.
+    /// run's ids are decoded and cached here, the one way this fails, and a
+    /// pending residual's matches are known once every piece was compared,
+    /// and computed here under tombstones. Passed no tombstones, it counts the
+    /// selection's rows, a bound on its live ones.
     pub(crate) fn len_if_known(
         &self,
         deleted: Option<&Mask>,
@@ -82,10 +110,14 @@ impl ViewSelection {
     ) -> Result<Option<usize>> {
         Ok(match (self, deleted) {
             (ViewSelection::Exact(selection), _) => Some(selection.live_len(deleted, base_len)),
-            (ViewSelection::Pending(lazy), None) => lazy.len_if_known(),
-            (ViewSelection::Pending(lazy), Some(deleted)) => lazy
+            (ViewSelection::Pending { ids, .. }, None) => ids.len_if_known(),
+            (ViewSelection::Pending { ids, .. }, Some(deleted)) => ids
                 .ids_without_io()?
                 .map(|ids| RowSelection::Ids(ids).live_len(Some(deleted), base_len)),
+            (ViewSelection::Residual(residual), None) => residual.len_if_known(),
+            (ViewSelection::Residual(residual), Some(deleted)) => {
+                Some(RowSelection::Ids(residual.materialized()?).live_len(Some(deleted), base_len))
+            }
         })
     }
 
@@ -96,7 +128,7 @@ impl ViewSelection {
     pub(crate) fn expect_exact(&self) -> &RowSelection {
         match self {
             ViewSelection::Exact(selection) => selection,
-            ViewSelection::Pending(_) => {
+            ViewSelection::Pending { .. } | ViewSelection::Residual(_) => {
                 unreachable!(
                     "a pending selection rides with a serve plan or on a count/window view; \
                      consumers that stream rows only ever see an exact one"
@@ -104,6 +136,14 @@ impl ViewSelection {
             }
         }
     }
+}
+
+/// The rows `offset..offset + limit` of a run `width` rows wide, clamped to
+/// it; `None` when the window holds no row.
+pub(crate) fn window_rows(offset: usize, limit: usize, width: u64) -> Option<Range<u64>> {
+    let start = (offset as u64).min(width);
+    let end = (offset as u64).saturating_add(limit as u64).min(width);
+    (start < end).then_some(start..end)
 }
 
 /// The base rows a view covers, as base row ids; refinements narrow, never

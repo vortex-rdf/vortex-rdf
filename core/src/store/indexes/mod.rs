@@ -14,6 +14,7 @@
 //! (the persisted-child model and the slug registry) are re-exported here,
 //! so callers see one `indexes::` surface.
 
+#[cfg(feature = "file-io")]
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -21,16 +22,15 @@ use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
-use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
-use crate::store::layouts::{OwnedQuadPattern, PatternCodes, QuadPattern, ResolvedLayout};
+use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::ChildReader;
-use crate::store::query::residual::{PendingResidual, ResidualPrefix};
 use crate::store::schema::RowId;
+use crate::store::view::selection::window_rows;
 use resolve::IndexProbe;
 
 pub(crate) mod components;
@@ -436,17 +436,10 @@ pub(crate) enum ResolvedRowIds {
 /// Two consumers racing on first need may both run the recipe; the source is
 /// immutable, so they compute the same ids, whichever stores first wins and
 /// both return the stored buffer. No lock is held across the computation.
-///
-/// Ids a match left pending over an unrestricted view may also name the
-/// pattern they are the matches of
-/// ([`set_matched_pattern`](Self::set_matched_pattern)), with whatever filter
-/// the match left beside them: a chained match on such a view is one match
-/// of both patterns, which never computes these ids.
 #[derive(Clone)]
 pub(crate) struct LazyRowIds {
     cell: Arc<OnceLock<Buffer<RowId>>>,
     source: LazyRowIdSource,
-    matches: Option<Arc<OwnedQuadPattern>>,
 }
 
 /// Where a [`LazyRowIds`]' ids come from, split by backend as the serve plans
@@ -484,95 +477,9 @@ enum LazyRowIdSource {
         child: ChildReader,
         range: Range<u64>,
     },
-    /// In-memory: a residual compare left pending for a view only counted or
-    /// windowed ([`PendingResidual`]), compared whole on first need, or piece
-    /// by piece only as far as a count or a window reaches
-    /// ([`residual_count_capped`](LazyRowIds::residual_count_capped),
-    /// [`residual_window`](LazyRowIds::residual_window)).
-    Residual(Arc<PendingResidual>),
 }
 
 impl LazyRowIds {
-    /// Name `pattern` as the pattern these ids are the matches of over
-    /// every base row: they are the pending selection of a match of
-    /// `pattern` on a view that selected every base row and had no filter,
-    /// the filter that match left (on file) holding beside them.
-    pub(crate) fn set_matched_pattern(&mut self, pattern: OwnedQuadPattern) {
-        self.matches = Some(Arc::new(pattern));
-    }
-
-    /// The pattern these ids are the matches of, set by
-    /// [`set_matched_pattern`](Self::set_matched_pattern).
-    pub(crate) fn matched_pattern(&self) -> Option<Arc<OwnedQuadPattern>> {
-        self.matches.clone()
-    }
-
-    /// Lazy ids of a residual compare left pending.
-    pub(crate) fn from_residual(residual: PendingResidual) -> Self {
-        Self {
-            cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::Residual(Arc::new(residual)),
-            matches: None,
-        }
-    }
-
-    /// What a pending residual's first pieces match, at least `want` live
-    /// rows under `deleted` when there are as many
-    /// ([`PendingResidual::prefix`]); every match once the ids are known, as
-    /// a prefix that compared every piece leaves them. `None` for any other
-    /// source.
-    fn residual_prefix(
-        &self,
-        want: usize,
-        deleted: Option<&Mask>,
-    ) -> Result<Option<ResidualPrefix>> {
-        let LazyRowIdSource::Residual(residual) = &self.source else {
-            return Ok(None);
-        };
-        if let Some(ids) = self.cell.get() {
-            return Ok(Some(ResidualPrefix::whole(ids.clone(), deleted)));
-        }
-        let prefix = residual.prefix(want, deleted)?;
-        if prefix.complete {
-            self.cell.get_or_init(|| prefix.ids.clone());
-        }
-        Ok(Some(prefix))
-    }
-
-    /// `min(live matches, limit)` of a pending residual (`deleted`
-    /// tombstoned), its pieces compared only until `limit` live rows are
-    /// found. `None` for any other source.
-    pub(crate) fn residual_count_capped(
-        &self,
-        limit: usize,
-        deleted: Option<&Mask>,
-    ) -> Result<Option<usize>> {
-        Ok(self
-            .residual_prefix(limit, deleted)?
-            .map(|prefix| prefix.live.min(limit)))
-    }
-
-    /// The live rows `offset..offset + limit` of a pending residual's
-    /// matches (`deleted` tombstoned), in base row order, its pieces compared
-    /// only until the window's last row is found, beside the base's live
-    /// rows as far as they are known: every one once every piece was
-    /// compared, else the ones found, at least `offset + limit`. `None` for
-    /// any other source.
-    pub(crate) fn residual_window(
-        &self,
-        offset: usize,
-        limit: usize,
-        deleted: Option<&Mask>,
-    ) -> Result<Option<(Buffer<RowId>, usize)>> {
-        let Some(prefix) = self.residual_prefix(offset.saturating_add(limit), deleted)? else {
-            return Ok(None);
-        };
-        let live = prefix.live_ids(deleted);
-        let rows = window_rows(offset, limit, live.len() as u64)
-            .map_or(0..0, |rows| rows.start as usize..rows.end as usize);
-        Ok(Some((live.slice(rows), live.len())))
-    }
-
     /// Test-only hook: whether the ids have been computed, so a test can pin
     /// a read answered without them.
     #[cfg(test)]
@@ -588,7 +495,6 @@ impl LazyRowIds {
         Self {
             cell: Arc::new(OnceLock::new()),
             source: LazyRowIdSource::Component { rids, ascending },
-            matches: None,
         }
     }
 
@@ -608,7 +514,6 @@ impl LazyRowIds {
                 constraints,
                 located,
             },
-            matches: None,
         }
     }
 
@@ -623,7 +528,6 @@ impl LazyRowIds {
         Self {
             cell: Arc::new(OnceLock::new()),
             source: LazyRowIdSource::LocatedRun { file, child, range },
-            matches: None,
         }
     }
 
@@ -683,7 +587,6 @@ impl LazyRowIds {
                 .or_else(|| located.as_ref().map(|run| (run.end - run.start) as usize)),
             #[cfg(feature = "file-io")]
             LazyRowIdSource::LocatedRun { range, .. } => Some((range.end - range.start) as usize),
-            LazyRowIdSource::Residual(_) => self.cell.get().map(Buffer::len),
         }
     }
 
@@ -693,9 +596,7 @@ impl LazyRowIds {
     /// read. `None` for a file child's ids not read yet.
     pub(crate) fn ids_without_io(&self) -> Result<Option<Buffer<RowId>>> {
         match &self.source {
-            LazyRowIdSource::Component { .. } | LazyRowIdSource::Residual(_) => {
-                self.materialized().map(Some)
-            }
+            LazyRowIdSource::Component { .. } => self.materialized().map(Some),
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 Ok(self.cell.get().cloned())
@@ -711,9 +612,7 @@ impl LazyRowIds {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component { .. } | LazyRowIdSource::Residual(_) => {
-                return self.materialized();
-            }
+            LazyRowIdSource::Component { .. } => return self.materialized(),
             LazyRowIdSource::IndexChild {
                 child, constraints, ..
             } => scan_index_row_ids(child, constraints).await?,
@@ -736,25 +635,16 @@ impl LazyRowIds {
         }
         let ids = match &self.source {
             LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
-            LazyRowIdSource::Residual(residual) => residual.all_ids()?,
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 unreachable!(
-                    "an in-memory view only ever carries component or residual pending ids, and \
+                    "an in-memory view only ever carries a component's pending ids, and \
                      the file match reads a file run's ids before it folds them"
                 )
             }
         };
         Ok(self.cell.get_or_init(|| ids).clone())
     }
-}
-
-/// The rows `offset..offset + limit` of a run `width` rows wide, clamped to
-/// it; `None` when the window holds no row.
-fn window_rows(offset: usize, limit: usize, width: u64) -> Option<Range<u64>> {
-    let start = (offset as u64).min(width);
-    let end = (offset as u64).saturating_add(limit as u64).min(width);
-    (start < end).then_some(start..end)
 }
 
 /// The pattern resolved against the configured indexes over an in-memory

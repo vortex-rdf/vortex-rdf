@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::io::zone_map::ZONE_ROWS;
-use crate::store::query::matching::zone_hooks;
+use crate::store::scan::residual::zone_hooks;
 
 /// The rows of [`zoned_quads`]: four zones and part of a fifth.
 const ROWS: usize = 4 * ZONE_ROWS + 1_000;

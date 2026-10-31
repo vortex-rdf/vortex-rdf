@@ -78,10 +78,8 @@ impl VortexRdfStore {
         }
         // A residual compare left pending compares its pieces only until
         // `limit` live rows are found.
-        if let ViewSelection::Pending(lazy) = &self.quads.selection
-            && let Some(count) = lazy.residual_count_capped(limit, self.quads.deleted.as_ref())?
-        {
-            return Ok(count);
+        if let ViewSelection::Residual(residual) = &self.quads.selection {
+            return residual.count_capped(limit, self.quads.deleted.as_ref());
         }
         #[cfg(feature = "file-io")]
         if let Some((file, filter)) = self.quads.pending_filter() {

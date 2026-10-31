@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::io::zone_map::ZONE_ROWS;
-use crate::store::query::residual::{FIRST_PIECE_ROWS, residual_hooks};
+use crate::store::view::pending::{FIRST_PIECE_ROWS, residual_hooks};
 
 /// The rows of [`residual_quads`]: three pieces, the last of a thousand rows.
 const ROWS: usize = 5 * ZONE_ROWS + 1_000;

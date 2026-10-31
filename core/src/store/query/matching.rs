@@ -1,38 +1,34 @@
 //! Pattern matching: composing a pattern's restrictions into derived views
 //! over the base and the tail.
 
+use std::sync::Arc;
+
 use crate::debug;
 use crate::error::Result;
-use crate::io::zone_map::ZONE_ROWS;
-use crate::session::VORTEX_SESSION;
 use crate::store::array::{
     bool_array_to_mask, column_is_sorted, into_struct_array, search_sorted_bounds, unsigned_value,
 };
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
-use crate::store::indexes::{
-    IndexResolution, LazyRowIds, ResolvedRowIds, resolve_indexes_in_memory,
-};
+use crate::store::indexes::{IndexResolution, ResolvedRowIds, resolve_indexes_in_memory};
 use crate::store::layouts::{Constraints, OwnedQuadPattern, PatternCodes, QuadPattern, TermRef};
 use crate::store::probes::StructProbes;
-use crate::store::query::residual::PendingResidual;
-use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
+use crate::store::scan::residual;
+use crate::store::scan::typed_eq::typed_positions;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_exprs, file_filter, file_reads, subject_runs};
 use crate::store::schema;
+use crate::store::view::pending::{FIRST_PIECE_ROWS, PendingResidual};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{Backend, MemoryBase, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use web_time::Instant;
 
+use vortex_array::ArrayRef;
 use vortex_array::arrays::StructArray;
-use vortex_array::arrays::constant::ConstantArray;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::scalar::Scalar;
-use vortex_array::scalar_fn::fns::operators::Operator;
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
 #[cfg(feature = "file-io")]
@@ -69,6 +65,14 @@ impl IdsNeed {
     /// Whether the view is only counted, windowed or kept.
     pub(crate) fn counts_or_windows(self) -> bool {
         matches!(self, IdsNeed::CountOrWindow { .. })
+    }
+
+    /// Whether a residual compare over `rows` selected rows is left pending
+    /// ([`PendingResidual`]): only a count or a window that needs fewer rows
+    /// than the selection holds can stop early, and only over more rows than
+    /// the first piece holds.
+    fn defers_residual(self, rows: usize) -> bool {
+        matches!(self, IdsNeed::CountOrWindow { reach } if reach < rows) && rows > FIRST_PIECE_ROWS
     }
 }
 
@@ -163,7 +167,7 @@ impl VortexRdfStore {
             debug::step!(t, "[match_pattern] Tail matched by typed positions");
             return Ok(carry(tail.selection.clone().refine(&mask)));
         }
-        let mask = Self::mask_for(&applied, &eqs)?;
+        let mask = residual::mask_for(&applied, &eqs)?;
         let matched = carry(tail.selection.clone().refine(&bool_array_to_mask(mask)?));
         debug::step!(t, "[match_pattern] Tail matched by mask scan");
         Ok(matched)
@@ -204,7 +208,7 @@ impl VortexRdfStore {
     ) -> Result<bool> {
         let row = row as usize;
         let one = rows.slice(row..row + 1)?;
-        Ok(bool_array_to_mask(Self::mask_for(&one, eqs)?)?.all_true())
+        Ok(bool_array_to_mask(residual::mask_for(&one, eqs)?)?.all_true())
     }
 
     /// Match the pattern against the base alone, composing its restrictions
@@ -215,8 +219,10 @@ impl VortexRdfStore {
         // A view whose base still holds the pending matches of one pattern
         // over every row is matched as one match of both patterns, which
         // never computes those ids.
-        if let ViewSelection::Pending(lazy) = &self.quads.selection
-            && let Some(first) = lazy.matched_pattern()
+        if let ViewSelection::Pending {
+            matches: Some(first),
+            ..
+        } = &self.quads.selection
             && let Some(both) = first.and(pattern)
         {
             return self.match_both(both, need).await;
@@ -247,12 +253,10 @@ impl VortexRdfStore {
         // keeping the pattern.
         if every_row
             && need == IdsNeed::Rows
-            && let ViewSelection::Pending(lazy) = &mut matched.quads.selection
-            && lazy
-                .len_if_known()
-                .is_none_or(|rows| rows >= CHAIN_MIN_ROWS)
+            && let ViewSelection::Pending { ids, matches } = &mut matched.quads.selection
+            && ids.len_if_known().is_none_or(|rows| rows >= CHAIN_MIN_ROWS)
         {
-            lazy.set_matched_pattern(OwnedQuadPattern::of(pattern));
+            *matches = Some(Arc::new(OwnedQuadPattern::of(pattern)));
         }
         Ok(matched)
     }
@@ -440,7 +444,7 @@ impl VortexRdfStore {
             t,
             "[match_pattern] In-memory view built (serve: {}, pending ids: {})",
             serve.is_some(),
-            matches!(selection, ViewSelection::Pending(_))
+            !matches!(selection, ViewSelection::Exact(_))
         );
         Ok(self.derived(
             self.quads.in_memory_with(memory, selection, serve),
@@ -538,7 +542,7 @@ impl VortexRdfStore {
 
     /// The residual column filter: `selection` narrowed to its rows matching
     /// every role the fast paths left bound in `pat`, compared column-wise
-    /// over those rows only ([`residual_rows`](Self::residual_rows)). A view
+    /// over those rows only ([`residual_rows`](residual::residual_rows)). A view
     /// only counted or windowed short of the selection's rows (`need`) leaves
     /// a compare over more rows than one piece holds pending instead
     /// ([`PendingResidual`]), compared only as far as the count or the window
@@ -558,107 +562,13 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
-        if PendingResidual::defers(need, selection.len(memory.base.len())) {
+        if need.defers_residual(selection.len(memory.base.len())) {
             debug::step!(t, "[match_pattern] In-memory residual left pending");
             let pending = PendingResidual::new(memory.clone(), selection, eqs);
-            return Ok(Some(ViewSelection::Pending(LazyRowIds::from_residual(
-                pending,
-            ))));
+            return Ok(Some(ViewSelection::Residual(Arc::new(pending))));
         }
-        let narrowed = Self::residual_rows(memory, selection, &eqs, t)?;
+        let narrowed = residual::residual_rows(memory, selection, &eqs, t)?;
         Ok(Some(ViewSelection::Exact(narrowed)))
-    }
-
-    /// The rows of `selection` (of `memory`'s base) where every equality of
-    /// `eqs` holds: the zones whose code bounds cannot hold a constrained
-    /// code skipped, then the typed fast path or the mask scan over the rows
-    /// left.
-    pub(crate) fn residual_rows(
-        memory: &MemoryBase,
-        selection: RowSelection,
-        eqs: &[(&'static str, Scalar)],
-        t: Option<Instant>,
-    ) -> Result<RowSelection> {
-        let MemoryBase {
-            base,
-            probes,
-            zones,
-            ..
-        } = memory;
-        let struct_arr = into_struct_array(base.clone())?;
-        // The zones whose code bounds cannot hold a constrained code are
-        // skipped, as a file's zone maps skip them. Every row or a range has
-        // the zone runs left inside it compared run by run, each a slice of
-        // the base, with no id list of the rows left (those runs are many
-        // where a code's zones scatter); an id list keeps only its ids in them.
-        let mut selection = selection;
-        if selection.len(base.len()) > ZONE_ROWS
-            && let Some(runs) = zones.runs_holding(eqs, base.len())
-        {
-            #[cfg(test)]
-            zone_hooks::note_narrowed();
-            debug::step!(t, "[match_pattern] In-memory narrowed by zone bounds");
-            match selection.clip_runs(&runs) {
-                Some(runs) => {
-                    let ids = Self::runs_matching(base, &runs, eqs)?;
-                    return Ok(RowSelection::from_ids(vortex_buffer::Buffer::from(ids)));
-                }
-                None => selection = selection.intersect_runs(&runs),
-            }
-            if selection.is_empty(base.len()) {
-                return Ok(selection);
-            }
-        }
-        // Typed fast path: residual equalities over canonical code columns
-        // (Dictionary layout) become slice loops yielding exact base ids,
-        // with no slice/compare/mask pipeline, and a probe-bound column reads
-        // through the store's own probe. Only the selection's rows are
-        // tested, so the ids are already the intersection.
-        Ok(
-            match typed_residual_ids(
-                &struct_arr,
-                &selection,
-                base.len(),
-                eqs,
-                Some((base, probes)),
-            ) {
-                Some(ids) => {
-                    debug::step!(
-                        t,
-                        "[match_pattern] In-memory narrowed by typed residual scan"
-                    );
-                    RowSelection::Ids(ids)
-                }
-                None => {
-                    let mask = Self::mask_for(&selection.apply(base)?, eqs)?;
-                    let narrowed = selection.refine(&bool_array_to_mask(mask)?);
-                    debug::step!(t, "[match_pattern] In-memory narrowed by mask scan");
-                    narrowed
-                }
-            },
-        )
-    }
-
-    /// The base rows of `runs` that satisfy `eqs`, ascending: each run's
-    /// slice of the base compared on the constrained columns alone
-    /// ([`mask_for`](Self::mask_for)).
-    fn runs_matching(
-        base: &ArrayRef,
-        runs: &[std::ops::Range<u64>],
-        eqs: &[(&'static str, Scalar)],
-    ) -> Result<Vec<u64>> {
-        let mut ids = Vec::new();
-        for run in runs {
-            let rows = base.slice(run.start as usize..run.end as usize)?;
-            match bool_array_to_mask(Self::mask_for(&rows, eqs)?)?.bit_buffer() {
-                vortex_mask::AllOr::All => ids.extend(run.clone()),
-                vortex_mask::AllOr::None => {}
-                vortex_mask::AllOr::Some(bits) => {
-                    bits.for_each_set_index(|i| ids.push(run.start + i as u64));
-                }
-            }
-        }
-        Ok(ids)
     }
 
     /// The file backend of [`match_base`](Self::match_base), `base` the
@@ -771,8 +681,8 @@ impl VortexRdfStore {
                     t,
                     "[match_pattern] File index {}",
                     match (&selection, serve.is_some()) {
-                        (ViewSelection::Pending(_), true) => "resolved (served, ids pending)",
-                        (ViewSelection::Pending(_), false) => {
+                        (ViewSelection::Pending { .. }, true) => "resolved (served, ids pending)",
+                        (ViewSelection::Pending { .. } | ViewSelection::Residual(_), _) => {
                             "located a run (ids pending for a count)"
                         }
                         (ViewSelection::Exact(_), _) if eager => "resolved (eager ids)",
@@ -845,7 +755,7 @@ impl VortexRdfStore {
             "[match_pattern] File view built (filter: {}, serve: {}, pending ids: {})",
             filter.is_some(),
             serve.is_some(),
-            matches!(selection, ViewSelection::Pending(_))
+            !matches!(selection, ViewSelection::Exact(_))
         );
         // The more-restricted file view, whose rows the next scan reads. It
         // shares the file, and so the index children further chained matches
@@ -914,39 +824,6 @@ impl VortexRdfStore {
 
     // ── pattern matching helpers ─────────────────────────────────────────────
 
-    /// A boolean mask, one bit per row of `array` in its own order, of the
-    /// rows that satisfy `eqs`: the per-column equalities a pattern compiled
-    /// to under the layout of `array`'s rows (the store's for the base, the
-    /// tail's for the tail; see [`Tail::layout_for`]). The mask is
-    /// positional, so a caller holding a view maps it back to base row ids
-    /// with [`RowSelection::refine`]. The fallback of the typed comparison
-    /// paths: callers pass in the constraints they compiled to try those.
-    fn mask_for(array: &ArrayRef, eqs: &[(&'static str, Scalar)]) -> Result<ArrayRef> {
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = array.clone().execute::<StructArray>(&mut ctx)?;
-
-        // One equality comparison per constrained column, ANDed.
-        let mut mask: Option<ArrayRef> = None;
-        for (field, value) in eqs {
-            let col = struct_arr.unmasked_field_by_name(field)?;
-            // Cast to the column's dtype, so a numeric column such as
-            // `o_kind` compares against a scalar of its type and nullability.
-            let scalar = value.cast(col.dtype())?;
-            let rhs = ConstantArray::new(scalar, col.len()).into_array();
-            let m = col.binary(rhs, Operator::Eq)?;
-            mask = Some(match mask.take() {
-                Some(prev) => prev.binary(m, Operator::And)?,
-                None => m,
-            });
-        }
-        Ok(match mask {
-            Some(mask) => mask,
-            // An unconstrained pattern matches every row. Both callers gate on
-            // a non-empty constraint set, so the fold always starts.
-            None => ConstantArray::new(Scalar::from(true), struct_arr.len()).into_array(),
-        })
-    }
-
     /// Whether the store holds a quad equal to `quad`, tombstoned rows counting
     /// as absent: one fully-bound `match_pattern` over the base and the tail,
     /// through whatever fast path applies, read only as far as its first row
@@ -978,7 +855,7 @@ fn fold_row_ids(
     defer: bool,
 ) -> Result<ViewSelection> {
     Ok(match row_ids {
-        ResolvedRowIds::Lazy(lazy) if defer => ViewSelection::Pending(lazy),
+        ResolvedRowIds::Lazy(lazy) if defer => ViewSelection::pending(lazy),
         ResolvedRowIds::Lazy(lazy) => {
             ViewSelection::Exact(existing.intersect_ids(lazy.materialized()?))
         }
@@ -1051,26 +928,5 @@ pub(crate) mod tail_hooks {
     /// The tail matches answered by comparing rows on this thread so far.
     pub(crate) fn scanned() -> usize {
         SCANNED.get()
-    }
-}
-
-/// Test hook: how many in-memory residual filters this thread narrowed to
-/// the zones their codes' bounds hold.
-#[cfg(test)]
-pub(crate) mod zone_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static NARROWED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one residual filter narrowed by zone bounds.
-    pub(super) fn note_narrowed() {
-        NARROWED.set(NARROWED.get() + 1);
-    }
-
-    /// The residual filters narrowed by zone bounds on this thread so far.
-    pub(crate) fn narrowed() -> usize {
-        NARROWED.get()
     }
 }

@@ -76,7 +76,7 @@ impl VortexRdfStore {
         #[cfg(feature = "file-io")]
         let base_live = if offset == 0
             && let Some(FileBase { serve: Some(_), .. }) = self.quads.file()
-            && let ViewSelection::Pending(lazy) = &self.quads.selection
+            && let ViewSelection::Pending { ids: lazy, .. } = &self.quads.selection
             && lazy.len_if_known().is_none()
         {
             lazy.materialized_async().await?;

@@ -305,7 +305,11 @@ fn selection_kind(selection: &ViewSelection) -> SelectionKind {
         ViewSelection::Exact(RowSelection::All) => SelectionKind::All,
         ViewSelection::Exact(RowSelection::Range(_)) => SelectionKind::Range,
         ViewSelection::Exact(RowSelection::Ids(_)) => SelectionKind::Ids,
-        ViewSelection::Pending(_) => SelectionKind::PendingIndexRun,
+        // A pending residual sits only on a view built to be counted or
+        // windowed, which no caller holds.
+        ViewSelection::Pending { .. } | ViewSelection::Residual(_) => {
+            SelectionKind::PendingIndexRun
+        }
     }
 }
 

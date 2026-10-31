@@ -229,7 +229,7 @@ impl VortexRdfStore {
         }
         // Codes off the index's run: no row ids computed, no gather.
         #[cfg(feature = "file-io")]
-        if let ViewSelection::Pending(_) = &self.quads.selection
+        if let ViewSelection::Pending { .. } = &self.quads.selection
             && let Some(FileBase {
                 serve: Some(plan), ..
             }) = self.quads.file()
