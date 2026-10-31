@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.TreeSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -26,8 +27,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * {@code iterateQuads} and {@code matchCodeChunks}: the oracle's rows in order at every chunk size, and the lifetime
- * of their native streams, freed at the end, on close, with their store, and when forgotten, across threads.
+ * {@code iterateQuads} and {@code matchCodeChunks}: the rows of {@code quads()} in its order at every chunk size (the
+ * oracle's rows, in the oracle's order but on a pattern the copy index serves), and the lifetime of their native
+ * streams, freed at the end, on close, with their store, and when forgotten, across threads.
  */
 class IteratorTest {
 	@BeforeAll
@@ -41,6 +43,21 @@ class IteratorTest {
 			out.add(VortexStoreTest.key(rows.next()));
 		}
 		return out;
+	}
+
+	/**
+	 * The rows a stream of pattern {@code p} must yield, in order: {@code quads()}'s, whose rows are the oracle's, in
+	 * the oracle's order on a store without the copy index (a pattern the copy index serves reads in its order).
+	 */
+	private static List<String> readOrder(VortexStore store, String name, String[] p, String tag) {
+		List<String> want = ChunkedTransferTest.joined(store.quads(p[0], p[1], p[2], p[3]));
+		List<String> oracle = ChunkedTransferTest.inOracleOrder(p);
+		assertEquals(new TreeSet<>(oracle), new TreeSet<>(want), tag + ": the oracle's rows");
+		assertEquals(oracle.size(), want.size(), tag + ": each row once");
+		if (!name.equals("copy")) {
+			assertEquals(oracle, want, tag + ": the oracle's order");
+		}
+		return want;
 	}
 
 	/** The rows of a code-chunk stream, spelled through {@code decode}. */
@@ -62,13 +79,14 @@ class IteratorTest {
 
 	@ParameterizedTest
 	@ValueSource(strings = { "dictionary", "copy", "reference", "default", "typed" })
-	void iteratorsYieldTheOracleInOrder(String name) {
+	void iteratorsYieldTheReadInOrder(String name) {
 		for (boolean inMemory : new boolean[] { false, true }) {
 			try (VortexStore store = VortexStoreTest.open(name, inMemory)) {
 				for (String[] p : VortexStoreTest.patterns()) {
-					List<String> want = ChunkedTransferTest.inOracleOrder(p);
+					String read = name + " inMemory=" + inMemory + " " + Arrays.toString(p);
+					List<String> want = readOrder(store, name, p, read);
 					for (int batchRows : new int[] { 1, 7, VortexStore.DEFAULT_BATCH_ROWS }) {
-						String tag = name + " inMemory=" + inMemory + " " + Arrays.toString(p) + " batch " + batchRows;
+						String tag = read + " batch " + batchRows;
 						try (QuadIterator rows = store.iterateQuads(p[0], p[1], p[2], p[3], batchRows)) {
 							assertEquals(want, drained(rows), tag);
 						}
@@ -81,7 +99,7 @@ class IteratorTest {
 
 	@ParameterizedTest
 	@ValueSource(strings = { "dictionary", "copy", "reference" })
-	void codeChunksYieldTheOracleInOrder(String name) {
+	void codeChunksYieldTheReadInOrder(String name) {
 		try (VortexStore store = VortexStoreTest.open(name, false)) {
 			TermDictionary dict = store.dictionary().get();
 			long terms = dict.size();
@@ -92,7 +110,7 @@ class IteratorTest {
 					long code = p[i] == null ? VortexStore.NONE : dict.encode(p[i]);
 					pattern[i] = p[i] != null && code == VortexStore.NONE ? terms + 7 : code;
 				}
-				List<String> want = ChunkedTransferTest.inOracleOrder(p);
+				List<String> want = readOrder(store, name, p, name + " " + Arrays.toString(p));
 				for (int maxRows : new int[] { 1, 5, 4_096 }) {
 					String tag = name + " " + Arrays.toString(p) + " maxRows " + maxRows;
 					try (CodeChunks chunks = store.matchCodeChunks(pattern[0], pattern[1], pattern[2], pattern[3], 7)) {
