@@ -10,6 +10,8 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinView, VarBinViewArray};
 use vortex_array::scalar::Scalar;
 
+use crate::observe::observe;
+use crate::store::array::unsigned_value;
 use crate::store::probes::StructProbes;
 use crate::store::schema::TermCode;
 use crate::store::view::selection::RowSelection;
@@ -25,7 +27,7 @@ enum Needle {
 
 impl Needle {
     fn from_scalar(scalar: &Scalar) -> Option<Self> {
-        if let Ok(code) = TermCode::try_from(scalar) {
+        if let Some(code) = unsigned_value(scalar) {
             return Some(Needle::Code(code));
         }
         Some(Needle::Str(scalar.as_utf8_opt()?.value()?.to_string()))
@@ -140,13 +142,11 @@ impl<'a> TypedEq<'a> {
                 }
                 note(TYPED_EQ_PROBE, col.len());
                 if let Some(probe) = cached {
-                    #[cfg(test)]
-                    probe_hooks::note(true);
+                    observe!(ProbeBound { cached: true });
                     return Some(TypedEq::CodeProbe(ColumnProbe::Cached(probe), *code));
                 }
                 let probe = vortex_rdf_encoded_search::SortedProbe::resolve(col)?;
-                #[cfg(test)]
-                probe_hooks::note(false);
+                observe!(ProbeBound { cached: false });
                 Some(TypedEq::CodeProbe(ColumnProbe::Resolved(probe), *code))
             }
             Needle::Str(s) => {
@@ -211,43 +211,26 @@ impl<'a> TypedEq<'a> {
     }
 }
 
-/// Test hook: how this thread's typed scans bound their probe-read columns,
-/// and how its in-memory sorted searches (the prefix probe's subject search,
-/// an index component's run search) read theirs — through a probe the store
-/// had cached, or searched for the call.
-#[cfg(test)]
-pub(crate) mod probe_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static CACHED: Cell<usize> = const { Cell::new(0) };
-        static RESOLVED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one probe-read column bound or searched through the cache, or
-    /// for the call.
-    pub(crate) fn note(cached: bool) {
-        let cell = if cached { &CACHED } else { &RESOLVED };
-        cell.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The `(cached, resolved)` probe binds and searches on this thread so
-    /// far.
-    pub(crate) fn binds() -> (usize, usize) {
-        (CACHED.with(Cell::get), RESOLVED.with(Cell::get))
-    }
-}
-
 /// Selection size above which the typed row loop declines to the vectorized
-/// mask scan: always for a lone constraint, and for any set that binds a
-/// column through an encoded-search probe (see [`typed_residual_ids`]).
+/// mask scan for a lone constraint (see [`typed_residual_ids`]).
 const TYPED_EQ_MAX_ROWS: usize = 4_096;
+
+/// Selection size above which the typed row loop declines to the mask scan
+/// when it binds a column through an encoded-search probe, whatever the
+/// constraints: such a column is read a row at a time, each a point read,
+/// and over more rows than this they cost more than the mask scan's whole
+/// call. Measured over a `from_bytes` store's code columns, the two meet
+/// near 256 rows of a range and near 512 of ids spread across the base,
+/// which the mask scan gathers first.
+const TYPED_PROBE_MAX_ROWS: usize = 256;
 
 /// The typed residual filter over a store's base: when every residual
 /// equality binds a typed column (see [`TypedEq`]), the rows the selection
 /// covers are tested with direct loads and the surviving base row ids
 /// returned. `None` when a constraint cannot bind, or the selection is too
-/// wide for the bound columns ([`TYPED_EQ_MAX_ROWS`]); the caller then runs
+/// wide for the bound columns ([`TYPED_EQ_MAX_ROWS`] for a lone constraint,
+/// [`TYPED_PROBE_MAX_ROWS`] for any set with a probe-bound column); the
+/// caller then runs
 /// the mask scan, whose per-call pipeline (a slice through the optimizer,
 /// constant compares, a boolean canonicalization) is the fixed cost this path
 /// avoids. A probe-read column reads through the store's probe in `probes`
@@ -277,8 +260,8 @@ pub(crate) fn typed_residual_ids(
     let canonicalize = selected.saturating_mul(eqs.len()) >= base_len;
     let cols = TypedEq::bind(struct_arr, eqs, &needles, canonicalize, probes)?;
     // A probe-bound column (no canonical form to reach for) is read per row,
-    // so a wide selection over one goes to the mask scan.
-    if cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..))) && wide {
+    // so all but a narrow selection over one goes to the mask scan.
+    if selected > TYPED_PROBE_MAX_ROWS && cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..))) {
         return None;
     }
     let ids: Vec<u64> = if let Some(codes) = TypedEq::code_views(&cols) {
@@ -399,15 +382,16 @@ mod tests {
         pairs.iter().map(|&(f, v)| (f, Scalar::from(v))).collect()
     }
 
-    /// The selection-size gate, by `(constraints, rows, selection, want)`:
-    /// an encoded column binds through the probe and, below the gate,
-    /// filters exactly like the canonical ground truth. A probe-bound
-    /// constraint keeps the gate even with a second constraint beside it,
-    /// and a lone slice-bound constraint keeps it too: a wide selection
-    /// declines to the mask scan (`None`), a narrow one is served.
+    /// The selection-size gates, by `(constraints, rows, selection, want)`:
+    /// an encoded column binds through the probe and, up to
+    /// [`TYPED_PROBE_MAX_ROWS`] selected rows, filters exactly like the
+    /// canonical ground truth, a second constraint beside it or not; past
+    /// them it declines to the mask scan (`None`). A lone slice-bound
+    /// constraint keeps its own gate, [`TYPED_EQ_MAX_ROWS`].
     #[test]
     fn typed_eq_gates_the_selection_size() {
         let wide = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
+        let probe_max = TYPED_PROBE_MAX_ROWS as u64;
         let both = |range: std::ops::Range<u64>| -> Option<Vec<u64>> {
             Some(range.filter(|i| i % 7 == 3 && i % 11 == 10).collect())
         };
@@ -417,11 +401,30 @@ mod tests {
         let probe_bound: &[(&'static str, TermCode)] = &[("p", 3), ("o", 10)];
         let slice_bound: &[(&'static str, TermCode)] = &[("p", 3)];
         for (constraints, rows, selection, want) in [
-            (probe_bound, 1000, RowSelection::All, both(0..1000)),
+            (probe_bound, 200, RowSelection::All, both(0..200)),
+            (probe_bound, 1000, RowSelection::All, None),
             (probe_bound, wide, RowSelection::All, None),
             (probe_bound, wide, RowSelection::Range(10..90), both(10..90)),
+            (
+                probe_bound,
+                wide,
+                RowSelection::Range(5..5 + probe_max),
+                both(5..5 + probe_max),
+            ),
+            (
+                probe_bound,
+                wide,
+                RowSelection::Range(5..6 + probe_max),
+                None,
+            ),
             (slice_bound, wide, RowSelection::All, None),
             (slice_bound, wide, RowSelection::Range(0..100), lone(0..100)),
+            (
+                slice_bound,
+                wide,
+                RowSelection::Range(0..1000),
+                lone(0..1000),
+            ),
         ] {
             let sa = mixed_struct(rows);
             let ids = typed_residual_ids(&sa, &selection, rows as usize, &eqs(constraints), None);

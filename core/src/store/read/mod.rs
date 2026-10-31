@@ -3,6 +3,8 @@
 
 pub(crate) mod chunks;
 pub(crate) mod count;
+#[cfg(feature = "file-io")]
+pub(crate) mod file_plan;
 pub(crate) mod metadata;
 pub(crate) mod quads;
 pub(crate) mod rows;

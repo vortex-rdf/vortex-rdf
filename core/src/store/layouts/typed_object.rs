@@ -4,11 +4,12 @@
 //!
 //! [`LayoutStrategy::TypedObject`]: super::LayoutStrategy::TypedObject
 
-use oxrdf::{BlankNode, Literal, NamedNode, Quad, Term};
+use oxrdf::{BlankNodeRef, LiteralRef, NamedNodeRef, Quad, Term, TermRef};
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
+use crate::common::quad::push_spelling;
 use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::common::vocab::XSD_STRING;
 use crate::error::{Result, VortexRdfError};
@@ -82,33 +83,31 @@ pub(crate) fn decompose_object(term: &Term) -> (u8, String, Option<String>, Opti
     }
 }
 
-/// The term a row's typed sub-column values recompose into; an unknown
-/// `kind` is a `Deserialization` error.
-fn compose_object(
+/// The term a row's typed sub-column values recompose into, borrowing them;
+/// an unknown `kind` is a `Deserialization` error.
+fn compose_object<'a>(
     kind: u8,
-    value: &str,
-    datatype: Option<&str>,
-    lang: Option<&str>,
-) -> Result<Term> {
+    value: &'a str,
+    datatype: Option<&'a str>,
+    lang: Option<&'a str>,
+) -> Result<TermRef<'a>> {
     // Trusted decode, as for `Trust::Stored` spellings: the sub-columns hold
     // terms decomposed from validated terms when the store was built, so the
     // precondition is a store this crate wrote or the caller trusts, and the
     // checked constructors' re-validation (a full `oxiri::Iri::parse` per
     // IRI) is skipped.
     match kind {
-        0 => Ok(Term::NamedNode(NamedNode::new_unchecked(value))),
-        1 => Ok(Term::BlankNode(BlankNode::new_unchecked(value))),
-        2 => Ok(Term::Literal(Literal::new_simple_literal(value))),
-        3 => Ok(Term::Literal(
-            Literal::new_language_tagged_literal_unchecked(value, lang.unwrap_or("")),
-        )),
-        4 => {
-            let dt_str = datatype.unwrap_or(XSD_STRING);
-            Ok(Term::Literal(Literal::new_typed_literal(
-                value,
-                NamedNode::new_unchecked(dt_str),
-            )))
+        0 => Ok(NamedNodeRef::new_unchecked(value).into()),
+        1 => Ok(BlankNodeRef::new_unchecked(value).into()),
+        2 => Ok(LiteralRef::new_simple_literal(value).into()),
+        3 => {
+            Ok(LiteralRef::new_language_tagged_literal_unchecked(value, lang.unwrap_or("")).into())
         }
+        4 => Ok(LiteralRef::new_typed_literal(
+            value,
+            NamedNodeRef::new_unchecked(datatype.unwrap_or(XSD_STRING)),
+        )
+        .into()),
         _ => Err(VortexRdfError::Deserialization(format!(
             "Unknown object kind: {}",
             kind
@@ -118,7 +117,7 @@ fn compose_object(
 
 /// The four object sub-columns of a chunk, executed to their canonical
 /// arrays.
-struct ObjectColumns {
+pub(crate) struct ObjectColumns {
     kind: PrimitiveArray,
     value: VarBinViewArray,
     datatype: Option<VarBinViewArray>,
@@ -129,7 +128,7 @@ impl ObjectColumns {
     /// Load the sub-columns of `struct_arr`. `o_kind` and `o_value` are
     /// required; the nullable `o_datatype`/`o_lang` read as all-null when
     /// they cannot be read as string columns.
-    fn load(struct_arr: &StructArray, ctx: &mut ExecutionCtx) -> Result<Self> {
+    pub(crate) fn load(struct_arr: &StructArray, ctx: &mut ExecutionCtx) -> Result<Self> {
         Ok(Self {
             kind: field_as::<PrimitiveArray>(struct_arr, COL_O_KIND, ctx)?,
             value: field_as::<VarBinViewArray>(struct_arr, COL_O_VALUE, ctx)?,
@@ -139,7 +138,7 @@ impl ObjectColumns {
     }
 
     /// Row-level readers over the loaded columns.
-    fn reader(&self) -> ObjectReader<'_> {
+    pub(crate) fn reader(&self) -> ObjectReader<'_> {
         ObjectReader {
             kinds: self.kind.as_slice::<u8>(),
             values: StrColReader::new(&self.value),
@@ -151,21 +150,29 @@ impl ObjectColumns {
 
 /// Per-row access to an [`ObjectColumns`], recomposing each row's object
 /// term.
-struct ObjectReader<'a> {
+pub(crate) struct ObjectReader<'a> {
     kinds: &'a [u8],
     values: StrColReader<'a>,
     datatypes: Option<StrColReader<'a>>,
     langs: Option<StrColReader<'a>>,
 }
 
-impl ObjectReader<'_> {
-    fn term_at(&self, i: usize) -> Result<Term> {
+impl<'a> ObjectReader<'a> {
+    /// Row `i`'s object term, borrowing the columns.
+    fn term_at(&self, i: usize) -> Result<TermRef<'a>> {
         compose_object(
             self.kinds[i],
             self.values.str_at(i),
             nullable_str_at(self.datatypes.as_ref(), i),
             nullable_str_at(self.langs.as_ref(), i),
         )
+    }
+
+    /// Append row `i`'s object term to `out` in N-Triples form, the spelling
+    /// a [`RawQuad`] holds, without building the term.
+    pub(crate) fn push_spelling(&self, i: usize, out: &mut String) -> Result<()> {
+        push_spelling(out, self.term_at(i)?);
+        Ok(())
     }
 }
 
@@ -184,8 +191,14 @@ pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let columns = ObjectColumns::load(struct_arr, &mut ctx)?;
     let objects = columns.reader();
+    // Each spelling goes into one buffer and out as one exact copy.
+    let mut spelling = String::new();
     (0..struct_arr.len())
-        .map(|i| Ok(objects.term_at(i)?.to_string()))
+        .map(|i| {
+            spelling.clear();
+            objects.push_spelling(i, &mut spelling)?;
+            Ok(spelling.as_str().to_owned())
+        })
         .collect()
 }
 
@@ -223,7 +236,7 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
             Ok(Quad::new(
                 subject(subjects.str_at(i), Trust::Stored)?,
                 named_node(predicates.str_at(i), Trust::Stored)?,
-                objects.term_at(i)?,
+                objects.term_at(i)?.into_owned(),
                 graph_name(graphs.str_at(i), Trust::Stored)?,
             ))
         })

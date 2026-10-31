@@ -140,9 +140,12 @@ pub(super) fn lang_matches(tag: &str, range: &str) -> Verdict {
     if !plain(range) || !plain(tag) {
         return Verdict::Unknown;
     }
-    let tag = tag.to_ascii_lowercase();
-    let range = range.to_ascii_lowercase();
+    // Both are ASCII here, so comparing them ignoring ASCII case is
+    // comparing them lower-cased, with no lower-cased copy made.
+    let (tag, range) = (tag.as_bytes(), range.as_bytes());
     Verdict::from(
-        tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-')),
+        tag.len() >= range.len()
+            && tag[..range.len()].eq_ignore_ascii_case(range)
+            && tag.get(range.len()).is_none_or(|&b| b == b'-'),
     )
 }

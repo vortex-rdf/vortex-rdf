@@ -85,6 +85,20 @@ impl<'a> DeltaNode<'a> {
         self.block(physical / 1024)[physical % 1024]
     }
 
+    /// The values at `start..start + out.len()`, copied block by block from
+    /// the decoded blocks.
+    pub(crate) fn read_into(&self, start: usize, out: &mut [u64]) {
+        let mut physical = self.offset + start;
+        let mut done = 0;
+        while done < out.len() {
+            let (b, at) = (physical / 1024, physical % 1024);
+            let take = (1024 - at).min(out.len() - done);
+            out[done..done + take].copy_from_slice(&self.block(b)[at..at + take]);
+            done += take;
+            physical += take;
+        }
+    }
+
     fn block(&self, b: usize) -> &[u64; 1024] {
         self.blocks[b].get_or_init(|| {
             Box::new(match self.width {

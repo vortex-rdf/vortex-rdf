@@ -212,7 +212,6 @@ fn probe_path_quads(n_subjects: usize) -> Vec<Quad> {
 /// row scan.
 #[tokio::test]
 async fn test_file_backed_subject_chunk_probe_matches_memory() {
-    use crate::store::scan::file_scans::scan_hooks;
     let quads = probe_path_quads(2000);
     let (_dir, path) = write_store_file(
         quads.clone(),
@@ -249,11 +248,11 @@ async fn test_file_backed_subject_chunk_probe_matches_memory() {
         ] {
             let got = matched_view(&store, Some(&s), pp, po, pg).await;
             let want = matched_view(&memory, Some(&s), pp, po, pg).await;
-            let scans = scan_hooks::scans();
+            let rec = Recorder::start();
             let got = view_strings(&got).await;
             assert_eq!(
-                scan_hooks::scans(),
-                scans,
+                rec.count(&Event::RowScan),
+                0,
                 "scanned on subject {s} pattern ({pp:?}, {po:?}, {pg:?})"
             );
             assert_eq!(
@@ -853,5 +852,103 @@ async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], s
     assert!(
         deleted.locate_codes(s, 0, None).await.unwrap().is_none(),
         "{tag}: tombstones"
+    );
+}
+
+/// Object codes of 12 bits but for a few past them, which the writer packs at
+/// 12 bits with patches: an `O` or `PO` match over the mapped file compares a
+/// zone-pruned slice of the object leaf through the store session's kernel
+/// ([`crate::kernels`]), and answers as the store built in memory, whose code
+/// columns pack at their full width without patches, does.
+#[tokio::test]
+async fn test_patched_object_codes_compare_through_the_kernel() {
+    use crate::kernels::Kernel;
+
+    // 4,096 literal objects, each 8,192-row zone holding its own 1,024 of
+    // them, scattered through the zone so that no run repeats one; in the
+    // last zone every 64th row's object is its subject instead, an IRI,
+    // whose code passes the literals' 12 bits (literals sort first).
+    const ZONE: usize = 8_192;
+    let quads: Vec<Quad> = (0..4 * ZONE)
+        .map(|i| {
+            let subject = format!("http://example.org/s{:05}", i / 8);
+            let object = if i >= 3 * ZONE && i % 64 == 0 {
+                Term::NamedNode(NamedNode::new(&subject).unwrap())
+            } else {
+                plain_literal(&format!("v{:04}", (i / ZONE) * 1_024 + (i * 37) % 1_024))
+            };
+            Quad::new(
+                NamedOrBlankNode::NamedNode(NamedNode::new(&subject).unwrap()),
+                iri(&format!("p{}", i % 4)),
+                object,
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let (v0000, v1234, v3500) = (
+        plain_literal("v0000"),
+        plain_literal("v1234"),
+        plain_literal("v3500"),
+    );
+    let s03200 = Term::NamedNode(iri("s03200"));
+    let (p0, p2) = (iri("p0"), iri("p2"));
+    let patterns: [Pattern<'_>; 7] = [
+        ("O v0000", None, None, Some(&v0000), None),
+        ("PO p0 v0000", None, Some(&p0), Some(&v0000), None),
+        ("O v1234", None, None, Some(&v1234), None),
+        ("PO p2 v1234", None, Some(&p2), Some(&v1234), None),
+        ("PO p0 v3500", None, Some(&p0), Some(&v3500), None),
+        ("O s03200", None, None, Some(&s03200), None),
+        ("PO p0 s03200", None, Some(&p0), Some(&s03200), None),
+    ];
+    let rec = Recorder::start();
+    assert_patterns_match(&memory, &[("mapped", &file)], &patterns).await;
+    assert!(
+        rec.count(&Event::Kernel(Kernel::CompareSlicedPatches)) > 0,
+        "the object leaf's slices compared through the kernel"
+    );
+}
+
+/// Subjects in runs of ten rows, which the writer run-end encodes, and the
+/// graph `gd` on every ninth row: a `G` match over the mapped file projects
+/// its kept rows (more than one per 16 rows of the split) and filters the
+/// subject column by its mask through the store session's run-end filter
+/// ([`crate::kernels`]), and answers as the store built in memory does.
+#[tokio::test]
+async fn test_run_end_subjects_filter_through_the_kernel() {
+    use crate::kernels::Kernel;
+
+    let gd = iri_graph("gd");
+    let quads: Vec<Quad> = (0..16_384usize)
+        .map(|i| {
+            let graph = if i % 9 == 0 {
+                gd.clone()
+            } else {
+                GraphName::DefaultGraph
+            };
+            make_quad(
+                &format!("http://example.org/s{:05}", i / 10),
+                &format!("http://example.org/p{}", i % 4),
+                &format!("o{}", i % 7),
+                graph,
+            )
+        })
+        .collect();
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let p0 = iri("p0");
+    let patterns: [Pattern<'_>; 2] = [
+        ("G gd", None, None, None, Some(&gd)),
+        ("PG p0 gd", None, Some(&p0), None, Some(&gd)),
+    ];
+    let rec = Recorder::start();
+    assert_patterns_match(&memory, &[("mapped", &file)], &patterns).await;
+    assert!(
+        rec.count(&Event::Kernel(Kernel::RunEndFilter)) > 0,
+        "the subject column filtered through the kernel"
     );
 }

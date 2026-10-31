@@ -290,8 +290,8 @@ mod tests {
     }
 
     /// `encode_many` over terms that cycle through every window, under a
-    /// two-window budget that turns the cache over throughout, returns the
-    /// resident dictionary's codes.
+    /// two-window budget the windows would turn over one lookup at a time,
+    /// returns the resident dictionary's codes, reading each window once.
     #[tokio::test]
     async fn encode_many_under_a_two_window_budget_matches_the_resident_dictionary() {
         let (native, d, terms) = windowed_native(600, 100).await;
@@ -310,7 +310,7 @@ mod tests {
             fbd.encode_many(&refs).await.unwrap(),
             d.encode_many(&refs).unwrap()
         );
-        assert!(fbd.debug_windows_rebuilt() > fbd.debug_window_count());
+        assert_eq!(fbd.debug_windows_rebuilt(), fbd.debug_window_count());
         assert!(fbd.debug_cached_bytes() <= budget);
     }
 }

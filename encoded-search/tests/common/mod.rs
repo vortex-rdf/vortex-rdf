@@ -222,3 +222,47 @@ pub fn data_node(root: &LayoutRef, field: &str) -> LayoutRef {
     }
     node
 }
+
+/// A probe's bulk reads against `data`: the whole array, windows of widths
+/// that end inside, at and past a 1024-value block, from a spread of starts,
+/// and index lists of runs and gaps, of a stride of two, and of repeats.
+pub fn assert_bulk_reads<T: Copy + Into<u64>>(
+    probe: &vortex_rdf_encoded_search::SortedProbe,
+    data: &[T],
+) {
+    let at = |i: usize| -> u64 { data[i].into() };
+    let mut whole = vec![0; data.len()];
+    probe.read_into(0, &mut whole);
+    assert_eq!(
+        whole,
+        (0..data.len()).map(at).collect::<Vec<_>>(),
+        "read_into the whole array"
+    );
+    for width in [1, 2, 7, 1023, 1024, 1025, 3000] {
+        let Some(last) = data.len().checked_sub(width) else {
+            continue;
+        };
+        for start in (0..=last).step_by((last / 7).max(1)) {
+            let mut out = vec![0; width];
+            probe.read_into(start, &mut out);
+            let want: Vec<u64> = (start..start + width).map(at).collect();
+            assert_eq!(out, want, "read_into({start}..+{width})");
+        }
+    }
+    let lists: [Vec<usize>; 3] = [
+        (0..data.len()).filter(|i| i % 5 < 3).collect(),
+        (0..data.len()).step_by(2).collect(),
+        (0..data.len()).flat_map(|i| [i, i]).collect(),
+    ];
+    for indices in lists {
+        let mut out = vec![0; indices.len()];
+        probe.read_at(&indices, &mut out);
+        let want: Vec<u64> = indices.iter().map(|&i| at(i)).collect();
+        assert_eq!(
+            out,
+            want,
+            "read_at {:?}..",
+            &indices[..indices.len().min(6)]
+        );
+    }
+}

@@ -326,18 +326,19 @@ async fn test_a_store_the_process_cannot_write_is_never_replaced() {
     assert_eq!(entries(dir.path()), vec![path.clone()]);
 }
 
-/// The counter above counts: compacting a store file the process can
-/// write gathers its live rows exactly once.
+/// The gather the refusals below are checked against is recorded:
+/// compacting a store file the process can write gathers its live rows
+/// exactly once.
 #[tokio::test]
 async fn test_compaction_of_a_writable_store_gathers_once() {
     let (_dir, path) =
         write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let gathered = crate::store::test_hooks::gathers();
+    let rec = Recorder::start();
 
     let compacted = store.compact().await.unwrap();
 
-    assert_eq!(crate::store::test_hooks::gathers(), gathered + 1);
+    assert_eq!(rec.count(&Event::RawQuadsGathered), 1);
     assert_eq!(compacted.size().await.unwrap(), 12);
 }
 
@@ -381,7 +382,7 @@ async fn test_compaction_leaves_a_store_the_process_cannot_write_alone() {
     let extra = extra_quad();
 
     let tailed = store.add_quad(extra).await.unwrap();
-    let gathered = crate::store::test_hooks::gathers();
+    let rec = Recorder::start();
 
     let error = tailed
         .compact()
@@ -390,8 +391,8 @@ async fn test_compaction_leaves_a_store_the_process_cannot_write_alone() {
         .expect("a read-only store file must not be rewritten");
 
     assert_eq!(
-        crate::store::test_hooks::gathers(),
-        gathered,
+        rec.count(&Event::RawQuadsGathered),
+        0,
         "the live rows were gathered although the store file cannot be rewritten"
     );
 
@@ -446,7 +447,6 @@ fn read_only_dir(path: &Path) -> Option<RestoreMode> {
 /// named after the file it sits beside, not after the link.
 #[tokio::test]
 async fn test_compaction_spills_beside_the_file_it_replaces_not_the_link() {
-    use crate::store::builders::spill::spill_hooks;
     // `VORTEX_RDF_SPILL_DIR` outranks any placement by design: only assert
     // the default placement when it is absent.
     if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
@@ -460,8 +460,7 @@ async fn test_compaction_spills_beside_the_file_it_replaces_not_the_link() {
     let Some(_read_only) = read_only_dir(dir.path()) else {
         return;
     };
-    // The setup's own build spilled beside `v3.vortex` as well.
-    let setup_spill = spill_hooks::last_dir();
+    let rec = Recorder::start();
 
     let compacted = tailed
         .compact()
@@ -472,12 +471,7 @@ async fn test_compaction_spills_beside_the_file_it_replaces_not_the_link() {
     assert_eq!(compacted.size().await.unwrap(), 13);
     assert_eq!(stored_size(&v3).await, 13);
     let versions = dir.path().join("versions");
-    let spilled = spill_hooks::last_dir().expect("the compaction made a run directory");
-    assert_ne!(
-        Some(&spilled),
-        setup_spill.as_ref(),
-        "the compaction made a run directory of its own"
-    );
+    let spilled = last_spill_dir(&rec);
     assert_eq!(spilled.parent(), Some(versions.as_path()));
     let name = spilled.file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.starts_with(".v3.vortex.spill-"), "{name}");
@@ -557,7 +551,6 @@ fn test_spill_directory_error_names_the_directory_and_the_hint() {
 /// output, and it is gone once the write is done.
 #[tokio::test]
 async fn test_serialize_spills_beside_the_output() {
-    use crate::store::builders::spill::spill_hooks;
     // `VORTEX_RDF_SPILL_DIR` outranks any placement by design: only assert
     // the default placement when it is absent.
     if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
@@ -566,10 +559,11 @@ async fn test_serialize_spills_beside_the_output() {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.vortex");
+    let rec = Recorder::start();
 
     rebuild(&path, modular_quads(12, 3, 4)).await.unwrap();
 
-    let spilled = spill_hooks::last_dir().expect("the build made a run directory");
+    let spilled = last_spill_dir(&rec);
     assert_eq!(spilled.parent(), Some(dir.path()));
     let name = spilled.file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.starts_with(".out.vortex.spill-"), "{name}");
@@ -592,14 +586,14 @@ fn past_the_floor() -> Vec<Quad> {
 
 /// What an append whose auto-compaction was refused leaves: `batch` is in
 /// the tail on top of the twelve quads of the base, matches and counts
-/// see it, nothing was gathered since `gathered` (the refusal came before
-/// any work), an explicit `compact()` still reports `PermissionDenied`,
-/// and a later append goes the same way and is kept too. Returns the
-/// store after that later append.
+/// see it, nothing was gathered since `rec` started (the refusal came
+/// before any work), an explicit `compact()` still reports
+/// `PermissionDenied`, and a later append goes the same way and is kept
+/// too. Returns the store after that later append.
 async fn assert_kept_in_the_tail(
     appended: VortexRdfStore,
     batch: &[Quad],
-    gathered: usize,
+    rec: &Recorder,
 ) -> VortexRdfStore {
     assert_eq!(appended.tail_len(), 4_200, "the batch is in the tail");
     assert_eq!(appended.size().await.unwrap(), 12 + 4_200);
@@ -618,7 +612,7 @@ async fn assert_kept_in_the_tail(
         matched_size(&appended, None, Some(&p0), None, None).await,
         expected_p0
     );
-    assert_eq!(crate::store::test_hooks::gathers(), gathered);
+    assert_eq!(rec.count(&Event::RawQuadsGathered), 0);
 
     // Explicit compaction still says why it cannot happen.
     let error = appended
@@ -638,7 +632,7 @@ async fn assert_kept_in_the_tail(
     let more = appended.add_quad(extra).await.unwrap();
     assert_eq!(more.tail_len(), 4_201);
     assert_eq!(more.size().await.unwrap(), 12 + 4_201);
-    assert_eq!(crate::store::test_hooks::gathers(), gathered);
+    assert_eq!(rec.count(&Event::RawQuadsGathered), 0);
     more
 }
 
@@ -662,13 +656,13 @@ async fn test_appends_past_the_floor_stay_in_the_tail_when_the_file_cannot_be_re
     let before = std::fs::read(&path).unwrap();
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let batch = past_the_floor();
-    let gathered = crate::store::test_hooks::gathers();
+    let rec = Recorder::start();
 
     let appended = store
         .add_quads(batch.clone())
         .await
         .expect("the batch must be kept in the tail, not lost to the refused compaction");
-    assert_kept_in_the_tail(appended, &batch, gathered).await;
+    assert_kept_in_the_tail(appended, &batch, &rec).await;
 
     // The file is as it was.
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -694,13 +688,13 @@ async fn test_appends_stay_in_the_tail_when_the_directory_cannot_be_written() {
         return;
     };
     let batch = past_the_floor();
-    let gathered = crate::store::test_hooks::gathers();
+    let rec = Recorder::start();
 
     let appended = store
         .add_quads(batch.clone())
         .await
         .expect("the batch must be kept in the tail, not lost to the refused compaction");
-    assert_kept_in_the_tail(appended, &batch, gathered).await;
+    assert_kept_in_the_tail(appended, &batch, &rec).await;
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(entries(dir.path()), vec![path.clone()]);

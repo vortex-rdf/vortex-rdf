@@ -1,7 +1,8 @@
 //! The out-of-core build's term interner: every distinct term of a build
 //! held once under a provisional `u32` id, handed out in arrival order, with
-//! the term behind an id at hand, so a quad kept as four ids sorts in its
-//! terms' order ([`TermInterner::cmp_quads`]). [`TermInterner::finish`] ranks
+//! the term behind an id at hand, so ids compare in their terms' order
+//! ([`TermInterner::cmp_terms`]) and a quad kept as four ids sorts in its
+//! terms' order. [`TermInterner::finish`] ranks
 //! the terms in byte order, the order of dictionary codes and of
 //! [`RawQuad`]'s derived `Ord`, and maps every id to its term's rank.
 //!
@@ -99,17 +100,14 @@ impl TermInterner {
         self.terms.len()
     }
 
-    /// Two quads of ids in their terms' order: `(s, p, o, g)`, each term in
-    /// byte order, as [`RawQuad`]'s `Ord` compares them. A position whose ids
-    /// are equal is equal without reading its term.
-    pub(crate) fn cmp_quads(&self, a: &[u32; 4], b: &[u32; 4]) -> Ordering {
-        for (x, y) in a.iter().zip(b) {
-            if x != y {
-                // Distinct ids name distinct terms: never `Equal`.
-                return self.terms[*x as usize].cmp(&self.terms[*y as usize]);
-            }
+    /// Two ids in their terms' order: byte order, as [`RawQuad`]'s `Ord`
+    /// compares a term. Equal ids are equal without reading the term, and
+    /// distinct ids name distinct terms, so never compare `Equal`.
+    pub(crate) fn cmp_terms(&self, a: u32, b: u32) -> Ordering {
+        if a == b {
+            return Ordering::Equal;
         }
-        Ordering::Equal
+        self.terms[a as usize].cmp(&self.terms[b as usize])
     }
 
     /// The terms in byte order beside each id's rank. Each term is moved
@@ -182,20 +180,29 @@ mod tests {
     }
 
     #[test]
-    fn cmp_quads_agrees_with_raw_quad_order() {
+    fn cmp_terms_agrees_with_raw_quad_order() {
         let quads = pool_quads();
         let mut terms = TermInterner::new();
         let ids: Vec<[u32; 4]> = quads
             .iter()
             .map(|q| terms.intern_quad(q.clone()).unwrap())
             .collect();
-        for (i, a) in quads.iter().enumerate() {
-            for (j, b) in quads.iter().enumerate() {
-                assert_eq!(
-                    terms.cmp_quads(&ids[i], &ids[j]),
-                    a.cmp(b),
-                    "quad {i} against quad {j}"
-                );
+        let as_terms = |q: &RawQuad| [q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()];
+        for (i, (a, a_ids)) in quads.iter().zip(&ids).enumerate() {
+            for (j, (b, b_ids)) in quads.iter().zip(&ids).enumerate() {
+                let (a_terms, b_terms) = (as_terms(a), as_terms(b));
+                for (role, ((x, y), (ta, tb))) in a_ids
+                    .iter()
+                    .zip(b_ids)
+                    .zip(a_terms.iter().zip(&b_terms))
+                    .enumerate()
+                {
+                    assert_eq!(
+                        terms.cmp_terms(*x, *y),
+                        ta.cmp(tb),
+                        "quad {i} against quad {j}, role {role}"
+                    );
+                }
             }
         }
     }

@@ -85,7 +85,6 @@ async fn test_from_file_is_listed_in_the_process_maps_only_while_mapped() {
 #[tokio::test]
 async fn test_from_file_in_memory_never_maps_the_file() {
     use crate::io::container;
-    use crate::io::file::map_probe;
 
     let (_dir, good) = write_store_file(
         dictionary_test_quads(),
@@ -112,16 +111,24 @@ async fn test_from_file_in_memory_never_maps_the_file() {
     let garbage = write("garbage.vortex", &[0xA5; 4096]);
     let empty = write("empty.vortex", &[]);
 
-    map_probe::take();
+    let mut rec = Recorder::start();
     VortexRdfStore::from_file_in_memory(&good).await.unwrap();
-    assert_eq!(map_probe::take(), 0, "a store loaded whole maps nothing");
+    assert_eq!(
+        rec.take_count(&Event::FileMapped),
+        0,
+        "a store loaded whole maps nothing"
+    );
 
     for (what, path) in [("newer", &newer), ("garbage", &garbage), ("empty", &empty)] {
         let error = VortexRdfStore::from_file_in_memory(path)
             .await
             .err()
             .unwrap_or_else(|| panic!("{what}: must not open"));
-        assert_eq!(map_probe::take(), 0, "{what}: a failed open maps nothing");
+        assert_eq!(
+            rec.take_count(&Event::FileMapped),
+            0,
+            "{what}: a failed open maps nothing"
+        );
         assert_eq!(
             error.to_string().contains("written by a newer vortex-rdf"),
             what == "newer",
@@ -130,7 +137,11 @@ async fn test_from_file_in_memory_never_maps_the_file() {
     }
 
     VortexRdfStore::from_file(&good).await.unwrap();
-    assert_eq!(map_probe::take(), 1, "a mapped open maps the file once");
+    assert_eq!(
+        rec.take_count(&Event::FileMapped),
+        1,
+        "a mapped open maps the file once"
+    );
 }
 
 /// Compaction replaces a store file by renaming over it: the open, mapped

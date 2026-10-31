@@ -115,6 +115,7 @@ mod tests {
             version: DICT_VERSION,
             required: true,
             sorted: true,
+            bracketed_iris: false,
             dtype,
         }
     }
@@ -140,6 +141,7 @@ mod tests {
             version: INDEX_VERSION,
             required: false,
             sorted: true,
+            bracketed_iris: false,
             dtype: quad_chunk(0, 1).dtype().clone(),
         };
         let bytes = encode_store_metadata(true, &[dict.clone(), index.clone()]).unwrap();
@@ -153,7 +155,8 @@ mod tests {
     /// The exact root metadata bytes of a store with a dictionary and a copy
     /// index child, and of a bare store: every reader depends on them. A
     /// component without `sorted`, under a root without `quads_sorted`,
-    /// decodes both as `false`.
+    /// decodes both as `false`. A dictionary's `bracketed_iris` is written
+    /// only when set, and decodes as `false` when absent.
     #[test]
     fn metadata_json_is_pinned() {
         use crate::store::indexes::COL_RID;
@@ -170,6 +173,7 @@ mod tests {
             version: INDEX_VERSION,
             required: false,
             sorted: true,
+            bracketed_iris: false,
             dtype: DType::Struct(
                 StructFields::new(
                     PRIMARY_COLUMNS
@@ -201,6 +205,24 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&encode_store_metadata(false, &[]).unwrap()).unwrap(),
             r#"{"version":1,"quads_sorted":false,"components":[]}"#
+        );
+        let bracketed = StoreComponentDescriptor {
+            bracketed_iris: true,
+            ..dict.clone()
+        };
+        let bytes = encode_store_metadata(true, std::slice::from_ref(&bracketed)).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            concat!(
+                r#"{"version":1,"quads_sorted":true,"components":["#,
+                r#"{"name":"dictionary","role":"dictionary","implementation":"sorted-terms-fsst-v1","#,
+                r#""version":2,"required":true,"sorted":true,"bracketed_iris":true,"#,
+                r#""fields":[{"name":"_dict_term","kind":"utf8"}]}]}"#,
+            )
+        );
+        assert_eq!(
+            decode_store_metadata(&bytes).unwrap(),
+            (true, vec![bracketed])
         );
 
         let unstamped = concat!(

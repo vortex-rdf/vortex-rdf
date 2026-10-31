@@ -115,11 +115,26 @@ fn point_read_columns<'n>(
     Some(children)
 }
 
-/// `column` read point by point at `positions` through its `probe` into a
-/// canonical primitive (see [`primitive_from_u64_reads`]).
+/// `column` read at `positions` through its `probe` into a canonical
+/// primitive. Positions that hold consecutive runs are read a run in one pass
+/// ([`SortedProbe::read_at`]), a `u64` column (every code column) taking the
+/// reads as its buffer and a narrower one narrowing them; positions none of
+/// which follow another are read point by point straight into the column
+/// (see [`primitive_from_u64_reads`]).
 fn read_points(probe: &SortedProbe, column: &ArrayRef, positions: &[usize]) -> Option<ArrayRef> {
-    let reads = positions.iter().map(|&i| probe.value_at(i));
-    primitive_from_u64_reads(column.dtype().as_ptype(), reads)
+    if !positions.windows(2).any(|pair| pair[1] == pair[0] + 1) {
+        let reads = positions.iter().map(|&i| probe.value_at(i));
+        return primitive_from_u64_reads(column.dtype().as_ptype(), reads);
+    }
+    let mut reads = vec![0; positions.len()];
+    probe.read_at(positions, &mut reads);
+    match column.dtype().as_ptype() {
+        PType::U64 => Some(
+            PrimitiveArray::new(vortex_buffer::Buffer::from(reads), Validity::NonNullable)
+                .into_array(),
+        ),
+        ptype => primitive_from_u64_reads(ptype, reads.into_iter()),
+    }
 }
 
 /// A primitive column of `ptype` built from point reads widened to `u64`.

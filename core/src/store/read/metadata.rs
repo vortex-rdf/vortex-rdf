@@ -206,11 +206,9 @@ impl VortexRdfStore {
             #[cfg(feature = "file-io")]
             Backend::File(FileBase { filter, .. }) => {
                 // The pushed-down equalities bound their columns exactly.
-                if let Some(filter) = filter
-                    && let Some(pairs) = crate::store::scan::file_exprs::eq_code_pairs(filter)
-                {
-                    for (column, code) in pairs {
-                        if let Some(column) = QuadColumn::from_name(&column) {
+                if let Some(eqs) = filter.over_selection().and_then(|f| f.eqs()) {
+                    for (column, code) in eqs.iter() {
+                        if let Some(column) = QuadColumn::from_name(column.as_ref()) {
                             code_bounds[column.index()] = Some((code, code));
                         }
                     }
@@ -307,7 +305,11 @@ fn selection_kind(selection: &ViewSelection) -> SelectionKind {
         ViewSelection::Exact(RowSelection::All) => SelectionKind::All,
         ViewSelection::Exact(RowSelection::Range(_)) => SelectionKind::Range,
         ViewSelection::Exact(RowSelection::Ids(_)) => SelectionKind::Ids,
-        ViewSelection::Pending(_) => SelectionKind::PendingIndexRun,
+        // A pending residual sits only on a view built to be counted or
+        // windowed, which no caller holds.
+        ViewSelection::Pending { .. } | ViewSelection::Residual(_) => {
+            SelectionKind::PendingIndexRun
+        }
     }
 }
 

@@ -3,9 +3,8 @@
 
 use super::masks_first::{MANY_SPLITS, many_splits_file};
 use super::*;
-use crate::store::array::rechunk_hooks;
-use crate::store::read::chunks::{RowChunkStream, gather_hooks, run_hooks};
-use crate::store::read::rows::column_hooks;
+use crate::store::read::chunks::RowChunkStream;
+use crate::store::test_hooks::{FailingCut, ForcedLimit};
 use crate::store::{QuadColumn, TermCode};
 
 /// Both exports of `view` agree with its base-ordered codes at several batch
@@ -107,12 +106,12 @@ fn short_last(rows: usize) -> usize {
 /// How many slices `rechunk` cut while `stream` was pulled `pulls` times,
 /// each pull a chunk, before it was dropped.
 async fn cuts_pulling(mut stream: RowChunkStream, pulls: usize) -> usize {
-    let start = rechunk_hooks::cuts();
+    let rec = Recorder::start();
     for _ in 0..pulls {
         stream.next().await.unwrap().unwrap();
     }
     drop(stream);
-    rechunk_hooks::cuts() - start
+    rec.count(&Event::RechunkCut)
 }
 
 /// How many chunks `stream` yields before its first error item, and the
@@ -130,22 +129,112 @@ async fn chunks_before_error<T, E: std::fmt::Display>(
     panic!("no error item after {chunks} chunks")
 }
 
-/// Every item of `stream`, unwrapped, beside how far `counter` rose over the
-/// stream's first pull and over the whole stream.
+/// Every item of `stream`, unwrapped, beside how many of the events reached
+/// over the stream's first pull, and over the whole stream, are `counted`.
 async fn drain_counted<T>(
     mut stream: futures::stream::BoxStream<'static, crate::error::Result<T>>,
-    counter: impl Fn() -> usize,
+    counted: impl Fn(&Event) -> bool,
 ) -> (Vec<T>, usize, usize) {
-    let start = counter();
+    let rec = Recorder::start();
     let mut items = Vec::new();
     if let Some(item) = stream.next().await {
         items.push(item.unwrap());
     }
-    let first = counter() - start;
+    let first = rec.count_where(&counted);
     while let Some(item) = stream.next().await {
         items.push(item.unwrap());
     }
-    (items, first, counter() - start)
+    (items, first, rec.count_where(counted))
+}
+
+/// Whether `event` is an in-memory gather of a window of ids.
+fn gathered(event: &Event) -> bool {
+    matches!(event, Event::Gather { .. })
+}
+
+/// A code-chunk read of an in-memory store decodes into the base's shared
+/// caches only the columns it asks for: `o` alone, over the whole store's run
+/// or over a matched view's windows, fills `o`'s cache and no other; a read
+/// of all four then fills the rest, so the whole store's four columns are
+/// decoded once each.
+#[tokio::test]
+async fn test_code_chunks_decode_only_the_columns_asked_for() {
+    let quads = modular_quads(4_096, 3, 4);
+    let p0 = iri("p0");
+    for whole in [true, false] {
+        let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+        let view = if whole {
+            store
+        } else {
+            matched_view(&store, None, Some(&p0), None, None).await
+        };
+        let rec = Recorder::start();
+        let codes = view.code_chunks(&[QuadColumn::O], 1_000).unwrap();
+        let (o_chunks, ..) = drain_counted(codes, gathered).await;
+        assert_eq!(
+            rec.count(&Event::SharedDecoded),
+            1,
+            "whole: {whole}: `o` alone"
+        );
+        let codes = view.code_chunks(&QuadColumn::ALL, 1_000).unwrap();
+        let (chunks, ..) = drain_counted(codes, gathered).await;
+        let all_four = rec.count(&Event::SharedDecoded);
+        if whole {
+            assert_eq!(all_four, 4, "then all four");
+        } else {
+            // The match may have decoded `p` already.
+            assert!((3..=4).contains(&all_four), "then all four: {all_four}");
+        }
+        let expected = base_ordered_codes(&view).await;
+        assert_eq!(drained_code_rows::<4>(&chunks), expected, "whole: {whole}");
+        assert_eq!(
+            drained_code_rows::<1>(&o_chunks),
+            expected.iter().map(|r| [r[2]]).collect::<Vec<_>>(),
+            "whole: {whole}"
+        );
+    }
+}
+
+/// A code-chunk read over an in-memory base whose code columns the shared
+/// caches cannot hand out (a store opened from bytes, its columns in their
+/// stored encodings) gathers each window of the base cut to the columns it
+/// asks for: `o` alone one column, a row read every primary column.
+#[tokio::test]
+async fn test_code_chunks_gather_the_base_cut_to_the_asked_columns() {
+    let quads = modular_quads(4_096, 3, 4);
+    let built = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let store = VortexRdfStore::from_bytes(&built.to_bytes().await.unwrap())
+        .await
+        .unwrap();
+    let view = matched_view(&store, None, Some(&iri("p0")), None, None).await;
+    let expected = base_ordered_codes(&view).await;
+    // The widths of the gathers since the last take.
+    let widths = |rec: &mut Recorder| {
+        rec.take_picked(|e| match e {
+            Event::Gather { width } => Some(*width),
+            _ => None,
+        })
+    };
+    let mut rec = Recorder::start();
+    let codes = view.code_chunks(&[QuadColumn::O], 1_000).unwrap();
+    let (chunks, ..) = drain_counted(codes, gathered).await;
+    let gathers = widths(&mut rec);
+    assert!(!gathers.is_empty(), "a window gathered from the base");
+    assert!(
+        gathers.iter().all(|&w| w == Some(1)),
+        "each of one column: {gathers:?}"
+    );
+    assert_eq!(
+        drained_code_rows::<1>(&chunks),
+        expected.iter().map(|r| [r[2]]).collect::<Vec<_>>()
+    );
+    let rows = view.row_chunks(1_000).unwrap();
+    let _: Vec<_> = rows.collect().await;
+    let gathers = widths(&mut rec);
+    assert!(
+        !gathers.is_empty() && gathers.iter().all(|&w| w == Some(4)),
+        "a row read gathers every primary column: {gathers:?}"
+    );
 }
 
 /// Both exports of the in-memory `view` at `batch` rows a chunk answer its
@@ -156,14 +245,19 @@ async fn drain_counted<T>(
 async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag: &str) {
     let expected = base_ordered_codes(view).await;
     let first_pull = gathers.min(1);
-    // The gathers by path since `start`: `(of all four columns, of one)`.
-    let since = |start: (usize, usize)| {
-        let (four, one) = column_hooks::gathers();
-        (four - start.0, one - start.1)
+    // The code gathers by path since the last take: `(of all four columns,
+    // of one)`.
+    let by_path = |rec: &mut Recorder| {
+        let paths = rec.take_picked(|e| match e {
+            Event::CodeGather { all_four } => Some(*all_four),
+            _ => None,
+        });
+        let four = paths.iter().filter(|&&all_four| all_four).count();
+        (four, paths.len() - four)
     };
-    let start = column_hooks::gathers();
+    let mut rec = Recorder::start();
     let codes = view.code_chunks(&QuadColumn::ALL, batch).unwrap();
-    let (chunks, first, total) = drain_counted(codes, gather_hooks::gathers).await;
+    let (chunks, first, total) = drain_counted(codes, gathered).await;
     assert_eq!(
         first, first_pull,
         "{tag}: code_chunks' first pull at batch {batch}"
@@ -173,7 +267,7 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
         "{tag}: code_chunks' gathers at batch {batch}"
     );
     assert_eq!(
-        since(start),
+        by_path(&mut rec),
         (gathers, 0),
         "{tag}: one four-column gather a window at batch {batch}"
     );
@@ -182,12 +276,11 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
         expected,
         "{tag}: code_chunks at batch {batch}"
     );
-    let start = column_hooks::gathers();
     let reordered = [QuadColumn::G, QuadColumn::O, QuadColumn::S, QuadColumn::P];
     let codes = view.code_chunks(&reordered, batch).unwrap();
-    let (chunks, ..) = drain_counted(codes, gather_hooks::gathers).await;
+    let (chunks, ..) = drain_counted(codes, gathered).await;
     assert_eq!(
-        since(start),
+        by_path(&mut rec),
         (gathers, 0),
         "{tag}: all four reordered, one four-column gather a window at batch {batch}"
     );
@@ -199,16 +292,16 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
             .collect::<Vec<_>>(),
         "{tag}: all four reordered at batch {batch}"
     );
-    let start = column_hooks::gathers();
     let codes = view.code_chunks(&[QuadColumn::O], batch).unwrap();
-    let (chunks, first, total) = drain_counted(codes, || column_hooks::gathers().1).await;
+    let one_column = |e: &Event| *e == Event::CodeGather { all_four: false };
+    let (chunks, first, total) = drain_counted(codes, one_column).await;
     assert_eq!(
         (first, total),
         (first_pull, gathers),
         "{tag}: one column a window at batch {batch}"
     );
     assert_eq!(
-        since(start),
+        by_path(&mut rec),
         (0, gathers),
         "{tag}: `o` alone, one one-column gather a window at batch {batch}"
     );
@@ -218,7 +311,7 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
         "{tag}: the `o` chunks at batch {batch}"
     );
     let rows = view.row_chunks(batch).unwrap();
-    let (chunks, first, total) = drain_counted(rows, gather_hooks::gathers).await;
+    let (chunks, first, total) = drain_counted(rows, gathered).await;
     assert_eq!(
         first, first_pull,
         "{tag}: row_chunks' first pull at batch {batch}"
@@ -295,7 +388,7 @@ async fn test_chunks_cut_a_run_per_pull() {
     let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let expected = base_ordered_codes(&store).await;
     let codes = store.code_chunks(&QuadColumn::ALL, 1).unwrap();
-    let (chunks, first, total) = drain_counted(codes, run_hooks::cuts).await;
+    let (chunks, first, total) = drain_counted(codes, |e| *e == Event::RunCut).await;
     assert_eq!(first, 1, "the first pull cuts one chunk");
     assert_eq!(total, expected.len(), "one cut per row at one row a chunk");
     assert_eq!(
@@ -304,7 +397,7 @@ async fn test_chunks_cut_a_run_per_pull() {
         "the cut chunks are the rows"
     );
     let rows = store.row_chunks(1).unwrap();
-    let (chunks, first, total) = drain_counted(rows, rechunk_hooks::cuts).await;
+    let (chunks, first, total) = drain_counted(rows, |e| *e == Event::RechunkCut).await;
     assert_eq!(
         (first, total),
         (1, expected.len()),
@@ -348,8 +441,6 @@ async fn test_chunks_cut_a_run_per_pull() {
 /// tail.
 #[tokio::test]
 async fn test_chunks_surface_a_failed_cut() {
-    use crate::store::array::rechunk_hooks::FailingCut;
-
     let hooked = |(chunks, message): (usize, String)| {
         assert!(message.contains("test hook"), "the hook's error: {message}");
         chunks
@@ -439,7 +530,6 @@ async fn test_chunks_file_backed_match_gathered() {
 #[tokio::test]
 async fn test_chunks_take_sparse_file_ids() {
     use crate::store::Keep;
-    use crate::store::scan::file_reads::take_hooks;
 
     let quads = modular_quads(20_000, 3, 4);
     let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
@@ -452,7 +542,11 @@ async fn test_chunks_take_sparse_file_ids() {
     let expected = base_ordered_codes(&loaded.keep(QuadColumn::S, &keep).await.unwrap()).await;
     assert_eq!(expected.len(), 1_000);
 
-    let takes = || take_hooks::takes().0;
+    let takes = |e: &Event| {
+        *e == Event::Take {
+            through_chunks: true,
+        }
+    };
     let codes = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
     let (code_chunks, first, total) = drain_counted(codes, takes).await;
     assert_eq!(first, 1, "code_chunks' first pull takes one chunk's ids");
@@ -479,9 +573,6 @@ async fn test_chunks_take_sparse_file_ids() {
 #[tokio::test]
 async fn test_chunks_choose_a_file_read_once() {
     use crate::store::Keep;
-    use crate::store::scan::{
-        file_reads::take_hooks, file_scans::driver_hooks, read_plan::exact_read_hooks,
-    };
 
     let (_dir, path) = write_store_file(
         modular_quads(20_000, 3, 4),
@@ -514,12 +605,12 @@ async fn test_chunks_choose_a_file_read_once() {
         ),
         ("unrestricted view, scanned", &file, false, true),
     ];
-    let _limit = driver_hooks::ForcedLimit::set(0);
+    let _limit = ForcedLimit::set(0);
+    let chosen = |e: &Event| *e == Event::ExactRead;
     for (tag, view, taken, scanned) in reads {
-        let takes = take_hooks::takes().0;
-        driver_hooks::take_spawned();
+        let rec = Recorder::start();
         let codes = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
-        let (chunks, first, total) = drain_counted(codes, exact_read_hooks::chosen).await;
+        let (chunks, first, total) = drain_counted(codes, chosen).await;
         assert!(!chunks.is_empty(), "{tag}: code_chunks read rows");
         assert_eq!(
             (first, total),
@@ -527,14 +618,24 @@ async fn test_chunks_choose_a_file_read_once() {
             "{tag}: code_chunks chooses its read once"
         );
         let rows = view.row_chunks(256).unwrap();
-        let (_, first, total) = drain_counted(rows, exact_read_hooks::chosen).await;
+        let (_, first, total) = drain_counted(rows, chosen).await;
         assert_eq!(
             (first, total),
             (1, 1),
             "{tag}: row_chunks chooses its read once"
         );
-        assert_eq!(take_hooks::takes().0 > takes, taken, "{tag}: taken by id");
-        assert_eq!(driver_hooks::take_spawned() > 0, scanned, "{tag}: scanned");
+        assert_eq!(
+            rec.count(&Event::Take {
+                through_chunks: true
+            }) > 0,
+            taken,
+            "{tag}: taken by id"
+        );
+        assert_eq!(
+            rec.count(&Event::SplitSpawned) > 0,
+            scanned,
+            "{tag}: scanned"
+        );
     }
 }
 
@@ -546,8 +647,6 @@ async fn test_chunks_choose_a_file_read_once() {
 /// chunks are the view's base-ordered codes.
 #[tokio::test]
 async fn test_chunks_read_filtered_file_runs_by_id() {
-    use crate::store::scan::file_scans::driver_hooks;
-
     let (_dir, path) =
         write_store_file(term_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -576,11 +675,11 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
             .map(|row| [row[column.index()]])
             .collect();
         assert_eq!(expected.len(), rows, "{tag}");
-        let _limit = driver_hooks::ForcedLimit::set(0);
-        driver_hooks::take_spawned();
+        let _limit = ForcedLimit::set(0);
+        let rec = Recorder::start();
         let (codes, _) = collect_code_chunks(&view, &[column], 256).await;
         assert_eq!(
-            driver_hooks::take_spawned(),
+            rec.count(&Event::SplitSpawned),
             0,
             "{tag}: read by id, not scanned"
         );
@@ -594,8 +693,6 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
 /// spawned, and both exports answer the view's base-ordered codes.
 #[tokio::test]
 async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
-    use crate::store::scan::file_scans::driver_hooks;
-
     let (_dir, path) = write_store_file(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p1 = iri("p1");
@@ -605,12 +702,12 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     assert_eq!(expected.len(), 600);
 
     let (codes, rows, spawned) = std::thread::spawn(move || {
-        let _limit = driver_hooks::ForcedLimit::set(0);
+        let _limit = ForcedLimit::set(0);
         futures::executor::block_on(async {
-            driver_hooks::take_spawned();
+            let rec = Recorder::start();
             let (codes, _) = collect_code_chunks(&view, &QuadColumn::ALL, 256).await;
             let rows = struct_chunk_codes(&collect_row_chunks(&view, 256).await);
-            (codes, rows, driver_hooks::take_spawned())
+            (codes, rows, rec.count(&Event::SplitSpawned))
         })
     })
     .join()
@@ -720,11 +817,10 @@ async fn pull_and_drain<S: futures::Stream + Unpin>(
     before_first_poll: impl FnOnce(),
     rows_of: impl Fn(S::Item) -> usize,
 ) -> (usize, usize) {
-    use crate::store::scan::file_scans::driver_hooks;
     before_first_poll();
-    driver_hooks::take_spawned();
+    let rec = Recorder::start();
     let first = stream.next().await.expect("a first item");
-    let spawned = driver_hooks::take_spawned();
+    let spawned = rec.count(&Event::SplitSpawned);
     let mut rows = rows_of(first);
     while let Some(item) = stream.next().await {
         rows += rows_of(item);
@@ -733,22 +829,15 @@ async fn pull_and_drain<S: futures::Stream + Unpin>(
 }
 
 /// The chunk streams over a filtered no-index file view (`code_chunks`,
-/// `row_chunks` and `quads()`) stay lazy and scan:
-/// nothing is evaluated or scanned before the first poll, each drained stream
-/// runs one row scan and never reads the filter's masks first, and with the
-/// split limit forced to zero a first pull has at most a scan's window of
-/// splits spawned, four per unit of available parallelism, on a file of more
-/// splits than that. The row-chunk streams spawn through the crate's driver,
-/// which counts each spawn; `quads()` reads through vortex's own scan stream,
-/// whose window the count does not see.
+/// `row_chunks` and `quads()`) stay lazy and read the filter's masks first:
+/// nothing is evaluated or scanned before the first poll, each drained
+/// stream evaluates every split once and reads each split's rows at its
+/// mask, with no row scan, and with the split limit forced to zero a first
+/// pull has a window of splits spawned, four per unit of available
+/// parallelism, on a file of more splits than that.
 #[tokio::test]
 async fn test_chunk_stream_over_filtered_file_stays_lazy() {
     use crate::io::read::available_parallelism;
-    use crate::store::scan::file_filter::split_hooks;
-    use crate::store::scan::{
-        file_scans::{driver_hooks, scan_hooks},
-        read_plan::masked_read_hooks,
-    };
 
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -757,19 +846,18 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
     assert!(view.view_statistics().unwrap().pending_filter);
     let n = view.size().await.unwrap();
     let window = 4 * available_parallelism();
-    let _limit = driver_hooks::ForcedLimit::set(0);
+    let _limit = ForcedLimit::set(0);
     for read in ["code_chunks", "row_chunks", "quads"] {
-        let (scans, evaluated) = (scan_hooks::scans(), split_hooks::evaluated());
-        let masked = masked_read_hooks::reads();
+        let rec = Recorder::start();
         let lazy = || {
             assert_eq!(
-                scan_hooks::scans(),
-                scans,
+                rec.count(&Event::RowScan),
+                0,
                 "{read}: no scan before the first poll"
             );
             assert_eq!(
-                split_hooks::evaluated(),
-                evaluated,
+                rec.count(&Event::SplitEvaluated),
+                0,
                 "{read}: no split evaluated before the first poll"
             );
         };
@@ -791,19 +879,65 @@ async fn test_chunk_stream_over_filtered_file_stays_lazy() {
             }
         };
         assert_eq!(rows, n, "{read}: every row");
-        assert!(
-            spawned <= window,
-            "{read}: {spawned} splits spawned by a first pull"
-        );
-        if read != "quads" {
-            assert_eq!(spawned, window.min(MANY_SPLITS), "{read}: a scan's window");
-        }
-        assert_eq!(scan_hooks::scans() - scans, 1, "{read}: one row scan");
         assert_eq!(
-            split_hooks::evaluated(),
-            evaluated,
-            "{read}: no masks evaluated"
+            spawned,
+            window.min(MANY_SPLITS),
+            "{read}: a window of splits spawned by a first pull"
         );
-        assert_eq!(masked_read_hooks::reads(), masked, "{read}: no masked read");
+        assert_eq!(rec.count(&Event::RowScan), 0, "{read}: no row scan");
+        assert_eq!(
+            rec.count(&Event::SplitEvaluated),
+            MANY_SPLITS,
+            "{read}: every split evaluated once"
+        );
+        assert_eq!(
+            rec.count_where(|e| matches!(e, Event::MaskedRead(_))),
+            MANY_SPLITS,
+            "{read}: each split's rows read at its mask"
+        );
+    }
+}
+
+/// A chunk stream over a filtered no-index file view (`code_chunks`,
+/// `row_chunks` and `quads()`) dropped after its first item has evaluated
+/// only the splits its driver reached, not the file's [`MANY_SPLITS`]: the
+/// first split, whose matches the item holds, and at most the rest of the
+/// inline driver's window (the host's available parallelism). A query
+/// engine's `LIMIT` stops a stream this way.
+#[tokio::test]
+async fn test_chunk_stream_stopped_early_evaluates_only_the_splits_it_reached() {
+    use crate::io::read::available_parallelism;
+
+    let (_dir, path) = many_splits_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p0 = iri("p0");
+    let view = matched_view(&store, None, Some(&p0), None, None).await;
+    assert!(view.view_statistics().unwrap().pending_filter);
+    let reach = available_parallelism().min(MANY_SPLITS);
+    // Inline whatever the split count, so the window a first pull fills is
+    // the host's parallelism.
+    let _limit = ForcedLimit::set(usize::MAX);
+    for read in ["code_chunks", "row_chunks", "quads"] {
+        let rec = Recorder::start();
+        let rows = match read {
+            "code_chunks" => {
+                let mut chunks = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+                chunks.next().await.unwrap().unwrap()[0].len()
+            }
+            "row_chunks" => {
+                let mut chunks = view.row_chunks(256).unwrap();
+                chunks.next().await.unwrap().unwrap().len()
+            }
+            _ => {
+                view.quads().next().await.unwrap().unwrap();
+                1
+            }
+        };
+        assert!(rows > 0, "{read}: a first item with rows");
+        let evaluated = rec.count(&Event::SplitEvaluated);
+        assert!(
+            (1..=reach).contains(&evaluated),
+            "{read}: {evaluated} splits evaluated for a first item, at most {reach}"
+        );
     }
 }

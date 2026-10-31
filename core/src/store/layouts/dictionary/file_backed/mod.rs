@@ -43,8 +43,9 @@ use self::cache::WindowCache;
 use super::predicates::{KindRanges, TermPredicate};
 use super::storage::{TermChunk, chunk_of};
 use super::term_dict::{
-    CodeSpace, TermDictionary, check_candidates, check_code, find_by, kind_verdicts,
-    lower_bound_by, prefix_range_from, prefix_successor, split_verdicts, tolerant_fallback,
+    CodeSpace, TermDictionary, check_candidates, check_code, decide_iris, find_by,
+    iri_prefix_to_decide, kind_verdicts, lower_bound_by, next_lower_bound_by, prefix_range_from,
+    prefix_successor, split_verdicts, tolerant_fallback,
 };
 
 /// One flat leaf of the term column (one FSST window as written): the rank of
@@ -74,6 +75,9 @@ struct Windows {
     source: Arc<dyn SegmentSource>,
     /// The kind ranges, computed on first use.
     kinds: OnceLock<KindRanges>,
+    /// Whether every IRI is spelled `<`, its text, `>`: the child's
+    /// descriptor's `bracketed_iris` provenance, as `TermDictionary`'s.
+    bracketed_iris: bool,
     /// The rebuilt windows. The lock is held for a lookup or an insert, never
     /// across an `.await`.
     cache: Mutex<WindowCache>,
@@ -168,6 +172,12 @@ impl FileBackedDict {
 
     pub(crate) fn len(&self) -> usize {
         self.0.code_space.len()
+    }
+
+    /// Whether every IRI is spelled `<`, its text, `>` (the child's
+    /// descriptor says).
+    pub(crate) fn bracketed_iris(&self) -> bool {
+        self.0.bracketed_iris
     }
 
     /// The code of `term` exactly as spelled: the window whose bounds enclose
@@ -279,30 +289,78 @@ impl FileBackedDict {
     /// The terms of `codes`, in any order and with repeats, each handed to
     /// `visit(position, term)` once per position (`None` for an out-of-range
     /// code), borrowed: no string is built per term. Out-of-range positions
-    /// are visited first, then the rest in code order, each distinct code
-    /// read once ([`visit_terms`](Self::visit_terms)).
+    /// are visited first. The rest are grouped by window in one counting
+    /// pass, not a sort: each window holding any of them is read once (the
+    /// reads overlapped, as [`encode_many`](Self::encode_many)'s), and its
+    /// positions are visited in input order through one cursor, which
+    /// decompresses only the asked rows, a repeated code at each of its
+    /// positions as a resident decode does.
     pub(crate) async fn decode_many_with(
         &self,
         codes: &[TermCode],
         mut visit: impl FnMut(usize, Option<&str>),
     ) -> Result<()> {
-        let mut sorted: Vec<(TermCode, usize)> = Vec::with_capacity(codes.len());
-        for (i, &code) in codes.iter().enumerate() {
-            if self.0.code_space.rank_of(code).is_some() {
-                sorted.push((code, i));
-            } else {
-                visit(i, None);
+        let inner = &*self.0;
+        // Each in-range position beside its window, and the windows
+        // `lo..hi` they fall in.
+        let mut located: Vec<(usize, usize)> = Vec::with_capacity(codes.len());
+        let (mut lo, mut hi) = (usize::MAX, 0);
+        for (at, &code) in codes.iter().enumerate() {
+            match inner.code_space.rank_of(code) {
+                Some(rank) => {
+                    let (w, _) = chunk_of(&inner.starts, rank);
+                    lo = lo.min(w);
+                    hi = hi.max(w + 1);
+                    located.push((w, at));
+                }
+                None => visit(at, None),
             }
         }
-        sorted.sort_unstable();
-        let groups: Vec<&[(TermCode, usize)]> = sorted.chunk_by(|a, b| a.0 == b.0).collect();
-        let distinct: Vec<TermCode> = groups.iter().map(|group| group[0].0).collect();
-        self.visit_terms(&distinct, |j, term| {
-            for &(_, i) in groups[j] {
-                visit(i, Some(term));
+        if located.is_empty() {
+            return Ok(());
+        }
+        // In range (checked above), so a code's offset from the first code
+        // is a rank below the term count: exact as a `usize`.
+        let base = inner.code_space.base();
+        let rank = |at: usize| (codes[at] - base) as usize;
+        if hi - lo == 1 {
+            // One window, as for a single code: read it straight and visit
+            // in input order, with nothing to group.
+            let chunk = inner.window_chunk(lo).await?;
+            let start = inner.windows[lo].start;
+            let mut cursor = chunk.cursor();
+            for &(_, at) in &located {
+                visit(at, Some(cursor.str_at(rank(at) - start)));
             }
-        })
-        .await
+            return Ok(());
+        }
+        // A counting sort by window, which keeps input order within one:
+        // window `lo + k`'s positions are `order[bounds[k]..bounds[k + 1]]`.
+        let mut bounds = vec![0usize; hi - lo + 1];
+        for &(w, _) in &located {
+            bounds[w - lo + 1] += 1;
+        }
+        for k in 1..bounds.len() {
+            bounds[k] += bounds[k - 1];
+        }
+        let mut next = bounds.clone();
+        let mut order = vec![0usize; located.len()];
+        for &(w, at) in &located {
+            order[next[w - lo]] = at;
+            next[w - lo] += 1;
+        }
+        let touched = (0..hi - lo).filter(|&k| bounds[k] < bounds[k + 1]);
+        let mut chunks = futures::stream::iter(touched)
+            .map(|k| async move { Ok::<_, VortexRdfError>((k, inner.window_chunk(lo + k).await?)) })
+            .buffered(available_parallelism().max(4));
+        while let Some((k, chunk)) = chunks.try_next().await? {
+            let start = inner.windows[lo + k].start;
+            let mut cursor = chunk.cursor();
+            for &at in &order[bounds[k]..bounds[k + 1]] {
+                visit(at, Some(cursor.str_at(rank(at) - start)));
+            }
+        }
+        Ok(())
     }
 
     /// The code of `term`, tolerant of spelling as `TermDictionary::encode`.
@@ -316,12 +374,80 @@ impl FileBackedDict {
         }
     }
 
-    /// [`encode`](Self::encode) over a batch, in order, the lookups overlapped.
+    /// [`encode`](Self::encode) over a batch, in order. The exact lookups
+    /// run in the terms' byte order: a term at a window's bounds, below its
+    /// first term or past every window is answered without a read, and the
+    /// rest are grouped by window, each window read once (the reads
+    /// overlapped) and searched through one cursor, each search running only
+    /// past where the one before landed ([`next_lower_bound_by`]). Then each miss takes its
+    /// canonical spelling's lookup, in input order, so the first malformed
+    /// miss is the error, as the lookups one at a time report it.
     pub(crate) async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
-        futures::stream::iter(terms.iter().map(|term| self.encode(term)))
+        let inner = &*self.0;
+        let mut order: Vec<usize> = (0..terms.len()).collect();
+        order.sort_unstable_by_key(|&at| terms[at]);
+        let mut codes: Vec<Option<TermCode>> = vec![None; terms.len()];
+        // The windows to read, each beside its terms in byte order.
+        let mut reads: Vec<(usize, Vec<usize>)> = Vec::new();
+        for at in order {
+            let needle = terms[at].as_bytes();
+            let Some((w, window)) = inner.locate(needle) else {
+                continue;
+            };
+            match needle.cmp(&*window.first) {
+                Ordering::Less => continue,
+                Ordering::Equal => {
+                    codes[at] = Some(inner.code_space.code_at(window.start));
+                    continue;
+                }
+                Ordering::Greater => {}
+            }
+            if needle == &*window.last {
+                codes[at] = Some(inner.code_space.code_at(window.start + window.rows - 1));
+                continue;
+            }
+            match reads.last_mut() {
+                Some((last, ats)) if *last == w => ats.push(at),
+                _ => reads.push((w, vec![at])),
+            }
+        }
+        let hits: Vec<Vec<(usize, TermCode)>> = futures::stream::iter(reads)
+            .map(|(w, ats)| async move {
+                let window = &inner.windows[w];
+                let chunk = inner.window_chunk(w).await?;
+                let mut cursor = chunk.cursor();
+                // first < needle < last: a hit lies strictly inside.
+                let inside = window.rows - 1;
+                let mut from = 1;
+                let mut hits = Vec::new();
+                let count = ats.len();
+                for (searched, at) in ats.into_iter().enumerate() {
+                    let needle = terms[at].as_bytes();
+                    let local = next_lower_bound_by(from..inside, count - searched, |local| {
+                        cursor.bytes_at(local) < needle
+                    });
+                    if local < inside && cursor.bytes_at(local) == needle {
+                        hits.push((at, inner.code_space.code_at(window.start + local)));
+                    }
+                    from = local;
+                }
+                Ok::<_, VortexRdfError>(hits)
+            })
             .buffered(available_parallelism().max(4))
             .try_collect()
-            .await
+            .await?;
+        for (at, code) in hits.into_iter().flatten() {
+            codes[at] = Some(code);
+        }
+        for (at, term) in terms.iter().enumerate() {
+            if codes[at].is_none() {
+                codes[at] = match tolerant_fallback(term)? {
+                    Some(canonical) => self.encode_exact(&canonical).await?,
+                    None => None,
+                };
+            }
+        }
+        Ok(codes)
     }
 
     /// The code range of the terms spelled with `prefix`, as
@@ -359,9 +485,10 @@ impl FileBackedDict {
     }
 
     /// `TermDictionary::filter_codes` over the file, under its precondition:
-    /// the candidates their kind does not decide are read through
-    /// [`visit_terms`](Self::visit_terms), so only the windows holding them
-    /// are read.
+    /// the candidates their kind does not decide, less the IRIs a `STR()`
+    /// prefix decides by its code range (whose two bounds read a window
+    /// each at most), are read through [`visit_terms`](Self::visit_terms),
+    /// so only the windows holding them are read.
     pub(crate) async fn filter_codes(
         &self,
         predicate: &TermPredicate,
@@ -369,10 +496,17 @@ impl FileBackedDict {
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         check_candidates(codes, self.0.code_space)?;
         let kinds = self.kind_ranges().await?;
-        let (mut verdicts, read_at) = kind_verdicts(predicate, &kinds, codes);
+        let (mut verdicts, mut read_at) = kind_verdicts(predicate, &kinds, codes);
+        if let Some(prefix) =
+            iri_prefix_to_decide(predicate, self.bracketed_iris(), &kinds, codes, &read_at)
+        {
+            let passing = self.prefix_range(&format!("<{prefix}")).await?;
+            decide_iris(&mut verdicts, &mut read_at, codes, &kinds.iris, &passing);
+        }
         let read: Vec<TermCode> = read_at.iter().map(|&at| codes[at]).collect();
+        let mut scratch = String::new();
         self.visit_terms(&read, |j, spelling| {
-            verdicts[read_at[j]] = predicate.eval(spelling);
+            verdicts[read_at[j]] = predicate.eval_with(spelling, &mut scratch);
         })
         .await?;
         Ok(split_verdicts(codes, &verdicts))
@@ -387,12 +521,15 @@ impl FileBackedDict {
         self.0
             .lifted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        TermDictionary::from_child_reader(self.0.reader.clone()).await
+        TermDictionary::from_child_reader(self.0.reader.clone(), self.bracketed_iris()).await
     }
 
-    /// Whether a window read has had to wait ([`Windows::reads_wait`]).
-    #[cfg(test)]
-    pub(crate) fn debug_reads_wait(&self) -> bool {
+    /// Whether a window read has had to wait ([`Windows::reads_wait`]):
+    /// from then on a chunk decode reads no window in place, and a decode
+    /// that cannot await leaves its chunk ([`ChunkDecode::decode_now`]).
+    ///
+    /// [`ChunkDecode::decode_now`]: crate::store::layouts::ChunkDecode::decode_now
+    pub(crate) fn reads_wait(&self) -> bool {
         self.0.reads_wait.load(std::sync::atomic::Ordering::Relaxed)
     }
 

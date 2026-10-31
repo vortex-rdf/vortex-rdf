@@ -13,8 +13,9 @@ use crate::store::view::selection::RowSelection;
 use crate::store::view::selection::ViewSelection;
 use crate::store::{Backend, Tail, next_generation};
 
+use hashbrown::{DefaultHashBuilder, HashTable};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use std::collections::HashSet;
+use std::hash::BuildHasher;
 
 #[cfg(feature = "file-io")]
 use vortex_mask::Mask;
@@ -99,13 +100,18 @@ impl VortexRdfStore {
         self.ensure_owner("add_quads")?;
 
         let mut fresh: Vec<RawQuad> = Vec::new();
-        let mut seen: HashSet<RawQuad> = HashSet::new();
+        // The quads kept so far, by their place in `fresh`: an earlier equal
+        // quad of the batch is found there, with no copy of a kept quad. The
+        // hasher is seeded, as the dictionary ingest's term tables are.
+        let mut kept: HashTable<usize> = HashTable::new();
+        let hasher = DefaultHashBuilder::default();
         for quad in quads {
             let raw = RawQuad::from_quad(&quad);
-            if seen.contains(&raw) || self.contains(&quad).await? {
+            let hash = hasher.hash_one(&raw);
+            if kept.find(hash, |&i| fresh[i] == raw).is_some() || self.contains(&quad).await? {
                 continue;
             }
-            seen.insert(raw.clone());
+            kept.insert_unique(hash, fresh.len(), |&i| hasher.hash_one(&fresh[i]));
             fresh.push(raw);
         }
         if fresh.is_empty() {
@@ -115,7 +121,7 @@ impl VortexRdfStore {
         let layout = Tail::layout_for(&self.layout);
         let fresh_rows = build_struct_array(&fresh, layout.strategy(), false)?;
         let tail = match &self.tail {
-            None => Tail::new(fresh_rows, layout),
+            None => Tail::new(fresh_rows, layout)?,
             // The fresh rows join the tail as one more chunk, flattened per
             // the tail's policy (see `Tail::append`).
             Some(tail) => tail.append(fresh_rows)?,
@@ -221,6 +227,6 @@ impl VortexRdfStore {
     async fn matching_file_row_mask(base: &FileBase, selection: &ViewSelection) -> Result<Mask> {
         // A served match's pending selection materializes here.
         let selection = selection.materialized_async().await?;
-        file_filter::matching_file_rows(&base.file, base.filter.as_ref(), &selection).await
+        file_filter::matching_file_rows(&base.file, base.filter.over_selection(), &selection).await
     }
 }

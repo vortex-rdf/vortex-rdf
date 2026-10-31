@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::io::quads_stream_to_vortex_writer;
+use crate::observe::{Event, Recorder};
 use crate::store::VortexArrayBuilder;
 use crate::store::indexes::ALL_INDEX_TYPES;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -12,6 +13,7 @@ use std::sync::OnceLock;
 mod adoption;
 mod atomic_write;
 mod builders;
+mod chained;
 mod chunks;
 mod dictionary;
 mod dictionary_file_backed;
@@ -31,11 +33,14 @@ mod mutation;
 mod names;
 mod narrowing;
 mod open_errors;
+mod pending_residual;
 mod predicates;
+mod rebuild;
 mod roundtrip;
 mod row_limit;
 mod serialization;
 mod streaming;
+mod tail_keys;
 mod unique_quads;
 mod wide_codes;
 mod wide_row_ids;
@@ -429,7 +434,11 @@ async fn build_array<B: VortexArrayBuilder>(
 /// The store [`SortedInMemoryBuilder`] builds from `quads` — [`build_array`]
 /// and [`VortexRdfStore::from_built`] in one call, for the tests that never
 /// look at the built array itself.
-async fn built_store(quads: Vec<Quad>, layout: LayoutStrategy, indexes: Indexes) -> VortexRdfStore {
+pub(crate) async fn built_store(
+    quads: Vec<Quad>,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+) -> VortexRdfStore {
     let built = build_array::<SortedInMemoryBuilder>(quad_stream(quads), layout, indexes)
         .await
         .unwrap();
@@ -505,6 +514,35 @@ fn selection_pending(view: &VortexRdfStore) -> bool {
 
 /// The quad-row column names `layout` builds — what a schema assertion
 /// expects the primary struct to carry and nothing else.
+/// The probes the matches `rec` saw bind a column: `(the store's own,
+/// resolved for the call)`.
+fn probe_binds(rec: &Recorder) -> (usize, usize) {
+    (
+        rec.count(&Event::ProbeBound { cached: true }),
+        rec.count(&Event::ProbeBound { cached: false }),
+    )
+}
+
+/// The `rid` rows of in-memory index components `rec` saw decoded.
+fn rids_decoded(rec: &Recorder) -> usize {
+    rec.picked(|e| match e {
+        Event::RidsDecoded(rows) => Some(*rows),
+        _ => None,
+    })
+    .iter()
+    .sum()
+}
+
+/// The directory the last out-of-core build `rec` saw spill its runs under.
+fn last_spill_dir(rec: &Recorder) -> std::path::PathBuf {
+    rec.picked(|e| match e {
+        Event::Spilled(dir) => Some(dir.clone()),
+        _ => None,
+    })
+    .pop()
+    .expect("the build made a run directory")
+}
+
 fn primary_columns(layout: LayoutStrategy) -> &'static [&'static str] {
     match layout {
         LayoutStrategy::Default | LayoutStrategy::Dictionary => &["s", "p", "o", "g"],
@@ -679,6 +717,7 @@ fn index_child_write(
             version: 1,
             required,
             sorted,
+            bracketed_iris: false,
             dtype,
         },
         chunks,
@@ -704,6 +743,7 @@ fn dict_child_write(
             version,
             required: true,
             sorted: true,
+            bracketed_iris: dict.bracketed_iris(),
             dtype,
         },
         chunks,
@@ -1326,8 +1366,7 @@ fn chunk_columns(chunks: &[vortex_array::ArrayRef], names: &[&str]) -> Vec<Vec<u
 }
 
 /// The `(s, p, o, g)` codes of Dictionary-layout struct chunks — what
-/// `row_chunks` and a data source scan yield — concatenated: one
-/// `[s, p, o, g]` row per chunk row.
+/// `row_chunks` yields — concatenated: one `[s, p, o, g]` row per chunk row.
 fn struct_chunk_codes(chunks: &[vortex_array::ArrayRef]) -> Vec<[TermCode; 4]> {
     chunk_columns(chunks, &crate::store::schema::PRIMARY_COLUMNS)
         .into_iter()
@@ -1541,6 +1580,23 @@ type Pattern<'a> = (
     Option<&'a Term>,
     Option<&'a GraphName>,
 );
+
+/// [`assert_patterns_agree`] over patterns that each match some quad of
+/// `want`, which it checks first: a test of the path a pattern takes passes
+/// on no empty answer.
+async fn assert_patterns_match(
+    want: &VortexRdfStore,
+    got: &[(&str, &VortexRdfStore)],
+    patterns: &[Pattern<'_>],
+) {
+    for &(name, s, p, o, g) in patterns {
+        assert!(
+            matched_size(want, s, p, o, g).await > 0,
+            "[{name}]: the pattern matches"
+        );
+    }
+    assert_patterns_agree(want, got, patterns).await;
+}
 
 /// Every store in `got`, beside its name, answers each of `patterns` as `want`
 /// does: the same size and the same quads.

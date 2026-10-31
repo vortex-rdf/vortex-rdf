@@ -54,6 +54,12 @@ let probe = SortedProbe::resolve(&encoded).expect("supported encoding tree");
 assert_eq!(probe.bounds(1_000), (11_000, 11_011));
 assert_eq!(probe.value_at(11_000), 1_000);
 
+// Read a range in one pass: the run-end node finds the range's first run
+// once and walks the runs from there.
+let mut values = [0; 4];
+probe.read_into(10_999, &mut values);
+assert_eq!(values, [999, 1_000, 1_000, 1_000]);
+
 // Restrict a search to a window — useful when a column is sorted only
 // within the run of a preceding key.
 assert_eq!(probe.bounds_in(11_000..22_000, 1_500), (16_500, 16_511));
@@ -102,8 +108,11 @@ writer was limited to an edition can still hold it.
 ascending. This is a caller contract, exactly as it is for
 `slice::partition_point`: an unsorted array yields an unspecified — but never
 panicking, never unsound — answer. `bounds_in` requires only its window to be
-sorted, and never reads a row outside it. `value_at` is exact regardless of
-order.
+sorted, and never reads a row outside it. `value_at`, and `read_into` and
+`read_at` (a range, or a list of indices, each run of consecutive indices read
+in one pass: a run-end node's first run found once, a bit-packed node's
+patches searched once, a delta node's decoded blocks copied), are exact
+regardless of order.
 
 Searches over ascending codes in a run-end node's values, and a `bounds_in`
 window's lower bound, interpolate: once a probe has landed on each side of the
@@ -113,7 +122,8 @@ spread about evenly cost a few reads instead of one per halving, while
 plateaus and windows of 16 values or fewer cost what bisection does. A
 `bounds_in` window's upper bound is then bisected for between its lower bound
 and the nearest row the lower search found past the needle: a few rows when
-the needle's rows are few.
+the needle's rows are few. A bit-packed node's `bounds`, and a frame of
+reference's over one (the needle less the reference), search the same way.
 
 ## The `layout` feature
 
@@ -125,7 +135,9 @@ chunks' last values, or the rows, actually touch; a take has each leaf take its
 rows from its array. A `bounds_in` window is searched inside the leaf holding
 its lower bound, which the leaves' last values pick, and `leaf_rows` hands
 back a window inside one leaf as a `LeafRows`, whose bounds searches and point
-reads go through that leaf's probe without finding the leaf again. Each fetched chunk is reconstructed in its wire encoding
+reads go through that leaf's probe without finding the leaf again. `values_at`
+reads any list of rows, finding each leaf once for the rows that follow one
+another in it and reading each run of consecutive rows in one pass. Each fetched chunk is reconstructed in its wire encoding
 (`SerializedArray::decode` rebuilds metadata over the segment buffers — it does
 not decompress), resolved into a probe once, and cached, so repeated queries
 against a hot file do no further I/O.

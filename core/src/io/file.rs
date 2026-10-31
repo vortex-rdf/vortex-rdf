@@ -4,6 +4,7 @@
 
 use crate::error::Result;
 use crate::io::read::{open_failure, open_store_buffer};
+use crate::observe::observe;
 
 /// Which file a path named when it was opened: the device and inode on Unix.
 /// A store keeps it to tell, before it rewrites its source file, whether the
@@ -60,6 +61,9 @@ pub(crate) struct OpenedFile {
     /// The absolute path the file was opened from, so that a later change of
     /// the working directory does not move it; none for a buffer.
     pub(crate) path: Option<std::path::PathBuf>,
+    /// The whole file's bytes, where the open holds them: the mapping. None
+    /// where the file is read through Vortex's reader, and for a buffer.
+    pub(crate) bytes: Option<vortex_buffer::ByteBuffer>,
 }
 
 /// A file opened over a buffer: no mapping, no identity, no path.
@@ -70,6 +74,7 @@ impl From<vortex_file::VortexFile> for OpenedFile {
             mapped: false,
             identity: None,
             path: None,
+            bytes: None,
         }
     }
 }
@@ -84,8 +89,7 @@ impl std::ops::Deref for OpenedFile {
 
 /// Map `file` read-only. The only place a store file is mapped.
 fn map_file(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
-    #[cfg(test)]
-    map_probe::note();
+    observe!(FileMapped);
     // SAFETY: a store file is read-only while open; truncating or rewriting
     // it in place is unsupported (docs/file-format.md §8).
     unsafe { memmap2::Mmap::map(file) }
@@ -125,12 +129,14 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
         FileAccess::Mapped => {
             let identity = file.metadata().ok().as_ref().and_then(FileIdentity::of);
             let mmap = map_file(&file).map_err(|e| path_error("map", path, e))?;
-            let opened = open_store_buffer(vortex_buffer::ByteBuffer::from(mmap))?;
+            let bytes = vortex_buffer::ByteBuffer::from(mmap);
+            let opened = open_store_buffer(bytes.clone())?;
             Ok(OpenedFile {
                 file: opened,
                 mapped: true,
                 identity,
                 path: Some(absolute),
+                bytes: Some(bytes),
             })
         }
         FileAccess::Read => {
@@ -150,25 +156,5 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
                 )),
             }
         }
-    }
-}
-
-/// Test hook: the number of files [`map_file`] has mapped on this thread.
-#[cfg(test)]
-pub(crate) mod map_probe {
-    use std::cell::Cell;
-
-    thread_local! {
-        static MAPPED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Count one mapped file.
-    pub(super) fn note() {
-        MAPPED.set(MAPPED.get() + 1);
-    }
-
-    /// The files mapped on this thread since the last call.
-    pub(crate) fn take() -> usize {
-        MAPPED.take()
     }
 }

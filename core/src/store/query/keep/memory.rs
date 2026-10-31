@@ -15,6 +15,7 @@ use vortex_rdf_encoded_search::SortedProbe;
 use super::{Keep, KeepTest};
 use crate::debug;
 use crate::error::Result;
+use crate::observe::observe;
 use crate::store::array::{column_is_sorted, into_struct_array};
 use crate::store::probes::StructProbes;
 use crate::store::resident::cached_code_primitive;
@@ -44,8 +45,7 @@ impl VortexRdfStore {
         let narrowed =
             match Self::keep_sorted_run(&struct_arr, base, probes, &selection, column, keep) {
                 Some(narrowed) => {
-                    #[cfg(test)]
-                    keep_hooks::note_sorted_run_keep();
+                    observe!(SortedRunKeep);
                     debug::step!(
                         t,
                         "[keep] {:?} narrowed by binary search inside a sorted run",
@@ -268,8 +268,7 @@ fn keep_by_pieces(
     use vortex_array::arrays::PrimitiveArray;
 
     if selection.is_point_sized() {
-        #[cfg(test)]
-        keep_hooks::note_probed_rows(selection.len(base_len));
+        observe!(KeepRowsProbed(selection.len(base_len)));
         let kept = selection.filter_rows(base_len, |row| test.admits(probe.value_at(row)));
         return Ok(survivors(selection, base_len, kept));
     }
@@ -302,15 +301,13 @@ fn keep_by_pieces(
                 continue;
             }
             if decodes_piece(rows.selected(), span.len()) {
-                #[cfg(test)]
-                keep_hooks::note_decoded_piece();
+                observe!(KeepPieceDecoded);
                 let codes = chunk
                     .slice(span.start - chunk_start..span.end - chunk_start)?
                     .execute::<PrimitiveArray>(&mut ctx)?;
                 rows.admit_decoded(&mut kept, test, codes.as_slice::<TermCode>(), span.start);
             } else {
-                #[cfg(test)]
-                keep_hooks::note_probed_rows(rows.selected());
+                observe!(KeepRowsProbed(rows.selected()));
                 rows.admit_probed(&mut kept, test, probe);
             }
         }
@@ -412,53 +409,6 @@ fn code_chunks(column: &ArrayRef) -> Vec<(usize, ArrayRef)> {
     (0..chunked.nchunks())
         .map(|i| (offsets[i], chunked.chunk(i).clone()))
         .collect()
-}
-
-/// Test hook: how many of this thread's in-memory keeps were answered by
-/// binary search inside a sorted run (`keep_sorted_run`), not by a pass
-/// over the selected rows; and how many pieces of a column the passes
-/// decoded, and how many selected rows they read through a probe instead
-/// (`keep_by_pieces`).
-#[cfg(test)]
-pub(crate) mod keep_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static SORTED_RUN_KEEPS: Cell<usize> = const { Cell::new(0) };
-        static DECODED_PIECES: Cell<usize> = const { Cell::new(0) };
-        static PROBED_ROWS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one keep answered inside a sorted run.
-    pub(super) fn note_sorted_run_keep() {
-        SORTED_RUN_KEEPS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The keeps answered inside a sorted run on this thread so far.
-    pub(crate) fn sorted_run_keeps() -> usize {
-        SORTED_RUN_KEEPS.with(Cell::get)
-    }
-
-    /// Record one piece of a column a keep's pass decoded.
-    pub(super) fn note_decoded_piece() {
-        DECODED_PIECES.set(DECODED_PIECES.get() + 1);
-    }
-
-    /// The pieces this thread's keeps decoded so far.
-    pub(crate) fn decoded_pieces() -> usize {
-        DECODED_PIECES.get()
-    }
-
-    /// Record `rows` selected rows a keep's pass read one by one through a
-    /// probe.
-    pub(super) fn note_probed_rows(rows: usize) {
-        PROBED_ROWS.set(PROBED_ROWS.get() + rows);
-    }
-
-    /// The selected rows this thread's keeps read through a probe so far.
-    pub(crate) fn probed_rows() -> usize {
-        PROBED_ROWS.get()
-    }
 }
 
 #[cfg(test)]
@@ -720,7 +670,7 @@ mod tests {
         if !vortex_rdf_encoded_search::encoded_search_enabled() {
             return; // VORTEX_RDF_ENCODED_SEARCH=0 decodes every leaf whole: no pieces to count
         }
-        use super::keep_hooks::{decoded_pieces, probed_rows};
+        use crate::observe::{Event, Recorder};
         const ROWS: usize = 6_000;
         let codes = base_codes(ROWS as u64);
         let (struct_arr, base, probes) = encoded_base(&codes, 2_000);
@@ -729,9 +679,16 @@ mod tests {
         let keep = Keep::range(0..7);
         let test = keep.test(ROWS);
         let run = |selection: &RowSelection, piece_rows: usize| {
-            let (pieces, probed) = (decoded_pieces(), probed_rows());
+            let rec = Recorder::start();
             keep_by_pieces(col, probe, selection, &test, ROWS, piece_rows).unwrap();
-            (decoded_pieces() - pieces, probed_rows() - probed)
+            let probed = rec.picked(|e| match e {
+                Event::KeepRowsProbed(rows) => Some(*rows),
+                _ => None,
+            });
+            (
+                rec.count(&Event::KeepPieceDecoded),
+                probed.iter().sum::<usize>(),
+            )
         };
         let ids = |admit: &dyn Fn(u64) -> bool| -> Vec<u64> {
             (0..ROWS as u64).filter(|&i| admit(i)).collect()

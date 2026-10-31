@@ -33,6 +33,11 @@ pub(crate) struct TermDictionary {
     code_space: CodeSpace,
     /// The kind ranges, computed on first use.
     kinds: OnceLock<KindRanges>,
+    /// Whether every IRI is spelled `<`, its text, `>`: read from the terms a
+    /// build compresses, else the provenance of the child they were read
+    /// from. Lets [`filter_codes`](Self::filter_codes) decide a `STR()`
+    /// prefix over IRIs by a code range.
+    bracketed_iris: bool,
 }
 
 /// The rank of `code` in a dictionary of `len` terms from `base`; `None` when
@@ -128,14 +133,28 @@ pub(crate) fn next_dictionary_id() -> u64 {
 }
 
 impl TermDictionary {
-    /// A dictionary over `terms`, under a fresh identity.
-    pub(super) fn new(terms: ResidentChunks) -> Self {
+    /// A dictionary over `terms`, under a fresh identity, its IRIs bracketed
+    /// as `bracketed_iris` says.
+    pub(super) fn new(terms: ResidentChunks, bracketed_iris: bool) -> Self {
         Self {
             id: next_dictionary_id(),
             code_space: CodeSpace::new(terms.len()),
             terms,
             kinds: OnceLock::new(),
+            bracketed_iris,
         }
+    }
+
+    /// Whether every IRI is spelled `<`, its text, `>`.
+    pub(crate) fn bracketed_iris(&self) -> bool {
+        self.bracketed_iris
+    }
+
+    /// Test hook: claim bracketed IRIs whatever the terms, so a test tells a
+    /// verdict from the code range from one from reading the term.
+    #[cfg(test)]
+    pub(crate) fn claim_bracketed_iris(&mut self, bracketed_iris: bool) {
+        self.bracketed_iris = bracketed_iris;
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -237,9 +256,36 @@ impl TermDictionary {
         Ok(tolerant_fallback(term)?.and_then(|canonical| self.encode_exact(&canonical)))
     }
 
-    /// [`encode`](Self::encode) over a batch, in order.
+    /// [`encode`](Self::encode) over a batch, in order. The exact lookups
+    /// run in the terms' byte order, each searching only past where the one
+    /// before landed ([`next_lower_bound_by`]), every probe decoded into one
+    /// scratch buffer; then each miss takes its canonical spelling's lookup,
+    /// in input order, so the first malformed miss is the error, as the
+    /// lookups one at a time report it.
     pub(crate) fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
-        terms.iter().map(|term| self.encode(term)).collect()
+        let mut order: Vec<usize> = (0..terms.len()).collect();
+        order.sort_unstable_by_key(|&at| terms[at]);
+        let mut codes = vec![None; terms.len()];
+        let mut scratch = Vec::new();
+        let mut from = 0;
+        for (searched, &at) in order.iter().enumerate() {
+            let needle = terms[at].as_bytes();
+            let left = order.len() - searched;
+            let rank = next_lower_bound_by(from..self.len(), left, |i| {
+                self.terms.bytes_into(i, &mut scratch) < needle
+            });
+            if rank < self.len() && self.terms.bytes_into(rank, &mut scratch) == needle {
+                codes[at] = Some(self.code_at(rank));
+            }
+            from = rank;
+        }
+        for (code, term) in codes.iter_mut().zip(terms) {
+            if code.is_none() {
+                *code =
+                    tolerant_fallback(term)?.and_then(|canonical| self.encode_exact(&canonical));
+            }
+        }
+        Ok(codes)
     }
 
     /// [`decode`](Self::decode) over a batch, in order, each term handed to
@@ -269,19 +315,29 @@ impl TermDictionary {
     /// inside the dictionary ([`check_candidates`]): `(passed, undecided)`,
     /// both ascending subsets of `codes`; a candidate in neither failed. Only
     /// the candidates their kind does not decide
-    /// ([`TermPredicate::kind_verdict`]) are read. Nothing is memoized.
+    /// ([`TermPredicate::kind_verdict`]) are read, less the IRIs a `STR()`
+    /// prefix decides by its code range ([`decide_iris`]). Nothing is
+    /// memoized.
     pub(crate) fn filter_codes(
         &self,
         predicate: &TermPredicate,
         codes: &[TermCode],
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         check_candidates(codes, self.code_space)?;
-        let (mut verdicts, read) = kind_verdicts(predicate, self.kind_ranges(), codes);
+        let kinds = self.kind_ranges();
+        let (mut verdicts, mut read) = kind_verdicts(predicate, kinds, codes);
+        if let Some(prefix) =
+            iri_prefix_to_decide(predicate, self.bracketed_iris, kinds, codes, &read)
+        {
+            let passing = self.prefix_range(&format!("<{prefix}"));
+            decide_iris(&mut verdicts, &mut read, codes, &kinds.iris, &passing);
+        }
         let mut cursor = self.cursor();
+        let mut scratch = String::new();
         for at in read {
             // In range: the candidates were checked above.
             if let Some(rank) = self.rank_of(codes[at]) {
-                verdicts[at] = predicate.eval(cursor.str_at(rank));
+                verdicts[at] = predicate.eval_with(cursor.str_at(rank), &mut scratch);
             }
         }
         Ok(split_verdicts(codes, &verdicts))
@@ -342,6 +398,48 @@ pub(super) fn lower_bound_by(
         }
     }
     lo
+}
+
+/// The lower bound of the next of `left` sorted needles, `range` starting
+/// where the one before landed: galloped out from the start
+/// ([`gallop_lower_bound_by`]) while the needles left are more than the
+/// square root of the range, so that the next is likely near, else the
+/// range bisected ([`lower_bound_by`]). A bound `d` positions in costs about
+/// `2 log2(d)` probes galloped, against `log2` of the range bisected, so
+/// neither is ever much worse than one search of the whole dictionary per
+/// needle.
+pub(super) fn next_lower_bound_by(
+    range: Range<usize>,
+    left: usize,
+    is_below: impl FnMut(usize) -> bool,
+) -> usize {
+    if left.saturating_mul(left) > range.len() {
+        gallop_lower_bound_by(range, is_below)
+    } else {
+        lower_bound_by(range, is_below)
+    }
+}
+
+/// [`lower_bound_by`] for a bound expected near `range.start`: the probes
+/// step out from there, doubling each time, until one fails, then bisect the
+/// last step, so a bound `d` positions in costs about `2 log2(d)` probes
+/// however long the range.
+pub(super) fn gallop_lower_bound_by(
+    range: Range<usize>,
+    mut is_below: impl FnMut(usize) -> bool,
+) -> usize {
+    // Every position from `range.start` up to `lo` is below.
+    let (mut lo, end) = (range.start, range.end);
+    let mut step = 1;
+    while lo < end {
+        let probe = lo.saturating_add(step - 1).min(end - 1);
+        if !is_below(probe) {
+            return lower_bound_by(lo..probe, is_below);
+        }
+        lo = probe + 1;
+        step = step.saturating_mul(2);
+    }
+    end
 }
 
 /// The position of `range` where `cmp` is `Equal`, `cmp` being `Less` before
@@ -410,6 +508,49 @@ pub(super) fn kind_verdicts(
     (verdicts, read)
 }
 
+/// The prefix whose code range decides the IRI candidates
+/// [`kind_verdicts`] left to `read` ([`decide_iris`]): `predicate`'s
+/// ([`TermPredicate::iri_prefix`]), when the dictionary's IRIs are all
+/// bracketed and an IRI is among the candidates to read. `None` otherwise:
+/// they are read.
+pub(super) fn iri_prefix_to_decide<'p>(
+    predicate: &'p TermPredicate,
+    bracketed_iris: bool,
+    kinds: &KindRanges,
+    codes: &[TermCode],
+    read: &[usize],
+) -> Option<&'p str> {
+    if !bracketed_iris {
+        return None;
+    }
+    let prefix = predicate.iri_prefix()?;
+    read.iter()
+        .any(|&at| kinds.iris.contains(&codes[at]))
+        .then_some(prefix)
+}
+
+/// Takes the IRI candidates out of `read`, each with its verdict from
+/// `passing`, the code range of `<` and an [`iri_prefix_to_decide`]: every
+/// IRI spelled `<`, its text, `>` and the prefix holding no `>`, an IRI's
+/// `STR()` starts with the prefix exactly when its spelling starts with `<`
+/// and the prefix. The other candidates stay to be read.
+pub(super) fn decide_iris(
+    verdicts: &mut [Verdict],
+    read: &mut Vec<usize>,
+    codes: &[TermCode],
+    iris: &Range<TermCode>,
+    passing: &Range<TermCode>,
+) {
+    read.retain(|&at| {
+        let code = codes[at];
+        if !iris.contains(&code) {
+            return true;
+        }
+        verdicts[at] = Verdict::from(passing.contains(&code));
+        false
+    });
+}
+
 /// The candidates' verdicts as `(passed, undecided)`, both ascending
 /// subsets of `codes`; a code in neither failed.
 pub(super) fn split_verdicts(
@@ -429,9 +570,97 @@ pub(super) fn split_verdicts(
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage::scratch_hooks;
     use super::*;
+    use crate::observe::{Event, Recorder};
     use vortex_array::arrays::VarBinViewArray;
+
+    /// A batch lookup answers as the lookups one at a time, duplicates,
+    /// absent terms and a non-canonical spelling included, and decodes every
+    /// probe of its exact lookups into one scratch buffer. The galloping
+    /// bound agrees with the bisection wherever it starts.
+    #[test]
+    fn a_batch_lookup_answers_as_single_ones_through_one_scratch() {
+        let terms: Vec<String> = (0..1024)
+            .map(|i| format!("<http://example.org/term/{i:05}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let dict = TermDictionary::compress_windowed(plain, 32).unwrap();
+        let mut batch: Vec<&str> = (0..1024)
+            .rev()
+            .step_by(7)
+            .map(|i| terms[i].as_str())
+            .collect();
+        batch.extend([
+            terms[3].as_str(),
+            terms[3].as_str(),
+            "<http://example.org/term/00003x>",
+        ]);
+        batch.extend([
+            "<http://example.org/term/zzz>",
+            "<http://example.org/a>",
+            terms[1023].as_str(),
+        ]);
+        let mut rec = Recorder::start();
+        let codes = dict.encode_many(&batch).unwrap();
+        // The absent terms are spelled canonically already: none takes a
+        // second lookup.
+        assert_eq!(rec.take_count(&Event::ScratchGrown { fresh: true }), 1);
+        let one_at_a_time: Vec<_> = batch.iter().map(|t| dict.encode(t).unwrap()).collect();
+        assert_eq!(codes, one_at_a_time);
+        // Each search runs only past the one before. Terms two apart gallop:
+        // under half the probes of the lookups one at a time. Terms sixteen
+        // apart gallop too, about 2 log2(16) probes each and an equality
+        // read. Terms 128 apart, too few to gallop, bisect what is left of
+        // the dictionary, never more than one search of it.
+        let mut probes = |batch: &[&str]| {
+            rec.take();
+            dict.encode_many(batch).unwrap();
+            rec.take_count(&Event::ScratchRead)
+        };
+        let every = |step: usize| -> Vec<&str> {
+            (0..1024).step_by(step).map(|i| terms[i].as_str()).collect()
+        };
+        let dense = every(2);
+        let single = {
+            let rec = Recorder::start();
+            for term in &dense {
+                dict.encode_exact(term);
+            }
+            rec.count(&Event::ScratchRead)
+        };
+        let batched = probes(&dense);
+        assert!(
+            batched * 2 < single,
+            "{batched} probes, {single} one at a time"
+        );
+        let batched = probes(&every(16));
+        assert!(batched <= 64 * 10, "{batched} probes for 64 terms 16 apart");
+        let batched = probes(&every(128));
+        assert!(batched <= 8 * 11, "{batched} probes for 8 terms 128 apart");
+        // A tolerated spelling (no angle brackets) resolves through the
+        // fallback; a malformed miss is the error.
+        assert_eq!(
+            dict.encode_many(&["http://example.org/term/00010", terms[2].as_str()])
+                .unwrap(),
+            vec![Some(10), Some(2)]
+        );
+        assert!(
+            dict.encode_many(&[terms[0].as_str(), "\"unterminated"])
+                .is_err()
+        );
+
+        let values: Vec<usize> = (0..100).map(|i| i * 3).collect();
+        for start in 0..values.len() {
+            for needle in 0..310 {
+                let want = lower_bound_by(start..values.len(), |i| values[i] < needle);
+                assert_eq!(
+                    gallop_lower_bound_by(start..values.len(), |i| values[i] < needle),
+                    want,
+                    "from {start} for {needle}"
+                );
+            }
+        }
+    }
 
     /// A single-term read — an encode, a lower bound, a decode — decodes every
     /// probe into one scratch buffer, so it allocates one buffer however many
@@ -444,16 +673,15 @@ mod tests {
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let dict = TermDictionary::compress_windowed(plain, 32).unwrap();
         assert_eq!(dict.term_chunks().len(), 32, "32 windows");
+        let mut rec = Recorder::start();
+        let mut fresh = || rec.take_count(&Event::ScratchGrown { fresh: true });
         for (i, term) in terms.iter().enumerate() {
-            let fresh = scratch_hooks::fresh();
             assert_eq!(dict.encode_exact(term), Some(i as TermCode));
-            assert_eq!(scratch_hooks::fresh() - fresh, 1, "encode {i}");
-            let fresh = scratch_hooks::fresh();
+            assert_eq!(fresh(), 1, "encode {i}");
             assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
-            assert_eq!(scratch_hooks::fresh() - fresh, 1, "lower_bound {i}");
-            let fresh = scratch_hooks::fresh();
+            assert_eq!(fresh(), 1, "lower_bound {i}");
             assert_eq!(dict.decode(i as TermCode).as_deref(), Some(term.as_str()));
-            assert_eq!(scratch_hooks::fresh() - fresh, 1, "decode {i}");
+            assert_eq!(fresh(), 1, "decode {i}");
         }
     }
 
@@ -471,11 +699,11 @@ mod tests {
         let dict = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
         let chunks = dict.term_chunks();
         assert!(chunks.len() == 1 && chunks[0].is::<vortex_fsst::FSST>());
-        let regrown = scratch_hooks::regrown();
+        let rec = Recorder::start();
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(dict.encode_exact(term), Some(i as TermCode));
             assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
         }
-        assert_eq!(scratch_hooks::regrown(), regrown);
+        assert_eq!(rec.count(&Event::ScratchGrown { fresh: false }), 0);
     }
 }

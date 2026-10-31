@@ -16,9 +16,6 @@
 mod file;
 mod memory;
 
-#[cfg(test)]
-pub(crate) use memory::keep_hooks;
-
 use std::ops::Range;
 
 use vortex_buffer::Buffer;

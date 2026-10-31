@@ -6,6 +6,11 @@
 //! pending filter, the dictionary's residency — is asserted through
 //! [`view_statistics`](VortexRdfStore::view_statistics) and
 //! [`dict_reader`](VortexRdfStore::dict_reader).
+//!
+//! The values a test forces on production code (a code or row-id base, a
+//! term cap, a split limit, a failing cut) are here too, each a guard of
+//! [`Override`]. Which points production code reached is recorded as events
+//! instead ([`crate::observe`]).
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -22,7 +27,7 @@ use crate::store::array;
 use crate::store::indexes::IndexComponent;
 use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
-use crate::store::layouts::{DictAccess, QuadPattern};
+use crate::store::layouts::{DictAccess, Prepared, QuadPattern};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::FileCounter;
 use crate::store::view::selection::{RowSelection, ViewSelection};
@@ -31,17 +36,6 @@ use crate::store::{DictSnapshot, RowId, TermCode, VortexRdfStore};
 pub(crate) use crate::store::view::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
 thread_local! {
-    /// How many times this thread gathered a store's live rows into raw quads
-    /// (`live_raw_quads`, every rebuild's first step). Thread-local because the
-    /// tests share a process and run on the current-thread runtime, so a test
-    /// reads only its own gathers.
-    static GATHERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-
-    /// How many row ids this thread's in-memory resolutions decoded from an
-    /// index component's `rid` column (`sorted_row_ids`). Thread-local like
-    /// `GATHERS`.
-    static DECODED_RIDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-
     /// The code the dictionaries built or opened on this thread give their
     /// first term, while a [`CodeBase`] guard is live.
     static CODE_BASE: Cell<Option<TermCode>> = const { Cell::new(None) };
@@ -59,9 +53,10 @@ thread_local! {
 /// A thread's override of a value production code reads, live while the
 /// guard is: `cell` holds the value, `None` meaning the production one, and
 /// dropping the guard restores what it replaced, so guards nest. Every
-/// guard of the test seams ([`RowIdBase`], [`CodeBase`], [`TermCap`], the
-/// driver's `ForcedLimit`, the rechunk's `FailingCut`) is one. Thread-local
-/// like `GATHERS`, for the same reason.
+/// guard of the test seams ([`RowIdBase`], [`CodeBase`], [`TermCap`],
+/// [`ForcedLimit`], [`FailingCut`]) is one. Thread-local because the tests
+/// share a process and run on the current-thread runtime, so a test sees
+/// only its own.
 pub(crate) struct Override<T: Copy + 'static> {
     cell: &'static LocalKey<Cell<Option<T>>>,
     replaced: Option<T>,
@@ -80,6 +75,71 @@ impl<T: Copy + 'static> Override<T> {
 impl<T: Copy + 'static> Drop for Override<T> {
     fn drop(&mut self) {
         self.cell.set(self.replaced);
+    }
+}
+
+thread_local! {
+    /// The split limit forced on this thread's row scans, while a
+    /// [`ForcedLimit`] guard is live.
+    static SPLIT_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+
+    /// The cuts this thread's `rechunk` iterators make before one fails,
+    /// while a [`FailingCut`] guard is live.
+    static CUTS_BEFORE_FAILURE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The split limit a [`ForcedLimit`] forced on this thread's row scans.
+pub(crate) fn forced_split_limit() -> Option<usize> {
+    SPLIT_LIMIT.get()
+}
+
+/// While alive, this thread's row scans run inline up to `limit` splits and
+/// spawn above it, in place of the production limit. Dropping it restores
+/// the limit it replaced ([`Override`]).
+pub(crate) struct ForcedLimit {
+    _guard: Override<usize>,
+}
+
+impl ForcedLimit {
+    /// Force the split limit to `limit` until the guard drops.
+    pub(crate) fn set(limit: usize) -> Self {
+        Self {
+            _guard: Override::set(&SPLIT_LIMIT, limit),
+        }
+    }
+}
+
+/// One cut of this thread's `rechunk` iterators: an error when it is the cut
+/// a [`FailingCut`] names.
+pub(crate) fn rechunk_cut() -> crate::error::Result<()> {
+    match CUTS_BEFORE_FAILURE.get() {
+        Some(0) => {
+            CUTS_BEFORE_FAILURE.set(None);
+            Err(crate::error::VortexRdfError::Vortex(
+                vortex_error::vortex_err!("a cut failed (test hook)"),
+            ))
+        }
+        Some(n) => {
+            CUTS_BEFORE_FAILURE.set(Some(n - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+/// While alive, the cut this thread's `rechunk` iterators make `n` cuts from
+/// now (`0`: the next) fails. Dropping it restores the failure it replaced
+/// ([`Override`]).
+pub(crate) struct FailingCut {
+    _guard: Override<usize>,
+}
+
+impl FailingCut {
+    /// Fail the cut `n` cuts from now.
+    pub(crate) fn after(n: usize) -> Self {
+        Self {
+            _guard: Override::set(&CUTS_BEFORE_FAILURE, n),
+        }
     }
 }
 
@@ -173,30 +233,6 @@ impl TermCap {
     }
 }
 
-/// Record `rows` row ids decoded from a component's `rid` column (called by
-/// `sorted_row_ids`).
-pub(crate) fn note_decoded_rids(rows: usize) {
-    DECODED_RIDS.with(|decoded| decoded.set(decoded.get() + rows));
-}
-
-/// The row ids this thread has decoded from component `rid` columns so far.
-pub(crate) fn decoded_rids() -> usize {
-    DECODED_RIDS.with(std::cell::Cell::get)
-}
-
-/// Record one gather of live rows (called by `live_raw_quads`).
-pub(crate) fn note_gather() {
-    GATHERS.with(|gathers| gathers.set(gathers.get() + 1));
-}
-
-/// The gathers of live rows this thread has made so far: a refusal that comes
-/// before any work leaves it unchanged. (Read by the file-backed compaction
-/// tests.)
-#[cfg(feature = "file-io")]
-pub(crate) fn gathers() -> usize {
-    GATHERS.with(std::cell::Cell::get)
-}
-
 #[cfg(feature = "file-io")]
 use oxrdf::NamedOrBlankNode;
 
@@ -217,7 +253,8 @@ impl VortexRdfStore {
     pub(crate) fn debug_row_ids_materialized(&self) -> Option<bool> {
         match &self.quads.selection {
             ViewSelection::Exact(_) => None,
-            ViewSelection::Pending(lazy) => Some(lazy.debug_materialized()),
+            ViewSelection::Pending { ids, .. } => Some(ids.debug_materialized()),
+            ViewSelection::Residual(residual) => Some(residual.debug_materialized()),
         }
     }
 
@@ -236,7 +273,8 @@ impl VortexRdfStore {
     /// whose width is unknown, `None` for an exact selection.
     pub(crate) fn debug_pending_len(&self) -> Option<Option<usize>> {
         match &self.quads.selection {
-            ViewSelection::Pending(lazy) => Some(lazy.len_if_known()),
+            ViewSelection::Pending { ids, .. } => Some(ids.len_if_known()),
+            ViewSelection::Residual(residual) => Some(residual.len_if_known()),
             ViewSelection::Exact(_) => None,
         }
     }
@@ -368,15 +406,15 @@ impl VortexRdfStore {
     }
 
     /// The live base rows the filter masks a window kept on this view hold
-    /// (see `FileBase::masks`); `None` on a view without them.
+    /// (see `FileFilter::Kept`); `None` on a view without them.
     pub(crate) fn debug_evaluated_len(&self) -> Option<usize> {
         self.quads.evaluated_len()
     }
 
     /// The ranges of the filter masks a window kept on this view, in file
-    /// order (see `FileBase::masks`); `None` on a view without them.
+    /// order (see `FileFilter::Kept`); `None` on a view without them.
     pub(crate) fn debug_evaluated_ranges(&self) -> Option<Vec<std::ops::Range<u64>>> {
-        let masks = self.quads.file()?.masks.as_ref()?;
+        let masks = self.quads.file()?.filter.kept_masks()?;
         Some(masks.iter().map(|(_, range)| range.clone()).collect())
     }
 
@@ -480,7 +518,7 @@ impl VortexRdfStore {
             return Ok(None);
         };
         let pattern = QuadPattern::new(Some(subject), None, None, None);
-        let Some(mut codes) = self.prepared_codes(pattern).await? else {
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
             return Ok(Some(0..0));
         };
         match file_exprs::build_file_filter(pattern, &mut codes)? {
@@ -500,10 +538,8 @@ impl VortexRdfStore {
         let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
-        let Some(mut codes) = self
-            .prepared_codes(QuadPattern::new(Some(subject), None, None, None))
-            .await?
-        else {
+        let pattern = QuadPattern::new(Some(subject), None, None, None);
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
             return Ok(None);
         };
         subject_runs::locate_subject_run(file, &mut codes, subject).await
@@ -521,7 +557,7 @@ impl VortexRdfStore {
             return Ok(None);
         };
         let pattern = QuadPattern::new(None, predicate, object, None);
-        let Some(mut codes) = self.prepared_codes(pattern).await? else {
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
             return Ok(None);
         };
         crate::store::indexes::file::debug_located_run(

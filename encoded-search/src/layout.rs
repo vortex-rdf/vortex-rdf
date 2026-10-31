@@ -466,6 +466,53 @@ impl ColumnChunks {
         ))
     }
 
+    /// Exact values at global `rows`, in their order: each chunk leaf holding
+    /// some of them fetched (and cached) once for the rows that follow one
+    /// another in it, and each run of consecutive rows read in one pass
+    /// through the leaf's probe ([`SortedProbe::read_into`]), a lone row
+    /// point-read, where [`Self::value_at`] finds a row's leaf and reads it
+    /// alone. Needs no sort order. `Ok(None)` when a leaf the rows reach
+    /// declines the probe.
+    ///
+    /// # Panics
+    /// Panics if a row is `>= self.row_count()`.
+    pub async fn values_at(
+        &self,
+        rows: &[u64],
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u64>>> {
+        if let [row] = rows {
+            return Ok(self.value_at(*row, source, session).await?.map(|v| vec![v]));
+        }
+        let mut values = vec![0; rows.len()];
+        let mut i = 0;
+        while i < rows.len() {
+            assert!(rows[i] < self.row_count, "row {} out of bounds", rows[i]);
+            let idx = self.leaf_holding(rows[i]);
+            let leaf = &self.chunks[idx];
+            let in_leaf = |row: u64| leaf.row_offset <= row && row < leaf.end();
+            let end = i + rows[i..].iter().take_while(|&&row| in_leaf(row)).count();
+            let Some(probe) = self.chunk_probe(idx, source, session).await? else {
+                return Ok(None);
+            };
+            let probe = probe.probe();
+            while i < end {
+                let run = crate::consecutive_run(&rows[i..end], |row| row + 1);
+                // The local row is below the leaf's row count, which its fetch
+                // checked fits a `usize`.
+                let local = (rows[i] - leaf.row_offset) as usize;
+                if run == 1 {
+                    values[i] = probe.value_at(local);
+                } else {
+                    probe.read_into(local, &mut values[i..i + run]);
+                }
+                i += run;
+            }
+        }
+        Ok(Some(values))
+    }
+
     /// The values at `rows` (ascending), as one array of the column's dtype:
     /// each leaf holding some of them takes them from its array in the wire
     /// encoding (the take kernels decode only what they touch), and only
@@ -589,6 +636,44 @@ impl LeafRows<'_> {
     pub fn value_at(&self, row: u64) -> u64 {
         assert!(self.rows().contains(&row), "row {row} outside the window");
         self.probe.value_at((row - self.row_offset) as usize)
+    }
+
+    /// The values at the absolute rows `first..first + out.len()`, into
+    /// `out`, read in one pass through the leaf's probe
+    /// ([`SortedProbe::read_into`]).
+    ///
+    /// # Panics
+    /// Panics if the rows leave the window.
+    pub fn read_into(&self, first: u64, out: &mut [u64]) {
+        let rows = self.rows();
+        assert!(
+            rows.start <= first && first + out.len() as u64 <= rows.end,
+            "rows {first}..+{} outside the window {rows:?}",
+            out.len()
+        );
+        self.probe
+            .read_into((first - self.row_offset) as usize, out);
+    }
+
+    /// The values at the absolute `rows`, in their order, into `out`: each
+    /// run of consecutive rows read in one pass ([`Self::read_into`]), a lone
+    /// row point-read.
+    ///
+    /// # Panics
+    /// Panics if a row is outside the window or `out` is not as long as
+    /// `rows`.
+    pub fn values_at(&self, rows: &[u64], out: &mut [u64]) {
+        assert_eq!(rows.len(), out.len(), "one value per row");
+        let mut i = 0;
+        while i < rows.len() {
+            let run = crate::consecutive_run(&rows[i..], |row| row + 1);
+            if run == 1 {
+                out[i] = self.value_at(rows[i]);
+            } else {
+                self.read_into(rows[i], &mut out[i..i + run]);
+            }
+            i += run;
+        }
     }
 }
 

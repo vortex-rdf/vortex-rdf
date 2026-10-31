@@ -14,6 +14,7 @@
 //! (the persisted-child model and the slug registry) are re-exported here,
 //! so callers see one `indexes::` surface.
 
+#[cfg(feature = "file-io")]
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -29,6 +30,7 @@ use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::ChildReader;
 use crate::store::schema::RowId;
+use crate::store::view::selection::window_rows;
 use resolve::IndexProbe;
 
 pub(crate) mod components;
@@ -572,7 +574,8 @@ impl LazyRowIds {
     /// in-memory run knows its width up front (so a count on a served match
     /// never decodes), and so does a located file run, whether its ids come
     /// from the run itself or from the child scan it bounds; an unlocated
-    /// child scan only once its ids are read.
+    /// child scan and a pending residual compare only once their ids are
+    /// known.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
             LazyRowIdSource::Component { rids, .. } => Some(rids.len()),
@@ -587,9 +590,10 @@ impl LazyRowIds {
         }
     }
 
-    /// The ids, when they take no I/O: an in-memory run's, computed (and
-    /// cached) here as [`materialized`](Self::materialized) does, or a file
-    /// child's once read. `None` for a file child's ids not read yet.
+    /// The ids, when they take no I/O: an in-memory run's or a pending
+    /// residual compare's, computed (and cached) here as
+    /// [`materialized`](Self::materialized) does, or a file child's once
+    /// read. `None` for a file child's ids not read yet.
     pub(crate) fn ids_without_io(&self) -> Result<Option<Buffer<RowId>>> {
         match &self.source {
             LazyRowIdSource::Component { .. } => self.materialized().map(Some),
@@ -634,21 +638,13 @@ impl LazyRowIds {
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 unreachable!(
-                    "an in-memory view only ever carries component-sourced pending ids, and the \
-                     file match reads a file run's ids before it folds them"
+                    "an in-memory view only ever carries a component's pending ids, and \
+                     the file match reads a file run's ids before it folds them"
                 )
             }
         };
         Ok(self.cell.get_or_init(|| ids).clone())
     }
-}
-
-/// The rows `offset..offset + limit` of a run `width` rows wide, clamped to
-/// it; `None` when the window holds no row.
-fn window_rows(offset: usize, limit: usize, width: u64) -> Option<Range<u64>> {
-    let start = (offset as u64).min(width);
-    let end = (offset as u64).saturating_add(limit as u64).min(width);
-    (start < end).then_some(start..end)
 }
 
 /// The pattern resolved against the configured indexes over an in-memory

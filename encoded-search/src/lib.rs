@@ -172,6 +172,46 @@ impl<'a> SortedProbe<'a> {
         self.root.value_at(index)
     }
 
+    /// The exact values at `start..start + out.len()`, widened to `u64`, into
+    /// `out`: what [`Self::value_at`] reads at each index, with the work the
+    /// indices share done once (a run-end column's first run found once and
+    /// the runs walked, a patched column's patches searched once, a chunked
+    /// column's chunks found once each). Needs no sort order.
+    ///
+    /// # Panics
+    /// Panics if `start + out.len() > self.len()`.
+    pub fn read_into(&self, start: usize, out: &mut [u64]) {
+        assert!(
+            start
+                .checked_add(out.len())
+                .is_some_and(|end| end <= self.len()),
+            "{} values from {start} out of bounds",
+            out.len()
+        );
+        self.root.read_into(start, out);
+    }
+
+    /// The exact values at `indices`, in their order, into `out`: each run of
+    /// consecutive indices read in one pass ([`Self::read_into`]), a lone
+    /// index point-read.
+    ///
+    /// # Panics
+    /// Panics if an index is `>= self.len()` or `out` is not as long as
+    /// `indices`.
+    pub fn read_at(&self, indices: &[usize], out: &mut [u64]) {
+        assert_eq!(indices.len(), out.len(), "one value per index");
+        let mut i = 0;
+        while i < indices.len() {
+            let run = consecutive_run(&indices[i..], |index| index + 1);
+            if run == 1 {
+                out[i] = self.value_at(indices[i]);
+            } else {
+                self.read_into(indices[i], &mut out[i..i + run]);
+            }
+            i += run;
+        }
+    }
+
     /// Pre-order encoding kinds of the resolved tree, for tests and
     /// diagnostics.
     pub fn node_kinds(&self) -> Vec<NodeKind> {
@@ -179,6 +219,15 @@ impl<'a> SortedProbe<'a> {
         self.root.collect_kinds(&mut kinds);
         kinds
     }
+}
+
+/// The length of the run of consecutive values `values` starts with, at least
+/// one: each value is `next` of the one before it.
+pub(crate) fn consecutive_run<T: Copy + PartialEq>(values: &[T], next: impl Fn(T) -> T) -> usize {
+    1 + values
+        .windows(2)
+        .take_while(|pair| pair[1] == next(pair[0]))
+        .count()
 }
 
 /// Reports what the probe resolved to, not the data it reads: the row count
