@@ -228,6 +228,36 @@ impl VortexRdfStore {
             observe!(ServedRunChunks);
             let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
             let deleted = self.quads.deleted.clone();
+            // Kept rows, or a point-sized run: each batch's codes point by
+            // point, straight into code buffers.
+            if let Some(positions) = plan.point_positions() {
+                let (plan, file) = (plan.clone(), Arc::clone(&base.file));
+                let rows = positions.len();
+                return Ok(Some(
+                    stream::iter((0..rows).step_by(batch_rows))
+                        .then(move |start| {
+                            let (plan, file) = (plan.clone(), Arc::clone(&file));
+                            let (deleted, positions) = (deleted.clone(), positions.clone());
+                            async move {
+                                let batch = &positions[start..(start + batch_rows).min(rows)];
+                                match plan.point_codes(&file, batch, deleted.as_ref()).await? {
+                                    Some(codes) => Ok(codes),
+                                    None => plan.chunk_codes(
+                                        &plan.rows_at(&file, batch).await?,
+                                        deleted.as_ref(),
+                                    ),
+                                }
+                            }
+                        })
+                        .flat_map(move |codes| {
+                            stream::iter(match codes {
+                                Ok(codes) => code_slices(codes, &picked, batch_rows),
+                                Err(e) => vec![Err(e)],
+                            })
+                        })
+                        .boxed(),
+                ));
+            }
             let chunks = plan.child_chunks(Arc::clone(&base.file), batch_rows)?;
             let plan = plan.clone();
             return Ok(Some(

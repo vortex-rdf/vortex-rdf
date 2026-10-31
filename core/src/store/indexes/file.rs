@@ -39,7 +39,9 @@ use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
 use crate::store::read::chunks::extract_codes;
 use crate::store::scan::file_exprs::eq_conjunction;
-use crate::store::scan::file_reads::{component_point_chunk, component_point_rows, values_at};
+use crate::store::scan::file_reads::{
+    component_point_chunk, component_point_rows, component_point_values, values_at,
+};
 use crate::store::scan::file_scans::{read_all_rows, stream_rows};
 use crate::store::schema::{COL_O, RowId, TermCode};
 use crate::store::view::selection::point_sized;
@@ -811,11 +813,91 @@ impl FileServePlan {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return Ok(None);
         }
+        if let Some(positions) = self.point_positions()
+            && let Some(codes) = self.point_codes(file, &positions, deleted).await?
+        {
+            return Ok(Some(codes));
+        }
         let chunk = match self.point_run(file)? {
             Some(read) => read.await?,
             None => read_all_rows(self.scan()?).await?,
         };
         self.decode.chunk_code_columns(&chunk, deleted).map(Some)
+    }
+
+    /// The child rows a code read takes point by point: the rows a keep
+    /// kept, or a located point-sized run's. `None` for any other view, which
+    /// the plan's [`scan`](Self::scan) reads.
+    pub(crate) fn point_positions(&self) -> Option<Buffer<u64>> {
+        match (&self.kept, &self.row_range) {
+            (Some(kept), _) => Some(kept.positions.clone()),
+            (None, Some(run)) if point_sized(run.end - run.start) => Some(run.clone().collect()),
+            _ => None,
+        }
+    }
+
+    /// The four code columns of the child rows `positions` (ascending, rows
+    /// of the view's run), in that order, read point by point through the
+    /// child's chunk probes straight into code buffers, with no chunk built:
+    /// a column the plan's terms pin filled with its code, not read, and the
+    /// row id read only under `deleted` tombstones, to drop those rows.
+    /// `None` declines (a column or chunk without a probe, or a term that is
+    /// not a code): the caller reads the rows' chunk.
+    pub(crate) async fn point_codes(
+        &self,
+        file: &NativeStoreFile,
+        positions: &[u64],
+        deleted: Option<&Mask>,
+    ) -> Result<Option<[Buffer<TermCode>; 4]>> {
+        // Each quad column's code where the plan's terms pin it: every row
+        // of the run holds it.
+        let mut pinned: [Option<TermCode>; 4] = [None; 4];
+        for (column, value) in &self.constraints {
+            let Some(k) = CHILD_COLUMNS[..4].iter().position(|c| c == column) else {
+                continue;
+            };
+            let Some(code) = crate::store::array::unsigned_value(value) else {
+                return Ok(None);
+            };
+            pinned[k] = Some(code);
+        }
+        let mut read: Vec<&'static str> = (0..4)
+            .filter(|&k| pinned[k].is_none())
+            .map(|k| CHILD_COLUMNS[k])
+            .collect();
+        if deleted.is_some() {
+            read.push(COL_RID);
+        }
+        let Some(mut values) =
+            component_point_values(file, self.child.name, &read, positions.to_vec()).await?
+        else {
+            return Ok(None);
+        };
+        observe!(ServedCodesRead(read));
+        let live: Option<Vec<bool>> = deleted.map(|deleted| {
+            let rids = values.pop().expect("the row id column was read");
+            rids.iter()
+                .map(|&rid| !deleted.value(super::base_row(rid) as usize))
+                .collect()
+        });
+        let rows = live
+            .as_ref()
+            .map_or(positions.len(), |live| live.iter().filter(|&&l| l).count());
+        let mut values = values.into_iter();
+        Ok(Some(std::array::from_fn(|k| match pinned[k] {
+            Some(code) => Buffer::from(vec![code; rows]),
+            None => {
+                let column = values.next().expect("every unpinned column was read");
+                match &live {
+                    None => Buffer::from(column),
+                    Some(live) => column
+                        .into_iter()
+                        .zip(live)
+                        .filter_map(|(value, &live)| live.then_some(value))
+                        .collect(),
+                }
+            }
+        })))
     }
 
     /// The served rows as chunks of the child's columns, in the index's

@@ -93,6 +93,10 @@ pub(crate) enum Event {
     RidScan,
     /// A served run read point by point.
     ServePointRead,
+    /// A served file view's codes read point by point straight into code
+    /// buffers: the index child's columns read (those its terms do not pin,
+    /// the row id only under tombstones).
+    ServedCodesRead(Vec<&'static str>),
     /// A code-chunk stream read off its serving index's located run.
     ServedRunChunks,
     /// A served file run its index did not locate read once by row index,

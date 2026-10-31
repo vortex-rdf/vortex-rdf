@@ -1277,3 +1277,78 @@ async fn sort_order_reports_the_reads_order() {
         assert_eq!(order(&p), None, "{tag}: tail rows follow");
     }
 }
+
+/// A point-sized served file run (`??o?`, `?po?`) reads its codes point by
+/// point straight into code buffers, for the one-shot gather and the chunk
+/// stream alike: the columns its terms pin are filled with their codes, not
+/// read, and the row id is read only under tombstones. The codes are the
+/// view's rows in its order (base order, for these shapes).
+#[tokio::test]
+async fn point_sized_served_runs_read_only_their_unpinned_codes() {
+    let quads = modular_quads(2_000, 7, 11);
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let (p2, o3) = (iri("p2"), plain_literal("object 3"));
+    // Every fourth quad of the object's.
+    let doomed: Vec<Quad> = quads
+        .iter()
+        .filter(|quad| quad.object == o3)
+        .step_by(4)
+        .cloned()
+        .collect();
+    let tombstoned = delete_all(&store, &doomed).await;
+    let codes_read = |rec: &Recorder| {
+        rec.picked(|e| match e {
+            Event::ServedCodesRead(columns) => Some(columns.clone()),
+            _ => None,
+        })
+    };
+    for (variant, store) in [("as written", store), ("tombstoned", tombstoned)] {
+        for (shape, view, mut read) in [
+            (
+                "??o?",
+                matched_view(&store, None, None, Some(&o3), None).await,
+                vec!["s", "p", "g"],
+            ),
+            (
+                "?po?",
+                matched_view(&store, None, Some(&p2), Some(&o3), None).await,
+                vec!["s", "g"],
+            ),
+        ] {
+            let tag = format!("{variant} {shape}");
+            if variant == "tombstoned" {
+                read.push("rid");
+            }
+            assert!(served_component(&view).is_some(), "{tag}: served");
+            let want = base_ordered_codes(&view).await;
+            assert!(
+                !want.is_empty() && want.len() <= 256,
+                "{tag}: a point-sized run"
+            );
+            let rec = Recorder::start();
+            assert_eq!(row_list(&view).await, want, "{tag}: gathered");
+            assert_eq!(
+                codes_read(&rec),
+                vec![read.clone()],
+                "{tag}: gathered reads"
+            );
+            // One read a batch of the run's rows, tombstoned ones included.
+            let run = view.debug_serve_row_range().expect("a located run");
+            let batches = ((run.end - run.start) as usize).div_ceil(64);
+            let rec = Recorder::start();
+            let (rows, _) = collect_code_chunks(&view, &QuadColumn::ALL, 64).await;
+            assert_eq!(rows, want, "{tag}: chunks");
+            assert_eq!(
+                codes_read(&rec),
+                vec![read.clone(); batches],
+                "{tag}: chunk reads, one a batch"
+            );
+        }
+    }
+}
