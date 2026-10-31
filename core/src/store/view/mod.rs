@@ -22,7 +22,7 @@ use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::subject_sorted;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
-use crate::store::layouts::{ChunkDecode, ResolvedLayout};
+use crate::store::layouts::{ChunkDecode, ResolvedLayout, StringLayout};
 use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
@@ -533,13 +533,12 @@ pub(crate) struct Tail {
     /// Tail rows deleted since they were appended, one bit per tail row
     /// (`None` until something is deleted).
     pub(crate) deleted: Option<Mask>,
-    /// The layout `rows` are stored in: [`layout_for`](Self::layout_for) the
-    /// store's.
-    pub(crate) layout: ResolvedLayout,
+    /// The string layout `rows` are stored in: [`layout_for`](Self::layout_for)
+    /// the store's.
+    pub(crate) layout: StringLayout,
     /// The keys of `rows`, which a fully bound match reads instead of
-    /// comparing every row ([`TailKeys`]); `None` under a layout without key
-    /// columns, which no tail takes.
-    pub(crate) keys: Option<TailKeys>,
+    /// comparing every row ([`TailKeys`]).
+    pub(crate) keys: TailKeys,
 }
 
 /// Tail flatten policy: appended chunks are folded into the flat first chunk
@@ -552,21 +551,21 @@ pub(crate) const TAIL_FLATTEN_FLOOR: usize = 1_024;
 pub(crate) const TAIL_MAX_CHUNKS: usize = 64;
 
 impl Tail {
-    /// The layout of a tail beside a base in `base`: the base's, except
-    /// Default under the Dictionary layout, whose sorted dictionary has no
-    /// code for an appended term; patterns then probe the base by code and
-    /// the tail by string.
-    pub(crate) fn layout_for(base: &ResolvedLayout) -> ResolvedLayout {
+    /// The layout of a tail beside a base in `base`, always one that stores
+    /// strings: the base's, except Default under the Dictionary layout, whose
+    /// sorted dictionary has no code for an appended term; patterns then
+    /// probe the base by code and the tail by string.
+    pub(crate) fn layout_for(base: &ResolvedLayout) -> StringLayout {
         match base {
-            ResolvedLayout::Dictionary(_) => ResolvedLayout::Default,
-            other => other.clone(),
+            ResolvedLayout::Default | ResolvedLayout::Dictionary(_) => StringLayout::Default,
+            ResolvedLayout::TypedObject => StringLayout::TypedObject,
         }
     }
 
     /// A tail of fresh `rows` in `layout`, every row visible and none
     /// deleted, every row keyed.
-    pub(crate) fn new(rows: ArrayRef, layout: ResolvedLayout) -> Result<Tail> {
-        let keys = TailKeys::of(&rows, &layout)?;
+    pub(crate) fn new(rows: ArrayRef, layout: StringLayout) -> Result<Tail> {
+        let keys = TailKeys::of(&rows, layout)?;
         Ok(Tail {
             rows,
             selection: RowSelection::All,
@@ -582,7 +581,7 @@ impl Tail {
             rows: self.rows.clone(),
             selection,
             deleted: self.deleted.clone(),
-            layout: self.layout.clone(),
+            layout: self.layout,
             keys: self.keys.clone(),
         }
     }
@@ -616,7 +615,7 @@ impl Tail {
                 self.deleted.as_ref(),
                 doomed.to_mask(self.rows.len()),
             )),
-            layout: self.layout.clone(),
+            layout: self.layout,
             keys: self.keys.clone(),
         }
     }
@@ -632,14 +631,14 @@ impl Tail {
     /// [`raw_quads`](Self::raw_quads) is.
     pub(crate) fn decode<T: ChunkDecode>(&self) -> Vec<Result<T>> {
         match self.live_rows() {
-            Ok(rows) => T::decode(&self.layout, &rows),
+            Ok(rows) => T::from_strings(self.layout, &rows),
             Err(e) => vec![Err(e)],
         }
     }
 
     /// The tail rows visible through this store, decoded to raw quads in
-    /// tail order. Never needs the async dictionary path: under the
-    /// Dictionary layout the tail already holds N-Triples strings.
+    /// tail order: the tail holds N-Triples strings, whatever the base's
+    /// layout.
     pub(crate) fn raw_quads(&self) -> Result<Vec<RawQuad>> {
         self.layout.raw_quads(&self.live_rows()?)
     }
@@ -666,8 +665,8 @@ impl Tail {
                 fresh.dtype()
             )));
         }
-        let keys = match (&self.keys, &self.deleted, &self.selection) {
-            (Some(keys), None, RowSelection::All) => Some(keys.extended(&fresh)?),
+        let keys = match (&self.deleted, &self.selection) {
+            (None, RowSelection::All) => Some(self.keys.extended(&fresh)?),
             _ => None,
         };
         let mut chunks = match old.clone().try_downcast::<Chunked>() {
@@ -697,10 +696,10 @@ impl Tail {
                 rows,
                 selection: RowSelection::All,
                 deleted: None,
-                layout: self.layout.clone(),
-                keys: Some(keys),
+                layout: self.layout,
+                keys,
             }),
-            None => Tail::new(rows, self.layout.clone()),
+            None => Tail::new(rows, self.layout),
         }
     }
 }

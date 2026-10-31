@@ -13,13 +13,13 @@ use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 
-use super::{default, typed_object};
+use super::{ResolvedLayout, default, typed_object};
 use crate::common::quad::{NQuadLines, SharedQuad};
 use crate::error::Result;
 use crate::session::VORTEX_SESSION;
-use crate::store::RawQuad;
 use crate::store::array::{StrColReader, field_as};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
+use crate::store::{LayoutStrategy, RawQuad};
 
 /// A layout that stores its terms as N-Triples strings, read in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +30,24 @@ pub(crate) enum StringLayout {
     TypedObject,
 }
 
+impl From<StringLayout> for ResolvedLayout {
+    fn from(layout: StringLayout) -> Self {
+        match layout {
+            StringLayout::Default => ResolvedLayout::Default,
+            StringLayout::TypedObject => ResolvedLayout::TypedObject,
+        }
+    }
+}
+
 impl StringLayout {
+    /// The build-time strategy tag of this layout.
+    pub(crate) fn strategy(self) -> LayoutStrategy {
+        match self {
+            StringLayout::Default => LayoutStrategy::Default,
+            StringLayout::TypedObject => LayoutStrategy::TypedObject,
+        }
+    }
+
     /// `chunk`'s rows as oxrdf quads, each term parsed from its column.
     pub(super) fn quads(self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         match self {
@@ -42,7 +59,7 @@ impl StringLayout {
     /// `rows` as [`RawQuad`]s, each term in its N-Triples string form: the
     /// string columns verbatim, a TypedObject object recomposed from its
     /// sub-columns.
-    pub(super) fn raw_quads(self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
+    pub(crate) fn raw_quads(self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = rows.clone().execute::<StructArray>(&mut ctx)?;
         let objects = match self {

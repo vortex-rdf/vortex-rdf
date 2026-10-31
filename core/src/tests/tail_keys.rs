@@ -4,7 +4,7 @@
 //! views and keys that two rows share.
 
 use super::*;
-use crate::store::layouts::ResolvedLayout;
+use crate::store::layouts::StringLayout;
 use crate::store::view::tail_keys::TailKeys;
 use vortex_array::scalar::Scalar;
 
@@ -158,9 +158,7 @@ fn test_tail_keys_merge_their_runs() {
         )
         .unwrap()
     };
-    let mut keys = TailKeys::of(&row(&raws[0]), &ResolvedLayout::Default)
-        .unwrap()
-        .unwrap();
+    let mut keys = TailKeys::of(&row(&raws[0]), StringLayout::Default).unwrap();
     for raw in &raws[1..] {
         keys = keys.extended(&row(raw)).unwrap();
         let runs = keys.run_lengths();

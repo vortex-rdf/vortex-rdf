@@ -249,7 +249,7 @@ byte order, and maps each id to its term's rank. A rank keeps its term's order
 sorted by its terms is sorted by rank tuple once its ids are read as ranks: no
 spilled run is sorted again. The in-memory run of a build that spilled nothing
 is sorted here, its ids replaced by their ranks
-([`SpilledQuads::ranked`](../core/src/store/builders/runs.rs#L419)), so its
+([`SpilledQuads::ranked`](../core/src/store/builders/runs.rs#L413)), so its
 sort compares integers where a spilled run's compares terms. Under the Dictionary layout the ranked terms become the
 term dictionary (a rank's code is its position), each term moved into the
 column and freed as it is copied.
@@ -336,7 +336,7 @@ full) or to a writable directory (any other failure).
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L49)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L50)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |
@@ -596,14 +596,14 @@ parts are:
 | tailed, or tombstoned with indexes | live base rows + live tail rows, **re-sorted** into `(s, p, o, g)` order | **rebuilt** over the merged rows | **fresh** under Dictionary — the tail may hold terms the old dictionary never coded |
 | narrowed (a `match_pattern` result) | its selected rows only | none — its rows are renumbered, and rebuilding indexes for an arbitrary view is compaction's job | the store's own |
 
-The rebuild ([`rebuilt_parts`](../core/src/store/write/compaction.rs#L83),
+The rebuild ([`rebuilt_parts`](../core/src/store/write/compaction.rs#L85),
 the one compaction runs too) works on codes under the Dictionary layout with
 its dictionary in memory: the live base rows are read as codes, only the
 distinct terms they use are decoded, once each, and merged with the tail's
 into the fresh dictionary, and the rows sort as integers once their codes are
 remapped ([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L97)).
 Under the string layouts, or a dictionary left in its file, the re-sort
-([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L107)) sorts
+([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L108)) sorts
 the small tail alone and merges it into the already-sorted base in a linear
 pass; only a base that never carried the stamp pays a full sort. Both give the
 same parts, so the written artifact always claims `quads_sorted` truthfully.

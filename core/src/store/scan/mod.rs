@@ -9,7 +9,9 @@
 //! evaluates a filter split by split and computes statistics-only pruning
 //! envelopes, `subject_runs` locates runs of the sorted subject column,
 //! `read_plan` chooses how an exact selection's rows are read, and
-//! `file_reads` reads them by id through the file's cached chunk probes. The
+//! `file_reads` reads them by id through the file's cached chunk probes. A
+//! fold that may stop at its first matches, on either side, cuts its rows
+//! into the growing pieces of `pieces`. The
 //! point-read paths on both sides decline above a selection width to the
 //! vectorized pipeline. The row-set algebra itself is in
 //! [`selection`](super::view::selection).
@@ -25,6 +27,7 @@ pub(crate) mod file_reads;
 #[cfg(feature = "file-io")]
 pub(crate) mod file_scans;
 pub(crate) mod gather;
+pub(crate) mod pieces;
 #[cfg(feature = "file-io")]
 pub(crate) mod read_plan;
 pub(crate) mod residual;

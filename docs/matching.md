@@ -227,7 +227,7 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/query/matching.rs#L312) runs four stages
+[`match_base_in_memory`](../core/src/store/query/matching.rs#L300) runs four stages
 over the base `StructArray`. Each one asks the same two questions — *can I answer
 part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
 `RowSelection` and clearing whatever pattern components it answered, so the next
@@ -270,11 +270,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:318-343`](../core/src/store/query/matching.rs#L318-L343 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L454), [`search_sorted_bounds`](../core/src/store/array.rs#L217) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:347-400`](../core/src/store/query/matching.rs#L347-L400 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L654), [`fold_row_ids`](../core/src/store/query/matching.rs#L838) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:402-418`](../core/src/store/query/matching.rs#L402-L418 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L536), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L128) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`matching.rs:420-427`](../core/src/store/query/matching.rs#L420-L427 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| Prelude | [`matching.rs:306-331`](../core/src/store/query/matching.rs#L306-L331 "MemoryBase") | — |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L442), [`search_sorted_bounds`](../core/src/store/array.rs#L217) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:335-388`](../core/src/store/query/matching.rs#L335-L388 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L654), [`fold_row_ids`](../core/src/store/query/matching.rs#L826) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:390-406`](../core/src/store/query/matching.rs#L390-L406 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L524), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L128) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:408-415`](../core/src/store/query/matching.rs#L408-L415 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -470,12 +470,12 @@ windowed (`IdsNeed::CountOrWindow`: `count_probe` with a limit, and
 how many rows it needs, its window's offset and limit. When those are fewer
 than the rows the selection holds, and the selection holds more than one
 8,192-row piece, the compare is left pending
-([`PendingResidual`](../core/src/store/view/pending.rs#L50)) as the view's
+([`PendingResidual`](../core/src/store/view/pending.rs#L37)) as the view's
 selection (`ViewSelection::Residual`), as a deferred index run's ids are. `size_capped` and `window` then compare the
 selection in pieces, in base row order, a zone's rows first and four times as
 many each piece after, each through the zone bounds and the implementations
 above, and stop at the piece that brings the live rows they need to their
-count ([`prefix`](../core/src/store/view/pending.rs#L164)); a selection no
+count ([`prefix`](../core/src/store/view/pending.rs#L151)); a selection no
 wider than that count is one piece. A compare that runs to the end keeps its
 matches as the view's ids, and any other consumer compares the whole
 selection at once. A count without a limit, a window that reaches every row,
@@ -533,7 +533,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/query/matching.rs#L570) composes the same
+[`match_base_file`](../core/src/store/query/matching.rs#L558) composes the same
 restrictions as the in-memory path, but **leaves the rows to the next scan**:
 each stage decides what that scan will do, and the result is a filter
 expression plus a row selection. The match itself reads only what those
@@ -583,12 +583,12 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:578-582`](../core/src/store/query/matching.rs#L578-L582 "existing_filter") | — |
-| 1 · subject chunk probe and prefix | [`matching.rs:582-589`](../core/src/store/query/matching.rs#L582-L589 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L764), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:590-603`](../core/src/store/query/matching.rs#L590-L603 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L679) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:560-630`](../core/src/store/query/matching.rs#L560-L630 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:609-610`](../core/src/store/query/matching.rs#L609-L610 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L838) and [`matching.rs:694-708`](../core/src/store/query/matching.rs#L694-L708 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L793), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L711) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
-| 5 · filter at sparse ids | [`matching.rs:710-725`](../core/src/store/query/matching.rs#L710-L725 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L200) | [§7.3](#73-what-ends-up-on-the-view) |
+| Prelude | [`matching.rs:566-570`](../core/src/store/query/matching.rs#L566-L570 "existing_filter") | — |
+| 1 · subject chunk probe and prefix | [`matching.rs:570-577`](../core/src/store/query/matching.rs#L570-L577 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L752), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:578-591`](../core/src/store/query/matching.rs#L578-L591 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L679) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`matching.rs:548-618`](../core/src/store/query/matching.rs#L548-L618 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:597-598`](../core/src/store/query/matching.rs#L597-L598 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L826) and [`matching.rs:682-696`](../core/src/store/query/matching.rs#L682-L696 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L781), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 5 · filter at sparse ids | [`matching.rs:698-713`](../core/src/store/query/matching.rs#L698-L713 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L200) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -636,7 +636,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L711) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -979,7 +979,7 @@ scan that still supplies a serve plan.
   (`ViewSelection::Pending`'s `matches`; a narrower run costs less to compute than
   the pattern's terms cost to copy, `CHAIN_MIN_ROWS`). A match chained on such
   a view is **one match of both patterns** over every base row
-  ([`match_both`](../core/src/store/query/matching.rs#L274)): the pending ids
+  ([`match_both`](../core/src/store/query/matching.rs#L262)): the pending ids
   are never computed, and two roles one index orders together are one run of
   it. A view built for its rows gets the ids in base order with no serve plan,
   as every chained match leaves them; one only counted or windowed keeps what
@@ -1120,11 +1120,11 @@ file run) and a rid-only scan of the index child otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L865) | an already-narrowed view below this skips index routing |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L853) | an already-narrowed view below this skips index routing |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L216) | selection size above which the typed row loop declines to the vectorized mask scan for a lone residual equality |
 | `TYPED_PROBE_MAX_ROWS` | 256 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L225) | the same for any set that binds a column through an encoded-search probe, read a row at a time: the mask scan costs less from about 256 rows of a range and 512 of scattered ids |
-| `FIRST_PIECE_ROWS` | 8192 | [`pending.rs`](../core/src/store/view/pending.rs#L34) | the first piece of a residual compare left pending for a count or a window, each piece after four times the one before; a selection this wide or narrower is compared eagerly |
-| `CHAIN_MIN_ROWS` | 1024 | [`matching.rs`](../core/src/store/query/matching.rs#L859) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
+| `FIRST_PIECE_ROWS` | 8192 | [`pieces.rs`](../core/src/store/scan/pieces.rs#L14) | the first piece of a residual compare left pending for a count or a window, and of a file filter's early-exit loop, each piece after four times the one before; a selection this wide or narrower is compared eagerly |
+| `CHAIN_MIN_ROWS` | 1024 | [`matching.rs`](../core/src/store/query/matching.rs#L847) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
 `POINT_IDS_PER_SPLIT`, `TAKE_ROWS`) are in [file-format.md §11](file-format.md#11-constants).
@@ -1342,7 +1342,7 @@ stopped at the first split that fills `offset + limit` rows — so `LIMIT`
 over a filtered scan costs the matching prefix of the file, not all of it.
 A loop that stops at fewer matches than a zone has rows (8,192: an
 `exists`, a small `LIMIT`) evaluates the splits in pieces
-([`early_exit_pieces`](../core/src/store/scan/file_filter.rs#L239)): the
+([`growing_pieces`](../core/src/store/scan/pieces.rs#L24)): the
 first zone, then pieces four times the one before inside a split, which
 reach whole splits within the first, so matches in the first rows end the
 loop there; a loop that runs to the end evaluates its first split in a few

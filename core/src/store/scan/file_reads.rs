@@ -24,7 +24,7 @@ use crate::store::array::named_struct;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{CodeEqs, PushedFilter, QUAD_SCOPE};
 use crate::store::scan::file_filter::{self, SplitMasks};
-use crate::store::scan::file_scans::{SPLITS_IN_FLIGHT_PER_CORE, collect_row_splits};
+use crate::store::scan::file_scans::{collect_row_splits, split_window};
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::scan::read_plan::{Footprint, MaskedRead, POINT_READ_ROWS, ids_by_split};
 use crate::store::schema::{RowId, TermCode};
@@ -545,7 +545,7 @@ impl<'a> MaskedRows<'a> {
             }
         }
         let (dtype, tasks) = masked_split_tasks(self.file, &read_columns, &self.masks, false)?;
-        let window = SPLITS_IN_FLIGHT_PER_CORE * available_parallelism();
+        let window = split_window();
         collect_row_splits(dtype, tasks, window).await
     }
 

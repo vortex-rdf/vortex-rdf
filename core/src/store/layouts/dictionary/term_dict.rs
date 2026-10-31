@@ -333,10 +333,11 @@ impl TermDictionary {
             decide_iris(&mut verdicts, &mut read, codes, &kinds.iris, &passing);
         }
         let mut cursor = self.cursor();
+        let mut scratch = String::new();
         for at in read {
             // In range: the candidates were checked above.
             if let Some(rank) = self.rank_of(codes[at]) {
-                verdicts[at] = predicate.eval(cursor.str_at(rank));
+                verdicts[at] = predicate.eval_with(cursor.str_at(rank), &mut scratch);
             }
         }
         Ok(split_verdicts(codes, &verdicts))

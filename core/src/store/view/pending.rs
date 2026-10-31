@@ -19,25 +19,12 @@ use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use crate::error::Result;
-use crate::io::zone_map::ZONE_ROWS;
 use crate::observe::observe;
 use crate::store::MemoryBase;
+use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
 use crate::store::scan::residual::residual_rows;
 use crate::store::schema::RowId;
 use crate::store::view::selection::{RowSelection, SelectedRows, window_rows};
-
-/// The rows of a pending compare's first piece: a zone's. It is above the
-/// typed residual's 4,096-row cap, so every piece but a selection's last is
-/// compared by the mask scan, never by the per-row probe reads the typed loop
-/// makes over a probe-bound column (a store loaded from a file or from
-/// bytes), which cost many times a mask scan's row.
-pub(crate) const FIRST_PIECE_ROWS: usize = ZONE_ROWS;
-
-/// Each piece after the first holds this many times the rows of the one
-/// before: a count or a window whose rows come early stops after a piece of
-/// about their size, and a compare that runs to the end takes a handful of
-/// pieces.
-const PIECE_GROWTH: usize = 4;
 
 /// A residual compare left pending: the rows of `selection` (of `memory`'s
 /// base) where every equality of `eqs` holds, compared as the eager compare
@@ -172,41 +159,47 @@ impl PendingResidual {
         Ok(prefix)
     }
 
-    /// The matches of the selection's first pieces, compared in base row
-    /// order until at least `want` of them are live (not tombstoned in
-    /// `deleted`) or the selection ends: [`FIRST_PIECE_ROWS`] rows first,
-    /// [`PIECE_GROWTH`] times as many each piece after, and the whole
-    /// selection as one piece when it holds no more than `want` rows, as no
-    /// count or window of `want` rows could stop short of it.
+    /// The matches of the selection's first pieces ([`growing_pieces`]),
+    /// compared in base row order until at least `want` of them are live
+    /// (not tombstoned in `deleted`) or the selection ends. The first piece
+    /// is a zone's rows, above the typed residual's 4,096-row cap, so every
+    /// piece but a selection's last is compared by the mask scan, never by
+    /// the per-row probe reads the typed loop makes over a probe-bound column
+    /// (a store loaded from a file or from bytes), which cost many times a
+    /// mask scan's row. A selection of no more than `want` rows is one
+    /// piece, as no count or window of `want` rows could stop short of it.
     fn compare_prefix(&self, want: usize, deleted: Option<&Mask>) -> Result<ResidualPrefix> {
         let base_len = self.memory.base.len();
         let rows = self.selection.as_rows(base_len);
         let total = self.selection.len(base_len);
-        let mut ids: Vec<RowId> = Vec::new();
-        let mut live = 0;
-        let mut start = 0;
-        let mut piece = if total <= want {
+        let first = if total <= want {
             total
         } else {
             FIRST_PIECE_ROWS
         };
-        while start < total && live < want {
-            let end = start.saturating_add(piece).min(total);
-            observe!(ResidualPiece(end - start));
-            let matched = residual_rows(&self.memory, rows_at(&rows, start..end), &self.eqs, None)?;
+        let mut ids: Vec<RowId> = Vec::new();
+        let mut live = 0;
+        let mut compared = 0;
+        for (_, piece) in growing_pieces(std::iter::once(0..total as u64), first as u64) {
+            if live >= want {
+                break;
+            }
+            let piece = piece.start as usize..piece.end as usize;
+            observe!(ResidualPiece(piece.len()));
+            let matched =
+                residual_rows(&self.memory, rows_at(&rows, piece.clone()), &self.eqs, None)?;
             let found = ids.len();
             match matched.as_rows(base_len) {
                 SelectedRows::Run(run) => ids.extend(run.start as RowId..run.end as RowId),
                 SelectedRows::Ids(matches) => ids.extend_from_slice(matches),
             }
             live += count_live(&ids[found..], deleted);
-            start = end;
-            piece = piece.saturating_mul(PIECE_GROWTH);
+            compared = piece.end;
         }
         Ok(ResidualPrefix {
             ids: Buffer::from(ids),
             live,
-            complete: start == total,
+            complete: compared == total,
         })
     }
 }

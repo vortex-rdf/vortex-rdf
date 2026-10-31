@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::io::zone_map::ZONE_ROWS;
-use crate::store::view::pending::FIRST_PIECE_ROWS;
+use crate::store::scan::pieces::FIRST_PIECE_ROWS;
 
 /// The rows of each piece of a pending residual `rec` saw compared since its
 /// last take, in order.

@@ -388,8 +388,6 @@ fn filtered_windows(
     }))
 }
 
-/// The [`InvalidInput`](VortexRdfError::InvalidInput) error for a zero batch
-/// size.
 /// `base`, a struct of primary columns, cut to `columns` (each once, in the
 /// order first asked for) without copying them; a base of any other shape as
 /// it is.
@@ -410,6 +408,8 @@ fn projected(base: &ArrayRef, columns: &[&'static str]) -> Result<ArrayRef> {
     Ok(struct_arr.project(&names)?.into_array())
 }
 
+/// The [`InvalidInput`](VortexRdfError::InvalidInput) error for a zero batch
+/// size.
 fn check_batch(batch_rows: usize) -> Result<()> {
     if batch_rows == 0 {
         return Err(VortexRdfError::InvalidInput(

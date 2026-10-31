@@ -3,7 +3,6 @@
 //! reads them, and the text of a term each test reads.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 
 use crate::common::vocab::{XSD, XSD_STRING};
 use crate::error::{Result, VortexRdfError};
@@ -198,12 +197,6 @@ fn rdflib_normalizes(dt: &str) -> bool {
             .is_some_and(|local| RDFLIB_NORMALIZED_XSD.contains(&local))
 }
 
-thread_local! {
-    /// The case-mapped text of the candidate [`TextPredicate::eval`] tests,
-    /// a buffer reused from candidate to candidate.
-    static CASE_MAPPED: RefCell<String> = const { RefCell::new(String::new()) };
-}
-
 impl TextPredicate {
     /// The term's text and language under `string()` (`as_str` off) or
     /// `STR()` (on); `Err(verdict)` when there is no text (`False`: rdflib
@@ -262,7 +255,10 @@ impl TextPredicate {
         (!prefix.contains('>')).then_some(prefix.as_str())
     }
 
-    pub(super) fn eval(&self, spelling: &str, kind: Kind) -> Verdict {
+    /// The verdict on a term's `spelling` of `kind`, its text case-mapped
+    /// into `scratch`, a buffer the caller reuses from candidate to
+    /// candidate.
+    pub(super) fn eval(&self, spelling: &str, kind: Kind, scratch: &mut String) -> Verdict {
         let (text, lang) = match self.text_of(spelling, kind) {
             Ok(text) => text,
             Err(verdict) => return verdict,
@@ -270,17 +266,15 @@ impl TextPredicate {
         match self.case {
             None => self.test_text(&text, lang),
             Some(_) if !text.is_ascii() => Verdict::Unknown,
-            // The case-mapped text goes into one buffer per thread, reused
-            // from candidate to candidate.
-            Some(case) => CASE_MAPPED.with_borrow_mut(|mapped| {
-                mapped.clear();
-                mapped.push_str(&text);
+            Some(case) => {
+                scratch.clear();
+                scratch.push_str(&text);
                 match case {
-                    CaseMap::Lower => mapped.make_ascii_lowercase(),
-                    CaseMap::Upper => mapped.make_ascii_uppercase(),
+                    CaseMap::Lower => scratch.make_ascii_lowercase(),
+                    CaseMap::Upper => scratch.make_ascii_uppercase(),
                 }
-                self.test_text(mapped, lang)
-            }),
+                self.test_text(scratch, lang)
+            }
         }
     }
 

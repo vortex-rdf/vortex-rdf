@@ -12,15 +12,16 @@ use crate::store::array::{
 use crate::store::indexes::resolve_indexes_file;
 use crate::store::indexes::{IndexResolution, ResolvedRowIds, resolve_indexes_in_memory};
 use crate::store::layouts::{
-    Constraints, OwnedQuadPattern, PatternCodes, Prepared, QuadPattern, TermRef,
+    Constraints, OwnedQuadPattern, PatternCodes, Prepared, QuadPattern, ResolvedLayout, TermRef,
 };
 use crate::store::probes::StructProbes;
+use crate::store::scan::pieces::FIRST_PIECE_ROWS;
 use crate::store::scan::residual;
 use crate::store::scan::typed_eq::typed_positions;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_exprs, file_filter, file_reads, subject_runs};
 use crate::store::schema;
-use crate::store::view::pending::{FIRST_PIECE_ROWS, PendingResidual};
+use crate::store::view::pending::PendingResidual;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{Backend, MemoryBase, Tail};
 
@@ -129,9 +130,10 @@ impl VortexRdfStore {
     }
 
     /// A tail narrowed to the rows matching the pattern, under the tail's own
-    /// layout: a scan over its selected rows (a tail is small, unsorted and
-    /// unindexed), whose surviving positions refine the tail-local selection
-    /// as base matches refine the base's.
+    /// layout: a compare over its selected rows (a tail is small, unsorted
+    /// and unindexed), whose surviving positions refine the tail-local
+    /// selection as base matches refine the base's. A fully bound pattern
+    /// compares only the rows its key names.
     async fn match_tail(tail: &Tail, pattern: QuadPattern<'_>) -> Result<Tail> {
         let t = debug::timer();
         let carry = |selection: RowSelection| tail.with_selection(selection);
@@ -141,7 +143,8 @@ impl VortexRdfStore {
         // The tail's layouts store plain strings (see `Tail::layout_for`), so
         // this prelude resolves nothing, never suspends and is never empty;
         // it still mints the witness, as for every probe surface.
-        let Prepared::Codes(mut codes) = tail.layout.prepare_pattern(pattern).await? else {
+        let layout = ResolvedLayout::from(tail.layout);
+        let Prepared::Codes(mut codes) = layout.prepare_pattern(pattern).await? else {
             return Ok(carry(RowSelection::empty()));
         };
         let eqs = match codes.constraints(pattern)? {
@@ -155,63 +158,48 @@ impl VortexRdfStore {
             return Ok(carry(tail.selection.clone()));
         }
         // A fully bound pattern (every `contains`, so every presence check
-        // `add_quads` makes) reads the rows its key names off the tail's
-        // keys, instead of comparing every selected row.
-        if let Some(rows) = Self::keyed_tail_rows(tail, &eqs)? {
-            debug::step!(t, "[match_pattern] Tail matched by its row keys");
-            return Ok(carry(rows));
-        }
-        observe!(TailMatch { keyed: false });
-        let applied = tail.selection.apply(&tail.rows)?;
-        // Typed fast path first: the tail's string columns compared as raw
-        // bytes, without the per-call compare/canonicalize pipeline; every
-        // pattern the keys cannot answer rides it.
-        if let Some(positions) = typed_positions(&applied, &eqs) {
-            let mask = Mask::from_indices(applied.len(), positions);
-            debug::step!(t, "[match_pattern] Tail matched by typed positions");
-            return Ok(carry(tail.selection.clone().refine(&mask)));
-        }
-        let mask = residual::mask_for(&applied, &eqs)?;
-        let matched = carry(tail.selection.clone().refine(&bool_array_to_mask(mask)?));
-        debug::step!(t, "[match_pattern] Tail matched by mask scan");
-        Ok(matched)
-    }
-
-    /// The selected tail rows that hold every equality of `eqs`, read off the
-    /// tail's keys ([`TailKeys`](crate::store::view::tail_keys::TailKeys)):
-    /// the rows the key of `eqs` names, each checked against every equality,
-    /// so a row that only shares the key is not matched. `None` when the tail
-    /// has no keys or `eqs` leave a key column free (a pattern not fully
-    /// bound), which the scan answers.
-    fn keyed_tail_rows(
-        tail: &Tail,
-        eqs: &[(&'static str, Scalar)],
-    ) -> Result<Option<RowSelection>> {
-        let Some(candidates) = tail.keys.as_ref().and_then(|keys| keys.candidates(eqs)) else {
-            return Ok(None);
-        };
-        observe!(TailMatch { keyed: true });
-        let mut rows = Vec::with_capacity(candidates.len());
-        for row in candidates {
-            if tail.selection.contains(row) && Self::tail_row_holds(&tail.rows, row, eqs)? {
-                rows.push(row);
+        // `add_quads` makes) compares only the selected rows the tail's keys
+        // name for it ([`TailKeys`](crate::store::view::tail_keys::TailKeys)),
+        // instead of every selected row; a row that only shares the key is
+        // dropped by the compare.
+        let compared = match tail.keys.candidates(&eqs) {
+            Some(candidates) => {
+                observe!(TailMatch { keyed: true });
+                let named: Vec<schema::RowId> = candidates
+                    .into_iter()
+                    .filter(|&row| tail.selection.contains(row))
+                    .collect();
+                RowSelection::from_ids(vortex_buffer::Buffer::from(named))
             }
-        }
-        Ok(Some(RowSelection::from_ids(vortex_buffer::Buffer::from(
-            rows,
-        ))))
+            None => {
+                observe!(TailMatch { keyed: false });
+                tail.selection.clone()
+            }
+        };
+        let matched = Self::tail_rows_holding(&tail.rows, compared, &eqs)?;
+        debug::step!(t, "[match_pattern] Tail matched");
+        Ok(carry(matched))
     }
 
-    /// Whether row `row` of the tail `rows` holds every equality of `eqs`,
-    /// compared as the scan compares it.
-    fn tail_row_holds(
+    /// The rows of `selection` (tail-local ids into `rows`) that hold every
+    /// equality of `eqs`: the tail's string columns compared as raw bytes
+    /// where they can be ([`typed_positions`]), without the per-call
+    /// compare/canonicalize pipeline, else by the mask scan.
+    fn tail_rows_holding(
         rows: &ArrayRef,
-        row: schema::RowId,
+        selection: RowSelection,
         eqs: &[(&'static str, Scalar)],
-    ) -> Result<bool> {
-        let row = row as usize;
-        let one = rows.slice(row..row + 1)?;
-        Ok(bool_array_to_mask(residual::mask_for(&one, eqs)?)?.all_true())
+    ) -> Result<RowSelection> {
+        if selection.is_empty(rows.len()) {
+            return Ok(selection);
+        }
+        let applied = selection.apply(rows)?;
+        if let Some(positions) = typed_positions(&applied, eqs) {
+            let mask = Mask::from_indices(applied.len(), positions);
+            return Ok(selection.refine(&mask));
+        }
+        let mask = residual::mask_for(&applied, eqs)?;
+        Ok(selection.refine(&bool_array_to_mask(mask)?))
     }
 
     /// Match the pattern against the base alone, composing its restrictions

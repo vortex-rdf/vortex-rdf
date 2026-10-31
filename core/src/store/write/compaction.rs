@@ -1,6 +1,8 @@
 //! Compaction: folding the append tail into the base, reclaiming tombstoned
 //! rows, and the auto-compaction policy that decides when `add_quads` does it.
 
+use vortex_error::VortexExpect as _;
+
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
@@ -81,20 +83,19 @@ impl VortexRdfStore {
     /// are decoded, once each, and the rows sort as integers. Otherwise from
     /// the quads spelled out ([`sorted_live_raw_quads`](Self::sorted_live_raw_quads)).
     pub(in crate::store) async fn rebuilt_parts(&self, indexes: &Indexes) -> Result<BuiltArray> {
-        if let Some(dict) = self.layout.resident_dictionary() {
-            let base = self.derived(self.quads.clone(), None);
-            if let Some(codes) = base.code_columns_gathered().await? {
-                let tail = self.tail.as_ref().map(Tail::raw_quads).transpose()?;
-                return rebuild_from_codes(
-                    dict,
-                    &codes,
-                    tail.as_deref().unwrap_or_default(),
-                    indexes,
-                );
-            }
-        }
-        let raws = self.sorted_live_raw_quads().await?;
-        build_parts_from_raws(&raws, self.layout.strategy(), indexes)
+        let Some(dict) = self.layout.resident_dictionary() else {
+            let raws = self.sorted_live_raw_quads().await?;
+            return build_parts_from_raws(&raws, self.layout.strategy(), indexes);
+        };
+        // The base without the tail: a Dictionary view with no tail, whose
+        // rows the dictionary's codes address.
+        let codes = self
+            .derived(self.quads.clone(), None)
+            .code_columns_gathered()
+            .await?
+            .vortex_expect("a Dictionary view without a tail is a code view");
+        let tail = self.tail.as_ref().map(Tail::raw_quads).transpose()?;
+        rebuild_from_codes(dict, &codes, tail.as_deref().unwrap_or_default(), indexes)
     }
 
     /// Every live quad this view covers in (s, p, o, g) order, each once: the

@@ -262,11 +262,11 @@ async fn test_tail_accretion_flattens_at_chunk_bound() {
 #[test]
 fn test_tail_append_refuses_rows_of_another_type() {
     use crate::store::Tail;
-    use crate::store::layouts::ResolvedLayout;
+    use crate::store::layouts::StringLayout;
 
     let quads = [RawQuad::from_quad(&tail_quad(0))];
     let rows = |layout| crate::store::builders::build_struct_array(&quads, layout, false).unwrap();
-    let tail = Tail::new(rows(LayoutStrategy::Default), ResolvedLayout::Default).unwrap();
+    let tail = Tail::new(rows(LayoutStrategy::Default), StringLayout::Default).unwrap();
     let appended = tail.append(rows(LayoutStrategy::Default)).unwrap();
     assert_eq!(appended.rows.len(), 2);
     let refused = tail

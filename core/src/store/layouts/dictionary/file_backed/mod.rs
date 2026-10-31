@@ -504,8 +504,9 @@ impl FileBackedDict {
             decide_iris(&mut verdicts, &mut read_at, codes, &kinds.iris, &passing);
         }
         let read: Vec<TermCode> = read_at.iter().map(|&at| codes[at]).collect();
+        let mut scratch = String::new();
         self.visit_terms(&read, |j, spelling| {
-            verdicts[read_at[j]] = predicate.eval(spelling);
+            verdicts[read_at[j]] = predicate.eval_with(spelling, &mut scratch);
         })
         .await?;
         Ok(split_verdicts(codes, &verdicts))

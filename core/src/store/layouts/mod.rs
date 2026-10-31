@@ -37,6 +37,7 @@ pub(crate) mod typed_object;
 
 pub(crate) use self::decode::ChunkDecode;
 pub(crate) use self::dictionary::DictAccess;
+pub(crate) use self::strings::StringLayout;
 use crate::observe::observe;
 use crate::store::schema::{
     CODE_PTYPE, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_S, PRIMARY_COLUMNS,

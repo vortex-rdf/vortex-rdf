@@ -132,20 +132,28 @@ pub(crate) fn stream_rows(
 }
 
 /// Split futures in flight per unit of available parallelism when a split
-/// loop's futures are spawned: a scan's default concurrency, the window
-/// [`stream_rows`] spawns under.
-pub(crate) const SPLITS_IN_FLIGHT_PER_CORE: usize = 4;
+/// loop's futures are spawned: a scan's default concurrency.
+const SPLITS_IN_FLIGHT_PER_CORE: usize = 4;
+
+/// How many split futures a split loop keeps in flight:
+/// [`SPLITS_IN_FLIGHT_PER_CORE`] per unit of available parallelism. Every
+/// loop over a file's splits outside Vortex's own scan takes it: a streamed
+/// row scan ([`stream_rows`]), a filter's evaluation over its splits, and
+/// the reads of the rows a filter's masks keep.
+pub(crate) fn split_window() -> usize {
+    SPLITS_IN_FLIGHT_PER_CORE * available_parallelism()
+}
 
 /// `reads` (one future per split, in split order, each the split's rows or
 /// none) streamed as a row scan's splits are ([`stream_rows`]): the driver
-/// is [`ScanDriver::for_row_scan`]'s, [`SPLITS_IN_FLIGHT_PER_CORE`] per core
-/// in flight when spawned. The rows come in split order, the splits that
+/// is [`ScanDriver::for_row_scan`]'s, [`split_window`] in flight when
+/// spawned. The rows come in split order, the splits that
 /// keep none dropped, a split's error as one error item.
 pub(crate) fn stream_split_reads<F>(reads: Vec<F>) -> BoxStream<'static, Result<ArrayRef>>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
 {
-    let window = SPLITS_IN_FLIGHT_PER_CORE * available_parallelism();
+    let window = split_window();
     let splits = match ScanDriver::for_row_scan(reads.len()) {
         ScanDriver::Inline => inline_splits(reads).boxed(),
         ScanDriver::Spawned => spawned_splits(reads, window).boxed(),

@@ -289,6 +289,13 @@ impl TermPredicate {
 
     /// Evaluate the predicate on one N-Triples spelling.
     pub fn eval(&self, spelling: &str) -> Verdict {
+        self.eval_with(spelling, &mut String::new())
+    }
+
+    /// [`eval`](Self::eval), a text predicate's case-mapped text written
+    /// into `scratch`: a loop over candidates passes one buffer to all of
+    /// them.
+    pub(crate) fn eval_with(&self, spelling: &str, scratch: &mut String) -> Verdict {
         let kind = kind_of(spelling);
         match kind {
             // Neither the default graph's name nor a foreign spelling is a
@@ -324,7 +331,7 @@ impl TermPredicate {
                 }
                 on_literal(kind, spelling, |lit| number.compare(*op, lit))
             }
-            TermPredicate::Text(text) => text.eval(spelling, kind),
+            TermPredicate::Text(text) => text.eval(spelling, kind, scratch),
         }
     }
 

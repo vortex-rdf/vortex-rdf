@@ -1,10 +1,13 @@
 //! Kernels the store session adds to Vortex's own, each for a case Vortex
 //! 0.90 executes the slow way. The executor looks a fused execution up by
-//! its `(parent, child)` encoding pair; the store's kernels are registered
-//! before the default encodings register theirs ([`register`]), so that a
-//! kernel for a pair Vortex also covers is tried first, and declines
-//! whatever it does not do better, which Vortex's own kernel then takes.
-//! Each goes once Vortex covers its case.
+//! its `(parent, child)` encoding pair and tries a pair's kernels in the
+//! order they were registered: vortex-array's built-in ones when the
+//! session's array registry is created, then the store's ([`register`]),
+//! then the default encodings'. A store kernel for a pair an encoding crate
+//! also covers (vortex-runend's filter) is so tried first, and declines
+//! whatever it does not do better, which that crate's kernel then takes;
+//! vortex-array covers neither of the store's pairs. Each goes once Vortex
+//! covers its case.
 
 use crate::observe::observe;
 use vortex_array::arrays::scalar_fn::{ExactScalarFn, ScalarFnArrayView};

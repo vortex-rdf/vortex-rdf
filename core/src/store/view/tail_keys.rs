@@ -20,7 +20,7 @@ use crate::error::Result;
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{StrColReader, field_as, unsigned_value};
-use crate::store::layouts::ResolvedLayout;
+use crate::store::layouts::StringLayout;
 use crate::store::schema::{COL_G, COL_O, COL_O_KIND, COL_O_VALUE, COL_P, COL_S, RowId};
 
 /// One run of keys: `(key, tail row)` pairs, ascending.
@@ -46,18 +46,14 @@ pub(crate) struct TailKeys {
 }
 
 impl TailKeys {
-    /// The keys of every row of `rows`, a tail in `layout`; `None` under a
-    /// layout no tail takes (see [`key_columns`]).
-    pub(crate) fn of(rows: &ArrayRef, layout: &ResolvedLayout) -> Result<Option<Self>> {
-        let Some(columns) = key_columns(layout) else {
-            return Ok(None);
-        };
+    /// The keys of every row of `rows`, a tail in `layout`.
+    pub(crate) fn of(rows: &ArrayRef, layout: StringLayout) -> Result<Self> {
         let empty = Self {
-            columns,
+            columns: key_columns(layout),
             runs: Vec::new(),
             rows: 0,
         };
-        empty.extended(rows).map(Some)
+        empty.extended(rows)
     }
 
     /// These keys and those of `fresh`, rows that follow the keyed ones in
@@ -135,14 +131,11 @@ impl TailKeys {
 /// role): under the Default layout the four term strings; under TypedObject
 /// the subject, predicate and graph strings with the object's kind and value,
 /// its datatype and language being constrained only for the literals that
-/// have one (the check after a lookup compares them). `None` under the
-/// Dictionary layout, which no tail takes: a tail stores strings
-/// (`Tail::layout_for`).
-fn key_columns(layout: &ResolvedLayout) -> Option<&'static [&'static str]> {
+/// have one (the check after a lookup compares them).
+fn key_columns(layout: StringLayout) -> &'static [&'static str] {
     match layout {
-        ResolvedLayout::Default => Some(&[COL_S, COL_P, COL_O, COL_G]),
-        ResolvedLayout::TypedObject => Some(&[COL_S, COL_P, COL_O_KIND, COL_O_VALUE, COL_G]),
-        ResolvedLayout::Dictionary(_) => None,
+        StringLayout::Default => &[COL_S, COL_P, COL_O, COL_G],
+        StringLayout::TypedObject => &[COL_S, COL_P, COL_O_KIND, COL_O_VALUE, COL_G],
     }
 }
 

@@ -21,7 +21,7 @@ use super::rows::BaseRead;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
 #[cfg(feature = "file-io")]
-use crate::io::read::{available_parallelism, inline_splits, spawned_splits};
+use crate::io::read::{inline_splits, spawned_splits};
 use crate::observe::observe;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
@@ -32,7 +32,7 @@ use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_reads::{self, MaskedRows};
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_scans::{SPLITS_IN_FLIGHT_PER_CORE, ScanDriver};
+use crate::store::scan::file_scans::{ScanDriver, split_window};
 #[cfg(feature = "file-io")]
 use crate::store::scan::read_plan::ExactRead;
 #[cfg(feature = "file-io")]
@@ -310,8 +310,8 @@ impl VortexRdfStore {
 
     /// The rows of split `reads` (one per split, in split order) decoded into
     /// chunks of `T`, then the tail's chunk: the reads spawned onto the
-    /// runtime when `spawn`, [`SPLITS_IN_FLIGHT_PER_CORE`] per core in
-    /// flight, or polled inline. Each chunk decodes inside its split's read,
+    /// runtime when `spawn`, [`split_window`] in flight, or polled
+    /// inline. Each chunk decodes inside its split's read,
     /// so spawned splits decode on the runtime's workers, a file-backed
     /// dictionary's awaiting its window reads there; a file-backed chunk of
     /// fewer than [`TASK_DECODE_MIN_ROWS`] rows decodes on the stream.
@@ -322,7 +322,7 @@ impl VortexRdfStore {
         spawn: bool,
         tail: Vec<Result<T>>,
     ) -> Chunks<T> {
-        let window = SPLITS_IN_FLIGHT_PER_CORE * available_parallelism();
+        let window = split_window();
         let file_backed_dictionary =
             matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
         let decoding: Vec<_> = tasks

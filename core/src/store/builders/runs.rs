@@ -380,103 +380,96 @@ impl QuadSpiller {
     /// build's terms are ranked ([`SpilledQuads::ranked`]).
     pub(crate) fn finish(mut self, terms: &TermInterner) -> Result<SpilledQuads> {
         if self.run_paths.is_empty() {
-            return Ok(SpilledQuads {
-                memory: Some(std::mem::take(&mut self.buf)),
-                paths: Vec::new(),
-            });
+            return Ok(SpilledQuads::Memory(std::mem::take(&mut self.buf)));
         }
         if !self.buf.is_empty() {
             self.flush_run(terms)?;
         }
-        Ok(SpilledQuads {
-            memory: None,
-            paths: self.run_paths,
-        })
+        Ok(SpilledQuads::Spilled(self.run_paths))
     }
 }
 
-/// A build's quads once ingested, before its terms are ranked: the sorted
-/// runs a [`QuadSpiller`] wrote, or, when it spilled nothing, its buffer of
-/// ids, unsorted.
-pub(crate) struct SpilledQuads {
-    memory: Option<Vec<[u32; 4]>>,
-    paths: Vec<PathBuf>,
+/// A build's quads once ingested, before its terms are ranked.
+pub(crate) enum SpilledQuads {
+    /// Nothing spilled: the spiller's buffer of ids, unsorted.
+    Memory(Vec<[u32; 4]>),
+    /// The sorted runs a [`QuadSpiller`] wrote.
+    Spilled(Vec<PathBuf>),
 }
 
 impl SpilledQuads {
     /// How many runs: the files written, or the one buffer.
     pub(crate) fn run_count(&self) -> usize {
-        if self.memory.is_some() {
-            1
-        } else {
-            self.paths.len()
+        match self {
+            SpilledQuads::Memory(_) => 1,
+            SpilledQuads::Spilled(paths) => paths.len(),
         }
     }
 
     /// The runs under the ranks `rank_of` gives the build's terms: an
     /// in-memory run's ids replaced by their ranks, then sorted and each quad
-    /// kept once, integers alone compared, the terms' order being the ranks'.
-    pub(crate) fn ranked(self, rank_of: &RankTable) -> Result<QuadRuns> {
-        let memory = match self.memory {
-            None => None,
-            Some(mut quads) => {
+    /// kept once, integers alone compared, the terms' order being the ranks';
+    /// spilled runs' ids mapped as they are read back.
+    pub(crate) fn ranked(self, rank_of: RankTable) -> Result<QuadRuns> {
+        Ok(match self {
+            SpilledQuads::Memory(mut quads) => {
                 for id in quads.iter_mut().flatten() {
-                    *id = rank_in(rank_of, *id)?;
+                    *id = rank_in(&rank_of, *id)?;
                 }
                 quads.sort_unstable();
                 quads.dedup();
-                Some(Arc::from(quads))
+                QuadRuns::Memory(Arc::from(quads))
             }
-        };
-        Ok(QuadRuns {
-            memory,
-            paths: self.paths,
+            SpilledQuads::Spilled(paths) => QuadRuns::Spilled { paths, rank_of },
         })
     }
 }
 
-/// A build's quad runs: the files a [`QuadSpiller`] wrote, read back as
-/// ranks, or its single in-memory run, held as ranks already. A merge over
-/// them can be opened any number of times.
-pub(crate) struct QuadRuns {
-    memory: Option<Arc<[[u32; 4]]>>,
-    paths: Vec<PathBuf>,
+/// A build's quad runs, read back as ranks. A merge over them can be opened
+/// any number of times.
+pub(crate) enum QuadRuns {
+    /// A build that spilled nothing: its one run, held as ranks already.
+    Memory(Arc<[[u32; 4]]>),
+    /// The runs a [`QuadSpiller`] wrote, read back as the ranks `rank_of`
+    /// maps their ids to.
+    Spilled {
+        paths: Vec<PathBuf>,
+        rank_of: RankTable,
+    },
 }
 
 impl QuadRuns {
     /// How many quads the in-memory run holds; `None` when the runs spilled.
     #[cfg(test)]
     pub(crate) fn memory_len(&self) -> Option<usize> {
-        self.memory.as_ref().map(|quads| quads.len())
+        match self {
+            QuadRuns::Memory(quads) => Some(quads.len()),
+            QuadRuns::Spilled { .. } => None,
+        }
     }
 
     /// How many runs: the files written, or the one in memory.
     #[cfg(test)]
     pub(crate) fn run_count(&self) -> usize {
-        if self.memory.is_some() {
-            1
-        } else {
-            self.paths.len()
+        match self {
+            QuadRuns::Memory(_) => 1,
+            QuadRuns::Spilled { paths, .. } => paths.len(),
         }
     }
 
     /// A merge of the runs yielding each distinct quad once, in global order,
-    /// as the ranks `rank_of` maps its ids to.
-    pub(crate) fn merger(&self, rank_of: &RankTable) -> Result<RunMerger<QuadRunReader>> {
-        let runs = match &self.memory {
-            Some(ranks) => vec![QuadRunReader {
-                source: QuadSource::Memory {
-                    ranks: Arc::clone(ranks),
-                    at: 0,
-                },
-                rank_of: Arc::clone(rank_of),
+    /// as ranks.
+    pub(crate) fn merger(&self) -> Result<RunMerger<QuadRunReader>> {
+        let runs = match self {
+            QuadRuns::Memory(ranks) => vec![QuadRunReader::Memory {
+                ranks: Arc::clone(ranks),
+                at: 0,
             }],
-            None => self
-                .paths
+            QuadRuns::Spilled { paths, rank_of } => paths
                 .iter()
                 .map(|path| {
-                    Ok(QuadRunReader {
-                        source: QuadSource::File(RecordReader::open(path)?),
+                    Ok(QuadRunReader::File {
+                        reader: RecordReader::open(path)?,
                         rank_of: Arc::clone(rank_of),
                     })
                 })
@@ -486,16 +479,15 @@ impl QuadRuns {
     }
 }
 
-/// One quad run read back as ranks: a spilled run's ids mapped to theirs,
-/// the in-memory run's held so already.
-pub(crate) struct QuadRunReader {
-    source: QuadSource,
-    rank_of: RankTable,
-}
-
-enum QuadSource {
+/// One quad run read back as ranks.
+pub(crate) enum QuadRunReader {
+    /// The in-memory run, held as ranks already, read from `at` on.
     Memory { ranks: Arc<[[u32; 4]]>, at: usize },
-    File(RecordReader),
+    /// A spilled run, its ids mapped to their ranks as they are read.
+    File {
+        reader: RecordReader,
+        rank_of: RankTable,
+    },
 }
 
 /// The rank of the term `id` names; an id past the table (a corrupt run) is
@@ -513,25 +505,25 @@ impl RunRead for QuadRunReader {
     type Item = [u32; 4];
 
     fn next(&mut self) -> Result<Option<[u32; 4]>> {
-        match &mut self.source {
-            QuadSource::Memory { ranks, at } => {
+        match self {
+            QuadRunReader::Memory { ranks, at } => {
                 let Some(&quad) = ranks.get(*at) else {
                     return Ok(None);
                 };
                 *at += 1;
                 Ok(Some(quad))
             }
-            QuadSource::File(reader) => {
+            QuadRunReader::File { reader, rank_of } => {
                 let mut record = [0u8; QUAD_RECORD_BYTES];
                 if !reader.read(&mut record, "quad")? {
                     return Ok(None);
                 }
                 let ids = read_u32s(&record);
                 Ok(Some([
-                    rank_in(&self.rank_of, ids[0])?,
-                    rank_in(&self.rank_of, ids[1])?,
-                    rank_in(&self.rank_of, ids[2])?,
-                    rank_in(&self.rank_of, ids[3])?,
+                    rank_in(rank_of, ids[0])?,
+                    rank_in(rank_of, ids[1])?,
+                    rank_in(rank_of, ids[2])?,
+                    rank_in(rank_of, ids[3])?,
                 ]))
             }
         }
@@ -790,8 +782,9 @@ mod tests {
         out
     }
 
-    /// `quads` interned and spilled in runs of `capacity` under `dir`.
-    fn spill(dir: &Path, quads: &[RawQuad], capacity: usize) -> (QuadRuns, FrozenTerms) {
+    /// `quads` interned and spilled in runs of `capacity` under `dir`, not
+    /// yet ranked, beside the build's frozen terms.
+    fn spilled(dir: &Path, quads: &[RawQuad], capacity: usize) -> (SpilledQuads, FrozenTerms) {
         let mut terms = TermInterner::new();
         let mut spiller = QuadSpiller::new(dir, capacity);
         for quad in quads {
@@ -799,8 +792,13 @@ mod tests {
             spiller.push(ids, &terms).unwrap();
         }
         let spilled = spiller.finish(&terms).unwrap();
-        let frozen = terms.finish();
-        let runs = spilled.ranked(&Arc::new(frozen.rank_of.clone())).unwrap();
+        (spilled, terms.finish())
+    }
+
+    /// [`spilled`], ranked by the build's own table.
+    fn spill(dir: &Path, quads: &[RawQuad], capacity: usize) -> (QuadRuns, FrozenTerms) {
+        let (spilled, frozen) = spilled(dir, quads, capacity);
+        let runs = spilled.ranked(Arc::new(frozen.rank_of.clone())).unwrap();
         (runs, frozen)
     }
 
@@ -837,12 +835,7 @@ mod tests {
         let guard = TempRunsGuard::create(None, None).unwrap();
         let (runs, frozen) = spill(guard.path(), &pushes(), 3);
         assert!(runs.run_count() > 1, "{} runs", runs.run_count());
-        let rank_of = Arc::new(frozen.rank_of.clone());
-        let merged = runs
-            .merger(&rank_of)
-            .unwrap()
-            .next_batch(usize::MAX)
-            .unwrap();
+        let merged = runs.merger().unwrap().next_batch(usize::MAX).unwrap();
         assert_eq!(decode(&frozen, &merged), sorted_distinct(distinct_quads()));
     }
 
@@ -871,12 +864,7 @@ mod tests {
         for capacity in [usize::MAX, 100, 13, 1] {
             let guard = TempRunsGuard::create(None, None).unwrap();
             let (runs, frozen) = spill(guard.path(), &quads, capacity);
-            let rank_of = Arc::new(frozen.rank_of.clone());
-            let merged = runs
-                .merger(&rank_of)
-                .unwrap()
-                .next_batch(usize::MAX)
-                .unwrap();
+            let merged = runs.merger().unwrap().next_batch(usize::MAX).unwrap();
             assert_eq!(
                 decode(&frozen, &merged),
                 sorted_distinct(quads.clone()),
@@ -888,18 +876,9 @@ mod tests {
     #[test]
     fn quad_runs_open_twice_yield_the_same_sequence() {
         let guard = TempRunsGuard::create(None, None).unwrap();
-        let (runs, frozen) = spill(guard.path(), &pushes(), 3);
-        let rank_of = Arc::new(frozen.rank_of);
-        let first = runs
-            .merger(&rank_of)
-            .unwrap()
-            .next_batch(usize::MAX)
-            .unwrap();
-        let second = runs
-            .merger(&rank_of)
-            .unwrap()
-            .next_batch(usize::MAX)
-            .unwrap();
+        let (runs, _) = spill(guard.path(), &pushes(), 3);
+        let first = runs.merger().unwrap().next_batch(usize::MAX).unwrap();
+        let second = runs.merger().unwrap().next_batch(usize::MAX).unwrap();
         assert_eq!(first.len(), 12);
         assert_eq!(first, second);
     }
@@ -911,12 +890,7 @@ mod tests {
         let (runs, frozen) = spill(guard.path(), quads, 100);
         assert_eq!(runs.run_count(), 1);
         assert_eq!(std::fs::read_dir(guard.path()).unwrap().count(), 0);
-        let rank_of = Arc::new(frozen.rank_of.clone());
-        let merged = runs
-            .merger(&rank_of)
-            .unwrap()
-            .next_batch(usize::MAX)
-            .unwrap();
+        let merged = runs.merger().unwrap().next_batch(usize::MAX).unwrap();
         assert_eq!(decode(&frozen, &merged), sorted_distinct(quads.to_vec()));
     }
 
@@ -959,10 +933,11 @@ mod tests {
     #[test]
     fn quad_run_id_past_the_table_is_a_deserialization_error() {
         let guard = TempRunsGuard::create(None, None).unwrap();
-        let (runs, frozen) = spill(guard.path(), &distinct_quads(), 3);
+        let (spilled, frozen) = spilled(guard.path(), &distinct_quads(), 3);
         let short = Arc::new(frozen.rank_of[..2].to_vec());
-        let read = runs
-            .merger(&short)
+        let read = spilled
+            .ranked(short)
+            .and_then(|runs| runs.merger())
             .and_then(|mut merger| merger.next_batch(usize::MAX));
         assert!(
             matches!(read, Err(VortexRdfError::Deserialization(_))),
@@ -1062,8 +1037,8 @@ mod tests {
         let spilled = spiller.finish(&terms).unwrap();
         let rank_of = Arc::new(terms.finish().rank_of);
         let read = spilled
-            .ranked(&rank_of)
-            .and_then(|runs| runs.merger(&rank_of))
+            .ranked(rank_of)
+            .and_then(|runs| runs.merger())
             .and_then(|mut merger| merger.next_batch(usize::MAX));
         assert!(
             matches!(read, Err(VortexRdfError::Deserialization(_))),
