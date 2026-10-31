@@ -49,27 +49,25 @@ final class Native {
 
 	/**
 	 * A read of every quad matching a pattern as its first chunk ({@link Payload}), whose last slot is
-	 * {@code {cursor, rows}}: the cursor of the chunks left, 0 when none are, and the read's rows. A chunk holds at
-	 * most {@code chunkRows} rows and {@code chunkBytes} bytes of terms; terms over {@code largeTerm} bytes cross on
-	 * their own. The caller closes the cursor within the call that opened it.
+	 * {@code {stream, rows}}: the term stream of the chunks left ({@link #termStreamNext}), 0 when none are, and the
+	 * read's rows. A chunk holds at most {@code chunkRows} rows and {@code chunkBytes} bytes of terms; terms over
+	 * {@code largeTerm} bytes cross on their own. The caller frees the stream within the call that opened it.
 	 */
 	static native Object[] quadsOpen(long handle, String s, String p, String o, String g, int chunkRows,
 			int chunkBytes, int largeTerm);
 
-	/** The next chunk of a read, its last slot null; null once the read is over. */
-	static native Object[] cursorNext(long cursor);
-
-	/** Frees a cursor; 0 is a no-op. */
-	static native void cursorClose(long cursor);
-
-	/** The native objects held by handle and not yet freed, in this process: cursors and streams. */
+	/** The native objects held by handle and not yet freed, in this process: term and code streams. */
 	static native long openHandles();
 
-	/** A read of the matching quads as a stream of chunks of at most {@code batchRows} rows; its handle. */
-	static native long termStreamOpen(long handle, String s, String p, String o, String g, int batchRows);
+	/**
+	 * A read of the matching quads as a stream of chunks of at most {@code batchRows} rows, sent as {@link #quadsOpen}
+	 * sends its chunks; its handle.
+	 */
+	static native long termStreamOpen(long handle, String s, String p, String o, String g, int batchRows,
+			int chunkRows, int chunkBytes, int largeTerm);
 
 	/** A term stream's next chunk ({@link Payload}, its last slot null); null at the end. */
-	static native Object[] termStreamNext(long stream, int chunkRows, int chunkBytes, int largeTerm);
+	static native Object[] termStreamNext(long stream);
 
 	/** A read of the quads matching a pattern of codes (-1 is free) as a stream of their codes; its handle. */
 	static native long codeStreamOpen(long handle, long s, long p, long o, long g, int batchRows);

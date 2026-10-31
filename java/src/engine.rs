@@ -7,16 +7,42 @@
 
 use std::sync::LazyLock;
 
+use vortex_buffer::Buffer;
 use vortex_rdf_core::{
-    CodePattern, DictReader, KindRanges, Probe, Result, VortexRdfError, VortexRdfStore,
+    CodePattern, DictReader, KindRanges, Probe, Result, TermCode, VortexRdfError, VortexRdfStore,
 };
 
-use crate::cursor::QuadCursor;
 use crate::payload::{Limits, Payload, encode_lookup};
-use crate::streams::{CodeStream, TermStream, check_batch_rows};
+use crate::streams::{CodeStream, TermStream};
 
 /// Bytes per row [`Store::match_codes`] writes: four codes of eight bytes.
 pub const ROW_BYTES: usize = 32;
+
+/// Writes rows `from..` of `columns`, as many as `out` holds, into `out`: each its `(s, p, o, g)` codes, eight
+/// native-endian bytes apiece. Returns the rows written.
+pub(crate) fn write_rows(
+    columns: &[Buffer<TermCode>; 4],
+    from: usize,
+    out: &mut [[u8; ROW_BYTES]],
+) -> usize {
+    let rows = out.len().min(columns[0].len() - from);
+    for (row, bytes) in out[..rows].iter_mut().enumerate() {
+        for (code, column) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(columns) {
+            *code = column[from + row].to_ne_bytes();
+        }
+    }
+    rows
+}
+
+/// `InvalidInput` for a chunk of no rows: checked before a stream's pattern is matched.
+fn check_batch_rows(batch_rows: usize) -> Result<()> {
+    if batch_rows == 0 {
+        return Err(VortexRdfError::InvalidInput(
+            "batch_rows must be at least 1: the most rows a chunk holds".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// One runtime for every store of the process, as in the Python bindings: a store's reads are async, the
 /// caller's threads block on them.
@@ -81,32 +107,35 @@ impl Store {
         Ok(RUNTIME.block_on(self.store.count_probe(&probe))? as u64)
     }
 
-    /// The quads matching a pattern of N-Triples spellings, in the store's row order, as a cursor that hands
-    /// them out in packed chunks under `limits`: a Dictionary store's matched codes, gathered (in index order
-    /// when an index serves the pattern), or the matched quads' terms otherwise.
-    pub fn quads_cursor(
+    /// The quads matching a pattern of N-Triples spellings, read now, in the match's order (a
+    /// `secondary-by-copy` index's for a pattern it serves, else base row order), beside their number: a stream
+    /// that sends them in packed payloads under `limits` ([`TermStream`]), of a Dictionary store's matched codes,
+    /// gathered, or of the matched quads' terms otherwise.
+    pub fn quads(
         &self,
         s: Option<&str>,
         p: Option<&str>,
         o: Option<&str>,
         g: Option<&str>,
         limits: Limits,
-    ) -> Result<QuadCursor> {
+    ) -> Result<(TermStream, usize)> {
         let probe = Probe::parse(s, p, o, g)?;
         let view = RUNTIME.block_on(self.store.run_probe(&probe))?;
         if let Some(dict) = &self.dict
             && let Some(columns) = RUNTIME.block_on(view.code_columns_gathered())?
         {
-            return Ok(QuadCursor::codes(dict.clone(), columns, limits));
+            let rows = columns[0].len();
+            return Ok((TermStream::codes(dict.clone(), columns, limits), rows));
         }
-        let rows = RUNTIME.block_on(view.shared_quads_vec())?;
-        Ok(QuadCursor::shared(rows, limits))
+        let quads = RUNTIME.block_on(view.shared_quads_vec())?;
+        let rows = quads.len();
+        Ok((TermStream::shared(quads, limits), rows))
     }
 
     /// The quads matching a pattern of N-Triples spellings as a stream, in the match's order (a
     /// `secondary-by-copy` index's for a pattern it serves, else base row order), read in chunks of at most
-    /// `batch_rows` rows and sent as packed payloads ([`TermStream`]). The pattern is parsed and matched now; the
-    /// rows are read as the stream is pulled.
+    /// `batch_rows` rows and sent as packed payloads under `limits` ([`TermStream`]). The pattern is parsed and
+    /// matched now; the rows are read as the stream is pulled.
     pub fn term_stream(
         &self,
         s: Option<&str>,
@@ -114,11 +143,12 @@ impl Store {
         o: Option<&str>,
         g: Option<&str>,
         batch_rows: usize,
+        limits: Limits,
     ) -> Result<TermStream> {
         check_batch_rows(batch_rows)?;
         let probe = Probe::parse(s, p, o, g)?;
         let view = RUNTIME.block_on(self.store.run_probe(&probe))?;
-        TermStream::open(view, self.dict.clone(), batch_rows)
+        TermStream::open(view, self.dict.clone(), batch_rows, limits)
     }
 
     // ---- term codes, Dictionary layout ----
@@ -175,7 +205,6 @@ impl Store {
     /// one in a position its term's kind cannot take).
     pub fn code_stream(&self, pattern: CodePattern, batch_rows: usize) -> Result<CodeStream> {
         check_batch_rows(batch_rows)?;
-        self.dict()?;
         match RUNTIME.block_on(self.store.code_probe(pattern))? {
             None => Ok(CodeStream::empty()),
             Some(probe) => {
@@ -202,12 +231,6 @@ impl Store {
             offset as usize,
             Some(out.len()),
         ))?;
-        let rows = columns[0].len();
-        for (row, bytes) in out[..rows].iter_mut().enumerate() {
-            for (code, column) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&columns) {
-                *code = column[row].to_ne_bytes();
-            }
-        }
-        Ok(rows)
+        Ok(write_rows(&columns, 0, out))
     }
 }

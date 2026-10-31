@@ -1,6 +1,5 @@
 package org.vortexrdf;
 
-import java.lang.ref.Cleaner;
 import java.nio.ByteBuffer;
 
 /**
@@ -14,15 +13,11 @@ import java.nio.ByteBuffer;
  * closed writes no more rows. Not thread-safe.
  */
 public final class CodeChunks implements AutoCloseable {
-	private final VortexStore store;
 	private final NativeStream stream;
-	private final Cleaner.Cleanable cleanable;
-	private boolean ended;
 
-	CodeChunks(VortexStore store, NativeStream stream) {
-		this.store = store;
+	CodeChunks(NativeStream stream) {
 		this.stream = stream;
-		this.cleanable = QuadIterator.CLEANER.register(this, stream);
+		stream.freeWith(this);
 	}
 
 	/**
@@ -39,31 +34,12 @@ public final class CodeChunks implements AutoCloseable {
 		if (maxRows < 1) {
 			throw new IllegalArgumentException("maxRows must be at least 1");
 		}
-		if (ended) {
-			return 0;
-		}
-		if (store.isClosed()) {
-			throw new IllegalStateException("the store is closed");
-		}
-		int rows;
-		try {
-			rows = store.callInt(h -> stream.codesNext(out, maxRows));
-		} catch (IllegalStateException closed) {
-			throw closed;
-		} catch (RuntimeException failed) {
-			close();
-			throw failed;
-		}
-		if (rows == 0) {
-			close();
-		}
-		return rows;
+		return stream.live() ? stream.codesNext(out, maxRows) : 0;
 	}
 
 	/** Ends the stream and frees it natively; closing twice is harmless. */
 	@Override
 	public void close() {
-		ended = true;
-		cleanable.clean();
+		stream.close();
 	}
 }

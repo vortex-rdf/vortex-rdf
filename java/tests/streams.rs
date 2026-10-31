@@ -8,7 +8,8 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::{
-    Built, Quad, as_refs, builds, patterns, quads as make_quads, reference_quads, scan, write,
+    Built, JAVA_LIMITS, Quad, as_refs, builds, drain, patterns, quads as make_quads,
+    reference_quads, scan, write,
 };
 use vortex_rdf_core::{CodePattern, IndexType, LayoutStrategy};
 use vortex_rdf_jni::engine::{ROW_BYTES, Store};
@@ -17,29 +18,6 @@ use vortex_rdf_jni::streams::{CodeStream, TermStream};
 
 fn quads() -> Vec<Quad> {
     make_quads(400)
-}
-
-/// Every row a term stream sends, each payload's positions read four to a row.
-fn drain_terms(mut stream: TermStream, limits: Limits) -> Vec<Quad> {
-    let mut rows = Vec::new();
-    while let Some(payload) = stream.next(limits).unwrap() {
-        let positions = payload.positions();
-        assert!(positions > 0 && positions % 4 == 0, "{positions} positions");
-        assert!(positions / 4 <= limits.rows);
-        for row in 0..positions / 4 {
-            rows.push(std::array::from_fn(|c| {
-                payload
-                    .term(4 * row + c)
-                    .expect("a row position holds a term")
-                    .to_string()
-            }));
-        }
-    }
-    assert!(
-        stream.next(limits).unwrap().is_none(),
-        "an ended stream stays ended"
-    );
-    rows
 }
 
 /// Every row a code stream writes, `rows` at a time, as its four codes.
@@ -110,15 +88,15 @@ fn term_streams_yield_the_match_in_read_order() {
                     if batch_rows == 1 && want.len() > 64 {
                         continue;
                     }
-                    for limits in [Limits::DEFAULT, Limits::new(3, 128, 32).unwrap()] {
+                    for limits in [JAVA_LIMITS, Limits::new(3, 128, 32).unwrap()] {
                         let tag = format!(
                             "{} in_memory={in_memory} {pattern:?} batch {batch_rows} {limits:?}",
                             built.name
                         );
                         let stream = store
-                            .term_stream(r[0], r[1], r[2], r[3], batch_rows)
+                            .term_stream(r[0], r[1], r[2], r[3], batch_rows, limits)
                             .unwrap();
-                        assert_eq!(drain_terms(stream, limits), want, "{tag}");
+                        assert_eq!(drain(stream, limits), want, "{tag}");
                     }
                 }
             }
@@ -200,12 +178,16 @@ fn streams_refuse_what_their_store_cannot_serve() {
     assert!(error.contains("no term dictionary"), "{error}");
     let store = Store::open(&write(dir.path(), &builds()[0], &quads), false).unwrap();
     let error = store
-        .term_stream(None, Some("not a term"), None, None, 7)
+        .term_stream(None, Some("not a term"), None, None, 7, JAVA_LIMITS)
         .err()
         .expect("a malformed predicate")
         .to_string();
     assert!(error.contains("pattern predicate"), "{error}");
-    assert!(store.term_stream(None, None, None, None, 0).is_err());
+    assert!(
+        store
+            .term_stream(None, None, None, None, 0, JAVA_LIMITS)
+            .is_err()
+    );
     assert!(store.code_stream(CodePattern::default(), 0).is_err());
 }
 
@@ -217,11 +199,13 @@ fn streams_outlive_their_store_handle() {
     for built in builds() {
         let path = write(dir.path(), &built, &quads);
         let store = Store::open(&path, false).unwrap();
-        let terms = store.term_stream(None, None, None, None, 64).unwrap();
+        let terms = store
+            .term_stream(None, None, None, None, 64, JAVA_LIMITS)
+            .unwrap();
         let codes = (built.layout == LayoutStrategy::Dictionary)
             .then(|| store.code_stream(CodePattern::default(), 64).unwrap());
         drop(store);
-        assert_eq!(drain_terms(terms, Limits::DEFAULT), want, "{}", built.name);
+        assert_eq!(drain(terms, JAVA_LIMITS), want, "{}", built.name);
         if let Some(codes) = codes {
             let reader = Store::open(&path, false).unwrap();
             let spelled: Vec<Quad> = drain_codes(codes, 100)

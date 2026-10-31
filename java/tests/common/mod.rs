@@ -8,7 +8,8 @@ use std::collections::{BTreeSet, HashMap};
 use futures::stream;
 use vortex_rdf_core::io::quads_stream_to_vortex_file;
 use vortex_rdf_core::{IndexType, LayoutStrategy, Probe, RawQuad, VortexRdfStore};
-use vortex_rdf_jni::cursor::QuadCursor;
+use vortex_rdf_jni::payload::{Limits, Payload};
+use vortex_rdf_jni::streams::TermStream;
 
 pub type Quad = [String; 4];
 
@@ -232,24 +233,54 @@ pub fn reference_quads(path: &str, in_memory: bool, pattern: [Option<&str>; 4]) 
     })
 }
 
-/// The rows a cursor sends, each chunk's positions read through `Payload::term`, four to a row; checks that
-/// every chunk holds whole rows and that the rows add up to the cursor's count.
-pub fn drain(mut cursor: QuadCursor) -> Vec<Quad> {
-    let mut rows = Vec::with_capacity(cursor.rows());
-    for payload in &mut cursor {
-        let payload = payload.expect("read a chunk");
-        let positions = payload.positions();
-        assert!(positions > 0 && positions % 4 == 0, "{positions} positions");
-        for row in 0..positions / 4 {
-            rows.push(std::array::from_fn(|c| {
-                payload
-                    .term(4 * row + c)
-                    .expect("a row position holds a term")
-                    .to_string()
-            }));
+/// The chunk limits the Java side reads with: `Payload.java`'s `CHUNK_ROWS`, `CHUNK_BYTES` and `LARGE_TERM`.
+pub const JAVA_LIMITS: Limits = Limits {
+    rows: 65_536,
+    chunk_bytes: 16 << 20,
+    large_term: 1 << 20,
+};
+
+/// The term at `position` of a payload, read as `Payload.java` reads it; `None` for a lookup's miss.
+pub fn term(payload: &Payload, position: usize) -> Option<&str> {
+    match payload.terms[position] {
+        -1 => None,
+        large if large < 0 => Some(&payload.large[(-2 - large) as usize]),
+        k => {
+            let k = 2 * k as usize;
+            let bytes = &payload.text[payload.bounds[k] as usize..payload.bounds[k + 1] as usize];
+            Some(std::str::from_utf8(bytes).expect("a term's bounds hold whole characters"))
         }
     }
-    assert_eq!(rows.len(), cursor.rows(), "the chunks hold the read's rows");
+}
+
+/// A payload's rows, four positions each, spelled through [`term`].
+pub fn payload_rows(payload: &Payload) -> Vec<Quad> {
+    let positions = payload.positions();
+    assert_eq!(positions % 4, 0, "{positions} positions");
+    (0..positions / 4)
+        .map(|row| {
+            std::array::from_fn(|c| {
+                term(payload, 4 * row + c)
+                    .expect("a row position holds a term")
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
+/// Every row a term stream opened with `limits` sends, each payload holding whole rows, at least one and at
+/// most `limits.rows`; checks that an ended stream stays ended.
+pub fn drain(mut stream: TermStream, limits: Limits) -> Vec<Quad> {
+    let mut rows = Vec::new();
+    while let Some(payload) = stream.next_payload().expect("read a payload") {
+        let held = payload.positions() / 4;
+        assert!((1..=limits.rows).contains(&held), "{held} rows");
+        rows.extend(payload_rows(&payload));
+    }
+    assert!(
+        stream.next_payload().expect("read past the end").is_none(),
+        "an ended stream stays ended"
+    );
     rows
 }
 

@@ -62,8 +62,8 @@ final class Payload {
 		return terms.length;
 	}
 
-	/** A read's first chunk's cursor of the chunks left; 0 when none are. */
-	static long cursor(Object[] payload) {
+	/** A read's first chunk's term stream of the chunks left; 0 when none are. */
+	static long stream(Object[] payload) {
 		return ((long[]) payload[4])[0];
 	}
 

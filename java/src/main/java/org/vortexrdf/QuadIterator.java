@@ -1,6 +1,5 @@
 package org.vortexrdf;
 
-import java.lang.ref.Cleaner;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -20,25 +19,13 @@ import java.util.stream.StreamSupport;
  * or was closed answers no more rows. Not thread-safe, as no {@code Iterator} is.
  */
 public final class QuadIterator implements Iterator<String[]>, AutoCloseable {
-	static final Cleaner CLEANER = Cleaner.create();
-
-	private final VortexStore store;
 	private final NativeStream stream;
-	private final Cleaner.Cleanable cleanable;
-	private final int chunkRows;
-	private final int chunkBytes;
-	private final int largeTerm;
 	private final List<String[]> rows = new ArrayList<>();
 	private int next;
-	private boolean ended;
 
-	QuadIterator(VortexStore store, NativeStream stream, int chunkRows, int chunkBytes, int largeTerm) {
-		this.store = store;
+	QuadIterator(NativeStream stream) {
 		this.stream = stream;
-		this.cleanable = CLEANER.register(this, stream);
-		this.chunkRows = chunkRows;
-		this.chunkBytes = chunkBytes;
-		this.largeTerm = largeTerm;
+		stream.freeWith(this);
 	}
 
 	/**
@@ -48,28 +35,16 @@ public final class QuadIterator implements Iterator<String[]>, AutoCloseable {
 	 */
 	@Override
 	public boolean hasNext() {
-		if (ended) {
+		if (!stream.live()) {
 			return false;
-		}
-		if (store.isClosed()) {
-			throw new IllegalStateException("the store is closed");
 		}
 		if (next < rows.size()) {
 			return true;
 		}
 		rows.clear();
 		next = 0;
-		Object[] payload;
-		try {
-			payload = store.call(h -> stream.termsNext(chunkRows, chunkBytes, largeTerm));
-		} catch (IllegalStateException closed) {
-			throw closed;
-		} catch (RuntimeException failed) {
-			close();
-			throw failed;
-		}
+		Object[] payload = stream.termsNext();
 		if (payload == null) {
-			close();
 			return false;
 		}
 		Payload.addQuads(payload, rows);
@@ -95,9 +70,8 @@ public final class QuadIterator implements Iterator<String[]>, AutoCloseable {
 	/** Ends the iteration and frees its native stream; closing twice is harmless. */
 	@Override
 	public void close() {
-		ended = true;
 		rows.clear();
-		cleanable.clean();
+		stream.close();
 	}
 
 	/** The rows left as a sequential, ordered stream, whose {@code close()} closes this iterator. */

@@ -6,7 +6,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Quad, builds, quads, write};
+use common::{JAVA_LIMITS, Quad, builds, payload_rows, quads, term, write};
 use vortex_rdf_core::{DictReader, LayoutStrategy, Probe, SharedQuad, TermCode, VortexRdfStore};
 use vortex_rdf_jni::payload::{Limits, Pace, Payload, encode_codes, encode_lookup, encode_shared};
 
@@ -91,16 +91,7 @@ async fn drain_codes(
 fn spelled(payloads: &[(Payload, usize)]) -> Vec<Quad> {
     payloads
         .iter()
-        .flat_map(|(payload, rows)| {
-            (0..*rows).map(move |row| {
-                std::array::from_fn(|c| {
-                    payload
-                        .term(4 * row + c)
-                        .expect("a row position holds a term")
-                        .to_string()
-                })
-            })
-        })
+        .flat_map(|(payload, _)| payload_rows(payload))
         .collect()
 }
 
@@ -112,7 +103,7 @@ fn codes_round_trip_in_order() {
         block_on(async {
             let dict = store.dict_reader().unwrap();
             let columns = columns(store, [None; 4]).await;
-            let payloads = drain_codes(&dict, &columns, Limits::DEFAULT).await;
+            let payloads = drain_codes(&dict, &columns, JAVA_LIMITS).await;
             assert_eq!(spelled(&payloads), decoded(&dict, &columns).await, "{tag}");
         });
     }
@@ -132,7 +123,7 @@ fn repeats_share_a_slot() {
                 "{tag}: the predicate holds several rows"
             );
             let rest = std::array::from_fn(|c| &columns[c][..]);
-            let (payload, _) = encode_codes(&dict, rest, Limits::DEFAULT).await.unwrap();
+            let (payload, _) = encode_codes(&dict, rest, JAVA_LIMITS).await.unwrap();
             assert_eq!(payload.terms[1], payload.terms[5], "{tag}: one slot");
             assert!(payload.bounds.len() / 2 < payload.terms.len(), "{tag}");
         });
@@ -191,9 +182,9 @@ fn huge_terms_take_the_large_list() {
             let payloads = drain_codes(&dict, &columns, limits).await;
             assert_eq!(spelled(&payloads), want, "{tag}");
             for (payload, _) in &payloads {
-                for (position, &term) in payload.terms.iter().enumerate() {
-                    let length = payload.term(position).unwrap().len();
-                    if term <= -2 {
+                for (position, &entry) in payload.terms.iter().enumerate() {
+                    let length = term(payload, position).unwrap().len();
+                    if entry <= -2 {
                         assert!(length > 16, "{tag}: a large term is long");
                     } else {
                         assert!(length <= 16, "{tag}: a long term is large");
@@ -246,7 +237,7 @@ fn shared_rows_round_trip() {
             .iter()
             .map(|q| [&q.s, &q.p, &q.o, &q.g].map(|t| t.to_string()))
             .collect();
-        for limits in [Limits::DEFAULT, Limits::new(3, 128, 32).unwrap()] {
+        for limits in [JAVA_LIMITS, Limits::new(3, 128, 32).unwrap()] {
             let payloads = drain_shared(&rows, limits);
             assert_eq!(spelled(&payloads), want, "{tag} {limits:?}");
             // Positions holding one Arc hold one slot.
@@ -279,10 +270,10 @@ fn shared_rows_round_trip() {
         quad("<http://example.org/a>"),
         quad("<http://example.org/b>"),
     ];
-    let (payload, n) = encode_shared(&rows, Limits::DEFAULT);
+    let (payload, n) = encode_shared(&rows, JAVA_LIMITS);
     assert_eq!(n, 2);
     assert_eq!(payload.terms[1], payload.terms[5]);
-    assert_eq!(payload.term(5), Some("<http://example.org/p>"));
+    assert_eq!(term(&payload, 5), Some("<http://example.org/p>"));
 }
 
 #[test]
@@ -299,15 +290,19 @@ fn lookup_maps_misses_to_null() {
                 .unwrap();
             let len = dict.len() as u64;
             let codes = [c0, u64::MAX, c0, len + 3];
-            let (payload, n) = encode_lookup(&dict, &codes, Limits::DEFAULT).await.unwrap();
+            let (payload, n) = encode_lookup(&dict, &codes, JAVA_LIMITS).await.unwrap();
             assert_eq!((n, payload.positions()), (4, 4), "{tag}");
             let want = dict.decode(c0).await.unwrap();
-            assert_eq!(payload.term(0), want.as_deref(), "{tag}");
-            assert_eq!(payload.term(2), want.as_deref(), "{tag}");
+            assert_eq!(term(&payload, 0), want.as_deref(), "{tag}");
+            assert_eq!(term(&payload, 2), want.as_deref(), "{tag}");
             assert_eq!(payload.terms[0], payload.terms[2], "{tag}");
-            assert_eq!((payload.term(1), payload.term(3)), (None, None), "{tag}");
             assert_eq!(
-                encode_lookup(&dict, &[], Limits::DEFAULT).await.unwrap(),
+                (term(&payload, 1), term(&payload, 3)),
+                (None, None),
+                "{tag}"
+            );
+            assert_eq!(
+                encode_lookup(&dict, &[], JAVA_LIMITS).await.unwrap(),
                 (Payload::default(), 0),
                 "{tag}"
             );
@@ -320,7 +315,7 @@ fn lookup_maps_misses_to_null() {
                 assert!(n >= 1 && (payload.bytes() <= 4 * 23 || n == 1), "{tag}");
                 for i in 0..n {
                     let want = dict.decode(all[at + i]).await.unwrap();
-                    assert_eq!(payload.term(i), want.as_deref(), "{tag}");
+                    assert_eq!(term(&payload, i), want.as_deref(), "{tag}");
                 }
                 at += n;
             }
@@ -337,7 +332,7 @@ fn a_code_outside_the_dictionary_fails_a_row_read() {
             let dict = store.dict_reader().unwrap();
             let bad = dict.len() as u64 + 5;
             let columns: [&[TermCode]; 4] = [&[0, 1], &[2, 2], &[3, bad], &[0, 0]];
-            let error = encode_codes(&dict, columns, Limits::DEFAULT)
+            let error = encode_codes(&dict, columns, JAVA_LIMITS)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -355,10 +350,7 @@ fn limits_new_refuses_bad_values() {
     // The largest values the int-coded payload addresses.
     assert!(Limits::new(i32::MAX as usize / 4 + 1, 64, 16).is_err());
     assert!(Limits::new(1, i32::MAX as usize + 1, 16).is_err());
-    assert_eq!(
-        Limits::new(65_536, 16 << 20, 1 << 20).unwrap(),
-        Limits::DEFAULT
-    );
+    assert_eq!(Limits::new(65_536, 16 << 20, 1 << 20).unwrap(), JAVA_LIMITS);
 }
 
 #[test]

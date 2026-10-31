@@ -130,11 +130,16 @@ public final class VortexStore implements AutoCloseable {
 				synchronized (streams) {
 					open = streams.toArray(new NativeStream[0]);
 				}
-				for (NativeStream stream : open) {
-					stream.free();
+				try {
+					for (NativeStream stream : open) {
+						stream.free();
+					}
+				} finally {
+					// Cleared first, so a native close that fails is never retried on a store already released.
+					long freed = handle;
+					handle = 0;
+					Native.close(freed);
 				}
-				Native.close(handle);
-				handle = 0;
 			}
 		} finally {
 			lock.writeLock().unlock();
@@ -146,11 +151,15 @@ public final class VortexStore implements AutoCloseable {
 		return closed;
 	}
 
-	/** Tracks an iterator's native stream, for {@link #close()} to free. */
-	void track(NativeStream stream) {
-		synchronized (streams) {
-			streams.add(stream);
-		}
+	/** The native stream {@code open} opens on the open store's handle, tracked for {@link #close()} to free. */
+	private NativeStream openStream(LongUnaryOperator open) {
+		return call(h -> {
+			NativeStream stream = new NativeStream(this, open.applyAsLong(h));
+			synchronized (streams) {
+				streams.add(stream);
+			}
+			return stream;
+		});
 	}
 
 	/** Stops tracking a freed native stream. */
@@ -210,23 +219,23 @@ public final class VortexStore implements AutoCloseable {
 
 	/**
 	 * {@link #quads(String, String, String, String)} with the chunk limits the rows cross in, which tests set small to
-	 * cut every chunk. The read's cursor lives within this call: freed before it returns or throws.
+	 * cut every chunk. The read's stream lives within this call: freed before it returns or throws.
 	 */
 	List<String[]> quads(String s, String p, String o, String g, int chunkRows, int chunkBytes, int largeTerm) {
 		return call(h -> {
 			Object[] first = Native.quadsOpen(h, s, p, o, g, chunkRows, chunkBytes, largeTerm);
-			long cursor = Payload.cursor(first);
+			long stream = Payload.stream(first);
 			try {
 				List<String[]> rows = new ArrayList<>(Payload.rows(first));
 				Payload.addQuads(first, rows);
 				Object[] next;
-				while (cursor != 0 && (next = Native.cursorNext(cursor)) != null) {
+				while (stream != 0 && (next = Native.termStreamNext(stream)) != null) {
 					Payload.addQuads(next, rows);
 				}
 				return rows;
 			} finally {
-				if (cursor != 0) {
-					Native.cursorClose(cursor);
+				if (stream != 0) {
+					Native.streamClose(stream);
 				}
 			}
 		});
@@ -247,11 +256,8 @@ public final class VortexStore implements AutoCloseable {
 	 */
 	public QuadIterator iterateQuads(String s, String p, String o, String g, int batchRows) {
 		checkBatchRows(batchRows);
-		return call(h -> {
-			NativeStream stream = new NativeStream(this, Native.termStreamOpen(h, s, p, o, g, batchRows));
-			track(stream);
-			return new QuadIterator(this, stream, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
-		});
+		return new QuadIterator(openStream(h -> Native.termStreamOpen(h, s, p, o, g, batchRows, Payload.CHUNK_ROWS,
+				Payload.CHUNK_BYTES, Payload.LARGE_TERM)));
 	}
 
 	private static void checkBatchRows(int batchRows) {
@@ -277,11 +283,7 @@ public final class VortexStore implements AutoCloseable {
 	 */
 	public CodeChunks matchCodeChunks(long s, long p, long o, long g, int batchRows) {
 		checkBatchRows(batchRows);
-		return call(h -> {
-			NativeStream stream = new NativeStream(this, Native.codeStreamOpen(h, s, p, o, g, batchRows));
-			track(stream);
-			return new CodeChunks(this, stream);
-		});
+		return new CodeChunks(openStream(h -> Native.codeStreamOpen(h, s, p, o, g, batchRows)));
 	}
 
 	/** The number of quads matching a pattern of codes, exact and without reading rows; negative is free. */

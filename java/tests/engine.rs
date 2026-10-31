@@ -6,11 +6,10 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::{
-    Built, Quad, as_refs, builds, drain, patterns, quads as make_quads, reference_quads, scan,
-    write,
+    Built, JAVA_LIMITS, Quad, as_refs, builds, drain, patterns, quads as make_quads,
+    reference_quads, scan, term, write,
 };
 use vortex_rdf_core::{CodePattern, LayoutStrategy};
-use vortex_rdf_jni::cursor::QuadCursor;
 use vortex_rdf_jni::engine::{ROW_BYTES, Store};
 use vortex_rdf_jni::payload::Limits;
 
@@ -48,11 +47,8 @@ fn term_patterns_match_a_scan_on_every_layout() {
                     want.len() as u64,
                     "{tag}: count"
                 );
-                let all = drain(
-                    store
-                        .quads_cursor(r[0], r[1], r[2], r[3], Limits::DEFAULT)
-                        .unwrap(),
-                );
+                let (stream, _) = store.quads(r[0], r[1], r[2], r[3], JAVA_LIMITS).unwrap();
+                let all = drain(stream, JAVA_LIMITS);
                 assert_eq!(
                     all.iter().cloned().collect::<BTreeSet<_>>(),
                     want,
@@ -92,9 +88,9 @@ fn reference_reads_the_scan_on_every_build() {
     }
 }
 
-/// The cursor's rows against the per-term read's, row for row, on every build, residency and pattern, under
-/// each of `limits`.
-fn cursor_matches_the_reference(limits: &[Limits]) {
+/// The rows of a whole read ([`Store::quads`]) against the per-term read's, row for row, on every build,
+/// residency and pattern, under each of `limits`.
+fn quads_match_the_reference(limits: &[Limits]) {
     let quads = quads();
     let dir = tempfile::tempdir().unwrap();
     for built in builds() {
@@ -109,9 +105,9 @@ fn cursor_matches_the_reference(limits: &[Limits]) {
                         "{} in_memory={in_memory} {pattern:?} {limits:?}",
                         built.name
                     );
-                    let cursor = store.quads_cursor(r[0], r[1], r[2], r[3], limits).unwrap();
-                    assert_eq!(cursor.rows(), want.len(), "{tag}: rows");
-                    assert_eq!(drain(cursor), want, "{tag}");
+                    let (stream, rows) = store.quads(r[0], r[1], r[2], r[3], limits).unwrap();
+                    assert_eq!(rows, want.len(), "{tag}: rows");
+                    assert_eq!(drain(stream, limits), want, "{tag}");
                 }
             }
         }
@@ -119,28 +115,22 @@ fn cursor_matches_the_reference(limits: &[Limits]) {
 }
 
 #[test]
-fn cursor_reads_equal_the_reference_row_for_row() {
-    cursor_matches_the_reference(&[Limits::DEFAULT]);
+fn quads_reads_equal_the_reference_row_for_row() {
+    quads_match_the_reference(&[JAVA_LIMITS]);
 }
 
 #[test]
-fn cursor_reads_survive_every_chunk_cut() {
-    cursor_matches_the_reference(&[
+fn quads_reads_survive_every_chunk_cut() {
+    quads_match_the_reference(&[
         Limits::new(1, 64, 16).unwrap(),
         Limits::new(7, 256, 64).unwrap(),
     ]);
 }
 
-#[test]
-fn cursors_can_cross_threads() {
-    fn send<T: Send>() {}
-    send::<QuadCursor>();
-}
-
 /// After a chunk the byte budget cut, the next one offers the rows that fit, growing back at most twofold a
 /// chunk: rows of long literals followed by short ones never jump from a few rows a chunk to many.
 #[test]
-fn cursor_paces_chunks_by_the_last_fit() {
+fn quads_reads_pace_chunks_by_the_last_fit() {
     let long = "x".repeat(200);
     let quads: Vec<Quad> = (0..40)
         .map(|i| format!("\"{long} {i}\""))
@@ -167,10 +157,9 @@ fn cursor_paces_chunks_by_the_last_fit() {
             indexes: vec![],
         };
         let store = Store::open(&write(dir.path(), &built, &quads), false).unwrap();
-        let cursor = store.quads_cursor(None, None, None, None, limits).unwrap();
+        let (mut stream, _) = store.quads(None, None, None, None, limits).unwrap();
         let mut held = Vec::new();
-        for payload in cursor {
-            let payload = payload.unwrap();
+        while let Some(payload) = stream.next_payload().unwrap() {
             held.push(payload.positions() / 4);
         }
         assert_eq!(held.iter().sum::<usize>(), quads.len(), "{name}");
@@ -206,10 +195,15 @@ fn decode_payload_matches_decode() {
             let check = |from: usize, payload: &vortex_rdf_jni::payload::Payload, n: usize| {
                 for i in 0..n {
                     let want = store.decode(codes[from + i]).unwrap();
-                    assert_eq!(payload.term(i), want.as_deref(), "{tag}: code {}", from + i);
+                    assert_eq!(
+                        term(payload, i),
+                        want.as_deref(),
+                        "{tag}: code {}",
+                        from + i
+                    );
                 }
             };
-            let (payload, n) = store.decode_payload(&codes, Limits::DEFAULT).unwrap();
+            let (payload, n) = store.decode_payload(&codes, JAVA_LIMITS).unwrap();
             assert_eq!(n, codes.len(), "{tag}: one call");
             check(0, &payload, n);
             let three = Limits::new(3, 16 << 20, 1 << 20).unwrap();
@@ -237,7 +231,7 @@ fn term_patterns_report_what_a_caller_can_get_wrong() {
         .to_string();
     assert!(error.contains("pattern subject"), "{error}");
     let error = store
-        .quads_cursor(None, Some("not a term"), None, None, Limits::DEFAULT)
+        .quads(None, Some("not a term"), None, None, JAVA_LIMITS)
         .err()
         .expect("a malformed predicate")
         .to_string();
@@ -297,14 +291,18 @@ fn code_patterns_match_a_scan_on_dictionary_stores() {
                         .unwrap_or_else(|| panic!("{tag}: {t} has no code"))
                 })
                 .collect();
-            let (decoded, n) = store.decode_payload(&codes, Limits::DEFAULT).unwrap();
+            let (decoded, n) = store.decode_payload(&codes, JAVA_LIMITS).unwrap();
             assert_eq!(n, codes.len(), "{tag}: one chunk");
             let strings = store.decode_many(&codes).unwrap();
-            for (i, term) in distinct.iter().enumerate() {
-                assert_eq!(decoded.term(i), Some(term.as_str()), "{tag}: round trip");
+            for (i, spelling) in distinct.iter().enumerate() {
+                assert_eq!(
+                    term(&decoded, i),
+                    Some(spelling.as_str()),
+                    "{tag}: round trip"
+                );
                 assert_eq!(
                     strings[i].as_deref(),
-                    Some(term.as_str()),
+                    Some(spelling.as_str()),
                     "{tag}: a string apiece"
                 );
             }
@@ -383,7 +381,7 @@ fn a_store_without_a_dictionary_refuses_code_calls_only() {
         store.term_count().map(|_| ()),
         store.encode("<http://example.org/s1>").map(|_| ()),
         store.count_codes(CodePattern::default()).map(|_| ()),
-        store.decode_payload(&[0], Limits::DEFAULT).map(|_| ()),
+        store.decode_payload(&[0], JAVA_LIMITS).map(|_| ()),
     ] {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("no term dictionary"), "{error}");

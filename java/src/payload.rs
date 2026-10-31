@@ -20,13 +20,6 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// 65,536 rows, 16 MiB, terms over 1 MiB on their own.
-    pub const DEFAULT: Limits = Limits {
-        rows: 65_536,
-        chunk_bytes: 16 << 20,
-        large_term: 1 << 20,
-    };
-
     /// `InvalidInput` unless `rows >= 1`, `large_term >= 1` and `chunk_bytes >= 4 * large_term` (a row's
     /// shared text always fits), and unless the payload's `int`s address them: `rows <= i32::MAX / 4` and
     /// `chunk_bytes <= i32::MAX`.
@@ -72,19 +65,6 @@ impl Payload {
     /// The number of positions.
     pub fn positions(&self) -> usize {
         self.terms.len()
-    }
-
-    /// The term at `position`, read as `Payload.java` reads it; `None` for a lookup's miss.
-    pub fn term(&self, position: usize) -> Option<&str> {
-        match self.terms[position] {
-            NONE => None,
-            large if large < 0 => Some(&self.large[(-2 - large) as usize]),
-            k => {
-                let k = 2 * k as usize;
-                let bytes = &self.text[self.bounds[k] as usize..self.bounds[k + 1] as usize];
-                Some(std::str::from_utf8(bytes).expect("a term's bounds hold whole characters"))
-            }
-        }
     }
 
     /// The bytes of the chunk's distinct terms, large ones included: what [`Limits::chunk_bytes`] budgets.
