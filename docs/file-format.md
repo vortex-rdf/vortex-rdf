@@ -388,7 +388,7 @@ row ids.
 On a file-backed store an index child is never lifted into memory. Under the
 `Dictionary` layout its run is located by binary-searching the child's
 encoded chunks through the chunk probes of [§4](#4-the-quad-table)
-([`locate_component_run`](../core/src/store/indexes/file.rs#L56)): a
+([`locate_component_run`](../core/src/store/indexes/file.rs#L58)): a
 located run of at most `POINT_GATHER_MAX_ROWS` rows is point-read, a wider
 one is read as a scan of exactly that row range. A run the probes cannot
 locate — a string-keyed child under the other layouts — is answered by a
@@ -594,7 +594,7 @@ its layout:
 | — | the source's `selection` and `deleted`, and the base's `serve` — a view's restrictions ([matching.md §1](matching.md#1-what-a-match-produces)) |
 
 A file-backed store (its source's `Backend::File`, a
-[`FileBase`](../core/src/store/view/mod.rs#L100)) holds none of the rows: the
+[`FileBase`](../core/src/store/view/mod.rs#L102)) holds none of the rows: the
 file handle, a pushed-down filter and an optional serve plan, beside the
 source's selection and tombstones. Its index data stays in the index children
 and is reached by chunk probes and pushed-down scans; a `FileBase`

@@ -87,9 +87,11 @@ pub(crate) struct MemoryBase {
     /// shared by every view of this base; empty when the base has none.
     pub(crate) zones: Arc<ZoneTable>,
     /// The index's plan for reading this view's rows from the index's own
-    /// columns ([`InMemoryServePlan`]). Present only while the selection is
-    /// exactly the plan's run: any narrowing drops it, materializing a
-    /// pending selection first (see [`ViewSelection`]).
+    /// columns ([`InMemoryServePlan`]), in its order. A match keeps it only
+    /// when its resolution is the view's sole restriction; a window, keep,
+    /// partition or chained match of a served view narrows it (its range, or
+    /// the rows it kept), the selection staying pending beside it (see
+    /// [`ViewSelection`]).
     pub(crate) serve: Option<InMemoryServePlan>,
 }
 
@@ -109,9 +111,12 @@ pub(crate) struct FileBase {
     /// left it ([`FileFilter`]).
     pub(crate) filter: FileFilter,
     /// The index's plan for reading this view's rows from the index's own
-    /// columns ([`FileServePlan`]). Present only while the selection is
-    /// exactly the plan's run: any narrowing drops it, materializing a
-    /// pending selection first (see [`ViewSelection`]).
+    /// columns ([`FileServePlan`]), in its order. A match keeps it only
+    /// when its resolution is the view's sole restriction (the filter it
+    /// leaves beside the plan is a residual the plan's terms cover); a
+    /// window, keep, partition or chained match of a served view narrows it
+    /// (its located range, or the rows it kept), the selection staying
+    /// pending and the filter resolved beside it (see [`ViewSelection`]).
     pub(crate) serve: Option<FileServePlan>,
 }
 
@@ -333,8 +338,6 @@ impl QuadsSource {
         }
     }
 
-    /// The index component whose serve plan answers this view's reads, if
-    /// any.
     /// The order the view's base rows read in, when it is a known sort: a
     /// served view's, its plan's (`(p, o, s, g)` for an `index:posg` run with
     /// the object unbound, else base order; none over a file child whose
@@ -354,6 +357,8 @@ impl QuadsSource {
         }
     }
 
+    /// The index component whose serve plan answers this view's reads, if
+    /// any.
     pub(crate) fn served_component(&self) -> Option<&'static str> {
         match &self.backend {
             Backend::InMemory(memory) => memory.serve.as_ref().map(|plan| plan.component()),

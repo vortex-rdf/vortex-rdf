@@ -17,10 +17,11 @@
 //! A plan reproduces exactly the view's rows: the run the resolution's row
 //! ids name, or the part of it a window, keep, partition or chained match
 //! narrowed it to, so an operation that cannot honor it (materialization in
-//! base order) reads through the ids instead. The store keeps a plan
-//! only while the resolution is a view's sole restriction (see `MemoryBase`,
-//! `FileBase`). A plan is what lets the resolution defer the ids
-//! (`LazyRowIds`): reads through the plan never touch them.
+//! base order) reads through the ids instead. A match keeps the plan only
+//! while its resolution is the view's sole restriction; the narrowings of a
+//! served view keep it, narrowed (see `MemoryBase`, `FileBase`). A plan is
+//! what lets the resolution defer the ids (`LazyRowIds`): reads through the
+//! plan never touch them.
 
 use std::ops::Range;
 use std::sync::Arc;

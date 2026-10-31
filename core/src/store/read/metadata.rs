@@ -70,8 +70,10 @@ pub enum SelectionKind {
     Range,
     /// An explicit list of base rows: an index lookup or a mask scan.
     Ids,
-    /// An index run whose base row ids are not read yet (a served match);
-    /// reading the view materializes them.
+    /// An index run whose base row ids are not read yet: a served match, or
+    /// a window, keep, partition or chained match of one, whose reads take
+    /// its rows off the index. Reading such a view in base order, or reading
+    /// a view built only to be counted or windowed, materializes them.
     PendingIndexRun,
 }
 

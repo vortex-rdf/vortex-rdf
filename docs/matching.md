@@ -759,13 +759,13 @@ comparator makes the second column sorted inside each lead run). It returns:
   re-sorted only on demand) and **always a serve plan** over the matched run.
 
 **On file:** locates the run by binary-searching the child's cached chunk probes
-([`locate_component_run`](../core/src/store/indexes/file.rs#L56): lead,
+([`locate_component_run`](../core/src/store/indexes/file.rs#L58): lead,
 then a windowed second-key search), integers only. Then:
 
 | Located run | Row ids |
 |---|---|
 | empty | `IndexResolution::Empty` |
-| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/file.rs#L87) |
+| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/file.rs#L89) |
 | wider, or unlocated | **Lazy** — a deferred rid-only pushed-down scan |
 
 The serve plan is built from *every* bound non-subject component (p, o, **g**).
@@ -807,15 +807,15 @@ own rows out of the run before decoding them (the rows of one value are in row
 id order). Declines when the component is absent, unsorted, or
 probe-incompatible.
 
-**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L56)
+**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L58)
 binary-searches the value column's chunk probes (sorted child + integer probe
 required). A located run's ids are `Lazy`
-([`read_located_rids`](../core/src/store/indexes/file.rs#L152)): a count
+([`read_located_rids`](../core/src/store/indexes/file.rs#L154)): a count
 takes the run's width, a window reads only its own rows, and materialized, a
-run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/file.rs#L87)
+run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/file.rs#L89)
 and a wider one a rid-only scan restricted to the range — neither pays filter
 evaluation. Anything the probes decline falls back to
-[`scan_index_row_ids`](../core/src/store/indexes/file.rs#L118), an eager
+[`scan_index_row_ids`](../core/src/store/indexes/file.rs#L120), an eager
 pushed-down `val == probe` scan that answers whatever the order.
 
 **Example.** For the running example `index:ref-o` holds
@@ -850,9 +850,10 @@ longer list for each of the shorter's instead of merging the two.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L591) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::scan`](../core/src/store/indexes/file.rs#L765)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L591) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::scan`](../core/src/store/indexes/file.rs#L767)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
-| Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
+| Dropped at match time when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
+| Kept by | a window, keep, partition or chained match of the served view, narrowed ([§6.4](#64-keeping-or-dropping-the-serve-plan)) | the same, its residual filter resolved |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
 
 Both decode through the shared `ServeDecode` tail, reading the copy's
@@ -1043,7 +1044,7 @@ a one-shot read, `StreamedPlan` for a stream):
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else a range scan of the located run (`FileServePlan::scan`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries; on file, read it by id or scan it as `ExactRead` chooses (below) |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — under the Dictionary layout one `Arc<str>` per distinct term of a chunk, under the string layouts one per run of rows repeating a term, each read in place, handed to every row that holds it | the same gather or file read, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located run's width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L806)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
+| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L808)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
 | `row_chunks()` / `code_chunks()` | the plan's rows in the index's order, the ids never sorted: in memory gathered off the base at the run's ids, one window of ids per chunk; on file the index child's own chunks (the located range, the kept rows' positions, or the filtered scan) cut to the cap, except TypedObject's rows, taken from the base a window of ids at a time | the selection's rows in base row order: sliced or gathered in memory; on file read by id, by a pending filter's masks, or scanned |
 | `nquad_line_chunks()` (the N-Triples/N-Quads export) | as `quads()`, in the index's order, each chunk written as N-Quads lines | as `quads()`, in base row order, each chunk written as N-Quads lines: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
 
@@ -1077,7 +1078,7 @@ instead: filling costs it a few thousand instructions, more than the values
 so few rows skip. A window over such a filter
 ([§16.2](#162-window-size_capped-exists)), whether it keeps the filter's
 masks or resolves the filter into its matches' ids, keeps the filter's
-equalities ([`FileFilter`](../core/src/store/view/mod.rs#L124)): its reads
+equalities ([`FileFilter`](../core/src/store/view/mod.rs#L129)): its reads
 by id, one-shot or streamed, read only the free columns and fill the pinned
 ones in the same way, a point read only from 64 rows. `quads_vec` and `shared_quads_vec` read and decode a take or a
 projection split by split, spawning the split reads when there is more than
