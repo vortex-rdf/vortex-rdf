@@ -166,3 +166,48 @@ async fn chained_match_on_an_unnarrowed_view_is_unchanged() {
         );
     }
 }
+
+/// A window that keeps every row of its view's run but cuts the append tail
+/// is a narrowing like any other: a pattern chained on it is matched over
+/// the copy's columns and stays served, its rows in the index's order (the
+/// default graph's, every base row's, in `index:posg`'s (o, s) order).
+#[tokio::test]
+async fn chained_match_on_a_window_of_the_whole_run_stays_served() {
+    let (p2, default) = (iri("p2"), GraphName::DefaultGraph);
+    for (residency, _dir, store) in served_stores().await {
+        let want = matched_view(&store, None, Some(&p2), None, None)
+            .await
+            .quads_vec()
+            .await
+            .unwrap();
+        let tail: Vec<Quad> = (0..3)
+            .map(|k| {
+                make_quad(
+                    &format!("http://example.org/t{k}"),
+                    "http://example.org/p2",
+                    "tail",
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+        let store = store.add_quads(tail).await.unwrap();
+        let p = matched_view(&store, None, Some(&p2), None, None).await;
+        let whole_run = p.window(0, want.len()).await.unwrap();
+        assert_eq!(
+            whole_run.quads_vec().await.unwrap(),
+            want,
+            "{residency}: the run"
+        );
+        let chained = matched_view(&whole_run, None, None, None, Some(&default)).await;
+        assert_eq!(
+            served_component(&chained),
+            Some("index:posg"),
+            "{residency}: served"
+        );
+        assert_eq!(
+            chained.quads_vec().await.unwrap(),
+            want,
+            "{residency}: index order"
+        );
+    }
+}

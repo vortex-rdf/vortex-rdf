@@ -1,8 +1,7 @@
 //! Partitions: a view cut into views over disjoint, contiguous pieces of
 //! its rows that read, in turn, the view, for a consumer that reads them in
-//! parallel. A served view is cut in its index's order
-//! ([`served_partitions`](VortexRdfStore::served_partitions)); any other in
-//! base row order.
+//! parallel. A served view is cut in its index's order ([`served`](super::served));
+//! any other in base row order.
 
 use std::num::NonZeroUsize;
 
@@ -18,7 +17,7 @@ impl VortexRdfStore {
     /// windows of about equal live rows, as [`window`](Self::window) cuts
     /// one (on file an unlocated run is read once by row index first), the
     /// tail with the last: every partition keeps the view's
-    /// [`sort_order`](ViewStatistics::sort_order), the last only when the
+    /// [`sort_order`](crate::store::ViewStatistics::sort_order), the last only when the
     /// view reads no tail row. Any other view is cut in base row order: each
     /// keeps the view's pushed-down filter and tombstones and applies them to
     /// its own rows, its pieces about equal before filtering, not after; the

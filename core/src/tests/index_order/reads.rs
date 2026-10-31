@@ -16,17 +16,19 @@ use super::*;
 async fn streams_follow_index_order() {
     for (residency, _dir, store) in served_stores().await {
         let (p2, o3) = (iri("p2"), plain_literal("object 3"));
+        let o3_view = matched_view(&store, None, None, Some(&o3), None).await;
+        assert_eq!(
+            served_component(&o3_view),
+            Some("index:ospg"),
+            "{residency} ??o?"
+        );
         let mut views = vec![
             (
                 "?p2??",
                 matched_view(&store, None, Some(&p2), None, None).await,
                 true,
             ),
-            (
-                "??o?",
-                matched_view(&store, None, None, Some(&o3), None).await,
-                false,
-            ),
+            ("??o?", o3_view, false),
             (
                 "?po?",
                 matched_view(&store, None, Some(&p2), Some(&o3), None).await,

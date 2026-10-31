@@ -26,7 +26,7 @@ use crate::store::scan::residual::mask_for;
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection, window_rows};
 #[cfg(feature = "file-io")]
-use crate::store::{FileBase, SortOrder, read::chunks::extract_codes};
+use crate::store::{FileBase, read::chunks::extract_codes};
 use crate::store::{MemoryBase, QuadsSource, VortexRdfStore};
 
 /// A served view's plan beside its base, with the rows of the index it
@@ -405,14 +405,13 @@ impl<'a> Served<'a> {
     fn narrowed_file(&self, base: &FileBase, plan: &FileServePlan, cut: Cut) -> QuadsSource {
         let (span, ids) = match cut {
             Cut::Range { range, .. } => {
-                // The run's rids ascend where the index's order within it is
-                // base order.
-                let ascending = plan.read_order() == Some(SortOrder::Spog);
+                // A copy child's rids follow its own sort order, which nothing
+                // ties to base row order: they are not taken to ascend.
                 let ids = LazyRowIds::from_located_run(
                     Arc::clone(&base.file),
                     plan.child().clone(),
                     range.clone(),
-                    ascending,
+                    false,
                 );
                 (ServedSpan::Range(range), ids)
             }
@@ -497,7 +496,8 @@ impl VortexRdfStore {
 
     /// A view an in-memory plan serves cut into served windows, as
     /// [`served_partitions_of`](Self::served_partitions_of) cuts it; nothing
-    /// is awaited. `None` for a view no in-memory plan serves.
+    /// is awaited. `None` for a view no in-memory plan serves, or with no
+    /// live row.
     pub(in crate::store) fn served_partitions_in_memory(
         &self,
         n: usize,
@@ -505,12 +505,13 @@ impl VortexRdfStore {
         let Some((served, live)) = Served::in_memory_live(&self.quads)? else {
             return Ok(None);
         };
-        self.served_partitions_of(&served, live, n).map(Some)
+        self.served_partitions_of(&served, live, n)
     }
 
     /// A view a file plan serves cut into served windows, as
     /// [`served_partitions_of`](Self::served_partitions_of) cuts it, an
-    /// unlocated run located first. `None` for a view no file plan serves.
+    /// unlocated run located first. `None` for a view no file plan serves,
+    /// or with no live row.
     #[cfg(feature = "file-io")]
     pub(in crate::store) async fn served_partitions_file(
         &self,
@@ -519,23 +520,24 @@ impl VortexRdfStore {
         let Some((served, live)) = Served::file_live(&self.quads).await? else {
             return Ok(None);
         };
-        self.served_partitions_of(&served, live, n).map(Some)
+        self.served_partitions_of(&served, live, n)
     }
 
     /// A served view (`served`, its `live` rows) cut into at most `n` served
     /// windows of `ceil(rows / n)` of its live rows each, in its index's
     /// order, as [`served_window_of`](Self::served_window_of) cuts one, the
-    /// tail with the last. A view whose base holds no live row is its own one
-    /// partition.
+    /// tail with the last. `None` for a view whose base holds no live row,
+    /// which is cut as an unserved view is: there are no live rows to cut in
+    /// the index's order.
     fn served_partitions_of(
         &self,
         served: &Served<'_>,
         live: LiveRows,
         n: usize,
-    ) -> Result<Vec<Self>> {
+    ) -> Result<Option<Vec<Self>>> {
         let rows = live.len();
         if rows == 0 {
-            return Ok(vec![self.clone()]);
+            return Ok(None);
         }
         let live = served.holding_ids(live)?;
         let size = rows.div_ceil(n);
@@ -545,7 +547,7 @@ impl VortexRdfStore {
             let quads = served.narrowed(live.cut(start..(start + size).min(rows)))?;
             parts.push(self.derived(quads, self.partition_tail(i + 1 == count)));
         }
-        Ok(parts)
+        Ok(Some(parts))
     }
 
     /// [`keep`](Self::keep) of a served view, served too: the view's live

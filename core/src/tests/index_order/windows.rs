@@ -109,6 +109,34 @@ async fn partitions_concatenate_to_index_order() {
     }
 }
 
+/// A served view with no live row left (its run all tombstoned) is cut as
+/// an unserved one is: its selection's pieces, each reading nothing.
+#[tokio::test]
+async fn partitions_of_a_view_with_no_live_row_cut_as_unserved() {
+    let n = std::num::NonZeroUsize::new(4).unwrap();
+    for (residency, _dir, store) in served_stores().await {
+        let store = store
+            .delete_matching(None, Some(&iri("p2")), None, None)
+            .await
+            .unwrap();
+        let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+        assert!(served_component(&p).is_some(), "{residency}: served");
+        assert_eq!(p.size().await.unwrap(), 0, "{residency}");
+        let parts = p.partitions(n).await.unwrap();
+        let unserved = p
+            .debug_unserved()
+            .await
+            .unwrap()
+            .partitions(n)
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), unserved.len(), "{residency}");
+        for part in &parts {
+            assert_eq!(part.size().await.unwrap(), 0, "{residency}");
+        }
+    }
+}
+
 /// The probe API, as the bindings call it: a windowed probe of a served
 /// pattern is the index-order slice, and its count is the view's size. In
 /// memory and on file.

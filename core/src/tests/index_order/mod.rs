@@ -44,15 +44,25 @@ async fn file_store() -> (tempfile::TempDir, VortexRdfStore) {
     (dir, VortexRdfStore::from_file(&path).await.unwrap())
 }
 
-/// [`store_file`]'s Dictionary store in memory and on file, each beside its
-/// residency's name, for a case that runs over both. Keep each `TempDir`
-/// alive while its store is used.
-async fn served_stores() -> Vec<(&'static str, tempfile::TempDir, VortexRdfStore)> {
-    let (memory_dir, memory) = memory_store(LayoutStrategy::Dictionary).await;
+/// [`store_file`]'s Dictionary store three ways, each beside its name, for
+/// a case that runs over all of them: built in memory (its code columns
+/// resident, so a served read gathers the base at the view's ids), read into
+/// memory (its code columns encoded, so a served read takes the index's own
+/// columns) and read off its file. Keep each `TempDir` alive while its store
+/// is used.
+async fn served_stores() -> Vec<(&'static str, Option<tempfile::TempDir>, VortexRdfStore)> {
+    let built = built_store(
+        modular_quads(20_000, 7, 11),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let (read_dir, read) = memory_store(LayoutStrategy::Dictionary).await;
     let (file_dir, file) = file_store().await;
     vec![
-        ("in memory", memory_dir, memory),
-        ("on file", file_dir, file),
+        ("built in memory", None, built),
+        ("read into memory", Some(read_dir), read),
+        ("on file", Some(file_dir), file),
     ]
 }
 
