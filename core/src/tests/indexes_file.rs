@@ -136,15 +136,14 @@ async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
     // the component's chunk probes, with no row scan; an unlocated one scans
     // the child under the plan's filter.
     {
-        use crate::store::scan::file_scans::scan_hooks;
         let by_p = matched_view(&store, None, Some(&p1), None, None).await;
         assert_eq!(by_p.debug_serve_row_range().is_some(), located);
-        let scans = scan_hooks::scans();
+        let rec = Recorder::start();
         assert_eq!(
             view_strings(&by_p).await,
             expected_strings(&quads, |i| i % 3 == 1)
         );
-        assert_eq!(scan_hooks::scans() > scans, !located, "{layout:?}");
+        assert_eq!(rec.count(&Event::RowScan) > 0, !located, "{layout:?}");
     }
 
     run_copy_index_serving_script(
@@ -328,8 +327,6 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
 /// wherever it sits in the child; a wider one by a scan of the run.
 #[tokio::test]
 async fn test_copy_index_file_serves_code_columns_from_the_run() {
-    use crate::store::scan::file_scans::scan_hooks;
-
     let p1 = iri("p1");
     let o1 = plain_literal("o1");
     let o2 = plain_literal("o2");
@@ -368,10 +365,10 @@ async fn test_copy_index_file_serves_code_columns_from_the_run() {
                     rows == 9_000 || o.is_none(),
                     "{rows} {p:?} {o:?}: only a run past the cap defers its ids"
                 );
-                let scans = scan_hooks::scans();
+                let rec = Recorder::start();
                 let strings = view_strings(&served).await;
                 assert_eq!(
-                    scan_hooks::scans() - scans,
+                    rec.count(&Event::RowScan),
                     usize::from(pending),
                     "{rows} {p:?} {o:?}: a run within the cap is served without a scan"
                 );
@@ -1462,8 +1459,6 @@ async fn test_reference_index_counts_with_named_graphs() {
 /// dictionary. The rows are the in-memory store's, tombstoned rows dropped.
 #[tokio::test]
 async fn test_reference_index_file_takes_sparse_ids() {
-    use crate::store::scan::{file_reads::take_hooks, file_scans::scan_hooks};
-
     /// `view`'s N-Quads export, as sorted lines.
     async fn export_lines(view: &VortexRdfStore) -> Vec<String> {
         let mut out = Vec::new();
@@ -1500,8 +1495,7 @@ async fn test_reference_index_file_takes_sparse_ids() {
             assert_eq!(want_lines.len(), rows, "{layout:?} {rows}");
             for read in ["quads_vec", "quads", "export"] {
                 let label = format!("{layout:?} {rows} {read}");
-                let (chunks, splits) = take_hooks::takes();
-                let scans = scan_hooks::scans();
+                let rec = Recorder::start();
                 let (got, expected) = match read {
                     "quads_vec" => (view_strings(&matched).await, &want),
                     "quads" => {
@@ -1510,18 +1504,15 @@ async fn test_reference_index_file_takes_sparse_ids() {
                     }
                     _ => (export_lines(&matched).await, &want_lines),
                 };
-                let (chunks_after, splits_after) = take_hooks::takes();
+                let takes = |through_chunks| rec.count(&Event::Take { through_chunks });
                 if through_chunks {
-                    assert!(
-                        chunks_after > chunks,
-                        "{label}: taken through the chunk probes"
-                    );
-                    assert_eq!(splits_after, splits, "{label}");
+                    assert!(takes(true) > 0, "{label}: taken through the chunk probes");
+                    assert_eq!(takes(false), 0, "{label}");
                 } else {
-                    assert!(splits_after > splits, "{label}: taken split by split");
-                    assert_eq!(chunks_after, chunks, "{label}");
+                    assert!(takes(false) > 0, "{label}: taken split by split");
+                    assert_eq!(takes(true), 0, "{label}");
                 }
-                assert_eq!(scan_hooks::scans(), scans, "{label}: no row scan");
+                assert_eq!(rec.count(&Event::RowScan), 0, "{label}: no row scan");
                 assert_eq!(&got, expected, "{label}");
             }
             let label = format!("{layout:?} {rows}");

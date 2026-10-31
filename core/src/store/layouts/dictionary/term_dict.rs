@@ -569,8 +569,8 @@ pub(super) fn split_verdicts(
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage::scratch_hooks;
     use super::*;
+    use crate::observe::{Event, Recorder};
     use vortex_array::arrays::VarBinViewArray;
 
     /// A batch lookup answers as the lookups one at a time, duplicates,
@@ -599,11 +599,11 @@ mod tests {
             "<http://example.org/a>",
             terms[1023].as_str(),
         ]);
-        let fresh = scratch_hooks::fresh();
+        let mut rec = Recorder::start();
         let codes = dict.encode_many(&batch).unwrap();
         // The absent terms are spelled canonically already: none takes a
         // second lookup.
-        assert_eq!(scratch_hooks::fresh() - fresh, 1);
+        assert_eq!(rec.take_count(&Event::ScratchGrown { fresh: true }), 1);
         let one_at_a_time: Vec<_> = batch.iter().map(|t| dict.encode(t).unwrap()).collect();
         assert_eq!(codes, one_at_a_time);
         // Each search runs only past the one before. Terms two apart gallop:
@@ -611,20 +611,22 @@ mod tests {
         // apart gallop too, about 2 log2(16) probes each and an equality
         // read. Terms 128 apart, too few to gallop, bisect what is left of
         // the dictionary, never more than one search of it.
-        let probes = |batch: &[&str]| {
-            let reads = scratch_hooks::reads();
+        let mut probes = |batch: &[&str]| {
+            rec.take();
             dict.encode_many(batch).unwrap();
-            scratch_hooks::reads() - reads
+            rec.take_count(&Event::ScratchRead)
         };
         let every = |step: usize| -> Vec<&str> {
             (0..1024).step_by(step).map(|i| terms[i].as_str()).collect()
         };
         let dense = every(2);
-        let reads = scratch_hooks::reads();
-        for term in &dense {
-            dict.encode_exact(term);
-        }
-        let single = scratch_hooks::reads() - reads;
+        let single = {
+            let rec = Recorder::start();
+            for term in &dense {
+                dict.encode_exact(term);
+            }
+            rec.count(&Event::ScratchRead)
+        };
         let batched = probes(&dense);
         assert!(
             batched * 2 < single,
@@ -670,16 +672,15 @@ mod tests {
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let dict = TermDictionary::compress_windowed(plain, 32).unwrap();
         assert_eq!(dict.term_chunks().len(), 32, "32 windows");
+        let mut rec = Recorder::start();
+        let mut fresh = || rec.take_count(&Event::ScratchGrown { fresh: true });
         for (i, term) in terms.iter().enumerate() {
-            let fresh = scratch_hooks::fresh();
             assert_eq!(dict.encode_exact(term), Some(i as TermCode));
-            assert_eq!(scratch_hooks::fresh() - fresh, 1, "encode {i}");
-            let fresh = scratch_hooks::fresh();
+            assert_eq!(fresh(), 1, "encode {i}");
             assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
-            assert_eq!(scratch_hooks::fresh() - fresh, 1, "lower_bound {i}");
-            let fresh = scratch_hooks::fresh();
+            assert_eq!(fresh(), 1, "lower_bound {i}");
             assert_eq!(dict.decode(i as TermCode).as_deref(), Some(term.as_str()));
-            assert_eq!(scratch_hooks::fresh() - fresh, 1, "decode {i}");
+            assert_eq!(fresh(), 1, "decode {i}");
         }
     }
 
@@ -697,11 +698,11 @@ mod tests {
         let dict = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
         let chunks = dict.term_chunks();
         assert!(chunks.len() == 1 && chunks[0].is::<vortex_fsst::FSST>());
-        let regrown = scratch_hooks::regrown();
+        let rec = Recorder::start();
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(dict.encode_exact(term), Some(i as TermCode));
             assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
         }
-        assert_eq!(scratch_hooks::regrown(), regrown);
+        assert_eq!(rec.count(&Event::ScratchGrown { fresh: false }), 0);
     }
 }

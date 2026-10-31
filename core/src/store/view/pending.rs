@@ -20,6 +20,7 @@ use vortex_mask::Mask;
 
 use crate::error::Result;
 use crate::io::zone_map::ZONE_ROWS;
+use crate::observe::observe;
 use crate::store::MemoryBase;
 use crate::store::scan::residual::residual_rows;
 use crate::store::schema::RowId;
@@ -97,8 +98,7 @@ impl PendingResidual {
         selection: RowSelection,
         eqs: Vec<(&'static str, Scalar)>,
     ) -> Self {
-        #[cfg(test)]
-        residual_hooks::note_deferred();
+        observe!(ResidualDeferred);
         Self {
             memory,
             selection,
@@ -192,8 +192,7 @@ impl PendingResidual {
         };
         while start < total && live < want {
             let end = start.saturating_add(piece).min(total);
-            #[cfg(test)]
-            residual_hooks::note_piece(end - start);
+            observe!(ResidualPiece(end - start));
             let matched = residual_rows(&self.memory, rows_at(&rows, start..end), &self.eqs, None)?;
             let found = ids.len();
             match matched.as_rows(base_len) {
@@ -231,38 +230,5 @@ fn count_live(ids: &[RowId], deleted: Option<&Mask>) -> usize {
             .iter()
             .filter(|&&id| !deleted.value(id as usize))
             .count(),
-    }
-}
-
-/// Test hook: the compares this thread left pending, and the rows of each
-/// piece it compared, in order.
-#[cfg(test)]
-pub(crate) mod residual_hooks {
-    use std::cell::{Cell, RefCell};
-
-    thread_local! {
-        static DEFERRED: Cell<usize> = const { Cell::new(0) };
-        static PIECES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Record one compare left pending.
-    pub(super) fn note_deferred() {
-        DEFERRED.set(DEFERRED.get() + 1);
-    }
-
-    /// Record one piece of `rows` rows compared.
-    pub(super) fn note_piece(rows: usize) {
-        PIECES.with_borrow_mut(|pieces| pieces.push(rows));
-    }
-
-    /// The compares left pending on this thread so far.
-    pub(crate) fn deferred() -> usize {
-        DEFERRED.get()
-    }
-
-    /// The rows of each piece compared on this thread since the last call,
-    /// in order.
-    pub(crate) fn take_pieces() -> Vec<usize> {
-        PIECES.with_borrow_mut(std::mem::take)
     }
 }

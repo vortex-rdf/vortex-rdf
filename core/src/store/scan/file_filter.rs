@@ -19,6 +19,7 @@ use vortex_scan::selection::Selection;
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{available_parallelism, spawned_splits};
 use crate::io::zone_map::ZONE_ROWS;
+use crate::observe::observe;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::NativeStoreFile;
@@ -281,8 +282,7 @@ fn filter_split_tasks(
             let order = Arc::clone(&order);
             let start_mask = split_start_mask(mask_selection, deleted, &range);
             async move {
-                #[cfg(test)]
-                split_hooks::note_evaluated();
+                observe!(SplitEvaluated);
                 let mask = evaluate_filter_split(reader, &order, &range, start_mask).await?;
                 Ok::<_, VortexRdfError>((mask, range))
             }
@@ -480,8 +480,7 @@ where
     let mut split_of = split_of.into_iter();
     while let Some(r) = results.next().await {
         let (mask, range) = r?;
-        #[cfg(test)]
-        split_hooks::note_consumed(&range);
+        observe!(SplitConsumed(range.clone()));
         let split = split_of.next().expect("one split index per task");
         if !step(mask, &range, split) {
             break;
@@ -753,49 +752,6 @@ pub(crate) async fn row_range_from_pruning(
     };
     file.memoize_pruning_envelope(filter.clone(), envelope.clone());
     Ok(envelope)
-}
-
-/// Test hook: how many split filter evaluations this thread started (a split
-/// task's body, a spawned one's included, since the current-thread runtime
-/// polls it here), and how many split masks the in-order fold handed its
-/// consumer, with the ranges of the last ones it handed.
-#[cfg(test)]
-pub(crate) mod split_hooks {
-    use std::cell::{Cell, RefCell};
-    use std::ops::Range;
-
-    thread_local! {
-        static EVALUATED: Cell<usize> = const { Cell::new(0) };
-        static CONSUMED: Cell<usize> = const { Cell::new(0) };
-        static CONSUMED_RANGES: RefCell<Vec<Range<u64>>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Record one split evaluation started.
-    pub(super) fn note_evaluated() {
-        EVALUATED.set(EVALUATED.get() + 1);
-    }
-
-    /// Record one split mask the in-order fold consumed, of `range`.
-    pub(super) fn note_consumed(range: &Range<u64>) {
-        CONSUMED.set(CONSUMED.get() + 1);
-        CONSUMED_RANGES.with_borrow_mut(|ranges| ranges.push(range.clone()));
-    }
-
-    /// The split evaluations started on this thread so far.
-    pub(crate) fn evaluated() -> usize {
-        EVALUATED.get()
-    }
-
-    /// The split masks the in-order fold consumed on this thread so far.
-    pub(crate) fn consumed() -> usize {
-        CONSUMED.get()
-    }
-
-    /// The ranges of the split masks the in-order fold consumed on this
-    /// thread since the last call, in order.
-    pub(crate) fn take_consumed_ranges() -> Vec<Range<u64>> {
-        CONSUMED_RANGES.with_borrow_mut(std::mem::take)
-    }
 }
 
 #[cfg(test)]

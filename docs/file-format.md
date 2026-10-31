@@ -163,7 +163,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L126)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
-| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L63) |
+| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L64) |
 | `version` | the implementation's version, positive; a dictionary or index child above the version a reader reads (`DICT_VERSION`, `INDEX_VERSION`) fails the open ([§3](#3-the-store-root-vortex-rdfstorev2)) |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
 | `sorted` | the writer's provenance that the sort-key columns are *globally* sorted — a reader may binary-search the child only when this is set; absent means false |
@@ -269,13 +269,13 @@ the dtype alone decides the layout ([§4](#4-the-quad-table)).
 | `implementation` / `version` | `sorted-terms-fsst-v1` / 2 ([`DICT_VERSION`](../core/src/io/container/mod.rs#L47)); version 1, without zone maps, is read the same way, and a higher version is refused at open |
 | `required` / `sorted` | `true` / `true` |
 | `bracketed_iris` | `true` when every IRI the writer wrote is spelled `<`, its text, `>` (always, from RDF this crate parsed; a term built by hand, as a `RawQuad`'s, may not be): a `STR()` prefix over the IRIs is then the code range of `<` and the prefix ([matching.md §16.4](matching.md#164-predicates-and-the-dictionary-handle)) |
-| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage/mod.rs#L30): non-nullable `Utf8` |
+| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage/mod.rs#L31): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
 | size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage/mod.rs#L221)), not of the format |
 
 The column is FSST-compressed **at the source**, in independent windows of
-65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36))
+65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L37))
 that share one symbol table trained on the whole column. The child is written
 through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L290)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
@@ -367,7 +367,7 @@ Shared rules:
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L75)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L76)).
 - **A bound graph is never a key an index is searched by** (it is the last
   key of both copy orders, and a `{val, rid}` child holds none), and neither
   index answers a bound-subject pattern — the sorted quad table is the better
@@ -388,7 +388,7 @@ row ids.
 On a file-backed store an index child is never lifted into memory. Under the
 `Dictionary` layout its run is located by binary-searching the child's
 encoded chunks through the chunk probes of [§4](#4-the-quad-table)
-([`locate_component_run`](../core/src/store/indexes/file.rs#L47)): a
+([`locate_component_run`](../core/src/store/indexes/file.rs#L48)): a
 located run of at most `POINT_GATHER_MAX_ROWS` rows is point-read, a wider
 one is read as a scan of exactly that row range. A run the probes cannot
 locate — a string-keyed child under the other layouts — is answered by a
@@ -518,7 +518,7 @@ A row scan — the reads that
 materialize a view's rows: serialization and the `from_file_in_memory` load, a
 compaction's gather, and the one-shot reads (`code_columns_gathered`,
 `quads_vec`, `shared_quads_vec`) the reads by id decline — filters and decodes
-per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L64)
+per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L65)
 (42) splits runs inline, a larger one is spawned across the runtime's workers.
 Without a Tokio runtime these scans run inline. A one-shot read under a
 pending filter of code equalities over columns with chunk probes evaluates
@@ -545,11 +545,11 @@ gain it no parallelism.
 
 **Kernels.** The store's Vortex session adds fused executions of its own for
 cases Vortex 0.90 runs the slow way, registered before the default encodings
-register theirs ([`register`](../core/src/kernels.rs#L31)), so that each is
+register theirs ([`register`](../core/src/kernels.rs#L32)), so that each is
 tried first and declines whatever Vortex's own kernel does as well. A
 comparison against a constant of a slice of a bit-packed leaf with patches
 slices the leaf, patches and all, and compares it packed
-([`CompareSlicedPatches`](../core/src/kernels.rs#L51)): Vortex cannot slice
+([`CompareSlicedPatches`](../core/src/kernels.rs#L52)): Vortex cannot slice
 such a leaf without reading its patches, so it leaves the slice lazy and then
 decodes it to compare it value by value. A leaf is sliced whenever a filter
 evaluates part of it (a zone-pruned range, a split that cuts it, an
@@ -558,7 +558,7 @@ of its codes pass a power of two: the object column, whose codes start at 0,
 under an `O` or `PO` match. A filter of a run-end leaf that keeps a row in
 ten runs or more, and 25 rows or more, counts each run's kept rows as the
 rank of its end in the mask, one pass over the mask's words
-([`RunEndFilter`](../core/src/kernels.rs#L118)): Vortex counts each run's
+([`RunEndFilter`](../core/src/kernels.rs#L119)): Vortex counts each run's
 range of the mask on its own, some 30 instructions a run, which is most of
 filtering a sorted file's subject column under a dense pattern's masks.
 Vortex's own kernel keeps the sparser filters, which it answers by taking
@@ -656,17 +656,17 @@ open rather than being read around.
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L16) |
 | row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ZONE_ROWS`](../core/src/io/zone_map.rs#L22) |
 | data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L112), [`child_strategy`](../core/src/io/container/sources.rs#L153) |
-| `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs#L36) |
+| `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs#L37) |
 | `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, and a chunk decode hold in place, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L47) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L51) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes, each run of consecutive rows in one pass (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L615) |
-| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L23) |
-| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L34) |
-| `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L29) |
+| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L24) |
+| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L35) |
+| `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L30) |
 | `PIN_POINT_MIN_ROWS` | 64 rows — a point read of rows that passed a filter of code equalities (the rows its masks keep, the ids a window resolved it into) leaves out the columns the filter pins, as a take or a projection always does, only from this many rows ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_exprs.rs`](../core/src/store/scan/file_exprs.rs#L86) |
-| `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scans.rs`](../core/src/store/scan/file_scans.rs#L64) |
+| `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scans.rs`](../core/src/store/scan/file_scans.rs#L65) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: an emitted chunk's size, an index child chunk's size and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L46) |
 | `DEFAULT_RUN_ROWS` | 1,048,576 entries per out-of-core spill run: quads per quad run, entries per index-family run (whose `u32` row offsets this bounds) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L54) |
 

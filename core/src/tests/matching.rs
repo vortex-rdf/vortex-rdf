@@ -153,8 +153,6 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
 /// no row id is decoded.
 #[tokio::test]
 async fn test_subject_range_then_index_routing_above_gate() {
-    use crate::store::test_hooks::decoded_rids;
-
     let quads = above_gate_quads();
     let store = built_store(
         quads.clone(),
@@ -167,9 +165,9 @@ async fn test_subject_range_then_index_routing_above_gate() {
     let o5 = plain_literal("o5");
     for (subject, rids) in [("s0", 4), ("s1", 0)] {
         let s = iri_subject(subject);
-        let before = decoded_rids();
+        let rec = Recorder::start();
         let matched = matched_view(&store, Some(&s), None, Some(&o5), None).await;
-        assert_eq!(decoded_rids() - before, rids, "{subject}");
+        assert_eq!(rids_decoded(&rec), rids, "{subject}");
         assert_eq!(
             view_strings(&matched).await,
             expected_strings(&quads, |i| quads[i].subject == s && quads[i].object == o5),
@@ -418,7 +416,6 @@ async fn test_derived_view_does_not_lose_base_rows() {
 /// cached probe, and `p` is read at its rows through the base's.
 #[tokio::test]
 async fn test_in_memory_residual_reads_through_the_store_probes() {
-    use crate::store::scan::typed_eq::probe_hooks;
     let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
     let (_dir, path) = write_store_file(
         quads.clone(),
@@ -430,13 +427,12 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
     let p1 = iri("p1");
     let o2 = plain_literal("o2");
     for _ in 0..2 {
-        let (cached, resolved) = probe_hooks::binds();
+        let rec = Recorder::start();
         let matched = matched_view(&store, None, Some(&p1), Some(&o2), None).await;
-        let (cached_after, resolved_after) = probe_hooks::binds();
-        assert_eq!(resolved_after, resolved, "no probe is resolved per match");
+        let (cached, resolved) = probe_binds(&rec);
+        assert_eq!(resolved, 0, "no probe is resolved per match");
         assert_eq!(
-            cached_after,
-            cached + 2,
+            cached, 2,
             "`o`'s run is searched, and `p` read, through the store's probes"
         );
         assert_eq!(
@@ -507,8 +503,6 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
 /// then provably empty, and the terms after it are never searched for.
 #[tokio::test]
 async fn test_match_prelude_stops_at_the_first_absent_term() {
-    use crate::store::layouts::resolve_hooks;
-
     let quads = modular_quads(30, 3, 4);
     let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let (s, p, o) = (&quads[1].subject, &quads[1].predicate, &quads[1].object);
@@ -522,11 +516,11 @@ async fn test_match_prelude_stops_at_the_first_absent_term() {
         ((s, p, &absent_o), 3, 0),
     ] {
         let (s, p, o) = pattern;
-        let before = resolve_hooks::resolved();
+        let rec = Recorder::start();
         assert_eq!(
             matched_size(&store, Some(s), Some(p), Some(o), None).await,
             rows
         );
-        assert_eq!(resolve_hooks::resolved() - before, lookups, "{s} {p} {o}");
+        assert_eq!(rec.count(&Event::TermResolved), lookups, "{s} {p} {o}");
     }
 }

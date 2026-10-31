@@ -30,6 +30,7 @@ use vortex_mask::Mask;
 use super::deferred;
 use super::rows::{gather_codes, gather_column};
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
@@ -162,8 +163,7 @@ impl VortexRdfStore {
                         .collect();
                     let rows = run.len();
                     stream::iter((0..rows).step_by(batch_rows).map(move |start| {
-                        #[cfg(test)]
-                        run_hooks::note();
+                        observe!(RunCut);
                         let end = start.saturating_add(batch_rows).min(rows);
                         Ok(picked.iter().map(|b| b.slice(start..end)).collect())
                     }))
@@ -172,8 +172,7 @@ impl VortexRdfStore {
                 MemoryRows::Windows(windows) => {
                     let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
                     stream::iter(windows.map(move |ids| {
-                        #[cfg(test)]
-                        gather_hooks::note();
+                        observe!(Gather { width: None });
                         Ok(match &all {
                             // Every column asked for: the four gathered in
                             // one pass.
@@ -212,18 +211,11 @@ impl VortexRdfStore {
         {
             // Only the columns asked for are gathered.
             let base = projected(&memory.base, columns)?;
-            #[cfg(test)]
-            let width = base
-                .dtype()
-                .as_struct_fields_opt()
-                .map_or(0, |f| f.nfields());
             let probes = Arc::clone(&memory.probes);
             return Ok(stream::iter(windows.map(move |ids| {
-                #[cfg(test)]
-                {
-                    gather_hooks::note();
-                    gather_hooks::note_width(width);
-                }
+                observe!(Gather {
+                    width: base.dtype().as_struct_fields_opt().map(|f| f.nfields())
+                });
                 gather_live(&base, &RowSelection::Ids(ids), None, Some(&probes))
             }))
             .boxed());
@@ -441,57 +433,4 @@ pub(in crate::store) fn extract_codes(
             Ok(field_as::<PrimitiveArray>(&struct_arr, name, &mut ctx)?.into_buffer::<TermCode>())
         })
         .collect()
-}
-
-/// Test hook: how many windows of live ids this thread's chunk streams
-/// gathered from an in-memory base, one per pulled chunk.
-#[cfg(test)]
-pub(crate) mod gather_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static GATHERS: Cell<usize> = const { Cell::new(0) };
-        static WIDTH: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one window gathered.
-    pub(crate) fn note() {
-        GATHERS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The windows gathered on this thread so far.
-    pub(crate) fn gathers() -> usize {
-        GATHERS.with(Cell::get)
-    }
-
-    /// Record the columns a window gathered from the base itself read.
-    pub(crate) fn note_width(columns: usize) {
-        WIDTH.set(columns);
-    }
-
-    /// The columns the last window gathered from the base itself read.
-    pub(crate) fn last_width() -> usize {
-        WIDTH.get()
-    }
-}
-
-/// Test hook: how many chunks this thread's code-chunk streams cut from an
-/// in-memory run's columns, one per cut.
-#[cfg(test)]
-pub(crate) mod run_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static CUTS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one chunk cut.
-    pub(crate) fn note() {
-        CUTS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The chunks cut on this thread so far.
-    pub(crate) fn cuts() -> usize {
-        CUTS.with(Cell::get)
-    }
 }

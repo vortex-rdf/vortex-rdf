@@ -11,6 +11,8 @@ use vortex_error::VortexResult;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 
 use crate::error::{Result, VortexRdfError};
+#[cfg(feature = "file-io")]
+use crate::observe::observe;
 use crate::store::array::chunked_or_single;
 
 /// The host's available parallelism, read once; 1 where the target cannot
@@ -103,8 +105,7 @@ where
     let handle = crate::session::VORTEX_SESSION.handle();
     futures::stream::iter(tasks)
         .map(move |task| {
-            #[cfg(test)]
-            spawn_probe::note();
+            observe!(SplitSpawned);
             handle.spawn(task)
         })
         .buffered(window)
@@ -124,27 +125,6 @@ where
     F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
 {
     chunked_or_single(drain_chunks(spawned_splits(tasks, window)).await?, dtype)
-}
-
-/// Test hook: the number of split futures [`spawned_splits`] has spawned on
-/// this thread. Zero means a scan ran inline.
-#[cfg(test)]
-pub(crate) mod spawn_probe {
-    use std::cell::Cell;
-
-    thread_local! {
-        static SPAWNED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Count one spawned split.
-    pub(super) fn note() {
-        SPAWNED.set(SPAWNED.get() + 1);
-    }
-
-    /// The splits spawned on this thread since the last call.
-    pub(crate) fn take() -> usize {
-        SPAWNED.take()
-    }
 }
 
 /// Materialize a whole layout reader (a file's root, or one of the store
@@ -225,6 +205,7 @@ pub(crate) fn open_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observe::{Event, Recorder};
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_array::{IntoArray as _, VortexSessionExecute as _};
@@ -247,12 +228,12 @@ mod tests {
             })
             .collect();
         let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        spawn_probe::take();
+        let mut spawned = Recorder::start();
         let array = collect_scan_spawned(dtype, tasks, splits as usize)
             .await
             .unwrap();
         assert_eq!(
-            spawn_probe::take(),
+            spawned.take_count(&Event::SplitSpawned),
             splits as usize,
             "every split ran spawned, none inline"
         );
@@ -278,13 +259,13 @@ mod tests {
             })
             .collect();
         let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        spawn_probe::take();
+        let mut spawned = Recorder::start();
         let error = collect_scan_spawned(dtype, tasks, splits as usize)
             .await
             .expect_err("the failing split fails the scan");
         assert!(error.to_string().contains("split 2 failed"), "{error}");
         assert_eq!(
-            spawn_probe::take(),
+            spawned.take_count(&Event::SplitSpawned),
             splits as usize,
             "every split ran spawned, none inline"
         );
@@ -307,7 +288,7 @@ mod tests {
             })
             .collect();
         let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        spawn_probe::take();
+        let mut spawned = Recorder::start();
         let outcome =
             std::panic::AssertUnwindSafe(collect_scan_spawned(dtype, tasks, splits as usize))
                 .catch_unwind()
@@ -321,7 +302,7 @@ mod tests {
             .unwrap_or_default();
         assert!(message.contains("split 2 panicked"), "{message}");
         assert_eq!(
-            spawn_probe::take(),
+            spawned.take_count(&Event::SplitSpawned),
             splits as usize,
             "every split ran spawned, none inline"
         );
@@ -358,7 +339,7 @@ mod tests {
             })
             .collect();
         let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        spawn_probe::take();
+        let mut spawned = Recorder::start();
 
         tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -372,7 +353,7 @@ mod tests {
             splits,
             "the splits were running"
         );
-        assert_eq!(spawn_probe::take(), splits);
+        assert_eq!(spawned.take_count(&Event::SplitSpawned), splits);
         for _ in 0..100 {
             if dropped.load(Ordering::SeqCst) == splits {
                 break;

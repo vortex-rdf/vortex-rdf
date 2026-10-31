@@ -9,7 +9,16 @@
 
 use super::*;
 use crate::io::zone_map::ZONE_ROWS;
-use crate::store::view::pending::{FIRST_PIECE_ROWS, residual_hooks};
+use crate::store::view::pending::FIRST_PIECE_ROWS;
+
+/// The rows of each piece of a pending residual `rec` saw compared since its
+/// last take, in order.
+fn pieces(rec: &mut Recorder) -> Vec<usize> {
+    rec.take_picked(|e| match e {
+        Event::ResidualPiece(rows) => Some(*rows),
+        _ => None,
+    })
+}
 
 /// The rows of [`residual_quads`]: three pieces, the last of a thousand rows.
 const ROWS: usize = 5 * ZONE_ROWS + 1_000;
@@ -74,27 +83,27 @@ async fn a_count_compares_only_the_pieces_its_limit_needs() {
     let two = (5 * FIRST_PIECE_ROWS).div_ceil(3);
     let p0 = probe(Some("p0"), None);
     for (label, store) in &stores {
-        let deferred = residual_hooks::deferred();
-        residual_hooks::take_pieces();
+        let deferred = Recorder::start();
+        let mut compared = Recorder::start();
         let count = |limit: usize| {
             let probe = p0.clone().window(0, Some(limit));
             async move { store.count_probe(&probe).await }
         };
         assert_eq!(count(1).await.unwrap(), 1, "{label}: ASK");
         assert_eq!(
-            residual_hooks::take_pieces(),
+            pieces(&mut compared),
             [FIRST_PIECE_ROWS],
             "{label}: ASK compares the first piece"
         );
         assert_eq!(count(first + 1).await.unwrap(), first + 1, "{label}");
         assert_eq!(
-            residual_hooks::take_pieces(),
+            pieces(&mut compared),
             [FIRST_PIECE_ROWS, 4 * FIRST_PIECE_ROWS],
             "{label}: one row past the first piece's compares the second"
         );
         assert_eq!(count(two + 1).await.unwrap(), two + 1, "{label}");
         assert_eq!(
-            residual_hooks::take_pieces(),
+            pieces(&mut compared),
             [FIRST_PIECE_ROWS, 4 * FIRST_PIECE_ROWS, 1_000],
             "{label}: one row past the second piece's compares the rest"
         );
@@ -104,12 +113,12 @@ async fn a_count_compares_only_the_pieces_its_limit_needs() {
         let want = (ROWS - 57).div_ceil(150);
         assert_eq!(store.count_probe(&p0_o7).await.unwrap(), want, "{label}");
         assert_eq!(
-            residual_hooks::take_pieces(),
+            pieces(&mut compared),
             [FIRST_PIECE_ROWS, 4 * FIRST_PIECE_ROWS, 1_000],
             "{label}: a limit the rows never reach compares every piece"
         );
         assert_eq!(
-            residual_hooks::deferred() - deferred,
+            deferred.count(&Event::ResidualDeferred),
             4,
             "{label}: every count left its compare pending"
         );
@@ -128,13 +137,13 @@ async fn a_window_compares_only_the_pieces_it_reaches() {
             .quads_vec()
             .await
             .unwrap();
-        residual_hooks::take_pieces();
+        let mut compared = Recorder::start();
         let page = store
             .run_probe(&p0.clone().window(10, Some(64)))
             .await
             .unwrap();
         assert_eq!(
-            residual_hooks::take_pieces(),
+            pieces(&mut compared),
             [FIRST_PIECE_ROWS],
             "{label}: a first page compares the first piece"
         );
@@ -256,11 +265,11 @@ async fn a_pending_compare_counts_only_live_rows() {
             .delete_matching(None, Some(&iri("p0")), Some(&plain_literal("o0")), None)
             .await
             .unwrap();
-        residual_hooks::take_pieces();
+        let mut compared = Recorder::start();
         let ask = p0_o0.clone().window(0, Some(1));
         assert_eq!(deleted.count_probe(&ask).await.unwrap(), 0, "{label}");
         assert_eq!(
-            residual_hooks::take_pieces(),
+            pieces(&mut compared),
             [FIRST_PIECE_ROWS, 4 * FIRST_PIECE_ROWS, 1_000],
             "{label}: no live row stops the count early"
         );
@@ -279,7 +288,7 @@ async fn a_count_or_window_reaching_every_row_compares_eagerly() {
     let p0 = probe(Some("p0"), None);
     let p0_rows = ROWS.div_ceil(3);
     for (label, store) in &stores {
-        let deferred = residual_hooks::deferred();
+        let deferred = Recorder::start();
         let count = |probe: Probe| async move { store.count_probe(&probe).await.unwrap() };
         assert_eq!(count(p0.clone()).await, p0_rows, "{label}: no limit");
         assert_eq!(
@@ -325,8 +334,8 @@ async fn a_count_or_window_reaching_every_row_compares_eagerly() {
             "{label}: a selection of one piece"
         );
         assert_eq!(
-            residual_hooks::deferred(),
-            deferred,
+            deferred.count(&Event::ResidualDeferred),
+            0,
             "{label}: no compare left pending"
         );
     }
@@ -358,14 +367,14 @@ async fn a_pending_compare_run_to_the_end_keeps_its_matches() {
             .await
             .unwrap();
         assert!(view.debug_pending_without_plan(), "{label}: pending");
-        residual_hooks::take_pieces();
+        let mut compared = Recorder::start();
         assert_eq!(
             view.size_capped(usize::MAX).await.unwrap(),
             eager.len(),
             "{label}: every live row"
         );
         assert_eq!(
-            residual_hooks::take_pieces(),
+            pieces(&mut compared),
             [ROWS],
             "{label}: a count of every row compares one piece"
         );
@@ -378,7 +387,7 @@ async fn a_pending_compare_run_to_the_end_keeps_its_matches() {
         let page = view.window(2, 3).await.unwrap();
         assert_eq!(page.quads_vec().await.unwrap(), eager[2..5], "{label}");
         assert!(
-            residual_hooks::take_pieces().is_empty(),
+            pieces(&mut compared).is_empty(),
             "{label}: the kept matches answer"
         );
     }

@@ -16,8 +16,6 @@ use super::*;
 /// that no read by id checks, the window keeps the matches' ids, not masks.
 #[tokio::test]
 async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
-    use crate::store::scan::file_filter::split_hooks;
-
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let tombstoned = masks_deleted(&store).await;
@@ -33,7 +31,7 @@ async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
                 .run_probe(&probe.clone().window(0, Some(n + 1)))
                 .await
                 .unwrap();
-            let evaluated = split_hooks::evaluated();
+            let rec = Recorder::start();
             let stats = windowed.view_statistics().unwrap();
             assert!(!stats.pending_filter, "{label}: no filter pending");
             assert_eq!(stats.rows, RowCountHint::exact(n), "{label}: exact rows");
@@ -45,8 +43,8 @@ async fn test_window_that_finds_it_cuts_nothing_keeps_the_view() {
             );
             assert_eq!(row_list(&windowed).await, rows, "{label}: the plain rows");
             assert_eq!(
-                split_hooks::evaluated(),
-                evaluated,
+                rec.count(&Event::SplitEvaluated),
+                0,
                 "{label}: no split evaluated again"
             );
         }
@@ -328,8 +326,6 @@ async fn test_kept_masks_never_outlive_a_derivation() {
 /// answers. A window that cuts only the tail keeps the masks.
 #[tokio::test]
 async fn test_window_of_a_kept_masks_view_cuts_its_masks() {
-    use crate::store::scan::file_filter::split_hooks;
-
     let (_dir, path) = masks_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
@@ -364,7 +360,7 @@ async fn test_window_of_a_kept_masks_view_cuts_its_masks() {
                 tail_only,
             ] {
                 let label = format!("{label} window({offset}, {limit})");
-                let evaluated = split_hooks::evaluated();
+                let rec = Recorder::start();
                 let cut = view.window(offset, limit).await.unwrap();
                 let twin_cut = twin.window(offset, limit).await.unwrap();
                 let want = twin_cut.quads_vec().await.unwrap();
@@ -376,8 +372,8 @@ async fn test_window_of_a_kept_masks_view_cuts_its_masks() {
                 );
                 assert_eq!(cut.size().await.unwrap(), want.len(), "{label}: size");
                 assert_eq!(
-                    split_hooks::evaluated(),
-                    evaluated,
+                    rec.count(&Event::SplitEvaluated),
+                    0,
                     "{label}: no split evaluated again"
                 );
                 if (offset, limit) == tail_only && kept < n {
@@ -398,8 +394,6 @@ async fn test_window_of_a_kept_masks_view_cuts_its_masks() {
 /// go unused. The window still reads the plain rows, known exactly.
 #[tokio::test]
 async fn test_masks_first_window_under_tombstones_counts_no_live_rows() {
-    use crate::store::view::selection::live_count_hooks;
-
     let quads = fixture_quads();
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let store = delete_all(
@@ -423,12 +417,12 @@ async fn test_masks_first_window_under_tombstones_counts_no_live_rows() {
         "{n} rows under a base of {}",
         quads.len()
     );
-    let counts = live_count_hooks::counts();
+    let rec = Recorder::start();
     let windowed = store
         .run_probe(&probe.window(0, Some(n + 1)))
         .await
         .unwrap();
-    assert_eq!(live_count_hooks::counts(), counts, "no live rows counted");
+    assert_eq!(rec.count(&Event::LiveCount), 0, "no live rows counted");
     let stats = windowed.view_statistics().unwrap();
     assert!(!stats.pending_filter, "the filter evaluated");
     assert_eq!(stats.rows, RowCountHint::exact(n), "exact rows");
@@ -437,32 +431,36 @@ async fn test_masks_first_window_under_tombstones_counts_no_live_rows() {
 
 // ─── The streams over a window that kept what it found ──────────────────
 
-/// The read hooks' counters on this thread: split masks evaluated, masked
-/// reads by kind, restricted scans built with a filter, row scans, and takes
-/// through the chunk probes.
-#[derive(Clone, Copy)]
-struct ReadCounters {
+/// What a run of file reads did, counted off the events a recorder saw:
+/// split masks evaluated, masked reads, restricted scans built with a
+/// filter, row scans, and takes through the chunk probes.
+#[derive(Default)]
+struct ReadCounts {
     evaluated: usize,
-    masked: [usize; 3],
+    masked: usize,
     filtered_scans: usize,
     scans: usize,
     takes: usize,
 }
 
-impl ReadCounters {
-    fn now() -> Self {
-        use crate::store::read::file_plan::restricted_scan_hooks;
-        use crate::store::scan::file_filter::split_hooks;
-        use crate::store::scan::{
-            file_reads::take_hooks, file_scans::scan_hooks, read_plan::masked_read_hooks,
-        };
-        Self {
-            evaluated: split_hooks::evaluated(),
-            masked: masked_read_hooks::reads(),
-            filtered_scans: restricted_scan_hooks::filtered(),
-            scans: scan_hooks::scans(),
-            takes: take_hooks::takes().0,
+impl ReadCounts {
+    /// The reads `rec` saw since its last take, after which it reads only
+    /// later ones.
+    fn taken(rec: &mut Recorder) -> Self {
+        let mut counts = Self::default();
+        for event in rec.take() {
+            match event {
+                Event::SplitEvaluated => counts.evaluated += 1,
+                Event::MaskedRead(_) => counts.masked += 1,
+                Event::FilteredScan => counts.filtered_scans += 1,
+                Event::RowScan => counts.scans += 1,
+                Event::Take {
+                    through_chunks: true,
+                } => counts.takes += 1,
+                _ => {}
+            }
         }
+        counts
     }
 }
 
@@ -497,29 +495,15 @@ async fn test_owned_copy_reads_the_filter_by_its_masks() {
         }
         for (state, view) in views {
             let label = format!("{shape} {state}");
-            let before = ReadCounters::now();
+            let mut rec = Recorder::start();
             let owned = view.owned().await.unwrap();
-            let after = ReadCounters::now();
-            let masked = |c: &ReadCounters| c.masked.iter().sum::<usize>();
-            assert_eq!(
-                masked(&after),
-                masked(&before) + 1,
-                "{label}: one masked read"
-            );
-            assert_eq!(
-                after.filtered_scans, before.filtered_scans,
-                "{label}: no scan with the filter"
-            );
+            let did = ReadCounts::taken(&mut rec);
+            assert_eq!(did.masked, 1, "{label}: one masked read");
+            assert_eq!(did.filtered_scans, 0, "{label}: no scan with the filter");
             if state == "kept" {
-                assert_eq!(
-                    after.evaluated, before.evaluated,
-                    "{label}: no split evaluated"
-                );
+                assert_eq!(did.evaluated, 0, "{label}: no split evaluated");
             } else {
-                assert!(
-                    after.evaluated > before.evaluated,
-                    "{label}: masks evaluated"
-                );
+                assert!(did.evaluated > 0, "{label}: masks evaluated");
             }
             assert_eq!(
                 owned.quads_vec().await.unwrap(),
@@ -531,30 +515,28 @@ async fn test_owned_copy_reads_the_filter_by_its_masks() {
 }
 
 /// Each of `view`'s streams drained in turn: `code_chunks` and `row_chunks`
-/// at 4,096 rows a chunk answer `codes`, and `quads()` answers `quads`. After each, `check` is handed the stream's name
-/// and the read counters from just before it.
+/// at 4,096 rows a chunk answer `codes`, and `quads()` answers `quads`.
+/// After each, `check` is handed the stream's name and what its reads did.
 async fn assert_streams_answer(
     view: &VortexRdfStore,
     codes: &[[TermCode; 4]],
     quads: &[Quad],
     label: &str,
-    check: impl Fn(&str, ReadCounters),
+    check: impl Fn(&str, ReadCounts),
 ) {
-    let before = ReadCounters::now();
+    let mut rec = Recorder::start();
     let (streamed, _) = collect_code_chunks(view, &QuadColumn::ALL, 4_096).await;
     assert_eq!(streamed, codes, "{label}: code_chunks");
-    check("code_chunks", before);
-    let before = ReadCounters::now();
+    check("code_chunks", ReadCounts::taken(&mut rec));
     assert_eq!(
         struct_chunk_codes(&collect_row_chunks(view, 4_096).await),
         codes,
         "{label}: row_chunks"
     );
-    check("row_chunks", before);
-    let before = ReadCounters::now();
+    check("row_chunks", ReadCounts::taken(&mut rec));
     let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
     assert_eq!(streamed, quads, "{label}: quads()");
-    check("quads()", before);
+    check("quads()", ReadCounts::taken(&mut rec));
 }
 
 /// The streams over a view whose window kept its filter's masks (`code_chunks`,
@@ -583,22 +565,14 @@ async fn test_stream_over_a_kept_masks_view_reads_its_ids() {
             .await
             .unwrap();
         assert_eq!(kept.debug_evaluated_len(), Some(n), "{shape}: kept masks");
-        // What a reader did since `before`.
-        let check = |reader: &str, before: ReadCounters| {
+        let check = |reader: &str, did: ReadCounts| {
             let label = format!("{shape} {reader}");
-            let after = ReadCounters::now();
-            assert_eq!(
-                after.evaluated, before.evaluated,
-                "{label}: no split evaluated"
-            );
-            assert_eq!(after.masked, before.masked, "{label}: no masked read");
-            assert_eq!(
-                after.filtered_scans, before.filtered_scans,
-                "{label}: no scan with the filter"
-            );
+            assert_eq!(did.evaluated, 0, "{label}: no split evaluated");
+            assert_eq!(did.masked, 0, "{label}: no masked read");
+            assert_eq!(did.filtered_scans, 0, "{label}: no scan with the filter");
             if read == MaskedRead::Take {
-                assert_eq!(after.scans, before.scans, "{label}: no row scan");
-                assert!(after.takes > before.takes, "{label}: the ids taken");
+                assert_eq!(did.scans, 0, "{label}: no row scan");
+                assert!(did.takes > 0, "{label}: the ids taken");
             }
         };
         assert_streams_answer(&kept, &codes, &quads, shape, check).await;
@@ -642,46 +616,35 @@ async fn test_fitting_window_over_a_masks_first_view_reads_ids() {
             let got = windowed.view_statistics().unwrap();
             assert!(!got.pending_filter, "{label}: evaluated");
             assert_eq!(got.rows, RowCountHint::exact(n), "{label}: exact rows");
-            let before = ReadCounters::now();
+            let mut rec = Recorder::start();
             assert_eq!(row_list(&windowed).await, codes, "{label}: the plain rows");
             assert_eq!(
                 windowed.quads_vec().await.unwrap(),
                 quads,
                 "{label}: the plain quads"
             );
-            let after = ReadCounters::now();
+            let did = ReadCounts::taken(&mut rec);
             assert_eq!(
-                after.evaluated, before.evaluated,
+                did.evaluated, 0,
                 "{label}: one-shot reads evaluate no split"
             );
             assert_eq!(
-                after.filtered_scans, before.filtered_scans,
+                did.filtered_scans, 0,
                 "{label}: one-shot reads build no scan with the filter"
             );
             views.push((label, windowed, false));
         }
         for (label, view, evaluates_masks) in &views {
-            // What a reader did since `before`.
-            let check = |reader: &str, before: ReadCounters| {
+            let check = |reader: &str, did: ReadCounts| {
                 let label = format!("{label} {reader}");
-                let after = ReadCounters::now();
-                assert_eq!(
-                    after.filtered_scans, before.filtered_scans,
-                    "{label}: no scan with the filter"
-                );
+                assert_eq!(did.filtered_scans, 0, "{label}: no scan with the filter");
                 if *evaluates_masks {
-                    assert!(
-                        after.evaluated > before.evaluated,
-                        "{label}: the filter's masks evaluated"
-                    );
-                    assert_ne!(after.masked, before.masked, "{label}: masked reads");
+                    assert!(did.evaluated > 0, "{label}: the filter's masks evaluated");
+                    assert!(did.masked > 0, "{label}: masked reads");
                     return;
                 }
-                assert_eq!(
-                    after.evaluated, before.evaluated,
-                    "{label}: no split evaluated"
-                );
-                assert_eq!(after.masked, before.masked, "{label}: no masked read");
+                assert_eq!(did.evaluated, 0, "{label}: no split evaluated");
+                assert_eq!(did.masked, 0, "{label}: no masked read");
             };
             assert_streams_answer(view, &codes, &quads, label, check).await;
         }

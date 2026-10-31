@@ -7,7 +7,6 @@
 
 use super::*;
 use crate::io::zone_map::ZONE_ROWS;
-use crate::store::scan::residual::zone_hooks;
 
 /// The rows of [`zoned_quads`]: four zones and part of a fifth.
 const ROWS: usize = 4 * ZONE_ROWS + 1_000;
@@ -162,11 +161,11 @@ async fn a_rare_code_compares_only_the_zones_that_may_hold_it() {
     ];
     for (label, store) in &stores {
         for (shape, p, o, rows) in cases {
-            let before = zone_hooks::narrowed();
+            let rec = Recorder::start();
             let view = matched_view(store, None, p, Some(o), None).await;
             assert_eq!(
-                zone_hooks::narrowed(),
-                before + 1,
+                rec.count(&Event::ZoneNarrowed),
+                1,
                 "{label} {shape}: narrowed by zone bounds"
             );
             let got = view_strings(&view).await;
@@ -175,9 +174,13 @@ async fn a_rare_code_compares_only_the_zones_that_may_hold_it() {
             assert_eq!(got, want, "{label} {shape}");
         }
         let common = plain_literal("o7");
-        let before = zone_hooks::narrowed();
+        let rec = Recorder::start();
         let view = matched_view(store, None, None, Some(&common), None).await;
-        assert_eq!(zone_hooks::narrowed(), before, "{label}: a common object");
+        assert_eq!(
+            rec.count(&Event::ZoneNarrowed),
+            0,
+            "{label}: a common object"
+        );
         let want = (0..ROWS)
             .filter(|i| i % 50 == 7 && !RARE.contains(i))
             .count();

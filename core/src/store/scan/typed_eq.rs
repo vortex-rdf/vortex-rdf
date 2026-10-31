@@ -10,6 +10,7 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinView, VarBinViewArray};
 use vortex_array::scalar::Scalar;
 
+use crate::observe::observe;
 use crate::store::array::unsigned_value;
 use crate::store::probes::StructProbes;
 use crate::store::schema::TermCode;
@@ -141,13 +142,11 @@ impl<'a> TypedEq<'a> {
                 }
                 note(TYPED_EQ_PROBE, col.len());
                 if let Some(probe) = cached {
-                    #[cfg(test)]
-                    probe_hooks::note(true);
+                    observe!(ProbeBound { cached: true });
                     return Some(TypedEq::CodeProbe(ColumnProbe::Cached(probe), *code));
                 }
                 let probe = vortex_rdf_encoded_search::SortedProbe::resolve(col)?;
-                #[cfg(test)]
-                probe_hooks::note(false);
+                observe!(ProbeBound { cached: false });
                 Some(TypedEq::CodeProbe(ColumnProbe::Resolved(probe), *code))
             }
             Needle::Str(s) => {
@@ -209,33 +208,6 @@ impl<'a> TypedEq<'a> {
                 TypedEq::CodeProbe(..) | TypedEq::Str(..) => None,
             })
             .collect()
-    }
-}
-
-/// Test hook: how this thread's typed scans bound their probe-read columns,
-/// and how its in-memory sorted searches (the prefix probe's subject search,
-/// an index component's run search) read theirs — through a probe the store
-/// had cached, or searched for the call.
-#[cfg(test)]
-pub(crate) mod probe_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static CACHED: Cell<usize> = const { Cell::new(0) };
-        static RESOLVED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one probe-read column bound or searched through the cache, or
-    /// for the call.
-    pub(crate) fn note(cached: bool) {
-        let cell = if cached { &CACHED } else { &RESOLVED };
-        cell.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The `(cached, resolved)` probe binds and searches on this thread so
-    /// far.
-    pub(crate) fn binds() -> (usize, usize) {
-        (CACHED.with(Cell::get), RESOLVED.with(Cell::get))
     }
 }
 

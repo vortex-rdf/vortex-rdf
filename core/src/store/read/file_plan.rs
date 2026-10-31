@@ -28,6 +28,7 @@ use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_mask::Mask;
 
 use crate::error::Result;
+use crate::observe::observe;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::read::chunks::extract_codes;
 use crate::store::read::rows::BaseRead;
@@ -244,8 +245,7 @@ impl FileReadScope<'_> {
             &scope,
         )?);
         if let Some(f) = self.filter {
-            #[cfg(test)]
-            restricted_scan_hooks::note_filtered();
+            observe!(FilteredScan);
             scan = scan.with_filter(memo.bind(file_exprs::QUAD_SCOPE, f.expr(), &scope)?);
         }
         Ok(self.selection.restrict_scan(scan, self.deleted))
@@ -267,26 +267,4 @@ pub(in crate::store) async fn masked_codes(
     masked
         .pins()
         .fill_codes(&read_columns, codes, masked.kept())
-}
-
-/// Test hook: how many restricted file scans this thread built with a filter
-/// pushed down ([`FileReadScope::scan`]), each evaluating that filter split by
-/// split as it is read.
-#[cfg(test)]
-pub(crate) mod restricted_scan_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static FILTERED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one restricted scan built with a filter.
-    pub(super) fn note_filtered() {
-        FILTERED.set(FILTERED.get() + 1);
-    }
-
-    /// The restricted scans built with a filter on this thread so far.
-    pub(crate) fn filtered() -> usize {
-        FILTERED.get()
-    }
 }

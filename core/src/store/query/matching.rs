@@ -44,6 +44,7 @@ use std::ops::Range;
 #[cfg(feature = "file-io")]
 use vortex_array::expr::{Expression, and};
 
+use crate::observe::observe;
 use crate::store::VortexRdfStore;
 
 /// What the caller of a match does with the view's selection: whether a
@@ -160,8 +161,7 @@ impl VortexRdfStore {
             debug::step!(t, "[match_pattern] Tail matched by its row keys");
             return Ok(carry(rows));
         }
-        #[cfg(test)]
-        tail_hooks::note_scanned();
+        observe!(TailMatch { keyed: false });
         let applied = tail.selection.apply(&tail.rows)?;
         // Typed fast path first: the tail's string columns compared as raw
         // bytes, without the per-call compare/canonicalize pipeline; every
@@ -190,8 +190,7 @@ impl VortexRdfStore {
         let Some(candidates) = tail.keys.as_ref().and_then(|keys| keys.candidates(eqs)) else {
             return Ok(None);
         };
-        #[cfg(test)]
-        tail_hooks::note_keyed();
+        observe!(TailMatch { keyed: true });
         let mut rows = Vec::with_capacity(candidates.len());
         for row in candidates {
             if tail.selection.contains(row) && Self::tail_row_holds(&tail.rows, row, eqs)? {
@@ -273,8 +272,7 @@ impl VortexRdfStore {
     /// always leaves them; one only counted or windowed keeps what the match
     /// left.
     async fn match_both(&self, both: QuadPattern<'_>, need: IdsNeed) -> Result<Self> {
-        #[cfg(test)]
-        chain_hooks::note_merged();
+        observe!(ChainMerged);
         let t = debug::timer();
         let every_row = self.derived(self.quads.unrestricted(), self.tail.clone());
         let matched = Box::pin(every_row.match_base(both, need)).await?;
@@ -476,13 +474,11 @@ impl VortexRdfStore {
             let cached = probes.by_name(base, schema::COL_S).flatten();
             let (lo, hi) = match (cached, unsigned_value(&scalar)) {
                 (Some(owned), Some(needle)) => {
-                    #[cfg(test)]
-                    crate::store::scan::typed_eq::probe_hooks::note(true);
+                    observe!(ProbeBound { cached: true });
                     owned.probe().bounds(needle)
                 }
                 _ => {
-                    #[cfg(test)]
-                    crate::store::scan::typed_eq::probe_hooks::note(false);
+                    observe!(ProbeBound { cached: false });
                     search_sorted_bounds(s_col, &scalar)?
                 }
             };
@@ -867,56 +863,3 @@ const CHAIN_MIN_ROWS: usize = 1_024;
 /// `match_base`): a lookup costs the rows matching the component it resolves,
 /// not the rows the view still holds. An unrefined view never skips.
 const INDEX_ROUTING_MIN_ROWS: usize = 4_096;
-
-/// Test hook: how many chained matches this thread answered as one match of
-/// both patterns ([`VortexRdfStore::match_both`]).
-#[cfg(test)]
-pub(crate) mod chain_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static MERGED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one chained match answered as one match of both patterns.
-    pub(super) fn note_merged() {
-        MERGED.set(MERGED.get() + 1);
-    }
-
-    /// The chained matches answered so on this thread so far.
-    pub(crate) fn merged() -> usize {
-        MERGED.get()
-    }
-}
-
-/// Test hook: how many tail matches this thread answered off the tail's keys,
-/// and how many by comparing the tail's selected rows.
-#[cfg(test)]
-pub(crate) mod tail_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static KEYED: Cell<usize> = const { Cell::new(0) };
-        static SCANNED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one tail match answered off the keys.
-    pub(super) fn note_keyed() {
-        KEYED.set(KEYED.get() + 1);
-    }
-
-    /// Record one tail match answered by comparing rows.
-    pub(super) fn note_scanned() {
-        SCANNED.set(SCANNED.get() + 1);
-    }
-
-    /// The tail matches answered off the keys on this thread so far.
-    pub(crate) fn keyed() -> usize {
-        KEYED.get()
-    }
-
-    /// The tail matches answered by comparing rows on this thread so far.
-    pub(crate) fn scanned() -> usize {
-        SCANNED.get()
-    }
-}

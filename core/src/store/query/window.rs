@@ -16,6 +16,7 @@ use vortex_buffer::Buffer;
 
 use crate::debug;
 use crate::error::Result;
+use crate::observe::observe;
 use crate::store::VortexRdfStore;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, read_plan};
@@ -88,8 +89,7 @@ impl VortexRdfStore {
         } else {
             base_live
         };
-        #[cfg(test)]
-        window_hooks::note_window();
+        observe!(Window);
         #[cfg(feature = "file-io")]
         if offset == 0
             && let Some(windowed) = self.filter_window(limit).await?
@@ -316,26 +316,4 @@ enum WindowCheck {
     /// when the check counted it, which the window takes instead of
     /// counting again.
     MayCut { base_live: Option<usize> },
-}
-
-/// Test hook: how many windows this thread built.
-#[cfg(test)]
-pub(crate) mod window_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static WINDOWS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one window built: a call of
-    /// [`window`](crate::store::VortexRdfStore::window) past the checks that
-    /// find it is the view as it is.
-    pub(super) fn note_window() {
-        WINDOWS.set(WINDOWS.get() + 1);
-    }
-
-    /// The windows built on this thread so far.
-    pub(crate) fn windows() -> usize {
-        WINDOWS.get()
-    }
 }

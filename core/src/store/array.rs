@@ -3,6 +3,7 @@
 //! and slicing, sorted-column binary search, and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::schema;
 
@@ -135,8 +136,9 @@ pub(crate) fn rechunk(
         if fits {
             return Ok(rows.clone());
         }
+        observe!(RechunkCut);
         #[cfg(test)]
-        rechunk_hooks::note()?;
+        crate::store::test_hooks::rechunk_cut()?;
         rows.slice(start..start.saturating_add(batch_rows).min(len))
             .map_err(VortexRdfError::Vortex)
     })
@@ -278,53 +280,6 @@ pub(crate) fn trusted_str(buf: &[u8]) -> &str {
     // SAFETY: the caller's precondition above: `buf` is a value of a `Utf8`
     // column of a store this crate wrote or the caller trusts.
     unsafe { std::str::from_utf8_unchecked(buf) }
-}
-
-/// Test hook: how many slices this thread's [`rechunk`] iterators cut, and a
-/// guard that fails one of the next cuts.
-#[cfg(test)]
-pub(crate) mod rechunk_hooks {
-    use std::cell::Cell;
-
-    use crate::error::{Result, VortexRdfError};
-    use crate::store::test_hooks::Override;
-
-    thread_local! {
-        static CUTS: Cell<usize> = const { Cell::new(0) };
-        static FAILING: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    /// Record one cut: an error, the cut's, when a [`FailingCut`] names it.
-    pub(super) fn note() -> Result<()> {
-        let cut = CUTS.with(|c| c.replace(c.get() + 1));
-        if FAILING.with(Cell::get) == Some(cut) {
-            return Err(VortexRdfError::Vortex(vortex_error::vortex_err!(
-                "cut {cut} failed (test hook)"
-            )));
-        }
-        Ok(())
-    }
-
-    /// The slices cut on this thread so far.
-    pub(crate) fn cuts() -> usize {
-        CUTS.with(Cell::get)
-    }
-
-    /// While alive, the cut this thread's `rechunk` iterators make `n` cuts
-    /// from now (`0`: the next) fails. Dropping it restores the failure it
-    /// replaced.
-    pub(crate) struct FailingCut {
-        _guard: Override<usize>,
-    }
-
-    impl FailingCut {
-        /// Fail the cut `n` cuts from now.
-        pub(crate) fn after(n: usize) -> Self {
-            Self {
-                _guard: Override::set(&FAILING, cuts() + n),
-            }
-        }
-    }
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ use vortex_buffer::Buffer;
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
 
+use crate::observe::observe;
 use crate::store::VortexRdfStore;
 
 /// A view's base rows as [`base_read`](VortexRdfStore::base_read) reads
@@ -79,8 +80,7 @@ pub(in crate::store) fn gather_codes(
     prims: &[PrimitiveArray; 4],
     ids: &[RowId],
 ) -> [Buffer<TermCode>; 4] {
-    #[cfg(test)]
-    column_hooks::note(true);
+    observe!(CodeGather { all_four: true });
     let [s, p, o, g] = prims;
     [
         gather(s, ids),
@@ -91,8 +91,7 @@ pub(in crate::store) fn gather_codes(
 }
 
 pub(in crate::store) fn gather_column(prim: &PrimitiveArray, ids: &[RowId]) -> Buffer<TermCode> {
-    #[cfg(test)]
-    column_hooks::note(false);
+    observe!(CodeGather { all_four: false });
     gather(prim, ids)
 }
 
@@ -351,8 +350,7 @@ impl VortexRdfStore {
     /// first in base row order, then the tail's live rows, and how many of
     /// them came from the base.
     pub(in crate::store) async fn live_raw_quads(&self) -> Result<(Vec<RawQuad>, usize)> {
-        #[cfg(test)]
-        crate::store::test_hooks::note_gather();
+        observe!(RawQuadsGathered);
         let base = self.base_selected_rows().await?;
         let mut raws = self.layout.raw_quads_async(&base).await?;
         let base_rows = raws.len();
@@ -368,28 +366,4 @@ fn primary_codes(rows: ArrayRef) -> Result<[Buffer<TermCode>; 4]> {
     Ok(extract_codes(rows, &schema::PRIMARY_COLUMNS)?
         .try_into()
         .expect("one code buffer per primary column"))
-}
-
-/// Test hook: how many gathers this thread made from code primitives, by
-/// path: all four columns in one pass ([`gather_codes`]), or one column
-/// ([`gather_column`]).
-#[cfg(test)]
-pub(crate) mod column_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static FOUR: Cell<usize> = const { Cell::new(0) };
-        static ONE: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one gather, of all four columns or of one.
-    pub(super) fn note(four: bool) {
-        let cell = if four { &FOUR } else { &ONE };
-        cell.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The gathers on this thread so far: `(of all four columns, of one)`.
-    pub(crate) fn gathers() -> (usize, usize) {
-        (FOUR.with(Cell::get), ONE.with(Cell::get))
-    }
 }

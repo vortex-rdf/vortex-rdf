@@ -7,6 +7,7 @@
 //! shared wrapper's cache, or only when an earlier read already did).
 
 use crate::error::Result;
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{column_is_sorted, stamp_is_sorted};
 use crate::store::schema;
@@ -155,8 +156,7 @@ pub(crate) fn shared_code_primitive(
     let shared = child.as_opt::<Shared>()?;
     let cached = shared
         .get_or_compute(|source| {
-            #[cfg(test)]
-            shared_hooks::note_decoded();
+            observe!(SharedDecoded);
             use vortex_rdf_encoded_search::counters::{SHARED_DECODED, note};
             note(SHARED_DECODED, source.len());
             let mut ctx = VORTEX_SESSION.create_execution_ctx();
@@ -312,25 +312,4 @@ fn compress_int_column(
     }
     let packed = BitPacked::encode(&prim.clone().into_array(), bit_width, ctx)?;
     Ok(packed.into_array())
-}
-
-/// Test hook: how many shared code columns this thread decoded into their
-/// caches ([`shared_code_primitive`]).
-#[cfg(test)]
-pub(crate) mod shared_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static DECODED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one shared column decoded into its cache.
-    pub(super) fn note_decoded() {
-        DECODED.set(DECODED.get() + 1);
-    }
-
-    /// The shared columns decoded on this thread so far.
-    pub(crate) fn decoded() -> usize {
-        DECODED.get()
-    }
 }

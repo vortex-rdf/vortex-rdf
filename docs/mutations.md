@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: a hash table over the batch's kept
   quads catches the latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/query/matching.rs#L821) — one fully bound
+  [`contains`](../core/src/store/query/matching.rs#L817) — one fully bound
   `match_pattern` over base and tail, which reads the tail rows its row key
   names rather than every tail row ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
@@ -99,9 +99,9 @@ flowchart TD
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
-- **Matching.** [`match_pattern`](../core/src/store/query/matching.rs#L91) runs the
+- **Matching.** [`match_pattern`](../core/src/store/query/matching.rs#L92) runs the
   base's normal routing (prefix probe / index / scan) and, independently, a
-  mask scan over the tail ([`match_tail`](../core/src/store/query/matching.rs#L134)),
+  mask scan over the tail ([`match_tail`](../core/src/store/query/matching.rs#L135)),
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
@@ -156,9 +156,9 @@ flowchart TD
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L227) (through
-  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L677)), and on
+  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L676)), and on
   every later read the mask is applied **inside the scan**
-  ([`restrict_scan`](../core/src/store/scan/file_scans.rs#L254)) — as an
+  ([`restrict_scan`](../core/src/store/scan/file_scans.rs#L182)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`
   selection, or subtracted up front from an id list — so it composes with a
   pushed-down filter, whose output carries no row ids to re-align against.
@@ -178,13 +178,13 @@ flowchart TD
 Both rebuild the same way
 ([`rebuilt_parts`](../core/src/store/write/compaction.rs#L83)). Under the
 Dictionary layout with its dictionary in memory, from the base rows' codes
-([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L96)):
+([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L97)):
 the live base rows are read as codes, only the distinct terms they use are
 decoded, once each, and merged with the tail's terms into the fresh
 dictionary, every base code moves to its term's new code (code order being
 term order) and the rows, the tail's beside them, sort as integers, each
 quad once. Otherwise from the quads spelled out
-([`live_raw_quads`](../core/src/store/read/rows.rs#L353): base rows first, in
+([`live_raw_quads`](../core/src/store/read/rows.rs#L352): base rows first, in
 view order, then tail rows, tombstones already excluded), put in order by
 [`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L107): the tail
 is sorted alone and merged into the sorted base in one linear pass (a base
@@ -259,7 +259,7 @@ flowchart TD
   there a file-backed store cannot compact over its own path: the compaction
   fails with the I/O error and the file stays as it was. The builder's spill
   runs are placed in the temp file's directory
-  ([`spill_site`](../core/src/io/pending.rs#L252), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
+  ([`spill_site`](../core/src/io/pending.rs#L252), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L100)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default), in a

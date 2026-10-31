@@ -377,8 +377,6 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
     indexes: Indexes,
     quads: Vec<Quad>,
 ) {
-    use crate::store::scan::typed_eq::probe_hooks;
-
     let arr = build_array::<B>(
         quad_stream(quads.clone()),
         layout,
@@ -442,20 +440,19 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
     // Where the columns hold codes, a bound subject and an index-resolved
     // predicate or object are searched through the probes the construction
     // cached, none resolved for the call.
-    // Assumes an in-memory match never suspends between the hooks' per-thread reads.
-    let cached_searches = |before: (usize, usize), what: &str| {
-        let (cached, resolved) = probe_hooks::binds();
+    let cached_searches = |rec: &Recorder, what: &str| {
+        let (cached, resolved) = probe_binds(rec);
         assert!(
-            cached > before.0 && resolved == before.1,
-            "{what}: ({cached}, {resolved}) after {before:?} for builder={builder_name} layout={layout_name} indexes={index_name}",
+            cached > 0 && resolved == 0,
+            "{what}: ({cached}, {resolved}) for builder={builder_name} layout={layout_name} indexes={index_name}",
         );
     };
     let codes = layout == LayoutStrategy::Dictionary;
     let s05 = iri_subject("s05");
-    let before = probe_hooks::binds();
+    let rec = Recorder::start();
     let by_subject = matched_view(&store, Some(&s05), None, None, None).await;
     if codes {
-        cached_searches(before, "subject");
+        cached_searches(&rec, "subject");
     }
     assert_eq!(
         view_strings(&by_subject).await,
@@ -469,10 +466,10 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
     let index_searched = codes && !indexes.is_empty();
 
     let p0 = iri("p0");
-    let before = probe_hooks::binds();
+    let rec = Recorder::start();
     let by_pred = matched_view(&store, None, Some(&p0), None, None).await;
     if index_searched {
-        cached_searches(before, "predicate");
+        cached_searches(&rec, "predicate");
     }
     assert_eq!(
         by_pred.size().await.unwrap(),
@@ -486,10 +483,10 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
     );
 
     let o1 = plain_literal("object 1");
-    let before = probe_hooks::binds();
+    let rec = Recorder::start();
     let by_obj = matched_view(&store, None, None, Some(&o1), None).await;
     if index_searched {
-        cached_searches(before, "object");
+        cached_searches(&rec, "object");
     }
     assert_eq!(
         by_obj.size().await.unwrap(),
@@ -536,11 +533,10 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
     }
 }
 
-/// The 3-layout × 4-index-config matrix for one builder. The 12 cells are
-/// independent in-memory builds, so they are spawned and joined rather than
-/// run serially — per-cell failure context stays in each cell's panics,
-/// re-raised through the join.
-async fn run_index_matrix_test<B: VortexArrayBuilder + 'static>(builder_name: &'static str) {
+/// The 3-layout × 4-index-config matrix for one builder, its 12 cells run
+/// in turn on the test's thread, where a cell's recorder sees its own
+/// matches alone; each cell's panic names the cell.
+async fn run_index_matrix_test<B: VortexArrayBuilder>(builder_name: &'static str) {
     let quads = modular_quads(24, 3, 4);
 
     let layouts = [
@@ -558,30 +554,27 @@ async fn run_index_matrix_test<B: VortexArrayBuilder + 'static>(builder_name: &'
         ("both", ALL_INDEX_TYPES.to_vec()),
     ];
 
-    let mut cells = Vec::new();
     for (layout_name, layout) in layouts {
         for (index_name, indexes) in &index_configs {
-            cells.push(tokio::spawn(run_index_matrix_cell::<B>(
+            run_index_matrix_cell::<B>(
                 builder_name,
                 layout_name,
                 layout,
                 index_name,
                 indexes.clone(),
                 quads.clone(),
-            )));
+            )
+            .await;
         }
-    }
-    if let Err(e) = futures::future::try_join_all(cells).await {
-        std::panic::resume_unwind(e.into_panic());
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_index_matrix_sorted_in_memory() {
     run_index_matrix_test::<SortedInMemoryBuilder>("SortedInMemoryBuilder").await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_index_matrix_sorted_stream() {
     run_index_matrix_test::<SortedStreamBuilder>("SortedStreamBuilder").await;
 }
@@ -759,8 +752,6 @@ pub(super) async fn run_copy_index_serving_script(
 /// point-read cap is read point by point.
 #[tokio::test]
 async fn test_in_memory_copy_index_serving() {
-    use crate::store::indexes::serve::serve_hooks::point_reads;
-
     async fn nquads(view: VortexRdfStore) -> String {
         let mut out = Vec::new();
         crate::export_rdf(view, &mut out, oxrdfio::RdfFormat::NQuads)
@@ -859,9 +850,13 @@ async fn test_in_memory_copy_index_serving() {
         for (store, deleted) in [(&store, None), (&tombstoned, Some(1))] {
             let tag = format!("{width} rows, deleted {deleted:?}");
             let by_p = matched_view(store, None, Some(&p1), object, None).await;
-            let before = point_reads();
+            let rec = Recorder::start();
             let served: Vec<Quad> = by_p.quads().try_collect().await.unwrap();
-            assert_eq!(point_reads() - before, usize::from(point_read), "{tag}");
+            assert_eq!(
+                rec.count(&Event::ServePointRead),
+                usize::from(point_read),
+                "{tag}"
+            );
             let keep = |i| deleted != Some(i) && i % 3 == 1 && (object.is_none() || i % 7 == 1);
             assert_eq!(
                 quad_strings(&served),
@@ -1079,12 +1074,12 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
             } else {
                 to - from
             };
-            let before = crate::store::test_hooks::decoded_rids();
+            let rec = Recorder::start();
             let window = store
                 .run_probe(&probe.clone().window(offset, Some(limit)))
                 .await
                 .unwrap();
-            let decoded = crate::store::test_hooks::decoded_rids() - before;
+            let decoded = rids_decoded(&rec);
             assert_eq!(decoded, expected, "{index:?} ({offset}, {limit}) decodes");
             assert_eq!(
                 served_component(&window).is_some(),

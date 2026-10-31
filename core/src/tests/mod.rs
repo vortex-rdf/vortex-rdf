@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::io::quads_stream_to_vortex_writer;
+use crate::observe::{Event, Recorder};
 use crate::store::VortexArrayBuilder;
 use crate::store::indexes::ALL_INDEX_TYPES;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -513,6 +514,35 @@ fn selection_pending(view: &VortexRdfStore) -> bool {
 
 /// The quad-row column names `layout` builds — what a schema assertion
 /// expects the primary struct to carry and nothing else.
+/// The probes the matches `rec` saw bind a column: `(the store's own,
+/// resolved for the call)`.
+fn probe_binds(rec: &Recorder) -> (usize, usize) {
+    (
+        rec.count(&Event::ProbeBound { cached: true }),
+        rec.count(&Event::ProbeBound { cached: false }),
+    )
+}
+
+/// The `rid` rows of in-memory index components `rec` saw decoded.
+fn rids_decoded(rec: &Recorder) -> usize {
+    rec.picked(|e| match e {
+        Event::RidsDecoded(rows) => Some(*rows),
+        _ => None,
+    })
+    .iter()
+    .sum()
+}
+
+/// The directory the last out-of-core build `rec` saw spill its runs under.
+fn last_spill_dir(rec: &Recorder) -> std::path::PathBuf {
+    rec.picked(|e| match e {
+        Event::Spilled(dir) => Some(dir.clone()),
+        _ => None,
+    })
+    .pop()
+    .expect("the build made a run directory")
+}
+
 fn primary_columns(layout: LayoutStrategy) -> &'static [&'static str] {
     match layout {
         LayoutStrategy::Default | LayoutStrategy::Dictionary => &["s", "p", "o", "g"],

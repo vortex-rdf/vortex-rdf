@@ -22,6 +22,7 @@ use super::rows::BaseRead;
 use crate::error::VortexRdfError;
 #[cfg(feature = "file-io")]
 use crate::io::read::{available_parallelism, inline_splits, spawned_splits};
+use crate::observe::observe;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
 #[cfg(feature = "file-io")]
@@ -151,8 +152,7 @@ impl VortexRdfStore {
     /// ([`in_memory_chunk`](Self::in_memory_chunk)), decoded without
     /// suspending; on file the chunks of `file_chunks`, read as `mode` asks.
     fn chunk_stream<T: ChunkDecode>(&self, mode: QuadRead) -> BoxStream<'_, Vec<Result<T>>> {
-        #[cfg(test)]
-        chunk_stream_hooks::note();
+        observe!(ChunkStream);
         match &self.quads.backend {
             Backend::InMemory(memory) => stream::once(future::lazy(move |_| {
                 self.in_memory_chunk::<T>(memory, mode)
@@ -373,8 +373,7 @@ impl VortexRdfStore {
         decoder: impl ChunkDecoder<T>,
         tail: Vec<Result<T>>,
     ) -> Result<Chunks<T>> {
-        #[cfg(test)]
-        crate::store::scan::file_scans::scan_hooks::note();
+        observe!(RowScan);
         let file_backed_dictionary =
             matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
         let chunks: Chunks<T> = if file_backed_dictionary {
@@ -452,8 +451,7 @@ fn finished_on_stream<T: ChunkDecode, D: ChunkDecoder<T>>(
     match chunk {
         Ok(SplitChunk::Decoded(rows)) => future::ready(rows).left_future(),
         Ok(SplitChunk::Undecoded(chunk)) => {
-            #[cfg(test)]
-            stream_decode_hooks::note(chunk.len());
+            observe!(StreamDecode(chunk.len()));
             decoder.decode_async(chunk).right_future()
         }
         Err(e) => future::ready(vec![Err(VortexRdfError::Vortex(e))]).left_future(),
@@ -524,52 +522,10 @@ impl<T: ChunkDecode> ChunkDecoder<T> for ServedDecoder {
     }
 }
 
-/// Test hook: how many chunk streams this thread's reads built (materializing
-/// an in-memory view builds none).
-#[cfg(test)]
-pub(crate) mod chunk_stream_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static STREAMS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one chunk stream.
-    pub(super) fn note() {
-        STREAMS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The chunk streams built on this thread so far.
-    pub(crate) fn streams() -> usize {
-        STREAMS.with(Cell::get)
-    }
-}
-
-/// Test hook: the row counts of the chunks this thread's streams decoded
-/// themselves, their split tasks having left them undecoded.
-#[cfg(all(test, feature = "file-io"))]
-pub(crate) mod stream_decode_hooks {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static LEFT: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Record a chunk of `rows` rows decoded on a stream.
-    pub(super) fn note(rows: usize) {
-        LEFT.with_borrow_mut(|left| left.push(rows));
-    }
-
-    /// The row counts of the chunks decoded on this thread's streams so
-    /// far, in order.
-    pub(crate) fn left() -> Vec<usize> {
-        LEFT.with_borrow(Vec::clone)
-    }
-}
-
 #[cfg(all(test, feature = "file-io"))]
 mod tests {
     use super::*;
+    use crate::observe::{Event, Recorder};
     use crate::store::layouts::dictionary::{DictAccess, FileBackedDict};
     use crate::{LayoutStrategy, export_rdf};
 
@@ -579,14 +535,17 @@ mod tests {
     async fn read_whole(
         store: &VortexRdfStore,
     ) -> ((Vec<Quad>, Vec<SharedQuad>, Vec<u8>), Vec<usize>) {
-        let before = stream_decode_hooks::left().len();
+        let rec = Recorder::start();
         let quads = store.quads_vec().await.unwrap();
         let shared = store.shared_quads_vec().await.unwrap();
         let mut lines = Vec::new();
         export_rdf(store.clone(), &mut lines, oxrdfio::RdfFormat::NQuads)
             .await
             .unwrap();
-        let left = stream_decode_hooks::left().split_off(before);
+        let left = rec.picked(|e| match e {
+            Event::StreamDecode(rows) => Some(*rows),
+            _ => None,
+        });
         ((quads, shared, lines), left)
     }
 

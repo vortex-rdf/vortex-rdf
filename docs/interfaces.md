@@ -15,12 +15,12 @@ tests pin each interface
 
 | What the engine needs | What it calls |
 |---|---|
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L70), [`code_chunks`](../core/src/store/read/chunks.rs#L102) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L71), [`code_chunks`](../core/src/store/read/chunks.rs#L103) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L153), [`index_components`](../core/src/store/read/metadata.rs#L225), [`partitions`](../core/src/store/read/metadata.rs#L260) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L139), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
-| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L77) ([§6](#6-a-store-file-through-vortexs-reader)) |
+| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L78) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
 
@@ -100,10 +100,10 @@ Every read is lazy, and a stream's first poll decides how it runs:
   the polling task, and need no runtime.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
-  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L64)), and a
+  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L65)), and a
   scan first polled where no tokio runtime is current run inline on the
   polling task. Any other scan spawns its splits
-  ([`ScanDriver`](../core/src/store/scan/file_scans.rs#L28)) onto the tokio
+  ([`ScanDriver`](../core/src/store/scan/file_scans.rs#L29)) onto the tokio
   runtime it is polled in, and vortex looks that runtime up
   (`Handle::current()`) at every spawn, so every later poll of the stream
   must run inside a tokio runtime too. A filtered file view's capped count,
@@ -242,7 +242,7 @@ valid.
 
 ## 6. A store file through vortex's reader
 
-[`vortex_session`](../core/src/lib.rs#L77) holds this crate's store layout,
+[`vortex_session`](../core/src/lib.rs#L78) holds this crate's store layout,
 encodings and write editions. vortex's own reader opens a store file through
 it, and the file scans as the quad table: the root hands its dtype, row
 count and scan to child 0

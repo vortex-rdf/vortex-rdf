@@ -6,7 +6,6 @@
 
 use super::indexes::copy_index_script_dataset;
 use super::*;
-use crate::store::query::matching::chain_hooks;
 
 /// 3,300 quads `s{i:04} p{i % 3} "o{i % 5}"` alternating between the copy
 /// script's two graphs, beside the graphs: a predicate's run holds 1,100
@@ -92,9 +91,9 @@ async fn test_a_chained_match_is_one_match_of_both_patterns() {
             );
         }
 
-        let merged = chain_hooks::merged();
+        let rec = Recorder::start();
         let other = matched_view(&by_p, None, Some(&p2), None, None).await;
-        assert_eq!(chain_hooks::merged(), merged, "{tag}: p2 after p1");
+        assert_eq!(rec.count(&Event::ChainMerged), 0, "{tag}: p2 after p1");
         assert_eq!(view_strings(&other).await, Vec::<String>::new(), "{tag}");
         assert_eq!(other.size().await.unwrap(), 0, "{tag}");
     }
@@ -116,10 +115,10 @@ async fn test_only_a_wide_pending_view_chains_as_one_match() {
         let by_p = matched_view(&store, None, Some(&p1), None, None).await;
         let width = by_p.debug_pending_len();
         narrow_known += usize::from(matches!(width, Some(Some(_))));
-        let merged = chain_hooks::merged();
+        let rec = Recorder::start();
         let chained = matched_view(&by_p, None, None, Some(&o1), None).await;
         assert_eq!(
-            chain_hooks::merged() - merged,
+            rec.count(&Event::ChainMerged),
             usize::from(width == Some(None)),
             "{tag}"
         );
@@ -141,17 +140,17 @@ async fn test_only_a_wide_pending_view_chains_as_one_match() {
         let by_p = matched_view(&store, None, Some(&p1), None, None).await;
         let pending = selection_pending(&by_p);
         pending_views += usize::from(pending);
-        let merged = chain_hooks::merged();
+        let rec = Recorder::start();
         let chained = matched_view(&by_p, None, None, Some(&o1), None).await;
         assert_eq!(
-            chain_hooks::merged() - merged,
+            rec.count(&Event::ChainMerged),
             usize::from(pending),
             "{tag}"
         );
         // A chain on the chained view, whose ids are exact, composes.
         let again = matched_view(&chained, None, None, Some(&o1), None).await;
         assert_eq!(
-            chain_hooks::merged() - merged,
+            rec.count(&Event::ChainMerged),
             usize::from(pending),
             "{tag}"
         );
@@ -176,7 +175,7 @@ async fn test_only_a_wide_pending_view_chains_as_one_match() {
             "{tag}"
         );
         assert_eq!(
-            chain_hooks::merged() - merged,
+            rec.count(&Event::ChainMerged),
             3 * usize::from(pending),
             "{tag}"
         );

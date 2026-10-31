@@ -20,6 +20,7 @@ use web_time::Instant;
 use crate::debug;
 use crate::error::Result;
 use crate::io::zone_map::ZONE_ROWS;
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::MemoryBase;
 use crate::store::array::{bool_array_to_mask, into_struct_array};
@@ -52,8 +53,7 @@ pub(crate) fn residual_rows(
     if selection.len(base.len()) > ZONE_ROWS
         && let Some(runs) = zones.runs_holding(eqs, base.len())
     {
-        #[cfg(test)]
-        zone_hooks::note_narrowed();
+        observe!(ZoneNarrowed);
         debug::step!(t, "[match_pattern] In-memory narrowed by zone bounds");
         match selection.clip_runs(&runs) {
             Some(runs) => {
@@ -149,25 +149,4 @@ pub(crate) fn mask_for(array: &ArrayRef, eqs: &[(&'static str, Scalar)]) -> Resu
         // a non-empty constraint set, so the fold always starts.
         None => ConstantArray::new(Scalar::from(true), struct_arr.len()).into_array(),
     })
-}
-
-/// Test hook: how many in-memory residual filters this thread narrowed to
-/// the zones their codes' bounds hold.
-#[cfg(test)]
-pub(crate) mod zone_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static NARROWED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one residual filter narrowed by zone bounds.
-    pub(super) fn note_narrowed() {
-        NARROWED.set(NARROWED.get() + 1);
-    }
-
-    /// The residual filters narrowed by zone bounds on this thread so far.
-    pub(crate) fn narrowed() -> usize {
-        NARROWED.get()
-    }
 }

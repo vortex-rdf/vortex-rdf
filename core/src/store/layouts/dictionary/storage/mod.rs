@@ -19,6 +19,7 @@ use vortex_buffer::Buffer;
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::scan_reader_chunks;
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{StrColReader, trusted_str};
 
@@ -177,8 +178,7 @@ impl ResidentChunks {
     /// `scratch` from an FSST one. A single-term read passes one scratch
     /// through all its probes, where a cursor holds one per chunk.
     pub(super) fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
-        #[cfg(test)]
-        scratch_hooks::note_read();
+        observe!(ScratchRead);
         let (chunk, local) = self.locate(i);
         chunk.bytes_into(local, scratch)
     }
@@ -386,12 +386,12 @@ impl FsstTerms {
         let codes = &self.array.codes_bytes()[start..end];
         scratch.clear();
         let needed = codes.len() * FSST_SYMBOL_LEN + FSST_DECODE_HEADROOM;
-        #[cfg(test)]
-        match scratch.capacity() {
-            0 => scratch_hooks::note_fresh(),
-            capacity if capacity < needed => scratch_hooks::note_regrown(),
-            _ => {}
-        }
+        observe!(
+            when scratch.capacity() < needed,
+            ScratchGrown {
+                fresh: scratch.capacity() == 0
+            }
+        );
         scratch.reserve(needed.max(SCRATCH_SEED_BYTES));
         let n = self
             .array
@@ -402,47 +402,6 @@ impl FsstTerms {
             scratch.set_len(n);
         }
         &scratch[..n]
-    }
-}
-
-/// Test hooks: the FSST reads on this thread that allocated a fresh scratch,
-/// and those that grew one; and the terms read by position.
-#[cfg(test)]
-pub(super) mod scratch_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static FRESH: Cell<usize> = const { Cell::new(0) };
-        static REGROWN: Cell<usize> = const { Cell::new(0) };
-        static READS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub(super) fn note_read() {
-        READS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The terms this thread read by position (`bytes_into`) so far.
-    pub(in crate::store::layouts::dictionary) fn reads() -> usize {
-        READS.with(Cell::get)
-    }
-
-    pub(super) fn note_fresh() {
-        FRESH.with(|c| c.set(c.get() + 1));
-    }
-
-    pub(super) fn note_regrown() {
-        REGROWN.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The fresh scratch buffers this thread's reads allocated so far.
-    pub(in crate::store::layouts::dictionary) fn fresh() -> usize {
-        FRESH.with(Cell::get)
-    }
-
-    /// The times this thread's reads found their buffer too small and grew
-    /// it.
-    pub(in crate::store::layouts::dictionary) fn regrown() -> usize {
-        REGROWN.with(Cell::get)
     }
 }
 

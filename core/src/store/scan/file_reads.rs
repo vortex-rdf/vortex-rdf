@@ -19,6 +19,7 @@ use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::available_parallelism;
+use crate::observe::observe;
 use crate::store::array::named_struct;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{CodeEqs, PushedFilter, QUAD_SCOPE};
@@ -46,8 +47,7 @@ pub(crate) async fn file_point_rows(
     filter: Option<&PushedFilter>,
     rows: Vec<u64>,
 ) -> Result<Option<ArrayRef>> {
-    #[cfg(test)]
-    masked_column_hooks::note(columns);
+    observe!(ColumnsRead(columns.iter().map(|c| c.to_string()).collect()));
     let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
     };
@@ -67,8 +67,7 @@ pub(crate) async fn file_point_codes(
     filter: Option<&PushedFilter>,
     rows: Vec<u64>,
 ) -> Result<Option<Vec<Buffer<TermCode>>>> {
-    #[cfg(test)]
-    masked_column_hooks::note(columns);
+    observe!(ColumnsRead(columns.iter().map(|c| c.to_string()).collect()));
     let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
     };
@@ -240,11 +239,11 @@ pub(crate) async fn take_file_rows(
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::validity::Validity;
 
-    #[cfg(test)]
-    masked_column_hooks::note(columns);
+    observe!(ColumnsRead(columns.iter().map(|c| c.to_string()).collect()));
     if let Some(rows) = chunk_take(file, columns, ids).await? {
-        #[cfg(test)]
-        take_hooks::note(true);
+        observe!(Take {
+            through_chunks: true
+        });
         return Ok(Some(rows));
     }
     if ids.is_empty() {
@@ -282,8 +281,9 @@ pub(crate) async fn take_file_rows(
         .await
         .into_iter()
         .collect::<Result<Vec<ArrayRef>>>()?;
-    #[cfg(test)]
-    take_hooks::note(false);
+    observe!(Take {
+        through_chunks: false
+    });
     let dtype = chunks[0].dtype().clone();
     crate::store::array::chunked_or_single(chunks, dtype).map(Some)
 }
@@ -330,8 +330,7 @@ pub(crate) fn masked_split_tasks(
     masks: &SplitMasks,
     take: bool,
 ) -> Result<(DType, Vec<SplitRead>)> {
-    #[cfg(test)]
-    masked_column_hooks::note(columns);
+    observe!(ColumnsRead(columns.iter().map(|c| c.to_string()).collect()));
     let reader = file.layout_reader()?;
     let projection =
         file.bound_exprs()
@@ -612,54 +611,4 @@ pub(crate) async fn component_point_chunk(
         return Ok(None);
     };
     u64_struct(&run.handles, columns, values, run.live.len())
-}
-
-/// Test hook: how many reads this thread gathered by taking exact ids
-/// ([`take_file_rows`]), through the chunk probes' leaves or split by split.
-#[cfg(test)]
-pub(crate) mod take_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static CHUNKS: Cell<usize> = const { Cell::new(0) };
-        static SPLITS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one gather by take, through the chunk probes or split by split.
-    pub(super) fn note(through_chunks: bool) {
-        let cell = if through_chunks { &CHUNKS } else { &SPLITS };
-        cell.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The gathers by take on this thread so far: `(through the chunk
-    /// probes, split by split)`.
-    pub(crate) fn takes() -> (usize, usize) {
-        (CHUNKS.with(Cell::get), SPLITS.with(Cell::get))
-    }
-}
-
-/// Test hook: the columns each point read ([`file_point_rows`],
-/// [`file_point_codes`]), each take by id ([`take_file_rows`]) and each take
-/// or projection of a filter's kept rows ([`masked_split_tasks`]) read on
-/// this thread.
-#[cfg(test)]
-pub(crate) mod masked_column_hooks {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static READS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Record one read of `columns`.
-    pub(super) fn note(columns: &[&str]) {
-        READS.with_borrow_mut(|reads| {
-            reads.push(columns.iter().map(|c| c.to_string()).collect());
-        });
-    }
-
-    /// The columns of each point read, take or projection on this thread
-    /// since the last call, in order.
-    pub(crate) fn take() -> Vec<Vec<String>> {
-        READS.with_borrow_mut(std::mem::take)
-    }
 }

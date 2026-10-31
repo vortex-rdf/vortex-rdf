@@ -11,6 +11,7 @@ use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use crate::error::Result;
+use crate::observe::observe;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::PushedFilter;
 use crate::store::scan::file_filter::SplitMasks;
@@ -75,8 +76,7 @@ impl ExactRead {
         selection: &RowSelection,
         deleted: Option<&Mask>,
     ) -> Result<Self> {
-        #[cfg(test)]
-        exact_read_hooks::note();
+        observe!(ExactRead);
         let live = || {
             selection.filter_rows(file.row_count() as usize, move |id| {
                 deleted.is_none_or(|d| !d.value(id))
@@ -155,26 +155,6 @@ impl ReadKind {
     }
 }
 
-/// Test hook: how many times this thread chose an [`ExactRead`].
-#[cfg(test)]
-pub(crate) mod exact_read_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static CHOSEN: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one [`ExactRead::of`](super::ExactRead::of).
-    pub(super) fn note() {
-        CHOSEN.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The reads chosen on this thread so far.
-    pub(crate) fn chosen() -> usize {
-        CHOSEN.with(Cell::get)
-    }
-}
-
 /// How the rows a pending filter's split masks keep are read, cheapest first,
 /// once the masks have applied the filter: point by point while the kept ids
 /// fit point reads, taken at their ids while they fit a take (the reads
@@ -204,35 +184,8 @@ impl MaskedRead {
         } else {
             MaskedRead::Project
         };
-        #[cfg(test)]
-        masked_read_hooks::note(read);
+        observe!(MaskedRead(read));
         Ok(read)
-    }
-}
-
-/// Test hook: how many reads of a filter's kept rows this thread chose
-/// ([`MaskedRead`]), by kind.
-#[cfg(test)]
-pub(crate) mod masked_read_hooks {
-    use std::cell::Cell;
-
-    use super::MaskedRead;
-
-    thread_local! {
-        static READS: Cell<[usize; 3]> = const { Cell::new([0; 3]) };
-    }
-
-    /// Record one masked read of kind `read`.
-    pub(super) fn note(read: MaskedRead) {
-        let mut reads = READS.get();
-        reads[read as usize] += 1;
-        READS.set(reads);
-    }
-
-    /// The masked reads chosen on this thread so far: `[points, takes,
-    /// projections]`.
-    pub(crate) fn reads() -> [usize; 3] {
-        READS.get()
     }
 }
 

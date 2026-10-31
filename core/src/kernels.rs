@@ -6,6 +6,7 @@
 //! whatever it does not do better, which Vortex's own kernel then takes.
 //! Each goes once Vortex covers its case.
 
+use crate::observe::observe;
 use vortex_array::arrays::scalar_fn::{ExactScalarFn, ScalarFnArrayView};
 use vortex_array::arrays::slice::{SliceArraySlotsExt as _, SliceKernel as _};
 use vortex_array::arrays::{Filter, PrimitiveArray, Slice};
@@ -87,10 +88,10 @@ impl ExecuteParentKernel<Slice> for CompareSlicedPatches {
         };
         let compared =
             CompareExecuteAdaptor(BitPacked).execute_parent(sliced, parent, child_idx, ctx)?;
-        #[cfg(test)]
-        if compared.is_some() {
-            hooks::note(hooks::Kernel::CompareSlicedPatches);
-        }
+        observe!(
+            when compared.is_some(),
+            Kernel(Kernel::CompareSlicedPatches)
+        );
         Ok(compared)
     }
 }
@@ -154,8 +155,7 @@ impl ExecuteParentKernel<RunEnd> for RunEndFilter {
             )
         });
         let values = array.values().filter(kept_runs)?;
-        #[cfg(test)]
-        hooks::note(hooks::Kernel::RunEndFilter);
+        observe!(Kernel(Kernel::RunEndFilter));
         // SAFETY: `kept_run_ends` pushes one end per run that keeps a row,
         // each past the one before and the last `kept`, and `values` holds
         // those runs' values.
@@ -199,32 +199,13 @@ fn kept_run_ends(
     .into()
 }
 
-/// Test hook: which of the store's kernels ran on this thread.
+/// One of the store's kernels, as tests observe it answering
+/// ([`Event::Kernel`](crate::observe::Event::Kernel)).
 #[cfg(test)]
-pub(crate) mod hooks {
-    use std::cell::RefCell;
-
-    /// One of the store's kernels.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum Kernel {
-        CompareSlicedPatches,
-        RunEndFilter,
-    }
-
-    thread_local! {
-        static RAN: RefCell<Vec<Kernel>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Record that `kernel` answered.
-    pub(super) fn note(kernel: Kernel) {
-        RAN.with_borrow_mut(|ran| ran.push(kernel));
-    }
-
-    /// The kernels that answered on this thread since the last call, in
-    /// order.
-    pub(crate) fn take() -> Vec<Kernel> {
-        RAN.with_borrow_mut(std::mem::take)
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kernel {
+    CompareSlicedPatches,
+    RunEndFilter,
 }
 
 #[cfg(test)]
@@ -240,9 +221,17 @@ mod tests {
     use vortex_mask::Mask;
     use vortex_runend::RunEnd;
 
-    use super::hooks::{self, Kernel};
-    use super::kept_run_ends;
+    use super::{Kernel, kept_run_ends};
+    use crate::observe::{Event, Recorder};
     use crate::session::VORTEX_SESSION;
+
+    /// The kernel an event names.
+    fn kernel(event: &Event) -> Option<Kernel> {
+        match event {
+            Event::Kernel(kernel) => Some(*kernel),
+            _ => None,
+        }
+    }
 
     /// A comparison of a slice of a bit-packed array with patches against a
     /// constant answers as the sliced values do, for every comparison, the
@@ -276,7 +265,7 @@ mod tests {
             "the codes past 10 bits are patched"
         );
         let packed = packed.into_array();
-        hooks::take();
+        let mut ran = Recorder::start();
         for range in [
             3..1_500,
             1_000..2_049,
@@ -329,7 +318,7 @@ mod tests {
                     let got: Vec<bool> = compared.to_bit_buffer().iter().collect();
                     assert_eq!(got, want, "{label}: the comparison");
                     assert_eq!(
-                        hooks::take(),
+                        ran.take_picked(kernel),
                         [Kernel::CompareSlicedPatches],
                         "{label}: the kernel"
                     );
@@ -416,8 +405,8 @@ mod tests {
         )
         .unwrap()
         .into_array();
-        hooks::take();
-        for (every, kernel) in [(9, true), (3, true), (150, false), (1_000, false)] {
+        let mut ran = Recorder::start();
+        for (every, runs_kernel) in [(9, true), (3, true), (150, false), (1_000, false)] {
             let mask = Mask::from_iter((0..values.len()).map(|i| i % every == 2));
             let kept = runs
                 .filter(mask)
@@ -431,8 +420,8 @@ mod tests {
                 "every {every}th row: the kept rows"
             );
             assert_eq!(
-                hooks::take().contains(&Kernel::RunEndFilter),
-                kernel,
+                ran.take_picked(kernel).contains(&Kernel::RunEndFilter),
+                runs_kernel,
                 "every {every}th row: the kernel"
             );
         }

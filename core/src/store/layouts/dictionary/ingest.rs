@@ -23,6 +23,7 @@ use vortex_buffer::Buffer;
 use crate::common::quad::push_spelling;
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::store::RawQuad;
 use crate::store::builders::{BuiltArray, build_components};
 use crate::store::indexes::{IndexInput, IndexType, Indexes};
@@ -99,8 +100,7 @@ pub(crate) fn rebuild_from_codes(
     tail: &[RawQuad],
     indexes: &[IndexType],
 ) -> Result<BuiltArray> {
-    #[cfg(test)]
-    rebuild_hooks::note_rebuilt();
+    observe!(DictionaryRebuilt);
     let start = debug::timer();
     let unknown = |code: TermCode| {
         VortexRdfError::Serialization(format!("code {code} names no term of the dictionary"))
@@ -334,8 +334,7 @@ impl InterningQuadBuilder {
         match self.codes.entry_ref(term) {
             EntryRef::Occupied(entry) => *entry.get(),
             EntryRef::Vacant(entry) => {
-                #[cfg(test)]
-                intern_hooks::note_copied();
+                observe!(TermInterned);
                 *entry.insert_with_key(Box::from(term), next)
             }
         }
@@ -409,47 +408,5 @@ impl InterningQuadBuilder {
             debug::elapsed(total_start)
         );
         Ok((dict, codes))
-    }
-}
-
-/// Test hook: how many stores this thread rebuilt from their codes
-/// ([`rebuild_from_codes`]).
-#[cfg(test)]
-pub(crate) mod rebuild_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static REBUILT: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one rebuild from codes.
-    pub(super) fn note_rebuilt() {
-        REBUILT.set(REBUILT.get() + 1);
-    }
-
-    /// The rebuilds from codes on this thread so far.
-    pub(crate) fn rebuilt() -> usize {
-        REBUILT.get()
-    }
-}
-
-/// Test hook: how many terms this thread's interners copied in from a
-/// borrowed spelling.
-#[cfg(test)]
-pub(crate) mod intern_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static COPIED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one term copied in.
-    pub(super) fn note_copied() {
-        COPIED.set(COPIED.get() + 1);
-    }
-
-    /// The terms copied in on this thread so far.
-    pub(crate) fn copied() -> usize {
-        COPIED.get()
     }
 }

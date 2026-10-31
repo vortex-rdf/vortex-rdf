@@ -31,6 +31,7 @@ use crate::io::container::{
     INDEX_VERSION, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
     child_strategy,
 };
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{into_struct_array, make_string_array, named_struct};
 use crate::store::probes::StructProbes;
@@ -343,8 +344,7 @@ impl IndexComponent {
         if let Some(owned) = self.probe(column)
             && let Some(needle) = crate::store::array::unsigned_value(native)
         {
-            #[cfg(test)]
-            crate::store::scan::typed_eq::probe_hooks::note(true);
+            observe!(ProbeBound { cached: true });
             let (lo, hi) = match within {
                 None => owned.probe().bounds(needle),
                 Some(range) => owned.probe().bounds_in(range, needle),
@@ -360,8 +360,7 @@ impl IndexComponent {
             return Ok(None);
         };
         let run = col.slice(within.clone())?;
-        #[cfg(test)]
-        crate::store::scan::typed_eq::probe_hooks::note(false);
+        observe!(ProbeBound { cached: false });
         let (lo, hi) = search_sorted_bounds(&run, &scalar)?;
         Ok(Some(within.start + lo..within.start + hi))
     }
@@ -478,8 +477,7 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
     if row_id_column.is_empty() {
         return Ok(Buffer::empty());
     }
-    #[cfg(test)]
-    crate::store::test_hooks::note_decoded_rids(row_id_column.len());
+    observe!(RidsDecoded(row_id_column.len()));
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     // A no-op cast for the u64 column every writer here produces.
     let ids = row_id_column
@@ -503,17 +501,26 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
     Ok(ids.freeze())
 }
 
+/// How [`sort_unique_ids`] sorted its ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SortPath {
+    /// Already ascending, left as they are.
+    Ascending,
+    /// Compared.
+    Compared,
+    /// Set as bits of a bitmap over their span and read back in order.
+    Bitmap,
+}
+
 /// Sort unique row ids ascending, in place: left as they are when already
 /// ascending (a reference run: rows of one value are in row id order), set as
 /// bits of a bitmap over their span and read back in order when the span is
 /// under [`BITMAP_BITS_PER_ID`] bits per id (a copy run, whose ids scatter
-/// over a window of the base), compared otherwise.
-pub(super) fn sort_unique_ids(ids: &mut [RowId]) {
+/// over a window of the base), compared otherwise. Returns which.
+pub(super) fn sort_unique_ids(ids: &mut [RowId]) -> SortPath {
     if ids.is_sorted() {
-        return;
+        return SortPath::Ascending;
     }
-    #[cfg(test)]
-    sort_hooks::note_sorted();
     let (min, max) = ids
         .iter()
         .fold((RowId::MAX, 0), |(lo, hi), &id| (lo.min(id), hi.max(id)));
@@ -521,10 +528,8 @@ pub(super) fn sort_unique_ids(ids: &mut [RowId]) {
     let reach = max - min;
     if reach / BITMAP_BITS_PER_ID >= ids.len() as u64 {
         ids.sort_unstable();
-        return;
+        return SortPath::Compared;
     }
-    #[cfg(test)]
-    sort_hooks::note_bitmap();
     // Under a word per id, so the bitmap fits where the ids do.
     let mut words = vec![0u64; (reach / 64 + 1) as usize];
     for &id in ids.iter() {
@@ -541,6 +546,7 @@ pub(super) fn sort_unique_ids(ids: &mut [RowId]) {
         }
     }
     debug_assert_eq!(next, ids.len(), "row ids are unique");
+    SortPath::Bitmap
 }
 
 /// Bits of span per id under which [`sort_unique_ids`] sorts by a bitmap: at
@@ -548,38 +554,6 @@ pub(super) fn sort_unique_ids(ids: &mut [RowId]) {
 /// passes, where a comparison sort's `n log n` steps cost more from a few
 /// hundred ids up.
 const BITMAP_BITS_PER_ID: u64 = 64;
-
-/// Test hook: how many unsorted row-id runs this thread sorted, and how many
-/// of them by a bitmap.
-#[cfg(test)]
-pub(crate) mod sort_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static SORTED: Cell<usize> = const { Cell::new(0) };
-        static BITMAP: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one unsorted run sorted.
-    pub(super) fn note_sorted() {
-        SORTED.set(SORTED.get() + 1);
-    }
-
-    /// Record one run sorted by a bitmap.
-    pub(super) fn note_bitmap() {
-        BITMAP.set(BITMAP.get() + 1);
-    }
-
-    /// The unsorted runs sorted on this thread so far.
-    pub(crate) fn sorted() -> usize {
-        SORTED.get()
-    }
-
-    /// The runs sorted by a bitmap on this thread so far.
-    pub(crate) fn bitmap() -> usize {
-        BITMAP.get()
-    }
-}
 
 /// Refuses ascending base rows `ids` whose last one a `usize` cannot hold
 /// (on a 32-bit target, wasm, a row id past `u32::MAX`, which no base there
@@ -603,24 +577,24 @@ mod tests {
     #[test]
     fn sort_unique_ids_takes_the_path_their_spread_allows() {
         let wide: RowId = 1 << 40;
-        let cases: [(Vec<RowId>, usize, usize); 7] = [
-            ((0..100).collect(), 0, 0),
-            (vec![7], 0, 0),
-            (vec![9, 2], 1, 1),
-            ((0..1_000).rev().map(|i| i * 3).collect(), 1, 1),
-            ((0..500).rev().map(|i| wide + i * 7).collect(), 1, 1),
-            ((0..100).rev().map(|i| i * 65).collect(), 1, 0),
-            (vec![wide, 1, RowId::MAX - 1, 5], 1, 0),
+        let cases: [(Vec<RowId>, SortPath); 7] = [
+            ((0..100).collect(), SortPath::Ascending),
+            (vec![7], SortPath::Ascending),
+            (vec![9, 2], SortPath::Bitmap),
+            ((0..1_000).rev().map(|i| i * 3).collect(), SortPath::Bitmap),
+            (
+                (0..500).rev().map(|i| wide + i * 7).collect(),
+                SortPath::Bitmap,
+            ),
+            ((0..100).rev().map(|i| i * 65).collect(), SortPath::Compared),
+            (vec![wide, 1, RowId::MAX - 1, 5], SortPath::Compared),
         ];
-        for (ids, sorted, bitmap) in cases {
+        for (ids, path) in cases {
             let mut want = ids.clone();
             want.sort_unstable();
-            let (sorts, bitmaps) = (sort_hooks::sorted(), sort_hooks::bitmap());
             let mut got = ids.clone();
-            sort_unique_ids(&mut got);
+            assert_eq!(sort_unique_ids(&mut got), path, "{ids:?}");
             assert_eq!(got, want, "{ids:?}");
-            assert_eq!(sort_hooks::sorted() - sorts, sorted, "sorted {ids:?}");
-            assert_eq!(sort_hooks::bitmap() - bitmaps, bitmap, "bitmap {ids:?}");
         }
     }
 

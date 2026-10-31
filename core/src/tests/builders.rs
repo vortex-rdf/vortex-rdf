@@ -500,11 +500,10 @@ async fn test_spilled_string_layouts_decode_terms_verbatim() {
 /// builds emit every quad.
 #[tokio::test]
 async fn test_run_capacity_boundary_spills_only_past_it() {
-    use crate::store::builders::spill::spill_hooks;
-
     for layout in LAYOUTS {
         for (n, files) in [(4usize, 0usize), (5, 2)] {
             let quads = modular_quads(n, 3, 4);
+            let rec = Recorder::start();
             let built = sorted_stream::build_chunk_stream(
                 Box::new(quad_stream(quads)),
                 layout,
@@ -514,7 +513,7 @@ async fn test_run_capacity_boundary_spills_only_past_it() {
             )
             .await
             .unwrap();
-            let dir = spill_hooks::last_dir().expect("the build made a run directory");
+            let dir = last_spill_dir(&rec);
             let mut names: Vec<String> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -539,8 +538,6 @@ async fn test_run_capacity_boundary_spills_only_past_it() {
 /// error, and the run directory is gone.
 #[tokio::test]
 async fn test_input_error_after_spilling_removes_the_runs() {
-    use crate::store::builders::spill::spill_hooks;
-
     for layout in LAYOUTS {
         let raws: Vec<_> = modular_quads(10, 3, 4)
             .iter()
@@ -550,6 +547,7 @@ async fn test_input_error_after_spilling_removes_the_runs() {
                 "boom".to_owned(),
             ))))
             .collect();
+        let rec = Recorder::start();
         let result = sorted_stream::build_chunk_stream(
             Box::new(stream::iter(raws)),
             layout,
@@ -562,7 +560,7 @@ async fn test_input_error_after_spilling_removes_the_runs() {
             matches!(&result, Err(VortexRdfError::InvalidInput(m)) if m == "boom"),
             "{layout:?}"
         );
-        let dir = spill_hooks::last_dir().expect("the build made a run directory");
+        let dir = last_spill_dir(&rec);
         assert!(!dir.exists(), "{layout:?}: {} is left", dir.display());
     }
 }
@@ -574,12 +572,11 @@ async fn test_input_error_after_spilling_removes_the_runs() {
 /// with no merged copy of the quads, under every layout.
 #[tokio::test]
 async fn test_peak_spill_is_term_ids_and_compact_entries() {
-    use crate::store::builders::spill::spill_hooks;
-
     for layout in LAYOUTS {
         for indexes in index_sets() {
             let who = format!("{layout:?} / {indexes:?}");
             // 10 distinct quads in runs of 3: 4 runs of each kind (3, 3, 3, 1).
+            let rec = Recorder::start();
             let built = sorted_stream::build_chunk_stream(
                 Box::new(quad_stream(modular_quads(10, 3, 4))),
                 layout,
@@ -589,7 +586,7 @@ async fn test_peak_spill_is_term_ids_and_compact_entries() {
             )
             .await
             .unwrap();
-            let dir = spill_hooks::last_dir().expect("the build made a run directory");
+            let dir = last_spill_dir(&rec);
             let files: Vec<(String, u64)> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| {
@@ -647,7 +644,6 @@ async fn test_dictionary_quad_sink_serializes_like_the_builder() {
 #[tokio::test]
 async fn test_dictionary_quad_sink_interns_borrowed_quads() {
     use crate::store::RawQuad;
-    use crate::store::layouts::dictionary::ingest::intern_hooks;
 
     let mut quads = term_kind_quads();
     let s = iri_subject("escapes");
@@ -675,11 +671,11 @@ async fn test_dictionary_quad_sink_interns_borrowed_quads() {
         spelled.push(raw);
     }
     let mut borrowed = DictionaryQuadSink::new(indexes);
-    let copied = intern_hooks::copied();
+    let rec = Recorder::start();
     for quad in &quads {
         borrowed.push_quad(quad.as_ref());
     }
-    assert_eq!(intern_hooks::copied() - copied, distinct.len());
+    assert_eq!(rec.count(&Event::TermInterned), distinct.len());
 
     let spelled = VortexRdfStore::from_built(spelled.finish().unwrap()).unwrap();
     let borrowed = VortexRdfStore::from_built(borrowed.finish().unwrap()).unwrap();

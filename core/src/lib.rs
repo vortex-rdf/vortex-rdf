@@ -55,6 +55,7 @@ pub(crate) mod debug;
 mod error;
 pub mod io;
 mod kernels;
+pub(crate) mod observe;
 mod session;
 // The quad store. Its public items, like `error`'s, are re-exported below and
 // reached at the crate root only.

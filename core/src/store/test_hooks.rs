@@ -6,6 +6,11 @@
 //! pending filter, the dictionary's residency — is asserted through
 //! [`view_statistics`](VortexRdfStore::view_statistics) and
 //! [`dict_reader`](VortexRdfStore::dict_reader).
+//!
+//! The values a test forces on production code (a code or row-id base, a
+//! term cap, a split limit, a failing cut) are here too, each a guard of
+//! [`Override`]. Which points production code reached is recorded as events
+//! instead ([`crate::observe`]).
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -31,17 +36,6 @@ use crate::store::{DictSnapshot, RowId, TermCode, VortexRdfStore};
 pub(crate) use crate::store::view::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
 thread_local! {
-    /// How many times this thread gathered a store's live rows into raw quads
-    /// (`live_raw_quads`, every rebuild's first step). Thread-local because the
-    /// tests share a process and run on the current-thread runtime, so a test
-    /// reads only its own gathers.
-    static GATHERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-
-    /// How many row ids this thread's in-memory resolutions decoded from an
-    /// index component's `rid` column (`sorted_row_ids`). Thread-local like
-    /// `GATHERS`.
-    static DECODED_RIDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-
     /// The code the dictionaries built or opened on this thread give their
     /// first term, while a [`CodeBase`] guard is live.
     static CODE_BASE: Cell<Option<TermCode>> = const { Cell::new(None) };
@@ -59,9 +53,10 @@ thread_local! {
 /// A thread's override of a value production code reads, live while the
 /// guard is: `cell` holds the value, `None` meaning the production one, and
 /// dropping the guard restores what it replaced, so guards nest. Every
-/// guard of the test seams ([`RowIdBase`], [`CodeBase`], [`TermCap`], the
-/// driver's `ForcedLimit`, the rechunk's `FailingCut`) is one. Thread-local
-/// like `GATHERS`, for the same reason.
+/// guard of the test seams ([`RowIdBase`], [`CodeBase`], [`TermCap`],
+/// [`ForcedLimit`], [`FailingCut`]) is one. Thread-local because the tests
+/// share a process and run on the current-thread runtime, so a test sees
+/// only its own.
 pub(crate) struct Override<T: Copy + 'static> {
     cell: &'static LocalKey<Cell<Option<T>>>,
     replaced: Option<T>,
@@ -80,6 +75,71 @@ impl<T: Copy + 'static> Override<T> {
 impl<T: Copy + 'static> Drop for Override<T> {
     fn drop(&mut self) {
         self.cell.set(self.replaced);
+    }
+}
+
+thread_local! {
+    /// The split limit forced on this thread's row scans, while a
+    /// [`ForcedLimit`] guard is live.
+    static SPLIT_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+
+    /// The cuts this thread's `rechunk` iterators make before one fails,
+    /// while a [`FailingCut`] guard is live.
+    static CUTS_BEFORE_FAILURE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The split limit a [`ForcedLimit`] forced on this thread's row scans.
+pub(crate) fn forced_split_limit() -> Option<usize> {
+    SPLIT_LIMIT.get()
+}
+
+/// While alive, this thread's row scans run inline up to `limit` splits and
+/// spawn above it, in place of the production limit. Dropping it restores
+/// the limit it replaced ([`Override`]).
+pub(crate) struct ForcedLimit {
+    _guard: Override<usize>,
+}
+
+impl ForcedLimit {
+    /// Force the split limit to `limit` until the guard drops.
+    pub(crate) fn set(limit: usize) -> Self {
+        Self {
+            _guard: Override::set(&SPLIT_LIMIT, limit),
+        }
+    }
+}
+
+/// One cut of this thread's `rechunk` iterators: an error when it is the cut
+/// a [`FailingCut`] names.
+pub(crate) fn rechunk_cut() -> crate::error::Result<()> {
+    match CUTS_BEFORE_FAILURE.get() {
+        Some(0) => {
+            CUTS_BEFORE_FAILURE.set(None);
+            Err(crate::error::VortexRdfError::Vortex(
+                vortex_error::vortex_err!("a cut failed (test hook)"),
+            ))
+        }
+        Some(n) => {
+            CUTS_BEFORE_FAILURE.set(Some(n - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+/// While alive, the cut this thread's `rechunk` iterators make `n` cuts from
+/// now (`0`: the next) fails. Dropping it restores the failure it replaced
+/// ([`Override`]).
+pub(crate) struct FailingCut {
+    _guard: Override<usize>,
+}
+
+impl FailingCut {
+    /// Fail the cut `n` cuts from now.
+    pub(crate) fn after(n: usize) -> Self {
+        Self {
+            _guard: Override::set(&CUTS_BEFORE_FAILURE, n),
+        }
     }
 }
 
@@ -171,30 +231,6 @@ impl TermCap {
             _guard: Override::set(&TERM_CAP, cap),
         }
     }
-}
-
-/// Record `rows` row ids decoded from a component's `rid` column (called by
-/// `sorted_row_ids`).
-pub(crate) fn note_decoded_rids(rows: usize) {
-    DECODED_RIDS.with(|decoded| decoded.set(decoded.get() + rows));
-}
-
-/// The row ids this thread has decoded from component `rid` columns so far.
-pub(crate) fn decoded_rids() -> usize {
-    DECODED_RIDS.with(std::cell::Cell::get)
-}
-
-/// Record one gather of live rows (called by `live_raw_quads`).
-pub(crate) fn note_gather() {
-    GATHERS.with(|gathers| gathers.set(gathers.get() + 1));
-}
-
-/// The gathers of live rows this thread has made so far: a refusal that comes
-/// before any work leaves it unchanged. (Read by the file-backed compaction
-/// tests.)
-#[cfg(feature = "file-io")]
-pub(crate) fn gathers() -> usize {
-    GATHERS.with(std::cell::Cell::get)
 }
 
 #[cfg(feature = "file-io")]

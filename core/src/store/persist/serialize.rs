@@ -8,6 +8,8 @@ use crate::store::FileBase;
 use crate::store::builders::BuiltArray;
 use crate::store::layouts::ResolvedLayout;
 
+#[cfg(feature = "file-io")]
+use crate::observe::observe;
 use crate::store::VortexRdfStore;
 #[cfg(feature = "file-io")]
 use crate::store::persist::open::scanned_index_components;
@@ -132,8 +134,7 @@ impl VortexRdfStore {
     pub async fn to_bytes(&self) -> Result<Vec<u8>> {
         #[cfg(feature = "file-io")]
         if let Some(bytes) = self.untouched_file_bytes() {
-            #[cfg(test)]
-            serialize_hooks::note_copied();
+            observe!(BytesCopied);
             return Ok(bytes.as_slice().to_vec());
         }
         let parts = self.to_serializable_parts().await?;
@@ -159,26 +160,5 @@ impl VortexRdfStore {
         let untouched =
             self.quads.is_unrefined() && self.quads.deleted.is_none() && self.tail.is_none();
         if untouched { file.bytes() } else { None }
-    }
-}
-
-/// Test hook: how many `to_bytes` calls this thread answered by copying the
-/// store's file.
-#[cfg(test)]
-pub(crate) mod serialize_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static COPIED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one store serialized as a copy of its file.
-    pub(super) fn note_copied() {
-        COPIED.set(COPIED.get() + 1);
-    }
-
-    /// The stores serialized as copies of their files on this thread so far.
-    pub(crate) fn copied() -> usize {
-        COPIED.get()
     }
 }

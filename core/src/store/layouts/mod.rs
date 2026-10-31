@@ -37,6 +37,7 @@ pub(crate) mod typed_object;
 
 pub(crate) use self::decode::ChunkDecode;
 pub(crate) use self::dictionary::DictAccess;
+use crate::observe::observe;
 use crate::store::schema::{
     CODE_PTYPE, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_S, PRIMARY_COLUMNS,
     QuadColumn, TermCode,
@@ -457,8 +458,7 @@ impl PatternCodes {
             return cached;
         }
         term.write_nt(&mut self.scratch);
-        #[cfg(test)]
-        resolve_hooks::note_resolved();
+        observe!(TermResolved);
         let resolved = f(&self.scratch);
         self.roles[role] = Some(resolved);
         resolved
@@ -699,26 +699,5 @@ mod tests {
             Constraints::Eq(eqs) => assert_eq!(eqs, vec![(COL_S, Scalar::from(7 as TermCode))]),
             Constraints::AlwaysFalse => panic!("a seeded role compiles to an equality"),
         }
-    }
-}
-
-/// Test hook: how many bound terms this thread's match preludes looked up in
-/// a resident dictionary.
-#[cfg(test)]
-pub(crate) mod resolve_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static RESOLVED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one term looked up.
-    pub(super) fn note_resolved() {
-        RESOLVED.set(RESOLVED.get() + 1);
-    }
-
-    /// The terms looked up on this thread so far.
-    pub(crate) fn resolved() -> usize {
-        RESOLVED.get()
     }
 }

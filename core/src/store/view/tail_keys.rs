@@ -17,6 +17,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, VortexSessionExecute, match_each_unsigned_integer_ptype};
 
 use crate::error::Result;
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{StrColReader, field_as, unsigned_value};
 use crate::store::layouts::ResolvedLayout;
@@ -172,8 +173,7 @@ impl KeyValue<'_> {
 /// order: the hash of its values in `columns`, unsigned integers (the
 /// object's kind) as numbers and anything else as the string column it is.
 fn row_keys(rows: &ArrayRef, columns: &[&'static str]) -> Result<Vec<u64>> {
-    #[cfg(test)]
-    key_hooks::note_keyed(rows.len());
+    observe!(TailKeyed(rows.len()));
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let rows = rows.clone().execute::<StructArray>(&mut ctx)?;
     let mut hashers = vec![FxHasher::default(); rows.len()];
@@ -216,24 +216,4 @@ fn merged(older: &[(u64, RowId)], newer: &[(u64, RowId)]) -> Vec<(u64, RowId)> {
     out.extend_from_slice(&older[i..]);
     out.extend_from_slice(&newer[j..]);
     out
-}
-
-/// Test hook: how many tail rows this thread keyed.
-#[cfg(test)]
-pub(crate) mod key_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static KEYED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record `rows` rows keyed.
-    pub(super) fn note_keyed(rows: usize) {
-        KEYED.set(KEYED.get() + rows);
-    }
-
-    /// The tail rows keyed on this thread so far.
-    pub(crate) fn keyed_rows() -> usize {
-        KEYED.get()
-    }
 }

@@ -212,7 +212,6 @@ fn probe_path_quads(n_subjects: usize) -> Vec<Quad> {
 /// row scan.
 #[tokio::test]
 async fn test_file_backed_subject_chunk_probe_matches_memory() {
-    use crate::store::scan::file_scans::scan_hooks;
     let quads = probe_path_quads(2000);
     let (_dir, path) = write_store_file(
         quads.clone(),
@@ -249,11 +248,11 @@ async fn test_file_backed_subject_chunk_probe_matches_memory() {
         ] {
             let got = matched_view(&store, Some(&s), pp, po, pg).await;
             let want = matched_view(&memory, Some(&s), pp, po, pg).await;
-            let scans = scan_hooks::scans();
+            let rec = Recorder::start();
             let got = view_strings(&got).await;
             assert_eq!(
-                scan_hooks::scans(),
-                scans,
+                rec.count(&Event::RowScan),
+                0,
                 "scanned on subject {s} pattern ({pp:?}, {po:?}, {pg:?})"
             );
             assert_eq!(
@@ -863,7 +862,7 @@ async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], s
 /// columns pack at their full width without patches, does.
 #[tokio::test]
 async fn test_patched_object_codes_compare_through_the_kernel() {
-    use crate::kernels::hooks::{self, Kernel};
+    use crate::kernels::Kernel;
 
     // 4,096 literal objects, each 8,192-row zone holding its own 1,024 of
     // them, scattered through the zone so that no run repeats one; in the
@@ -889,7 +888,7 @@ async fn test_patched_object_codes_compare_through_the_kernel() {
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     let memory = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
-    hooks::take();
+    let rec = Recorder::start();
     for (object, predicate) in [
         (plain_literal("v0000"), None),
         (plain_literal("v0000"), Some(iri("p0"))),
@@ -921,7 +920,7 @@ async fn test_patched_object_codes_compare_through_the_kernel() {
         assert_eq!(got, want, "{label}: the rows");
     }
     assert!(
-        hooks::take().contains(&Kernel::CompareSlicedPatches),
+        rec.count(&Event::Kernel(Kernel::CompareSlicedPatches)) > 0,
         "the object leaf's slices compared through the kernel"
     );
 }
@@ -933,7 +932,7 @@ async fn test_patched_object_codes_compare_through_the_kernel() {
 /// ([`crate::kernels`]), and answers as the store built in memory does.
 #[tokio::test]
 async fn test_run_end_subjects_filter_through_the_kernel() {
-    use crate::kernels::hooks::{self, Kernel};
+    use crate::kernels::Kernel;
 
     let gd = iri_graph("gd");
     let quads: Vec<Quad> = (0..16_384usize)
@@ -954,7 +953,7 @@ async fn test_run_end_subjects_filter_through_the_kernel() {
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     let memory = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
-    hooks::take();
+    let rec = Recorder::start();
     for probe in [
         Probe::new(None, None, None, Some(gd.clone())),
         Probe::new(None, Some(iri("p0")), None, Some(gd)),
@@ -980,7 +979,7 @@ async fn test_run_end_subjects_filter_through_the_kernel() {
         assert_eq!(got, want, "{label}: the rows");
     }
     assert!(
-        hooks::take().contains(&Kernel::RunEndFilter),
+        rec.count(&Event::Kernel(Kernel::RunEndFilter)) > 0,
         "the subject column filtered through the kernel"
     );
 }

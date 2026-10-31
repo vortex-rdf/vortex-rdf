@@ -5,8 +5,7 @@
 
 use super::*;
 use crate::store::layouts::ResolvedLayout;
-use crate::store::query::matching::tail_hooks;
-use crate::store::view::tail_keys::{TailKeys, key_hooks};
+use crate::store::view::tail_keys::TailKeys;
 use vortex_array::scalar::Scalar;
 
 /// A quad `http://example.org/{s} p9 {o}` in the default graph.
@@ -28,26 +27,37 @@ fn quad_with(s: &str, o: Term) -> Quad {
 /// selection holds.
 #[tokio::test]
 async fn test_tail_keys_answer_fully_bound_matches() {
+    // The tail rows keyed, and the tail matches made by a scan, that `rec`
+    // saw.
+    let rows_keyed = |rec: &Recorder| -> usize {
+        rec.picked(|e| match e {
+            Event::TailKeyed(rows) => Some(*rows),
+            _ => None,
+        })
+        .iter()
+        .sum()
+    };
+    let scanned = |rec: &Recorder| rec.count(&Event::TailMatch { keyed: false });
     let fresh = appended_quads(1_100);
     let absent = quad_with("tail-absent", plain_literal("late"));
     for layout in LAYOUTS {
-        let (keyed, scanned) = (tail_hooks::keyed(), tail_hooks::scanned());
+        let matches = Recorder::start();
         let mut store = built_store(fixture_quads(), layout, vec![]).await;
-        let rows_keyed = key_hooks::keyed_rows();
+        let mut keys = Recorder::start();
         for quad in &fresh[..70] {
             store = store.add_quad(quad.clone()).await.unwrap();
         }
-        assert_eq!(key_hooks::keyed_rows() - rows_keyed, 70, "{layout:?}");
+        assert_eq!(rows_keyed(&keys), 70, "{layout:?}");
         let store = store.add_quads(fresh[70..].iter().cloned()).await.unwrap();
-        assert_eq!(
-            key_hooks::keyed_rows() - rows_keyed,
-            fresh.len(),
-            "{layout:?}"
-        );
+        assert_eq!(rows_keyed(&keys), fresh.len(), "{layout:?}");
         assert_eq!(store.tail_len(), fresh.len(), "{layout:?}");
         // The first add had no tail to look in; every later presence check
         // read the keys.
-        assert_eq!(tail_hooks::keyed() - keyed, fresh.len() - 1, "{layout:?}");
+        assert_eq!(
+            matches.count(&Event::TailMatch { keyed: true }),
+            fresh.len() - 1,
+            "{layout:?}"
+        );
 
         for quad in fresh.iter().step_by(97) {
             assert!(store.contains(quad).await.unwrap(), "{layout:?} {quad}");
@@ -62,13 +72,9 @@ async fn test_tail_keys_answer_fully_bound_matches() {
         let doomed = &fresh[5];
         let deleted = store.delete_quad(doomed).await.unwrap();
         assert!(!deleted.contains(doomed).await.unwrap(), "{layout:?}");
-        let rows_keyed = key_hooks::keyed_rows();
+        keys.take();
         let restored = deleted.add_quad(doomed.clone()).await.unwrap();
-        assert_eq!(
-            key_hooks::keyed_rows() - rows_keyed,
-            fresh.len(),
-            "{layout:?}"
-        );
+        assert_eq!(rows_keyed(&keys), fresh.len(), "{layout:?}");
         assert_eq!(restored.size().await.unwrap(), size, "{layout:?}");
         for quad in fresh.iter().step_by(97).chain([doomed]) {
             assert!(restored.contains(quad).await.unwrap(), "{layout:?} {quad}");
@@ -76,7 +82,7 @@ async fn test_tail_keys_answer_fully_bound_matches() {
         let twice = restored.add_quads(fresh.iter().cloned()).await.unwrap();
         assert_eq!(twice.size().await.unwrap(), size, "{layout:?}");
 
-        assert_eq!(tail_hooks::scanned(), scanned, "{layout:?}");
+        assert_eq!(scanned(&matches), 0, "{layout:?}");
 
         // A view's tail holds only the rows its match kept: a match of the
         // subject alone, which compares the tail's rows.
@@ -85,7 +91,7 @@ async fn test_tail_keys_answer_fully_bound_matches() {
         let view = matched_view(&store, Some(&tail1), None, None, None).await;
         assert!(view.contains(&fresh[1]).await.unwrap(), "{layout:?}");
         assert!(!view.contains(&fresh[2]).await.unwrap(), "{layout:?}");
-        assert_eq!(tail_hooks::scanned(), scanned + 1, "{layout:?}");
+        assert_eq!(scanned(&matches), 1, "{layout:?}");
     }
 }
 

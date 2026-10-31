@@ -814,8 +814,6 @@ fn test_parts_stream_requires_dictionary_beside_code_rows() {
 /// each reads back with its own rows.
 #[tokio::test]
 async fn test_untouched_file_store_to_bytes_copies_its_file() {
-    use crate::store::persist::serialize::serialize_hooks;
-
     let quads = modular_quads(60, 3, 4);
     for layout in LAYOUTS {
         let (_dir, path) =
@@ -823,12 +821,12 @@ async fn test_untouched_file_store_to_bytes_copies_its_file() {
         let file_bytes = std::fs::read(&path).unwrap();
         let store = VortexRdfStore::from_file(&path).await.unwrap();
 
-        let copied = serialize_hooks::copied();
+        let rec = Recorder::start();
         let unconstrained = matched_view(&store, None, None, None, None).await;
         for view in [&store, &unconstrained] {
             assert_eq!(view.to_bytes().await.unwrap(), file_bytes, "{layout:?}");
         }
-        assert_eq!(serialize_hooks::copied() - copied, 2, "{layout:?}");
+        assert_eq!(rec.count(&Event::BytesCopied), 2, "{layout:?}");
 
         let p1 = iri("p1");
         let narrowed = matched_view(&store, None, Some(&p1), None, None).await;
@@ -844,6 +842,6 @@ async fn test_untouched_file_store_to_bytes_copies_its_file() {
             let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
             assert_eq!(reread.size().await.unwrap(), rows, "{layout:?} {tag}");
         }
-        assert_eq!(serialize_hooks::copied() - copied, 2, "{layout:?}");
+        assert_eq!(rec.count(&Event::BytesCopied), 2, "{layout:?}");
     }
 }

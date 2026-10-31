@@ -6,7 +6,6 @@
 
 use super::*;
 use crate::store::builders::build_parts_from_raws;
-use crate::store::layouts::dictionary::ingest::rebuild_hooks;
 
 /// The base of the mutated stores: twelve quads over subjects `s01..s12`,
 /// two predicates and three objects, half in a named graph.
@@ -110,13 +109,13 @@ async fn test_a_dictionary_rebuild_from_codes_writes_the_spelled_rebuild() {
             .collect();
         let expected = spelled_bytes(&live, &indexes).await;
 
-        let rebuilt = rebuild_hooks::rebuilt();
+        let rec = Recorder::start();
         assert!(
             store.to_bytes().await.unwrap() == expected,
             "{indexes:?}: to_bytes"
         );
         let compacted = store.compact().await.unwrap();
-        assert_eq!(rebuild_hooks::rebuilt() - rebuilt, 2, "{indexes:?}");
+        assert_eq!(rec.count(&Event::DictionaryRebuilt), 2, "{indexes:?}");
         assert!(
             compacted.to_bytes().await.unwrap() == expected,
             "{indexes:?}: compact"
@@ -147,9 +146,9 @@ async fn test_a_rebuild_from_codes_past_u32() {
         .await
         .unwrap();
     let live: Vec<Quad> = base.iter().cloned().chain(appended).collect();
-    let rebuilt = rebuild_hooks::rebuilt();
+    let rec = Recorder::start();
     let compacted = store.compact().await.unwrap();
-    assert_eq!(rebuild_hooks::rebuilt() - rebuilt, 1);
+    assert_eq!(rec.count(&Event::DictionaryRebuilt), 1);
     assert!(compacted.to_bytes().await.unwrap() == spelled_bytes(&live, &vec![]).await);
 }
 
@@ -173,9 +172,9 @@ async fn test_rebuilds_of_unsorted_and_file_backed_stores() {
         .add_quads(appended.clone())
         .await
         .unwrap();
-    let rebuilt = rebuild_hooks::rebuilt();
+    let rec = Recorder::start();
     assert!(loaded.compact().await.unwrap().to_bytes().await.unwrap() == expected);
-    assert_eq!(rebuild_hooks::rebuilt() - rebuilt, 1, "loaded in memory");
+    assert_eq!(rec.count(&Event::DictionaryRebuilt), 1, "loaded in memory");
 
     let (_dir, path) = write_store_file(base.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let file = VortexRdfStore::from_file(&path).await.unwrap();
@@ -184,7 +183,11 @@ async fn test_rebuilds_of_unsorted_and_file_backed_stores() {
         .add_quads(appended)
         .await
         .unwrap();
-    let rebuilt = rebuild_hooks::rebuilt();
+    let rec = Recorder::start();
     assert!(view.compact().await.unwrap().to_bytes().await.unwrap() == expected);
-    assert_eq!(rebuild_hooks::rebuilt(), rebuilt, "file-backed dictionary");
+    assert_eq!(
+        rec.count(&Event::DictionaryRebuilt),
+        0,
+        "file-backed dictionary"
+    );
 }

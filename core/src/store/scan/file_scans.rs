@@ -20,6 +20,7 @@ use crate::io::read::{
     available_parallelism, collect_scan, collect_scan_spawned, collect_whole_scan, inline_splits,
     spawned_splits,
 };
+use crate::observe::observe;
 use crate::store::schema::RowId;
 use crate::store::view::selection::RowSelection;
 
@@ -67,81 +68,10 @@ const MAX_INLINE_SPLITS: usize = 42;
 /// what a test forced on this thread.
 fn max_inline_splits() -> usize {
     #[cfg(test)]
-    if let Some(limit) = driver_hooks::forced_limit() {
+    if let Some(limit) = crate::store::test_hooks::forced_split_limit() {
         return limit;
     }
     MAX_INLINE_SPLITS
-}
-
-/// Test hooks for the driver choice: a per-thread override of the split limit,
-/// and the driver a scan ran under, read off how many of its splits were
-/// spawned.
-#[cfg(test)]
-pub(crate) mod driver_hooks {
-    use std::cell::Cell;
-
-    use super::ScanDriver;
-    use crate::store::test_hooks::Override;
-
-    thread_local! {
-        static LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    /// The limit forced on this thread, if any.
-    pub(super) fn forced_limit() -> Option<usize> {
-        LIMIT.get()
-    }
-
-    /// Forces the split limit to `limit` on this thread until dropped.
-    pub(crate) struct ForcedLimit {
-        _guard: Override<usize>,
-    }
-
-    impl ForcedLimit {
-        pub(crate) fn set(limit: usize) -> Self {
-            Self {
-                _guard: Override::set(&LIMIT, limit),
-            }
-        }
-    }
-
-    /// The splits spawned on this thread since the last call.
-    pub(crate) fn take_spawned() -> usize {
-        crate::io::read::spawn_probe::take()
-    }
-
-    /// The driver a scan of `splits` split futures ran under, given how many
-    /// of them were spawned: none is the inline driver, all of them the
-    /// spawned one. Anything between is neither, and fails the test.
-    pub(crate) fn driver_of(splits: usize, spawned: usize) -> ScanDriver {
-        match spawned {
-            0 => ScanDriver::Inline,
-            n if n == splits => ScanDriver::Spawned,
-            n => panic!("{n} of {splits} splits were spawned: neither driver"),
-        }
-    }
-}
-
-/// Test hook: how many row scans this thread ran, collected whole
-/// ([`read_all_rows`]) or streamed ([`stream_rows`], the quad decode's scan
-/// stream); a read by id ([`ExactRead`]) runs none.
-#[cfg(test)]
-pub(crate) mod scan_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static SCANS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one row scan.
-    pub(crate) fn note() {
-        SCANS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The row scans run on this thread so far.
-    pub(crate) fn scans() -> usize {
-        SCANS.with(Cell::get)
-    }
 }
 
 /// Every row a row scan yields, in one in-memory array in the scan's row
@@ -154,8 +84,7 @@ pub(crate) mod scan_hooks {
 /// the workers; an index child's row-id scan goes through
 /// [`read_index_row_ids`] instead.
 pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
-    #[cfg(test)]
-    scan_hooks::note();
+    observe!(RowScan);
     let dtype = scan.dtype()?;
     let window = scan.concurrency() * available_parallelism();
     collect_row_splits(dtype, scan.build()?, window).await
@@ -190,8 +119,7 @@ where
 pub(crate) fn stream_rows(
     scan: ScanBuilder<ArrayRef>,
 ) -> Result<BoxStream<'static, Result<ArrayRef>>> {
-    #[cfg(test)]
-    scan_hooks::note();
+    observe!(RowScan);
     let window = scan.concurrency() * available_parallelism();
     let tasks = scan.build()?;
     let splits = match ScanDriver::for_row_scan(tasks.len()) {
@@ -307,6 +235,9 @@ mod tests {
     use super::*;
     use vortex_array::expr::root;
 
+    use crate::observe::{Event, Recorder};
+    use crate::store::test_hooks::ForcedLimit;
+
     use crate::store::persist::native_file::NativeStoreFile;
     use crate::store::scan::file_exprs::QUAD_SCOPE;
     use crate::store::schema::TermCode;
@@ -358,6 +289,17 @@ mod tests {
         columns
     }
 
+    /// The driver a scan of `splits` split futures ran under, given how many
+    /// of them were spawned: none is the inline driver, all of them the
+    /// spawned one. Anything between is neither, and fails the test.
+    fn driver_of(splits: usize, spawned: usize) -> ScanDriver {
+        match spawned {
+            0 => ScanDriver::Inline,
+            n if n == splits => ScanDriver::Spawned,
+            n => panic!("{n} of {splits} splits were spawned: neither driver"),
+        }
+    }
+
     /// What `read_all_rows` did with a scan: its split count, how many of
     /// them it spawned, and the rows it returned.
     struct Driven {
@@ -369,7 +311,7 @@ mod tests {
     impl Driven {
         /// The driver that ran the scan, read off the splits it spawned.
         fn driver(&self) -> ScanDriver {
-            driver_hooks::driver_of(self.splits, self.spawned)
+            driver_of(self.splits, self.spawned)
         }
     }
 
@@ -386,11 +328,11 @@ mod tests {
     /// one to read.
     async fn drive_scan(scan: impl Fn() -> ScanBuilder<ArrayRef>) -> Driven {
         let splits = scan().build().unwrap().len();
-        driver_hooks::take_spawned();
+        let recorder = Recorder::start();
         let rows = read_all_rows(scan()).await.unwrap();
         Driven {
             splits,
-            spawned: driver_hooks::take_spawned(),
+            spawned: recorder.count(&Event::SplitSpawned),
             rows: quad_codes(rows),
         }
     }
@@ -407,7 +349,7 @@ mod tests {
     impl Streamed {
         /// The driver that ran the scan, read off the splits it spawned.
         fn driver(&self) -> ScanDriver {
-            driver_hooks::driver_of(self.splits, self.spawned)
+            driver_of(self.splits, self.spawned)
         }
     }
 
@@ -416,11 +358,11 @@ mod tests {
         use futures::TryStreamExt as _;
 
         let splits = scan().build().unwrap().len();
-        driver_hooks::take_spawned();
+        let recorder = Recorder::start();
         let chunks: Vec<ArrayRef> = stream_rows(scan()).unwrap().try_collect().await.unwrap();
         Streamed {
             splits,
-            spawned: driver_hooks::take_spawned(),
+            spawned: recorder.count(&Event::SplitSpawned),
             chunk_rows: chunks.iter().map(|chunk| chunk.len()).collect(),
             rows: chunk_code_columns(chunks),
         }
@@ -451,7 +393,7 @@ mod tests {
 
         // Splits of 16 rows: four futures for the driver to run, the last short.
         for (limit, driver) in [(4, ScanDriver::Inline), (3, ScanDriver::Spawned)] {
-            let _limit = driver_hooks::ForcedLimit::set(limit);
+            let _limit = ForcedLimit::set(limit);
             let driven = drive(&file, 0..50, 16, true).await;
             assert_eq!(driven.splits, 4);
             assert_eq!(
@@ -465,7 +407,7 @@ mod tests {
         // An unordered scan is collected in split order as well, by either
         // driver: the flag relaxes what a caller may rely on, not what it gets.
         for (limit, driver) in [(4, ScanDriver::Inline), (0, ScanDriver::Spawned)] {
-            let _limit = driver_hooks::ForcedLimit::set(limit);
+            let _limit = ForcedLimit::set(limit);
             let driven = drive(&file, 0..50, 16, false).await;
             assert_eq!(driven.driver(), driver, "unordered, limit {limit}");
             assert_eq!(driven.rows, whole.rows, "unordered, {driver:?}");
@@ -511,8 +453,9 @@ mod tests {
 
         let (rows, spawned) = std::thread::spawn(move || {
             futures::executor::block_on(async {
+                let recorder = Recorder::start();
                 let rows = read_all_rows(scan).await.unwrap();
-                (quad_codes(rows), driver_hooks::take_spawned())
+                (quad_codes(rows), recorder.count(&Event::SplitSpawned))
             })
         })
         .join()
@@ -550,7 +493,7 @@ mod tests {
         };
 
         for (limit, driver) in [(4, ScanDriver::Inline), (3, ScanDriver::Spawned)] {
-            let _limit = driver_hooks::ForcedLimit::set(limit);
+            let _limit = ForcedLimit::set(limit);
             for (tag, filter, chunk_rows) in [
                 ("unfiltered", None, vec![16, 16, 16, 2]),
                 ("filtered", Some(&filter), vec![1]),
@@ -581,8 +524,9 @@ mod tests {
         let (chunk_rows, rows, spawned) = std::thread::spawn(move || {
             use futures::TryStreamExt as _;
 
-            let _limit = driver_hooks::ForcedLimit::set(0);
+            let _limit = ForcedLimit::set(0);
             futures::executor::block_on(async {
+                let recorder = Recorder::start();
                 let chunks: Vec<ArrayRef> = stream_rows(no_runtime)
                     .unwrap()
                     .try_collect()
@@ -592,7 +536,7 @@ mod tests {
                 (
                     chunk_rows,
                     chunk_code_columns(chunks),
-                    driver_hooks::take_spawned(),
+                    recorder.count(&Event::SplitSpawned),
                 )
             })
         })
@@ -609,14 +553,14 @@ mod tests {
     #[tokio::test]
     async fn read_index_row_ids_drives_inline_above_the_split_limit() {
         let (_dir, file) = crate::tests::mapped_file(50, vec![]).await;
-        let _limit = driver_hooks::ForcedLimit::set(1);
+        let _limit = ForcedLimit::set(1);
 
-        driver_hooks::take_spawned();
+        let recorder = Recorder::start();
         let rows = read_index_row_ids(scan_of(&file, 0..50, 16, false))
             .await
             .unwrap();
         assert_eq!(
-            driver_hooks::take_spawned(),
+            recorder.count(&Event::SplitSpawned),
             0,
             "no split of it was spawned"
         );

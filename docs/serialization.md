@@ -54,7 +54,7 @@ A builder hands these back in one of two shapes
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L66), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L112) to name the builder | either | in-memory store |
-| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L132) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
+| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L134) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
 | Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L254) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
@@ -315,7 +315,7 @@ to; a build with no output path (an in-memory store, or
 [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) into a caller's
 writer), or one whose file name would make the directory's name longer than
 255 bytes, uses `.vortex-rdf.spill-<uuid>`. The parent directory is resolved in
-this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L99)):
+this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L100)):
 the `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (a
 serialization to a file,
 [`quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) and so the CLI
@@ -336,7 +336,7 @@ full) or to a writable directory (any other failure).
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L48)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L49)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |
@@ -362,13 +362,13 @@ term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
 FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage/mod.rs#L265)):
 one symbol table is trained on the whole column and the terms are compressed in
-independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L36)
+independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L37)
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
 Which pipeline built the dictionary decides how a term reaches its code during
 encoding: a rebuild looks it up in a term→code map borrowed from the live quads
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L71)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L72)),
 while the interning builds never look a term up again: their quads hold term
 ids, remapped to ranks, and a rank's code is its position. Either way the
 mapping exists only for the build; stores keep the columnar dictionary alone.
@@ -379,7 +379,7 @@ mapping exists only for the build; stores keep the columnar dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L120),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L121),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |
@@ -477,7 +477,7 @@ flowchart TD
   of every component's, in inventory order; the descriptors and `quads_sorted`
   are encoded into the root layout's metadata ([file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)).
 - **Provenance.** `quads_sorted` is read off the primary's own `s` stamp when a
-  store re-serializes ([`into_stream`](../core/src/store/persist/serialize.rs#L27)) and is
+  store re-serializes ([`into_stream`](../core/src/store/persist/serialize.rs#L29)) and is
   `true` by construction for a builder's stream; each component's `sorted` flag
   travels on its descriptor.
 
@@ -487,7 +487,7 @@ a builder's chunk stream (files, compaction; a file is written through a
 into place, so a failed write leaves no partial file and the previous store
 untouched, and on Unix a store that has the old file mapped keeps reading
 it), or a store's split parts as one chunk
-([`into_stream`](../core/src/store/persist/serialize.rs#L27): `to_bytes`, the
+([`into_stream`](../core/src/store/persist/serialize.rs#L29): `to_bytes`, the
 bindings' exchange bytes). On the wire the two are the same container.
 
 **Replacing a file.** [`PendingStore`](../core/src/io/pending.rs#L77) is the one
@@ -545,7 +545,7 @@ store's *compressed-resident* form (through
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L77)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L78)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
@@ -587,7 +587,7 @@ that file, so `to_bytes` copies the mapped bytes as they are: no row is read,
 no part rebuilt, no compression run, and the copy reads back as the file
 does, unknown children included. Any other store is written from its parts.
 
-[`to_serializable_parts`](../core/src/store/persist/serialize.rs#L88) decides what a view's
+[`to_serializable_parts`](../core/src/store/persist/serialize.rs#L90) decides what a view's
 parts are:
 
 | The view is… | Rows | Components | Dictionary |
@@ -601,7 +601,7 @@ the one compaction runs too) works on codes under the Dictionary layout with
 its dictionary in memory: the live base rows are read as codes, only the
 distinct terms they use are decoded, once each, and merged with the tail's
 into the fresh dictionary, and the rows sort as integers once their codes are
-remapped ([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L96)).
+remapped ([`rebuild_from_codes`](../core/src/store/layouts/dictionary/ingest.rs#L97)).
 Under the string layouts, or a dictionary left in its file, the re-sort
 ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L107)) sorts
 the small tail alone and merges it into the already-sorted base in a linear

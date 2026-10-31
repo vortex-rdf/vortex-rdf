@@ -34,6 +34,7 @@ use vortex_mask::Mask;
 
 use super::COL_RID;
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
@@ -285,8 +286,7 @@ impl InMemoryServePlan {
         let Some(columns) = self.live_point_columns(deleted) else {
             return Ok(None);
         };
-        #[cfg(test)]
-        serve_hooks::note_point_read();
+        observe!(ServePointRead);
         let len = columns[0].len();
         Ok(Some(
             StructArray::try_new(
@@ -338,27 +338,5 @@ impl InMemoryServePlan {
             Ok(rows) => self.decode.decode_columns(&rows, deleted),
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
         }
-    }
-}
-
-/// Test hook: how many served in-memory runs this thread read point by point
-/// at their global positions ([`InMemoryServePlan::point_read_run_rows`]), not
-/// by slicing the component.
-#[cfg(test)]
-pub(crate) mod serve_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static POINT_READS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Record one run read point by point.
-    pub(super) fn note_point_read() {
-        POINT_READS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// The runs read point by point on this thread so far.
-    pub(crate) fn point_reads() -> usize {
-        POINT_READS.with(Cell::get)
     }
 }
