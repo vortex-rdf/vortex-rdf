@@ -408,14 +408,9 @@ pub(crate) struct FileServePlan {
     /// (see `BoundExprMemo`).
     child: ChildReader,
     constraints: Vec<(&'static str, Scalar)>,
-    /// The lazily bound (projection, filter) pair, shared across clones so
-    /// the first reader's bind serves them all.
-    bound: Arc<
-        std::sync::OnceLock<(
-            vortex_array::expr::BoundExpression,
-            vortex_array::expr::BoundExpression,
-        )>,
-    >,
+    /// What the plan fills on first use, shared across clones so the first
+    /// reader's work serves them all ([`PlanCells`]): one allocation a plan.
+    cells: Arc<PlanCells>,
     /// The child rows the view covers, when the resolution located them by
     /// chunk probes: exactly constrained rows, the located run or the part of
     /// it a window cut, letting a small run be point-read
@@ -430,9 +425,20 @@ pub(crate) struct FileServePlan {
     /// The rows a keep kept of the range, in the child's order; when set,
     /// the view covers these and not the whole range.
     kept: Option<Arc<ServedRows>>,
+}
+
+/// What a [`FileServePlan`] fills on first use, behind one `Arc` its clones
+/// share.
+#[derive(Default)]
+struct PlanCells {
+    /// The lazily bound (projection, filter) pair.
+    bound: std::sync::OnceLock<(
+        vortex_array::expr::BoundExpression,
+        vortex_array::expr::BoundExpression,
+    )>,
     /// An unlocated run's rows, read once by row index for its first
-    /// narrowing ([`run_rows`](Self::run_rows)), shared across clones.
-    run_rows_cell: Arc<std::sync::OnceLock<ServedRows>>,
+    /// narrowing ([`run_rows`](FileServePlan::run_rows)).
+    run_rows: std::sync::OnceLock<ServedRows>,
 }
 
 /// The fewest rows a located run's scan split carries: below this the
@@ -465,11 +471,10 @@ impl FileServePlan {
             decode,
             child,
             constraints,
-            bound: Arc::new(std::sync::OnceLock::new()),
+            cells: Arc::default(),
             run: row_range.clone(),
             row_range,
             kept: None,
-            run_rows_cell: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -479,7 +484,7 @@ impl FileServePlan {
     /// id, read on the first call and kept for every clone of the plan. What
     /// a narrowing of a run the resolution did not locate starts from.
     pub(crate) async fn run_rows(&self) -> Result<ServedRows> {
-        if let Some(rows) = self.run_rows_cell.get() {
+        if let Some(rows) = self.cells.run_rows.get() {
             return Ok(rows.clone());
         }
         observe!(ServedRunLocated);
@@ -504,7 +509,7 @@ impl FileServePlan {
             positions: columns.remove(0),
             rids,
         };
-        Ok(self.run_rows_cell.get_or_init(|| rows).clone())
+        Ok(self.cells.run_rows.get_or_init(|| rows).clone())
     }
 
     /// This plan with its run located, what a narrowing cuts: a located or
@@ -677,7 +682,7 @@ impl FileServePlan {
         vortex_array::expr::BoundExpression,
         vortex_array::expr::BoundExpression,
     )> {
-        if let Some(bound) = self.bound.get() {
+        if let Some(bound) = self.cells.bound.get() {
             return Ok(bound.clone());
         }
         // The serving child's quad columns plus the row-id column, for
@@ -690,6 +695,7 @@ impl FileServePlan {
         let bound_projection = self.child.bind(&projection)?;
         let bound_filter = self.child.bind(&filter)?;
         Ok(self
+            .cells
             .bound
             .get_or_init(|| (bound_projection, bound_filter))
             .clone())
