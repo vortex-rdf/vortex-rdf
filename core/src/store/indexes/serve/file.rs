@@ -394,8 +394,9 @@ impl FileServePlan {
     /// the kept rows, or a located range of at most
     /// [`POINT_GATHER_MAX_ROWS`] rows, point by point; a wider located range
     /// by row range, split across the workers (`run_split_rows`); an
-    /// unlocated run under the plan's filter. The plan is bound before the
-    /// read starts, so a bind failure fails this call rather than the read.
+    /// unlocated run under the plan's filter. A scan's plan is bound before
+    /// the read starts, so a bind failure fails this call rather than the
+    /// read; rows read point by point bind nothing of the plan's.
     ///
     /// The scan spawns one task per split and the consumer decodes each
     /// chunk inside its task, so the split count is the decode's
@@ -408,12 +409,8 @@ impl FileServePlan {
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     pub(crate) fn read(&self) -> Result<PlanRead> {
         Ok(match self.span() {
-            Some(ServedSpan::Kept(kept)) => {
-                self.bound_exprs()?;
-                PlanRead::Kept(kept.positions.clone())
-            }
+            Some(ServedSpan::Kept(kept)) => PlanRead::Kept(kept.positions.clone()),
             Some(ServedSpan::Range(range)) if point_sized(range.end - range.start) => {
-                self.bound_exprs()?;
                 PlanRead::Points(range.collect())
             }
             Some(ServedSpan::Range(range)) => {

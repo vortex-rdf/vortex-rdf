@@ -384,6 +384,45 @@ async fn sort_order_reports_the_reads_order() {
     }
 }
 
+/// A point-sized served file run's reads (its codes one-shot and chunked,
+/// and its row chunks) bind none of the plan's expressions: the rows are
+/// read point by point, with no scan to bind them for.
+#[tokio::test]
+async fn point_sized_served_reads_bind_nothing() {
+    let (_dir, path) = write_store_file(
+        modular_quads(2_000, 7, 11),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let (p2, o3) = (iri("p2"), plain_literal("object 3"));
+    for (shape, view) in [
+        (
+            "??o?",
+            matched_view(&store, None, None, Some(&o3), None).await,
+        ),
+        (
+            "?po?",
+            matched_view(&store, None, Some(&p2), Some(&o3), None).await,
+        ),
+    ] {
+        assert!(served_component(&view).is_some(), "{shape}: served");
+        let bound = view.debug_bound_exprs().unwrap();
+        view.code_columns_gathered()
+            .await
+            .unwrap()
+            .expect("a Dictionary view's codes");
+        collect_code_chunks(&view, &QuadColumn::ALL, 64).await;
+        collect_row_chunks(&view, 64).await;
+        assert_eq!(
+            view.debug_bound_exprs().unwrap(),
+            bound,
+            "{shape}: nothing bound"
+        );
+    }
+}
+
 /// A point-sized served file run (`??o?`, `?po?`) reads its codes point by
 /// point straight into code buffers, for the one-shot gather and the chunk
 /// stream alike: the columns its terms pin are filled with their codes, not
