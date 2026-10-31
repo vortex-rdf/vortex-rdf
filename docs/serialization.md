@@ -229,7 +229,7 @@ kept as its four ids. The buffer holds up to
 [`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L54) (1,048,576) quads,
 16 bytes each; a buffer that would overflow is sorted in its terms' order,
 deduplicated and spilled as one run
-([`QuadSpiller`](../core/src/store/builders/runs.rs#L267)). Where its terms
+([`QuadSpiller`](../core/src/store/builders/runs/mod.rs#L268)). Where its terms
 repeat (at most one distinct term for two quads), the buffer's distinct terms
 are compared once, to rank them among themselves, and the quads sort in place
 as tuples of those ranks; otherwise they are compared term by term, a role's
@@ -249,7 +249,7 @@ byte order, and maps each id to its term's rank. A rank keeps its term's order
 sorted by its terms is sorted by rank tuple once its ids are read as ranks: no
 spilled run is sorted again. The in-memory run of a build that spilled nothing
 is sorted here, its ids replaced by their ranks
-([`SpilledQuads::ranked`](../core/src/store/builders/runs.rs#L413)), so its
+([`SpilledQuads::ranked`](../core/src/store/builders/runs/mod.rs#L414)), so its
 sort compares integers where a spilled run's compares terms. Under the Dictionary layout the ranked terms become the
 term dictionary (a rank's code is its position), each term moved into the
 column and freed as it is copied.
@@ -276,7 +276,7 @@ first merge runs to completion
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's ranks are pushed into one spiller per requested family
-([`EntrySpiller`](../core/src/store/builders/runs.rs#L598)), each spilling its
+([`EntrySpiller`](../core/src/store/builders/runs/mod.rs#L591)), each spilling its
 own sorted runs:
 
 | Family | Spilled entry | Run files |
@@ -291,7 +291,7 @@ chunk is built — no index is ever materialized whole, and the quads are never
 written a second time.
 
 **Spill files** are fixed-width little-endian records
-([`runs.rs`](../core/src/store/builders/runs.rs)) in a per-build run
+([`runs`](../core/src/store/builders/runs/mod.rs)) in a per-build run
 directory, removed when the stream is dropped:
 
 | Run | Header | Record |
@@ -336,7 +336,7 @@ full) or to a writable directory (any other failure).
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L50)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L48)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |

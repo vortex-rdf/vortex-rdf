@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: a hash table over the batch's kept
   quads catches the latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/query/matching.rs#L805) — one fully bound
+  [`contains`](../core/src/store/query/matching/mod.rs#L193) — one fully bound
   `match_pattern` over base and tail, which reads the tail rows its row key
   names rather than every tail row ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
@@ -99,9 +99,9 @@ flowchart TD
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
-- **Matching.** [`match_pattern`](../core/src/store/query/matching.rs#L93) runs the
+- **Matching.** [`match_pattern`](../core/src/store/query/matching/mod.rs#L68) runs the
   base's normal routing (prefix probe / index / scan) and, independently, a
-  mask scan over the tail ([`match_tail`](../core/src/store/query/matching.rs#L137)),
+  mask scan over the tail ([`match_tail`](../core/src/store/query/matching/tail.rs#L25)),
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
@@ -364,7 +364,8 @@ runs the mutation on the store the view came from.
 | `restrict_scan`, `matching_file_rows` — tombstones inside a file scan | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs), [`file_filter.rs`](../core/src/store/scan/file_filter.rs) |
 | `size` | [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
 | `live_raw_quads` | [`core/src/store/read/rows.rs`](../core/src/store/read/rows.rs) |
-| `match_pattern`, `match_tail`, `contains` | [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
+| `match_pattern`, `contains` | [`core/src/store/query/matching/mod.rs`](../core/src/store/query/matching/mod.rs) |
+| `match_tail` | [`core/src/store/query/matching/tail.rs`](../core/src/store/query/matching/tail.rs) |
 | `tail_len` | [`core/src/store/mod.rs`](../core/src/store/mod.rs) |
 | Rebuilding a tailed or tombstoned store for serialization | [`core/src/store/persist/serialize.rs`](../core/src/store/persist/serialize.rs) |
 | The rebuild pipeline compaction reuses | [`core/src/store/builders/mod.rs`](../core/src/store/builders/mod.rs), [`sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`core/src/store/construct.rs`](../core/src/store/construct.rs), [`core/src/io/write.rs`](../core/src/io/write.rs), [`pending.rs`](../core/src/io/pending.rs) |
