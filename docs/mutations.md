@@ -184,7 +184,7 @@ decoded, once each, and merged with the tail's terms into the fresh
 dictionary, every base code moves to its term's new code (code order being
 term order) and the rows, the tail's beside them, sort as integers, each
 quad once. Otherwise from the quads spelled out
-([`live_raw_quads`](../core/src/store/read/rows.rs#L469): base rows first, in
+([`live_raw_quads`](../core/src/store/read/rows.rs#L353): base rows first, in
 view order, then tail rows, tombstones already excluded), put in order by
 [`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L107): the tail
 is sorted alone and merged into the sorted base in one linear pass (a base

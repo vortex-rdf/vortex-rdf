@@ -451,7 +451,7 @@ struct ReadCounters {
 
 impl ReadCounters {
     fn now() -> Self {
-        use crate::store::read::rows::restricted_scan_hooks;
+        use crate::store::read::file_plan::restricted_scan_hooks;
         use crate::store::scan::file_filter::split_hooks;
         use crate::store::scan::{
             file_reads::take_hooks, file_scans::scan_hooks, read_plan::masked_read_hooks,
@@ -462,6 +462,70 @@ impl ReadCounters {
             filtered_scans: restricted_scan_hooks::filtered(),
             scans: scan_hooks::scans(),
             takes: take_hooks::takes().0,
+        }
+    }
+}
+
+/// A whole-base read (an owned copy of a view, which a compaction rebuilds
+/// from the view's rows) takes the view's filter as a one-shot read does: a
+/// pending filter the reads by id leave to the masks is evaluated to its
+/// masks first and the rows they keep read after, and the masks a window
+/// kept are read as they are, the filter not evaluated again. Neither builds
+/// a scan with the filter, and either copy holds the in-memory twin's quads.
+#[tokio::test]
+async fn test_owned_copy_reads_the_filter_by_its_masks() {
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    for MasksProbe {
+        shape,
+        probe,
+        dense,
+        ..
+    } in masks_probes()
+    {
+        let plain = store.run_probe(&probe).await.unwrap();
+        assert!(plain.debug_reads_masks_first(), "{shape}: masks first");
+        let twin = memory.run_probe(&probe).await.unwrap();
+        let want = twin.quads_vec().await.unwrap();
+        let mut views = vec![("pending", plain)];
+        if dense {
+            let window = probe.clone().window(0, Some(want.len() + 1));
+            let kept = store.run_probe(&window).await.unwrap();
+            assert_eq!(kept.debug_evaluated_len(), Some(want.len()), "{shape}");
+            views.push(("kept", kept));
+        }
+        for (state, view) in views {
+            let label = format!("{shape} {state}");
+            let before = ReadCounters::now();
+            let owned = view.owned().await.unwrap();
+            let after = ReadCounters::now();
+            let masked = |c: &ReadCounters| c.masked.iter().sum::<usize>();
+            assert_eq!(
+                masked(&after),
+                masked(&before) + 1,
+                "{label}: one masked read"
+            );
+            assert_eq!(
+                after.filtered_scans, before.filtered_scans,
+                "{label}: no scan with the filter"
+            );
+            if state == "kept" {
+                assert_eq!(
+                    after.evaluated, before.evaluated,
+                    "{label}: no split evaluated"
+                );
+            } else {
+                assert!(
+                    after.evaluated > before.evaluated,
+                    "{label}: masks evaluated"
+                );
+            }
+            assert_eq!(
+                owned.quads_vec().await.unwrap(),
+                want,
+                "{label}: the twin's quads"
+            );
         }
     }
 }

@@ -35,12 +35,12 @@ use crate::session::VORTEX_SESSION;
 use crate::store::FileBase;
 use crate::store::VortexRdfStore;
 use crate::store::array::{field_as, into_struct_array, rechunk};
+#[cfg(feature = "file-io")]
+use crate::store::read::file_plan::StreamedPlan;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{
-    file_reads::{masks_first_split_reads, take_file_rows},
-    file_scans::stream_split_reads,
-    read_plan::ExactRead,
+    file_reads::take_file_rows, file_scans::stream_split_reads, read_plan::ExactRead,
 };
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, SelectedRows};
@@ -255,14 +255,13 @@ impl VortexRdfStore {
         )))
     }
 
-    /// A file view's base chunks, its [`ExactRead`] chosen once: a selection
-    /// taken by id is cut into windows of at most `batch_rows` live ids, each
-    /// taken ([`take_file_rows`]) when its chunk is pulled; a pending filter
-    /// the reads by id leave to the scan ([`ExactRead::Masks`]) is read by
-    /// its masks first, split by split as the stream reaches them, only
-    /// `columns` read at the rows each split's mask keeps
-    /// ([`masks_first_split_reads`]); a point or scan read is
-    /// [`FileReadScope::rows`](crate::store::read::rows::FileReadScope::rows)'s.
+    /// A file view's base chunks, read as a stream's plan has it
+    /// ([`StreamedPlan`]): a pending filter the reads by id leave to the
+    /// masks split by split as the stream reaches them, only `columns` read
+    /// at the rows each split's mask keeps; a selection taken by id cut into
+    /// windows of at most `batch_rows` live ids, each taken
+    /// ([`take_file_rows`]) when its chunk is pulled; a point or scan read
+    /// [`FileReadScope::rows`](crate::store::read::file_plan::FileReadScope::rows)'s.
     /// Every chunk is cut to the cap.
     #[cfg(feature = "file-io")]
     async fn file_base_chunks(
@@ -271,24 +270,19 @@ impl VortexRdfStore {
         columns: &[&'static str],
         batch_rows: usize,
     ) -> Result<RowChunkStream> {
-        let (scope, read) = self.file_read(base, columns).await?;
-        if let (ExactRead::Masks, Some(filter)) = (&read, scope.filter) {
-            let reads = masks_first_split_reads(
-                &base.file,
-                filter,
-                &scope.selection,
-                scope.deleted,
-                columns,
-            )?;
-            return Ok(stream_split_reads(reads)
-                .flat_map(move |rows| {
-                    stream::iter(match rows {
-                        Ok(rows) => rechunk(rows, batch_rows).collect(),
-                        Err(e) => vec![Err(e)],
+        let (scope, read) = match self.streamed_plan(base, columns).await? {
+            StreamedPlan::SplitReads(reads) => {
+                return Ok(stream_split_reads(reads)
+                    .flat_map(move |rows| {
+                        stream::iter(match rows {
+                            Ok(rows) => rechunk(rows, batch_rows).collect(),
+                            Err(e) => vec![Err(e)],
+                        })
                     })
-                })
-                .boxed());
-        }
+                    .boxed());
+            }
+            StreamedPlan::Exact(scope, read) => (scope, read),
+        };
         let ids = match read {
             ExactRead::Take(ids) => ids,
             read => return scope.rows(read).await?.chunks(batch_rows),

@@ -13,10 +13,9 @@ use crate::store::layouts::ChunkDecode;
 use crate::store::{Backend, MemoryBase, SharedQuad, Tail, VortexRdfStore};
 
 #[cfg(feature = "file-io")]
-use std::sync::Arc;
-
-#[cfg(feature = "file-io")]
 use super::deferred;
+#[cfg(feature = "file-io")]
+use super::file_plan::{CollectedPlan, FileReadScope, StreamedPlan};
 #[cfg(feature = "file-io")]
 use super::rows::BaseRead;
 #[cfg(feature = "file-io")]
@@ -30,17 +29,11 @@ use crate::store::indexes::FileServePlan;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
-use crate::store::persist::native_file::NativeStoreFile;
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_exprs::CodeEqs;
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_filter::SplitMasks;
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_reads;
+use crate::store::scan::file_reads::{self, MaskedRows};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scans::{SPLITS_IN_FLIGHT_PER_CORE, ScanDriver};
 #[cfg(feature = "file-io")]
-use crate::store::scan::read_plan::{ExactRead, MaskedRead};
+use crate::store::scan::read_plan::ExactRead;
 #[cfg(feature = "file-io")]
 use futures::FutureExt as _;
 #[cfg(feature = "file-io")]
@@ -204,16 +197,14 @@ impl VortexRdfStore {
     /// When `mode` serves, a served view reads its plan's run: point reads for a
     /// point-sized located run, a row-count-split scan for a wide one, the
     /// plan's filter scan for an unlocated one. Every other read is the base's
-    /// rows in base row order, over the exact selection
-    /// ([`base_read`](Self::base_read)): rows read by id
-    /// ([`ExactRead`](crate::store::scan::read_plan::ExactRead)) are one chunk, and the
-    /// restricted scan streams split by split. A pending filter the reads by
-    /// id leave to the scan is read by its masks first: a collected read
-    /// evaluates every split's mask, then reads the rows they keep
-    /// ([`masked_chunks`](Self::masked_chunks)), and reads a window's kept
-    /// masks the same way; a stream evaluates each split's mask when it
-    /// reaches the split, then reads the rows that mask keeps
-    /// ([`decoded_split_reads`](Self::decoded_split_reads)).
+    /// rows in base row order, read as the file read's plan has it
+    /// ([`file_plan`](crate::store::read::file_plan)), one-shot for a
+    /// collected read and streamed otherwise: a filter's kept rows
+    /// ([`masked_chunks`](Self::masked_chunks)), or a stream's split by split
+    /// ([`decoded_split_reads`](Self::decoded_split_reads)); rows read by id
+    /// ([`ExactRead`](crate::store::scan::read_plan::ExactRead)) as one chunk,
+    /// and the restricted scan split by split
+    /// ([`exact_chunks`](Self::exact_chunks)).
     #[cfg(feature = "file-io")]
     async fn file_chunks<T: ChunkDecode>(
         &self,
@@ -255,37 +246,35 @@ impl VortexRdfStore {
             };
             return self.scan_chunks(plan.scan()?, decoder, tail);
         }
-        if mode == QuadRead::Collected
-            && let Some(masks) = base.filter.kept_masks()
-        {
-            return self
-                .masked_chunks(file, masks, base.filter.pins(), tail)
-                .await;
-        }
         let primary = self.layout.strategy().primary_column_names();
-        let (scope, read) = self.file_read(base, primary).await?;
-        if mode == QuadRead::Collected
-            && let Some(masks) = scope.masks_first(&read).await?
-        {
-            return self
-                .masked_chunks(file, &masks, scope.filter_eqs(), tail)
-                .await;
+        if mode == QuadRead::Collected {
+            return match self.collected_plan(base, primary).await? {
+                CollectedPlan::Masked(masked) => self.masked_chunks(&masked, tail).await,
+                CollectedPlan::Exact(scope, read) => self.exact_chunks(scope, read, tail).await,
+            };
         }
-        // A stream takes the filter by its masks first too, split by split as
-        // it reaches them, under the row-scan driver.
-        if let (ExactRead::Masks, Some(filter)) = (&read, scope.filter) {
-            let reads = file_reads::masks_first_split_reads(
-                file,
-                filter,
-                &scope.selection,
-                scope.deleted,
-                primary,
-            )?;
-            let spawn = ScanDriver::for_row_scan(reads.len()) == ScanDriver::Spawned;
-            return Ok(self.decoded_split_reads(reads, spawn, tail));
+        match self.streamed_plan(base, primary).await? {
+            // Each split's mask evaluated as the stream reaches it, under the
+            // row-scan driver.
+            StreamedPlan::SplitReads(reads) => {
+                let spawn = ScanDriver::for_row_scan(reads.len()) == ScanDriver::Spawned;
+                Ok(self.decoded_split_reads(reads, spawn, tail))
+            }
+            StreamedPlan::Exact(scope, read) => self.exact_chunks(scope, read, tail).await,
         }
+    }
+
+    /// The chunks of `read` over `scope`, then the tail's chunk: rows read
+    /// by id decode as one chunk, with no scan machinery; the restricted scan
+    /// decodes split by split ([`scan_chunks`](Self::scan_chunks)).
+    #[cfg(feature = "file-io")]
+    async fn exact_chunks<T: ChunkDecode>(
+        &self,
+        scope: FileReadScope<'_>,
+        read: ExactRead,
+        tail: Vec<Result<T>>,
+    ) -> Result<Chunks<T>> {
         match scope.rows(read).await? {
-            // Rows read by id decode as one chunk, with no scan machinery.
             BaseRead::Rows(rows) => Ok(with_tail(
                 stream::iter([T::decode_async(&self.layout, &rows).await]),
                 tail,
@@ -294,66 +283,29 @@ impl VortexRdfStore {
         }
     }
 
-    /// A one-shot read's chunks of the rows `masks` keep (a pending filter's
-    /// split masks), then the tail's chunk, read as [`MaskedRead`] chooses:
-    /// point by point as one chunk, read inline, or else one chunk per split
-    /// with a match, taken at its ids or projected at its mask, reading only
-    /// the columns the equalities `pins` leave free and filling the others
-    /// with their codes where the read fills them ([`CodeEqs::for_points`]).
-    /// Those split reads are spawned onto the
+    /// A one-shot read's chunks of the rows `masked` keeps (a filter's split
+    /// masks), then the tail's chunk: point by point as one chunk, read
+    /// inline, or else one chunk per split with a match
+    /// ([`MaskedRows::split_reads`]). Those split reads are spawned onto the
     /// tokio runtime whenever there is more than one and a runtime is
     /// current, whatever the row-scan driver's split limit: the read is
     /// collected whole, so many splits' reads overlap their decodes, where a
     /// single split, read inline, spares a spawn's latency. Each chunk
     /// decodes inside its split's read
-    /// ([`decoded_split_reads`](Self::decoded_split_reads)). A point read a
-    /// chunk declines is taken.
+    /// ([`decoded_split_reads`](Self::decoded_split_reads)).
     #[cfg(feature = "file-io")]
     async fn masked_chunks<T: ChunkDecode>(
         &self,
-        file: &Arc<NativeStoreFile>,
-        masks: &SplitMasks,
-        pins: &CodeEqs,
+        masked: &MaskedRows<'_>,
         tail: Vec<Result<T>>,
     ) -> Result<Chunks<T>> {
-        let primary = self.layout.strategy().primary_column_names();
-        let read = MaskedRead::of(file, masks)?;
-        // Only the columns the equalities leave free are read where the read
-        // fills them: every row the masks keep holds its code in the others.
-        let pinned = match read {
-            MaskedRead::Points => pins.for_points(masks.kept()),
-            MaskedRead::Take | MaskedRead::Project => pins,
+        if let Some(rows) = masked.points().await? {
+            let chunk = T::decode_async(&self.layout, &rows).await;
+            return Ok(with_tail(stream::iter([chunk]), tail));
         }
-        .clone();
-        let read_columns = pinned.columns_to_read(primary);
-        if read == MaskedRead::Points {
-            let ids = masks.first_ids(usize::MAX);
-            if let Some(rows) = file_reads::file_point_rows(file, &read_columns, None, ids).await? {
-                let rows = pinned.fill_rows(rows, primary)?;
-                let chunk = T::decode_async(&self.layout, &rows).await;
-                return Ok(with_tail(stream::iter([chunk]), tail));
-            }
-        }
-        let take = read != MaskedRead::Project;
-        let (_, tasks) = file_reads::masked_split_tasks(file, &read_columns, masks, take)?;
-        let tasks: Vec<file_reads::SplitRead> = tasks
-            .into_iter()
-            .map(|task| {
-                let pinned = pinned.clone();
-                async move {
-                    task.await?
-                        .map(|rows| {
-                            pinned
-                                .fill_rows(rows, primary)
-                                .map_err(vortex_error::VortexError::from)
-                        })
-                        .transpose()
-                }
-                .boxed()
-            })
-            .collect();
-        let spawn = tasks.len() > 1 && tokio::runtime::Handle::try_current().is_ok();
-        Ok(self.decoded_split_reads(tasks, spawn, tail))
+        let reads = masked.split_reads()?;
+        let spawn = reads.len() > 1 && tokio::runtime::Handle::try_current().is_ok();
+        Ok(self.decoded_split_reads(reads, spawn, tail))
     }
 
     /// The rows of split `reads` (one per split, in split order) decoded into

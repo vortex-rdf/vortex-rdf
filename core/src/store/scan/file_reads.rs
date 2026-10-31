@@ -4,6 +4,7 @@
 //! filter's split masks keep, as [`read_plan`](super::read_plan) chooses
 //! them. Functions of the file, with no store state.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use crate::store::array::named_struct;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{CodeEqs, PushedFilter, QUAD_SCOPE};
 use crate::store::scan::file_filter::{self, SplitMasks};
-use crate::store::scan::file_scans::collect_row_splits;
+use crate::store::scan::file_scans::{SPLITS_IN_FLIGHT_PER_CORE, collect_row_splits};
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::scan::read_plan::{Footprint, MaskedRead, POINT_READ_ROWS, ids_by_split};
 use crate::store::schema::{RowId, TermCode};
@@ -396,7 +397,7 @@ pub(crate) fn masks_first_split_reads(
                         return Ok(None);
                     }
                     let masks = SplitMasks::of_split(mask, range);
-                    kept_split_rows(&file, &columns, &pinned, &masks).await
+                    kept_split_rows(&file, &columns, &pinned, masks).await
                 }
                 .map(|rows| rows.map_err(VortexError::from))
                 .boxed()
@@ -405,50 +406,159 @@ pub(crate) fn masks_first_split_reads(
     )
 }
 
-/// `columns` at the rows one split's `masks` keep, read as [`MaskedRead`]
-/// chooses for them: point by point through the chunk probes, taken at the
-/// kept ids or projected at the mask, reading only the columns `pinned`
-/// leaves free and filling the others where the read fills them
-/// ([`CodeEqs::for_points`]). A point read a chunk declines is taken.
+/// `columns` at the rows one split's `masks` keep, read as [`MaskedRows`]
+/// reads them, every row passing the equalities `pinned`.
 async fn kept_split_rows(
     file: &Arc<NativeStoreFile>,
     columns: &[&'static str],
     pinned: &CodeEqs,
-    masks: &SplitMasks,
+    masks: SplitMasks,
 ) -> Result<Option<ArrayRef>> {
-    let read = MaskedRead::of(file, masks)?;
-    let pinned = match read {
-        MaskedRead::Points => pinned.for_points(masks.kept()),
-        MaskedRead::Take | MaskedRead::Project => pinned,
-    };
-    let read_columns = pinned.columns_to_read(columns);
-    if read == MaskedRead::Points
-        && let Some(rows) =
-            file_point_rows(file, &read_columns, None, masks.first_ids(usize::MAX)).await?
-    {
-        return pinned.fill_rows(rows, columns).map(Some);
+    let masked = MaskedRows::of(file, columns, Arc::new(masks), pinned)?;
+    if let Some(rows) = masked.points().await? {
+        return Ok(Some(rows));
     }
-    let (_, tasks) = masked_split_tasks(file, &read_columns, masks, read != MaskedRead::Project)?;
-    match tasks.into_iter().next() {
-        Some(task) => task
-            .await?
-            .map(|rows| pinned.fill_rows(rows, columns))
-            .transpose(),
+    match masked.split_reads()?.into_iter().next() {
+        Some(read) => Ok(read.await?),
         None => Ok(None),
     }
 }
 
-/// The rows of `columns` that `masks` keep, each split with a match projected
-/// at its mask ([`masked_split_tasks`]), in one array in split order, the
-/// splits driven as [`read_all_rows`](super::file_scans::read_all_rows)
-/// drives a scan's ([`collect_row_splits`]).
-pub(crate) async fn masked_projection(
-    file: &Arc<NativeStoreFile>,
-    columns: &[&'static str],
-    masks: &SplitMasks,
-) -> Result<ArrayRef> {
-    let (dtype, tasks) = masked_split_tasks(file, columns, masks, false)?;
-    collect_row_splits(dtype, tasks, 4 * available_parallelism()).await
+/// A read of `columns` at the rows a filter's split masks keep, as
+/// [`MaskedRead`] chooses it for their density over the splits holding them:
+/// point by point through the chunk probes, taken at the kept ids, or each
+/// split projected at its own mask. Every row the masks keep passed the
+/// filter, so the read reads only the columns its equalities leave free and
+/// fills the others with their codes where it fills them
+/// ([`CodeEqs::for_points`]). A read by id that a chunk declines falls to the
+/// next: points to a take, a take to the projection. The one read of a
+/// filter's kept rows: a window's kept masks', a one-shot read's evaluated
+/// first, and a stream's split by split ([`masks_first_split_reads`]).
+pub(crate) struct MaskedRows<'a> {
+    file: &'a Arc<NativeStoreFile>,
+    columns: &'a [&'static str],
+    masks: Arc<SplitMasks>,
+    read: MaskedRead,
+    pins: CodeEqs,
+}
+
+impl<'a> MaskedRows<'a> {
+    /// The read of `columns` (primary column names) at the rows `masks`
+    /// keep, every one of which holds the codes of the equalities `pins`.
+    pub(crate) fn of(
+        file: &'a Arc<NativeStoreFile>,
+        columns: &'a [&'static str],
+        masks: Arc<SplitMasks>,
+        pins: &CodeEqs,
+    ) -> Result<Self> {
+        let read = MaskedRead::of(file, &masks)?;
+        let pins = match read {
+            MaskedRead::Points => pins.for_points(masks.kept()),
+            MaskedRead::Take | MaskedRead::Project => pins,
+        }
+        .clone();
+        Ok(Self {
+            file,
+            columns,
+            masks,
+            read,
+            pins,
+        })
+    }
+
+    /// How many rows the masks keep.
+    pub(crate) fn kept(&self) -> usize {
+        self.masks.kept()
+    }
+
+    /// The equalities the read fills rather than reads.
+    pub(crate) fn pins(&self) -> &CodeEqs {
+        &self.pins
+    }
+
+    /// The columns the read reads, in order: those the equalities leave free
+    /// ([`CodeEqs::columns_to_read`]).
+    pub(crate) fn read_columns(&self) -> Cow<'a, [&'static str]> {
+        self.pins.columns_to_read(self.columns)
+    }
+
+    /// The kept rows read point by point, every column of `columns` filled
+    /// in, when the read is point by point; `None` for a denser read, or
+    /// where a chunk declines.
+    pub(crate) async fn points(&self) -> Result<Option<ArrayRef>> {
+        if self.read != MaskedRead::Points {
+            return Ok(None);
+        }
+        let ids = self.masks.first_ids(usize::MAX);
+        file_point_rows(self.file, &self.read_columns(), None, ids)
+            .await?
+            .map(|rows| self.pins.fill_rows(rows, self.columns))
+            .transpose()
+    }
+
+    /// [`points`](Self::points) as the `(s, p, o, g)` code columns, read
+    /// point by point straight into the code buffers, `columns` the primary
+    /// columns.
+    pub(crate) async fn point_codes(&self) -> Result<Option<[Buffer<TermCode>; 4]>> {
+        if self.read != MaskedRead::Points {
+            return Ok(None);
+        }
+        let read_columns = self.read_columns();
+        let ids = self.masks.first_ids(usize::MAX);
+        file_point_codes(self.file, &read_columns, None, ids)
+            .await?
+            .map(|codes| self.pins.fill_codes(&read_columns, codes, self.kept()))
+            .transpose()
+    }
+
+    /// One read per split with a match, in split order, of the rows its mask
+    /// keeps, every column of `columns` filled in: taken at the kept ids (a
+    /// point read is taken where a chunk declines it), or projected at the
+    /// split's mask.
+    pub(crate) fn split_reads(&self) -> Result<Vec<SplitRead>> {
+        let take = self.read != MaskedRead::Project;
+        let (_, tasks) = masked_split_tasks(self.file, &self.read_columns(), &self.masks, take)?;
+        let columns: Arc<[&'static str]> = Arc::from(self.columns);
+        Ok(tasks
+            .into_iter()
+            .map(|task| {
+                let (pins, columns) = (self.pins.clone(), Arc::clone(&columns));
+                async move {
+                    task.await?
+                        .map(|rows| pins.fill_rows(rows, &columns).map_err(VortexError::from))
+                        .transpose()
+                }
+                .boxed()
+            })
+            .collect())
+    }
+
+    /// The read columns of every kept row in one array, in file order, the
+    /// pinned ones not filled in: one take of all the kept ids, or, denser
+    /// than a take (or a take declined), each split projected at its mask,
+    /// the splits driven as a row scan's ([`collect_row_splits`]).
+    pub(crate) async fn collected(&self) -> Result<ArrayRef> {
+        let read_columns = self.read_columns();
+        if self.read != MaskedRead::Project {
+            let ids = self.masks.first_ids(usize::MAX);
+            if let Some(rows) = take_file_rows(self.file, &read_columns, &ids).await? {
+                return Ok(rows);
+            }
+        }
+        let (dtype, tasks) = masked_split_tasks(self.file, &read_columns, &self.masks, false)?;
+        let window = SPLITS_IN_FLIGHT_PER_CORE * available_parallelism();
+        collect_row_splits(dtype, tasks, window).await
+    }
+
+    /// Every kept row in one array, in file order, every column of `columns`
+    /// filled in: [`points`](Self::points), else
+    /// [`collected`](Self::collected).
+    pub(crate) async fn rows(&self) -> Result<ArrayRef> {
+        if let Some(rows) = self.points().await? {
+            return Ok(rows);
+        }
+        self.pins.fill_rows(self.collected().await?, self.columns)
+    }
 }
 
 /// One canonical struct chunk of `columns` holding `values`, `len` rows of
