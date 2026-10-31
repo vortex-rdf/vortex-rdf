@@ -120,13 +120,22 @@ impl VortexRdfStore {
         if !self.is_code_view() {
             return None;
         }
-        // The answering index's columns hold this view's codes as one
-        // contiguous run: no deferred row ids to compute, no scattered
-        // gather over the primaries.
-        if let Some(plan) = &self.quads.in_memory()?.serve
-            && let Some(columns) = plan.code_columns(self.quads.deleted.as_ref())
-        {
-            return Some(columns);
+        if let Some(plan) = &self.quads.in_memory()?.serve {
+            let deleted = self.quads.deleted.as_ref();
+            // A window of a served view: the base's code columns gathered at
+            // its row ids, in the index's order.
+            if plan.is_narrowed()
+                && let Some(prims) = self.base_code_primitives()
+                && let Ok(ids) = plan.live_rids(deleted)
+            {
+                return Some(gather_codes(&prims, &ids));
+            }
+            // The answering index's columns hold this view's codes as one
+            // contiguous run: no deferred row ids to compute, no scattered
+            // gather over the primaries.
+            if let Some(columns) = plan.code_columns(deleted) {
+                return Some(columns);
+            }
         }
         self.base_code_columns()
     }

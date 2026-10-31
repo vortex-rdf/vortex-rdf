@@ -782,8 +782,8 @@ async fn test_in_memory_copy_index_serving() {
     // A served view's N-Quads export lists its quads as `quads()` reads
     // them, in the index's (p, o, s, g) order; its unserved twin lists them
     // in base (s, p, o, g) order. A window that cannot cut a row is the
-    // served view as it is, plan and order included, while one that cuts a
-    // row drops the plan and reads base order.
+    // served view as it is, plan and order included, and one that cuts a
+    // row stays served, the index's order sliced.
     let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p), Some("index:posg"));
@@ -791,27 +791,12 @@ async fn test_in_memory_copy_index_serving() {
     let whole = by_p.window(0, size).await.unwrap();
     assert_eq!(served_component(&whole), Some("index:posg"));
     let cut = by_p.window(0, size - 1).await.unwrap();
-    assert_eq!(served_component(&cut), None);
+    assert_eq!(served_component(&cut), Some("index:posg"));
     let exported = nquads(by_p.clone()).await;
     assert_eq!(exported, nquads(whole.clone()).await);
     let unserved = nquads(by_p.debug_unserved().await.unwrap()).await;
     let lines: Vec<&str> = unserved.lines().collect();
     assert!(lines.is_sorted(), "base (s, p, o, g) order: {lines:#?}");
-    assert_eq!(
-        nquads(cut.clone()).await.lines().collect::<Vec<_>>(),
-        lines[..size - 1]
-    );
-    let cut_lines: Vec<String> = cut
-        .quads()
-        .map_ok(|q| format!("{q} ."))
-        .try_collect()
-        .await
-        .unwrap();
-    assert_eq!(
-        cut_lines,
-        lines[..size - 1],
-        "a cut window reads base order"
-    );
     let served: Vec<Quad> = by_p.quads().try_collect().await.unwrap();
     assert_eq!(
         quad_strings(&served),
@@ -831,6 +816,21 @@ async fn test_in_memory_copy_index_serving() {
         "the export follows quads()"
     );
     assert_ne!(served_lines, lines, "the two orders differ on this run");
+    assert_eq!(
+        nquads(cut.clone()).await.lines().collect::<Vec<_>>(),
+        served_lines[..size - 1]
+    );
+    let cut_lines: Vec<String> = cut
+        .quads()
+        .map_ok(|q| format!("{q} ."))
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        cut_lines,
+        served_lines[..size - 1],
+        "a cut window reads the index's order"
+    );
     let whole_served: Vec<Quad> = whole.quads().try_collect().await.unwrap();
     assert_eq!(
         whole_served, served,
@@ -1016,10 +1016,10 @@ async fn test_code_columns_serves_from_the_answering_index() {
 /// offset at or past the run's end — and never more than the run. The window
 /// holds the same rows as the slice of the whole run read in base order, and
 /// the pending view it is taken beside keeps its ids undecoded. A copy
-/// index's run is in key order, so a window that can cut it decodes it whole
-/// (and shares it with the pending view), while one that cannot cut a row is
-/// the served match as it is, read in the index's order, and decodes
-/// nothing.
+/// index's window stays served, its slice of the index's order: one that
+/// cuts the run decodes the run's ids once, in the index's order, and one
+/// that holds no row, or cannot cut one (the served match as it is),
+/// decodes nothing.
 #[tokio::test]
 async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
     use crate::store::{IdsNeed, Probe};
@@ -1072,13 +1072,14 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
 
         for (offset, limit) in windows {
             let (from, to) = span(offset, limit);
-            let served = decoded_whole && offset == 0 && limit >= width;
-            let expected = if served {
-                0
-            } else if decoded_whole {
+            let served = decoded_whole && from < to;
+            let cuts = !(offset == 0 && limit >= width);
+            let expected = if !decoded_whole {
+                to - from
+            } else if served && cuts {
                 width
             } else {
-                to - from
+                0
             };
             let rec = Recorder::start();
             let window = store
@@ -1108,7 +1109,7 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
                     "{index:?} ({offset}, {limit})"
                 );
                 let expected = match served_component(view) {
-                    Some(_) => &served_order[..],
+                    Some(_) => &served_order[from..to],
                     None => &base_order[from..to],
                 };
                 assert_eq!(

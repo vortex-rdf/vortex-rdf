@@ -11,16 +11,16 @@
 #[cfg(feature = "file-io")]
 use std::sync::Arc;
 
-#[cfg(feature = "file-io")]
 use vortex_buffer::Buffer;
 
 use crate::debug;
 use crate::error::Result;
 use crate::observe::observe;
 use crate::store::VortexRdfStore;
+use crate::store::indexes::LazyRowIds;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, read_plan};
-use crate::store::view::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection, window_rows};
 #[cfg(feature = "file-io")]
 use crate::store::{FileBase, FileFilter};
 
@@ -40,10 +40,12 @@ impl VortexRdfStore {
     /// window evaluates the filter whatever the bound, as below, and so finds
     /// whether it cuts.
     ///
-    /// Any other window is a position range over base order: base rows in
-    /// base row order, then the tail's. Its serve plan is dropped, so a
-    /// served view's rows come back in base order, not the index's. A
-    /// pending file filter is resolved only as far as the window reaches
+    /// A window of a view a by-copy index serves in memory is served too:
+    /// rows `offset..offset + limit` of the view in its index's order, then
+    /// the tail's, read off the index as the view's are. Any other window is
+    /// a position range over base order: base rows in base row order, then
+    /// the tail's, with no serve plan. A pending file filter is resolved only
+    /// as far as the window reaches
     /// (its splits evaluated in file order, stopping at the first that fills
     /// the window), so `LIMIT` over a filtered scan costs the matching prefix
     /// of the file. A window with no `offset` whose filter matches fewer rows
@@ -71,6 +73,13 @@ impl VortexRdfStore {
             debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
             return Ok(None);
         };
+        // A served in-memory view's window is served too, in its index's
+        // order.
+        if let Some(windowed) = self.served_window_in_memory(offset, limit)? {
+            observe!(Window);
+            debug::step!(t, "[window] offset {offset} limit {limit} of a served run");
+            return Ok(Some(windowed));
+        }
         // A served file run whose width is unknown until its ids are read
         // reads them into the view's shared cell, where any window below
         // takes them from, and is the view as it is when they fit.
@@ -128,6 +137,73 @@ impl VortexRdfStore {
             t,
             "[window] offset {offset} limit {limit}: {base_taken} base rows"
         );
+        Ok(Some(self.derived(quads, tail)))
+    }
+
+    /// The window of a view an in-memory plan serves, itself served: rows
+    /// `offset..offset + limit` of the view in its index's order, a part of
+    /// the plan's range ([`narrowed`](crate::store::indexes::InMemoryServePlan::narrowed)),
+    /// their row ids kept unsorted on the window
+    /// ([`LazyRowIds::from_unsorted_ids`]); under tombstones the cut counts
+    /// live rows. The tail is windowed with what the base did not fill, as
+    /// [`window_cutting`](Self::window_cutting) windows it. A window that
+    /// holds no base row selects none, with no plan. `None` for a view no
+    /// in-memory plan serves.
+    pub(in crate::store) fn served_window_in_memory(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Self>> {
+        let Some(memory) = self.quads.in_memory() else {
+            return Ok(None);
+        };
+        let Some(plan) = &memory.serve else {
+            return Ok(None);
+        };
+        let range = plan.range();
+        let (window, base_live) = match &self.quads.deleted {
+            None => {
+                let base_live = range.len();
+                let window = match window_rows(offset, limit, base_live as u64) {
+                    Some(rows) => {
+                        let (start, end) = (rows.start as usize, rows.end as usize);
+                        let narrowed = plan.narrowed(range.start + start..range.start + end);
+                        let ids = narrowed.live_rids(None)?;
+                        Some((narrowed, ids))
+                    }
+                    None => None,
+                };
+                (window, base_live)
+            }
+            Some(deleted) => {
+                let (positions, rids) = plan.live_rows(Some(deleted))?;
+                let base_live = positions.len();
+                let window = window_rows(offset, limit, base_live as u64).map(|rows| {
+                    let (start, end) = (rows.start as usize, rows.end as usize);
+                    let narrowed = plan.narrowed(positions[start]..positions[end - 1] + 1);
+                    (narrowed, Buffer::from(rids[start..end].to_vec()))
+                });
+                (window, base_live)
+            }
+        };
+        let base_taken = window.as_ref().map_or(0, |(_, ids)| ids.len());
+        let quads = match window {
+            Some((narrowed, ids)) => {
+                // The ids leave out every tombstone: the window took live rows.
+                let ids = LazyRowIds::from_unsorted_ids(ids, true);
+                self.quads
+                    .in_memory_with(memory, ViewSelection::pending(ids), Some(narrowed))
+            }
+            None => self
+                .quads
+                .with_selection(ViewSelection::Exact(RowSelection::empty())),
+        };
+        let tail = self.tail.as_ref().map(|tail| {
+            tail.window(
+                offset.saturating_sub(base_live),
+                limit.saturating_sub(base_taken),
+            )
+        });
         Ok(Some(self.derived(quads, tail)))
     }
 

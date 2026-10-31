@@ -226,7 +226,10 @@ pub(crate) struct InMemoryServePlan {
     component: &'static str,
     /// The index component's rows, in child schema.
     array: ArrayRef,
-    /// The rows of the component the view covers.
+    /// The rows of the component the match resolved: the run.
+    run: Range<usize>,
+    /// The rows of the component the view covers: the run, or the part of
+    /// it a window cut.
     range: Range<usize>,
     /// The run's slice of the component's rid column, the slice the view's
     /// lazy ids hold.
@@ -258,6 +261,7 @@ impl InMemoryServePlan {
             decode,
             component,
             array,
+            run: range.clone(),
             range,
             rids,
             cells,
@@ -269,6 +273,26 @@ impl InMemoryServePlan {
         self.component
     }
 
+    /// The rows of the component the view covers: the run, or the part of
+    /// it a window cut.
+    pub(crate) fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    /// Whether a window narrowed the view below the run the match resolved.
+    pub(crate) fn is_narrowed(&self) -> bool {
+        self.range != self.run
+    }
+
+    /// This plan over `range`, a part of its own: a window's.
+    pub(crate) fn narrowed(&self, range: Range<usize>) -> Self {
+        debug_assert!(self.range.start <= range.start && range.end <= self.range.end);
+        Self {
+            range,
+            ..self.clone()
+        }
+    }
+
     /// The run's base row ids in the component's order, decoded once into
     /// the caches the view's lazy ids share ([`LazyCells::run_order_of`]).
     pub(crate) fn run_rids(&self) -> Result<Buffer<RowId>> {
@@ -277,9 +301,10 @@ impl InMemoryServePlan {
 
     /// The base row ids of the view's rows in the component's order, less
     /// the `deleted` tombstones: what a read gathers off the base in the
-    /// index's order. The run's own ids, shared, when nothing is tombstoned.
+    /// index's order. A slice of the run's own ids, shared, when nothing is
+    /// tombstoned.
     pub(crate) fn live_rids(&self, deleted: Option<&Mask>) -> Result<Buffer<RowId>> {
-        let rids = self.run_rids()?;
+        let rids = self.run_rids()?.slice(self.run_slots());
         Ok(match deleted {
             None => rids,
             Some(deleted) => rids
@@ -288,6 +313,25 @@ impl InMemoryServePlan {
                 .filter(|&rid| !deleted.value(rid as usize))
                 .collect(),
         })
+    }
+
+    /// The view's live rows in the component's order: each one's position in
+    /// the component beside its base row id, the `deleted` tombstones left
+    /// out.
+    pub(crate) fn live_rows(&self, deleted: Option<&Mask>) -> Result<(Vec<usize>, Vec<RowId>)> {
+        let rids = self.run_rids()?;
+        Ok(self
+            .range
+            .clone()
+            .zip(rids[self.run_slots()].iter().copied())
+            .filter(|&(_, rid)| deleted.is_none_or(|d| !d.value(rid as usize)))
+            .unzip())
+    }
+
+    /// Where the view's range sits in the run: the slots of the run's ids
+    /// it covers.
+    fn run_slots(&self) -> Range<usize> {
+        self.range.start - self.run.start..self.range.end - self.run.start
     }
 
     /// The positions of a small run's live rows, for point reads through the

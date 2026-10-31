@@ -165,25 +165,22 @@ async fn slicing_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfSt
     views
 }
 
-/// Windows and capped counts of every view agree with slicing its
-/// base-ordered rows. A window that keeps a serve plan is one that cuts no
-/// row, and reads the rows of the same match built anew, read plain, in its
-/// order: its codes, and its quads in the index's order, which on a store
-/// with the copy index is not always base order.
+/// Windows and capped counts of every view agree with slicing its rows in
+/// the order its one-shot read takes them: a served view's in its index's
+/// order, which on a store with the copy index is not always base order,
+/// any other's in base order. A window of an in-memory served view stays
+/// served; on file a window that keeps the plan is one that cuts no row, and
+/// one that cuts reads base order.
 async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
     let views = slicing_views(store).await;
     let plain_views = slicing_views(store).await;
     let mut index_ordered = 0;
     for ((view_tag, view), (_, plain)) in views.iter().zip(&plain_views) {
-        let rows = base_ordered_codes(view).await;
+        let file = view.view_statistics().unwrap().file_backed;
+        let rows = row_list(plain).await;
+        let base_rows = base_ordered_codes(view).await;
         let n = rows.len();
-        let base_quads = view
-            .keep(QuadColumn::S, &Keep::range(0..TermCode::MAX))
-            .await
-            .unwrap()
-            .quads_vec()
-            .await
-            .unwrap();
+        let quads = plain.quads_vec().await.unwrap();
         for (offset, limit) in [
             (0, 0),
             (0, 1),
@@ -197,20 +194,28 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
             (1, n),
         ] {
             let windowed = view.window(offset, limit).await.unwrap();
-            let want: Vec<[TermCode; 4]> = rows.iter().copied().skip(offset).take(limit).collect();
+            let cuts = !(offset == 0 && limit >= n);
+            let slice = |rows: &[[TermCode; 4]]| -> Vec<[TermCode; 4]> {
+                rows.iter().copied().skip(offset).take(limit).collect()
+            };
+            let want = if file && cuts {
+                slice(&base_rows)
+            } else {
+                slice(&rows)
+            };
             let read = if served_component(&windowed).is_some() {
                 assert!(
-                    offset == 0 && limit >= n,
-                    "{tag}/{view_tag}: window({offset}, {limit}) cuts rows and keeps the plan"
+                    !(file && cuts),
+                    "{tag}/{view_tag}: window({offset}, {limit}) cuts rows and keeps the plan on file"
                 );
-                let quads = plain.quads_vec().await.unwrap();
+                let in_order: Vec<Quad> = quads.iter().skip(offset).take(limit).cloned().collect();
                 assert_eq!(
                     windowed.quads_vec().await.unwrap(),
-                    quads,
+                    in_order,
                     "{tag}/{view_tag}: window({offset}, {limit}): the plain quads, in order"
                 );
-                index_ordered += usize::from(quads != base_quads);
-                row_list(plain).await
+                index_ordered += usize::from(want != slice(&base_rows));
+                want.clone()
             } else {
                 want.clone()
             };
@@ -230,9 +235,15 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
                 "{tag}/{view_tag}: size_capped({})",
                 offset + limit
             );
-            // Windows compose: a window of a window re-bases on the first.
+            // Windows compose: a window of a window re-bases on the first, and
+            // on file, cutting it, reads its rows in base order.
             let inner = windowed.window(1, 2).await.unwrap();
-            let want_inner: Vec<[TermCode; 4]> = want.iter().copied().skip(1).take(2).collect();
+            let outer = if file {
+                slice(&base_rows)
+            } else {
+                want.clone()
+            };
+            let want_inner: Vec<[TermCode; 4]> = outer.iter().copied().skip(1).take(2).collect();
             assert_eq!(
                 row_list(&inner).await,
                 want_inner,
@@ -793,13 +804,15 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
 }
 
 /// A window that cuts rows (one row short of the match, or past its first
-/// row) is a position range over base order: the plain match's rows in base
-/// row order, sliced, with no serve plan, on every store and every shape
-/// with two rows to cut between.
+/// row) slices the plain match's rows in the order the match reads them: a
+/// served in-memory match's window stays served, in its index's order; any
+/// other is a position range over base order with no serve plan, a served
+/// file match's included. On every store and every shape with two rows to
+/// cut between.
 #[tokio::test]
-async fn test_window_that_cuts_keeps_base_order() {
+async fn test_window_that_cuts_slices_the_match_order() {
     let stores = window_stores().await;
-    let mut served = 0;
+    let (mut served, mut served_windows) = (0, 0);
     for fixture in &stores {
         let (tag, store) = (fixture.tag(), &fixture.store);
         for WindowProbe { shape, probe, .. } in window_probes() {
@@ -809,8 +822,14 @@ async fn test_window_that_cuts_keeps_base_order() {
             if n < 2 {
                 continue;
             }
-            served += usize::from(served_component(&plain).is_some());
-            let rows = base_ordered_codes(&plain).await;
+            let component = served_component(&plain);
+            served += usize::from(component.is_some());
+            let stays_served = component.is_some() && !plain.view_statistics().unwrap().file_backed;
+            let rows = if stays_served {
+                row_list(&plain).await
+            } else {
+                base_ordered_codes(&plain).await
+            };
             for (offset, limit) in [(0, n - 1), (1, n)] {
                 let windowed = store
                     .run_probe(&probe.clone().window(offset, Some(limit)))
@@ -822,20 +841,22 @@ async fn test_window_that_cuts_keeps_base_order() {
                 );
                 assert_eq!(
                     served_component(&windowed),
-                    None,
-                    "{label} ({offset}, {limit}): the plan is dropped"
+                    if stays_served { component } else { None },
+                    "{label} ({offset}, {limit}): the plan"
                 );
+                served_windows += usize::from(stays_served);
                 let want: Vec<[TermCode; 4]> =
                     rows.iter().copied().skip(offset).take(limit).collect();
                 assert_eq!(
                     row_list(&windowed).await,
                     want,
-                    "{label} ({offset}, {limit}): base order"
+                    "{label} ({offset}, {limit}): the match's order"
                 );
             }
         }
     }
     assert!(served > 0, "a served match is among those cut");
+    assert!(served_windows > 0, "a served window is among them");
 }
 
 /// Under tombstones and an appended tail, a window that cannot cut a row is

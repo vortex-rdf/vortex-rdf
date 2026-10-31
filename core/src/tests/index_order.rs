@@ -215,3 +215,224 @@ async fn run_ids_decode_once_across_clones() {
     assert_eq!(rec.count_where(|e| matches!(e, Event::RidsDecoded(_))), 1);
     assert_eq!(ids_sorted(&rec), 0);
 }
+
+/// The `?p2??` view of `store` and its rows in the index's order.
+async fn p2_view(store: &VortexRdfStore) -> (VortexRdfStore, Vec<[TermCode; 4]>) {
+    let p = matched_view(store, None, Some(&iri("p2")), None, None).await;
+    let want = posg(base_ordered_codes(&p).await);
+    (p, want)
+}
+
+/// The rows of a window, none when it is empty.
+async fn window_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    if view.size().await.unwrap() == 0 {
+        return vec![];
+    }
+    row_list(view).await
+}
+
+/// `rows[offset..offset + limit]`, clamped to `rows`.
+fn slice_of<T: Clone>(rows: &[T], offset: usize, limit: usize) -> Vec<T> {
+    let n = rows.len();
+    rows[offset.min(n)..offset.saturating_add(limit).min(n)].to_vec()
+}
+
+/// A window of a served in-memory view is the matching slice of the view's
+/// rows in the index's order and stays served; neither the window nor its
+/// count and read sorts ids.
+#[tokio::test]
+async fn memory_windows_are_slices_of_index_order() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let (p, want) = p2_view(&store).await;
+    let n = want.len();
+    for (offset, limit) in [
+        (0, 10),
+        (10, 100),
+        (n / 2, n / 4),
+        (n - 1, 5),
+        (n, 5),
+        (0, 0),
+    ] {
+        let rec = Recorder::start();
+        let w = p.window(offset, limit).await.unwrap();
+        let got = window_rows(&w).await;
+        assert_eq!(got, slice_of(&want, offset, limit), "({offset}, {limit})");
+        assert_eq!(ids_sorted(&rec), 0, "({offset}, {limit}) sorts no ids");
+        if !got.is_empty() {
+            assert_eq!(
+                served_component(&w),
+                Some("index:posg"),
+                "({offset}, {limit})"
+            );
+        }
+    }
+}
+
+/// Under tombstones inside and outside the run, a window of a served view is
+/// the slice of its live rows in the index's order.
+#[tokio::test]
+async fn memory_windows_under_tombstones() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let store = store
+        .delete_matching(None, Some(&iri("p0")), None, None)
+        .await
+        .unwrap()
+        .delete_matching(None, None, Some(&plain_literal("object 3")), None)
+        .await
+        .unwrap();
+    let (p, want) = p2_view(&store).await;
+    let n = want.len();
+    assert!(n > 0 && n < 20_000 / 7, "tombstones fall inside the run");
+    for (offset, limit) in [(0, 10), (10, 100), (n / 2, n / 4), (n - 1, 5), (n, 5)] {
+        let w = p.window(offset, limit).await.unwrap();
+        assert_eq!(
+            window_rows(&w).await,
+            slice_of(&want, offset, limit),
+            "({offset}, {limit})"
+        );
+        assert_eq!(
+            w.size().await.unwrap(),
+            slice_of(&want, offset, limit).len()
+        );
+    }
+}
+
+/// Windows nest: a window of a window is the slice of the slice.
+#[tokio::test]
+async fn nested_windows() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let (p, want) = p2_view(&store).await;
+    let outer = p.window(10, 100).await.unwrap();
+    let inner = outer.window(5, 50).await.unwrap();
+    assert_eq!(row_list(&inner).await, want[15..65]);
+    assert_eq!(served_component(&inner), Some("index:posg"));
+    let past = outer.window(95, 50).await.unwrap();
+    assert_eq!(row_list(&past).await, want[105..110]);
+}
+
+/// The partitions of a served in-memory view are served windows that read,
+/// in turn, the view in the index's order.
+#[tokio::test]
+async fn memory_partitions_concatenate_to_index_order() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let (p, want) = p2_view(&store).await;
+    let parts = p
+        .partitions(std::num::NonZeroUsize::new(4).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(parts.len(), 4);
+    let mut got = vec![];
+    for part in &parts {
+        assert_eq!(served_component(part), Some("index:posg"));
+        got.extend(row_list(part).await);
+    }
+    assert_eq!(got, want);
+}
+
+/// Windows of a served view with an append tail run past the base's rows,
+/// in the index's order, into the tail's: each window is the slice of the
+/// view's quads, and the counts add up.
+#[tokio::test]
+async fn window_crosses_into_the_tail() {
+    let (_dir, store) = memory_store(LayoutStrategy::Default).await;
+    let extra: Vec<Quad> = (0..3)
+        .map(|k| {
+            make_quad(
+                &format!("http://example.org/t{k}"),
+                "http://example.org/p2",
+                "tail",
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let store = store.add_quads(extra).await.unwrap();
+    let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    assert_eq!(served_component(&p), Some("index:posg"));
+    let quads = p.quads_vec().await.unwrap();
+    let n = quads.len() - 3;
+    for offset in n - 2..=n + 2 {
+        let w = p.window(offset, 4).await.unwrap();
+        let want = slice_of(&quads, offset, 4);
+        assert_eq!(
+            quad_strings(&w.quads_vec().await.unwrap()),
+            quad_strings(&want),
+            "offset {offset}"
+        );
+        assert_eq!(
+            w.quads_vec().await.unwrap(),
+            want,
+            "offset {offset}: the order"
+        );
+        assert_eq!(w.size().await.unwrap(), want.len(), "offset {offset}");
+    }
+}
+
+/// Row ids past `u32::MAX` through served windows and partitions: the same
+/// rows as the index-order slices of an unindexed twin's.
+#[tokio::test]
+async fn wide_row_ids_through_served_windows() {
+    let _base = crate::store::test_hooks::RowIdBase::set((1 << 32) + 5);
+    let quads = modular_quads(2_000, 7, 11);
+    let store = built_store(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let twin = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    assert_eq!(served_component(&p), Some("index:posg"));
+    let want = posg(row_list(&matched_view(&twin, None, Some(&iri("p2")), None, None).await).await);
+    for (offset, limit) in [(0, 10), (100, 50), (200, 1_000)] {
+        let w = p.window(offset, limit).await.unwrap();
+        assert_eq!(
+            row_list(&w).await,
+            slice_of(&want, offset, limit),
+            "({offset}, {limit})"
+        );
+    }
+    let parts = p
+        .partitions(std::num::NonZeroUsize::new(3).unwrap())
+        .await
+        .unwrap();
+    let mut got = vec![];
+    for part in &parts {
+        got.extend(row_list(part).await);
+    }
+    assert_eq!(got, want);
+}
+
+/// What does not depend on order reads a narrowed served view as before:
+/// its bytes, reopened, hold its rows.
+#[tokio::test]
+async fn order_free_consumers_unchanged() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let (p, _) = p2_view(&store).await;
+    let w = p.window(10, 100).await.unwrap();
+    let reopened = VortexRdfStore::from_bytes(&w.to_bytes().await.unwrap())
+        .await
+        .unwrap();
+    let mut want = quad_strings(&w.quads_vec().await.unwrap());
+    want.sort();
+    let mut got = quad_strings(&reopened.quads_vec().await.unwrap());
+    got.sort();
+    assert_eq!(got, want);
+}
+
+/// The probe API, as the bindings call it: a windowed probe of a served
+/// pattern is the index-order slice, and its count is the view's size.
+#[tokio::test]
+async fn probe_windows_follow_index_order() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let (p, want) = p2_view(&store).await;
+    let probe = Probe::parse(None, Some("<http://example.org/p2>"), None, None).unwrap();
+    let w = store
+        .run_probe(&probe.clone().window(10, Some(100)))
+        .await
+        .unwrap();
+    assert_eq!(row_list(&w).await, want[10..110]);
+    assert_eq!(
+        store.count_probe(&probe).await.unwrap(),
+        p.size().await.unwrap()
+    );
+}

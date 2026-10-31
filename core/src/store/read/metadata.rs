@@ -4,14 +4,16 @@
 //! the identity of the data behind it.
 
 use std::num::NonZeroUsize;
+use std::ops::Range;
 
+use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
 use crate::store::indexes::copy::CopyFamily;
-use crate::store::indexes::{ComponentIdentity, IndexType};
+use crate::store::indexes::{ComponentIdentity, IndexType, LazyRowIds};
 use crate::store::read::count::BaseRows;
 use crate::store::schema::{QuadColumn, TermCode};
 use crate::store::view::selection::{RowSelection, SelectedRows, ViewSelection};
@@ -247,8 +249,12 @@ impl VortexRdfStore {
     }
 
     /// This view cut into at most `n` views over disjoint, contiguous pieces
-    /// of its base rows, in base row order, so reading the partitions in
-    /// turn reads the view. Each keeps the view's pushed-down filter and
+    /// of its base rows, in the view's order, so reading the partitions in
+    /// turn reads the view. A view a by-copy index serves in memory is cut
+    /// in its index's order into served windows of about equal live rows
+    /// ([`served_window_in_memory`](Self::served_window_in_memory)), the tail
+    /// with the last. Any other view is cut in base row order: each keeps the
+    /// view's pushed-down filter and
     /// tombstones and applies them to its own rows; the append tail goes with
     /// the last, so over a sorted base every partition but the last keeps the
     /// `Spog` [`sort_order`](ViewStatistics::sort_order), and the last keeps
@@ -261,6 +267,9 @@ impl VortexRdfStore {
         let n = n.get();
         if n == 1 {
             return Ok(vec![self.clone()]);
+        }
+        if let Some(parts) = self.served_partitions(n)? {
+            return Ok(parts);
         }
         let pieces = self
             .quads
@@ -285,6 +294,68 @@ impl VortexRdfStore {
                 self.derived(self.quads.with_selection(ViewSelection::Exact(piece)), tail)
             })
             .collect())
+    }
+}
+
+impl VortexRdfStore {
+    /// A view an in-memory plan serves cut into at most `n` served windows
+    /// of `ceil(rows / n)` of its live rows each, in its index's order, the
+    /// tail with the last; each window a part of the plan's range with its
+    /// row ids kept unsorted, as [`served_window_in_memory`](Self::served_window_in_memory)
+    /// builds one. `None` for a view no in-memory plan serves, or one whose
+    /// base holds no live row.
+    fn served_partitions(&self, n: usize) -> Result<Option<Vec<Self>>> {
+        let Some(memory) = self.quads.in_memory() else {
+            return Ok(None);
+        };
+        let Some(plan) = &memory.serve else {
+            return Ok(None);
+        };
+        // The live rows' positions, under tombstones; without, the range's.
+        let (positions, rids) = match &self.quads.deleted {
+            None => (None, plan.live_rids(None)?),
+            Some(deleted) => {
+                let (positions, rids) = plan.live_rows(Some(deleted))?;
+                (Some(positions), Buffer::from(rids))
+            }
+        };
+        let rows = rids.len();
+        if rows == 0 {
+            return Ok(None);
+        }
+        let size = rows.div_ceil(n);
+        let range = plan.range();
+        let pieces: Vec<Range<usize>> = (0..rows)
+            .step_by(size)
+            .map(|start| start..(start + size).min(rows))
+            .collect();
+        let last = pieces.len() - 1;
+        Ok(Some(
+            pieces
+                .into_iter()
+                .enumerate()
+                .map(|(i, piece)| {
+                    let span = match &positions {
+                        None => range.start + piece.start..range.start + piece.end,
+                        Some(positions) => positions[piece.start]..positions[piece.end - 1] + 1,
+                    };
+                    let ids = LazyRowIds::from_unsorted_ids(rids.slice(piece), true);
+                    let quads = self.quads.in_memory_with(
+                        memory,
+                        ViewSelection::pending(ids),
+                        Some(plan.narrowed(span)),
+                    );
+                    let tail = self.tail.as_ref().map(|tail| {
+                        if i == last {
+                            tail.clone()
+                        } else {
+                            tail.with_selection(RowSelection::empty())
+                        }
+                    });
+                    self.derived(quads, tail)
+                })
+                .collect(),
+        ))
     }
 }
 

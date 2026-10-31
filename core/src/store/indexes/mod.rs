@@ -482,7 +482,6 @@ enum LazyRowIdSource {
     /// In-memory: a narrowed served view's ids, in any order (its index's),
     /// sorted into base order only on first need. `live` when they leave out
     /// every tombstoned row, so they count as they are.
-    #[cfg_attr(not(test), allow(dead_code))]
     Unsorted { ids: Buffer<RowId>, live: bool },
     /// File-backed: the rid-only pushed-down scan of the index child
     /// ([`scan_index_row_ids`]) the eager path would have run at match time.
@@ -539,7 +538,6 @@ impl LazyRowIds {
     /// Lazy ids of a narrowed served view: `ids` in any order, sorted into
     /// base order on first need. `live` when they leave out every tombstoned
     /// row.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_unsorted_ids(ids: Buffer<RowId>, live: bool) -> Self {
         Self {
             cells: Arc::default(),
