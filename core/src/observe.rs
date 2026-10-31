@@ -71,6 +71,9 @@ pub(crate) enum Event {
     // ── Matching ─────────────────────────────────────────────────────────
     /// An in-memory index component's `rid` column decoded, this many rows.
     RidsDecoded(usize),
+    /// A pending selection's ids sorted into base order, this many: a
+    /// `LazyRowIds` filling its sorted cache.
+    IdsSorted(usize),
     /// A typed residual's or a component's probe bound a column: `cached`
     /// when the store's own probe answered.
     ProbeBound { cached: bool },

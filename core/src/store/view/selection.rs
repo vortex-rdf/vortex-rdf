@@ -98,8 +98,10 @@ impl ViewSelection {
     /// The live rows this selection covers out of `base_len`, when known
     /// without I/O: an exact selection's rows less the `deleted` tombstones;
     /// a pending run's width while nothing is tombstoned
-    /// ([`LazyRowIds::len_if_known`]); under tombstones, its ids less them
-    /// when they take no I/O ([`LazyRowIds::ids_without_io`]). An in-memory
+    /// ([`LazyRowIds::len_if_known`]); under tombstones, an in-memory run's
+    /// or a narrowed served view's ids counted in their own order, never
+    /// sorted ([`LazyRowIds::live_len_without_sort`]), and a file run's ids
+    /// less them once read ([`LazyRowIds::ids_without_io`]). An in-memory
     /// run's ids are decoded and cached here, the one way this fails, and a
     /// pending residual's matches are known once every piece was compared,
     /// and computed here under tombstones. Passed no tombstones, it counts the
@@ -112,9 +114,14 @@ impl ViewSelection {
         Ok(match (self, deleted) {
             (ViewSelection::Exact(selection), _) => Some(selection.live_len(deleted, base_len)),
             (ViewSelection::Pending { ids, .. }, None) => ids.len_if_known(),
-            (ViewSelection::Pending { ids, .. }, Some(deleted)) => ids
-                .ids_without_io()?
-                .map(|ids| RowSelection::Ids(ids).live_len(Some(deleted), base_len)),
+            (ViewSelection::Pending { ids, .. }, Some(deleted)) => {
+                match ids.live_len_without_sort(deleted)? {
+                    Some(live) => Some(live),
+                    None => ids
+                        .ids_without_io()?
+                        .map(|ids| RowSelection::Ids(ids).live_len(Some(deleted), base_len)),
+                }
+            }
             (ViewSelection::Residual(residual), None) => residual.len_if_known(),
             (ViewSelection::Residual(residual), Some(deleted)) => {
                 Some(RowSelection::Ids(residual.materialized()?).live_len(Some(deleted), base_len))

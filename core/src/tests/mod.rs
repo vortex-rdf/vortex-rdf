@@ -23,6 +23,7 @@ mod dictionary_handle;
 // shared escaped-literal case list.
 pub(crate) mod escaping;
 mod file_backed;
+mod index_order;
 mod indexes;
 mod indexes_file;
 mod leaf_geometry;
