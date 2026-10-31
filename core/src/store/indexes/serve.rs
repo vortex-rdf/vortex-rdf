@@ -32,7 +32,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
-use super::COL_RID;
+use super::{COL_RID, LazyCells};
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
@@ -216,8 +216,9 @@ impl ServeDecode {
 /// contiguous run `range` of the index component's own array, bounded by a
 /// binary search over its sorted lead column, so `quads()` slices them from
 /// the component (an `Arc` bump) or point-reads a small run, instead of
-/// gathering the primary columns at scattered row ids. `MemoryBase` carries
-/// only this type; `FileServePlan` (in `file.rs`) is the file-backed half.
+/// gathering the primary columns at scattered row ids. Every read of the
+/// view follows the component's order. `MemoryBase` carries only this type;
+/// `FileServePlan` (in `file.rs`) is the file-backed half.
 #[derive(Clone)]
 pub(crate) struct InMemoryServePlan {
     decode: ServeDecode,
@@ -225,7 +226,14 @@ pub(crate) struct InMemoryServePlan {
     component: &'static str,
     /// The index component's rows, in child schema.
     array: ArrayRef,
+    /// The rows of the component the view covers.
     range: Range<usize>,
+    /// The run's slice of the component's rid column, the slice the view's
+    /// lazy ids hold.
+    rids: ArrayRef,
+    /// The caches the view's lazy ids fill, shared, so the run's ids decode
+    /// once for the plan's reads and the ids alike.
+    cells: Arc<LazyCells>,
     /// The component's shared probe cache, so a small run reads
     /// point-by-point at its global positions instead of slicing (a slice's
     /// probe would be re-resolved per call).
@@ -235,25 +243,51 @@ pub(crate) struct InMemoryServePlan {
 impl InMemoryServePlan {
     /// A plan serving the contiguous `range` of the rows `array` of the
     /// in-memory index component named `component`, decoded through
-    /// `decode`.
+    /// `decode`. `rids` is the run's slice of the component's rid column and
+    /// `cells` the caches of the lazy ids built over it.
     pub(super) fn new(
         decode: ServeDecode,
         component: &'static str,
         array: ArrayRef,
         range: Range<usize>,
+        rids: ArrayRef,
         probes: Arc<StructProbes>,
+        cells: Arc<LazyCells>,
     ) -> Self {
         Self {
             decode,
             component,
             array,
             range,
+            rids,
+            cells,
             probes,
         }
     }
 
     pub(crate) fn component(&self) -> &'static str {
         self.component
+    }
+
+    /// The run's base row ids in the component's order, decoded once into
+    /// the caches the view's lazy ids share ([`LazyCells::run_order_of`]).
+    pub(crate) fn run_rids(&self) -> Result<Buffer<RowId>> {
+        self.cells.run_order_of(&self.rids)
+    }
+
+    /// The base row ids of the view's rows in the component's order, less
+    /// the `deleted` tombstones: what a read gathers off the base in the
+    /// index's order. The run's own ids, shared, when nothing is tombstoned.
+    pub(crate) fn live_rids(&self, deleted: Option<&Mask>) -> Result<Buffer<RowId>> {
+        let rids = self.run_rids()?;
+        Ok(match deleted {
+            None => rids,
+            Some(deleted) => rids
+                .iter()
+                .copied()
+                .filter(|&rid| !deleted.value(rid as usize))
+                .collect(),
+        })
     }
 
     /// The positions of a small run's live rows, for point reads through the

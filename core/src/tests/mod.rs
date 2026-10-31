@@ -1272,11 +1272,31 @@ async fn sorted_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     rows
 }
 
-/// The view's rows in base row order: a keep that admits every code drops
-/// any serve plan without dropping a row.
+/// The view's rows in base row order: the rows of the view with no serve
+/// plan ([`debug_unserved`](VortexRdfStore::debug_unserved)).
 async fn base_ordered_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let all = Keep::range(0..TermCode::MAX);
-    row_list(&view.keep(QuadColumn::S, &all).await.unwrap()).await
+    row_list(&view.debug_unserved().await.unwrap()).await
+}
+
+/// `rows` in `index:posg`'s order, (p, o, s, g): the order a served `?p??`
+/// view reads them in.
+fn posg(mut rows: Vec<[TermCode; 4]>) -> Vec<[TermCode; 4]> {
+    rows.sort_unstable_by_key(|r| (r[1], r[2], r[0], r[3]));
+    rows
+}
+
+/// The view's rows in the order its reads yield them: a view `index:posg`
+/// serves in memory in (p, o, s, g) order ([`posg`]), any other in base row
+/// order ([`base_ordered_codes`]), the order of every view another index
+/// serves too, whose own order puts no unbound role ahead of the subject.
+/// Takes the view's statistics (see the note on [`served_component`]).
+async fn read_order_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    let stats = view.view_statistics().unwrap();
+    let base = base_ordered_codes(view).await;
+    match (stats.served_component, stats.file_backed) {
+        (Some("index:posg"), false) => posg(base),
+        _ => base,
+    }
 }
 
 /// The rows of one [`code_chunks`](VortexRdfStore::code_chunks) chunk over

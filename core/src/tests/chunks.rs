@@ -7,8 +7,9 @@ use crate::store::read::chunks::RowChunkStream;
 use crate::store::test_hooks::{FailingCut, ForcedLimit};
 use crate::store::{QuadColumn, TermCode};
 
-/// Both exports of `view` agree with its base-ordered codes at several batch
-/// sizes — one row (on a view of at most 256 rows), a size the rows do not
+/// Both exports of `view` agree with its codes in the order its reads yield
+/// them ([`read_order_codes`]) at several batch sizes — one row (on a view of
+/// at most 256 rows), a size the rows do not
 /// divide, the view's length — in the chunks the view reads at its length
 /// (one, or a file scan's split each), each cut to the batch; every column
 /// subset reads the subset's columns of the four-column read, and a subset
@@ -17,7 +18,7 @@ use crate::store::{QuadColumn, TermCode};
 /// is exact.
 async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> bool {
     let hint = view.view_statistics().unwrap().rows;
-    let expected = base_ordered_codes(view).await;
+    let expected = read_order_codes(view).await;
     let n = expected.len();
     let uncut: Vec<usize> = collect_row_chunks(view, n.max(1))
         .await
@@ -238,12 +239,13 @@ async fn test_code_chunks_gather_the_base_cut_to_the_asked_columns() {
 }
 
 /// Both exports of the in-memory `view` at `batch` rows a chunk answer its
-/// base-ordered codes through `gathers` window gathers, one per pull: the
+/// codes in the order its reads yield them ([`read_order_codes`]) through
+/// `gathers` window gathers, one per pull: the
 /// first pull gathers one window, or none when the view gathers none. A read
 /// of all four code columns, in any order, gathers each window's four in one
 /// pass (`gather_codes`), and a read of `o` alone only that column.
 async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag: &str) {
-    let expected = base_ordered_codes(view).await;
+    let expected = read_order_codes(view).await;
     let first_pull = gathers.min(1);
     // The code gathers by path since the last take: `(of all four columns,
     // of one)`.

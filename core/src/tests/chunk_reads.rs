@@ -153,8 +153,8 @@ async fn decode_row_chunk_refuses_a_dictionary_store() {
 }
 
 /// Drains `view`'s `code_chunks` over `columns` at `batch_rows` as it reads
-/// now and on its pre-fix path ([`LegacyChunkPaths`]): the same rows, in the same
-/// order.
+/// now and on its base-order path ([`LegacyChunkPaths`]): the same rows, the
+/// stream's in the order the view's reads yield them ([`read_order_codes`]).
 async fn assert_code_chunks_equal_legacy<const N: usize>(
     view: &VortexRdfStore,
     columns: &[QuadColumn; N],
@@ -168,10 +168,14 @@ async fn assert_code_chunks_equal_legacy<const N: usize>(
         collect_code_chunks(view, columns, batch_rows).await.0
     };
     assert!(!legacy_chunk_paths());
-    assert_eq!(
-        rows, legacy,
-        "{tag}: code_chunks {columns:?} at {batch_rows}"
-    );
+    let tag = format!("{tag}: code_chunks {columns:?} at {batch_rows}");
+    assert_eq!(sorted(rows.clone()), sorted(legacy), "{tag}");
+    let order: Vec<[TermCode; N]> = read_order_codes(view)
+        .await
+        .iter()
+        .map(|row| columns.map(|c| row[c.index()]))
+        .collect();
+    assert_eq!(rows, order, "{tag}: the view's order");
 }
 
 /// [`assert_code_chunks_equal_legacy`] for `row_chunks`.
@@ -181,7 +185,19 @@ async fn assert_row_chunks_equal_legacy(view: &VortexRdfStore, batch_rows: usize
         let _legacy = LegacyChunkPaths::set();
         struct_chunk_codes(&collect_row_chunks(view, batch_rows).await)
     };
-    assert_eq!(rows, legacy, "{tag}: row_chunks at {batch_rows}");
+    let tag = format!("{tag}: row_chunks at {batch_rows}");
+    assert_eq!(sorted(rows.clone()), sorted(legacy), "{tag}");
+    assert_eq!(
+        rows,
+        read_order_codes(view).await,
+        "{tag}: the view's order"
+    );
+}
+
+/// `rows`, sorted: a stream's rows as a multiset.
+fn sorted<T: Ord>(mut rows: Vec<T>) -> Vec<T> {
+    rows.sort_unstable();
+    rows
 }
 
 /// The patterns the legacy matrix reads on `modular_quads(20_000, 7, 11)`:
@@ -408,20 +424,17 @@ async fn other_served_views_keep_their_path() {
         vec![IndexType::SecondaryByReference],
     )
     .await;
-    for (name, store) in [
-        (
-            "copy in memory",
-            VortexRdfStore::from_file_in_memory(&copy).await.unwrap(),
-        ),
-        (
-            "reference on file",
-            VortexRdfStore::from_file(&reference).await.unwrap(),
-        ),
+    // An in-memory copy's run is read off its plan, in the index's order.
+    let memory = VortexRdfStore::from_file_in_memory(&copy).await.unwrap();
+    let reference = VortexRdfStore::from_file(&reference).await.unwrap();
+    for (name, store, read_off_the_run) in [
+        ("copy in memory", memory, true),
+        ("reference on file", reference, false),
     ] {
         let view = probe_view(&store, p2).await;
         for batch_rows in [256, 65_536] {
             let (_, served) = drain_counting_served(&view, batch_rows).await;
-            assert!(!served, "{name} at {batch_rows}: not read off an index run");
+            assert_eq!(served, read_off_the_run, "{name} at {batch_rows}");
             assert_code_chunks_equal_legacy(&view, &QuadColumn::ALL, batch_rows, name).await;
         }
     }

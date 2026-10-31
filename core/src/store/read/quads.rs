@@ -58,7 +58,7 @@ enum QuadRead {
     /// (`quads`, `shared_quad_chunks`).
     Served,
     /// Streamed in base row order, a serve plan never consulted (the raw
-    /// export).
+    /// export of an unserved view).
     BaseOrder,
     /// Collected whole and served as [`Served`](Self::Served) is (`quads_vec`,
     /// `shared_quads_vec`): a one-shot read, which on file reads a pending
@@ -121,11 +121,15 @@ impl VortexRdfStore {
     /// [`quads`](Self::quads) pays): what the N-Triples/N-Quads export
     /// writes.
     ///
-    /// Rows come in base row order: a serve plan, which orders rows by its
-    /// index, is not consulted, so a served view's pending selection
-    /// materializes and its rows are read as an unserved view's are.
+    /// Rows come in [`quads`](Self::quads)' order: a served view's in its
+    /// index's order, read off its serve plan, any other's in base row
+    /// order.
     pub(in crate::store) fn nquad_line_chunks(&self) -> BoxStream<'_, Vec<Result<NQuadLines>>> {
-        self.chunk_stream::<NQuadLines>(QuadRead::BaseOrder)
+        let mode = match self.quads.served_component() {
+            Some(_) => QuadRead::Served,
+            None => QuadRead::BaseOrder,
+        };
+        self.chunk_stream::<NQuadLines>(mode)
     }
 
     /// Collect every decoded chunk, then flatten into one exactly-sized `Vec`.

@@ -7,12 +7,14 @@ use vortex_array::arrays::{PrimitiveArray, Struct, StructArray};
 use vortex_array::dtype::PType;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
+use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 use vortex_rdf_encoded_search::SortedProbe;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::probes::StructProbes;
-use crate::store::view::selection::RowSelection;
+use crate::store::schema::RowId;
+use crate::store::view::selection::{RowSelection, point_sized};
 
 /// The rows of `base` that `selection` covers and `deleted` has not
 /// tombstoned: the one place the in-memory reads turn a view into rows, so
@@ -36,6 +38,32 @@ pub(crate) fn gather_live(
         return Ok(rows);
     }
     rows.filter(live).map_err(VortexRdfError::Vortex)
+}
+
+/// The rows of `base` at the base row ids `ids`, in the order of `ids` (any
+/// order, each id once, none tombstoned): point by point through `probes`
+/// when they are few ([`point_sized`]), else one take. A served view's rows
+/// read off the base in its index's order.
+pub(crate) fn gather_rows_at(
+    base: &ArrayRef,
+    ids: &Buffer<RowId>,
+    probes: Option<&StructProbes>,
+) -> Result<ArrayRef> {
+    if point_sized(ids.len() as u64)
+        && let Some(fields) = base.dtype().as_struct_fields_opt()
+    {
+        let positions: Vec<usize> = ids.iter().map(|&id| id as usize).collect();
+        let names = fields.names().clone();
+        if let Some(children) =
+            point_read_columns(base, names.iter().map(AsRef::as_ref), &positions, probes)
+        {
+            let rows =
+                StructArray::try_new(names, children, positions.len(), Validity::NonNullable)?;
+            return Ok(rows.into_array());
+        }
+    }
+    let indices = PrimitiveArray::new(ids.clone(), Validity::NonNullable).into_array();
+    base.take(indices).map_err(VortexRdfError::Vortex)
 }
 
 /// The live rows of a point-sized selection, read point by point through

@@ -747,9 +747,9 @@ pub(super) async fn run_copy_index_serving_script(
 /// from a slice of the base with its ids pending, a residual graph
 /// constraint drops the plan for a mask scan that gathers the rows itself,
 /// and a known-but-never-predicate term is proven empty by the in-memory
-/// probe at match time. The N-Quads export of a served view reads it in base
-/// order, not the plan's. Over code columns, a served run within the
-/// point-read cap is read point by point.
+/// probe at match time. The N-Quads export of a served view reads it in the
+/// plan's order, as `quads()` does. Over code columns, a served run within
+/// the point-read cap is read point by point.
 #[tokio::test]
 async fn test_in_memory_copy_index_serving() {
     async fn nquads(view: VortexRdfStore) -> String {
@@ -779,11 +779,11 @@ async fn test_in_memory_copy_index_serving() {
     )
     .await;
 
-    // A served view's N-Quads export lists its quads in base (s, p, o, g)
-    // order; `quads()` reads them in the index's (p, o, s, g) order. A window
-    // that cannot cut a row is the served view as it is, plan and order
-    // included, while one that cuts a row drops the plan and reads base
-    // order.
+    // A served view's N-Quads export lists its quads as `quads()` reads
+    // them, in the index's (p, o, s, g) order; its unserved twin lists them
+    // in base (s, p, o, g) order. A window that cannot cut a row is the
+    // served view as it is, plan and order included, while one that cuts a
+    // row drops the plan and reads base order.
     let p1 = iri("p1");
     let by_p = matched_view(&store, None, Some(&p1), None, None).await;
     assert_eq!(served_component(&by_p), Some("index:posg"));
@@ -794,7 +794,8 @@ async fn test_in_memory_copy_index_serving() {
     assert_eq!(served_component(&cut), None);
     let exported = nquads(by_p.clone()).await;
     assert_eq!(exported, nquads(whole.clone()).await);
-    let lines: Vec<&str> = exported.lines().collect();
+    let unserved = nquads(by_p.debug_unserved().await.unwrap()).await;
+    let lines: Vec<&str> = unserved.lines().collect();
     assert!(lines.is_sorted(), "base (s, p, o, g) order: {lines:#?}");
     assert_eq!(
         nquads(cut.clone()).await.lines().collect::<Vec<_>>(),
@@ -824,6 +825,11 @@ async fn test_in_memory_copy_index_serving() {
         "the index's order: {served:#?}"
     );
     let served_lines: Vec<String> = served.iter().map(|q| format!("{q} .")).collect();
+    assert_eq!(
+        exported.lines().collect::<Vec<_>>(),
+        served_lines,
+        "the export follows quads()"
+    );
     assert_ne!(served_lines, lines, "the two orders differ on this run");
     let whole_served: Vec<Quad> = whole.quads().try_collect().await.unwrap();
     assert_eq!(
@@ -1041,10 +1047,10 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
         (IndexType::SecondaryByCopy, true),
     ] {
         let store = streamed_store(quads.clone(), LayoutStrategy::Dictionary, vec![index]).await;
-        // The whole run in base order, as its code chunks come, and in the
-        // order its one-shot read takes: the index's under a copy's plan.
+        // The whole run in base order, as its unserved twin reads it, and in
+        // the order its reads take: the index's under a copy's plan.
         let matched = matched_view(&store, None, Some(&p1), None, None).await;
-        let (base_order, _) = collect_code_chunks(&matched, &QuadColumn::ALL, width).await;
+        let base_order = base_ordered_codes(&matched).await;
         let served_order = row_list(&matched).await;
         assert_eq!(base_order.len(), width, "{index:?}");
         let probe = Probe::new(None, Some(p1.clone()), None, None);

@@ -519,6 +519,12 @@ impl LazyRowIds {
         self.cells.sorted.get().is_some()
     }
 
+    /// The caches these ids fill, for a serve plan reading the same run to
+    /// share ([`LazyCells`]).
+    pub(crate) fn cells(&self) -> Arc<LazyCells> {
+        Arc::clone(&self.cells)
+    }
+
     /// Lazy ids over an in-memory component's matched rid run, in the
     /// component's own order; `ascending` when those rids are already in row
     /// id order, as a reference component's are within one value (its rows

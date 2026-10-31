@@ -19,7 +19,6 @@ use std::thread::LocalKey;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::{Struct, StructArray};
 
-#[cfg(feature = "file-io")]
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
@@ -287,6 +286,15 @@ impl VortexRdfStore {
             ViewSelection::Pending { ids, .. } => Some(ids.debug_materialized()),
             ViewSelection::Residual(residual) => Some(residual.debug_materialized()),
         }
+    }
+
+    /// This view's rows as an exact selection in base row order, with no
+    /// serve plan: what an unserved view of the same rows reads, a served
+    /// view's base-order expectation.
+    pub(crate) async fn debug_unserved(&self) -> Result<VortexRdfStore> {
+        let selection = self.quads.materialized_selection().await?;
+        let quads = self.quads.with_selection(ViewSelection::Exact(selection));
+        Ok(self.derived(quads, self.tail.clone()))
     }
 
     /// The exact row range this view's base selection is, when it is one

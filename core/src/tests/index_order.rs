@@ -100,3 +100,118 @@ async fn a_run_decodes_once_for_both_orders() {
     assert_eq!(rids_decoded(&rec), 3, "one decode of the run's three rids");
     assert_eq!(ids_sorted(&rec), 1);
 }
+
+/// The by-copy store of `modular_quads(20_000, 7, 11)` under `layout`,
+/// written once per process per layout (see [`cached_store_file`]) and
+/// opened in memory. Keep the `TempDir` alive while the store is used.
+async fn memory_store(layout: LayoutStrategy) -> (tempfile::TempDir, VortexRdfStore) {
+    static FILES: [OnceLock<Vec<u8>>; 3] = [const { OnceLock::new() }; 3];
+    let cell = &FILES[LAYOUTS.iter().position(|&l| l == layout).unwrap()];
+    let quads = || modular_quads(20_000, 7, 11);
+    let (dir, path) =
+        cached_store_file(cell, quads, layout, vec![IndexType::SecondaryByCopy]).await;
+    (
+        dir,
+        VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+    )
+}
+
+/// A quad's terms as the store spells them, `(s, p, o, g)`: their N-Triples
+/// forms, the default graph as the empty string.
+fn spellings(quad: &Quad) -> [String; 4] {
+    let graph = match &quad.graph_name {
+        GraphName::DefaultGraph => String::new(),
+        graph => graph.to_string(),
+    };
+    [
+        quad.subject.to_string(),
+        quad.predicate.to_string(),
+        quad.object.to_string(),
+        graph,
+    ]
+}
+
+/// Every stream of a served in-memory view reads its rows in its index's
+/// order: a `?p??` view in `index:posg`'s, which puts the object before the
+/// subject, and a `??o?` view in `index:ospg`'s, which for a bound object is
+/// base order. The one-shot read already did.
+#[tokio::test]
+async fn memory_streams_follow_index_order() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    assert_eq!(served_component(&p), Some("index:posg"));
+    let base = base_ordered_codes(&p).await;
+    let want = posg(base.clone());
+    assert_ne!(want, base, "the index's order is not base order");
+    assert_eq!(collect_code_chunks(&p, &QuadColumn::ALL, 64).await.0, want);
+    let objects: Vec<[TermCode; 1]> = want.iter().map(|r| [r[2]]).collect();
+    assert_eq!(
+        collect_code_chunks(&p, &[QuadColumn::O], 64).await.0,
+        objects
+    );
+    assert_eq!(struct_chunk_codes(&collect_row_chunks(&p, 256).await), want);
+    assert_eq!(row_list(&p).await, want);
+
+    let o = matched_view(&store, None, None, Some(&plain_literal("object 3")), None).await;
+    assert_eq!(served_component(&o), Some("index:ospg"));
+    let base = base_ordered_codes(&o).await;
+    assert_eq!(collect_code_chunks(&o, &QuadColumn::ALL, 64).await.0, base);
+    assert_eq!(struct_chunk_codes(&collect_row_chunks(&o, 256).await), base);
+}
+
+/// The same on a string layout: a served `?p??` view's row chunks and its
+/// `quads_vec` follow (p, o, s, g) over the terms' N-Triples spellings.
+#[tokio::test]
+async fn memory_string_streams_follow_index_order() {
+    let (_dir, store) = memory_store(LayoutStrategy::Default).await;
+    let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    assert_eq!(served_component(&p), Some("index:posg"));
+    let unserved = p.debug_unserved().await.unwrap().quads_vec().await.unwrap();
+    let mut want: Vec<[String; 4]> = unserved.iter().map(spellings).collect();
+    want.sort_by(|a, b| (&a[1], &a[2], &a[0], &a[3]).cmp(&(&b[1], &b[2], &b[0], &b[3])));
+    let chunks = collect_row_chunks(&p, 256).await;
+    let rows: Vec<(String, String)> = chunk_subjects(&chunks)
+        .into_iter()
+        .zip(chunk_strings(&chunks, "o"))
+        .collect();
+    let want_rows: Vec<(String, String)> =
+        want.iter().map(|q| (q[0].clone(), q[2].clone())).collect();
+    assert_eq!(rows, want_rows);
+    let quads: Vec<[String; 4]> = p.quads_vec().await.unwrap().iter().map(spellings).collect();
+    assert_eq!(quads, want);
+}
+
+/// The N-Quads export of a served in-memory view writes its rows in the
+/// order `quads_vec` reads them, the index's, not base order.
+#[tokio::test]
+async fn memory_export_follows_index_order() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    let mut out = Vec::new();
+    crate::export_rdf(p.clone(), &mut out, oxrdfio::RdfFormat::NQuads)
+        .await
+        .unwrap();
+    let exported: Vec<Quad> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_reader(out.as_slice())
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    let quads = p.quads_vec().await.unwrap();
+    assert_eq!(exported, quads);
+    let unserved = p.debug_unserved().await.unwrap().quads_vec().await.unwrap();
+    assert_ne!(quads, unserved, "the index's order is not base order");
+}
+
+/// A served view's run ids decode once however many clones stream it (every
+/// chunk stream reads a clone of its view), and no stream sorts them.
+#[tokio::test]
+async fn run_ids_decode_once_across_clones() {
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    let rec = Recorder::start();
+    for _ in 0..2 {
+        collect_code_chunks(&p.clone(), &QuadColumn::ALL, 64).await;
+        collect_row_chunks(&p.clone(), 64).await;
+    }
+    assert_eq!(rec.count_where(|e| matches!(e, Event::RidsDecoded(_))), 1);
+    assert_eq!(ids_sorted(&rec), 0);
+}

@@ -272,7 +272,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L217) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L654), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L214) | [§6.2](#62-secondary-index-routing) |
+| 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L753), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L214) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L128) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:152-159`](../core/src/store/query/matching/memory.rs#L152-L159 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
@@ -585,7 +585,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`file.rs:39-43`](../core/src/store/query/matching/file.rs#L39-L43 "existing_filter") | — |
 | 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L224), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L679) | [§8](#8-the-index-resolvers) |
+| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L778) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`file.rs:22-91`](../core/src/store/query/matching/file.rs#L22-L91 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
 | 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L214) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`file.rs:171-186`](../core/src/store/query/matching/file.rs#L171-L186 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L200) | [§7.3](#73-what-ends-up-on-the-view) |

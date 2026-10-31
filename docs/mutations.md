@@ -146,9 +146,9 @@ flowchart TD
 - **The contract.** `match_pattern` deliberately does **not** subtract
   tombstones when it computes a selection (keeping its row positions aligned
   for mask-based refinement); every *read* path does.
-  [`RowSelection::live_mask`](../core/src/store/view/selection.rs#L411) answers
+  [`RowSelection::live_mask`](../core/src/store/view/selection.rs#L418) answers
   "which of this selection's own rows are not tombstoned", and the in-memory
-  reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L21)
+  reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L23)
   — the single place a view becomes rows — so applying the mask cannot be
   forgotten by one of them. [`size`](../core/src/store/read/count.rs#L16) counts
   the live bits without gathering; the tail applies its own mask through

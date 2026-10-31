@@ -15,7 +15,7 @@ tests pin each interface
 
 | What the engine needs | What it calls |
 |---|---|
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L81), [`code_chunks`](../core/src/store/read/chunks.rs#L113) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L87), [`code_chunks`](../core/src/store/read/chunks.rs#L121) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L153), [`index_components`](../core/src/store/read/metadata.rs#L225), [`partitions`](../core/src/store/read/metadata.rs#L260) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
@@ -74,7 +74,7 @@ Two calls let a binding build its own chunked read of a pattern:
 [`code_probe`](../core/src/store/query/located.rs#L131) turns a `CodePattern` into
 the `Probe` that `match_code_pattern` runs when no located run answers it
 (`None` when no quad can match), for `run_probe` and then `code_chunks`;
-and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L140) decodes one of
+and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L148) decodes one of
 a string layout's `row_chunks` into `SharedQuad`s, each distinct term of the
 chunk once, as `shared_quads_vec` decodes it (a Dictionary store's chunks
 hold codes, which `dict_reader` decodes). Java's `matchCodeChunks` is built

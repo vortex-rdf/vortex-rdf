@@ -3,14 +3,16 @@
 //! ([`row_chunks`](VortexRdfStore::row_chunks)) or [`TermCode`] columns
 //! ([`code_chunks`](VortexRdfStore::code_chunks)).
 //!
-//! Chunks hold at most `batch_rows` rows and come in base row order with the
-//! view's narrowing and tombstones applied; under a string layout the tail's
-//! live rows follow the base, as [`quads`](VortexRdfStore::quads) orders
-//! them. A served match materializes its row ids first, so the order is the
-//! base's, never the index's. Nothing is read until the first poll. In memory
-//! a contiguous selection without tombstones is sliced from the base, and
-//! any other is cut into windows of live ids, each gathered when its chunk is
-//! pulled. On file a selection `ExactRead` takes by id is taken one window of
+//! Chunks hold at most `batch_rows` rows with the view's narrowing and
+//! tombstones applied, in the view's order: a served in-memory view's in its
+//! index's order, as [`quads`](VortexRdfStore::quads) reads it, gathered off
+//! the base at the run's row ids, one window of them per chunk, the ids never
+//! sorted; any other view's in base row order (a served file view's row ids
+//! sorted into it first). Under a string layout the tail's live rows follow
+//! the base, as `quads` orders them. Nothing is read until the first poll. In
+//! memory a contiguous selection without tombstones is sliced from the base,
+//! and any other is cut into windows of live ids, each gathered when its
+//! chunk is pulled. On file a selection `ExactRead` takes by id is taken one window of
 //! ids per pull; a pending filter it leaves to the masks is evaluated a split
 //! at a time as the stream reaches the split, only the requested columns read
 //! at the rows the split's mask keeps; any other read goes through the one
@@ -32,11 +34,13 @@ use super::rows::{gather_codes, gather_column};
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
+use crate::store::MemoryBase;
 use crate::store::array::{field_as, into_struct_array, rechunk};
+use crate::store::indexes::InMemoryServePlan;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::read::file_plan::StreamedPlan;
-use crate::store::scan::gather::gather_live;
+use crate::store::scan::gather::{gather_live, gather_rows_at};
 #[cfg(feature = "file-io")]
 use crate::store::scan::{
     file_reads::take_file_rows, file_scans::stream_split_reads, read_plan::ExactRead,
@@ -68,7 +72,9 @@ pub type CodeChunkStream = BoxStream<'static, Result<Vec<Buffer<TermCode>>>>;
 impl VortexRdfStore {
     /// The rows this view selects as struct chunks in the layout's primary
     /// dtype ([`TermCode`] columns under the Dictionary layout, strings
-    /// otherwise), in base row order, each of at most `batch_rows` rows (a
+    /// otherwise), in the view's order (a served in-memory view's in its
+    /// index's order, any other in base row order: see the [module
+    /// docs](self)), each of at most `batch_rows` rows (a
     /// file view read split by split, scanned or by its filter's masks, has
     /// its chunks follow the splits, cut to the cap).
     /// Tombstoned rows are skipped; under a string layout the tail's live
@@ -89,7 +95,8 @@ impl VortexRdfStore {
     }
 
     /// The rows this view selects as [`TermCode`] columns, one buffer per
-    /// column of `columns` in that order, in base row order, each chunk of at
+    /// column of `columns` in that order, in the view's order (as
+    /// [`row_chunks`](Self::row_chunks)), each chunk of at
     /// most `batch_rows` rows: the chunked twin of
     /// [`code_columns_gathered`](Self::code_columns_gathered), in the codes of
     /// the store's dictionary ([`dict_reader`](Self::dict_reader) decodes
@@ -98,7 +105,8 @@ impl VortexRdfStore {
     ///
     /// In memory, over code columns the shared cache hands out as primitives,
     /// a contiguous selection without tombstones is sliced zero-copy, and any
-    /// other has only `columns` gathered, one window of live ids per chunk;
+    /// other has only `columns` gathered, one window of live ids per chunk (a
+    /// served view's ids in its index's order);
     /// columns the cache cannot hand out (chunked or wire-encoded) are read
     /// as row chunks and decoded chunk by chunk. On file a selection taken by
     /// id is taken one chunk's ids per pull, and a pending filter the reads
@@ -154,9 +162,11 @@ impl VortexRdfStore {
     /// the stream is first polled: the base's rows, then the tail's.
     async fn row_chunk_source(&self, batch_rows: usize) -> Result<RowChunkStream> {
         let tail = self.tail_chunks(batch_rows)?;
-        let base = self
-            .base_chunks(self.layout.strategy().primary_column_names(), batch_rows)
-            .await?;
+        let primary = self.layout.strategy().primary_column_names();
+        let base = match self.served_rows(primary, batch_rows)? {
+            Some(base) => base,
+            None => self.base_chunks(primary, batch_rows).await?,
+        };
         Ok(base.chain(stream::iter(tail)).boxed())
     }
 
@@ -167,24 +177,14 @@ impl VortexRdfStore {
         columns: &[QuadColumn],
         batch_rows: usize,
     ) -> Result<CodeChunkStream> {
+        // A served view, in its index's order.
+        if let Some(chunks) = self.served_code_chunks(columns, batch_rows)? {
+            return Ok(chunks);
+        }
         // In memory over the base's own code columns: a contiguous run is
         // sliced and a window of live ids gathered, one chunk per pull. Only
         // the columns asked for are decoded into their shared caches.
-        let every = QuadColumn::ALL.iter().all(|c| columns.contains(c));
-        let all = if every {
-            self.base_code_primitives()
-        } else {
-            None
-        };
-        let asked: Option<Vec<PrimitiveArray>> = match &all {
-            Some(all) => Some(columns.iter().map(|c| all[c.index()].clone()).collect()),
-            None if every => None,
-            None => columns
-                .iter()
-                .map(|&c| self.base_code_primitive(c))
-                .collect(),
-        };
-        if let Some(asked) = asked {
+        if let Some((all, asked)) = self.base_code_sources(columns) {
             return Ok(match self.memory_rows(batch_rows)? {
                 MemoryRows::Run(run) => {
                     let picked: Vec<Buffer<TermCode>> = asked
@@ -199,23 +199,7 @@ impl VortexRdfStore {
                     }))
                     .boxed()
                 }
-                MemoryRows::Windows(windows) => {
-                    let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
-                    stream::iter(windows.map(move |ids| {
-                        observe!(Gather { width: None });
-                        Ok(match &all {
-                            // Every column asked for: the four gathered in
-                            // one pass.
-                            Some(all) => {
-                                let codes = gather_codes(all, &ids);
-                                picked.iter().map(|&k| codes[k].clone()).collect()
-                            }
-                            // A subset: only its columns.
-                            None => asked.iter().map(|prim| gather_column(prim, &ids)).collect(),
-                        })
-                    }))
-                    .boxed()
-                }
+                MemoryRows::Windows(windows) => gathered_code_chunks(all, asked, columns, windows),
             });
         }
         // A file view its index serves from a short located run: the run off
@@ -239,6 +223,103 @@ impl VortexRdfStore {
         let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
         let base = self.base_chunks(&names, batch_rows).await?;
         Ok(base.map(move |chunk| extract_codes(chunk?, &names)).boxed())
+    }
+
+    /// A served in-memory view's code chunks in its index's order: the base's
+    /// code columns gathered at the view's row ids as the index keeps them
+    /// ([`InMemoryServePlan::live_rids`]), one window of ids per chunk, the
+    /// run's ids decoded once and never sorted; where the shared cache cannot
+    /// hand the code columns out, the [served rows](Self::served_rows)' codes,
+    /// read per chunk. `None` for a view no in-memory plan serves.
+    ///
+    fn served_code_chunks(
+        &self,
+        columns: &[QuadColumn],
+        batch_rows: usize,
+    ) -> Result<Option<CodeChunkStream>> {
+        let Some((_, plan)) = self.served_memory_plan() else {
+            return Ok(None);
+        };
+        let Some((all, asked)) = self.base_code_sources(columns) else {
+            let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
+            return Ok(self
+                .served_rows(&names, batch_rows)?
+                .map(|rows| rows.map(move |chunk| extract_codes(chunk?, &names)).boxed()));
+        };
+        let ids = plan.live_rids(self.quads.deleted.as_ref())?;
+        observe!(ServedRunChunks);
+        Ok(Some(gathered_code_chunks(
+            all,
+            asked,
+            columns,
+            id_windows(ids, batch_rows),
+        )))
+    }
+
+    /// A served in-memory view's base rows, at least `columns` (primary
+    /// column names), in its index's order: the base's rows at the view's
+    /// row ids as the index keeps them, one window of ids per chunk, each
+    /// read when its chunk is pulled. `None` for a view no in-memory plan
+    /// serves.
+    fn served_rows(
+        &self,
+        columns: &[&'static str],
+        batch_rows: usize,
+    ) -> Result<Option<RowChunkStream>> {
+        let Some((memory, plan)) = self.served_memory_plan() else {
+            return Ok(None);
+        };
+        let ids = plan.live_rids(self.quads.deleted.as_ref())?;
+        let base = projected(&memory.base, columns)?;
+        let probes = Arc::clone(&memory.probes);
+        observe!(ServedRunChunks);
+        Ok(Some(
+            stream::iter(id_windows(ids, batch_rows).map(move |ids| {
+                observe!(Gather {
+                    width: base.dtype().as_struct_fields_opt().map(|f| f.nfields())
+                });
+                gather_rows_at(&base, &ids, Some(&probes))
+            }))
+            .boxed(),
+        ))
+    }
+
+    /// This in-memory view's base beside the serve plan its chunk streams
+    /// read in its index's order; `None` for a view no in-memory plan serves
+    /// (or while a [`LegacyChunkPaths`](crate::store::test_hooks::LegacyChunkPaths)
+    /// guard sends every stream down the base-order paths).
+    fn served_memory_plan(&self) -> Option<(&MemoryBase, &InMemoryServePlan)> {
+        #[cfg(test)]
+        if crate::store::test_hooks::legacy_chunk_paths() {
+            return None;
+        }
+        let memory = self.quads.in_memory()?;
+        Some((memory, memory.serve.as_ref()?))
+    }
+
+    /// The base's code primitives an in-memory code read of `columns` takes
+    /// its codes from: all four when every column is asked for (gathered in
+    /// one pass), beside the asked ones in the order asked. `None` when the
+    /// shared cache cannot hand one out (chunked or wire-encoded), or on
+    /// file.
+    fn base_code_sources(
+        &self,
+        columns: &[QuadColumn],
+    ) -> Option<(Option<[PrimitiveArray; 4]>, Vec<PrimitiveArray>)> {
+        let every = QuadColumn::ALL.iter().all(|c| columns.contains(c));
+        let all = if every {
+            Some(self.base_code_primitives()?)
+        } else {
+            None
+        };
+        let asked = match &all {
+            Some(all) => columns.iter().map(|c| all[c.index()].clone()).collect(),
+            None => columns
+                .iter()
+                .map(|&c| self.base_code_primitive(c))
+                .collect::<Option<_>>()?,
+        };
+        Some((all, asked))
     }
 
     /// The live codes of this file view's served run in base row order,
@@ -415,6 +496,31 @@ enum MemoryRows {
 
 /// Windows of base row ids, a chunk's rows each.
 type IdWindows = Box<dyn Iterator<Item = Buffer<RowId>> + Send>;
+
+/// Code chunks of `columns`, one per window of base row ids, each gathered
+/// when its chunk is pulled: from `all` four primitives in one pass when
+/// every column is asked for, else from the `asked` ones alone.
+fn gathered_code_chunks(
+    all: Option<[PrimitiveArray; 4]>,
+    asked: Vec<PrimitiveArray>,
+    columns: &[QuadColumn],
+    windows: impl Iterator<Item = Buffer<RowId>> + Send + 'static,
+) -> CodeChunkStream {
+    let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
+    stream::iter(windows.map(move |ids| {
+        observe!(Gather { width: None });
+        Ok(match &all {
+            // Every column asked for: the four gathered in one pass.
+            Some(all) => {
+                let codes = gather_codes(all, &ids);
+                picked.iter().map(|&k| codes[k].clone()).collect()
+            }
+            // A subset: only its columns.
+            None => asked.iter().map(|prim| gather_column(prim, &ids)).collect(),
+        })
+    }))
+    .boxed()
+}
 
 /// `ids` cut into consecutive windows of at most `batch_rows`, each a slice
 /// of it.
