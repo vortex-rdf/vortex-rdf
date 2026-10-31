@@ -1232,7 +1232,11 @@ async fn test_window_over_an_unlocated_served_run_reads_its_rows_once() {
                     windowed.debug_serve_row_range().is_some(),
                     "{label}: located from then on"
                 );
-                assert_eq!(windowed.quads_vec().await.unwrap(), want, "{label}: the rows");
+                assert_eq!(
+                    windowed.quads_vec().await.unwrap(),
+                    want,
+                    "{label}: the rows"
+                );
                 let rec = Recorder::start();
                 let probed = store
                     .run_probe(&probe.clone().window(0, Some(limit)))

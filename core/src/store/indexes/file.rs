@@ -421,6 +421,9 @@ pub(crate) struct FileServePlan {
     /// constraint the location did not cover would make the range
     /// over-approximate.
     row_range: Option<Range<u64>>,
+    /// The run the resolution located, which a window narrows `row_range`
+    /// within; `None` when unlocated.
+    run: Option<Range<u64>>,
     /// The rows a keep kept of the range, in the child's order; when set,
     /// the view covers these and not the whole range.
     kept: Option<Arc<ServedRows>>,
@@ -460,6 +463,7 @@ impl FileServePlan {
             child,
             constraints,
             bound: Arc::new(std::sync::OnceLock::new()),
+            run: row_range.clone(),
             row_range,
             kept: None,
             run_rows_cell: Arc::new(std::sync::OnceLock::new()),
@@ -529,6 +533,14 @@ impl FileServePlan {
     /// range.
     pub(crate) fn kept(&self) -> Option<&ServedRows> {
         self.kept.as_deref()
+    }
+
+    /// Whether a window, keep, partition or chained match narrowed the view
+    /// below the run the match resolved: it keeps rows, or covers a range
+    /// other than the resolution's (an unlocated run's narrowing locates
+    /// it).
+    pub(crate) fn is_narrowed(&self) -> bool {
+        self.kept.is_some() || self.row_range != self.run
     }
 
     /// This plan over `range`, a part of its located range: a window's of a

@@ -14,9 +14,10 @@
 //! carries only its own plan type, and both plans decode through
 //! [`ServeDecode`], so tombstone handling is shared.
 //!
-//! A plan reproduces exactly the rows the resolution's row ids name, so an
-//! operation that cannot honor it (chained matches, counts,
-//! materialization) reads through the ids instead. The store keeps a plan
+//! A plan reproduces exactly the view's rows: the run the resolution's row
+//! ids name, or the part of it a window, keep, partition or chained match
+//! narrowed it to, so an operation that cannot honor it (materialization in
+//! base order) reads through the ids instead. The store keeps a plan
 //! only while the resolution is a view's sole restriction (see `MemoryBase`,
 //! `FileBase`). A plan is what lets the resolution defer the ids
 //! (`LazyRowIds`): reads through the plan never touch them.
@@ -36,6 +37,7 @@ use super::{COL_RID, LazyCells};
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
+use crate::store::array::into_struct_array;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
 use crate::store::schema::{PRIMARY_COLUMNS, RowId, TermCode};
@@ -379,6 +381,33 @@ impl InMemoryServePlan {
                 }
             }
         })
+    }
+
+    /// The component's `columns` at its rows `positions`, in that order, as
+    /// one struct array: what a filter of the view's rows compares (a pattern
+    /// chained on the view), the other columns never read.
+    pub(crate) fn columns_at(
+        &self,
+        columns: &[&'static str],
+        positions: &[u64],
+    ) -> Result<ArrayRef> {
+        let rows = into_struct_array(self.array.clone())?;
+        let indices = PrimitiveArray::new(
+            positions.iter().copied().collect::<Buffer<u64>>(),
+            Validity::NonNullable,
+        )
+        .into_array();
+        let fields = columns
+            .iter()
+            .map(|name| Ok(rows.unmasked_field_by_name(name)?.take(indices.clone())?))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(StructArray::try_new(
+            FieldNames::from(columns),
+            fields,
+            positions.len(),
+            Validity::NonNullable,
+        )?
+        .into_array())
     }
 
     /// The serving component's `name` column through its cached probe, which

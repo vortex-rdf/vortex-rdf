@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: a hash table over the batch's kept
   quads catches the latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/query/matching/mod.rs#L193) — one fully bound
+  [`contains`](../core/src/store/query/matching/mod.rs#L203) — one fully bound
   `match_pattern` over base and tail, which reads the tail rows its row key
   names rather than every tail row ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
@@ -99,7 +99,7 @@ flowchart TD
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
-- **Matching.** [`match_pattern`](../core/src/store/query/matching/mod.rs#L68) runs the
+- **Matching.** [`match_pattern`](../core/src/store/query/matching/mod.rs#L70) runs the
   base's normal routing (prefix probe / index / scan) and, independently, a
   mask scan over the tail ([`match_tail`](../core/src/store/query/matching/tail.rs#L25)),
   then unions the two. A base short-circuit (a term with no code in the

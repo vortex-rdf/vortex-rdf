@@ -1034,7 +1034,10 @@ async fn unlocated_runs_read_once_then_narrow() {
             .unwrap();
         let mut got = Vec::new();
         for part in &parts {
-            assert!(served_component(part).is_some(), "{tag}: a served partition");
+            assert!(
+                served_component(part).is_some(),
+                "{tag}: a served partition"
+            );
             got.extend(part.quads_vec().await.unwrap().iter().map(spellings));
         }
         assert_eq!(got, want, "{tag}: partitions");
@@ -1074,6 +1077,143 @@ async fn typed_object_row_chunks_follow_index_order() {
             decoded,
             p.shared_quads_vec().await.unwrap(),
             "in_memory={in_memory}"
+        );
+    }
+}
+
+/// A pattern chained on a narrowed served view (a window of `?p2??`) keeps
+/// the window's rows its bound terms match, compared on the copy's own
+/// columns (codes or strings), in the window's order, and stays served: in
+/// both residencies, on the Dictionary and Default layouts, as written and
+/// under tombstones. The object chain keeps one object's rows; the graph
+/// chain keeps rows of every object, so its order is the index's, not
+/// base order.
+#[tokio::test]
+async fn chained_match_on_a_window_filters_in_index_order() {
+    // Every third quad in a named graph.
+    let quads: Vec<Quad> = modular_quads(5_000, 7, 11)
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut quad)| {
+            if i % 3 == 0 {
+                quad.graph_name = iri_graph("g1");
+            }
+            quad
+        })
+        .collect();
+    let (p2, o3) = (iri("p2"), plain_literal("object 3"));
+    let default = GraphName::DefaultGraph;
+    // Every fifth of the predicate's quads.
+    let doomed: Vec<Quad> = quads
+        .iter()
+        .filter(|quad| quad.predicate == p2)
+        .step_by(5)
+        .cloned()
+        .collect();
+    for layout in [LayoutStrategy::Dictionary, LayoutStrategy::Default] {
+        let (_dir, path) =
+            write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
+        let file = VortexRdfStore::from_file(&path).await.unwrap();
+        let memory = built_store(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
+        let mut stores = Vec::new();
+        for (residency, store) in [("file", file), ("memory", memory)] {
+            stores.push((format!("{layout:?} {residency} as written"), store.clone()));
+            let tombstoned = delete_all(&store, &doomed).await;
+            stores.push((format!("{layout:?} {residency} tombstoned"), tombstoned));
+        }
+        for (tag, store) in stores {
+            let window = matched_view(&store, None, Some(&p2), None, None)
+                .await
+                .window(10, 500)
+                .await
+                .unwrap();
+            assert!(
+                served_component(&window).is_some(),
+                "{tag}: a served window"
+            );
+            let rows = window.quads_vec().await.unwrap();
+            for (chain, object, graph) in [
+                ("o3", Some(&o3), None),
+                ("default graph", None, Some(&default)),
+            ] {
+                let tag = format!("{tag}, {chain}");
+                let want: Vec<Quad> = rows
+                    .iter()
+                    .filter(|quad| object.is_none_or(|o| &quad.object == o))
+                    .filter(|quad| graph.is_none_or(|g| &quad.graph_name == g))
+                    .cloned()
+                    .collect();
+                assert!(
+                    !want.is_empty() && want.len() < rows.len(),
+                    "{tag}: the chain filters"
+                );
+                let chained = window
+                    .match_pattern(None, None, object, graph)
+                    .await
+                    .unwrap();
+                assert!(served_component(&chained).is_some(), "{tag}: served");
+                assert_eq!(
+                    chained.quads_vec().await.unwrap(),
+                    want,
+                    "{tag}: the window's rows, filtered, in its order"
+                );
+                assert_eq!(
+                    chained.size().await.unwrap(),
+                    want.len(),
+                    "{tag}: the count"
+                );
+            }
+            // A term no row of the window holds leaves none.
+            let absent = plain_literal("object 99");
+            let none = window
+                .match_pattern(None, None, Some(&absent), None)
+                .await
+                .unwrap();
+            assert_eq!(none.size().await.unwrap(), 0, "{tag}: an absent object");
+            assert!(none.quads_vec().await.unwrap().is_empty(), "{tag}: no rows");
+        }
+    }
+}
+
+/// A pattern chained on a served view no window or keep narrowed is matched
+/// as one match of both patterns, as before: the rows of the merged pattern.
+/// The run is wide enough for its view to name its pattern (1,428 rows).
+#[tokio::test]
+async fn chained_match_on_an_unnarrowed_view_is_unchanged() {
+    let quads = modular_quads(10_000, 7, 11);
+    let (p2, o3) = (iri("p2"), plain_literal("object 3"));
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = built_store(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    for (tag, store) in [("file", file), ("memory", memory)] {
+        let view = matched_view(&store, None, Some(&p2), None, None).await;
+        assert!(served_component(&view).is_some(), "{tag}: served");
+        let rec = Recorder::start();
+        let chained = view
+            .match_pattern(None, None, Some(&o3), None)
+            .await
+            .unwrap();
+        assert_eq!(rec.count(&Event::ChainMerged), 1, "{tag}: merged");
+        let merged = matched_view(&store, None, Some(&p2), Some(&o3), None)
+            .await
+            .quads_vec()
+            .await
+            .unwrap();
+        assert!(!merged.is_empty(), "{tag}: rows to chain");
+        assert_eq!(
+            chained.quads_vec().await.unwrap(),
+            merged,
+            "{tag}: the rows"
         );
     }
 }
