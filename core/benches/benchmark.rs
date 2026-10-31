@@ -769,14 +769,21 @@ fn narrow_exists(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
+/// The store of `residency` beside the predicate-bound probe the probe
+/// benches run, cut to `limit` rows.
+fn predicate_probe(residency: DictResidency, limit: Option<usize>) -> (VortexRdfStore, Probe) {
+    let store = open_dict_store(residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let mut probe = Probe::new(None, p, None, None);
+    probe.limit = limit;
+    (store, probe)
+}
+
 /// `ASK` through the probe API the bindings call: `count_probe` of a
 /// predicate-bound pattern with a limit of one.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn probe_exists(bencher: divan::Bencher, residency: &DictResidency) {
-    let store = open_dict_store(*residency, bench_size());
-    let (_, p, ..) = terms_for(Pattern::P);
-    let mut probe = Probe::new(None, p, None, None);
-    probe.limit = Some(1);
+    let (store, probe) = predicate_probe(*residency, Some(1));
     bencher.bench(|| {
         rt().block_on(async { black_box(store.count_probe(&probe).await.expect("count_probe")) })
     });
@@ -787,9 +794,7 @@ fn probe_exists(bencher: divan::Bencher, residency: &DictResidency) {
 /// evaluated over every split of the file.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn probe_count(bencher: divan::Bencher, residency: &DictResidency) {
-    let store = open_dict_store(*residency, bench_size());
-    let (_, p, ..) = terms_for(Pattern::P);
-    let probe = Probe::new(None, p, None, None);
+    let (store, probe) = predicate_probe(*residency, None);
     bencher.bench(|| {
         rt().block_on(async { black_box(store.count_probe(&probe).await.expect("count_probe")) })
     });
@@ -799,10 +804,7 @@ fn probe_count(bencher: divan::Bencher, residency: &DictResidency) {
 /// pattern windowed to 64 rows, its codes gathered.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn probe_window(bencher: divan::Bencher, residency: &DictResidency) {
-    let store = open_dict_store(*residency, bench_size());
-    let (_, p, ..) = terms_for(Pattern::P);
-    let mut probe = Probe::new(None, p, None, None);
-    probe.limit = Some(64);
+    let (store, probe) = predicate_probe(*residency, Some(64));
     bencher.bench(|| {
         rt().block_on(async {
             let view = store.run_probe(&probe).await.expect("run_probe");
@@ -1029,16 +1031,7 @@ fn run_limit_pair(
                     let columns = view.code_columns_gathered().await.expect("gather");
                     columns.expect("a Dictionary view has code columns")[0].len()
                 }
-                PairRead::Chunks => {
-                    let mut chunks = view
-                        .code_chunks(&QuadColumn::ALL, 65_536)
-                        .expect("code_chunks");
-                    let mut rows = 0;
-                    while let Some(chunk) = chunks.next().await {
-                        rows += chunk.expect("code chunk")[0].len();
-                    }
-                    rows
-                }
+                PairRead::Chunks => drain_code_chunks(&view, &QuadColumn::ALL).await,
             }
         })
     };
@@ -1131,6 +1124,17 @@ impl fmt::Debug for ChunkColumns {
 
 const CHUNK_COLUMNS: &[ChunkColumns] = &[ChunkColumns::O, ChunkColumns::Spog];
 
+/// The rows of `view`'s code chunks of `columns`, drained at the Python
+/// binding's default of 65,536 rows a chunk.
+async fn drain_code_chunks(view: &VortexRdfStore, columns: &[QuadColumn]) -> usize {
+    let mut chunks = view.code_chunks(columns, 65_536).expect("code_chunks");
+    let mut rows = 0;
+    while let Some(chunk) = chunks.next().await {
+        rows += chunk.expect("code chunk")[0].len();
+    }
+    rows
+}
+
 /// `code_chunks` over a predicate-bound view of the in-memory store (a 32nd
 /// of its rows, an id list), drained at the Python binding's default of
 /// 65,536 rows a chunk: `o` alone, and all four columns. The match, and a
@@ -1144,16 +1148,7 @@ fn chunks_codes(bencher: divan::Bencher, columns: &ChunkColumns) {
     let view = rt()
         .block_on(store.match_pattern(None, p.as_ref(), None, None))
         .expect("match P");
-    let drain = || {
-        rt().block_on(async {
-            let mut chunks = view.code_chunks(columns, 65_536).expect("code_chunks");
-            let mut rows = 0;
-            while let Some(chunk) = chunks.next().await {
-                rows += chunk.expect("code chunk")[0].len();
-            }
-            rows
-        })
-    };
+    let drain = || rt().block_on(drain_code_chunks(&view, columns));
     assert!(drain() > 0, "the predicate-bound view has rows");
     bencher.bench(|| black_box(drain()));
 }
@@ -1172,16 +1167,7 @@ fn chunks_codes_cold(bencher: divan::Bencher, columns: &ChunkColumns) {
             rt().block_on(store.match_pattern(None, p.as_ref(), None, None))
                 .expect("match P")
         })
-        .bench_values(|view| {
-            rt().block_on(async {
-                let mut chunks = view.code_chunks(columns, 65_536).expect("code_chunks");
-                let mut rows = 0;
-                while let Some(chunk) = chunks.next().await {
-                    rows += chunk.expect("code chunk")[0].len();
-                }
-                black_box(rows)
-            })
-        });
+        .bench_values(|view| black_box(rt().block_on(drain_code_chunks(&view, columns))));
 }
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -27,40 +27,25 @@ const ROWS: usize = 5 * ZONE_ROWS + 1_000;
 /// predicate `p{i % 3}`, the object `"o{i % 50}"` and the default graph:
 /// `p0` holds every third row, `"o7"` every fiftieth, both every 150th.
 fn residual_quads() -> Vec<Quad> {
-    (0..ROWS)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{i:06}"),
-                &format!("http://example.org/p{}", i % 3),
-                &format!("o{}", i % 50),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect()
+    graph_modular_quads(ROWS, 6, 3, 50, &[GraphName::DefaultGraph])
 }
 
 /// [`residual_quads`]' in-memory Dictionary stores without an index: built,
-/// loaded from a file and opened from its bytes (whose code columns read
-/// through their probes). Keep the `TempDir` alive for the stores'
+/// and its file loaded whole and adopted from its bytes (whose code columns
+/// read through their probes). The file is written once per process (see
+/// [`cached_store_file`]). Keep the `TempDir` alive for the stores'
 /// lifetime.
 async fn residual_stores() -> (tempfile::TempDir, Vec<(&'static str, VortexRdfStore)>) {
-    let quads = residual_quads();
-    let (dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let bytes = std::fs::read(&path).unwrap();
-    let stores = vec![
-        (
-            "built",
-            built_store(quads, LayoutStrategy::Dictionary, vec![]).await,
-        ),
-        (
-            "loaded",
-            VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
-        ),
-        (
-            "from bytes",
-            VortexRdfStore::from_bytes(&bytes).await.unwrap(),
-        ),
-    ];
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    let (dir, path) =
+        cached_store_file(&BYTES, residual_quads, LayoutStrategy::Dictionary, vec![]).await;
+    let mut stores = vec![(
+        "built",
+        built_store(residual_quads(), LayoutStrategy::Dictionary, vec![]).await,
+    )];
+    for open in [Open::Loaded, Open::BytesOwned] {
+        stores.push((open.tag(), open.open(&path).await.unwrap()));
+    }
     (dir, stores)
 }
 

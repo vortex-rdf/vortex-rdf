@@ -888,37 +888,24 @@ async fn test_patched_object_codes_compare_through_the_kernel() {
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     let memory = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let (v0000, v1234, v3500) = (
+        plain_literal("v0000"),
+        plain_literal("v1234"),
+        plain_literal("v3500"),
+    );
+    let s03200 = Term::NamedNode(iri("s03200"));
+    let (p0, p2) = (iri("p0"), iri("p2"));
+    let patterns: [Pattern<'_>; 7] = [
+        ("O v0000", None, None, Some(&v0000), None),
+        ("PO p0 v0000", None, Some(&p0), Some(&v0000), None),
+        ("O v1234", None, None, Some(&v1234), None),
+        ("PO p2 v1234", None, Some(&p2), Some(&v1234), None),
+        ("PO p0 v3500", None, Some(&p0), Some(&v3500), None),
+        ("O s03200", None, None, Some(&s03200), None),
+        ("PO p0 s03200", None, Some(&p0), Some(&s03200), None),
+    ];
     let rec = Recorder::start();
-    for (object, predicate) in [
-        (plain_literal("v0000"), None),
-        (plain_literal("v0000"), Some(iri("p0"))),
-        (plain_literal("v1234"), None),
-        (plain_literal("v1234"), Some(iri("p2"))),
-        (plain_literal("v3500"), Some(iri("p0"))),
-        (Term::NamedNode(iri("s03200")), None),
-        (Term::NamedNode(iri("s03200")), Some(iri("p0"))),
-    ] {
-        let label = format!("{object} {predicate:?}");
-        let probe = Probe::new(None, predicate, Some(object), None);
-        let mut got = file
-            .run_probe(&probe)
-            .await
-            .unwrap()
-            .quads_vec()
-            .await
-            .unwrap();
-        let mut want = memory
-            .run_probe(&probe)
-            .await
-            .unwrap()
-            .quads_vec()
-            .await
-            .unwrap();
-        got.sort_by_key(ToString::to_string);
-        want.sort_by_key(ToString::to_string);
-        assert!(!want.is_empty(), "{label}: the pattern matches");
-        assert_eq!(got, want, "{label}: the rows");
-    }
+    assert_patterns_match(&memory, &[("mapped", &file)], &patterns).await;
     assert!(
         rec.count(&Event::Kernel(Kernel::CompareSlicedPatches)) > 0,
         "the object leaf's slices compared through the kernel"
@@ -953,31 +940,13 @@ async fn test_run_end_subjects_filter_through_the_kernel() {
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     let memory = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let p0 = iri("p0");
+    let patterns: [Pattern<'_>; 2] = [
+        ("G gd", None, None, None, Some(&gd)),
+        ("PG p0 gd", None, Some(&p0), None, Some(&gd)),
+    ];
     let rec = Recorder::start();
-    for probe in [
-        Probe::new(None, None, None, Some(gd.clone())),
-        Probe::new(None, Some(iri("p0")), None, Some(gd)),
-    ] {
-        let label = format!("{probe:?}");
-        let mut got = file
-            .run_probe(&probe)
-            .await
-            .unwrap()
-            .quads_vec()
-            .await
-            .unwrap();
-        let mut want = memory
-            .run_probe(&probe)
-            .await
-            .unwrap()
-            .quads_vec()
-            .await
-            .unwrap();
-        got.sort_by_key(ToString::to_string);
-        want.sort_by_key(ToString::to_string);
-        assert!(!want.is_empty(), "{label}: the pattern matches");
-        assert_eq!(got, want, "{label}: the rows");
-    }
+    assert_patterns_match(&memory, &[("mapped", &file)], &patterns).await;
     assert!(
         rec.count(&Event::Kernel(Kernel::RunEndFilter)) > 0,
         "the subject column filtered through the kernel"

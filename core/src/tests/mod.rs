@@ -1581,6 +1581,23 @@ type Pattern<'a> = (
     Option<&'a GraphName>,
 );
 
+/// [`assert_patterns_agree`] over patterns that each match some quad of
+/// `want`, which it checks first: a test of the path a pattern takes passes
+/// on no empty answer.
+async fn assert_patterns_match(
+    want: &VortexRdfStore,
+    got: &[(&str, &VortexRdfStore)],
+    patterns: &[Pattern<'_>],
+) {
+    for &(name, s, p, o, g) in patterns {
+        assert!(
+            matched_size(want, s, p, o, g).await > 0,
+            "[{name}]: the pattern matches"
+        );
+    }
+    assert_patterns_agree(want, got, patterns).await;
+}
+
 /// Every store in `got`, beside its name, answers each of `patterns` as `want`
 /// does: the same size and the same quads.
 async fn assert_patterns_agree(

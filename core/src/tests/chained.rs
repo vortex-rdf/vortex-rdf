@@ -15,23 +15,35 @@ fn wide_chain_dataset() -> (Vec<Quad>, [GraphName; 2]) {
     (graph_modular_quads(3_300, 4, 3, 5, &graphs), graphs)
 }
 
-/// The stores of `quads` the chains run on, each beside its name: every
-/// layout with each index, built in memory and opened from a file. Keep the
-/// `TempDir`s alive while the stores are used.
-async fn chain_stores(quads: &[Quad]) -> (Vec<tempfile::TempDir>, Vec<(String, VortexRdfStore)>) {
+/// The stores of `quads()` the chains run on, each beside its name: every
+/// layout with each index, built in memory and opened from a file, each file
+/// written once per process into one of `files` (see [`cached_store_file`]).
+/// Keep the `TempDir`s alive while the stores are used.
+async fn chain_stores(
+    files: &'static [OnceLock<Vec<u8>>; 6],
+    quads: fn() -> Vec<Quad>,
+) -> (Vec<tempfile::TempDir>, Vec<(String, VortexRdfStore)>) {
+    let indexes = [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let configs = LAYOUTS
+        .into_iter()
+        .flat_map(|layout| indexes.map(|index| (layout, index)));
     let mut dirs = Vec::new();
     let mut stores = Vec::new();
-    for layout in LAYOUTS {
-        for index in [IndexType::SecondaryByCopy, IndexType::SecondaryByReference] {
-            let memory = built_store(quads.to_vec(), layout, vec![index]).await;
-            stores.push((format!("{layout:?} {index:?} memory"), memory));
-            let (dir, path) = write_store_file(quads.to_vec(), layout, vec![index]).await;
-            let file = VortexRdfStore::from_file(&path).await.unwrap();
-            stores.push((format!("{layout:?} {index:?} file"), file));
-            dirs.push(dir);
-        }
+    for ((layout, index), cell) in configs.zip(files) {
+        let memory = built_store(quads(), layout, vec![index]).await;
+        stores.push((format!("{layout:?} {index:?} memory"), memory));
+        let (dir, path) = cached_store_file(cell, quads, layout, vec![index]).await;
+        let file = VortexRdfStore::from_file(&path).await.unwrap();
+        stores.push((format!("{layout:?} {index:?} file"), file));
+        dirs.push(dir);
     }
     (dirs, stores)
+}
+
+/// [`chain_stores`] of [`wide_chain_dataset`].
+async fn wide_chain_stores() -> (Vec<tempfile::TempDir>, Vec<(String, VortexRdfStore)>) {
+    static FILES: [OnceLock<Vec<u8>>; 6] = [const { OnceLock::new() }; 6];
+    chain_stores(&FILES, || wide_chain_dataset().0).await
 }
 
 /// A match chained on the predicate's view of [`wide_chain_dataset`]:
@@ -44,7 +56,7 @@ async fn chain_stores(quads: &[Quad]) -> (Vec<tempfile::TempDir>, Vec<(String, V
 #[tokio::test]
 async fn test_a_chained_match_is_one_match_of_both_patterns() {
     let (quads, graphs) = wide_chain_dataset();
-    let (_dirs, stores) = chain_stores(&quads).await;
+    let (_dirs, stores) = wide_chain_stores().await;
     let (p1, p2) = (iri("p1"), iri("p2"));
     let o1 = plain_literal("o1");
     let s04 = iri_subject("s0004");
@@ -109,7 +121,9 @@ async fn test_a_chained_match_is_one_match_of_both_patterns() {
 async fn test_only_a_wide_pending_view_chains_as_one_match() {
     let (p1, o1) = (iri("p1"), plain_literal("o1"));
     let (narrow, _) = copy_index_script_dataset();
-    let (_narrow_dirs, narrow_stores) = chain_stores(&narrow).await;
+    static NARROW_FILES: [OnceLock<Vec<u8>>; 6] = [const { OnceLock::new() }; 6];
+    let (_narrow_dirs, narrow_stores) =
+        chain_stores(&NARROW_FILES, || copy_index_script_dataset().0).await;
     let mut narrow_known = 0;
     for (tag, store) in narrow_stores {
         let by_p = matched_view(&store, None, Some(&p1), None, None).await;
@@ -134,7 +148,7 @@ async fn test_only_a_wide_pending_view_chains_as_one_match() {
     );
 
     let (quads, _) = wide_chain_dataset();
-    let (_dirs, stores) = chain_stores(&quads).await;
+    let (_dirs, stores) = wide_chain_stores().await;
     let mut pending_views = 0;
     for (tag, store) in stores {
         let by_p = matched_view(&store, None, Some(&p1), None, None).await;
@@ -190,7 +204,7 @@ async fn test_only_a_wide_pending_view_chains_as_one_match() {
 #[tokio::test]
 async fn test_a_chained_match_keeps_tombstones_and_the_tail() {
     let (quads, graphs) = wide_chain_dataset();
-    let (_dirs, stores) = chain_stores(&quads).await;
+    let (_dirs, stores) = wide_chain_stores().await;
     let (p1, o1) = (iri("p1"), plain_literal("o1"));
     let appended = make_quad(
         "http://example.org/s99",
