@@ -347,6 +347,22 @@ impl VortexRdfStore {
         }
     }
 
+    /// The window by position (`offset`, `limit`) of a pending selection's
+    /// lazy ids, as a located window reads it
+    /// ([`LazyRowIds::window`](crate::store::indexes::LazyRowIds::window)):
+    /// `Ok(None)` when the ids decline it, or for a view whose selection is
+    /// not pending.
+    pub(crate) async fn debug_pending_window(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<vortex_buffer::Buffer<crate::store::schema::RowId>>> {
+        match &self.quads.selection {
+            ViewSelection::Pending { ids, .. } => ids.window(offset, limit).await,
+            ViewSelection::Residual(_) | ViewSelection::Exact(_) => Ok(None),
+        }
+    }
+
     /// The append tail's physical rows, `None` when nothing has been
     /// appended.
     pub(crate) fn debug_tail_rows(&self) -> Option<&ArrayRef> {
@@ -571,7 +587,7 @@ impl VortexRdfStore {
     /// The index-child row range a file view's serve plan located for its
     /// run. `None` without a plan, or when the plan's run is unlocated.
     pub(crate) fn debug_serve_row_range(&self) -> Option<Range<u64>> {
-        self.quads.file()?.serve.as_ref()?.row_range()
+        self.quads.file()?.serve.as_ref()?.located_range()
     }
 
     /// The zone-map row range a bound subject prunes to on a file view:

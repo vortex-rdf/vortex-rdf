@@ -51,9 +51,9 @@ pub(crate) use components::{
 };
 #[cfg(feature = "file-io")]
 pub(crate) use rid_reads::{read_located_rids, scan_index_row_ids};
+pub(crate) use serve::{ComponentRows, InMemoryServePlan, ServedRows, ServedSpan};
 #[cfg(feature = "file-io")]
-pub(crate) use serve::FileServePlan;
-pub(crate) use serve::{ComponentRows, InMemoryServePlan, ServedRows};
+pub(crate) use serve::{FileServePlan, PlanRead};
 
 /// The primary-row-id column every persisted index child carries beside its
 /// own columns: the currency every resolution answers in, and the one column
@@ -515,12 +515,14 @@ enum LazyRowIdSource {
     },
     /// File-backed: a located run of an index child's rid column, read on
     /// first need through [`read_located_rids`]; its width is known up front,
-    /// so a count reads none of it.
+    /// so a count reads none of it. `ascending` when the run's rids are
+    /// already in row order, which a window of it reads by position.
     #[cfg(feature = "file-io")]
     LocatedRun {
         file: Arc<crate::store::persist::native_file::NativeStoreFile>,
         child: ChildReader,
         range: Range<u64>,
+        ascending: bool,
     },
 }
 
@@ -600,17 +602,26 @@ impl LazyRowIds {
         }
     }
 
-    /// Lazy ids over a located run of a file index child whose rids ascend
-    /// within the run, as [`window`](Self::window) requires.
+    /// Lazy ids over the located run `range` of a file index `child`;
+    /// `ascending` when the run's rids are already in row order, as a
+    /// [`window`](Self::window) of them requires (a reference child's within
+    /// one value, a copy child's where its order within the run is base
+    /// order).
     #[cfg(feature = "file-io")]
     pub(crate) fn from_located_run(
         file: Arc<crate::store::persist::native_file::NativeStoreFile>,
         child: ChildReader,
         range: Range<u64>,
+        ascending: bool,
     ) -> Self {
         Self {
             cells: Some(Arc::default()),
-            source: LazyRowIdSource::LocatedRun { file, child, range },
+            source: LazyRowIdSource::LocatedRun {
+                file,
+                child,
+                range,
+                ascending,
+            },
         }
     }
 
@@ -639,15 +650,18 @@ impl LazyRowIds {
                 None => Buffer::empty(),
             },
             #[cfg(feature = "file-io")]
-            LazyRowIdSource::LocatedRun { file, child, range } => {
-                match window_rows(offset, limit, range.end - range.start) {
-                    Some(rows) => {
-                        let rows = range.start + rows.start..range.start + rows.end;
-                        read_located_rids(file, child, rows).await?
-                    }
-                    None => Buffer::empty(),
+            LazyRowIdSource::LocatedRun {
+                file,
+                child,
+                range,
+                ascending: true,
+            } => match window_rows(offset, limit, range.end - range.start) {
+                Some(rows) => {
+                    let rows = range.start + rows.start..range.start + rows.end;
+                    read_located_rids(file, child, rows).await?
                 }
-            }
+                None => Buffer::empty(),
+            },
             _ => return Ok(None),
         };
         Ok(Some(ids))
@@ -760,9 +774,9 @@ impl LazyRowIds {
             LazyRowIdSource::IndexChild {
                 child, constraints, ..
             } => scan_index_row_ids(child, constraints).await?,
-            LazyRowIdSource::LocatedRun { file, child, range } => {
-                read_located_rids(file, child, range.clone()).await?
-            }
+            LazyRowIdSource::LocatedRun {
+                file, child, range, ..
+            } => read_located_rids(file, child, range.clone()).await?,
         };
         observe!(IdsSorted(ids.len()));
         Ok(self.sorted_cell().get_or_init(|| ids).clone())

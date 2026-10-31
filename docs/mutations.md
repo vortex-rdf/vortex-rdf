@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: a hash table over the batch's kept
   quads catches the latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/query/matching/mod.rs#L203) — one fully bound
+  [`contains`](../core/src/store/query/matching/mod.rs#L201) — one fully bound
   `match_pattern` over base and tail, which reads the tail rows its row key
   names rather than every tail row ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked

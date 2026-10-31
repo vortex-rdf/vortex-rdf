@@ -24,6 +24,7 @@
 //! plan never touch them.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
@@ -46,7 +47,7 @@ mod file;
 mod memory;
 
 #[cfg(feature = "file-io")]
-pub(crate) use file::FileServePlan;
+pub(crate) use file::{FileServePlan, PlanRead};
 pub(crate) use memory::InMemoryServePlan;
 
 /// The decode both serve plans share. A serving child holds the whole quad
@@ -54,7 +55,7 @@ pub(crate) use memory::InMemoryServePlan;
 /// row id ([`COL_RID`]), through which the rows tombstoned since
 /// construction are dropped.
 #[derive(Clone)]
-pub(super) struct ServeDecode {
+pub(crate) struct ServeDecode {
     /// The layout the projected source columns decode through (an index that
     /// stores whole terms decodes them as strings, or dictionary codes under
     /// the Dictionary layout).
@@ -62,10 +63,16 @@ pub(super) struct ServeDecode {
 }
 
 impl ServeDecode {
+    /// Whether the decode reads codes off the index (the Dictionary layout's
+    /// copies hold codes; the string layouts', terms).
+    pub(crate) fn decodes_codes(&self) -> bool {
+        matches!(self.decode_layout, ResolvedLayout::Dictionary(_))
+    }
+
     /// Decode the `(s, p, o, g)` rows out of a chunk of the plan's projected
     /// index columns, dropping rows tombstoned in `deleted` via the row-id
     /// column.
-    pub(super) fn decode_columns<T: ChunkDecode>(
+    pub(crate) fn decode_columns<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
@@ -80,7 +87,7 @@ impl ServeDecode {
     /// decode, for a file-backed dictionary: each chunk's codes are resolved
     /// by reading the dictionary windows that hold them.
     #[cfg(feature = "file-io")]
-    pub(super) async fn decode_columns_async<T: ChunkDecode>(
+    pub(crate) async fn decode_columns_async<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
@@ -95,7 +102,7 @@ impl ServeDecode {
     /// finishes without waiting ([`ChunkDecode::decode_now`]); `None` leaves
     /// the chunk to it.
     #[cfg(feature = "file-io")]
-    pub(super) fn decode_columns_now<T: ChunkDecode>(
+    pub(crate) fn decode_columns_now<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
@@ -109,7 +116,7 @@ impl ServeDecode {
     /// A chunk's live rows as four code columns, `(s, p, o, g)`: the
     /// code-payload counterpart of [`decode_columns`](Self::decode_columns)
     /// for a Dictionary decode layout, whose columns hold codes.
-    pub(super) fn chunk_code_columns(
+    pub(crate) fn chunk_code_columns(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
@@ -131,7 +138,7 @@ impl ServeDecode {
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: the
     /// chunk's quad columns without the row id, then any row whose primary
     /// row id is tombstoned dropped.
-    pub(super) fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
+    pub(crate) fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx)?;
         let col = |name: &'static str| {
@@ -197,12 +204,43 @@ impl ServedRows {
         self.rids.len()
     }
 
-    /// Each row's position (as a `usize`) beside its base row id, in order.
-    fn positions_and_rids(&self) -> impl Iterator<Item = (usize, RowId)> + '_ {
+    /// Each row's position beside its base row id, in order.
+    pub(crate) fn positions_and_rids(&self) -> impl Iterator<Item = (u64, RowId)> + '_ {
         self.positions
             .iter()
-            .map(|&position| position as usize)
+            .copied()
             .zip(self.rids.iter().copied())
+    }
+
+    /// The `rows` (positions beside base row ids, at most `capacity` of them)
+    /// that `keep` admits, in order: every narrowing that filters rows (a
+    /// keep, a chained match, the tombstones of a range) builds its rows
+    /// here. Each admitted row is pushed once to buffers reserved for every
+    /// row: two allocations, which a doubling buffer would spend on its
+    /// growth. Admitting fewer than a quarter of them gives the rest back
+    /// (two more): the buffers live as long as the narrowed view and every
+    /// window of it.
+    pub(crate) fn collect(
+        rows: impl Iterator<Item = (u64, RowId)>,
+        capacity: usize,
+        mut keep: impl FnMut(u64, RowId) -> bool,
+    ) -> Self {
+        let (mut positions, mut rids) =
+            (Vec::with_capacity(capacity), Vec::with_capacity(capacity));
+        for (position, rid) in rows {
+            if keep(position, rid) {
+                positions.push(position);
+                rids.push(rid);
+            }
+        }
+        if positions.len() < capacity / 4 {
+            positions.shrink_to_fit();
+            rids.shrink_to_fit();
+        }
+        Self {
+            positions: Buffer::from(positions),
+            rids: Buffer::from(rids),
+        }
     }
 
     /// Rows `range` of these, sharing their buffers.
@@ -215,49 +253,40 @@ impl ServedRows {
 
     /// These rows less the `deleted` tombstones: themselves, shared, when
     /// nothing is tombstoned.
+    #[cfg(feature = "file-io")]
     pub(crate) fn live(&self, deleted: Option<&Mask>) -> Self {
         let Some(deleted) = deleted else {
             return self.clone();
         };
-        let (positions, rids): (Vec<u64>, Vec<RowId>) = self
-            .positions
-            .iter()
-            .zip(self.rids.iter())
-            .filter(|&(_, &rid)| !deleted.value(rid as usize))
-            .map(|(&position, &rid)| (position, rid))
-            .unzip();
-        Self {
-            positions: Buffer::from(positions),
-            rids: Buffer::from(rids),
-        }
+        Self::collect(self.positions_and_rids(), self.len(), |_, rid| {
+            !deleted.value(rid as usize)
+        })
     }
 }
 
-/// The `rows` (positions beside base row ids, at most `capacity` of them)
-/// that `keep` admits, in order. Each kept row is pushed once to buffers
-/// reserved for every row: two allocations, which a doubling buffer would
-/// spend on its growth. A keep that admits fewer than a quarter of them gives
-/// the rest back (two more): the buffers live as long as the kept view and
-/// every window of it.
-fn collect_kept(
-    rows: impl Iterator<Item = (usize, RowId)>,
-    capacity: usize,
-    keep: impl Fn(usize, RowId) -> bool,
-) -> ServedRows {
-    let (mut positions, mut rids) = (Vec::with_capacity(capacity), Vec::with_capacity(capacity));
-    for (position, rid) in rows {
-        if keep(position, rid) {
-            positions.push(position as u64);
-            rids.push(rid);
+/// The rows of its index a served view covers, in the index's order: what
+/// both plans hold of a run, and what every narrowing of a served view cuts
+/// or keeps. A match's plan covers its whole run; a narrowing's covers what
+/// it cut or kept ([`InMemoryServePlan::is_narrowed`]).
+#[derive(Clone)]
+pub(crate) enum ServedSpan {
+    /// Rows `range` of the index: a match's run, or the part of it a window
+    /// or partition cut. Rows tombstoned since the index was built are among
+    /// them, dropped as they are read, through their row ids.
+    Range(Range<u64>),
+    /// The rows a keep or a chained match kept, a window or partition of
+    /// them, or an unlocated run's rows where they are not contiguous in the
+    /// index: each one live.
+    Kept(Arc<ServedRows>),
+}
+
+impl ServedSpan {
+    /// How many rows the span covers, tombstoned ones in a range included.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ServedSpan::Range(range) => (range.end - range.start) as usize,
+            ServedSpan::Kept(rows) => rows.len(),
         }
-    }
-    if positions.len() < capacity / 4 {
-        positions.shrink_to_fit();
-        rids.shrink_to_fit();
-    }
-    ServedRows {
-        positions: Buffer::from(positions),
-        rids: Buffer::from(rids),
     }
 }
 
@@ -310,12 +339,12 @@ mod tests {
     /// view and every window of it.
     #[test]
     fn sparse_keeps_hold_only_their_rows() {
-        let rows = || (0..10_000usize).map(|position| (position, position as RowId));
-        let sparse = collect_kept(rows(), 10_000, |position, _| position % 1_000 == 0);
+        let rows = || (0..10_000u64).map(|position| (position, position as RowId));
+        let sparse = ServedRows::collect(rows(), 10_000, |position, _| position % 1_000 == 0);
         assert_eq!(sparse.len(), 10);
         assert!(capacity(sparse.positions) < 10_000 / 4, "positions");
         assert!(capacity(sparse.rids) < 10_000 / 4, "row ids");
-        let dense = collect_kept(rows(), 10_000, |position, _| position % 2 == 0);
+        let dense = ServedRows::collect(rows(), 10_000, |position, _| position % 2 == 0);
         assert_eq!(dense.len(), 5_000);
         assert_eq!(dense.positions.as_slice()[..3], [0, 2, 4]);
     }

@@ -26,7 +26,7 @@ use crate::observe::observe;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
 #[cfg(feature = "file-io")]
-use crate::store::indexes::FileServePlan;
+use crate::store::indexes::{PlanRead, serve::ServeDecode};
 #[cfg(feature = "file-io")]
 use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
@@ -231,24 +231,31 @@ impl VortexRdfStore {
         if let Some(plan) = plan
             && mode.serves()
         {
-            // A small located run reads point by point, as one chunk.
-            if let Some(read) = plan.point_run(file)? {
-                let chunk = match read.await {
-                    Ok(rows) => {
-                        plan.decode_columns_async::<T>(&rows, deleted.as_ref())
-                            .await
-                    }
-                    Err(e) => vec![Err(e)],
-                };
-                return Ok(with_tail(stream::iter([chunk]), tail));
-            }
-            // Any other run streams the plan's scan (see
-            // `FileServePlan::scan`).
-            let decoder = ServedDecoder {
-                plan: plan.clone(),
-                deleted: deleted.clone(),
+            let read = plan.read()?;
+            let deleted = read.tombstones(deleted.as_ref()).cloned();
+            return match read {
+                // Rows taken point by point (kept rows, or a small located
+                // run), as one chunk.
+                PlanRead::Kept(positions) | PlanRead::Points(positions) => {
+                    let chunk = match plan.rows_at(file, &positions).await {
+                        Ok(rows) => {
+                            plan.decoder()
+                                .decode_columns_async::<T>(&rows, deleted.as_ref())
+                                .await
+                        }
+                        Err(e) => vec![Err(e)],
+                    };
+                    Ok(with_tail(stream::iter([chunk]), tail))
+                }
+                // Any other run streams the plan's scan.
+                PlanRead::Scan(scan) => {
+                    let decoder = ServedDecoder {
+                        decode: plan.decoder().clone(),
+                        deleted,
+                    };
+                    self.scan_chunks(scan, decoder, tail)
+                }
             };
-            return self.scan_chunks(plan.scan()?, decoder, tail);
         }
         let primary = self.layout.strategy().primary_column_names();
         if mode == QuadRead::Collected {
@@ -499,21 +506,22 @@ impl<T: ChunkDecode> ChunkDecoder<T> for ResolvedLayout {
 #[cfg(feature = "file-io")]
 #[derive(Clone)]
 struct ServedDecoder {
-    plan: FileServePlan,
+    decode: ServeDecode,
     deleted: Option<Mask>,
 }
 
 #[cfg(feature = "file-io")]
 impl<T: ChunkDecode> ChunkDecoder<T> for ServedDecoder {
     fn decode(&self, chunk: &ArrayRef) -> Vec<Result<T>> {
-        self.plan.decode_columns::<T>(chunk, self.deleted.as_ref())
+        self.decode
+            .decode_columns::<T>(chunk, self.deleted.as_ref())
     }
 
     fn decode_async(&self, chunk: ArrayRef) -> BoxFuture<'static, Vec<Result<T>>> {
         let served = self.clone();
         async move {
             served
-                .plan
+                .decode
                 .decode_columns_async::<T>(&chunk, served.deleted.as_ref())
                 .await
         }
@@ -521,7 +529,7 @@ impl<T: ChunkDecode> ChunkDecoder<T> for ServedDecoder {
     }
 
     fn decode_now(&self, chunk: &ArrayRef) -> Option<Vec<Result<T>>> {
-        self.plan
+        self.decode
             .decode_columns_now::<T>(chunk, self.deleted.as_ref())
     }
 }

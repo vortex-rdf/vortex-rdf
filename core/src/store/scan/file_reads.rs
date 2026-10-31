@@ -5,7 +5,6 @@
 //! them. Functions of the file, with no store state.
 
 use std::borrow::Cow;
-use std::ops::Range;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -581,20 +580,6 @@ fn u64_struct(
         children.push(child);
     }
     Ok(Some(named_struct(columns, children, len)?.into_array()))
-}
-
-/// A located serve run's projected component columns, read point by point
-/// through the component's cached chunk probes into one canonical
-/// child-named chunk: the serve path's counterpart of [`file_point_rows`].
-/// `Ok(None)` declines (a column or chunk without a probe); the caller keeps
-/// its filter scan.
-pub(crate) async fn component_point_chunk(
-    file: &NativeStoreFile,
-    component: &str,
-    columns: &[&'static str],
-    range: Range<u64>,
-) -> Result<Option<ArrayRef>> {
-    component_point_rows(file, component, columns, range.collect()).await
 }
 
 /// [`component_point_rows`] as one value column per column of `columns`, in

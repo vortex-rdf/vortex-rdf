@@ -119,6 +119,7 @@ pub(super) async fn resolve_file(
                     Arc::clone(file),
                     child,
                     range,
+                    true,
                 )),
                 resolves: probe.resolves,
                 serve: None,

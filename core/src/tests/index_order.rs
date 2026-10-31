@@ -1608,3 +1608,20 @@ async fn encoded_memory_streams_read_off_the_component() {
         "a built store gathers its base"
     );
 }
+
+/// The lazy ids of a served file window over a located range read the copy
+/// child's rid column on first need. Its rids follow the index's order, not
+/// row order, so the ids decline a window by position (which reads a run's
+/// rids as already in row order): a window of the window cuts the ids it
+/// holds instead.
+#[tokio::test]
+async fn served_located_ids_decline_a_window_by_position() {
+    let (_dir, store) = file_store().await;
+    let (p, want) = p2_view(&store).await;
+    let w = p.window(10, 100).await.unwrap();
+    assert_eq!(w.debug_pending_window(0, 10).await.unwrap(), None);
+    assert_eq!(
+        row_list(&w.window(5, 50).await.unwrap()).await,
+        want[15..65]
+    );
+}

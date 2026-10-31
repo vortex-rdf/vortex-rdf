@@ -15,11 +15,11 @@ tests pin each interface
 
 | What the engine needs | What it calls |
 |---|---|
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L87), [`code_chunks`](../core/src/store/read/chunks.rs#L123) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L166), [`index_components`](../core/src/store/read/metadata.rs#L238), [`partitions`](../core/src/store/read/metadata.rs#L278) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L89), [`code_chunks`](../core/src/store/read/chunks.rs#L125) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L162), [`index_components`](../core/src/store/read/metadata.rs#L234), [`partitions`](../core/src/store/query/partitions.rs#L30) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L155), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L151), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
 | A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L78) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
@@ -82,7 +82,7 @@ Two calls let a binding build its own chunked read of a pattern:
 [`code_probe`](../core/src/store/query/located.rs#L131) turns a `CodePattern` into
 the `Probe` that `match_code_pattern` runs when no located run answers it
 (`None` when no quad can match), for `run_probe` and then `code_chunks`;
-and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L150) decodes one of
+and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L152) decodes one of
 a string layout's `row_chunks` into `SharedQuad`s, each distinct term of the
 chunk once, as `shared_quads_vec` decodes it (a Dictionary store's chunks
 hold codes, which `dict_reader` decodes). Java's `matchCodeChunks` is built
@@ -286,7 +286,8 @@ integration can register the file through vortex's own data source over it
 |---|---|
 | `count_code_pattern`, `match_code_pattern`, `code_probe`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
 | `row_chunks`, `code_chunks`, `decode_row_chunk` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
-| `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
+| `view_statistics`, `index_components`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
+| `partitions` | [`core/src/store/query/partitions.rs`](../core/src/store/query/partitions.rs) |
 | The scan driver of a file view's reads | [`core/src/store/scan/file_scans.rs`](../core/src/store/scan/file_scans.rs) |
 | `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs) |

@@ -3,13 +3,12 @@
 //! that matches it, chains a match on a view that still holds a pattern's
 //! pending matches into one match of both, and decides what a view's ids may
 //! leave pending ([`IdsNeed`]); `memory` matches an in-memory base, `file` a
-//! file's, `served` a narrowed served view's rows in its index's order, and
-//! `tail` the append tail.
+//! file's, and `tail` the append tail. A pattern chained on a narrowed served
+//! view filters its rows in its index's order (`query::served`).
 
 #[cfg(feature = "file-io")]
 mod file;
 mod memory;
-mod served;
 mod tail;
 
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use crate::error::Result;
 use crate::observe::observe;
 use crate::store::indexes::ResolvedRowIds;
 use crate::store::layouts::{OwnedQuadPattern, Prepared, QuadPattern};
+use crate::store::query::served::Served;
 use crate::store::scan::pieces::FIRST_PIECE_ROWS;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{Backend, VortexRdfStore};
@@ -122,14 +122,6 @@ impl VortexRdfStore {
         {
             return self.match_both(both, need).await;
         }
-        // A narrowed served view (a window, keep or partition of a served
-        // match) keeps its rows the pattern matches, in its index's order.
-        // Boxed, so every other match's future stays its own size.
-        if self.is_narrowed_served()
-            && let Some(chained) = Box::pin(self.served_chain(pattern)).await?
-        {
-            return Ok(chained);
-        }
         let t = debug::timer();
 
         let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
@@ -137,6 +129,12 @@ impl VortexRdfStore {
             return Ok(self.empty_view());
         };
         debug::step!(t, "[match_pattern] Prepared pattern codes");
+        // A narrowed served view (a window, keep or partition of a served
+        // match) keeps its rows the pattern matches, in its index's order.
+        // Boxed, so every other match's future stays its own size.
+        if let Some(served) = Served::of_narrowed(&self.quads) {
+            return Box::pin(self.served_chain(served, pattern, &mut codes)).await;
+        }
 
         let every_row = self.quads.is_unrefined();
         let mut matched = match &self.quads.backend {

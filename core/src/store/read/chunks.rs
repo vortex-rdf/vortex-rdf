@@ -45,16 +45,18 @@ use crate::session::VORTEX_SESSION;
 use crate::store::FileBase;
 use crate::store::MemoryBase;
 use crate::store::array::{field_as, into_struct_array, rechunk};
-#[cfg(feature = "file-io")]
-use crate::store::indexes::FileServePlan;
 use crate::store::indexes::{ComponentRows, InMemoryServePlan};
+#[cfg(feature = "file-io")]
+use crate::store::indexes::{FileServePlan, PlanRead};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::read::file_plan::StreamedPlan;
 use crate::store::scan::gather::{gather_live, gather_rows_at};
 #[cfg(feature = "file-io")]
 use crate::store::scan::{
-    file_reads::take_file_rows, file_scans::stream_split_reads, read_plan::ExactRead,
+    file_reads::take_file_rows,
+    file_scans::{stream_rows, stream_split_reads},
+    read_plan::ExactRead,
 };
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, SelectedRows};
@@ -230,44 +232,42 @@ impl VortexRdfStore {
         if let Some((base, plan)) = self.served_file_plan() {
             observe!(ServedRunChunks);
             let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
-            let deleted = self.quads.deleted.clone();
-            // Kept rows, or a point-sized run: each batch's codes point by
-            // point, straight into code buffers.
-            if let Some(positions) = plan.point_positions() {
-                let (plan, file) = (plan.clone(), Arc::clone(&base.file));
-                let rows = positions.len();
-                return Ok(Some(
+            let read = plan.read()?;
+            let deleted = read.tombstones(self.quads.deleted.as_ref()).cloned();
+            let (plan, file) = (plan.clone(), Arc::clone(&base.file));
+            let codes = match read {
+                // Kept rows, or a point-sized run: each batch's codes point by
+                // point, straight into code buffers.
+                PlanRead::Kept(positions) | PlanRead::Points(positions) => {
+                    let rows = positions.len();
                     stream::iter((0..rows).step_by(batch_rows))
                         .then(move |start| {
-                            let (plan, file) = (plan.clone(), Arc::clone(&file));
-                            let (deleted, positions) = (deleted.clone(), positions.clone());
+                            let (plan, file, deleted) =
+                                (plan.clone(), Arc::clone(&file), deleted.clone());
+                            let batch = positions.slice(start..(start + batch_rows).min(rows));
                             async move {
-                                let batch = &positions[start..(start + batch_rows).min(rows)];
-                                match plan.point_codes(&file, batch, deleted.as_ref()).await? {
+                                match plan.point_codes(&file, &batch, deleted.as_ref()).await? {
                                     Some(codes) => Ok(codes),
-                                    None => plan.chunk_codes(
-                                        &plan.rows_at(&file, batch).await?,
+                                    None => plan.decoder().chunk_code_columns(
+                                        &plan.rows_at(&file, &batch).await?,
                                         deleted.as_ref(),
                                     ),
                                 }
                             }
                         })
-                        .flat_map(move |codes| {
-                            stream::iter(match codes {
-                                Ok(codes) => code_slices(codes, &picked, batch_rows),
-                                Err(e) => vec![Err(e)],
-                            })
+                        .boxed()
+                }
+                PlanRead::Scan(scan) => stream_rows(scan)?
+                    .map(move |chunk| {
+                        chunk.and_then(|chunk| {
+                            plan.decoder().chunk_code_columns(&chunk, deleted.as_ref())
                         })
-                        .boxed(),
-                ));
-            }
-            let chunks = plan.child_chunks(Arc::clone(&base.file), batch_rows)?;
-            let plan = plan.clone();
+                    })
+                    .boxed(),
+            };
             return Ok(Some(
-                chunks
-                    .flat_map(move |chunk| {
-                        let codes =
-                            chunk.and_then(|chunk| plan.chunk_codes(&chunk, deleted.as_ref()));
+                codes
+                    .flat_map(move |codes| {
                         stream::iter(match codes {
                             Ok(codes) => code_slices(codes, &picked, batch_rows),
                             Err(e) => vec![Err(e)],
@@ -282,7 +282,7 @@ impl VortexRdfStore {
         let Some((all, asked)) = self.base_code_sources(columns) else {
             // The base's code columns encoded (a store read off a file): each
             // chunk off the component, not gathered out of order.
-            if plan.decodes_codes() {
+            if plan.decoder().decodes_codes() {
                 observe!(ServedRunChunks);
                 let rows = plan.live_component_rows(self.quads.deleted.as_ref())?;
                 return Ok(Some(component_code_chunks(
@@ -327,14 +327,17 @@ impl VortexRdfStore {
                 ));
             }
             observe!(ServedRunChunks);
-            let deleted = self.quads.deleted.clone();
-            let chunks = plan.child_chunks(Arc::clone(&base.file), batch_rows)?;
-            let plan = plan.clone();
+            let (chunks, deleted) = plan.child_chunks(
+                Arc::clone(&base.file),
+                batch_rows,
+                self.quads.deleted.as_ref(),
+            )?;
+            let (plan, deleted) = (plan.clone(), deleted.cloned());
             return Ok(Some(
                 chunks
                     .flat_map(move |chunk| {
                         let rows = chunk
-                            .and_then(|chunk| plan.chunk_primary_rows(&chunk, deleted.as_ref()));
+                            .and_then(|chunk| plan.decoder().chunk_rows(&chunk, deleted.as_ref()));
                         stream::iter(match rows {
                             Ok(rows) => rechunk(rows, batch_rows).collect(),
                             Err(e) => vec![Err(e)],
@@ -348,7 +351,7 @@ impl VortexRdfStore {
         };
         // The base's code columns encoded (a store read off a file): each
         // chunk off the component, not gathered out of order.
-        if plan.decodes_codes() && !self.base_codes_decode_once() {
+        if plan.decoder().decodes_codes() && !self.base_codes_decode_once() {
             observe!(ServedRunChunks);
             let rows = plan.live_component_rows(self.quads.deleted.as_ref())?;
             return Ok(Some(component_row_chunks(plan.clone(), rows, batch_rows)));
