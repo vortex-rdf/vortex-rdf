@@ -11,7 +11,9 @@ use crate::store::array::{
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
 use crate::store::indexes::{IndexResolution, ResolvedRowIds, resolve_indexes_in_memory};
-use crate::store::layouts::{Constraints, OwnedQuadPattern, PatternCodes, QuadPattern, TermRef};
+use crate::store::layouts::{
+    Constraints, OwnedQuadPattern, PatternCodes, Prepared, QuadPattern, TermRef,
+};
 use crate::store::probes::StructProbes;
 use crate::store::scan::residual;
 use crate::store::scan::typed_eq::typed_positions;
@@ -136,9 +138,11 @@ impl VortexRdfStore {
             return Ok(carry(tail.selection.clone()));
         }
         // The tail's layouts store plain strings (see `Tail::layout_for`), so
-        // this prelude resolves nothing and never suspends; it still mints the
-        // witness, as for every probe surface.
-        let mut codes = tail.layout.prepare_pattern(pattern).await?;
+        // this prelude resolves nothing, never suspends and is never empty;
+        // it still mints the witness, as for every probe surface.
+        let Prepared::Codes(mut codes) = tail.layout.prepare_pattern(pattern).await? else {
+            return Ok(carry(RowSelection::empty()));
+        };
         let eqs = match codes.constraints(pattern)? {
             // The tail's string layouts never compile to AlwaysFalse (see
             // `Tail::layout_for`); the arm stays for totality.
@@ -229,7 +233,7 @@ impl VortexRdfStore {
         }
         let t = debug::timer();
 
-        let Some(mut codes) = self.prepared_codes(pattern).await? else {
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
             debug::step!(t, "[match_pattern] Layout proved the pattern unmatchable");
             return Ok(self.empty_view());
         };
@@ -290,20 +294,6 @@ impl VortexRdfStore {
             matched.quads.with_selection(ViewSelection::Exact(ids)),
             matched.tail.clone(),
         ))
-    }
-
-    /// The match prelude: every bound term of `pattern` resolved to its code
-    /// at most once, the witness every synchronous probe of the match runs
-    /// on, and the one point where a dictionary may do I/O (a file-backed one
-    /// reads here). `None` when the layout proves the pattern unmatchable (a
-    /// term absent from the dictionary, say), read off the prelude's role
-    /// cache: such a pattern needs no search and no scan on either backend.
-    pub(in crate::store) async fn prepared_codes(
-        &self,
-        pattern: QuadPattern<'_>,
-    ) -> Result<Option<PatternCodes>> {
-        let codes = self.layout.prepare_pattern(pattern).await?;
-        Ok((!codes.provably_empty(pattern)).then_some(codes))
     }
 
     /// The in-memory backend of [`match_base`](Self::match_base), `memory`

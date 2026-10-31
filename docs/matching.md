@@ -129,8 +129,9 @@ row: the result is that row. [§9](#9-the-tail) walks the tail side.
 Every match begins with
 [`ResolvedLayout::prepare_pattern`](../core/src/store/layouts/mod.rs), which
 returns a `PatternCodes` **witness** — the object every later stage probes for a
-term's column value. All three layouts produce one; only `Dictionary` does any
-work to build it. This is the single point in a match where a dictionary may
+term's column value — or `Prepared::Empty` when a bound term has no code
+(§4). All three layouts produce a witness; only `Dictionary` does any work to
+build it, and only it can answer empty. This is the single point in a match where a dictionary may
 perform I/O, and the only reason the prelude is async at all.
 
 | Layout | Residency | What the prelude does | Probe value |
@@ -175,18 +176,21 @@ code, and nothing below ever runs.
 ## 4. Stage B — the provable-emptiness gate
 
 ```rust
-if codes.provably_empty(pattern) {
+let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
     return Ok(self.empty_view());
-}
+};
 ```
 
 Only the Dictionary layout can reach this: a term missing from the dictionary
 cannot match any base row. `empty_view()` returns a view selecting nothing, with its indexes and components dropped (so a chained match on it runs no pointless lookups).
 
-`provably_empty` reads the prelude-seeded role cache (`roles[r] == Some(None)`)
+The prelude decides it from its own role cache (`roles[r] == Some(None)`)
 rather than compiling `Constraints` just to test for `AlwaysFalse`: the string
-layouts answer `false` without touching it, and every stage below compiles its
-own constraints over whatever the fast paths leave residual.
+layouts are never empty, and every stage below compiles its own constraints
+over whatever the fast paths leave residual. A witness the prelude hands back
+has every bound role resolved, so no probe below reads a role it left
+unresolved: a resident dictionary's prelude stops at the first absent term
+only when it answers empty.
 
 The string layouts (`Default`, `TypedObject`) never prove emptiness here; an
 unknown term simply matches zero rows later on.
@@ -223,7 +227,7 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/query/matching.rs#L324) runs four stages
+[`match_base_in_memory`](../core/src/store/query/matching.rs#L314) runs four stages
 over the base `StructArray`. Each one asks the same two questions — *can I answer
 part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
 `RowSelection` and clearing whatever pattern components it answered, so the next
@@ -266,11 +270,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:330-355`](../core/src/store/query/matching.rs#L330-L355 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L466), [`search_sorted_bounds`](../core/src/store/array.rs#L215) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:359-412`](../core/src/store/query/matching.rs#L359-L412 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L654), [`fold_row_ids`](../core/src/store/query/matching.rs#L852) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:414-430`](../core/src/store/query/matching.rs#L414-L430 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L550), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L267), [`mask_for`](../core/src/store/scan/residual.rs#L128) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`matching.rs:432-439`](../core/src/store/query/matching.rs#L432-L439 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| Prelude | [`matching.rs:320-345`](../core/src/store/query/matching.rs#L320-L345 "MemoryBase") | — |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L456), [`search_sorted_bounds`](../core/src/store/array.rs#L215) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:349-402`](../core/src/store/query/matching.rs#L349-L402 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L654), [`fold_row_ids`](../core/src/store/query/matching.rs#L842) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:404-420`](../core/src/store/query/matching.rs#L404-L420 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L540), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L267), [`mask_for`](../core/src/store/scan/residual.rs#L128) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:422-429`](../core/src/store/query/matching.rs#L422-L429 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -529,7 +533,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/query/matching.rs#L584) composes the same
+[`match_base_file`](../core/src/store/query/matching.rs#L574) composes the same
 restrictions as the in-memory path, but **leaves the rows to the next scan**:
 each stage decides what that scan will do, and the result is a filter
 expression plus a row selection. The match itself reads only what those
@@ -579,12 +583,12 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:592-596`](../core/src/store/query/matching.rs#L592-L596 "existing_filter") | — |
-| 1 · subject chunk probe and prefix | [`matching.rs:596-603`](../core/src/store/query/matching.rs#L596-L603 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L778), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:604-617`](../core/src/store/query/matching.rs#L604-L617 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L679) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:574-644`](../core/src/store/query/matching.rs#L574-L644 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:623-624`](../core/src/store/query/matching.rs#L623-L624 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L852) and [`matching.rs:708-722`](../core/src/store/query/matching.rs#L708-L722 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L807), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L712) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
-| 5 · filter at sparse ids | [`matching.rs:724-739`](../core/src/store/query/matching.rs#L724-L739 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L201) | [§7.3](#73-what-ends-up-on-the-view) |
+| Prelude | [`matching.rs:582-586`](../core/src/store/query/matching.rs#L582-L586 "existing_filter") | — |
+| 1 · subject chunk probe and prefix | [`matching.rs:586-593`](../core/src/store/query/matching.rs#L586-L593 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L768), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:594-607`](../core/src/store/query/matching.rs#L594-L607 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L679) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`matching.rs:564-634`](../core/src/store/query/matching.rs#L564-L634 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:613-614`](../core/src/store/query/matching.rs#L613-L614 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L842) and [`matching.rs:698-712`](../core/src/store/query/matching.rs#L698-L712 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L797), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L712) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 5 · filter at sparse ids | [`matching.rs:714-729`](../core/src/store/query/matching.rs#L714-L729 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L201) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -975,7 +979,7 @@ scan that still supplies a serve plan.
   (`ViewSelection::Pending`'s `matches`; a narrower run costs less to compute than
   the pattern's terms cost to copy, `CHAIN_MIN_ROWS`). A match chained on such
   a view is **one match of both patterns** over every base row
-  ([`match_both`](../core/src/store/query/matching.rs#L271)): the pending ids
+  ([`match_both`](../core/src/store/query/matching.rs#L275)): the pending ids
   are never computed, and two roles one index orders together are one run of
   it. A view built for its rows gets the ids in base order with no serve plan,
   as every chained match leaves them; one only counted or windowed keeps what
@@ -1091,7 +1095,7 @@ file run) and a rid-only scan of the index child otherwise.
 
 | # | Where | Condition | Consequence |
 |---|---|---|---|
-| 1 | `match_base` | `codes.provably_empty(pattern)` — a bound role resolved to no code | `empty_view()`, no backend work |
+| 1 | `match_base` | `Prepared::Empty` — a bound role resolved to no code | `empty_view()`, no backend work |
 | 2 | in memory | `s` bound ∧ `s` stamped sorted ∧ probe casts | binary-search `[lo, hi)`; subject cleared |
 | 2b | in memory | selection is a `Range` ∧ next role in (p, o, g) bound ∧ it has a code and a cached probe | `bounds_in` narrows the run; that role cleared; repeat until a role declines |
 | 3 | in memory | selection non-empty ∧ something bound ∧ (`!prefix_narrowed` ∨ `len ≥ 4096`) | try index routing |
@@ -1116,11 +1120,11 @@ file run) and a rid-only scan of the index child otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L879) | an already-narrowed view below this skips index routing |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L869) | an already-narrowed view below this skips index routing |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L244) | selection size above which the typed row loop declines to the vectorized mask scan for a lone residual equality |
 | `TYPED_PROBE_MAX_ROWS` | 256 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L253) | the same for any set that binds a column through an encoded-search probe, read a row at a time: the mask scan costs less from about 256 rows of a range and 512 of scattered ids |
 | `FIRST_PIECE_ROWS` | 8192 | [`pending.rs`](../core/src/store/view/pending.rs#L33) | the first piece of a residual compare left pending for a count or a window, each piece after four times the one before; a selection this wide or narrower is compared eagerly |
-| `CHAIN_MIN_ROWS` | 1024 | [`matching.rs`](../core/src/store/query/matching.rs#L873) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
+| `CHAIN_MIN_ROWS` | 1024 | [`matching.rs`](../core/src/store/query/matching.rs#L863) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
 `POINT_IDS_PER_SPLIT`, `TAKE_ROWS`) are in [file-format.md §11](file-format.md#11-constants).

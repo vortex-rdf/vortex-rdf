@@ -433,7 +433,11 @@ async fn build_array<B: VortexArrayBuilder>(
 /// The store [`SortedInMemoryBuilder`] builds from `quads` — [`build_array`]
 /// and [`VortexRdfStore::from_built`] in one call, for the tests that never
 /// look at the built array itself.
-async fn built_store(quads: Vec<Quad>, layout: LayoutStrategy, indexes: Indexes) -> VortexRdfStore {
+pub(crate) async fn built_store(
+    quads: Vec<Quad>,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+) -> VortexRdfStore {
     let built = build_array::<SortedInMemoryBuilder>(quad_stream(quads), layout, indexes)
         .await
         .unwrap();

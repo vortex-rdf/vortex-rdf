@@ -22,7 +22,7 @@ use crate::store::array;
 use crate::store::indexes::IndexComponent;
 use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
-use crate::store::layouts::{DictAccess, QuadPattern};
+use crate::store::layouts::{DictAccess, Prepared, QuadPattern};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::FileCounter;
 use crate::store::view::selection::{RowSelection, ViewSelection};
@@ -482,7 +482,7 @@ impl VortexRdfStore {
             return Ok(None);
         };
         let pattern = QuadPattern::new(Some(subject), None, None, None);
-        let Some(mut codes) = self.prepared_codes(pattern).await? else {
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
             return Ok(Some(0..0));
         };
         match file_exprs::build_file_filter(pattern, &mut codes)? {
@@ -502,10 +502,8 @@ impl VortexRdfStore {
         let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
-        let Some(mut codes) = self
-            .prepared_codes(QuadPattern::new(Some(subject), None, None, None))
-            .await?
-        else {
+        let pattern = QuadPattern::new(Some(subject), None, None, None);
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
             return Ok(None);
         };
         subject_runs::locate_subject_run(file, &mut codes, subject).await
@@ -523,7 +521,7 @@ impl VortexRdfStore {
             return Ok(None);
         };
         let pattern = QuadPattern::new(None, predicate, object, None);
-        let Some(mut codes) = self.prepared_codes(pattern).await? else {
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
             return Ok(None);
         };
         crate::store::indexes::file::debug_located_run(

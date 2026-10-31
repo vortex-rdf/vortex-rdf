@@ -44,7 +44,7 @@ impl DictAccess {
     /// ([`prepare_pattern`](crate::store::layouts::ResolvedLayout::prepare_pattern))
     /// minted. A resident dictionary resolves them one by one, in `s`, `p`,
     /// `o`, `g` order, and stops at the first it lacks: the pattern is then
-    /// provably empty (`PatternCodes::provably_empty`), so no match reads the
+    /// provably empty (`Prepared::Empty`), so no match reads the
     /// codes of the roles after it. A file-backed one searches every bound
     /// role at once, its window reads overlapped.
     pub(in crate::store::layouts) async fn resolve_pattern(

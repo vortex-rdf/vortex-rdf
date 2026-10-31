@@ -400,7 +400,10 @@ impl TermRef<'_> {
 /// the match core is a method on it ([`probe_scalar`](Self::probe_scalar),
 /// [`constraints`](Self::constraints)). Holding one proves the prelude ran
 /// ("prelude skipped" is unrepresentable), which lets a file-backed
-/// dictionary confine its I/O to the prelude.
+/// dictionary confine its I/O to the prelude, and that it resolved every
+/// bound role: a prelude that finds a term the dictionary lacks stops there
+/// and hands back [`Prepared::Empty`] instead, so no probe ever reads a role
+/// it left unresolved.
 ///
 /// The role cache memoizes: `match_base`'s stages (the unmatchable-pattern
 /// gate, the sorted-subject probe, the index probes, the residual
@@ -493,8 +496,8 @@ impl PatternCodes {
     fn code(&self, term: TermRef<'_>) -> Result<Option<TermCode>> {
         self.roles[term.role().index()].ok_or_else(|| {
             VortexRdfError::Deserialization(format!(
-                "no code resolution for {term}: the async prelude resolves every bound role \
-                 of the prepared pattern, and no probe reaches the dictionary outside it"
+                "no code resolution for {term}: the prepared pattern does not bind its role, \
+                 and no probe reaches the dictionary outside the prelude"
             ))
         })
     }
@@ -527,19 +530,16 @@ impl PatternCodes {
         self.code(term)
     }
 
-    /// Whether the layout can prove the pattern matches no row: a bound term
-    /// that resolved to no dictionary code.
+    /// Whether the layout proves the pattern matches no row: a bound term
+    /// that resolved to no dictionary code, which the prelude answers as
+    /// [`Prepared::Empty`].
     ///
-    /// The allocation-free form of testing [`Constraints::AlwaysFalse`]: the
-    /// async prelude resolved every bound role into the role cache, so this
-    /// reads it instead of compiling the per-column equalities only to
-    /// discard them. The string layouts probe with the term itself and have
-    /// no code to miss, so they answer `false` without touching the cache.
-    ///
-    /// The verdict is conservative: a role the prelude left unresolved
-    /// answers `false`, deferring to the constraint path rather than
-    /// fabricating an empty result.
-    pub(crate) fn provably_empty(&self, pattern: QuadPattern<'_>) -> bool {
+    /// The allocation-free form of testing [`Constraints::AlwaysFalse`]: it
+    /// reads the role cache instead of compiling the per-column equalities
+    /// only to discard them. The string layouts probe with the term itself
+    /// and have no code to miss, so they answer `false` without touching the
+    /// cache.
+    fn provably_empty(&self, pattern: QuadPattern<'_>) -> bool {
         !self.probes_by_string()
             && pattern
                 .bound_roles()
@@ -581,6 +581,17 @@ impl PatternCodes {
     }
 }
 
+/// What the match prelude ([`prepare_pattern`](ResolvedLayout::prepare_pattern))
+/// found: that the layout proves the pattern matches no row, or the witness
+/// every synchronous probe of the match runs on.
+pub(crate) enum Prepared {
+    /// A bound term the dictionary lacks: no row matches, and no probe runs.
+    /// The prelude stops at that term, leaving the roles after it unresolved.
+    Empty,
+    /// Every bound role resolved ([`PatternCodes`]).
+    Codes(PatternCodes),
+}
+
 /// Column equality constraints a quad pattern compiles to under a given
 /// layout: the single source of truth consumed by both the in-memory mask
 /// scan and the pushed-down file filter in `match_pattern`.
@@ -612,23 +623,60 @@ impl ResolvedLayout {
 
     /// `pattern` prepared for the synchronous match core: every bound term
     /// the layout probes by code pre-resolved into the [`PatternCodes`]
-    /// witness the core's probes run on. The one point in a match where a
-    /// dictionary may perform I/O (see [`DictAccess::resolve_pattern`]),
-    /// which is why this prelude is the witness's only constructor. The
-    /// string layouts have nothing to resolve, so their preparation never
-    /// suspends.
-    pub(crate) async fn prepare_pattern(&self, pattern: QuadPattern<'_>) -> Result<PatternCodes> {
+    /// witness the core's probes run on, or [`Prepared::Empty`] when a bound
+    /// term resolves to no code: such a pattern needs no search and no scan
+    /// on either backend. The one point in a match where a dictionary may
+    /// perform I/O (see [`DictAccess::resolve_pattern`]), which is why this
+    /// prelude is the witness's only constructor. The string layouts have
+    /// nothing to resolve, so their preparation never suspends and is never
+    /// empty.
+    pub(crate) async fn prepare_pattern(&self, pattern: QuadPattern<'_>) -> Result<Prepared> {
         let mut codes = PatternCodes::new(self.strategy());
         if let ResolvedLayout::Dictionary(access) = self {
             access.resolve_pattern(pattern, &mut codes).await?;
         }
-        Ok(codes)
+        Ok(if codes.provably_empty(pattern) {
+            Prepared::Empty
+        } else {
+            Prepared::Codes(codes)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prelude answers a pattern binding a term the dictionary lacks as
+    /// `Prepared::Empty`, and any other with a witness that resolved every
+    /// bound role: each probes with its code, and only a role the pattern
+    /// leaves free has no resolution.
+    #[tokio::test]
+    async fn prelude_is_empty_or_resolves_every_bound_role() {
+        use crate::LayoutStrategy;
+
+        let quads = crate::tests::modular_quads(30, 3, 4);
+        let store =
+            crate::tests::built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+        let (s, p, o) = (&quads[1].subject, &quads[1].predicate, &quads[1].object);
+        let absent = NamedNode::new_unchecked("http://example.org/absent");
+        let prepare = |pattern| store.layout.prepare_pattern(pattern);
+        let empty = prepare(QuadPattern::new(Some(s), Some(&absent), Some(o), None));
+        assert!(matches!(empty.await.unwrap(), Prepared::Empty));
+        let pattern = QuadPattern::new(Some(s), Some(p), Some(o), None);
+        let Prepared::Codes(codes) = prepare(pattern).await.unwrap() else {
+            panic!("every term is in the dictionary");
+        };
+        for term in [
+            TermRef::Subject(s),
+            TermRef::Predicate(p),
+            TermRef::Object(o),
+        ] {
+            assert!(codes.probe_code(term).unwrap().is_some(), "{term}");
+        }
+        let graph = GraphName::DefaultGraph;
+        assert!(codes.probe_code(TermRef::Graph(&graph)).is_err());
+    }
 
     /// A witness prepared under the Dictionary layout answers a probe for a
     /// role the prelude never seeded with an error, and from the role cache
