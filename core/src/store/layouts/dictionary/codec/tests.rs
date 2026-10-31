@@ -105,7 +105,7 @@ async fn assert_file_backed_decodes(
     let (decoded, reads, resolves) = decode_counts(Quad::decode_async(&layout, chunk)).await;
     assert_eq!((reads, resolves), counts, "{case}: quads");
     let decoded: Vec<Quad> = decoded.into_iter().map(|row| row.unwrap()).collect();
-    let want: Vec<Quad> = decode_chunk(chunk, dict)
+    let want: Vec<Quad> = decode_resident::<Quad>(chunk, dict)
         .into_iter()
         .map(|row| row.unwrap())
         .collect();
@@ -115,7 +115,7 @@ async fn assert_file_backed_decodes(
     let (shared, reads, resolves) = decode_counts(SharedQuad::decode_async(&layout, chunk)).await;
     assert_eq!((reads, resolves), counts, "{case}: shared quads");
     let shared: Vec<SharedQuad> = shared.into_iter().map(|row| row.unwrap()).collect();
-    let want: Vec<SharedQuad> = decode_chunk_shared(chunk, dict)
+    let want: Vec<SharedQuad> = decode_resident::<SharedQuad>(chunk, dict)
         .into_iter()
         .map(|row| row.unwrap())
         .collect();
@@ -177,7 +177,7 @@ async fn a_decode_that_cannot_await_takes_only_the_chunks_it_can() {
     let (dict, chunk) = skewed_chunk(&quads);
     let dict = Arc::new(dict);
     let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&dict).await);
-    let want: Vec<Quad> = decode_chunk(&chunk, &dict)
+    let want: Vec<Quad> = decode_resident::<Quad>(&chunk, &dict)
         .into_iter()
         .map(|row| row.unwrap())
         .collect();
@@ -390,7 +390,7 @@ fn a_quad_decode_ends_where_its_source_gives_up() {
     // Rows 30..40 share their subject, which no row before them has.
     let code = columns[0][30];
     assert!(columns[0][..30].iter().all(|&c| c != code));
-    let want = decode_chunk(&chunk, &dict);
+    let want = decode_resident::<Quad>(&chunk, &dict);
 
     for gives_up in [true, false] {
         let mut src = FailingTerms {

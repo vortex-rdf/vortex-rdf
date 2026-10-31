@@ -369,10 +369,11 @@ async fn test_serializable_parts_on_tailed_dictionary_store() {
     let dict = parts
         .dict
         .expect("a Dictionary rebuild carries its dictionary");
-    let decoded: Vec<Quad> = crate::store::layouts::dictionary::decode_chunk(&rows, &dict)
-        .into_iter()
-        .map(|q| q.unwrap())
-        .collect();
+    let decoded: Vec<Quad> =
+        crate::store::layouts::dictionary::decode_resident::<Quad>(&rows, &dict)
+            .into_iter()
+            .map(|q| q.unwrap())
+            .collect();
     let mut expected = quads.clone();
     expected.push(novel);
     assert_eq!(quad_strings(&decoded), quad_strings(&expected));
@@ -390,8 +391,8 @@ async fn test_serializable_parts_on_tailed_default_store() {
 
     let rows = tailed.to_serializable_parts().await.unwrap().array;
     assert_eq!(rows.len(), 14);
-    let decoded: Vec<Quad> = crate::store::layouts::ResolvedLayout::Default
-        .decode_chunk(&rows)
+    use crate::store::layouts::{ChunkDecode as _, ResolvedLayout};
+    let decoded: Vec<Quad> = Quad::decode(&ResolvedLayout::Default, &rows)
         .into_iter()
         .map(|q| q.unwrap())
         .collect();

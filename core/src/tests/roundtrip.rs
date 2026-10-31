@@ -3,6 +3,7 @@
 //! against oxrdfio.
 
 use super::*;
+use crate::store::layouts::ChunkDecode as _;
 
 // ─── Adoption, decode errors and rebuilds ──────────────────────────────
 
@@ -190,7 +191,7 @@ fn test_decode_chunk_reports_chunk_failure_as_single_err() {
         .collect();
     for layout in LAYOUTS {
         let (chunk, resolved) = chunk_for(layout, &raws);
-        let decoded = resolved.decode_chunk(&drop_graph_column(&chunk));
+        let decoded = Quad::decode(&resolved, &drop_graph_column(&chunk));
         assert_eq!(decoded.len(), 1, "{layout:?}: one error for the chunk");
         assert!(decoded[0].is_err(), "{layout:?}");
     }
@@ -251,7 +252,7 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
     ];
 
     for (layout, (chunk, resolved)) in cases {
-        let decoded = resolved.decode_chunk(&chunk);
+        let decoded = Quad::decode(&resolved, &chunk);
         assert_eq!(decoded.len(), 3, "{layout:?}: one result per row");
         assert!(decoded[0].is_ok(), "{layout:?}: row 0");
         assert!(

@@ -61,7 +61,10 @@ async fn test_default_streaming_chunk_boundaries() {
     // Decode all chunks in order and verify global subject sort.
     let subjects: Vec<String> = chunks
         .iter()
-        .flat_map(|c| store::layouts::ResolvedLayout::Default.decode_chunk(c))
+        .flat_map(|c| {
+            use store::layouts::{ChunkDecode as _, ResolvedLayout};
+            Quad::decode(&ResolvedLayout::Default, c)
+        })
         .map(|q| q.unwrap().subject.to_string())
         .collect();
     let mut sorted = subjects.clone();

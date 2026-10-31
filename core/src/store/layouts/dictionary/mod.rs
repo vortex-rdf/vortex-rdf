@@ -19,14 +19,10 @@ pub mod predicates;
 pub(crate) mod storage;
 pub(crate) mod term_dict;
 
-pub(super) use self::codec::decode_code_column;
-pub(crate) use self::codec::{
-    QuadCodes, build_code_chunk, decode_chunk, decode_chunk_lines, decode_chunk_shared,
-    encode_quads,
-};
 #[cfg(feature = "file-io")]
+pub(crate) use self::codec::decode_file_backed;
 pub(crate) use self::codec::{
-    decode_chunk_file_backed, decode_chunk_lines_file_backed, decode_chunk_shared_file_backed,
+    DecodeRows, QuadCodes, build_code_chunk, decode_resident, encode_quads,
 };
 #[cfg(feature = "file-io")]
 pub(crate) use self::file_backed::FileBackedDict;

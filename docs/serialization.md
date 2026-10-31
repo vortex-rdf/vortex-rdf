@@ -336,7 +336,7 @@ full) or to a writable directory (any other failure).
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L54)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L48)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |

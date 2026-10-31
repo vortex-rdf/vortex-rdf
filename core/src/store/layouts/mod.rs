@@ -2,8 +2,10 @@
 //! the [`LayoutStrategy`] a build requests, the `ResolvedLayout` a store
 //! reads through (the strategy plus the state it cannot carry alone, a
 //! Dictionary layout's term access), the `QuadPattern`/`PatternCodes` pattern
-//! form, and the dispatch that turns them into per-layout column building,
-//! chunk decoding and constraint lowering.
+//! form, and the dispatch that turns them into per-layout column building
+//! and constraint lowering. Chunk decoding, one dispatch over where a layout
+//! keeps its terms for every representation, is `decode` (the string
+//! layouts' reads in `strings`).
 //!
 //! A leaf (`default`, `typed_object`, `dictionary`) owns exactly one layout's
 //! physical schema, its column names and encode/decode loops, and never names
@@ -19,33 +21,25 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "file-io")]
-use futures::FutureExt as _;
-#[cfg(feature = "file-io")]
-use futures::future::{self, BoxFuture};
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use vortex_array::arrays::struct_::StructArray;
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
+use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
 use vortex_array::scalar::Scalar;
-use vortex_array::{ArrayRef, VortexSessionExecute};
 
-use crate::common::quad::{NQuadLines, SharedQuad};
 use crate::error::{Result, VortexRdfError};
-use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::array::{StrColReader, field_as};
 
+mod decode;
 pub(crate) mod default;
 pub(crate) mod dictionary;
+mod strings;
 pub(crate) mod typed_object;
 
+pub(crate) use self::decode::ChunkDecode;
 pub(crate) use self::dictionary::DictAccess;
-#[cfg(feature = "file-io")]
-use self::dictionary::FileBackedDict;
 use crate::store::schema::{
-    CODE_PTYPE, COL_G, COL_O, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-    PRIMARY_COLUMNS, QuadColumn, TermCode,
+    CODE_PTYPE, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_S, PRIMARY_COLUMNS,
+    QuadColumn, TermCode,
 };
 
 /// The columnar schema a store's quads are stored in.
@@ -616,54 +610,6 @@ impl ResolvedLayout {
         }
     }
 
-    /// A struct chunk decoded into quads, a Dictionary chunk through the
-    /// layout's own resident dictionary.
-    ///
-    /// A chunk-level failure (execution, a required column missing or of the
-    /// wrong type) is the single `Err` element; a row whose terms fail to
-    /// parse is an `Err` at that row's position, the other rows decoding
-    /// normally. The shared-string variant below and every [`ChunkDecode`]
-    /// follow the same contract.
-    pub(crate) fn decode_chunk(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
-        match self {
-            ResolvedLayout::Default => default::decode_chunk(chunk),
-            ResolvedLayout::TypedObject => typed_object::decode_chunk(chunk),
-            ResolvedLayout::Dictionary(access) => match access.resident() {
-                Some(dict) => dictionary::decode_chunk(chunk, dict),
-                // Defensive: the read paths decode a file-backed store's
-                // chunks through `ChunkDecode::decode_async`, which resolves
-                // each chunk's codes with a read of the dictionary; reaching
-                // here means one of them didn't.
-                None => vec![Err(VortexRdfError::Deserialization(
-                    "a file-backed dictionary decodes chunks through the async read path"
-                        .to_string(),
-                ))],
-            },
-        }
-    }
-
-    /// [`decode_chunk`](Self::decode_chunk) into [`SharedQuad`]s: terms as
-    /// shared N-Triples strings, decoded once per distinct code under the
-    /// Dictionary layout; the string layouts read each term in place
-    /// ([`shared_quads`](Self::shared_quads)).
-    pub(crate) fn decode_chunk_shared(&self, chunk: &ArrayRef) -> Vec<Result<SharedQuad>> {
-        match self {
-            ResolvedLayout::Default | ResolvedLayout::TypedObject => {
-                match self.shared_quads(chunk) {
-                    Ok(rows) => rows.into_iter().map(Ok).collect(),
-                    Err(e) => vec![Err(e)],
-                }
-            }
-            ResolvedLayout::Dictionary(access) => match access.resident() {
-                Some(dict) => dictionary::decode_chunk_shared(chunk, dict),
-                None => vec![Err(VortexRdfError::Deserialization(
-                    "a file-backed dictionary decodes chunks through the async read path"
-                        .to_string(),
-                ))],
-            },
-        }
-    }
-
     /// `pattern` prepared for the synchronous match core: every bound term
     /// the layout probes by code pre-resolved into the [`PatternCodes`]
     /// witness the core's probes run on. The one point in a match where a
@@ -678,313 +624,6 @@ impl ResolvedLayout {
         }
         Ok(codes)
     }
-
-    /// An array of this layout's rows decoded back into [`RawQuad`]s, each
-    /// term in its N-Triples string form, without an oxrdf parse round-trip.
-    ///
-    /// The inverse of the build-time column encoding, for the operations that
-    /// rebuild a store from its quads (compaction, and reads that must merge a
-    /// string tail into a Dictionary-encoded base): Default reads its four
-    /// string columns verbatim, TypedObject recomposes the object term from
-    /// its typed sub-columns, and Dictionary resolves each code through the
-    /// resident term dictionary (a file-backed one is an error here; see
-    /// [`raw_quads_async`](Self::raw_quads_async)).
-    pub(crate) fn raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = rows.clone().execute::<StructArray>(&mut ctx)?;
-        let (s, p, o, g) = match self {
-            ResolvedLayout::Default => (
-                read_string_column(&struct_arr, COL_S)?,
-                read_string_column(&struct_arr, COL_P)?,
-                read_string_column(&struct_arr, COL_O)?,
-                read_string_column(&struct_arr, COL_G)?,
-            ),
-            ResolvedLayout::TypedObject => (
-                read_string_column(&struct_arr, COL_S)?,
-                read_string_column(&struct_arr, COL_P)?,
-                typed_object::object_terms(&struct_arr)?,
-                read_string_column(&struct_arr, COL_G)?,
-            ),
-            ResolvedLayout::Dictionary(access) => {
-                let dict = access.resident().ok_or_else(|| {
-                    VortexRdfError::Deserialization(
-                        "a file-backed dictionary reconstructs rows through raw_quads_async"
-                            .to_string(),
-                    )
-                })?;
-                (
-                    dictionary::decode_code_column(dict, &read_code_column(&struct_arr, COL_S)?)?,
-                    dictionary::decode_code_column(dict, &read_code_column(&struct_arr, COL_P)?)?,
-                    dictionary::decode_code_column(dict, &read_code_column(&struct_arr, COL_O)?)?,
-                    dictionary::decode_code_column(dict, &read_code_column(&struct_arr, COL_G)?)?,
-                )
-            }
-        };
-        Ok(s.into_iter()
-            .zip(p)
-            .zip(o)
-            .zip(g)
-            .map(|(((s, p), o), g)| RawQuad { s, p, o, g })
-            .collect())
-    }
-
-    /// A string layout's rows as [`SharedQuad`]s. Each term is read in place
-    /// (a TypedObject object spelled from its sub-columns into one buffer)
-    /// and copied into a fresh `Arc<str>` only where it differs from the same
-    /// role's term in the row before, so a run of rows repeating a term, as
-    /// rows sorted by subject repeat their subject, predicate and graph,
-    /// shares one allocation. A Dictionary layout is an error here.
-    fn shared_quads(&self, rows: &ArrayRef) -> Result<Vec<SharedQuad>> {
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = rows.clone().execute::<StructArray>(&mut ctx)?;
-        let n = struct_arr.len();
-        let s = field_as::<VarBinViewArray>(&struct_arr, COL_S, &mut ctx)?;
-        let p = field_as::<VarBinViewArray>(&struct_arr, COL_P, &mut ctx)?;
-        let g = field_as::<VarBinViewArray>(&struct_arr, COL_G, &mut ctx)?;
-        let objects: Vec<Arc<str>> = match self {
-            ResolvedLayout::Default => {
-                let o = field_as::<VarBinViewArray>(&struct_arr, COL_O, &mut ctx)?;
-                shared_column(&o)
-            }
-            ResolvedLayout::TypedObject => {
-                let columns = typed_object::ObjectColumns::load(&struct_arr, &mut ctx)?;
-                let reader = columns.reader();
-                let mut spelling = String::new();
-                let mut run = None;
-                (0..n)
-                    .map(|i| {
-                        spelling.clear();
-                        reader.push_spelling(i, &mut spelling)?;
-                        Ok(shared_term(&mut run, &spelling))
-                    })
-                    .collect::<Result<_>>()?
-            }
-            ResolvedLayout::Dictionary(_) => {
-                return Err(VortexRdfError::Deserialization(
-                    "a Dictionary layout shares its terms by code".to_string(),
-                ));
-            }
-        };
-        Ok(shared_column(&s)
-            .into_iter()
-            .zip(shared_column(&p))
-            .zip(objects)
-            .zip(shared_column(&g))
-            .map(|(((s, p), o), g)| SharedQuad { s, p, o, g })
-            .collect())
-    }
-
-    /// A string layout's rows as N-Triples/N-Quads lines, each term read in
-    /// place (a TypedObject object spelled from its sub-columns straight into
-    /// the lines). A Dictionary layout is an error here.
-    fn nquad_lines(&self, rows: &ArrayRef) -> Result<NQuadLines> {
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = rows.clone().execute::<StructArray>(&mut ctx)?;
-        let n = struct_arr.len();
-        let s = field_as::<VarBinViewArray>(&struct_arr, COL_S, &mut ctx)?;
-        let p = field_as::<VarBinViewArray>(&struct_arr, COL_P, &mut ctx)?;
-        let g = field_as::<VarBinViewArray>(&struct_arr, COL_G, &mut ctx)?;
-        let (s, p, g) = (
-            StrColReader::new(&s),
-            StrColReader::new(&p),
-            StrColReader::new(&g),
-        );
-        let mut lines = NQuadLines::with_capacity(n);
-        match self {
-            ResolvedLayout::Default => {
-                let o = field_as::<VarBinViewArray>(&struct_arr, COL_O, &mut ctx)?;
-                let o = StrColReader::new(&o);
-                for i in 0..n {
-                    lines.push([s.str_at(i), p.str_at(i), o.str_at(i), g.str_at(i)]);
-                }
-            }
-            ResolvedLayout::TypedObject => {
-                let columns = typed_object::ObjectColumns::load(&struct_arr, &mut ctx)?;
-                let objects = columns.reader();
-                for i in 0..n {
-                    lines.term(s.str_at(i));
-                    lines.term(p.str_at(i));
-                    objects.push_spelling(i, &mut lines.text)?;
-                    lines.text.push(' ');
-                    lines.end(g.str_at(i));
-                }
-            }
-            ResolvedLayout::Dictionary(_) => {
-                return Err(VortexRdfError::Deserialization(
-                    "a Dictionary layout writes its lines from its codes".to_string(),
-                ));
-            }
-        }
-        Ok(lines)
-    }
-
-    /// [`raw_quads`](Self::raw_quads) with the file-backed Dictionary case
-    /// handled: the whole dictionary is lifted resident transiently, then the
-    /// sync decode runs unchanged. Its one caller, `live_raw_quads`, serves
-    /// whole-base reads only (compaction and serialization), which touch most
-    /// of the dictionary anyway; every chunk a read streams decodes through
-    /// [`ChunkDecode`] instead.
-    pub(crate) async fn raw_quads_async(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
-        #[cfg(feature = "file-io")]
-        if let ResolvedLayout::Dictionary(access) = self
-            && access.is_file_backed()
-        {
-            let dict = access.ensure_resident().await?;
-            let resident = ResolvedLayout::Dictionary(DictAccess::Resident(dict));
-            return resident.raw_quads(rows);
-        }
-        self.raw_quads(rows)
-    }
-}
-
-/// The representations a chunk's rows decode into: owned oxrdf [`Quad`]s,
-/// [`SharedQuad`]s whose terms are shared N-Triples strings, one row each,
-/// or the chunk's rows written as one [`NQuadLines`]. Each pipeline over
-/// chunks (the serve plans, the reads by id, the scan streams) is written
-/// once against this trait for all three.
-pub(crate) trait ChunkDecode: Sized + Send + 'static {
-    /// `chunk`'s rows through `layout`, under
-    /// [`ResolvedLayout::decode_chunk`]'s error convention; a file-backed
-    /// dictionary is a chunk-level error.
-    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>>;
-
-    /// `chunk`'s rows against the file-backed dictionary `fb`: the chunk's
-    /// code columns are read once and decoded in place through the windows
-    /// their codes fall in, or, when those outgrow the window cache or their
-    /// reads would wait, against their distinct codes' terms, read with one
-    /// read of each window holding them.
-    #[cfg(feature = "file-io")]
-    fn decode_file_backed<'a>(
-        fb: &'a FileBackedDict,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>>;
-
-    /// [`decode`](Self::decode), through
-    /// [`decode_file_backed`](Self::decode_file_backed) when the dictionary
-    /// is file-backed: how a file view's chunks decode. Every other layout,
-    /// and a resident dictionary, decodes without suspending.
-    #[cfg(feature = "file-io")]
-    fn decode_async<'a>(
-        layout: &'a ResolvedLayout,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = layout {
-            return Self::decode_file_backed(fb, chunk);
-        }
-        future::ready(Self::decode(layout, chunk)).boxed()
-    }
-
-    /// [`decode_async`](Self::decode_async) where it finishes without
-    /// waiting, for a caller that cannot await (a scan's split task): every
-    /// layout but a file-backed dictionary's, and that one while its window
-    /// reads complete when first polled, as over a mapped file. `None` when
-    /// a read would wait, and without reading once the dictionary's reads
-    /// have had to: the chunk is then `decode_async`'s.
-    #[cfg(feature = "file-io")]
-    fn decode_now(layout: &ResolvedLayout, chunk: &ArrayRef) -> Option<Vec<Result<Self>>> {
-        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = layout {
-            if fb.reads_wait() {
-                return None;
-            }
-            return Self::decode_file_backed(fb, chunk).now_or_never();
-        }
-        Some(Self::decode(layout, chunk))
-    }
-}
-
-impl ChunkDecode for Quad {
-    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
-        layout.decode_chunk(chunk)
-    }
-
-    #[cfg(feature = "file-io")]
-    fn decode_file_backed<'a>(
-        fb: &'a FileBackedDict,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        dictionary::decode_chunk_file_backed(fb, chunk).boxed()
-    }
-}
-
-impl ChunkDecode for NQuadLines {
-    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
-        match layout {
-            ResolvedLayout::Default | ResolvedLayout::TypedObject => {
-                vec![layout.nquad_lines(chunk)]
-            }
-            ResolvedLayout::Dictionary(access) => match access.resident() {
-                Some(dict) => dictionary::decode_chunk_lines(chunk, dict),
-                None => vec![Err(VortexRdfError::Deserialization(
-                    "a file-backed dictionary decodes chunks through the async read path"
-                        .to_string(),
-                ))],
-            },
-        }
-    }
-
-    #[cfg(feature = "file-io")]
-    fn decode_file_backed<'a>(
-        fb: &'a FileBackedDict,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        dictionary::decode_chunk_lines_file_backed(fb, chunk).boxed()
-    }
-}
-
-impl ChunkDecode for SharedQuad {
-    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
-        layout.decode_chunk_shared(chunk)
-    }
-
-    #[cfg(feature = "file-io")]
-    fn decode_file_backed<'a>(
-        fb: &'a FileBackedDict,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        dictionary::decode_chunk_shared_file_backed(fb, chunk).boxed()
-    }
-}
-
-/// A UTF-8 string column read into owned term strings, one per row. The bytes
-/// are taken as UTF-8 unchecked (`StrColReader`): they must come from a Utf8
-/// column of a store this crate wrote or the caller trusts.
-fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String>> {
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let col = field_as::<VarBinViewArray>(struct_arr, name, &mut ctx)?;
-    let reader = StrColReader::new(&col);
-    Ok((0..col.len())
-        .map(|i| reader.str_at(i).to_string())
-        .collect())
-}
-
-/// `term` as a shared string: `run`'s, the term of the row before, when the
-/// two are equal, else a fresh copy, which becomes `run`.
-fn shared_term(run: &mut Option<Arc<str>>, term: &str) -> Arc<str> {
-    if let Some(held) = run
-        && **held == *term
-    {
-        return Arc::clone(held);
-    }
-    let fresh: Arc<str> = Arc::from(term);
-    *run = Some(Arc::clone(&fresh));
-    fresh
-}
-
-/// A UTF-8 string column's terms as shared strings ([`shared_term`]), each
-/// run of equal terms one allocation. Unchecked UTF-8, as
-/// [`read_string_column`] reads.
-fn shared_column(col: &VarBinViewArray) -> Vec<Arc<str>> {
-    let reader = StrColReader::new(col);
-    let mut run = None;
-    (0..col.len())
-        .map(|i| shared_term(&mut run, reader.str_at(i)))
-        .collect()
-}
-
-fn read_code_column(struct_arr: &StructArray, name: &str) -> Result<Vec<TermCode>> {
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let col = field_as::<PrimitiveArray>(struct_arr, name, &mut ctx)?;
-    Ok(col.as_slice::<TermCode>().to_vec())
 }
 
 #[cfg(test)]
