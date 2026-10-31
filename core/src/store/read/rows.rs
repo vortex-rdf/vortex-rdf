@@ -218,12 +218,21 @@ impl VortexRdfStore {
         let Some(memory) = self.quads.in_memory() else {
             return false;
         };
-        let Ok(base) = memory.base.clone().try_downcast::<Struct>() else {
+        let Some(base) = memory.base.as_opt::<Struct>() else {
             return false;
         };
+        // Each code column at its schema position, its name checked rather
+        // than looked up: a base of another shape reads as encoded.
+        let names = base.names();
         QuadColumn::ALL.iter().all(|column| {
-            base.unmasked_field_by_name(column.name())
-                .is_ok_and(crate::store::resident::decodes_once)
+            let k = column.index();
+            names
+                .iter()
+                .nth(k)
+                .is_some_and(|name| name.as_ref() == column.name())
+                && base
+                    .unmasked_field_opt(k)
+                    .is_some_and(crate::store::resident::decodes_once)
         })
     }
 
