@@ -75,18 +75,25 @@ pub enum SelectionKind {
     PendingIndexRun,
 }
 
-/// What a view promises about its rows before they are read, for the order
-/// [`row_chunks`](VortexRdfStore::row_chunks) and
-/// [`code_chunks`](VortexRdfStore::code_chunks) produce: the base's rows in
-/// base row order, whatever answered the match, then the tail's.
+/// What a view promises about its rows before they are read: how many, the
+/// order every read of them follows (a served view's base rows in its
+/// index's order, any other view's in base row order, then the tail's), the
+/// code ranges they lie in, and how the view selects them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewStatistics {
     /// The row count, base and tail, exact or bounded.
     pub rows: RowCountHint,
-    /// The order the view's rows come out in, when it is a known sort:
-    /// `Spog` for a view over a globally sorted base that reads no tail row.
-    /// A view that reads any has none, since the tail's rows follow the
-    /// base's in append order.
+    /// The order the view's rows come out in, when it is a known sort: the
+    /// order every read follows ([`quads`](VortexRdfStore::quads),
+    /// [`row_chunks`](VortexRdfStore::row_chunks),
+    /// [`code_chunks`](VortexRdfStore::code_chunks), the exports). `Posg` for
+    /// a view the `index:posg` copy serves with the object unbound (`?p??`,
+    /// and on file `?p?g`) and for its windows, keeps, partitions and chained
+    /// matches; `Spog` for any other view over a globally sorted base (every
+    /// base this crate writes), a served one's index order being base order
+    /// within its bound terms. A served file view whose index child is not
+    /// globally sorted has none, and neither has a view that reads any tail
+    /// row, since the tail's rows follow the base's in append order.
     pub sort_order: Option<SortOrder>,
     /// Per column (`s`, `p`, `o`, `g`), the inclusive code range the view's
     /// base rows are known to lie in (a pushed-down equality's code, a
@@ -96,8 +103,10 @@ pub struct ViewStatistics {
     pub code_bounds: [Option<(TermCode, TermCode)>; 4],
     /// The shape of the view's selection over its base rows.
     pub selection: SelectionKind,
-    /// The index child that answered the match and decodes
-    /// [`quads`](VortexRdfStore::quads) in its own order, if any.
+    /// The index child that answered the match and serves every read of the
+    /// view, in its own order (see [`sort_order`](Self::sort_order)), if
+    /// any. A window, keep, partition or chained match of a served view is
+    /// served by the same child.
     pub served_component: Option<&'static str>,
     /// Whether a pushed-down file filter is still to be evaluated: then the
     /// row count is a bound, and every read runs the filter. A filter a
@@ -165,7 +174,7 @@ impl VortexRdfStore {
         let base = self.quads.base_rows(|_| true)?;
         Ok(ViewStatistics {
             rows: row_count_hint(base, filtered, tail_rows),
-            sort_order: (self.quads.subject_sorted() && tail_rows == 0).then_some(SortOrder::Spog),
+            sort_order: (tail_rows == 0).then(|| self.quads.read_order()).flatten(),
             code_bounds: self.code_bounds(),
             selection: match evaluated {
                 Some(_) => SelectionKind::Ids,
@@ -249,20 +258,21 @@ impl VortexRdfStore {
     }
 
     /// This view cut into at most `n` views over disjoint, contiguous pieces
-    /// of its base rows, in the view's order, so reading the partitions in
-    /// turn reads the view. A view a by-copy index serves in memory is cut
-    /// in its index's order into served windows of about equal live rows
-    /// ([`served_window_in_memory`](Self::served_window_in_memory)), the tail
-    /// with the last. Any other view is cut in base row order: each keeps the
-    /// view's pushed-down filter and
-    /// tombstones and applies them to its own rows; the append tail goes with
-    /// the last, so over a sorted base every partition but the last keeps the
-    /// `Spog` [`sort_order`](ViewStatistics::sort_order), and the last keeps
-    /// it only when the view reads no tail row. For `n` = 1 the one partition
-    /// is the view itself, its serve plan and pending selection included; for
-    /// a larger `n`, a served match's row ids are read first and no partition
-    /// keeps the serve plan. Pieces are about equal before filtering, not
-    /// after; a view selecting no base row is its own one partition.
+    /// of its rows, in the view's order, so reading the partitions in turn
+    /// reads the view. A view a by-copy index serves (a match, or a window,
+    /// keep or chained match of one) is cut in its index's order into served
+    /// windows of about equal live rows, as [`window`](Self::window) cuts
+    /// one (on file an unlocated run is read once by row index first), the
+    /// tail with the last: every partition keeps the view's
+    /// [`sort_order`](ViewStatistics::sort_order), the last only when the
+    /// view reads no tail row. Any other view is cut in base row order: each
+    /// keeps the view's pushed-down filter and tombstones and applies them to
+    /// its own rows, its pieces about equal before filtering, not after; the
+    /// append tail goes with the last, so over a sorted base every partition
+    /// but the last keeps the `Spog` sort order, and the last keeps it only
+    /// when the view reads no tail row. For `n` = 1 the one partition is the
+    /// view itself, its serve plan and pending selection included; a view
+    /// selecting no base row is its own one partition.
     pub async fn partitions(&self, n: NonZeroUsize) -> Result<Vec<Self>> {
         let n = n.get();
         if n == 1 {
@@ -305,9 +315,10 @@ impl VortexRdfStore {
     /// A view an in-memory plan serves cut into at most `n` served windows
     /// of `ceil(rows / n)` of its live rows each, in its index's order, the
     /// tail with the last; each window a part of the plan's range, or a slice
-    /// of the rows a keep kept, with its row ids kept unsorted, as [`served_window_in_memory`](Self::served_window_in_memory)
-    /// builds one. `None` for a view no in-memory plan serves, or one whose
-    /// base holds no live row.
+    /// of the rows a keep kept, with its row ids kept unsorted, as
+    /// [`served_window_in_memory`](Self::served_window_in_memory) builds one.
+    /// `None` for a view no in-memory plan serves, or one whose base holds no
+    /// live row.
     fn served_partitions(&self, n: usize) -> Result<Option<Vec<Self>>> {
         let Some(memory) = self.quads.in_memory() else {
             return Ok(None);

@@ -1217,3 +1217,63 @@ async fn chained_match_on_an_unnarrowed_view_is_unchanged() {
         );
     }
 }
+
+/// `view_statistics().sort_order` reports the order a served view's reads
+/// follow: `Posg` for `?p2??`, whose object is unbound, and for its window,
+/// keep, partitions and a pattern chained on its window; `Spog` where the
+/// index's order is base order (`?p2 "object 3"`, `??"object 3"`); `None`
+/// once tail rows follow the base's, in both residencies.
+#[tokio::test]
+async fn sort_order_reports_the_reads_order() {
+    let (_memory_dir, memory) = memory_store(LayoutStrategy::Dictionary).await;
+    let (_file_dir, file) = file_store().await;
+    let (p2, o3) = (iri("p2"), plain_literal("object 3"));
+    let order = |view: &VortexRdfStore| view.view_statistics().unwrap().sort_order;
+    for (tag, store) in [("memory", memory), ("file", file)] {
+        let p = matched_view(&store, None, Some(&p2), None, None).await;
+        assert_eq!(served_component(&p), Some("index:posg"), "{tag}");
+        assert_eq!(order(&p), Some(SortOrder::Posg), "{tag} ?p2??");
+        let window = p.window(10, 100).await.unwrap();
+        assert_eq!(order(&window), Some(SortOrder::Posg), "{tag}: its window");
+        let objects = objects_of(&row_list(&p).await);
+        let kept = p
+            .keep(QuadColumn::O, &Keep::set(objects.into_iter().step_by(2)))
+            .await
+            .unwrap();
+        assert_eq!(order(&kept), Some(SortOrder::Posg), "{tag}: its keep");
+        let parts = p
+            .partitions(std::num::NonZeroUsize::new(3).unwrap())
+            .await
+            .unwrap();
+        for part in &parts {
+            assert_eq!(order(part), Some(SortOrder::Posg), "{tag}: a partition");
+        }
+        let chained = window
+            .match_pattern(None, None, None, Some(&GraphName::DefaultGraph))
+            .await
+            .unwrap();
+        assert_eq!(
+            order(&chained),
+            Some(SortOrder::Posg),
+            "{tag}: a chain on its window"
+        );
+        let po = matched_view(&store, None, Some(&p2), Some(&o3), None).await;
+        assert_eq!(served_component(&po), Some("index:posg"), "{tag}");
+        assert_eq!(order(&po), Some(SortOrder::Spog), "{tag} ?p2 o3");
+        let o = matched_view(&store, None, None, Some(&o3), None).await;
+        assert_eq!(served_component(&o), Some("index:ospg"), "{tag}");
+        assert_eq!(order(&o), Some(SortOrder::Spog), "{tag} ??o3");
+        let tailed = store
+            .add_quads(vec![make_quad(
+                "http://example.org/t0",
+                "http://example.org/p2",
+                "tail",
+                GraphName::DefaultGraph,
+            )])
+            .await
+            .unwrap();
+        let p = matched_view(&tailed, None, Some(&p2), None, None).await;
+        assert_eq!(served_component(&p), Some("index:posg"), "{tag}");
+        assert_eq!(order(&p), None, "{tag}: tail rows follow");
+    }
+}

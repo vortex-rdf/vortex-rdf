@@ -33,10 +33,12 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
+use super::copy::CopyFamily;
 use super::{COL_RID, LazyCells};
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
+use crate::store::SortOrder;
 use crate::store::array::into_struct_array;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
@@ -250,6 +252,19 @@ fn collect_kept(
     }
 }
 
+/// The order a plan serving a run of the copy `component` reads in, its
+/// terms binding the object or not: `(p, o, s, g)` for the `index:posg` copy
+/// with the object unbound (`?p??`, `?p?g`); else base order,
+/// `(s, p, o, g)`, which every other served run's order reduces to (its
+/// bound columns lead the copy's sort).
+pub(super) fn served_order(component: &str, object_bound: bool) -> SortOrder {
+    if component == CopyFamily::Posg.identity().name && !object_bound {
+        SortOrder::Posg
+    } else {
+        SortOrder::Spog
+    }
+}
+
 /// An index's serving plan for an in-memory view: the matched rows are the
 /// contiguous run `range` of the index component's own array, bounded by a
 /// binary search over its sorted lead column, so `quads()` slices them from
@@ -262,6 +277,8 @@ pub(crate) struct InMemoryServePlan {
     decode: ServeDecode,
     /// The serving component's name (`index:posg`, `index:ospg`).
     component: &'static str,
+    /// The order the view's reads follow ([`served_order`]).
+    order: SortOrder,
     /// The index component's rows, in child schema.
     array: ArrayRef,
     /// The rows of the component the match resolved: the run.
@@ -287,11 +304,14 @@ pub(crate) struct InMemoryServePlan {
 impl InMemoryServePlan {
     /// A plan serving the contiguous `range` of the rows `array` of the
     /// in-memory index component named `component`, decoded through
-    /// `decode`. `rids` is the run's slice of the component's rid column and
-    /// `cells` the caches of the lazy ids built over it.
+    /// `decode`, its keys binding the object or not (`object_bound`). `rids`
+    /// is the run's slice of the component's rid column and `cells` the
+    /// caches of the lazy ids built over it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         decode: ServeDecode,
         component: &'static str,
+        object_bound: bool,
         array: ArrayRef,
         range: Range<usize>,
         rids: ArrayRef,
@@ -301,6 +321,7 @@ impl InMemoryServePlan {
         Self {
             decode,
             component,
+            order: served_order(component, object_bound),
             array,
             run: range.clone(),
             range,
@@ -313,6 +334,13 @@ impl InMemoryServePlan {
 
     pub(crate) fn component(&self) -> &'static str {
         self.component
+    }
+
+    /// The order the view's reads follow: the component's, `(p, o, s, g)`,
+    /// for an `index:posg` run with the object unbound, else base order (see
+    /// [`served_order`]).
+    pub(crate) fn read_order(&self) -> SortOrder {
+        self.order
     }
 
     /// The rows of the component the view covers: the run, or the part of

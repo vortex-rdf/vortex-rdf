@@ -14,6 +14,7 @@ use super::serve::{InMemoryServePlan, ServeDecode};
 use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::Result;
 use crate::store::layouts::{PatternCodes, TermRef};
+use crate::store::schema::COL_O;
 
 /// What an index probes for a pattern shape it covers: the shared front half
 /// of resolution, chosen by the index's leaf module (`copy::choose`,
@@ -108,6 +109,7 @@ pub(super) fn resolve_in_memory(
         InMemoryServePlan::new(
             decode,
             component.identity.name,
+            probe.keys.iter().any(|&(column, _)| column == COL_O),
             rows.clone().into_array(),
             run,
             rids,

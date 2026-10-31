@@ -15,11 +15,11 @@ tests pin each interface
 
 | What the engine needs | What it calls |
 |---|---|
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L80), [`code_chunks`](../core/src/store/read/chunks.rs#L114) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L155), [`index_components`](../core/src/store/read/metadata.rs#L227), [`partitions`](../core/src/store/read/metadata.rs#L266) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L84), [`code_chunks`](../core/src/store/read/chunks.rs#L120) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L164), [`index_components`](../core/src/store/read/metadata.rs#L236), [`partitions`](../core/src/store/read/metadata.rs#L276) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L144), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L153), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
 | A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L78) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
@@ -27,8 +27,11 @@ tests pin each interface
 ## 1. Rows as columns, without Arrow
 
 Two streams read a view's rows as chunks, lazily (nothing is gathered or
-scanned until the first poll), in base row order, every chunk holding at
-most `batch_rows` rows:
+scanned until the first poll), in the view's order, every chunk holding at
+most `batch_rows` rows: a served view's (a match a `secondary-by-copy`
+index answers, and every window, keep, partition and chained match of one)
+in that index's order, any other view's in base row order. `sort_order` in
+`view_statistics` says which ([§3](#3-what-a-view-promises-before-it-is-read)):
 
 - `row_chunks(batch_rows)` — struct chunks in the layout's primary dtype;
   under a string layout the tail's live rows follow the base.
@@ -48,11 +51,13 @@ by id is taken one window of ids per pulled chunk; the scan reads the file
 split by split, a bounded window of splits in flight ahead of the pulls
 ([§2](#2-which-runtime-a-read-needs)); and a selection small enough for
 point reads is read at once, at the first poll. The scan, and a read by id
-with no filter pending, read only the requested columns. A served match's
-chunks come in base row order, never the index's: `code_chunks` reads a
-file view's located run of at most 16 chunks, its row ids still pending,
-off the index's own columns and sorts it into base order; any other served
-match materializes its row ids at the first poll.
+with no filter pending, read only the requested columns. A served view's
+chunks come in its index's order, and its row ids are never sorted: in
+memory they are gathered off the base at the run's row ids, one window of
+ids per chunk; on file they are the index child's own chunks (its located
+range, its kept rows' positions, or its filtered scan), except a
+TypedObject store's `row_chunks`, taken from the base a window of ids at a
+time.
 
 `code_columns_gathered` is the one-shot form, for a match the caller has
 counted and will consume whole: one call answers all four columns,
@@ -74,7 +79,7 @@ Two calls let a binding build its own chunked read of a pattern:
 [`code_probe`](../core/src/store/query/located.rs#L131) turns a `CodePattern` into
 the `Probe` that `match_code_pattern` runs when no located run answers it
 (`None` when no quad can match), for `run_probe` and then `code_chunks`;
-and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L141) decodes one of
+and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L147) decodes one of
 a string layout's `row_chunks` into `SharedQuad`s, each distinct term of the
 chunk once, as `shared_quads_vec` decodes it (a Dictionary store's chunks
 hold codes, which `dict_reader` decodes). Java's `matchCodeChunks` is built
@@ -144,10 +149,10 @@ is the one way it fails.
 | Field | Meaning |
 |---|---|
 | `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones; a filter a window has evaluated, finding it cuts no row, counts as none. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
-| `sort_order` | `Some(Spog)` when the base is globally sorted (every base this crate writes) and the view reads no tail row — the order `row_chunks` and `code_chunks` produce, whatever answered the match. A view that reads tail rows has none: they follow the base in append order. |
+| `sort_order` | The order every read of the view follows (`quads`, `row_chunks`, `code_chunks`, the exports), when it is a known sort and the view reads no tail row. `Some(Posg)` for a view the `index:posg` copy serves with the object unbound (`?p??`, and on file `?p?g`) and for its windows, keeps, partitions and chained matches; `Some(Spog)` for any other view over a globally sorted base (every base this crate writes), a served one's index order being base order within its bound terms. `None` for a view that reads tail rows (they follow the base in append order) and for a served file view whose index child is not globally sorted. |
 | `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a file view's pushed-down filter binds by equality, while the view still carries the filter (pending, or evaluated by a window that kept its masks). |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |
-| `served_component` | The index child that answered the match, if any (`index:posg`, …; `quads()` on such a view decodes in that child's order, and `code_columns_gathered` reads its codes in it). |
+| `served_component` | The index child that answered the match, if any (`index:posg`, …): every read of the view, and of its windows, keeps, partitions and chained matches, follows that child's order. |
 | `pending_filter` | Whether every read runs a pushed-down file filter. A filter a window has evaluated over every row, finding it cuts none, is not pending: its matches are counted exactly and read without running it again, and the view's selection reads as `Ids`. |
 | `tombstones`, `tail_rows` | Rows tombstoned in the base (never counted) and live rows in the append tail (counted, read last). |
 | `file_backed`, `generation` | Where the base lives, and the data's identity ([§5](#5-snapshots-and-mutation)). |
@@ -162,16 +167,17 @@ backends differ: in memory the view holds no children and lists none; on
 file it lists the file's children, as every file view does.
 
 `partitions(n)` cuts a view into at most `n` views over disjoint,
-contiguous pieces of its base rows, in base order: reading them in turn
-reads the view, and each applies the view's filter and tombstones to its own
-rows only. For `n` = 1 the one partition is the view itself, its serve plan
-and pending selection included. For a larger `n`, a served match's row ids
-are read first and no partition keeps the serve plan. The append tail rides
-with the last partition, so over a sorted base every partition but the last
-keeps the `Spog` order, and the last keeps it only when the view reads no
-tail row. Sizes are about equal *before* filtering; a view selecting no base
-row is its own one partition. Each partition is an ordinary view, so an
-engine reads one per worker through its chunk streams.
+contiguous pieces of its rows, in the view's order: reading them in turn
+reads the view. A served view is cut in its index's order into served
+windows of about equal live rows, each keeping the view's `sort_order`.
+Any other view is cut in base order, each partition applying the view's
+filter and tombstones to its own rows only, its size about equal *before*
+filtering. For `n` = 1 the one partition is the view itself, its serve plan
+and pending selection included. The append tail rides with the last
+partition, so every partition but the last keeps the view's order, and the
+last keeps it only when the view reads no tail row; a view selecting no
+base row is its own one partition. Each partition is an ordinary view, so
+an engine reads one per worker through its chunk streams.
 
 ## 4. Narrowing natively
 

@@ -168,15 +168,13 @@ async fn slicing_views(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfSt
 /// Windows and capped counts of every view agree with slicing its rows in
 /// the order its one-shot read takes them: a served view's in its index's
 /// order, which on a store with the copy index is not always base order,
-/// any other's in base order. A window of an in-memory served view stays
-/// served, and so does a file view's over a run the index located; a window
-/// that drops the plan (of an unlocated file run) reads base order.
+/// any other's in base order. A window of a served view stays served, in
+/// memory and on file (an unlocated file run read once by row index first).
 async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
     let views = slicing_views(store).await;
     let plain_views = slicing_views(store).await;
     let mut index_ordered = 0;
     for ((view_tag, view), (_, plain)) in views.iter().zip(&plain_views) {
-        let file = view.view_statistics().unwrap().file_backed;
         let rows = row_list(plain).await;
         let base_rows = base_ordered_codes(view).await;
         let n = rows.len();
@@ -204,10 +202,10 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
             } else {
                 slice(&base_rows)
             };
-            if !file && served_component(plain).is_some() && !want.is_empty() {
+            if served_component(plain).is_some() && !want.is_empty() {
                 assert!(
                     stays_served,
-                    "{tag}/{view_tag}: window({offset}, {limit}) of an in-memory served view"
+                    "{tag}/{view_tag}: window({offset}, {limit}) of a served view"
                 );
             }
             let read = if stays_served {
@@ -810,9 +808,9 @@ async fn test_window_that_cannot_cut_is_the_plain_view() {
 /// A window that cuts rows (one row short of the match, or past its first
 /// row) slices the plain match's rows in the order the match reads them: a
 /// served match's window stays served, in its index's order, in memory and
-/// over a file run the index located; any other (an unlocated file run's
-/// among them) is a position range over base order with no serve plan. On
-/// every store and every shape with two rows to cut between.
+/// on file (an unlocated file run read once by row index first); any other
+/// is a position range over base order with no serve plan. On every store
+/// and every shape with two rows to cut between.
 #[tokio::test]
 async fn test_window_that_cuts_slices_the_match_order() {
     let stores = window_stores().await;
@@ -843,8 +841,8 @@ async fn test_window_that_cuts_slices_the_match_order() {
                     assert_eq!(served_component(&windowed), component, "{label}: the plan");
                 } else {
                     assert!(
-                        component.is_none() || file,
-                        "{label} ({offset}, {limit}): an in-memory window keeps the plan"
+                        component.is_none(),
+                        "{label} ({offset}, {limit}): a served match's window keeps the plan"
                     );
                 }
                 served_windows += usize::from(stays_served);

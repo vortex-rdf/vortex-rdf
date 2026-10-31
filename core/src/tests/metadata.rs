@@ -183,6 +183,17 @@ async fn test_generation_and_dictionary_identity() {
     }
 }
 
+/// The order a view of [`views_of`] named `name` reads in: the `index:posg`
+/// copy's for the `?p1??` match it serves, whose object is unbound; base
+/// order for every other view (a served one's index order is base order).
+fn read_order(name: &str, stats: &crate::store::ViewStatistics) -> SortOrder {
+    if name == "predicate" && stats.served_component == Some("index:posg") {
+        SortOrder::Posg
+    } else {
+        SortOrder::Spog
+    }
+}
+
 /// `view`'s row count hint against its size: a bound the size stays within,
 /// and the size itself wherever it is exact.
 async fn assert_rows_bound(view: &VortexRdfStore, stats: &crate::store::ViewStatistics, tag: &str) {
@@ -220,7 +231,7 @@ async fn test_view_statistics_in_memory() {
                 RowCountHint::exact(view.size().await.unwrap()),
                 "{tag}"
             );
-            assert_eq!(stats.sort_order, Some(SortOrder::Spog), "{tag}");
+            assert_eq!(stats.sort_order, Some(read_order(name, &stats)), "{tag}");
             assert_eq!(stats.tombstones, tombstones, "{tag}");
             assert!(!stats.pending_filter && !stats.file_backed, "{tag}");
             assert_eq!(stats.tail_rows, 0, "{tag}");
@@ -320,7 +331,7 @@ async fn test_view_statistics_file_backed() {
                     );
                 }
                 assert_eq!(stats.file_backed, mapped, "{tag}");
-                assert_eq!(stats.sort_order, Some(SortOrder::Spog), "{tag}");
+                assert_eq!(stats.sort_order, Some(read_order(name, &stats)), "{tag}");
                 assert_eq!(stats.tombstones, tombstones, "{tag}");
                 assert_eq!(stats.generation, base.generation(), "{tag}");
             }

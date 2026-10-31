@@ -32,6 +32,7 @@ use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds}
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
+use crate::store::SortOrder;
 use crate::store::layouts::{ChunkDecode, PatternCodes, ResolvedLayout};
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
@@ -40,7 +41,7 @@ use crate::store::read::chunks::extract_codes;
 use crate::store::scan::file_exprs::eq_conjunction;
 use crate::store::scan::file_reads::{component_point_chunk, component_point_rows, values_at};
 use crate::store::scan::file_scans::{read_all_rows, stream_rows};
-use crate::store::schema::{RowId, TermCode};
+use crate::store::schema::{COL_O, RowId, TermCode};
 use crate::store::view::selection::point_sized;
 
 /// The `[lo, hi)` run of a sorted component column's rows equal to `native`,
@@ -694,6 +695,17 @@ impl FileServePlan {
 
     pub(crate) fn component(&self) -> &'static str {
         self.child.name
+    }
+
+    /// The order the view's reads follow, the child's: `(p, o, s, g)` for
+    /// an `index:posg` run whose terms leave the object unbound, else base
+    /// order (see [`served_order`](super::serve::served_order)). `None` for
+    /// a child whose rows are not globally sorted, read in its own order.
+    pub(crate) fn read_order(&self) -> Option<SortOrder> {
+        let object_bound = self.constraints.iter().any(|&(column, _)| column == COL_O);
+        self.child
+            .sorted
+            .then(|| super::serve::served_order(self.child.name, object_bound))
     }
 
     /// The located child-row range the constraints select, when known.

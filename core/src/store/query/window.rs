@@ -44,12 +44,14 @@ impl VortexRdfStore {
     /// is read once by row index first, kept on the view for every narrowing
     /// of it, and windowed whether or not the limit cuts. Any other window is
     /// a position range over base order: base rows in base row order, then
-    /// the tail's, with no serve plan. A pending file filter is resolved only
-    /// as far as the window reaches (its splits evaluated in file order,
-    /// stopping at the first that fills the window), so `LIMIT` over a
-    /// filtered scan costs the matching prefix of the file. A window with no `offset` whose filter matches fewer rows
-    /// than its limit finds that it cuts no base row: the view keeps its rows,
-    /// known exactly from then on, its reads and counts taking them from the
+    /// the tail's, with no serve plan. Either order is the same on every
+    /// call, so paging by repeated windows reads each row once. A pending
+    /// file filter is resolved only as far as the window reaches (its splits
+    /// evaluated in file order, stopping at the first that fills the window),
+    /// so `LIMIT` over a filtered scan costs the matching prefix of the file.
+    /// A window with no `offset` whose filter matches fewer rows than its
+    /// limit finds that it cuts no base row: the view keeps its rows, known
+    /// exactly from then on, its reads and counts taking them from the
     /// filter's evaluation, which is never run again, and its tail is
     /// windowed to the rest of the limit.
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {

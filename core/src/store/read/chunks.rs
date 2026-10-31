@@ -4,21 +4,25 @@
 //! ([`code_chunks`](VortexRdfStore::code_chunks)).
 //!
 //! Chunks hold at most `batch_rows` rows with the view's narrowing and
-//! tombstones applied, in the view's order: a served in-memory view's in its
-//! index's order, as [`quads`](VortexRdfStore::quads) reads it, gathered off
-//! the base at the run's row ids, one window of them per chunk, the ids never
-//! sorted; any other view's in base row order (a served file view's row ids
-//! sorted into it first). Under a string layout the tail's live rows follow
-//! the base, as `quads` orders them. Nothing is read until the first poll. In
-//! memory a contiguous selection without tombstones is sliced from the base,
-//! and any other is cut into windows of live ids, each gathered when its
-//! chunk is pulled. On file a selection `ExactRead` takes by id is taken one window of
-//! ids per pull; a pending filter it leaves to the masks is evaluated a split
-//! at a time as the stream reaches the split, only the requested columns read
-//! at the rows the split's mask keeps; any other read goes through the one
-//! base-row seam (`base_read`): the few rows `ExactRead` reads point by
-//! point, read at once, or the scan's chunks, streamed through the row-scan
-//! driver.
+//! tombstones applied, in the view's order: a served view's (a by-copy
+//! index's match, or a window, keep, partition or chained match of one) in
+//! its index's order, as [`quads`](VortexRdfStore::quads) reads it, its row
+//! ids never sorted; any other view's in base row order. A served in-memory
+//! view's chunks are gathered off the base at the run's row ids, one window
+//! of them per chunk; a served file view's are the index child's own chunks
+//! (its located range, its kept rows, or its filtered scan), except
+//! TypedObject's rows, taken from the base a window of ids at a time. Under a
+//! string layout the tail's live rows follow the base, as `quads` orders
+//! them. Nothing is read until the first poll. In memory an unserved
+//! contiguous selection without tombstones is sliced from the base, and any
+//! other is cut into windows of live ids, each gathered when its chunk is
+//! pulled. On file a selection `ExactRead` takes by id is taken one window
+//! of ids per pull; a pending filter it leaves to the masks is evaluated a
+//! split at a time as the stream reaches the split, only the requested
+//! columns read at the rows the split's mask keeps; any other read goes
+//! through the one base-row seam (`base_read`): the few rows `ExactRead`
+//! reads point by point, read at once, or the scan's chunks, streamed
+//! through the row-scan driver.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -65,9 +69,9 @@ pub type CodeChunkStream = BoxStream<'static, Result<Vec<Buffer<TermCode>>>>;
 impl VortexRdfStore {
     /// The rows this view selects as struct chunks in the layout's primary
     /// dtype ([`TermCode`] columns under the Dictionary layout, strings
-    /// otherwise), in the view's order (a served in-memory view's in its
-    /// index's order, any other in base row order: see the [module
-    /// docs](self)), each of at most `batch_rows` rows (a
+    /// otherwise), in the view's order (a served view's in its index's
+    /// order, any other in base row order: see the [module docs](self)),
+    /// each of at most `batch_rows` rows (a
     /// file view read split by split, scanned or by its filter's masks, has
     /// its chunks follow the splits, cut to the cap).
     /// Tombstoned rows are skipped; under a string layout the tail's live
@@ -101,8 +105,10 @@ impl VortexRdfStore {
     /// other has only `columns` gathered, one window of live ids per chunk (a
     /// served view's ids in its index's order);
     /// columns the cache cannot hand out (chunked or wire-encoded) are read
-    /// as row chunks and decoded chunk by chunk. On file a selection taken by
-    /// id is taken one chunk's ids per pull, and a pending filter the reads
+    /// as row chunks and decoded chunk by chunk. On file a served view's
+    /// codes are its index child's chunks, cut to the cap; any other
+    /// selection taken by id is taken one chunk's ids per pull, and a pending
+    /// filter the reads
     /// by id leave to the scan is read by its masks first, a split at a time
     /// as the stream reaches it. The masked reads and the scan read only
     /// `columns` at the rows they keep (a pending filter's columns are read
