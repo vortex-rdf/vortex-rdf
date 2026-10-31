@@ -49,7 +49,7 @@ pub(crate) use components::{
 };
 #[cfg(feature = "file-io")]
 pub(crate) use file::{FileServePlan, read_located_rids, scan_index_row_ids};
-pub(crate) use serve::{InMemoryServePlan, ServedRows};
+pub(crate) use serve::{ComponentRows, InMemoryServePlan, ServedRows};
 
 /// The primary-row-id column every persisted index child carries beside its
 /// own columns: the currency every resolution answers in, and the one column

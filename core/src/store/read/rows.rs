@@ -198,6 +198,26 @@ impl VortexRdfStore {
         ])
     }
 
+    /// Whether every base code column of an in-memory view keeps its decode
+    /// once made ([`decodes_once`](crate::store::resident::decodes_once)),
+    /// so a gather at the view's scattered ids decodes nothing twice: a
+    /// built store's. `false` for a store read off a file or adopted from
+    /// bytes, whose encoded columns every take decodes again, and on file.
+    pub(in crate::store) fn base_codes_decode_once(&self) -> bool {
+        use vortex_array::arrays::Struct;
+
+        let Some(memory) = self.quads.in_memory() else {
+            return false;
+        };
+        let Ok(base) = memory.base.clone().try_downcast::<Struct>() else {
+            return false;
+        };
+        QuadColumn::ALL.iter().all(|column| {
+            base.unmasked_field_by_name(column.name())
+                .is_ok_and(crate::store::resident::decodes_once)
+        })
+    }
+
     /// The base's `column` code column as a canonical primitive, as
     /// [`base_code_primitives`](Self::base_code_primitives) reads each of
     /// the four: a builder-compressed column is decoded into its own shared

@@ -15,7 +15,7 @@ tests pin each interface
 
 | What the engine needs | What it calls |
 |---|---|
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L84), [`code_chunks`](../core/src/store/read/chunks.rs#L120) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L87), [`code_chunks`](../core/src/store/read/chunks.rs#L123) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L166), [`index_components`](../core/src/store/read/metadata.rs#L238), [`partitions`](../core/src/store/read/metadata.rs#L278) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
@@ -54,7 +54,10 @@ point reads is read at once, at the first poll. The scan, and a read by id
 with no filter pending, read only the requested columns. A served view's
 chunks come in its index's order, and its row ids are never sorted: in
 memory they are gathered off the base at the run's row ids, one window of
-ids per chunk; on file they are the index child's own chunks (its located
+ids per chunk, or, over a Dictionary base whose columns stay encoded (a
+store read off a file or adopted from bytes, which every take decodes
+again), read off the index component, a window of the run's live rows per
+chunk; on file they are the index child's own chunks (its located
 range, its kept rows' positions, or its filtered scan), except a
 TypedObject store's `row_chunks`, taken from the base a window of ids at a
 time.
@@ -79,7 +82,7 @@ Two calls let a binding build its own chunked read of a pattern:
 [`code_probe`](../core/src/store/query/located.rs#L131) turns a `CodePattern` into
 the `Probe` that `match_code_pattern` runs when no located run answers it
 (`None` when no quad can match), for `run_probe` and then `code_chunks`;
-and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L147) decodes one of
+and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L150) decodes one of
 a string layout's `row_chunks` into `SharedQuad`s, each distinct term of the
 chunk once, as `shared_quads_vec` decodes it (a Dictionary store's chunks
 hold codes, which `dict_reader` decodes). Java's `matchCodeChunks` is built

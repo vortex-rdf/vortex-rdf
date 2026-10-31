@@ -259,6 +259,25 @@ fn collect_kept(
     }
 }
 
+/// A served in-memory view's live rows in its component, as a stream reads
+/// them ([`InMemoryServePlan::live_component_rows`]).
+pub(crate) enum ComponentRows {
+    /// A run of the component with nothing kept or tombstoned.
+    Range(Range<usize>),
+    /// The live rows' positions in the component, in its order.
+    Positions(Buffer<u64>),
+}
+
+impl ComponentRows {
+    /// How many rows.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ComponentRows::Range(range) => range.len(),
+            ComponentRows::Positions(positions) => positions.len(),
+        }
+    }
+}
+
 /// The order a plan serving a run of the copy `component` reads in, its
 /// terms binding the object or not: `(p, o, s, g)` for the `index:posg` copy
 /// with the object unbound (`?p??`, `?p?g`); else base order,
@@ -640,6 +659,65 @@ impl InMemoryServePlan {
             Ok(rows) => self.decode.decode_columns(&rows, deleted),
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
         }
+    }
+
+    /// Whether the plan's decode reads codes off the component (the
+    /// Dictionary layout's copies hold codes; the string layouts', terms).
+    pub(crate) fn decodes_codes(&self) -> bool {
+        matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_))
+    }
+
+    /// The view's live rows in the component, in its order, as a stream reads
+    /// them a window at a time ([`window_rows`](Self::window_rows)): the
+    /// range, read by slices, when it keeps no rows and nothing is
+    /// tombstoned; else the live rows' positions, read by takes.
+    pub(crate) fn live_component_rows(&self, deleted: Option<&Mask>) -> Result<ComponentRows> {
+        Ok(match (&self.kept, deleted) {
+            (None, None) => ComponentRows::Range(self.range.clone()),
+            (Some(kept), deleted) => ComponentRows::Positions(kept.live(deleted).positions),
+            (None, Some(deleted)) => ComponentRows::Positions(
+                self.live_rows(Some(deleted))?
+                    .0
+                    .into_iter()
+                    .map(|position| position as u64)
+                    .collect(),
+            ),
+        })
+    }
+
+    /// The view's live rows `window` (positions in `rows`, as
+    /// [`live_component_rows`](Self::live_component_rows) lists them) off
+    /// the component's own columns, as a primary-named `(s, p, o, g)`
+    /// struct: a slice of the run, or one take at their positions. What a
+    /// served stream reads a chunk at a time when the base's columns are
+    /// encoded, where a gather at the view's ids, in the index's order,
+    /// would decode them out of order.
+    pub(crate) fn window_rows(
+        &self,
+        rows: &ComponentRows,
+        window: Range<usize>,
+    ) -> Result<ArrayRef> {
+        observe!(ServedComponentChunk(window.len()));
+        let chunk = match rows {
+            ComponentRows::Range(range) => self
+                .array
+                .slice(range.start + window.start..range.start + window.end)?,
+            ComponentRows::Positions(positions) => self.array.take(
+                PrimitiveArray::new(positions.slice(window), Validity::NonNullable).into_array(),
+            )?,
+        };
+        self.decode.chunk_rows(&chunk, None)
+    }
+
+    /// [`window_rows`](Self::window_rows) as the four code columns, under
+    /// the Dictionary layout ([`decodes_codes`](Self::decodes_codes)).
+    pub(crate) fn window_code_columns(
+        &self,
+        rows: &ComponentRows,
+        window: Range<usize>,
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        let chunk = self.window_rows(rows, window)?;
+        self.decode.chunk_code_columns(&chunk, None)
     }
 
     /// The component's rows at the kept rows' live positions, in their

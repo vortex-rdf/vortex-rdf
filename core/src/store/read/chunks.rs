@@ -9,7 +9,10 @@
 //! its index's order, as [`quads`](VortexRdfStore::quads) reads it, its row
 //! ids never sorted; any other view's in base row order. A served in-memory
 //! view's chunks are gathered off the base at the run's row ids, one window
-//! of them per chunk; a served file view's are the index child's own chunks
+//! of them per chunk, or, over a Dictionary base whose columns stay encoded
+//! (a store read off a file or adopted from bytes, which every take decodes
+//! again), read off the index component, a window of the run's live rows per
+//! chunk; a served file view's are the index child's own chunks
 //! (its located range, its kept rows, or its filtered scan), except
 //! TypedObject's rows, taken from the base a window of ids at a time. Under a
 //! string layout the tail's live rows follow the base, as `quads` orders
@@ -44,7 +47,7 @@ use crate::store::MemoryBase;
 use crate::store::array::{field_as, into_struct_array, rechunk};
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
-use crate::store::indexes::InMemoryServePlan;
+use crate::store::indexes::{ComponentRows, InMemoryServePlan};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::read::file_plan::StreamedPlan;
@@ -277,6 +280,18 @@ impl VortexRdfStore {
             return Ok(None);
         };
         let Some((all, asked)) = self.base_code_sources(columns) else {
+            // The base's code columns encoded (a store read off a file): each
+            // chunk off the component, not gathered out of order.
+            if plan.decodes_codes() {
+                observe!(ServedRunChunks);
+                let rows = plan.live_component_rows(self.quads.deleted.as_ref())?;
+                return Ok(Some(component_code_chunks(
+                    plan.clone(),
+                    rows,
+                    columns,
+                    batch_rows,
+                )));
+            }
             let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
             return Ok(self
                 .served_rows(&names, batch_rows)?
@@ -331,6 +346,13 @@ impl VortexRdfStore {
         let Some((memory, plan)) = self.served_memory_plan() else {
             return Ok(None);
         };
+        // The base's code columns encoded (a store read off a file): each
+        // chunk off the component, not gathered out of order.
+        if plan.decodes_codes() && !self.base_codes_decode_once() {
+            observe!(ServedRunChunks);
+            let rows = plan.live_component_rows(self.quads.deleted.as_ref())?;
+            return Ok(Some(component_row_chunks(plan.clone(), rows, batch_rows)));
+        }
         let ids = plan.live_rids(self.quads.deleted.as_ref())?;
         let base = projected(&memory.base, columns)?;
         let probes = Arc::clone(&memory.probes);
@@ -628,6 +650,40 @@ fn code_slices(
             Ok(picked.iter().map(|&k| codes[k].slice(start..end)).collect())
         })
         .collect()
+}
+
+/// A served in-memory view's code chunks of `columns`, each window of
+/// `batch_rows` of its live `rows` read off its index component when pulled
+/// ([`InMemoryServePlan::window_code_columns`]).
+fn component_code_chunks(
+    plan: InMemoryServePlan,
+    rows: ComponentRows,
+    columns: &[QuadColumn],
+    batch_rows: usize,
+) -> CodeChunkStream {
+    let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
+    let len = rows.len();
+    stream::iter((0..len).step_by(batch_rows))
+        .map(move |start| {
+            let window = start..start.saturating_add(batch_rows).min(len);
+            plan.window_code_columns(&rows, window)
+                .map(|codes| picked.iter().map(|&k| codes[k].clone()).collect())
+        })
+        .boxed()
+}
+
+/// A served in-memory view's row chunks, each window of `batch_rows` of its
+/// live `rows` read off its index component when pulled
+/// ([`InMemoryServePlan::window_rows`]).
+fn component_row_chunks(
+    plan: InMemoryServePlan,
+    rows: ComponentRows,
+    batch_rows: usize,
+) -> RowChunkStream {
+    let len = rows.len();
+    stream::iter((0..len).step_by(batch_rows))
+        .map(move |start| plan.window_rows(&rows, start..start.saturating_add(batch_rows).min(len)))
+        .boxed()
 }
 
 /// Code chunks of `columns`, one per window of base row ids, each gathered

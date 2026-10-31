@@ -202,18 +202,32 @@ async fn memory_export_follows_index_order() {
 }
 
 /// A served view's run ids decode once however many clones stream it (every
-/// chunk stream reads a clone of its view), and no stream sorts them.
+/// chunk stream reads a clone of its view), and no stream sorts them: on a
+/// built store, whose streams gather the base at the ids. A store read off a
+/// file streams off the component and decodes them never.
 #[tokio::test]
 async fn run_ids_decode_once_across_clones() {
-    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
-    let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
-    let rec = Recorder::start();
-    for _ in 0..2 {
-        collect_code_chunks(&p.clone(), &QuadColumn::ALL, 64).await;
-        collect_row_chunks(&p.clone(), 64).await;
+    let built = built_store(
+        modular_quads(20_000, 7, 11),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let (_dir, read) = memory_store(LayoutStrategy::Dictionary).await;
+    for (tag, store, decodes) in [("built", built, 1), ("read off a file", read, 0)] {
+        let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+        let rec = Recorder::start();
+        for _ in 0..2 {
+            collect_code_chunks(&p.clone(), &QuadColumn::ALL, 64).await;
+            collect_row_chunks(&p.clone(), 64).await;
+        }
+        assert_eq!(
+            rec.count_where(|e| matches!(e, Event::RidsDecoded(_))),
+            decodes,
+            "{tag}"
+        );
+        assert_eq!(ids_sorted(&rec), 0, "{tag}");
     }
-    assert_eq!(rec.count_where(|e| matches!(e, Event::RidsDecoded(_))), 1);
-    assert_eq!(ids_sorted(&rec), 0);
 }
 
 /// The `?p2??` view of `store` and its rows in the index's order.
@@ -1504,4 +1518,93 @@ async fn narrowed_residual_file_views_count_without_sorting() {
         assert!(narrowed.exists().await.unwrap(), "{tag}: exists");
         assert_eq!(ids_sorted(&rec), 0, "{tag}: the counts sort no ids");
     }
+}
+
+/// An in-memory store read off a file keeps its columns encoded, so its
+/// base cannot hand out code primitives, and a gather at a served run's ids,
+/// in the index's order, would decode them out of order. Its served code and
+/// row streams read each chunk off the index component instead (a slice of
+/// the run, or a take at its live rows), chunks exactly `batch_rows` long but
+/// the last, in the index's order, for a plain view, a window, a keep and
+/// under tombstones. A built store, whose code columns its shared cache hands
+/// out, keeps gathering the base.
+#[tokio::test]
+async fn encoded_memory_streams_read_off_the_component() {
+    let component_rows = |rec: &Recorder| {
+        rec.picked(|e| match e {
+            Event::ServedComponentChunk(rows) => Some(*rows),
+            _ => None,
+        })
+    };
+    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
+    let p2 = iri("p2");
+    let p = matched_view(&store, None, Some(&p2), None, None).await;
+    let want = posg(base_ordered_codes(&p).await);
+    let doomed: Vec<Quad> = p
+        .quads_vec()
+        .await
+        .unwrap()
+        .into_iter()
+        .step_by(7)
+        .collect();
+    let tombstoned = delete_all(&store, &doomed).await;
+    let t = matched_view(&tombstoned, None, Some(&p2), None, None).await;
+    let t_want = posg(base_ordered_codes(&t).await);
+    let window = p.window(100, 1_000).await.unwrap();
+    let kept = p
+        .keep(
+            QuadColumn::O,
+            &Keep::set(objects_of(&want).into_iter().step_by(2)),
+        )
+        .await
+        .unwrap();
+    let mut views = vec![
+        ("plain", p.clone(), want.clone()),
+        ("tombstoned", t, t_want),
+        ("window", window, slice_of(&want, 100, 1_000)),
+    ];
+    let kept_want = row_list(&kept).await;
+    views.push(("keep", kept, kept_want));
+    for (tag, view, want) in views {
+        assert!(served_component(&view).is_some(), "{tag}: served");
+        let rec = Recorder::start();
+        let (rows, sizes) = collect_code_chunks(&view, &QuadColumn::ALL, 64).await;
+        assert_eq!(rows, want, "{tag}: code chunks in the index's order");
+        assert!(
+            sizes[..sizes.len() - 1].iter().all(|&n| n == 64),
+            "{tag}: code chunks of exactly 64 rows but the last: {sizes:?}"
+        );
+        assert_eq!(
+            component_rows(&rec),
+            sizes,
+            "{tag}: each code chunk off the component"
+        );
+        let rec = Recorder::start();
+        let chunks = collect_row_chunks(&view, 256).await;
+        assert_eq!(struct_chunk_codes(&chunks), want, "{tag}: row chunks");
+        let lens: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+        assert_eq!(
+            component_rows(&rec),
+            lens,
+            "{tag}: each row chunk off the component"
+        );
+    }
+    // A built store's code columns come from its shared cache: no chunk off
+    // the component.
+    let built = built_store(
+        modular_quads(20_000, 7, 11),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let p = matched_view(&built, None, Some(&p2), None, None).await;
+    let rec = Recorder::start();
+    assert_eq!(
+        collect_code_chunks(&p, &QuadColumn::ALL, 64).await.0,
+        posg(base_ordered_codes(&p).await)
+    );
+    assert!(
+        component_rows(&rec).is_empty(),
+        "a built store gathers its base"
+    );
 }

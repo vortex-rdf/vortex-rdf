@@ -97,6 +97,10 @@ pub(crate) enum Event {
     /// buffers: the index child's columns read (those its terms do not pin,
     /// the row id only under tombstones).
     ServedCodesRead(Vec<&'static str>),
+    /// A served in-memory view's chunk read off its index component (a slice
+    /// of its run, or a take at its live rows), the base's code columns being
+    /// encoded (a store read off a file), this many rows.
+    ServedComponentChunk(usize),
     /// A code-chunk stream read off its serving index's located run.
     ServedRunChunks,
     /// A served file run its index did not locate read once by row index,
