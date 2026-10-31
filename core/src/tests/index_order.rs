@@ -1352,3 +1352,78 @@ async fn point_sized_served_runs_read_only_their_unpinned_codes() {
         }
     }
 }
+
+/// A served file view that keeps a residual term as a filter beside its plan
+/// (`?p2?g`, the graph a residual) narrows to rows that all pass it, so its
+/// window, keep, partition and chained match carry it resolved: their counts
+/// take the narrowed rows' width, sorting no ids, and their statistics are
+/// exact, with no filter pending.
+#[tokio::test]
+async fn narrowed_residual_file_views_count_without_sorting() {
+    // Every third quad in a named graph: the default graph is a residual
+    // that keeps rows of the predicate's run, not all of them.
+    let quads: Vec<Quad> = modular_quads(5_000, 7, 11)
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut quad)| {
+            if i % 3 == 0 {
+                quad.graph_name = iri_graph("g1");
+            }
+            quad
+        })
+        .collect();
+    let (_dir, path) = write_store_file(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let (p2, default) = (iri("p2"), GraphName::DefaultGraph);
+    let view = matched_view(&store, None, Some(&p2), None, Some(&default)).await;
+    assert!(served_component(&view).is_some(), "served");
+    let rows = row_list(&view).await;
+    let n = rows.len();
+    assert!(n > 100, "a run to narrow");
+    let window = view.window(10, 100).await.unwrap();
+    let kept = view
+        .keep(
+            QuadColumn::O,
+            &Keep::set(objects_of(&rows).into_iter().step_by(2)),
+        )
+        .await
+        .unwrap();
+    let part = view
+        .partitions(std::num::NonZeroUsize::new(3).unwrap())
+        .await
+        .unwrap()
+        .swap_remove(1);
+    // An object the window holds.
+    let object = window.quads_vec().await.unwrap()[50].object.clone();
+    let chained = window
+        .match_pattern(None, None, Some(&object), None)
+        .await
+        .unwrap();
+    for (tag, narrowed) in [
+        ("window", window),
+        ("keep", kept),
+        ("partition", part),
+        ("chain", chained),
+    ] {
+        assert!(served_component(&narrowed).is_some(), "{tag}: served");
+        let want = row_list(&narrowed).await.len();
+        assert!(want > 0, "{tag}: rows to count");
+        let stats = narrowed.view_statistics().unwrap();
+        assert!(!stats.pending_filter, "{tag}: no filter pending");
+        assert_eq!(stats.rows.exact, Some(want), "{tag}: an exact count");
+        let rec = Recorder::start();
+        assert_eq!(narrowed.size().await.unwrap(), want, "{tag}: size");
+        assert_eq!(
+            narrowed.size_capped(want / 2).await.unwrap(),
+            want / 2,
+            "{tag}: size_capped"
+        );
+        assert!(narrowed.exists().await.unwrap(), "{tag}: exists");
+        assert_eq!(ids_sorted(&rec), 0, "{tag}: the counts sort no ids");
+    }
+}

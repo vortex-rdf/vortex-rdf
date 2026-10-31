@@ -280,12 +280,17 @@ impl VortexRdfStore {
             .as_ref()
             .map_or(0, |(_, ids)| ids.len_if_known().unwrap_or(0));
         let quads = match window {
-            Some((narrowed, ids)) => self.quads.file_with(
-                base,
-                base.filter.clone(),
-                ViewSelection::pending(ids),
-                Some(narrowed),
-            ),
+            Some((narrowed, ids)) => self
+                .quads
+                .file_with(
+                    base,
+                    base.filter.clone(),
+                    ViewSelection::pending(ids),
+                    Some(narrowed),
+                )
+                // Every narrowed row passes the filter: its counts and reads take
+                // the plan's rows, the filter's pinned codes kept for reads by id.
+                .with_filter_resolved(),
             None => self
                 .quads
                 .with_selection(ViewSelection::Exact(RowSelection::empty())),

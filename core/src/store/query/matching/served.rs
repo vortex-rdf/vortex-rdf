@@ -131,12 +131,17 @@ impl VortexRdfStore {
         }
         // The kept ids leave out every tombstone: the chain skipped them.
         let ids = LazyRowIds::from_unsorted_ids(kept.rids.clone(), true);
-        let quads = self.quads.file_with(
-            base,
-            base.filter.clone(),
-            ViewSelection::pending(ids),
-            Some(plan.with_rows(kept)),
-        );
+        let quads = self
+            .quads
+            .file_with(
+                base,
+                base.filter.clone(),
+                ViewSelection::pending(ids),
+                Some(plan.with_rows(kept)),
+            )
+            // Every narrowed row passes the filter: its counts and reads take
+            // the plan's rows, the filter's pinned codes kept for reads by id.
+            .with_filter_resolved();
         Ok(Some(self.derived(quads, self.tail.clone())))
     }
 }

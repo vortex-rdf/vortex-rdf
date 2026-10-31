@@ -459,12 +459,17 @@ impl VortexRdfStore {
                         }
                         (None, None) => unreachable!("a located plan's rows are listed or ranged"),
                     };
-                    let quads = self.quads.file_with(
-                        base,
-                        base.filter.clone(),
-                        ViewSelection::pending(ids),
-                        Some(narrowed),
-                    );
+                    let quads = self
+                        .quads
+                        .file_with(
+                            base,
+                            base.filter.clone(),
+                            ViewSelection::pending(ids),
+                            Some(narrowed),
+                        )
+                        // Every narrowed row passes the filter: its counts and reads take
+                        // the plan's rows, the filter's pinned codes kept for reads by id.
+                        .with_filter_resolved();
                     let tail = self.tail.as_ref().map(|tail| {
                         if i == last {
                             tail.clone()
