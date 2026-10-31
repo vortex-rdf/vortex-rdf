@@ -4,14 +4,13 @@
 //! filter's split masks keep, as [`read_plan`](super::read_plan) chooses
 //! them. Functions of the file, with no store state.
 
-use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use futures::{FutureExt as _, StreamExt, stream};
 use vortex_array::dtype::DType;
-use vortex_array::expr::{Expression, root, select};
+use vortex_array::expr::{root, select};
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
 use vortex_error::{VortexError, VortexResult};
@@ -21,7 +20,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::read::available_parallelism;
 use crate::store::array::named_struct;
 use crate::store::persist::native_file::NativeStoreFile;
-use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
+use crate::store::scan::file_exprs::{CodeEqs, PushedFilter, QUAD_SCOPE};
 use crate::store::scan::file_filter::{self, SplitMasks};
 use crate::store::scan::file_scans::collect_row_splits;
 use crate::store::scan::gather::primitive_from_u64_reads;
@@ -43,7 +42,7 @@ use crate::store::view::selection::RowSelection;
 pub(crate) async fn file_point_rows(
     file: &NativeStoreFile,
     columns: &[&str],
-    filter: Option<&Expression>,
+    filter: Option<&PushedFilter>,
     rows: Vec<u64>,
 ) -> Result<Option<ArrayRef>> {
     #[cfg(test)]
@@ -64,7 +63,7 @@ pub(crate) async fn file_point_rows(
 pub(crate) async fn file_point_codes(
     file: &NativeStoreFile,
     columns: &[&str],
-    filter: Option<&Expression>,
+    filter: Option<&PushedFilter>,
     rows: Vec<u64>,
 ) -> Result<Option<Vec<Buffer<TermCode>>>> {
     #[cfg(test)]
@@ -81,7 +80,7 @@ pub(crate) async fn file_point_codes(
 /// them.
 struct PointRows {
     handles: Vec<Arc<vortex_rdf_encoded_search::ColumnChunks>>,
-    eqs: Vec<(vortex_array::dtype::FieldName, u64)>,
+    eqs: CodeEqs,
     live: Vec<u64>,
 }
 
@@ -92,13 +91,13 @@ impl PointRows {
     async fn read(
         file: &NativeStoreFile,
         columns: &[&str],
-        filter: Option<&Expression>,
+        filter: Option<&PushedFilter>,
         rows: Vec<u64>,
     ) -> Result<Option<Self>> {
         let eqs = match filter {
-            None => Vec::new(),
-            Some(f) => match eq_code_pairs(f) {
-                Some(pairs) => pairs,
+            None => CodeEqs::default(),
+            Some(f) => match f.eqs() {
+                Some(eqs) => eqs.clone(),
                 None => return Ok(None),
             },
         };
@@ -115,7 +114,7 @@ impl PointRows {
             .iter()
             .map(|(col, code)| {
                 let idx = columns.iter().position(|&c| c == col.as_ref())?;
-                Some((Arc::clone(&handles[idx]), *code))
+                Some((Arc::clone(&handles[idx]), code))
             })
             .collect::<Option<Vec<_>>>()
         else {
@@ -125,15 +124,6 @@ impl PointRows {
             return Ok(None);
         };
         Ok(Some(Self { handles, eqs, live }))
-    }
-
-    /// The code every surviving row reads in `column`, when the filter pins
-    /// it.
-    fn constant(&self, column: &str) -> Option<u64> {
-        self.eqs
-            .iter()
-            .find(|(c, _)| c.as_ref() == column)
-            .map(|(_, v)| *v)
     }
 
     /// The live rows' values of `columns`, the columns `handles` read, in
@@ -147,7 +137,7 @@ impl PointRows {
     ) -> Result<Option<Vec<Vec<u64>>>> {
         let mut out = Vec::with_capacity(columns.len());
         for (handle, column) in self.handles.iter().zip(columns) {
-            let values = match self.constant(column) {
+            let values = match self.eqs.code(column) {
                 Some(code) => vec![code; self.live.len()],
                 None => match values_at(file, handle, &self.live).await? {
                     Some(values) => values,
@@ -209,10 +199,10 @@ async fn rows_reading(
 /// their splits, where the scan costs less), and the caller keeps the filter.
 pub(crate) async fn point_filter_ids(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     ids: &Buffer<RowId>,
 ) -> Result<Option<Buffer<RowId>>> {
-    let Some(eqs) = eq_code_pairs(filter) else {
+    let Some(eqs) = filter.eqs() else {
         return Ok(None);
     };
     let splits = file.splits()?;
@@ -221,7 +211,7 @@ pub(crate) async fn point_filter_ids(
     }
     let Some(checks) = eqs
         .iter()
-        .map(|(col, code)| Some((file.column_chunks(col.as_ref())?, *code)))
+        .map(|(col, code)| Some((file.column_chunks(col.as_ref())?, code)))
         .collect::<Option<Vec<_>>>()
     else {
         return Ok(None);
@@ -375,162 +365,31 @@ pub(crate) fn masked_split_tasks(
     Ok((dtype, tasks))
 }
 
-/// Point reads of fewer rows than this read every column, pinned or not:
-/// filling the pinned ones costs a fixed few thousand instructions, more than
-/// the values so few rows skip. On the bench store a pinned point read of
-/// two rows cost 1.6 % more than reading all four columns (4 % for a quad or
-/// chunk read), and one of 114 rows over two pinned columns 15 % less.
-pub(crate) const PIN_POINT_MIN_ROWS: usize = 64;
-
-/// The code each column of a pending filter of code equalities pins
-/// ([`eq_code_pairs`]): every row the filter keeps holds that code there, so a
-/// read of the rows its masks keep (taken, projected, or point by point when
-/// they are [`PIN_POINT_MIN_ROWS`] or more) reads only the other columns and
-/// fills these with their codes.
-#[derive(Debug, Default)]
-pub(crate) struct PinnedCodes(Vec<(vortex_array::dtype::FieldName, TermCode)>);
-
-impl PinnedCodes {
-    /// No column pinned: a read of every column, filling none.
-    pub(crate) const NONE: &'static Self = &Self(Vec::new());
-
-    /// The columns `filter` pins: none without a filter, or for one that is
-    /// not code equalities.
-    pub(crate) fn of(filter: Option<&Expression>) -> Self {
-        Self(filter.and_then(eq_code_pairs).unwrap_or_default())
-    }
-
-    /// Whether no column is pinned.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Whether a read of `rows` kept rows the way `read` reads them fills
-    /// the pinned columns: every take and projection, and a point read of at
-    /// least [`PIN_POINT_MIN_ROWS`] rows.
-    pub(crate) fn pins(read: MaskedRead, rows: usize) -> bool {
-        read != MaskedRead::Points || rows >= PIN_POINT_MIN_ROWS
-    }
-
-    /// The code `column` is pinned to.
-    pub(crate) fn code(&self, column: &str) -> Option<TermCode> {
-        self.0
-            .iter()
-            .find_map(|(name, code)| (name.as_ref() == column).then_some(*code))
-    }
-
-    /// The columns of `columns` a read of the kept rows reads, in order: the
-    /// unpinned ones, or the first of `columns` when every one is pinned, so
-    /// that the read still yields its rows; `columns` itself when none is.
-    pub(crate) fn columns_to_read<'c>(
-        &self,
-        columns: &'c [&'static str],
-    ) -> Cow<'c, [&'static str]> {
-        if self.is_empty() {
-            return Cow::Borrowed(columns);
-        }
-        let unpinned: Vec<&'static str> = columns
-            .iter()
-            .copied()
-            .filter(|&c| self.code(c).is_none())
-            .collect();
-        if unpinned.is_empty() {
-            Cow::Borrowed(&columns[..columns.len().min(1)])
-        } else {
-            Cow::Owned(unpinned)
-        }
-    }
-
-    /// `rows`, read as [`columns_to_read`](Self::columns_to_read) lists them
-    /// for `columns`, as a struct of every column of `columns` in order, each
-    /// pinned one a constant of its code.
-    pub(crate) fn fill_rows(&self, rows: ArrayRef, columns: &[&'static str]) -> Result<ArrayRef> {
-        use vortex_array::IntoArray;
-        use vortex_array::arrays::ConstantArray;
-        use vortex_array::arrays::struct_::StructArrayExt;
-        use vortex_array::scalar::Scalar;
-
-        if columns.iter().all(|&c| self.code(c).is_none()) {
-            return Ok(rows);
-        }
-        let len = rows.len();
-        let read = crate::store::array::into_struct_array(rows)?;
-        let children = columns
-            .iter()
-            .map(|&name| match self.code(name) {
-                Some(code) => Ok(ConstantArray::new(Scalar::from(code), len).into_array()),
-                None => read
-                    .unmasked_field_by_name(name)
-                    .cloned()
-                    .map_err(VortexRdfError::Vortex),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(named_struct(columns, children, len)?.into_array())
-    }
-
-    /// The `(s, p, o, g)` code columns of `kept` rows: each pinned one its
-    /// code repeated, each other one its buffer among `codes`, read in
-    /// `read_columns`' order.
-    pub(crate) fn fill_codes(
-        &self,
-        read_columns: &[&'static str],
-        mut codes: Vec<Buffer<TermCode>>,
-        kept: usize,
-    ) -> Result<[Buffer<TermCode>; 4]> {
-        use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
-
-        let mut column = |name: &str| match self.code(name) {
-            Some(code) => Some(Buffer::full(code, kept)),
-            None => {
-                let at = read_columns.iter().position(|&c| c == name)?;
-                codes.get_mut(at).map(std::mem::take)
-            }
-        };
-        let filled = (|| {
-            Some([
-                column(COL_S)?,
-                column(COL_P)?,
-                column(COL_O)?,
-                column(COL_G)?,
-            ])
-        })();
-        filled.ok_or_else(|| {
-            let missing = [COL_S, COL_P, COL_O, COL_G]
-                .into_iter()
-                .find(|&name| self.code(name).is_none() && !read_columns.contains(&name))
-                .unwrap_or_default();
-            VortexRdfError::InvalidOperation(format!(
-                "a read neither read nor pinned the {missing} column"
-            ))
-        })
-    }
-}
-
 /// The reads of the rows `filter` keeps in `selection`, the filter's masks
 /// first, one future per split the selection touches, in file order: each
 /// evaluates the filter over its split
 /// ([`split_filter_tasks`](file_filter::split_filter_tasks), tombstoned rows
 /// cleared), then reads `columns` at the rows its mask keeps, as
 /// [`MaskedRead`] chooses for that split alone, filling the columns the
-/// filter pins rather than reading them ([`kept_split_rows`]); a split the
-/// filter keeps nothing of reads nothing.
+/// filter's equalities pin rather than reading them ([`kept_split_rows`]); a
+/// split the filter keeps nothing of reads nothing.
 /// Nothing is evaluated until a future is polled, so a stream of them
 /// evaluates only the splits it reaches.
 pub(crate) fn masks_first_split_reads(
     file: &Arc<NativeStoreFile>,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
     columns: &[&'static str],
 ) -> Result<Vec<SplitRead>> {
     let columns: Arc<[&'static str]> = Arc::from(columns);
-    let pinned = Arc::new(PinnedCodes::of(Some(filter)));
+    let pinned = filter.eqs().cloned().unwrap_or_default();
     Ok(
         file_filter::split_filter_tasks(file, filter, selection, deleted)?
             .into_iter()
             .map(|evaluate| {
                 let (file, columns) = (Arc::clone(file), Arc::clone(&columns));
-                let pinned = Arc::clone(&pinned);
+                let pinned = pinned.clone();
                 async move {
                     let (mask, range) = evaluate.await?;
                     if mask.all_false() {
@@ -549,20 +408,18 @@ pub(crate) fn masks_first_split_reads(
 /// `columns` at the rows one split's `masks` keep, read as [`MaskedRead`]
 /// chooses for them: point by point through the chunk probes, taken at the
 /// kept ids or projected at the mask, reading only the columns `pinned`
-/// leaves free and filling the others where the read pins
-/// ([`PinnedCodes::pins`]). A point read a chunk declines is taken.
+/// leaves free and filling the others where the read fills them
+/// ([`CodeEqs::for_points`]). A point read a chunk declines is taken.
 async fn kept_split_rows(
     file: &Arc<NativeStoreFile>,
     columns: &[&'static str],
-    pinned: &PinnedCodes,
+    pinned: &CodeEqs,
     masks: &SplitMasks,
 ) -> Result<Option<ArrayRef>> {
     let read = MaskedRead::of(file, masks)?;
-    let unpinned = PinnedCodes::default();
-    let pinned = if PinnedCodes::pins(read, masks.kept()) {
-        pinned
-    } else {
-        &unpinned
+    let pinned = match read {
+        MaskedRead::Points => pinned.for_points(masks.kept()),
+        MaskedRead::Take | MaskedRead::Project => pinned,
     };
     let read_columns = pinned.columns_to_read(columns);
     if read == MaskedRead::Points
@@ -638,7 +495,7 @@ pub(crate) async fn component_point_chunk(
     // The run's rows, under no filter: every column is read.
     let run = PointRows {
         handles,
-        eqs: Vec::new(),
+        eqs: CodeEqs::default(),
         live: range.collect(),
     };
     let Some(values) = run.columns(file, columns).await? else {

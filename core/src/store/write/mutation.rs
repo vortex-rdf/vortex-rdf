@@ -227,6 +227,6 @@ impl VortexRdfStore {
     async fn matching_file_row_mask(base: &FileBase, selection: &ViewSelection) -> Result<Mask> {
         // A served match's pending selection materializes here.
         let selection = selection.materialized_async().await?;
-        file_filter::matching_file_rows(&base.file, base.filter.as_ref(), &selection).await
+        file_filter::matching_file_rows(&base.file, base.filter.over_selection(), &selection).await
     }
 }

@@ -22,7 +22,7 @@ use crate::io::zone_map::ZONE_ROWS;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
 use crate::store::persist::native_file::NativeStoreFile;
-use crate::store::scan::file_exprs::{QUAD_SCOPE, eq_code_pairs};
+use crate::store::scan::file_exprs::{PushedFilter, QUAD_SCOPE};
 use crate::store::scan::file_scans::{ScanDriver, strict_ids};
 use crate::store::schema::{COL_G, COL_O, COL_O_VALUE, COL_P, COL_S, RowId};
 use crate::store::view::selection::RowSelection;
@@ -116,13 +116,14 @@ fn column_rank(column: &str) -> u8 {
 /// The prior order of `filter`'s `n` top-level conjuncts: by column rank
 /// when every conjunct is a code equality, ties in the filter's order; the
 /// filter's order otherwise.
-fn prior_order(filter: &Expression, n: usize) -> Vec<usize> {
+fn prior_order(filter: &PushedFilter, n: usize) -> Vec<usize> {
     let mut prior: Vec<usize> = (0..n).collect();
-    if let Some(pairs) = eq_code_pairs(filter)
-        && pairs.len() == n
+    if let Some(eqs) = filter.eqs()
+        && eqs.len() == n
     {
+        let columns: Vec<&str> = eqs.iter().map(|(column, _)| column.as_ref()).collect();
         // A stable sort: ties keep the filter's order.
-        prior.sort_by_key(|&i| column_rank(pairs[i].0.as_ref()));
+        prior.sort_by_key(|&i| column_rank(columns[i]));
     }
     prior
 }
@@ -143,7 +144,7 @@ struct ConjunctOrder {
 
 impl ConjunctOrder {
     /// `conjuncts` are `filter`'s top-level conjuncts, bound, in its order.
-    fn new(filter: &Expression, conjuncts: Vec<BoundExpression>) -> Self {
+    fn new(filter: &PushedFilter, conjuncts: Vec<BoundExpression>) -> Self {
         let prior = prior_order(filter, conjuncts.len());
         let observed = Mutex::new(vec![(0, 0); conjuncts.len()]);
         Self {
@@ -261,7 +262,7 @@ fn early_exit_pieces(ranges: &[Range<u64>]) -> Vec<(usize, Range<u64>)> {
 /// higher-ranked lifetime inference when a caller spawns the future.
 fn filter_split_tasks(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     mask_selection: &Selection,
     ranges: Vec<Range<u64>>,
     deleted: Option<&Mask>,
@@ -271,7 +272,7 @@ fn filter_split_tasks(
     let reader = file.layout_reader()?;
     let order = Arc::new(ConjunctOrder::new(
         filter,
-        bound_conjuncts(file, reader.as_ref(), filter).collect::<Result<_>>()?,
+        bound_conjuncts(file, reader.as_ref(), filter.expr()).collect::<Result<_>>()?,
     ));
     Ok(ranges
         .into_iter()
@@ -299,7 +300,7 @@ pub(crate) type SplitTask = BoxFuture<'static, Result<(Mask, Range<u64>)>>;
 /// evaluates only when polled.
 pub(crate) fn split_filter_tasks(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
 ) -> Result<Vec<SplitTask>> {
@@ -347,7 +348,7 @@ pub(crate) type ChunkTest =
 /// [`matching_file_rows`].
 pub(crate) async fn kept_file_rows(
     file: &NativeStoreFile,
-    filter: Option<&Expression>,
+    filter: Option<&PushedFilter>,
     selection: &RowSelection,
     column: &'static str,
     test: ChunkTest,
@@ -411,7 +412,7 @@ pub(crate) async fn kept_file_rows(
 /// evaluations run on as many cores; `map` is given each split's range.
 async fn map_filter_splits<T, F>(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
     map: F,
@@ -453,7 +454,7 @@ where
 /// spawned piece aborted with its task.
 async fn fold_filter_splits_ordered<F>(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
     want: usize,
@@ -545,7 +546,7 @@ impl SplitMasks {
 /// order: the evaluation a window runs, run to the end.
 pub(crate) async fn split_masks(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
 ) -> Result<SplitMasks> {
@@ -559,7 +560,7 @@ pub(crate) async fn split_masks(
 /// split evaluated whole is one mask as without pieces.
 pub(crate) async fn split_masks_until(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
     want: usize,
@@ -614,7 +615,7 @@ pub(crate) fn push_kept_ids(ids: &mut Vec<RowId>, mask: &Mask, range: &Range<u64
 /// completes the count.
 pub(crate) async fn first_matching_rows(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
     want: usize,
@@ -636,7 +637,7 @@ pub(crate) async fn first_matching_rows(
 /// `size_capped` and `exists`: `min(matches, cap)`.
 pub(crate) async fn count_matching_rows_capped(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
     cap: usize,
@@ -658,7 +659,7 @@ pub(crate) async fn count_matching_rows_capped(
 /// filter's columns are read, and no column is projected.
 pub(crate) async fn count_matching_rows(
     file: &NativeStoreFile,
-    filter: &Expression,
+    filter: &PushedFilter,
     selection: &RowSelection,
     deleted: Option<&Mask>,
 ) -> Result<usize> {
@@ -675,7 +676,7 @@ pub(crate) async fn count_matching_rows(
 /// is the rows the pattern names, which a delete unions into its tombstones.
 pub(crate) async fn matching_file_rows(
     file: &NativeStoreFile,
-    filter: Option<&Expression>,
+    filter: Option<&PushedFilter>,
     selection: &RowSelection,
 ) -> Result<Mask> {
     let row_count = file.row_count();
@@ -816,8 +817,8 @@ mod tests {
                 eq(get_item("g", root()), lit(4u64)),
             ),
         );
-        assert_eq!(prior_order(&filter, 4), vec![0, 2, 1, 3]);
-        assert_eq!(prior_order(&lit(false), 1), vec![0]);
+        assert_eq!(prior_order(&PushedFilter::new(filter), 4), vec![0, 2, 1, 3]);
+        assert_eq!(prior_order(&PushedFilter::new(lit(false)), 1), vec![0]);
     }
 
     /// The pieces start at one zone and grow fourfold, none crossing a

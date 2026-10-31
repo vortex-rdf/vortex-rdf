@@ -192,7 +192,7 @@ impl VortexRdfStore {
         let Some(base) = self.quads.file() else {
             return Ok(None);
         };
-        if base.filter.is_some() || base.serve.is_some() {
+        if base.filter.over_selection().is_some() || base.serve.is_some() {
             return Ok(None);
         }
         let file = &base.file;

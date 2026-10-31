@@ -368,15 +368,15 @@ impl VortexRdfStore {
     }
 
     /// The live base rows the filter masks a window kept on this view hold
-    /// (see `FileBase::masks`); `None` on a view without them.
+    /// (see `FileFilter::Kept`); `None` on a view without them.
     pub(crate) fn debug_evaluated_len(&self) -> Option<usize> {
         self.quads.evaluated_len()
     }
 
     /// The ranges of the filter masks a window kept on this view, in file
-    /// order (see `FileBase::masks`); `None` on a view without them.
+    /// order (see `FileFilter::Kept`); `None` on a view without them.
     pub(crate) fn debug_evaluated_ranges(&self) -> Option<Vec<std::ops::Range<u64>>> {
-        let masks = self.quads.file()?.masks.as_ref()?;
+        let masks = self.quads.file()?.filter.kept_masks()?;
         Some(masks.iter().map(|(_, range)| range.clone()).collect())
     }
 

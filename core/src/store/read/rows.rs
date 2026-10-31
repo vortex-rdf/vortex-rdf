@@ -8,17 +8,15 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::error::Result;
-#[cfg(feature = "file-io")]
-use crate::store::FileBase;
 use crate::store::RawQuad;
 use crate::store::array::{rechunk, with_subject_stamp};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::read::chunks::{RowChunkStream, extract_codes};
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_filter::{self, SplitMasks};
+use crate::store::scan::file_exprs::{CodeEqs, PushedFilter};
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_reads::PinnedCodes;
+use crate::store::scan::file_filter::{self, SplitMasks};
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::scan::read_plan::{ExactRead, MaskedRead};
@@ -29,6 +27,8 @@ use crate::store::view::selection::SelectedRows;
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{Backend, MemoryBase};
+#[cfg(feature = "file-io")]
+use crate::store::{FileBase, FileFilter};
 
 use futures::stream::{self, StreamExt};
 use vortex_array::ArrayRef;
@@ -37,7 +37,7 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_buffer::Buffer;
 
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{Expression, root, select};
+use vortex_array::expr::{root, select};
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
 #[cfg(feature = "file-io")]
@@ -258,21 +258,26 @@ impl VortexRdfStore {
         // read the same way, the filter not run again.
         #[cfg(feature = "file-io")]
         if let Backend::File(base) = &self.quads.backend {
-            if let Some(masks) = &base.masks {
+            if let Some(masks) = base.filter.kept_masks() {
                 let primary = self.layout.strategy().primary_column_names();
-                return Self::masked_codes(&base.file, primary, masks, base.filter.as_ref())
+                return Self::masked_codes(&base.file, primary, masks, base.filter.pins())
                     .await
                     .map(Some);
             }
             let (scope, read) = self.file_read(base, &schema::PRIMARY_COLUMNS).await?;
             if let Some(masks) = scope.masks_first(&read).await? {
-                return Self::masked_codes(scope.file, scope.by_id_columns, &masks, scope.filter)
-                    .await
-                    .map(Some);
+                return Self::masked_codes(
+                    scope.file,
+                    scope.by_id_columns,
+                    &masks,
+                    scope.filter_eqs(),
+                )
+                .await
+                .map(Some);
             }
             let rows = match read {
                 ExactRead::Points(rows) => {
-                    let pins = scope.pins();
+                    let pins = scope.pins.for_points(rows.len());
                     let read_columns = pins.columns_to_read(scope.by_id_columns);
                     if let Some(codes) =
                         file_reads::file_point_codes(scope.file, &read_columns, scope.filter, rows)
@@ -333,7 +338,7 @@ impl VortexRdfStore {
     /// by the index, and the read needs base order); the columns a read by id
     /// reads, every primary column while a filter is pending (the read checks
     /// it on the columns it reads), else `columns`; and the filter still to
-    /// run. A view whose window kept its filter's masks ([`FileBase::masks`])
+    /// run. A view whose window kept its filter's masks ([`FileFilter::Kept`])
     /// covers the ids the masks keep, with no filter to run.
     #[cfg(feature = "file-io")]
     pub(in crate::store) async fn file_read<'a>(
@@ -341,18 +346,18 @@ impl VortexRdfStore {
         base: &'a FileBase,
         columns: &'a [&'static str],
     ) -> Result<(FileReadScope<'a>, ExactRead)> {
-        let (selection, by_id_columns, filter) = match &base.masks {
-            Some(masks) => {
+        let (selection, by_id_columns, filter) = match &base.filter {
+            FileFilter::Kept { masks, .. } => {
                 let ids = Buffer::from(masks.first_ids(usize::MAX));
                 (Cow::Owned(RowSelection::from_ids(ids)), columns, None)
             }
-            None => {
+            filter => {
                 let selection = match base.serve {
                     // Runs the deferred index-child read once, cached on the view.
                     Some(_) => Cow::Owned(self.quads.selection.materialized_async().await?),
                     None => Cow::Borrowed(self.quads.selection.expect_exact()),
                 };
-                let filter = base.filter.as_ref();
+                let filter = filter.to_evaluate();
                 let by_id_columns = match filter {
                     Some(_) => self.layout.strategy().primary_column_names(),
                     None => columns,
@@ -367,7 +372,7 @@ impl VortexRdfStore {
             filter,
             selection,
             deleted: self.quads.deleted.as_ref(),
-            pins: base.pins.as_deref(),
+            pins: base.filter.pins(),
         };
         let read = ExactRead::of(
             scope.file,
@@ -422,21 +427,20 @@ impl VortexRdfStore {
     /// columns, read as [`MaskedRead`] chooses with no filter left to check:
     /// point by point straight into the code buffers, by one take through the
     /// chunk probes, or each split projected at its mask, reading only the
-    /// columns `filter` leaves free and filling the ones it pins with their
-    /// codes where the read pins ([`PinnedCodes::pins`]). A read by id that a
-    /// chunk declines falls to the next.
+    /// columns the equalities `pins` leave free and filling the others with
+    /// their codes where the read fills them ([`CodeEqs::for_points`]). A
+    /// read by id that a chunk declines falls to the next.
     #[cfg(feature = "file-io")]
     async fn masked_codes(
         file: &Arc<NativeStoreFile>,
         columns: &[&'static str],
         masks: &SplitMasks,
-        filter: Option<&Expression>,
+        pins: &CodeEqs,
     ) -> Result<[Buffer<TermCode>; 4]> {
         let read = MaskedRead::of(file, masks)?;
-        let pinned = if PinnedCodes::pins(read, masks.kept()) {
-            PinnedCodes::of(filter)
-        } else {
-            PinnedCodes::default()
+        let pinned = match read {
+            MaskedRead::Points => pins.for_points(masks.kept()),
+            MaskedRead::Take | MaskedRead::Project => pins,
         };
         let read_columns = pinned.columns_to_read(columns);
         if read == MaskedRead::Points
@@ -489,13 +493,14 @@ pub(in crate::store) struct FileReadScope<'a> {
     /// The columns a read by id reads: every primary column while a filter
     /// is pending, which the read checks on the columns it reads.
     pub(in crate::store) by_id_columns: &'a [&'static str],
-    pub(in crate::store) filter: Option<&'a Expression>,
+    pub(in crate::store) filter: Option<&'a PushedFilter>,
     pub(in crate::store) selection: Cow<'a, RowSelection>,
     pub(in crate::store) deleted: Option<&'a Mask>,
-    /// The codes a window's resolved filter pinned ([`FileBase::pins`]):
-    /// a read by id ([`pins`](Self::pins)) reads the
-    /// columns they leave free and fills them.
-    pub(in crate::store) pins: Option<&'a PinnedCodes>,
+    /// The codes every selected row holds by a filter a window kept the
+    /// masks of or resolved ([`FileFilter::pins`]): a read by id reads the
+    /// columns they leave free and fills them, as
+    /// [`CodeEqs::for_points`] has it.
+    pub(in crate::store) pins: &'a CodeEqs,
 }
 
 #[cfg(feature = "file-io")]
@@ -510,7 +515,7 @@ impl FileReadScope<'_> {
     pub(in crate::store) async fn rows(&self, read: ExactRead) -> Result<BaseRead> {
         let rows = match read {
             ExactRead::Points(rows) => {
-                let pins = self.pins();
+                let pins = self.pins.for_points(rows.len());
                 let columns = pins.columns_to_read(self.by_id_columns);
                 file_reads::file_point_rows(self.file, &columns, self.filter, rows)
                     .await?
@@ -518,7 +523,7 @@ impl FileReadScope<'_> {
                     .transpose()?
             }
             ExactRead::Take(ids) => {
-                let pins = self.pins();
+                let pins = self.pins;
                 let columns = pins.columns_to_read(self.by_id_columns);
                 file_reads::take_file_rows(self.file, &columns, &ids)
                     .await?
@@ -533,10 +538,12 @@ impl FileReadScope<'_> {
         })
     }
 
-    /// The codes a read by id fills instead of reading: the pins of the
-    /// filter a window resolved ([`FileBase::pins`]), else none.
-    pub(in crate::store) fn pins(&self) -> &PinnedCodes {
-        self.pins.unwrap_or(PinnedCodes::NONE)
+    /// The code equalities of the pending filter, which every row its masks
+    /// keep holds: what a read of those rows fills ([`masks_first`](Self::masks_first)).
+    pub(in crate::store) fn filter_eqs(&self) -> &CodeEqs {
+        self.filter
+            .and_then(PushedFilter::eqs)
+            .unwrap_or(CodeEqs::NONE)
     }
 
     /// The pending filter's masks over the selection, tombstones cleared,
@@ -577,7 +584,7 @@ impl FileReadScope<'_> {
         if let Some(f) = self.filter {
             #[cfg(test)]
             restricted_scan_hooks::note_filtered();
-            scan = scan.with_filter(memo.bind(file_exprs::QUAD_SCOPE, f, &scope)?);
+            scan = scan.with_filter(memo.bind(file_exprs::QUAD_SCOPE, f.expr(), &scope)?);
         }
         Ok(self.selection.restrict_scan(scan, self.deleted))
     }

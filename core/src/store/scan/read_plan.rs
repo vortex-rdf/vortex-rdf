@@ -7,13 +7,12 @@
 
 use std::ops::Range;
 
-use vortex_array::expr::Expression;
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use crate::error::Result;
 use crate::store::persist::native_file::NativeStoreFile;
-use crate::store::scan::file_exprs::eq_code_pairs;
+use crate::store::scan::file_exprs::PushedFilter;
 use crate::store::scan::file_filter::SplitMasks;
 use crate::store::schema::RowId;
 use crate::store::view::selection::{RowSelection, point_sized};
@@ -58,9 +57,9 @@ pub(crate) enum ExactRead {
 pub(crate) fn point_readable(
     file: &NativeStoreFile,
     columns: &[&str],
-    filter: Option<&Expression>,
+    filter: Option<&PushedFilter>,
 ) -> bool {
-    filter.is_none_or(|f| eq_code_pairs(f).is_some())
+    filter.is_none_or(|f| f.eqs().is_some())
         && columns.iter().all(|c| file.column_chunks(c).is_some())
 }
 
@@ -72,7 +71,7 @@ impl ExactRead {
     pub(crate) fn of(
         file: &NativeStoreFile,
         columns: &[&str],
-        filter: Option<&Expression>,
+        filter: Option<&PushedFilter>,
         selection: &RowSelection,
         deleted: Option<&Mask>,
     ) -> Result<Self> {
@@ -102,7 +101,7 @@ impl ExactRead {
     pub(crate) fn reads_masks(
         file: &NativeStoreFile,
         columns: &[&str],
-        filter: Option<&Expression>,
+        filter: Option<&PushedFilter>,
         selection: &RowSelection,
     ) -> Result<bool> {
         if filter.is_none() || selection.is_point_sized() {
@@ -132,7 +131,7 @@ impl ReadKind {
     fn of(
         file: &NativeStoreFile,
         columns: &[&str],
-        filter: Option<&Expression>,
+        filter: Option<&PushedFilter>,
         selection: &RowSelection,
     ) -> Result<Self> {
         let pointable = point_readable(file, columns, filter);

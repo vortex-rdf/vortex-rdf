@@ -11,7 +11,7 @@ use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::{file_filter, subject_runs};
 use crate::store::schema::QuadColumn;
 use crate::store::view::selection::{RowSelection, ViewSelection};
-use crate::store::{FileBase, VortexRdfStore};
+use crate::store::{FileBase, FileFilter, VortexRdfStore};
 
 impl VortexRdfStore {
     /// The file backend of [`keep`](Self::keep). On a file sorted by subject a
@@ -36,7 +36,8 @@ impl VortexRdfStore {
         keep: &Keep,
     ) -> Result<Self> {
         let t = debug::timer();
-        let FileBase { file, filter, .. } = base;
+        let file = &base.file;
+        let filter = base.filter.over_selection();
         let row_count = file.row_count() as usize;
         let selection = self.quads.selection.materialized_async().await?;
         if selection.is_empty(row_count) {
@@ -53,13 +54,13 @@ impl VortexRdfStore {
                     "[keep] {:?} located as runs of the sorted column",
                     column
                 );
-                (filter.clone(), narrowed)
+                (FileFilter::pending(filter.cloned()), narrowed)
             }
             None => {
                 let selected = selection.len(row_count);
                 let ids = file_filter::kept_file_rows(
                     file,
-                    filter.as_ref(),
+                    filter,
                     &selection,
                     column.name(),
                     keep.chunk_test(selected),
@@ -72,7 +73,7 @@ impl VortexRdfStore {
                     column,
                     selected
                 );
-                (None, narrowed)
+                (FileFilter::None, narrowed)
             }
         };
         if narrowed.is_empty(row_count) {

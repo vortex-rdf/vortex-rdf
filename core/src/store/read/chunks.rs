@@ -296,13 +296,13 @@ impl VortexRdfStore {
         let file = Arc::clone(&base.file);
         let columns: Arc<[&'static str]> = Arc::from(scope.by_id_columns);
         // Each take reads the columns a window's filter left free and fills
-        // the ones it pinned ([`FileBase::pins`]).
-        let pins = base.pins.clone().unwrap_or_default();
+        // the ones it pinned ([`FileFilter::pins`]).
+        let pins = scope.pins.clone();
         let read_columns: Arc<[&'static str]> = Arc::from(pins.columns_to_read(&columns));
         Ok(stream::iter(id_windows(ids, batch_rows).enumerate())
             .then(move |(k, window)| {
                 let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
-                let (pins, read_columns) = (Arc::clone(&pins), Arc::clone(&read_columns));
+                let (pins, read_columns) = (pins.clone(), Arc::clone(&read_columns));
                 async move {
                     // A take declines only an empty id list, and no
                     // window is empty: a decline is a broken invariant.

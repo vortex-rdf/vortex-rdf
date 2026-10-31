@@ -16,12 +16,12 @@ use vortex_buffer::Buffer;
 
 use crate::debug;
 use crate::error::Result;
-#[cfg(feature = "file-io")]
-use crate::store::FileBase;
 use crate::store::VortexRdfStore;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, read_plan};
 use crate::store::view::selection::{RowSelection, ViewSelection};
+#[cfg(feature = "file-io")]
+use crate::store::{FileBase, FileFilter};
 
 impl VortexRdfStore {
     /// The view's rows after skipping `offset` and taking at most `limit`.
@@ -193,10 +193,8 @@ impl VortexRdfStore {
         let (
             Some(FileBase {
                 file,
-                filter: Some(filter),
+                filter: FileFilter::Pending(filter),
                 serve: None,
-                masks: None,
-                ..
             }),
             ViewSelection::Exact(selection),
         ) = (self.quads.file(), &self.quads.selection)
@@ -207,43 +205,46 @@ impl VortexRdfStore {
         read_plan::ExactRead::reads_masks(file, primary, Some(filter), selection)
     }
 
-    /// `window(0, limit)` of a file view with a pending filter, an exact
-    /// selection and no serve plan: the filter's masks evaluated in file
-    /// order up to the split that brings the matches to `limit`
-    /// ([`file_filter::split_masks_until`]). `None` for any other view.
+    /// `window(0, limit)` of a file view with a filter its selected rows must
+    /// still pass, an exact selection and no serve plan: the filter's masks,
+    /// a pending filter's evaluated in file order up to the split that brings
+    /// the matches to `limit` ([`file_filter::split_masks_until`]), the ones
+    /// a window kept taken as they are, the filter not evaluated again.
+    /// `None` for any other view.
     ///
     /// With `limit` matches the window is their ids, in base order, with no
-    /// filter (only the codes it pinned, for the reads by id) and the tail
-    /// cut off. With fewer it cuts no base row: the view keeps its filter
-    /// with the masks kept for its reads (and the codes it pins, for the
-    /// reads by id) where the masks are smaller than the matches' ids
+    /// filter (only the codes its equalities pin, for the reads by id) and
+    /// the tail cut off. With fewer it cuts no base row: the view keeps its
+    /// filter with the masks kept for its reads ([`FileFilter::Kept`]) where
+    /// the masks are smaller than the matches' ids
     /// ([`SplitMasks::smaller_than_ids`]) and the filter is one the reads by
     /// id check ([`read_plan::point_readable`]), else holds those ids the
     /// same way, and its tail is windowed to the rest of the limit.
     #[cfg(feature = "file-io")]
     async fn filter_window(&self, limit: usize) -> Result<Option<Self>> {
-        let (Some(base), ViewSelection::Exact(selection), Some((file, filter))) = (
-            self.quads.file(),
-            &self.quads.selection,
-            self.quads.pending_filter(),
-        ) else {
+        let (Some(base), ViewSelection::Exact(selection)) =
+            (self.quads.file(), &self.quads.selection)
+        else {
             return Ok(None);
         };
         if base.serve.is_some() {
             return Ok(None);
         }
-        let deleted = self.quads.deleted.as_ref();
-        let masks = file_filter::split_masks_until(file, filter, selection, deleted, limit).await?;
+        let (file, deleted) = (&base.file, self.quads.deleted.as_ref());
+        let masks = match &base.filter {
+            FileFilter::Kept { masks, .. } => Arc::clone(masks),
+            FileFilter::Pending(filter) => Arc::new(
+                file_filter::split_masks_until(file, filter, selection, deleted, limit).await?,
+            ),
+            FileFilter::None | FileFilter::Resolved(_) => return Ok(None),
+        };
         let found = masks.kept();
         let primary = self.layout.strategy().primary_column_names();
         let keep_masks = found < limit
             && masks.smaller_than_ids()
-            && read_plan::point_readable(file, primary, Some(filter));
+            && read_plan::point_readable(file, primary, base.filter.over_selection());
         let (quads, tail_limit) = if keep_masks {
-            (
-                self.quads.with_evaluated_masks(Arc::new(masks)),
-                limit - found,
-            )
+            (self.quads.with_evaluated_masks(masks), limit - found)
         } else {
             // The matches' ids, the filter resolved into them: no filter
             // left, only the codes it pinned, for the reads by id.
@@ -262,10 +263,10 @@ impl VortexRdfStore {
     /// The base's window over its exact `selection`, and the base's live row
     /// count as far as the window needs it: a position range over the
     /// selection, stepping over tombstones, with the selection's live row
-    /// count (`live`, when the window's check counted it); or, under a
-    /// pending file filter, the window of the first matches, evaluated only
-    /// as far as the window reaches, with their count (at most
-    /// `offset + limit`).
+    /// count (`live`, when the window's check counted it); or, under a file
+    /// filter, the window of the first matches with their count (at most
+    /// `offset + limit`): a pending filter's evaluated only as far as the
+    /// window reaches, a window's kept masks' read off their bits.
     async fn base_window(
         &self,
         selection: &RowSelection,
@@ -276,22 +277,30 @@ impl VortexRdfStore {
         let base_len = self.quads.base_len();
         let deleted = self.quads.deleted.as_ref();
         #[cfg(feature = "file-io")]
-        if let Some((file, filter)) = self.quads.pending_filter() {
-            // Only the matches the window can reach are evaluated; fewer than
+        if let Some(base) = self.quads.file() {
+            // Only the matches the window can reach are read; fewer than
             // asked means the base is exhausted and their count is its live
             // size.
             let want = offset.saturating_add(limit);
-            let found =
-                file_filter::first_matching_rows(file, filter, selection, deleted, want).await?;
-            let live = if found.len() < want {
-                found.len()
-            } else {
-                want
+            let found = match &base.filter {
+                FileFilter::Kept { masks, .. } => Some(Buffer::from(masks.first_ids(want))),
+                FileFilter::Pending(filter) => Some(
+                    file_filter::first_matching_rows(&base.file, filter, selection, deleted, want)
+                        .await?,
+                ),
+                FileFilter::None | FileFilter::Resolved(_) => None,
             };
-            return Ok((
-                RowSelection::Ids(found).window(offset, limit, None, base_len),
-                live,
-            ));
+            if let Some(found) = found {
+                let live = if found.len() < want {
+                    found.len()
+                } else {
+                    want
+                };
+                return Ok((
+                    RowSelection::Ids(found).window(offset, limit, None, base_len),
+                    live,
+                ));
+            }
         }
         let live = live.unwrap_or_else(|| selection.live_len(deleted, base_len));
         Ok((selection.window(offset, limit, deleted, base_len), live))

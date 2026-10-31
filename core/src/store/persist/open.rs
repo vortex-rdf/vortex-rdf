@@ -15,7 +15,7 @@ use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{DictAccess, LayoutStrategy};
 #[cfg(feature = "file-io")]
 use crate::store::{
-    Backend, FileBase, QuadsSource, array::into_struct_array, indexes::Indexes,
+    Backend, FileBase, FileFilter, QuadsSource, array::into_struct_array, indexes::Indexes,
     layouts::dictionary::FileBackedDict, persist::native_file::NativeStoreFile,
 };
 
@@ -324,10 +324,8 @@ impl VortexRdfStore {
             generation: crate::store::next_generation(),
             quads: QuadsSource::new(Backend::File(FileBase {
                 file,
-                filter: None,
+                filter: FileFilter::None,
                 serve: None,
-                masks: None,
-                pins: None,
             })),
             tail: None,
         })

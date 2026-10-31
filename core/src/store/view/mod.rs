@@ -33,11 +33,9 @@ use crate::store::indexes::FileServePlan;
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
+use crate::store::scan::file_exprs::{CodeEqs, PushedFilter};
+#[cfg(feature = "file-io")]
 use crate::store::scan::file_filter::SplitMasks;
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_reads::PinnedCodes;
-#[cfg(feature = "file-io")]
-use vortex_array::expr::Expression;
 
 /// A view's base rows: the base the store was constructed from, never
 /// rewritten, and the selection and tombstones that narrow it. Base row ids
@@ -95,7 +93,7 @@ pub(crate) struct MemoryBase {
 }
 
 /// A file base: the file handle, the filter a match pushed down to its
-/// scan, and the serve plan of a served view.
+/// reads, and the serve plan of a served view.
 #[cfg(feature = "file-io")]
 #[derive(Clone)]
 pub(crate) struct FileBase {
@@ -106,30 +104,109 @@ pub(crate) struct FileBase {
     /// the index children having row spaces of their own, so
     /// `file.row_count()` is the base's row count.
     pub(crate) file: Arc<NativeStoreFile>,
-    /// Pattern components not resolved to row ids, pushed down to the scan.
-    pub(crate) filter: Option<Expression>,
+    /// The filter the view's selected rows pass, in the state its windows
+    /// left it ([`FileFilter`]).
+    pub(crate) filter: FileFilter,
     /// The index's plan for reading this view's rows from the index's own
     /// columns ([`FileServePlan`]). Present only while the selection is
     /// exactly the plan's run: any narrowing drops it, materializing a
     /// pending selection first (see [`ViewSelection`]).
     pub(crate) serve: Option<FileServePlan>,
-    /// The pending filter's masks over the selection, one per evaluated
-    /// split in file order, once a window has evaluated them all and found it
-    /// cuts no row: the view's one-shot reads take its rows from them, its
-    /// other reads their ids, and its counts their bits, so the filter is
-    /// never evaluated again. They are kept only for a filter of code
+}
+
+/// The filter a file view's selected rows pass: none, pending, evaluated by
+/// a window into masks it kept, or resolved by a window into the selection.
+/// Every view derived from this one over another selection starts from the
+/// filter its rows must still pass, pending ([`derived`](Self::derived)).
+#[cfg(feature = "file-io")]
+#[derive(Clone, Default)]
+pub(crate) enum FileFilter {
+    /// No filter: every selected row is the view's.
+    #[default]
+    None,
+    /// Pattern components no index resolved, pushed down to the reads,
+    /// which evaluate them over the selection.
+    Pending(PushedFilter),
+    /// A pending filter a window evaluated over the whole selection and
+    /// found to cut no row, beside its masks, one per evaluated split in file
+    /// order: the view's reads take their rows from the masks, and its
+    /// counts their bits, so no read evaluates the filter again. The filter
+    /// stays for what narrows the view (a chained match, a keep, a delete),
+    /// which evaluates it with the narrowing. Kept only for a filter of code
     /// equalities over columns with chunk probes, the one the reads by id
-    /// check, and only while smaller than the ids of the rows they keep; they
-    /// are read off their bits, so nothing caches beside them. Every view
-    /// derived from this one starts without them.
-    pub(crate) masks: Option<Arc<SplitMasks>>,
-    /// The codes pinned by the filter a window resolved into exact ids, or
-    /// evaluated into the masks it kept ([`PinnedCodes`]), for a window of
-    /// at least as many rows as a point read pins for: every row such a view
-    /// reads passed that filter, so a read of its rows by id reads only the
-    /// columns the filter left free and fills these with their codes. Every
-    /// view derived from this one starts without them.
-    pub(crate) pins: Option<Arc<PinnedCodes>>,
+    /// check, and only while the masks are smaller than the ids of the rows
+    /// they keep; they are read off their bits, so nothing caches beside
+    /// them.
+    Kept {
+        filter: PushedFilter,
+        masks: Arc<SplitMasks>,
+    },
+    /// A filter a window resolved into the exact selection, leaving its code
+    /// equalities: every selected row passed it, so a read of those rows by
+    /// id reads only the columns the equalities leave free and fills these
+    /// with their codes ([`CodeEqs::for_points`]).
+    Resolved(CodeEqs),
+}
+
+#[cfg(feature = "file-io")]
+impl FileFilter {
+    /// `filter` pending, or no filter.
+    pub(crate) fn pending(filter: Option<PushedFilter>) -> Self {
+        filter.map_or(FileFilter::None, FileFilter::Pending)
+    }
+
+    /// The filter the reads evaluate over the selection: a pending one; none
+    /// once a window kept its masks or resolved it.
+    pub(crate) fn to_evaluate(&self) -> Option<&PushedFilter> {
+        match self {
+            FileFilter::Pending(filter) => Some(filter),
+            _ => None,
+        }
+    }
+
+    /// The filter every selected row must still pass: a pending one, or one
+    /// a window kept the masks of.
+    pub(crate) fn over_selection(&self) -> Option<&PushedFilter> {
+        match self {
+            FileFilter::Pending(filter) | FileFilter::Kept { filter, .. } => Some(filter),
+            FileFilter::None | FileFilter::Resolved(_) => None,
+        }
+    }
+
+    /// The masks a window kept of the filter.
+    pub(crate) fn kept_masks(&self) -> Option<&Arc<SplitMasks>> {
+        match self {
+            FileFilter::Kept { masks, .. } => Some(masks),
+            _ => None,
+        }
+    }
+
+    /// The codes every row the view's reads take holds in the columns they
+    /// name: a kept filter's equalities, a resolved one's; none otherwise (a
+    /// pending filter's reads by id check its equalities themselves).
+    pub(crate) fn pins(&self) -> &CodeEqs {
+        match self {
+            FileFilter::Kept { filter, .. } => filter.eqs().unwrap_or(CodeEqs::NONE),
+            FileFilter::Resolved(eqs) => eqs,
+            FileFilter::None | FileFilter::Pending(_) => CodeEqs::NONE,
+        }
+    }
+
+    /// The filter a view derived from this one over another selection starts
+    /// with: the filter its rows must still pass, pending, without the masks
+    /// or the codes kept for this view's selection.
+    fn derived(&self) -> Self {
+        FileFilter::pending(self.over_selection().cloned())
+    }
+
+    /// This filter resolved into an exact selection: the codes its
+    /// equalities pin; none without a filter, or for one of another shape.
+    fn resolved(&self) -> Self {
+        match self.over_selection().and_then(PushedFilter::eqs) {
+            Some(eqs) => FileFilter::Resolved(eqs.clone()),
+            None => FileFilter::None,
+        }
+    }
 }
 
 impl QuadsSource {
@@ -159,18 +236,13 @@ impl QuadsSource {
         }
     }
 
-    /// The file and the filter a match pushed down to its scan, while one is
-    /// pending; `None` in memory or with no filter pending.
+    /// The file and the filter a match pushed down to its reads, while one
+    /// is pending ([`FileFilter::to_evaluate`]); `None` in memory, with no
+    /// filter, or once a window kept its masks or resolved it.
     #[cfg(feature = "file-io")]
-    pub(crate) fn pending_filter(&self) -> Option<(&NativeStoreFile, &Expression)> {
-        match &self.backend {
-            Backend::File(FileBase {
-                file,
-                filter: Some(filter),
-                ..
-            }) => Some((file, filter)),
-            _ => None,
-        }
+    pub(crate) fn pending_filter(&self) -> Option<(&NativeStoreFile, &PushedFilter)> {
+        let base = self.file()?;
+        Some((&base.file, base.filter.to_evaluate()?))
     }
 
     /// Whether the selection is pending with no serve plan: a view built only
@@ -217,22 +289,18 @@ impl QuadsSource {
     }
 
     /// The live base rows a window's kept filter masks hold
-    /// ([`FileBase::masks`]), counted off the masks; `None` without them, and
-    /// in memory.
+    /// ([`FileFilter::Kept`]), counted off the masks; `None` without them,
+    /// and in memory.
     pub(crate) fn evaluated_len(&self) -> Option<usize> {
         #[cfg(feature = "file-io")]
-        if let Backend::File(FileBase {
-            masks: Some(masks), ..
-        }) = &self.backend
-        {
+        if let Some(masks) = self.file().and_then(|base| base.filter.kept_masks()) {
             return Some(masks.kept());
         }
         None
     }
 
-    /// This file source with `masks`, its pending filter evaluated over its
-    /// exact selection, kept for its reads ([`FileBase::masks`]), and the
-    /// codes the filter pins kept for its reads by id ([`FileBase::pins`]).
+    /// This file source with `masks`, its filter evaluated over its exact
+    /// selection, kept for its reads ([`FileFilter::Kept`]).
     #[cfg(feature = "file-io")]
     pub(crate) fn with_evaluated_masks(&self, masks: Arc<SplitMasks>) -> Self {
         debug_assert!(self.has_filter(), "masks are a pending filter's");
@@ -245,20 +313,22 @@ impl QuadsSource {
             "masks cover an exact selection"
         );
         let mut source = self.clone();
-        if let Backend::File(base) = &mut source.backend {
-            base.pins = Self::pins_of(base.filter.as_ref(), masks.kept());
-            base.masks = Some(masks);
+        if let Backend::File(base) = &mut source.backend
+            && let Some(filter) = base.filter.over_selection().cloned()
+        {
+            base.filter = FileFilter::Kept { filter, masks };
         }
         source
     }
 
-    /// Whether a pushed-down file filter is still to be evaluated; never for
-    /// an in-memory source, whose matches resolve to exact row ids.
+    /// Whether the selected rows must still pass a pushed-down file filter,
+    /// pending or with its masks kept ([`FileFilter::over_selection`]); never
+    /// for an in-memory source, whose matches resolve to exact row ids.
     pub(crate) fn has_filter(&self) -> bool {
         match &self.backend {
             Backend::InMemory(_) => false,
             #[cfg(feature = "file-io")]
-            Backend::File(base) => base.filter.is_some(),
+            Backend::File(base) => base.filter.over_selection().is_some(),
         }
     }
 
@@ -352,7 +422,7 @@ impl QuadsSource {
     pub(crate) fn file_with(
         &self,
         base: &FileBase,
-        filter: Option<Expression>,
+        filter: FileFilter,
         selection: ViewSelection,
         serve: Option<FileServePlan>,
     ) -> Self {
@@ -363,22 +433,21 @@ impl QuadsSource {
                 file: Arc::clone(&base.file),
                 filter,
                 serve,
-                masks: None,
-                pins: None,
             }),
         }
     }
 
     /// This source under `selection`, with no serve plan; a file source keeps
-    /// its filter. A pending `selection` keeps its deferred ids without a
-    /// plan, which only a view built to be counted or windowed may hold
-    /// ([`is_pending_without_plan`](Self::is_pending_without_plan)).
+    /// the filter its rows must still pass, pending
+    /// ([`FileFilter::derived`]). A pending `selection` keeps its deferred
+    /// ids without a plan, which only a view built to be counted or windowed
+    /// may hold ([`is_pending_without_plan`](Self::is_pending_without_plan)).
     #[inline]
     pub(crate) fn with_selection(&self, selection: ViewSelection) -> Self {
         match &self.backend {
             Backend::InMemory(memory) => self.in_memory_with(memory, selection, None),
             #[cfg(feature = "file-io")]
-            Backend::File(base) => self.file_with(base, base.filter.clone(), selection, None),
+            Backend::File(base) => self.file_with(base, base.filter.derived(), selection, None),
         }
     }
 
@@ -389,45 +458,23 @@ impl QuadsSource {
         match &self.backend {
             Backend::InMemory(memory) => self.in_memory_with(memory, ViewSelection::all(), None),
             #[cfg(feature = "file-io")]
-            Backend::File(base) => self.file_with(base, None, ViewSelection::all(), None),
+            Backend::File(base) => {
+                self.file_with(base, FileFilter::None, ViewSelection::all(), None)
+            }
         }
     }
 
     /// This source with its pushed-down filter resolved into its exact
-    /// selection: the filter dropped, and the filter's masks with it, the
-    /// codes the filter pinned kept for the reads by id
-    /// ([`FileBase::pins`]); a no-op in memory.
+    /// selection: the filter dropped, and the masks a window kept of it, the
+    /// codes its equalities pin kept for the reads by id
+    /// ([`FileFilter::Resolved`]); a no-op in memory.
     pub(crate) fn with_filter_resolved(mut self) -> Self {
-        #[cfg(feature = "file-io")]
-        let rows = match &self.selection {
-            ViewSelection::Exact(selection) => selection.len(self.base_len()),
-            ViewSelection::Pending(_) => 0,
-        };
         match &mut self.backend {
             Backend::InMemory(_) => {}
             #[cfg(feature = "file-io")]
-            Backend::File(base) => {
-                base.pins = Self::pins_of(base.filter.as_ref(), rows);
-                base.filter = None;
-                base.masks = None;
-            }
+            Backend::File(base) => base.filter = base.filter.resolved(),
         }
         self
-    }
-
-    /// The codes `filter` pins, for [`FileBase::pins`] of a view of `rows`
-    /// rows: none for fewer rows than a point read pins for
-    /// ([`PIN_POINT_MIN_ROWS`](crate::store::scan::file_reads::PIN_POINT_MIN_ROWS)),
-    /// or without a filter of code equalities.
-    #[cfg(feature = "file-io")]
-    fn pins_of(filter: Option<&Expression>, rows: usize) -> Option<Arc<PinnedCodes>> {
-        use crate::store::scan::file_reads::PIN_POINT_MIN_ROWS;
-
-        if rows < PIN_POINT_MIN_ROWS {
-            return None;
-        }
-        let pins = PinnedCodes::of(filter);
-        (!pins.is_empty()).then(|| Arc::new(pins))
     }
 
     /// This source with the base rows `doomed` sets added to its tombstones,

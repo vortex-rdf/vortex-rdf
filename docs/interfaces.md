@@ -16,7 +16,7 @@ tests pin each interface
 | What the engine needs | What it calls |
 |---|---|
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L70), [`code_chunks`](../core/src/store/read/chunks.rs#L102) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L153), [`index_components`](../core/src/store/read/metadata.rs#L227), [`partitions`](../core/src/store/read/metadata.rs#L262) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L153), [`index_components`](../core/src/store/read/metadata.rs#L225), [`partitions`](../core/src/store/read/metadata.rs#L260) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L139), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |

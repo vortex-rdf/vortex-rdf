@@ -36,9 +36,11 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
 #[cfg(feature = "file-io")]
-use crate::store::FileBase;
-#[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
+#[cfg(feature = "file-io")]
+use crate::store::scan::file_exprs::PushedFilter;
+#[cfg(feature = "file-io")]
+use crate::store::{FileBase, FileFilter};
 #[cfg(feature = "file-io")]
 use std::ops::Range;
 #[cfg(feature = "file-io")]
@@ -677,11 +679,10 @@ impl VortexRdfStore {
         need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
-        let FileBase {
-            file,
-            filter: existing_filter,
-            ..
-        } = base;
+        let file = &base.file;
+        // The filter earlier matches left, which every selected row must
+        // still pass (a window's kept masks are of the old selection).
+        let existing_filter = base.filter.over_selection();
         let existing_selection = &self.quads.selection;
         // A bound subject on a sorted file resolves to its exact row range
         // first, by binary-searching the subject column's encoded chunks (the
@@ -788,11 +789,12 @@ impl VortexRdfStore {
                 (file_exprs::build_file_filter(pat, codes)?, None, None)
             }
         };
-        // ANDed with the filter earlier matches left on this view.
-        let filter = match (existing_filter.clone(), next_filter) {
-            (Some(lhs), Some(rhs)) => Some(and(lhs, rhs)),
-            (Some(lhs), None) => Some(lhs),
-            (None, rhs) => rhs,
+        // ANDed with the filter earlier matches left on this view, its code
+        // equalities read out once for every read of the derived view.
+        let filter = match (existing_filter, next_filter) {
+            (Some(lhs), Some(rhs)) => Some(PushedFilter::new(and(lhs.expr().clone(), rhs))),
+            (Some(lhs), None) => Some(lhs.clone()),
+            (None, rhs) => rhs.map(PushedFilter::new),
         };
 
         let selection = match resolved_selection {
@@ -805,7 +807,7 @@ impl VortexRdfStore {
                 let existing = existing_selection.materialized_async().await?;
                 ViewSelection::Exact(match (&subject_range, &filter) {
                     (Some(_), _) => apply_subject(existing),
-                    (None, Some(f)) => Self::prune_by_filter(file, existing, f, t).await?,
+                    (None, Some(f)) => Self::prune_by_filter(file, existing, f.expr(), t).await?,
                     (None, None) => existing,
                 })
             }
@@ -850,7 +852,8 @@ impl VortexRdfStore {
         // use; the tombstones carry over unchanged, and the reads apply them
         // (see `restrict_scan`).
         Ok(self.derived(
-            self.quads.file_with(base, filter, selection, serve),
+            self.quads
+                .file_with(base, FileFilter::pending(filter), selection, serve),
             self.tail.clone(),
         ))
     }

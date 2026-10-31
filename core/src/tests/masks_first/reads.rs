@@ -590,7 +590,7 @@ async fn test_dropping_a_spawned_capped_count_aborts_its_splits() {
 /// the first 300 rows of `pm` in the default graph are taken without `p`
 /// and `g`. Every answer is the in-memory store's.
 ///
-/// [`PIN_POINT_MIN_ROWS`]: crate::store::scan::file_reads::PIN_POINT_MIN_ROWS
+/// [`PIN_POINT_MIN_ROWS`]: crate::store::scan::file_exprs::PIN_POINT_MIN_ROWS
 #[tokio::test]
 async fn test_masked_reads_skip_the_columns_the_filter_pins() {
     use crate::store::scan::file_reads::masked_column_hooks;

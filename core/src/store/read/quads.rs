@@ -32,9 +32,11 @@ use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
+use crate::store::scan::file_exprs::CodeEqs;
+#[cfg(feature = "file-io")]
 use crate::store::scan::file_filter::SplitMasks;
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_reads::{self, PinnedCodes};
+use crate::store::scan::file_reads;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scans::{SPLITS_IN_FLIGHT_PER_CORE, ScanDriver};
 #[cfg(feature = "file-io")]
@@ -254,10 +256,10 @@ impl VortexRdfStore {
             return self.scan_chunks(plan.scan()?, decoder, tail);
         }
         if mode == QuadRead::Collected
-            && let Some(masks) = &base.masks
+            && let Some(masks) = base.filter.kept_masks()
         {
             return self
-                .masked_chunks(file, masks, base.filter.as_ref(), tail)
+                .masked_chunks(file, masks, base.filter.pins(), tail)
                 .await;
         }
         let primary = self.layout.strategy().primary_column_names();
@@ -265,7 +267,9 @@ impl VortexRdfStore {
         if mode == QuadRead::Collected
             && let Some(masks) = scope.masks_first(&read).await?
         {
-            return self.masked_chunks(file, &masks, scope.filter, tail).await;
+            return self
+                .masked_chunks(file, &masks, scope.filter_eqs(), tail)
+                .await;
         }
         // A stream takes the filter by its masks first too, split by split as
         // it reaches them, under the row-scan driver.
@@ -294,8 +298,9 @@ impl VortexRdfStore {
     /// split masks), then the tail's chunk, read as [`MaskedRead`] chooses:
     /// point by point as one chunk, read inline, or else one chunk per split
     /// with a match, taken at its ids or projected at its mask, reading only
-    /// the columns `filter` leaves free and filling the ones it pins with
-    /// their codes where the read pins ([`PinnedCodes::pins`]). Those split reads are spawned onto the
+    /// the columns the equalities `pins` leave free and filling the others
+    /// with their codes where the read fills them ([`CodeEqs::for_points`]).
+    /// Those split reads are spawned onto the
     /// tokio runtime whenever there is more than one and a runtime is
     /// current, whatever the row-scan driver's split limit: the read is
     /// collected whole, so many splits' reads overlap their decodes, where a
@@ -308,18 +313,18 @@ impl VortexRdfStore {
         &self,
         file: &Arc<NativeStoreFile>,
         masks: &SplitMasks,
-        filter: Option<&vortex_array::expr::Expression>,
+        pins: &CodeEqs,
         tail: Vec<Result<T>>,
     ) -> Result<Chunks<T>> {
         let primary = self.layout.strategy().primary_column_names();
         let read = MaskedRead::of(file, masks)?;
-        // Only the columns the filter leaves free are read where the read
-        // pins: every row the masks keep holds the pinned code in the others.
-        let pinned = Arc::new(if PinnedCodes::pins(read, masks.kept()) {
-            PinnedCodes::of(filter)
-        } else {
-            PinnedCodes::default()
-        });
+        // Only the columns the equalities leave free are read where the read
+        // fills them: every row the masks keep holds its code in the others.
+        let pinned = match read {
+            MaskedRead::Points => pins.for_points(masks.kept()),
+            MaskedRead::Take | MaskedRead::Project => pins,
+        }
+        .clone();
         let read_columns = pinned.columns_to_read(primary);
         if read == MaskedRead::Points {
             let ids = masks.first_ids(usize::MAX);
@@ -334,7 +339,7 @@ impl VortexRdfStore {
         let tasks: Vec<file_reads::SplitRead> = tasks
             .into_iter()
             .map(|task| {
-                let pinned = Arc::clone(&pinned);
+                let pinned = pinned.clone();
                 async move {
                     task.await?
                         .map(|rows| {
@@ -712,7 +717,7 @@ mod tests {
             assert!(matches!(
                 filtered.quads.file(),
                 Some(FileBase {
-                    filter: Some(_),
+                    filter: crate::store::FileFilter::Pending(_),
                     serve: None,
                     ..
                 })

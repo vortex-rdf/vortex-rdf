@@ -321,6 +321,77 @@ async fn test_kept_masks_never_outlive_a_derivation() {
     }
 }
 
+/// A window of a view whose window kept its filter's masks cuts those masks:
+/// cutting the base's rows, skipping some, or cutting only the tail's, the
+/// window and the reads and counts of what it leaves evaluate no split of the
+/// filter again, and answer what the same window of an in-memory twin
+/// answers. A window that cuts only the tail keeps the masks.
+#[tokio::test]
+async fn test_window_of_a_kept_masks_view_cuts_its_masks() {
+    use crate::store::scan::file_filter::split_hooks;
+
+    let (_dir, path) = masks_file().await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let tailed = store.add_quads(masks_tail()).await.unwrap();
+    let memory_tailed = memory.add_quads(masks_tail()).await.unwrap();
+    let stores = [
+        ("as written", &store, &memory),
+        ("tailed", &tailed, &memory_tailed),
+    ];
+    for (variant, store, memory) in stores {
+        let dense = masks_probes().into_iter().filter(|p| p.dense);
+        for MasksProbe { shape, probe, .. } in dense {
+            let label = format!("{variant} {shape}");
+            let n = store.run_probe(&probe).await.unwrap().size().await.unwrap();
+            let windowed = probe.clone().window(0, Some(n + 1));
+            let view = store.run_probe(&windowed).await.unwrap();
+            let twin = memory.run_probe(&windowed).await.unwrap();
+            let Some(kept) = view.debug_evaluated_len() else {
+                panic!("{label}: kept masks");
+            };
+            assert!(
+                kept > 4 && kept <= n,
+                "{label}: {kept} of {n} rows in the base"
+            );
+            let tail_only = (0, kept + (n - kept) / 2);
+            for (offset, limit) in [
+                (0, 1),
+                (0, kept / 2),
+                (1, kept / 3),
+                (kept / 2, usize::MAX),
+                (n - 1, 5),
+                tail_only,
+            ] {
+                let label = format!("{label} window({offset}, {limit})");
+                let evaluated = split_hooks::evaluated();
+                let cut = view.window(offset, limit).await.unwrap();
+                let twin_cut = twin.window(offset, limit).await.unwrap();
+                let want = twin_cut.quads_vec().await.unwrap();
+                assert!(!want.is_empty(), "{label}: rows to check");
+                assert_eq!(
+                    cut.quads_vec().await.unwrap(),
+                    want,
+                    "{label}: the twin's rows"
+                );
+                assert_eq!(cut.size().await.unwrap(), want.len(), "{label}: size");
+                assert_eq!(
+                    split_hooks::evaluated(),
+                    evaluated,
+                    "{label}: no split evaluated again"
+                );
+                if (offset, limit) == tail_only && kept < n {
+                    assert_eq!(
+                        cut.debug_evaluated_len(),
+                        Some(kept),
+                        "{label}: the masks kept"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Under tombstones, a window over a file view whose reads take its pending
 /// filter by the masks first counts none of the view's live rows: its window
 /// evaluates the filter whatever the bound, so a count for the bound would
