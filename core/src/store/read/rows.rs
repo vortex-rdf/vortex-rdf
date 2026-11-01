@@ -125,7 +125,7 @@ impl VortexRdfStore {
         match self.memory_read(ReadShape::Whole)? {
             // An unserved in-memory view's codes off the base's own columns;
             // none for a file view, whose codes the caller reads off its rows.
-            None => Ok(self.base_code_columns()),
+            None => self.base_code_columns(),
             // The base's codes gathered at the ids a narrowing holds.
             Some(MemoryRead::Gather { ids, .. }) => {
                 let prims = self.base_code_primitives().ok_or_else(|| {
@@ -141,31 +141,28 @@ impl VortexRdfStore {
         }
     }
 
-    /// [`code_columns`](Self::code_columns) without the served path: the
-    /// view's codes from the base's own columns in base row order, whatever
-    /// answered the match (an unserved view's order, and a served view's
-    /// base-order twin in tests). A served match's pending selection
-    /// materializes here. `None` under the same conditions as
-    /// `code_columns`.
-    pub(crate) fn base_code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
-        if !self.is_code_view() {
-            return None;
-        }
-        let prims = self.base_code_primitives()?;
-        // A gather by row id needs the exact selection: a served match's
-        // deferred decode and sort run here.
-        let selection = self.quads.selection.materialized().ok()?;
+    /// [`code_columns`](Self::code_columns) of an unserved view: its codes
+    /// from the base's own columns in base row order. A pending selection (a
+    /// run deferred for a count or a window) materializes here, its error
+    /// the read's. `Ok(None)` under the same conditions as `code_columns`.
+    fn base_code_columns(&self) -> Result<Option<[Buffer<TermCode>; 4]>> {
+        let Some(prims) = self.base_code_primitives() else {
+            return Ok(None);
+        };
+        // A gather by row id needs the exact selection: a deferred run's
+        // decode and sort run here.
+        let selection = self.quads.selection.materialized()?;
         // Without tombstones a contiguous selection shares the base's buffers
         // (a `Buffer` slice is a refcount bump) and an id list is a
         // branch-free gather; only tombstoned views test liveness per row.
         let rows = selection.as_rows(self.quads.base_len());
         let Some(deleted) = &self.quads.deleted else {
-            return Some(match rows {
+            return Ok(Some(match rows {
                 SelectedRows::Run(run) => {
                     prims.map(|prim| prim.into_buffer::<TermCode>().slice(run.clone()))
                 }
                 SelectedRows::Ids(ids) => gather_codes(&prims, ids),
-            });
+            }));
         };
         let live = |i: usize| !deleted.value(i);
         let column = |prim: &PrimitiveArray| -> Buffer<TermCode> {
@@ -182,7 +179,7 @@ impl VortexRdfStore {
                 ),
             }
         };
-        Some(prims.each_ref().map(column))
+        Ok(Some(prims.each_ref().map(column)))
     }
 
     /// The base's `s`, `p`, `o` and `g` code columns as canonical
@@ -251,9 +248,11 @@ impl VortexRdfStore {
             serve: Some(plan),
             ..
         }) = self.quads.file()
-            && let Some(columns) = plan.code_columns(file, self.quads.deleted.as_ref()).await?
         {
-            return Ok(Some(columns));
+            return plan
+                .code_columns(file, self.quads.deleted.as_ref())
+                .await
+                .map(Some);
         }
         // On file the read is a one-shot read's plan (`collected_plan`): a
         // filter's kept rows read straight into the code buffers, point by

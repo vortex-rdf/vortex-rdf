@@ -17,6 +17,8 @@ use vortex_mask::Mask;
 
 use super::keep::Keep;
 use crate::error::Result;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::array::bool_array_to_mask;
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
@@ -25,8 +27,6 @@ use crate::store::layouts::{PatternCodes, QuadPattern};
 use crate::store::scan::residual::mask_for;
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection, window_rows};
-#[cfg(feature = "file-io")]
-use crate::store::{FileBase, read::chunks::extract_codes};
 use crate::store::{MemoryBase, QuadsSource, VortexRdfStore};
 
 /// A served view's plan beside its base, with the rows of the index it
@@ -322,37 +322,10 @@ impl<'a> Served<'a> {
                 })?))
             }
             #[cfg(feature = "file-io")]
-            Backend::File { base, plan } => {
-                use crate::store::indexes::{COL_RID, base_row};
-
-                let name = column.name();
-                Ok(Some(match &self.span {
-                    // Kept rows are live: only `admits` tests them.
-                    ServedSpan::Kept(kept) => {
-                        let read = plan
-                            .columns_at(&base.file, &[name], &kept.positions)
-                            .await?;
-                        let codes = extract_codes(read, &[name])?.remove(0);
-                        let mut codes = codes.iter();
-                        ServedRows::collect(kept.positions_and_rids(), kept.len(), |_, _| {
-                            codes.next().is_some_and(|&code| admits(code))
-                        })
-                    }
-                    ServedSpan::Range(range) => {
-                        let mut columns = plan
-                            .range_columns(&base.file, range.clone(), &[name, COL_RID])
-                            .await?;
-                        let (rids, codes) = (columns.remove(1), columns.remove(0));
-                        let rows = range.clone().zip(rids.iter().map(|&rid| base_row(rid)));
-                        let mut codes = codes.iter();
-                        ServedRows::collect(rows, codes.len(), |_, rid| {
-                            // Every row's code is passed, tombstoned or not.
-                            let admitted = codes.next().is_some_and(|&code| admits(code));
-                            admitted && deleted.is_none_or(|d| !d.value(rid as usize))
-                        })
-                    }
-                }))
-            }
+            Backend::File { base, plan } => plan
+                .kept_rows(&base.file, deleted, column.name(), admits)
+                .await
+                .map(Some),
         }
     }
 
@@ -405,14 +378,7 @@ impl<'a> Served<'a> {
     fn narrowed_file(&self, base: &FileBase, plan: &FileServePlan, cut: Cut) -> QuadsSource {
         let (span, ids) = match cut {
             Cut::Range { range, .. } => {
-                // A copy child's rids follow its own sort order, which nothing
-                // ties to base row order: they are not taken to ascend.
-                let ids = LazyRowIds::from_located_run(
-                    Arc::clone(&base.file),
-                    plan.child().clone(),
-                    range.clone(),
-                    false,
-                );
+                let ids = plan.range_ids(&base.file, range.clone());
                 (ServedSpan::Range(range), ids)
             }
             Cut::Listed { span, rids } => (span, LazyRowIds::from_unsorted_ids(rids, true)),
@@ -614,11 +580,11 @@ impl VortexRdfStore {
         let names: Vec<&'static str> = eqs.iter().map(|(name, _)| *name).collect();
         let read = served.columns_at(&names, &rows.positions).await?;
         let holding = bool_array_to_mask(mask_for(&read, &eqs)?)?;
-        let mut row = 0;
-        let kept = ServedRows::collect(rows.positions_and_rids(), rows.len(), |_, _| {
-            row += 1;
-            holding.value(row - 1)
-        });
+        let holding = rows
+            .positions_and_rids()
+            .zip(0..)
+            .filter_map(|(row, i)| holding.value(i).then_some(row));
+        let kept = ServedRows::collect(holding, rows.len());
         if kept.len() == 0 {
             return Ok(self.empty_view());
         }

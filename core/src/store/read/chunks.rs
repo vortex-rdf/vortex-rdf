@@ -162,7 +162,7 @@ impl VortexRdfStore {
         let tail = self.tail_chunks(batch_rows)?;
         let primary = self.layout.strategy().primary_column_names();
         let base = match self.served_read()? {
-            Some(served) => served.row_chunks(primary, batch_rows)?,
+            Some(served) => served.row_chunks(self, primary, batch_rows)?,
             None => self.base_chunks(primary, batch_rows).await?,
         };
         Ok(base.chain(stream::iter(tail)).boxed())

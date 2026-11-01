@@ -63,61 +63,32 @@ pub(super) enum MemoryRead<'a> {
 
 /// How a chunk stream takes a served view's rows in its index's order,
 /// decided once per stream ([`VortexRdfStore::served_read`]).
-// Built once per stream and matched at once: boxing the file read's scan
-// would cost every served file stream an allocation for nothing.
-#[allow(clippy::large_enum_variant)]
 pub(super) enum ServedRead<'a> {
     /// In memory, as a chunk read takes the rows ([`MemoryRead`]).
     Memory(MemoryRead<'a>),
-    /// On file, the plan's rows as it reads them ([`PlanRead`]), beside the
-    /// tombstones each chunk's decode still drops.
+    /// On file, the plan's rows as it reads them ([`FileServePlan::read`]),
+    /// the view's `deleted` tombstones dropped.
     #[cfg(feature = "file-io")]
     File {
         file: &'a Arc<NativeStoreFile>,
         plan: &'a FileServePlan,
-        read: PlanRead,
-        deleted: Option<Mask>,
-    },
-    /// On file, a TypedObject view's chunks: its copies hold string
-    /// objects, not the layout's typed ones, so each batch of the view's ids
-    /// in the index's order ([`FileServePlan::live_rows`]) is taken from the
-    /// base.
-    #[cfg(feature = "file-io")]
-    TypedObject {
-        file: &'a Arc<NativeStoreFile>,
-        plan: &'a FileServePlan,
-        deleted: Option<Mask>,
+        deleted: Option<&'a Mask>,
     },
 }
 
 impl VortexRdfStore {
     /// How this view's chunk streams read it in its index's order: the one
     /// place a stream asks whether and how a plan serves the view. On file
-    /// the plan reads its own rows ([`FileServePlan::read`]), and a
-    /// TypedObject view's chunks are taken from the base; in memory, as
+    /// the plan reads its own rows ([`FileServePlan::read`]); in memory, as
     /// [`memory_read`](Self::memory_read) decides for a chunk read. `None`
     /// for a view no plan serves.
     pub(super) fn served_read(&self) -> Result<Option<ServedRead<'_>>> {
         #[cfg(feature = "file-io")]
         if let Some(base) = self.quads.file() {
-            let Some(plan) = &base.serve else {
-                return Ok(None);
-            };
-            let deleted = self.quads.deleted.as_ref();
-            if self.layout.strategy() == LayoutStrategy::TypedObject {
-                return Ok(Some(ServedRead::TypedObject {
-                    file: &base.file,
-                    plan,
-                    deleted: deleted.cloned(),
-                }));
-            }
-            let read = plan.read()?;
-            let deleted = read.tombstones(deleted).cloned();
-            return Ok(Some(ServedRead::File {
+            return Ok(base.serve.as_ref().map(|plan| ServedRead::File {
                 file: &base.file,
                 plan,
-                read,
-                deleted,
+                deleted: self.quads.deleted.as_ref(),
             }));
         }
         Ok(self.memory_read(ReadShape::Chunks)?.map(ServedRead::Memory))
@@ -193,14 +164,14 @@ impl ServedRead<'_> {
             ServedRead::File {
                 file,
                 plan,
-                read,
                 deleted,
             } => {
-                let (plan, file) = (plan.clone(), Arc::clone(file));
+                let (read, deleted) = plan.read(deleted)?;
+                let (plan, file, deleted) = (plan.clone(), Arc::clone(file), deleted.cloned());
                 let codes = match read {
                     // Kept rows, or a point-sized run: each batch's codes
                     // point by point, straight into code buffers.
-                    PlanRead::Kept(positions) | PlanRead::Points(positions) => {
+                    PlanRead::Points(positions) => {
                         stream::iter(batch_ranges(positions.len(), batch_rows))
                             .then(move |batch| {
                                 let (plan, file, deleted) =
@@ -227,12 +198,6 @@ impl ServedRead<'_> {
                     })
                     .boxed()
             }
-            #[cfg(feature = "file-io")]
-            ServedRead::TypedObject { .. } => {
-                return Err(VortexRdfError::InvalidOperation(
-                    "a TypedObject store's rows hold terms, not codes".into(),
-                ));
-            }
         })
     }
 
@@ -240,10 +205,11 @@ impl ServedRead<'_> {
     /// `batch_rows` rows each, in its index's order: in memory the base's
     /// rows gathered at each window of its ids, or each window of its live
     /// rows read off the component; on file each of the plan's chunks as the
-    /// primary columns, tombstoned rows dropped, or for TypedObject each
-    /// batch of its ids taken from the base.
+    /// primary columns, tombstoned rows dropped, or for a TypedObject
+    /// `store` each batch of its ids taken from the base.
     pub(super) fn row_chunks(
         self,
+        #[cfg_attr(not(feature = "file-io"), allow(unused_variables))] store: &VortexRdfStore,
         columns: &[&'static str],
         batch_rows: usize,
     ) -> Result<RowChunkStream> {
@@ -271,11 +237,22 @@ impl ServedRead<'_> {
             ServedRead::File {
                 file,
                 plan,
-                read,
                 deleted,
             } => {
+                // A TypedObject view's copies hold string objects, not the
+                // layout's typed ones.
+                if store.layout.strategy() == LayoutStrategy::TypedObject {
+                    return Ok(typed_rows(
+                        plan.clone(),
+                        Arc::clone(file),
+                        deleted.cloned(),
+                        columns,
+                        batch_rows,
+                    ));
+                }
+                let (read, deleted) = plan.read(deleted)?;
                 let chunks = plan.read_chunks(read, Arc::clone(file), batch_rows)?;
-                let plan = plan.clone();
+                let (plan, deleted) = (plan.clone(), deleted.cloned());
                 chunks
                     .flat_map(move |chunk| {
                         let rows = chunk
@@ -287,12 +264,6 @@ impl ServedRead<'_> {
                     })
                     .boxed()
             }
-            #[cfg(feature = "file-io")]
-            ServedRead::TypedObject {
-                file,
-                plan,
-                deleted,
-            } => typed_rows(plan.clone(), Arc::clone(file), deleted, columns, batch_rows),
         })
     }
 }

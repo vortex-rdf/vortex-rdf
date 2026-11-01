@@ -243,7 +243,10 @@ impl VortexRdfStore {
     /// expression. A view a by-copy index serves is kept in its index's order
     /// and stays served: its rows are tested in that order and the kept ones
     /// read off the index (on file an unlocated run is read once by row index
-    /// first). Any other pending view's deferred row ids (a run held for a
+    /// first). In memory that needs the column's codes from the base's code
+    /// cache or the serving component's probes; a column neither reads (an
+    /// encoding the probes decline) is kept as an unserved view is, in base
+    /// order. Any other pending view's deferred row ids (a run held for a
     /// count) materialize first.
     ///
     /// [`match_pattern`]: Self::match_pattern

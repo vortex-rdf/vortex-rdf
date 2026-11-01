@@ -141,18 +141,26 @@ impl InMemoryServePlan {
     ) -> Result<ServedRows> {
         Ok(match self.covered() {
             // Kept rows are live: only `admit` tests them.
-            Covered::Kept(kept) => {
-                ServedRows::collect(kept.positions_and_rids(), kept.len(), admit)
-            }
+            Covered::Kept(kept) => ServedRows::collect(
+                kept.positions_and_rids()
+                    .filter(|&(position, rid)| admit(position, rid)),
+                kept.len(),
+            ),
             Covered::Range(range) => {
                 let run = self.run_rids()?;
                 let rows = (range.start as u64..range.end as u64)
                     .zip(run[self.slots(&range)].iter().copied());
                 match deleted {
-                    None => ServedRows::collect(rows, range.len(), admit),
-                    Some(deleted) => ServedRows::collect(rows, range.len(), |position, rid| {
-                        !deleted.value(rid as usize) && admit(position, rid)
-                    }),
+                    None => ServedRows::collect(
+                        rows.filter(|&(position, rid)| admit(position, rid)),
+                        range.len(),
+                    ),
+                    Some(deleted) => ServedRows::collect(
+                        rows.filter(|&(position, rid)| {
+                            !deleted.value(rid as usize) && admit(position, rid)
+                        }),
+                        range.len(),
+                    ),
                 }
             }
         })
@@ -410,16 +418,8 @@ impl InMemoryServePlan {
         rows: &ComponentRows,
         window: Range<usize>,
     ) -> Result<ArrayRef> {
-        observe!(ServedComponentChunk(window.len()));
-        let chunk = match rows {
-            ComponentRows::Range(range) => self
-                .array
-                .slice(range.start + window.start..range.start + window.end)?,
-            ComponentRows::Positions(positions) => self.array.take(
-                PrimitiveArray::new(positions.slice(window), Validity::NonNullable).into_array(),
-            )?,
-        };
-        self.decode.chunk_rows(&chunk, None)
+        self.decode
+            .chunk_rows(&self.window_chunk(rows, window)?, None)
     }
 
     /// [`window_rows`](Self::window_rows) as the four code columns, under
@@ -429,8 +429,22 @@ impl InMemoryServePlan {
         rows: &ComponentRows,
         window: Range<usize>,
     ) -> Result<[Buffer<TermCode>; 4]> {
-        let chunk = self.window_rows(rows, window)?;
-        self.decode.chunk_code_columns(&chunk, None)
+        self.decode
+            .chunk_code_columns(&self.window_chunk(rows, window)?, None)
+    }
+
+    /// The component's rows `window` of `rows`, in child schema: a slice of
+    /// the run, or one take at their positions.
+    fn window_chunk(&self, rows: &ComponentRows, window: Range<usize>) -> Result<ArrayRef> {
+        observe!(ServedComponentChunk(window.len()));
+        Ok(match rows {
+            ComponentRows::Range(range) => self
+                .array
+                .slice(range.start + window.start..range.start + window.end)?,
+            ComponentRows::Positions(positions) => self.array.take(
+                PrimitiveArray::new(positions.slice(window), Validity::NonNullable).into_array(),
+            )?,
+        })
     }
 }
 

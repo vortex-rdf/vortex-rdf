@@ -3,12 +3,12 @@
 //! point when small), else under the pushed-down term-equality filter.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use futures::stream::{self, BoxStream, StreamExt};
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::dtype::Nullability;
-use vortex_array::expr::{col, pack, root, select};
+use vortex_array::expr::{BoundExpression, col, pack, root, select};
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
@@ -23,14 +23,14 @@ use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::SortOrder;
-use crate::store::indexes::COL_RID;
 use crate::store::indexes::copy::CHILD_COLUMNS;
+use crate::store::indexes::{COL_RID, LazyRowIds, base_row};
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
 use crate::store::read::chunks::extract_codes;
 use crate::store::scan::file_exprs::eq_conjunction;
 use crate::store::scan::file_reads::{component_point_rows, component_point_values};
 use crate::store::scan::file_scans::{read_all_rows, stream_rows};
-use crate::store::schema::TermCode;
+use crate::store::schema::{RowId, TermCode};
 use crate::store::view::selection::point_sized;
 
 /// An index's serving plan for a file-backed view: the matched rows are those
@@ -80,43 +80,58 @@ pub(crate) struct FileServePlan {
 // every served file read an allocation for nothing.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PlanRead {
-    /// The kept rows, each live, read point by point at these child rows.
-    Kept(Buffer<u64>),
-    /// A located range of at most [`POINT_GATHER_MAX_ROWS`] rows, read point
-    /// by point at these child rows; its tombstoned rows still to drop.
+    /// Point by point at these child rows: the kept rows, or a located range
+    /// of at most [`POINT_GATHER_MAX_ROWS`] rows.
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     Points(Buffer<u64>),
     /// A wider located range by row range, split across the workers, or an
-    /// unlocated run under the plan's filter; its tombstoned rows still to
-    /// drop.
+    /// unlocated run under the plan's filter.
     Scan(ScanBuilder<ArrayRef>),
-}
-
-impl PlanRead {
-    /// The tombstones a read of these rows still drops, of the view's
-    /// `deleted`: none for kept rows, which are live.
-    pub(crate) fn tombstones<'a>(&self, deleted: Option<&'a Mask>) -> Option<&'a Mask> {
-        match self {
-            PlanRead::Kept(_) => None,
-            PlanRead::Points(_) | PlanRead::Scan(_) => deleted,
-        }
-    }
 }
 
 /// What a [`FileServePlan`] fills on first use, behind one `Arc` its clones
 /// share.
 #[derive(Default)]
 struct PlanCells {
-    /// The lazily bound (projection, filter) pair.
-    bound: std::sync::OnceLock<(
-        vortex_array::expr::BoundExpression,
-        vortex_array::expr::BoundExpression,
-    )>,
+    /// The plan's projection, bound on first use
+    /// ([`projection`](FileServePlan::projection)).
+    projection: OnceLock<BoundExpression>,
+    /// The plan's filter, bound on first use
+    /// ([`filter`](FileServePlan::filter)): only a scan of an unlocated run
+    /// applies it, so a located read never binds it.
+    filter: OnceLock<BoundExpression>,
     /// An unlocated run's rows as its first narrowing locates them
     /// ([`located_span`](FileServePlan::located_span)), read once by row
-    /// index for every narrowing after.
-    located: std::sync::OnceLock<ServedSpan>,
+    /// index for every narrowing after. Its kept rows are the live ones under
+    /// the first caller's tombstones, which every caller shares: a plan's
+    /// views keep the tombstones of the view it was resolved for, as only an
+    /// owner's source, which holds no plan, takes new ones
+    /// ([`with_tombstones`](crate::store::QuadsSource::with_tombstones)).
+    located: OnceLock<ServedSpan>,
+}
+
+/// The expression `cell` holds, bound by `bind` on the first call.
+fn bound_once(
+    cell: &OnceLock<BoundExpression>,
+    bind: impl FnOnce() -> Result<BoundExpression>,
+) -> Result<BoundExpression> {
+    if let Some(bound) = cell.get() {
+        return Ok(bound.clone());
+    }
+    let bound = bind()?;
+    Ok(cell.get_or_init(|| bound).clone())
+}
+
+/// The child rows `range` beside the base row id each mirrors, `rids` being
+/// the range's rid column.
+fn child_rows(range: Range<u64>, rids: &Buffer<u64>) -> impl Iterator<Item = (u64, RowId)> + '_ {
+    range.zip(rids.iter().map(|&rid| base_row(rid)))
+}
+
+/// Whether the base row `rid` survives the `deleted` tombstones.
+fn is_live(deleted: Option<&Mask>, rid: RowId) -> bool {
+    deleted.is_none_or(|d| !d.value(rid as usize))
 }
 
 /// The fewest rows a located run's scan split carries: below this the
@@ -161,7 +176,7 @@ impl FileServePlan {
     /// id.
     async fn read_run_rows(&self) -> Result<ServedRows> {
         observe!(ServedRunLocated);
-        let (_, filter) = self.bound_exprs()?;
+        let filter = self.filter()?;
         let projection = self.child.bind(&pack(
             [("position", row_idx()), ("rid", col(COL_RID))],
             Nullability::NonNullable,
@@ -173,11 +188,7 @@ impl FileServePlan {
         )
         .await?;
         let mut columns = extract_codes(rows, &["position", "rid"])?;
-        let rids = columns
-            .remove(1)
-            .iter()
-            .map(|&rid| crate::store::indexes::base_row(rid))
-            .collect();
+        let rids = columns.remove(1).iter().map(|&rid| base_row(rid)).collect();
         Ok(ServedRows {
             positions: columns.remove(0),
             rids,
@@ -241,9 +252,13 @@ impl FileServePlan {
         }
     }
 
-    /// The serving index child, which the view's lazy ids read.
-    pub(crate) fn child(&self) -> &ChildReader {
-        &self.child
+    /// The base row ids of the child rows `range` (a part of the run), read
+    /// on first need off those rows of the child's rid column: what a window
+    /// or partition of a range holds. A copy child's rids follow its own sort
+    /// order, which nothing ties to base row order: they are not taken to
+    /// ascend.
+    pub(crate) fn range_ids(&self, file: &Arc<NativeStoreFile>, range: Range<u64>) -> LazyRowIds {
+        LazyRowIds::from_located_run(Arc::clone(file), self.child.clone(), range, false)
     }
 
     /// The child's `columns` at the child rows `positions` (ascending, not
@@ -262,13 +277,7 @@ impl FileServePlan {
             return Ok(rows);
         }
         let (first, last) = (positions[0], positions[positions.len() - 1]);
-        let projection = self.child.bind(&select(columns.to_vec(), root()))?;
-        let span = read_all_rows(
-            self.child_scan()
-                .with_projection(projection)
-                .with_row_range(first..last + 1),
-        )
-        .await?;
+        let span = read_all_rows(self.child.scan(columns)?.with_row_range(first..last + 1)).await?;
         let indices: Buffer<u64> = positions.iter().map(|&position| position - first).collect();
         span.take(PrimitiveArray::new(indices, Validity::NonNullable).into_array())
             .map_err(VortexRdfError::Vortex)
@@ -287,7 +296,7 @@ impl FileServePlan {
     /// The child's `columns` over the child rows `range`, as `u64` buffers in
     /// the child's order: point by point when the range is point-sized, else
     /// a scan of the range projecting them.
-    pub(crate) async fn range_columns(
+    async fn range_columns(
         &self,
         file: &NativeStoreFile,
         range: Range<u64>,
@@ -300,13 +309,7 @@ impl FileServePlan {
             let positions: Buffer<u64> = range.collect();
             self.columns_at(file, columns, &positions).await?
         } else {
-            let projection = self.child.bind(&select(columns.to_vec(), root()))?;
-            read_all_rows(
-                self.child_scan()
-                    .with_projection(projection)
-                    .with_row_range(range),
-            )
-            .await?
+            read_all_rows(self.child.scan(columns)?.with_row_range(range)).await?
         };
         extract_codes(rows, columns)
     }
@@ -328,7 +331,7 @@ impl FileServePlan {
 
     /// The child rows `range` with their base row ids (the range's rid
     /// column read), less the `deleted` tombstones, in the child's order.
-    pub(crate) async fn range_rows(
+    async fn range_rows(
         &self,
         file: &NativeStoreFile,
         range: Range<u64>,
@@ -338,41 +341,70 @@ impl FileServePlan {
             .range_columns(file, range.clone(), &[COL_RID])
             .await?
             .remove(0);
-        let rows = range
-            .clone()
-            .zip(rids.iter().map(|&rid| crate::store::indexes::base_row(rid)));
+        let live = child_rows(range.clone(), &rids).filter(|&(_, rid)| is_live(deleted, rid));
         Ok(ServedRows::collect(
-            rows,
+            live,
             (range.end - range.start) as usize,
-            |_, rid| deleted.is_none_or(|d| !d.value(rid as usize)),
         ))
     }
 
-    /// The plan's (projection, filter), bound through the handle's memo on
-    /// first use and shared across clones thereafter.
-    fn bound_exprs(
+    /// The view's live rows whose `column` code `admits`, in the child's
+    /// order: what a keep of the view keeps. Kept rows, which are live, have
+    /// the column read at their positions; a range has it read beside its
+    /// rid column, its tombstoned rows left out. An unlocated run is located
+    /// first ([`located_span`](Self::located_span)); the view covers a row.
+    pub(crate) async fn kept_rows(
         &self,
-    ) -> Result<(
-        vortex_array::expr::BoundExpression,
-        vortex_array::expr::BoundExpression,
-    )> {
-        if let Some(bound) = self.cells.bound.get() {
-            return Ok(bound.clone());
-        }
-        // The serving child's quad columns plus the row-id column, for
-        // tombstones: the copy family's child schema.
-        let projection = select(CHILD_COLUMNS, root());
-        // A serve plan always carries at least one constraint (the resolved
-        // lead component), so the conjunction is never empty.
-        let filter = eq_conjunction(self.constraints.iter().cloned())
-            .expect("a serve plan constrains at least one column");
-        let bound_projection = self.child.bind(&projection)?;
-        let bound_filter = self.child.bind(&filter)?;
-        Ok(self
-            .cells
-            .bound
-            .get_or_init(|| (bound_projection, bound_filter))
-            .clone())
+        file: &NativeStoreFile,
+        deleted: Option<&Mask>,
+        column: &'static str,
+        admits: impl Fn(TermCode) -> bool,
+    ) -> Result<ServedRows> {
+        Ok(match self.located_span(deleted).await? {
+            ServedSpan::Kept(kept) => {
+                let read = self.columns_at(file, &[column], &kept.positions).await?;
+                let codes = extract_codes(read, &[column])?.remove(0);
+                let admitted = kept
+                    .positions_and_rids()
+                    .zip(codes.iter())
+                    .filter_map(|(row, &code)| admits(code).then_some(row));
+                ServedRows::collect(admitted, kept.len())
+            }
+            ServedSpan::Range(range) => {
+                let mut columns = self
+                    .range_columns(file, range.clone(), &[column, COL_RID])
+                    .await?;
+                let (rids, codes) = (columns.remove(1), columns.remove(0));
+                let admitted =
+                    child_rows(range, &rids)
+                        .zip(codes.iter())
+                        .filter_map(|(row, &code)| {
+                            (admits(code) && is_live(deleted, row.1)).then_some(row)
+                        });
+                ServedRows::collect(admitted, codes.len())
+            }
+        })
+    }
+
+    /// The plan's projection, the copy family's child schema (the quad
+    /// columns, and the row-id column for tombstones), bound through the
+    /// handle's memo on first use and shared across clones thereafter.
+    fn projection(&self) -> Result<BoundExpression> {
+        bound_once(&self.cells.projection, || {
+            self.child.bind(&select(CHILD_COLUMNS, root()))
+        })
+    }
+
+    /// The plan's filter, the conjunction of its term equalities, bound as
+    /// [`projection`](Self::projection) is. A serve plan always carries at
+    /// least one constraint (the resolved lead component), so the
+    /// conjunction is never empty.
+    fn filter(&self) -> Result<BoundExpression> {
+        bound_once(&self.cells.filter, || {
+            let filter = eq_conjunction(self.constraints.iter().cloned())
+                .expect("a serve plan constrains at least one column");
+            self.child.bind(&filter)
+        })
     }
 
     pub(crate) fn component(&self) -> &'static str {
@@ -386,13 +418,15 @@ impl FileServePlan {
         self.child.sorted.then_some(self.decode.order)
     }
 
-    /// How the plan reads the view's rows, decided once from what it covers:
-    /// the kept rows, or a located range of at most
-    /// [`POINT_GATHER_MAX_ROWS`] rows, point by point; a wider located range
-    /// by row range, split across the workers (`run_split_rows`); an
-    /// unlocated run under the plan's filter. A scan's plan is bound before
-    /// the read starts, so a bind failure fails this call rather than the
-    /// read; rows read point by point bind nothing of the plan's.
+    /// How the plan reads the view's rows, decided once from what it covers,
+    /// beside the tombstones the read still drops of the view's `deleted`
+    /// (none for kept rows, which are live): the kept rows, or a located
+    /// range of at most [`POINT_GATHER_MAX_ROWS`] rows, point by point; a
+    /// wider located range by row range, split across the workers
+    /// (`run_split_rows`); an unlocated run under the plan's filter. A
+    /// scan's plan is bound before the read starts, so a bind failure fails
+    /// this call rather than the read; rows read point by point bind nothing
+    /// of the plan's.
     ///
     /// The scan spawns one task per split and the consumer decodes each
     /// chunk inside its task, so the split count is the decode's
@@ -403,24 +437,27 @@ impl FileServePlan {
     /// constrained rows (the same fact `size` and the point reads rely on).
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
-    pub(crate) fn read(&self) -> Result<PlanRead> {
+    pub(crate) fn read<'a>(
+        &self,
+        deleted: Option<&'a Mask>,
+    ) -> Result<(PlanRead, Option<&'a Mask>)> {
         Ok(match self.span() {
-            Some(ServedSpan::Kept(kept)) => PlanRead::Kept(kept.positions.clone()),
+            Some(ServedSpan::Kept(kept)) => (PlanRead::Points(kept.positions.clone()), None),
             Some(ServedSpan::Range(range)) if point_sized(range.end - range.start) => {
-                PlanRead::Points(range.collect())
+                (PlanRead::Points(range.collect()), deleted)
             }
             Some(ServedSpan::Range(range)) => {
-                let (projection, _) = self.bound_exprs()?;
+                let projection = self.projection()?;
                 let workers = crate::io::read::available_parallelism() as u64;
                 let split_rows = run_split_rows(&range, workers);
-                PlanRead::Scan(
-                    self.child_scan()
-                        .with_projection(projection)
-                        .with_row_range(range)
-                        .with_split_by(SplitBy::RowCount(split_rows)),
-                )
+                let scan = self
+                    .child_scan()
+                    .with_projection(projection)
+                    .with_row_range(range)
+                    .with_split_by(SplitBy::RowCount(split_rows));
+                (PlanRead::Scan(scan), deleted)
             }
-            None => PlanRead::Scan(self.filtered_scan()?),
+            None => (PlanRead::Scan(self.filtered_scan()?), deleted),
         })
     }
 
@@ -433,11 +470,10 @@ impl FileServePlan {
     /// [`Self::child_scan`] with the plan's projection and pushed-down
     /// filter (bound on first use) applied: an unlocated run's scan.
     fn filtered_scan(&self) -> Result<ScanBuilder<ArrayRef>> {
-        let (projection, filter) = self.bound_exprs()?;
         Ok(self
             .child_scan()
-            .with_projection(projection)
-            .with_filter(filter))
+            .with_projection(self.projection()?)
+            .with_filter(self.filter()?))
     }
 
     /// The served rows' four [`TermCode`] columns, read off the index child's
@@ -447,28 +483,24 @@ impl FileServePlan {
     /// buffers ([`point_codes`](Self::point_codes)), else their chunk, or
     /// the plan's scan read whole. Rows come back in the index's order, as
     /// the served streams read them, tombstoned rows dropped via the row-id
-    /// column. `None` declines to the caller's gather path: a non-Dictionary
-    /// decode layout, whose columns hold terms, not codes.
+    /// column.
+    ///
+    /// Under a Dictionary decode layout only ([`ServeDecode::decodes_codes`]):
+    /// the string layouts' copies hold terms, not codes.
     ///
     /// [`InMemoryServePlan::code_columns`]: super::InMemoryServePlan::code_columns
     pub(crate) async fn code_columns(
         &self,
         file: &NativeStoreFile,
         deleted: Option<&Mask>,
-    ) -> Result<Option<[Buffer<TermCode>; 4]>> {
-        if !self.decode.decodes_codes() {
-            return Ok(None);
-        }
-        let read = self.read()?;
-        let deleted = read.tombstones(deleted);
-        match read {
-            PlanRead::Kept(positions) | PlanRead::Points(positions) => {
-                self.codes_at(file, &positions, deleted).await.map(Some)
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        match self.read(deleted)? {
+            (PlanRead::Points(positions), deleted) => {
+                self.codes_at(file, &positions, deleted).await
             }
-            PlanRead::Scan(scan) => self
+            (PlanRead::Scan(scan), deleted) => self
                 .decode
-                .chunk_code_columns(&read_all_rows(scan).await?, deleted)
-                .map(Some),
+                .chunk_code_columns(&read_all_rows(scan).await?, deleted),
         }
     }
 
@@ -530,7 +562,7 @@ impl FileServePlan {
         let live: Option<Vec<bool>> = deleted.map(|deleted| {
             let rids = values.pop().expect("the row id column was read");
             rids.iter()
-                .map(|&rid| !deleted.value(crate::store::indexes::base_row(rid) as usize))
+                .map(|&rid| !deleted.value(base_row(rid) as usize))
                 .collect()
         });
         let rows = live
@@ -564,7 +596,7 @@ impl FileServePlan {
         batch_rows: usize,
     ) -> Result<BoxStream<'static, Result<ArrayRef>>> {
         Ok(match read {
-            PlanRead::Kept(positions) | PlanRead::Points(positions) => {
+            PlanRead::Points(positions) => {
                 let plan = self.clone();
                 stream::iter(crate::store::read::chunks::batch_ranges(
                     positions.len(),

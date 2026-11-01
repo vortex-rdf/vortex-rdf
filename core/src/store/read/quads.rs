@@ -215,12 +215,12 @@ impl VortexRdfStore {
         // names (see `FileServePlan`); tombstones apply through its rid
         // column.
         if let Some(plan) = plan {
-            let read = plan.read()?;
-            let deleted = read.tombstones(deleted.as_ref()).cloned();
+            let (read, deleted) = plan.read(deleted.as_ref())?;
+            let deleted = deleted.cloned();
             return match read {
                 // Rows taken point by point (kept rows, or a small located
                 // run), as one chunk.
-                PlanRead::Kept(positions) | PlanRead::Points(positions) => {
+                PlanRead::Points(positions) => {
                     let chunk = match plan.rows_at(file, &positions).await {
                         Ok(rows) => {
                             plan.decoder()

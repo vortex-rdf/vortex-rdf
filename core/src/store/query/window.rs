@@ -238,9 +238,10 @@ impl VortexRdfStore {
         else {
             return Ok(None);
         };
-        if base.serve.is_some() {
-            return Ok(None);
-        }
+        debug_assert!(
+            base.serve.is_none(),
+            "a served view's window is cut in its index's order first"
+        );
         let (file, deleted) = (&base.file, self.quads.deleted.as_ref());
         let masks = match &base.filter {
             FileFilter::Kept { masks, .. } => Arc::clone(masks),
