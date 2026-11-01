@@ -14,17 +14,7 @@ use super::*;
 /// own predicate keeps every row; another, none.
 #[tokio::test]
 async fn chained_match_on_a_window_filters_in_index_order() {
-    // Every third quad in a named graph.
-    let quads: Vec<Quad> = modular_quads(5_000, 7, 11)
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut quad)| {
-            if i % 3 == 0 {
-                quad.graph_name = iri_graph("g1");
-            }
-            quad
-        })
-        .collect();
+    let quads = graphed_quads(5_000);
     let (p2, o3) = (iri("p2"), plain_literal("object 3"));
     let default = GraphName::DefaultGraph;
     // Every fifth of the predicate's quads.
@@ -180,17 +170,7 @@ async fn chained_match_on_a_window_of_the_whole_run_stays_served() {
             .quads_vec()
             .await
             .unwrap();
-        let tail: Vec<Quad> = (0..3)
-            .map(|k| {
-                make_quad(
-                    &format!("http://example.org/t{k}"),
-                    "http://example.org/p2",
-                    "tail",
-                    GraphName::DefaultGraph,
-                )
-            })
-            .collect();
-        let store = store.add_quads(tail).await.unwrap();
+        let store = store.add_quads(tail_quads()).await.unwrap();
         let p = matched_view(&store, None, Some(&p2), None, None).await;
         let whole_run = p.window(0, want.len()).await.unwrap();
         assert_eq!(

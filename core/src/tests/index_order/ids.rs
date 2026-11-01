@@ -14,23 +14,15 @@ use vortex_mask::Mask;
 #[tokio::test]
 async fn unsorted_ids_sort_only_when_asked() {
     let ids = LazyRowIds::from_unsorted_ids(Buffer::from(vec![5u64, 1, 3]));
-    let mut rec = Recorder::start();
+    let rec = Recorder::start();
     assert_eq!(ids.len_if_known(), Some(3));
     let deleted = Mask::from_indices(8, vec![1]);
     // Live: the ids already leave every tombstone out, so the mask is not read.
     assert_eq!(ids.live_len_without_io(&deleted).unwrap(), Some(3));
-    assert_eq!(
-        rec.take_picked(|e| matches!(e, Event::IdsSorted(_)).then_some(()))
-            .len(),
-        0
-    );
+    assert_eq!(ids_sorted(&rec), 0);
     assert_eq!(ids.materialized().unwrap().as_slice(), &[1, 3, 5]);
     ids.materialized().unwrap();
-    assert_eq!(
-        rec.picked(|e| matches!(e, Event::IdsSorted(3)).then_some(()))
-            .len(),
-        1
-    );
+    assert_eq!(rec.count(&Event::IdsSorted(3)), 1, "sorted once");
 }
 
 /// Under tombstones an in-memory served run is counted off its ids in the
@@ -129,18 +121,9 @@ async fn run_ids_decode_once_across_clones() {
 /// exact, with no filter pending.
 #[tokio::test]
 async fn narrowed_residual_file_views_count_without_sorting() {
-    // Every third quad in a named graph: the default graph is a residual
-    // that keeps rows of the predicate's run, not all of them.
-    let quads: Vec<Quad> = modular_quads(5_000, 7, 11)
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut quad)| {
-            if i % 3 == 0 {
-                quad.graph_name = iri_graph("g1");
-            }
-            quad
-        })
-        .collect();
+    // The default graph is a residual that keeps rows of the predicate's
+    // run, not all of them.
+    let quads = graphed_quads(5_000);
     let (_dir, path) = write_store_file(
         quads,
         LayoutStrategy::Dictionary,

@@ -59,16 +59,57 @@ async fn served_stores() -> Vec<(&'static str, Option<tempfile::TempDir>, Vortex
 /// A quad's terms as the store spells them, `(s, p, o, g)`: their N-Triples
 /// forms, the default graph as the empty string.
 fn spellings(quad: &Quad) -> [String; 4] {
-    let graph = match &quad.graph_name {
-        GraphName::DefaultGraph => String::new(),
-        graph => graph.to_string(),
-    };
-    [
-        quad.subject.to_string(),
-        quad.predicate.to_string(),
-        quad.object.to_string(),
-        graph,
-    ]
+    let crate::store::RawQuad { s, p, o, g } = crate::store::RawQuad::from_quad(quad);
+    [s, p, o, g]
+}
+
+/// `modular_quads(rows, 7, 11)` with every third quad in the named graph
+/// `g1`: the default graph's rows of a predicate are scattered over its run
+/// in (p, o, s, g) order, so a bound default graph is a residual term.
+fn graphed_quads(rows: usize) -> Vec<Quad> {
+    modular_quads(rows, 7, 11)
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut quad)| {
+            if i % 3 == 0 {
+                quad.graph_name = iri_graph("g1");
+            }
+            quad
+        })
+        .collect()
+}
+
+/// Three quads of `p2` whose object is `"tail"`: added to a store, its tail.
+fn tail_quads() -> Vec<Quad> {
+    (0..3)
+        .map(|k| {
+            make_quad(
+                &format!("http://example.org/t{k}"),
+                "http://example.org/p2",
+                "tail",
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect()
+}
+
+/// `view` cut into `n` partitions, each served as the view is, gathered in
+/// turn; beside how many partitions there are.
+async fn partition_rows(view: &VortexRdfStore, n: usize) -> (usize, Vec<[TermCode; 4]>) {
+    let parts = view
+        .partitions(std::num::NonZeroUsize::new(n).unwrap())
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for part in &parts {
+        assert_eq!(
+            served_component(part),
+            served_component(view),
+            "a partition is served as its view is"
+        );
+        rows.extend(row_list(part).await);
+    }
+    (parts.len(), rows)
 }
 
 /// The `?p2??` view of `store` and its rows in the index's order.

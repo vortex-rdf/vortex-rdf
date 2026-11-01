@@ -104,16 +104,6 @@ async fn code_probe_refuses_a_store_without_a_dictionary() {
     assert!(error.contains("no term dictionary"), "{error}");
 }
 
-/// Every row chunk of `view` at `batch_rows`, each decoded with `decode_row_chunk`, in order.
-async fn decoded_chunks(view: &VortexRdfStore, batch_rows: usize) -> Vec<SharedQuad> {
-    let mut chunks = view.row_chunks(batch_rows).unwrap();
-    let mut rows = Vec::new();
-    while let Some(chunk) = chunks.next().await {
-        rows.extend(view.decode_row_chunk(&chunk.unwrap()).unwrap());
-    }
-    rows
-}
-
 #[tokio::test]
 async fn decode_row_chunk_equals_shared_quads() {
     let quads = modular_quads(200, 3, 5);

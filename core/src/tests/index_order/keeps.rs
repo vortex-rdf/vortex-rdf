@@ -129,45 +129,15 @@ async fn memory_keeps_compose() {
         collect_code_chunks(&both, &QuadColumn::ALL, 64).await.0,
         filtered
     );
-    let parts = both
-        .partitions(std::num::NonZeroUsize::new(3).unwrap())
-        .await
-        .unwrap();
-    let mut got = vec![];
-    for part in &parts {
-        assert_eq!(served_component(part), Some("index:posg"));
-        got.extend(row_list(part).await);
-    }
-    assert_eq!(got, filtered);
+    assert_eq!(partition_rows(&both, 3).await.1, filtered);
     let dict = both.dict_reader().unwrap();
     let codes: [vortex_buffer::Buffer<TermCode>; 4] =
         std::array::from_fn(|c| filtered.iter().map(|r| r[c]).collect());
     let rows: Vec<Row> = decoded_rows(&codes, &dict).await;
-    let quads: Vec<Row> = both
-        .quads_vec()
-        .await
-        .unwrap()
-        .iter()
-        .map(|q| {
-            let [s, p, o, g] = spellings(q);
-            (s, p, o, g)
-        })
-        .collect();
+    let quads = tuple_rows(&both.quads_vec().await.unwrap());
     assert_eq!(quads, rows, "the decoded quads, in order");
     // A window of the kept rows small enough to read point by point.
-    let small: Vec<Row> = both
-        .window(3, 10)
-        .await
-        .unwrap()
-        .quads_vec()
-        .await
-        .unwrap()
-        .iter()
-        .map(|q| {
-            let [s, p, o, g] = spellings(q);
-            (s, p, o, g)
-        })
-        .collect();
+    let small = tuple_rows(&both.window(3, 10).await.unwrap().quads_vec().await.unwrap());
     assert_eq!(small, rows[3..13], "a small kept window's quads, in order");
 
     let outside = Keep::set([objects[0] + 1_000_000]);

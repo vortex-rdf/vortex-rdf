@@ -1314,6 +1314,17 @@ async fn read_order_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     }
 }
 
+/// Every row chunk of `view` at `batch_rows`, each decoded with
+/// `decode_row_chunk`, in order.
+async fn decoded_chunks(view: &VortexRdfStore, batch_rows: usize) -> Vec<crate::store::SharedQuad> {
+    let mut chunks = view.row_chunks(batch_rows).unwrap();
+    let mut rows = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        rows.extend(view.decode_row_chunk(&chunk.unwrap()).unwrap());
+    }
+    rows
+}
+
 /// Both chunk exports of `view` at `batch_rows` rows a chunk give `expected`
 /// (its codes in the order its reads yield them, [`read_order_codes`]), row
 /// for row; returns each export's chunk lengths, code chunks' first.

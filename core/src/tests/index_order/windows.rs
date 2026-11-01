@@ -95,16 +95,9 @@ async fn windows_are_slices_of_index_order() {
 async fn partitions_concatenate_to_index_order() {
     for (residency, _dir, store) in served_stores().await {
         let (p, want) = p2_view(&store).await;
-        let parts = p
-            .partitions(std::num::NonZeroUsize::new(4).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(parts.len(), 4, "{residency}");
-        let mut got = vec![];
-        for part in &parts {
-            assert_eq!(served_component(part), Some("index:posg"), "{residency}");
-            got.extend(row_list(part).await);
-        }
+        assert_eq!(served_component(&p), Some("index:posg"), "{residency}");
+        let (parts, got) = partition_rows(&p, 4).await;
+        assert_eq!(parts, 4, "{residency}");
         assert_eq!(got, want, "{residency}");
     }
 }
@@ -178,17 +171,7 @@ async fn window_crosses_into_the_tail() {
 
 async fn window_crosses_into_the_tail_of(store: VortexRdfStore) {
     let file = store.view_statistics().unwrap().file_backed;
-    let extra: Vec<Quad> = (0..3)
-        .map(|k| {
-            make_quad(
-                &format!("http://example.org/t{k}"),
-                "http://example.org/p2",
-                "tail",
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-    let store = store.add_quads(extra).await.unwrap();
+    let store = store.add_quads(tail_quads()).await.unwrap();
     let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
     assert_eq!(served_component(&p), Some("index:posg"));
     let quads = p.quads_vec().await.unwrap();
@@ -196,11 +179,6 @@ async fn window_crosses_into_the_tail_of(store: VortexRdfStore) {
     for offset in n - 2..=n + 2 {
         let w = p.window(offset, 4).await.unwrap();
         let want = slice_of(&quads, offset, 4);
-        assert_eq!(
-            quad_strings(&w.quads_vec().await.unwrap()),
-            quad_strings(&want),
-            "offset {offset}"
-        );
         assert_eq!(
             w.quads_vec().await.unwrap(),
             want,
@@ -238,15 +216,7 @@ async fn wide_row_ids_through_served_windows() {
             "({offset}, {limit})"
         );
     }
-    let parts = p
-        .partitions(std::num::NonZeroUsize::new(3).unwrap())
-        .await
-        .unwrap();
-    let mut got = vec![];
-    for part in &parts {
-        got.extend(row_list(part).await);
-    }
-    assert_eq!(got, want);
+    assert_eq!(partition_rows(&p, 3).await.1, want);
     // A keep of half the objects, and a chain of one, filter the same rows.
     let objects = objects_of(&want);
     let kept_objects: Vec<TermCode> = objects.iter().copied().step_by(2).collect();
@@ -318,19 +288,7 @@ async fn windows_across_child_chunks() {
 #[tokio::test]
 async fn unlocated_runs_read_once_then_narrow() {
     let quads = modular_quads(5_000, 7, 11);
-    // Every third quad in a named graph: the default graph's rows of a
-    // predicate are scattered over its run in (p, o, s, g) order.
-    let graphed: Vec<Quad> = quads
-        .iter()
-        .enumerate()
-        .map(|(i, quad)| {
-            let mut quad = quad.clone();
-            if i % 3 == 0 {
-                quad.graph_name = iri_graph("g1");
-            }
-            quad
-        })
-        .collect();
+    let graphed = graphed_quads(5_000);
     let p2 = iri("p2");
     let default = GraphName::DefaultGraph;
     // Each view beside the unindexed twin's match, sorted (p, o, s, g), and

@@ -98,8 +98,7 @@ async fn memory_string_streams_follow_index_order() {
     let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
     assert_eq!(served_component(&p), Some("index:posg"));
     let unserved = p.debug_unserved().await.unwrap().quads_vec().await.unwrap();
-    let mut want: Vec<[String; 4]> = unserved.iter().map(spellings).collect();
-    want.sort_by(|a, b| (&a[1], &a[2], &a[0], &a[3]).cmp(&(&b[1], &b[2], &b[0], &b[3])));
+    let want = posg_quads(&unserved);
     let chunks = collect_row_chunks(&p, 256).await;
     let rows: Vec<(String, String)> = chunk_subjects(&chunks)
         .into_iter()
@@ -161,12 +160,10 @@ async fn file_streams_under_tombstones_and_strings() {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
     assert_eq!(served_component(&p), Some("index:posg"));
-    let mut decoded = Vec::new();
-    let mut chunks = p.row_chunks(50).unwrap();
-    while let Some(chunk) = chunks.next().await {
-        decoded.extend(p.decode_row_chunk(&chunk.unwrap()).unwrap());
-    }
-    assert_eq!(decoded, p.shared_quads_vec().await.unwrap());
+    assert_eq!(
+        decoded_chunks(&p, 50).await,
+        p.shared_quads_vec().await.unwrap()
+    );
 }
 
 /// TypedObject's row chunks, in both residencies, read a served view in the
@@ -188,13 +185,8 @@ async fn typed_object_row_chunks_follow_index_order() {
         .unwrap();
         let p = matched_view(&store, None, Some(&iri("p2")), None, None).await;
         assert_eq!(served_component(&p), Some("index:posg"));
-        let mut decoded = Vec::new();
-        let mut chunks = p.row_chunks(256).unwrap();
-        while let Some(chunk) = chunks.next().await {
-            decoded.extend(p.decode_row_chunk(&chunk.unwrap()).unwrap());
-        }
         assert_eq!(
-            decoded,
+            decoded_chunks(&p, 256).await,
             p.shared_quads_vec().await.unwrap(),
             "in_memory={in_memory}"
         );
@@ -300,11 +292,9 @@ async fn order_free_consumers_unchanged() {
     let reopened = VortexRdfStore::from_bytes(&w.to_bytes().await.unwrap())
         .await
         .unwrap();
-    let mut want = quad_strings(&w.quads_vec().await.unwrap());
-    want.sort();
-    let mut got = quad_strings(&reopened.quads_vec().await.unwrap());
-    got.sort();
-    assert_eq!(got, want);
+    // Sorted, so order-free.
+    let want = quad_strings(&w.quads_vec().await.unwrap());
+    assert_eq!(quad_strings(&reopened.quads_vec().await.unwrap()), want);
 }
 
 /// `view_statistics().sort_order` reports the order a served view's reads

@@ -70,19 +70,13 @@ async fn test_masked_streams_of_rare_and_absent_codes() {
             rows.next().await.is_none(),
             "no row chunk, batch {batch_rows}"
         );
-        let events = rec.take();
         assert_eq!(
-            events
-                .iter()
-                .filter(|event| **event == Event::MasksFirstStream)
-                .count(),
+            rec.count(&Event::MasksFirstStream),
             2,
             "both streams masked, batch {batch_rows}"
         );
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Event::MaskedRead(_))),
+            masked_reads(&mut rec).is_empty(),
             "no read of kept rows, batch {batch_rows}"
         );
     }
