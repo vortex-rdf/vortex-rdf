@@ -15,39 +15,54 @@
 //! so callers see one `indexes::` surface.
 
 #[cfg(feature = "file-io")]
-use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
 
-use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
-use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
-#[cfg(feature = "file-io")]
-use crate::store::persist::native_file::ChildReader;
 use crate::store::schema::RowId;
-use crate::store::view::selection::window_rows;
 use resolve::IndexProbe;
 
 pub(crate) mod components;
 pub(crate) mod copy;
 #[cfg(feature = "file-io")]
 pub(crate) mod file;
+mod lazy_ids;
 pub(crate) mod reference;
 mod resolve;
+#[cfg(feature = "file-io")]
+mod rid_reads;
 pub(crate) mod serve;
 
 pub(crate) use components::{
     ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
-    indexes_from_components, known_component, sorted_row_ids,
+    indexes_from_components, known_component,
 };
+pub(crate) use lazy_ids::{ComponentRun, LazyRowIds};
+#[cfg(test)]
+pub(crate) use serve::ServedSpan;
 #[cfg(feature = "file-io")]
-pub(crate) use file::{FileServePlan, read_located_rids, scan_index_row_ids};
-pub(crate) use serve::InMemoryServePlan;
+pub(crate) use serve::{FileServePlan, PlanRead};
+pub(crate) use serve::{InMemoryServePlan, LiveRows, ServedRows};
+
+/// What `cell` holds, computed by `init` on the first call and kept; two
+/// callers racing on the first call may both compute, and whichever stores
+/// first wins.
+pub(in crate::store::indexes) fn get_or_try_init<T: Clone>(
+    cell: &OnceLock<T>,
+    init: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(value) = cell.get() {
+        return Ok(value.clone());
+    }
+    let value = init()?;
+    Ok(cell.get_or_init(|| value).clone())
+}
 
 /// The primary-row-id column every persisted index child carries beside its
 /// own columns: the currency every resolution answers in, and the one column
@@ -424,227 +439,6 @@ pub(crate) enum ResolvedRowIds {
     #[cfg(feature = "file-io")]
     Eager(Buffer<RowId>),
     Lazy(LazyRowIds),
-}
-
-/// The exact base row ids of an index resolution whose consumer may not need
-/// them (a served one, or a located run that is only counted or windowed):
-/// the *recipe*, run by the first consumer that needs the selection, its
-/// result in a cell shared by every clone of the view that carries it. A
-/// serve plan reads without the ids, which on file cost a whole extra scan
-/// of the index child, and a located run's width counts without them.
-///
-/// Two consumers racing on first need may both run the recipe; the source is
-/// immutable, so they compute the same ids, whichever stores first wins and
-/// both return the stored buffer. No lock is held across the computation.
-#[derive(Clone)]
-pub(crate) struct LazyRowIds {
-    cell: Arc<OnceLock<Buffer<RowId>>>,
-    source: LazyRowIdSource,
-}
-
-/// Where a [`LazyRowIds`]' ids come from, split by backend as the serve plans
-/// are ([`InMemoryServePlan`], `FileServePlan`), holding what the eager path
-/// would have consumed at resolution time.
-#[derive(Clone)]
-enum LazyRowIdSource {
-    /// In-memory: the rid-column slice of the component's matched run, decoded
-    /// and sorted on demand ([`sorted_row_ids`]). `ascending` when the run's
-    /// rids are already in row id order, so a window of the run can be cut
-    /// before anything is decoded.
-    Component { rids: ArrayRef, ascending: bool },
-    /// File-backed: the rid-only pushed-down scan of the index child
-    /// ([`scan_index_row_ids`]) the eager path would have run at match time.
-    /// The child binds through its file's memo under its own name, so the
-    /// deferred scan binds with the same identity every plan and eager scan
-    /// of this component uses (see `BoundExprMemo`). `located` is the run of
-    /// child rows the constraints select, when the resolver located it:
-    /// exactly the rows the scan keeps, so its width is the ids' count. It
-    /// answers [`len_if_known`](LazyRowIds::len_if_known) and nothing else:
-    /// a serving child's rids follow its own sort order, so no window of the
-    /// run is a window of its ids.
-    #[cfg(feature = "file-io")]
-    IndexChild {
-        child: ChildReader,
-        constraints: Vec<(&'static str, Scalar)>,
-        located: Option<Range<u64>>,
-    },
-    /// File-backed: a located run of an index child's rid column, read on
-    /// first need through [`read_located_rids`]; its width is known up front,
-    /// so a count reads none of it.
-    #[cfg(feature = "file-io")]
-    LocatedRun {
-        file: Arc<crate::store::persist::native_file::NativeStoreFile>,
-        child: ChildReader,
-        range: Range<u64>,
-    },
-}
-
-impl LazyRowIds {
-    /// Test-only hook: whether the ids have been computed, so a test can pin
-    /// a read answered without them.
-    #[cfg(test)]
-    pub(crate) fn debug_materialized(&self) -> bool {
-        self.cell.get().is_some()
-    }
-
-    /// Lazy ids over an in-memory component's matched rid run, in the
-    /// component's own order; `ascending` when those rids are already in row
-    /// id order, as a reference component's are within one value (its rows
-    /// are ordered by `(val, rid)`).
-    pub(crate) fn from_component_run(rids: ArrayRef, ascending: bool) -> Self {
-        Self {
-            cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::Component { rids, ascending },
-        }
-    }
-
-    /// Lazy ids scanned from a file's index child on first need, counted by
-    /// `located`, the constraints' run of child rows when the resolver
-    /// located it.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn from_index_child_scan(
-        child: ChildReader,
-        constraints: Vec<(&'static str, Scalar)>,
-        located: Option<Range<u64>>,
-    ) -> Self {
-        Self {
-            cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::IndexChild {
-                child,
-                constraints,
-                located,
-            },
-        }
-    }
-
-    /// Lazy ids over a located run of a file index child whose rids ascend
-    /// within the run, as [`window`](Self::window) requires.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn from_located_run(
-        file: Arc<crate::store::persist::native_file::NativeStoreFile>,
-        child: ChildReader,
-        range: Range<u64>,
-    ) -> Self {
-        Self {
-            cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::LocatedRun { file, child, range },
-        }
-    }
-
-    /// The ids of rows `offset..offset + limit` of a run whose rids ascend,
-    /// in base row order, read from the window's own rows and no others: an
-    /// in-memory run's cut out of its rid column before they are decoded, a
-    /// located file run's read from those rows of its child. A reference
-    /// child's rows are ordered by `(val, rid)` (the order this crate's
-    /// writers emit, docs/file-format.md §6), so within one value the rids
-    /// ascend: row `k` of the run holds the run's `k`-th smallest rid, and a
-    /// window of the run's rows is the same window of its ids in base order.
-    /// A deep page costs its limit, and an empty window (no limit, or an
-    /// offset at or past the run's end) reads nothing. `None` for any other
-    /// source.
-    pub(crate) async fn window(
-        &self,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Option<Buffer<RowId>>> {
-        let ids = match &self.source {
-            LazyRowIdSource::Component {
-                rids,
-                ascending: true,
-            } => match window_rows(offset, limit, rids.len() as u64) {
-                Some(rows) => sorted_row_ids(rids.slice(rows.start as usize..rows.end as usize)?)?,
-                None => Buffer::empty(),
-            },
-            #[cfg(feature = "file-io")]
-            LazyRowIdSource::LocatedRun { file, child, range } => {
-                match window_rows(offset, limit, range.end - range.start) {
-                    Some(rows) => {
-                        let rows = range.start + rows.start..range.start + rows.end;
-                        read_located_rids(file, child, rows).await?
-                    }
-                    None => Buffer::empty(),
-                }
-            }
-            _ => return Ok(None),
-        };
-        Ok(Some(ids))
-    }
-
-    /// How many rows the ids cover, when knowable without computing them: an
-    /// in-memory run knows its width up front (so a count on a served match
-    /// never decodes), and so does a located file run, whether its ids come
-    /// from the run itself or from the child scan it bounds; an unlocated
-    /// child scan and a pending residual compare only once their ids are
-    /// known.
-    pub(crate) fn len_if_known(&self) -> Option<usize> {
-        match &self.source {
-            LazyRowIdSource::Component { rids, .. } => Some(rids.len()),
-            #[cfg(feature = "file-io")]
-            LazyRowIdSource::IndexChild { located, .. } => self
-                .cell
-                .get()
-                .map(Buffer::len)
-                .or_else(|| located.as_ref().map(|run| (run.end - run.start) as usize)),
-            #[cfg(feature = "file-io")]
-            LazyRowIdSource::LocatedRun { range, .. } => Some((range.end - range.start) as usize),
-        }
-    }
-
-    /// The ids, when they take no I/O: an in-memory run's or a pending
-    /// residual compare's, computed (and cached) here as
-    /// [`materialized`](Self::materialized) does, or a file child's once
-    /// read. `None` for a file child's ids not read yet.
-    pub(crate) fn ids_without_io(&self) -> Result<Option<Buffer<RowId>>> {
-        match &self.source {
-            LazyRowIdSource::Component { .. } => self.materialized().map(Some),
-            #[cfg(feature = "file-io")]
-            LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
-                Ok(self.cell.get().cloned())
-            }
-        }
-    }
-
-    /// The ids, computed and cached on the first call; the awaiting form,
-    /// which also runs a file child's deferred read.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn materialized_async(&self) -> Result<Buffer<RowId>> {
-        if let Some(ids) = self.cell.get() {
-            return Ok(ids.clone());
-        }
-        let ids = match &self.source {
-            LazyRowIdSource::Component { .. } => return self.materialized(),
-            LazyRowIdSource::IndexChild {
-                child, constraints, ..
-            } => scan_index_row_ids(child, constraints).await?,
-            LazyRowIdSource::LocatedRun { file, child, range } => {
-                read_located_rids(file, child, range.clone()).await?
-            }
-        };
-        Ok(self.cell.get_or_init(|| ids).clone())
-    }
-
-    /// The ids, computed and cached on the first call; the synchronous form,
-    /// for in-memory sources (a file child's ids take I/O, and every consumer
-    /// of a file view's selection is async: see
-    /// [`materialized_async`](Self::materialized_async)). A file child's ids
-    /// that `materialized_async` has already read come from the cache, which
-    /// is how the file match folds them; unread ones never reach here.
-    pub(crate) fn materialized(&self) -> Result<Buffer<RowId>> {
-        if let Some(ids) = self.cell.get() {
-            return Ok(ids.clone());
-        }
-        let ids = match &self.source {
-            LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
-            #[cfg(feature = "file-io")]
-            LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
-                unreachable!(
-                    "an in-memory view only ever carries a component's pending ids, and \
-                     the file match reads a file run's ids before it folds them"
-                )
-            }
-        };
-        Ok(self.cell.get_or_init(|| ids).clone())
-    }
 }
 
 /// The pattern resolved against the configured indexes over an in-memory

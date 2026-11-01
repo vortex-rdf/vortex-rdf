@@ -20,6 +20,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 vortex-rdf-core = { workspace = true }
 vortex-rdf-encoded-search = { workspace = true }
+vortex-buffer = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 jni = "0.22"
 

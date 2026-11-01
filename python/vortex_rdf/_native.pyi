@@ -288,7 +288,7 @@ class ProbeAnswers:
 
 class CodeChunks:
     """The chunks of `VortexRdfStore.match_code_chunks`: a match's code
-    columns in chunks of at most `batch_rows` rows, in base row order. Each
+    columns in chunks of at most `batch_rows` rows, in the match's order. Each
     `__next__` pulls one chunk with the GIL released and returns one
     zero-copy `U64Column` per name in `columns`, in that order. The end of
     the match, an error or a cancelled `CancelToken` (`Cancelled`) ends the
@@ -374,12 +374,13 @@ class VortexRdfStore:
         code range (a ``range`` with step 1, or a 2-tuple ``(lo, hi)``, the
         half-open codes ``lo <= code < hi``; a 2-tuple is never a set).
         `offset` and `limit` window the rows: a window that cuts rows takes
-        them in base order, and a filtered file scan stops at the first block
-        that fills it, while a `limit` that cannot cut a row (no `offset`, and
-        at least the match's row count, or a bound on it, known without
-        reading its rows: an index-served file match of unknown width reads
-        its row ids for the count) returns the match as it is, in the order
-        the call without a limit returns. With no `offset`, a `limit` that a
+        them in the match's order (a `secondary-by-copy` index's for a
+        pattern it serves, else base order), and a filtered file scan stops at
+        the first block that fills it, while a `limit` that cannot cut a row
+        (no `offset`, and at least the match's row count, or a bound on it,
+        known without reading its rows: an index-served file match of unknown
+        width reads its rows once to know it) returns the match's rows in the
+        order the call without a limit returns. With no `offset`, a `limit` that a
         filtered file match's rows turn out to fall short of returns the match
         as it is too, read from the window's evaluation of the filter, which a
         match whose reads evaluate the filter before reading a row makes even
@@ -401,7 +402,7 @@ class VortexRdfStore:
         cancel: Optional[CancelToken] = None,
     ) -> Optional[CodeChunks]:
         """`match_codes` in chunks: an iterator (`CodeChunks`) of at most
-        `batch_rows` rows a chunk, in base row order, each chunk one
+        `batch_rows` rows a chunk, in `match_codes`' order, each chunk one
         zero-copy `U64Column` per name in `columns` (``"s"``, ``"p"``,
         ``"o"``, ``"g"``, in the order given), or None when the code path
         does not apply. `keep`, `limit` and `offset` narrow the match as for

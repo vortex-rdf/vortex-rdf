@@ -1,9 +1,7 @@
 //! Planner-facing metadata about a view, answered without reading its rows:
 //! how many it holds and how surely, the order they come out in, the codes
-//! that bound them, the store's index children, the view's partitions, and
-//! the identity of the data behind it.
-
-use std::num::NonZeroUsize;
+//! that bound them, the store's index children, and the identity of the data
+//! behind it.
 
 use vortex_mask::Mask;
 
@@ -68,23 +66,32 @@ pub enum SelectionKind {
     Range,
     /// An explicit list of base rows: an index lookup or a mask scan.
     Ids,
-    /// An index run whose base row ids are not read yet (a served match);
-    /// reading the view materializes them.
+    /// An index run whose base row ids are not read yet: a served match, or
+    /// a window, keep, partition or chained match of one, whose reads take
+    /// its rows off the index. Reading such a view in base order, or reading
+    /// a view built only to be counted or windowed, materializes them.
     PendingIndexRun,
 }
 
-/// What a view promises about its rows before they are read, for the order
-/// [`row_chunks`](VortexRdfStore::row_chunks) and
-/// [`code_chunks`](VortexRdfStore::code_chunks) produce: the base's rows in
-/// base row order, whatever answered the match, then the tail's.
+/// What a view promises about its rows before they are read: how many, the
+/// order every read of them follows (a served view's base rows in its
+/// index's order, any other view's in base row order, then the tail's), the
+/// code ranges they lie in, and how the view selects them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewStatistics {
     /// The row count, base and tail, exact or bounded.
     pub rows: RowCountHint,
-    /// The order the view's rows come out in, when it is a known sort:
-    /// `Spog` for a view over a globally sorted base that reads no tail row.
-    /// A view that reads any has none, since the tail's rows follow the
-    /// base's in append order.
+    /// The order the view's rows come out in, when it is a known sort: the
+    /// order every read follows ([`quads`](VortexRdfStore::quads),
+    /// [`row_chunks`](VortexRdfStore::row_chunks),
+    /// [`code_chunks`](VortexRdfStore::code_chunks), the exports). `Posg` for
+    /// a view the `index:posg` copy serves with the object unbound (`?p??`,
+    /// and on file `?p?g`) and for its windows, keeps, partitions and chained
+    /// matches; `Spog` for any other view over a globally sorted base (every
+    /// base this crate writes), a served one's index order being base order
+    /// within its bound terms. A served file view whose index child is not
+    /// globally sorted has none, and neither has a view that reads any tail
+    /// row, since the tail's rows follow the base's in append order.
     pub sort_order: Option<SortOrder>,
     /// Per column (`s`, `p`, `o`, `g`), the inclusive code range the view's
     /// base rows are known to lie in (a pushed-down equality's code, a
@@ -94,8 +101,10 @@ pub struct ViewStatistics {
     pub code_bounds: [Option<(TermCode, TermCode)>; 4],
     /// The shape of the view's selection over its base rows.
     pub selection: SelectionKind,
-    /// The index child that answered the match and decodes
-    /// [`quads`](VortexRdfStore::quads) in its own order, if any.
+    /// The index child that answered the match and serves every read of the
+    /// view, in its own order (see [`sort_order`](Self::sort_order)), if
+    /// any. A window, keep, partition or chained match of a served view is
+    /// served by the same child.
     pub served_component: Option<&'static str>,
     /// Whether a pushed-down file filter is still to be evaluated: then the
     /// row count is a bound, and every read runs the filter. A filter a
@@ -163,7 +172,7 @@ impl VortexRdfStore {
         let base = self.quads.base_rows(|_| true)?;
         Ok(ViewStatistics {
             rows: row_count_hint(base, filtered, tail_rows),
-            sort_order: (self.quads.subject_sorted() && tail_rows == 0).then_some(SortOrder::Spog),
+            sort_order: (tail_rows == 0).then(|| self.quads.read_order()).flatten(),
             code_bounds: self.code_bounds(),
             selection: match evaluated {
                 Some(_) => SelectionKind::Ids,
@@ -244,47 +253,6 @@ impl VortexRdfStore {
                 .map(|child| info(child.identity, child.sorted, file.row_count() as usize))
                 .collect(),
         })
-    }
-
-    /// This view cut into at most `n` views over disjoint, contiguous pieces
-    /// of its base rows, in base row order, so reading the partitions in
-    /// turn reads the view. Each keeps the view's pushed-down filter and
-    /// tombstones and applies them to its own rows; the append tail goes with
-    /// the last, so over a sorted base every partition but the last keeps the
-    /// `Spog` [`sort_order`](ViewStatistics::sort_order), and the last keeps
-    /// it only when the view reads no tail row. For `n` = 1 the one partition
-    /// is the view itself, its serve plan and pending selection included; for
-    /// a larger `n`, a served match's row ids are read first and no partition
-    /// keeps the serve plan. Pieces are about equal before filtering, not
-    /// after; a view selecting no base row is its own one partition.
-    pub async fn partitions(&self, n: NonZeroUsize) -> Result<Vec<Self>> {
-        let n = n.get();
-        if n == 1 {
-            return Ok(vec![self.clone()]);
-        }
-        let pieces = self
-            .quads
-            .materialized_selection()
-            .await?
-            .split(n, self.quads.base_len());
-        if pieces.is_empty() {
-            return Ok(vec![self.clone()]);
-        }
-        let last = pieces.len() - 1;
-        Ok(pieces
-            .into_iter()
-            .enumerate()
-            .map(|(i, piece)| {
-                let tail = self.tail.as_ref().map(|tail| {
-                    if i == last {
-                        tail.clone()
-                    } else {
-                        tail.with_selection(RowSelection::empty())
-                    }
-                });
-                self.derived(self.quads.with_selection(ViewSelection::Exact(piece)), tail)
-            })
-            .collect())
     }
 }
 

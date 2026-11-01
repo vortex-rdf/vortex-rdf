@@ -70,7 +70,7 @@ impl Keep {
     }
 
     /// The keep compiled for a row loop over at most `rows` rows.
-    fn test(&self, rows: usize) -> KeepTest {
+    pub(in crate::store::query) fn test(&self, rows: usize) -> KeepTest {
         match self {
             Keep::Range(lo, hi) => KeepTest::Range(*lo, *hi),
             Keep::Set(set) => {
@@ -182,7 +182,7 @@ fn bitmap_span_cap(rows: usize) -> usize {
 /// A [`Keep`] as a per-row test: a range compare, a bitmap over a set's span
 /// (see [`bitmap_span_cap`]), or a binary search of a set too sparse for
 /// one.
-enum KeepTest {
+pub(in crate::store::query) enum KeepTest {
     Range(TermCode, TermCode),
     Bitmap {
         lo: TermCode,
@@ -194,7 +194,7 @@ enum KeepTest {
 
 impl KeepTest {
     #[inline]
-    fn admits(&self, code: TermCode) -> bool {
+    pub(in crate::store::query) fn admits(&self, code: TermCode) -> bool {
         match self {
             KeepTest::Range(lo, hi) => (*lo..*hi).contains(&code),
             KeepTest::Bitmap { lo, hi, bits } => {
@@ -240,14 +240,24 @@ impl VortexRdfStore {
     /// the view's rows touch: each evaluates the view's pending filter, reads
     /// the column at the rows it left and tests them (a range by Vortex's
     /// `between` kernel, a set against the decoded codes), never as a scan
-    /// expression. A pending view's deferred row ids (a served match's, or a
-    /// run held for a count) materialize first.
+    /// expression. A view a by-copy index serves is kept in its index's order
+    /// and stays served: its rows are tested in that order and the kept ones
+    /// read off the index (on file an unlocated run is read once by row index
+    /// first). In memory that needs the column's codes from the base's code
+    /// cache or the serving component's probes; a column neither reads (an
+    /// encoding the probes decline) is kept as an unserved view is, in base
+    /// order. Any other pending view's deferred row ids (a run held for a
+    /// count) materialize first.
     ///
     /// [`match_pattern`]: Self::match_pattern
     pub async fn keep(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
         self.ensure_code_view("keep")?;
         if keep.is_empty() {
             return Ok(self.empty_view());
+        }
+        // A served view's keep is served too, in the index's order.
+        if let Some(kept) = self.served_keep(column, keep).await? {
+            return Ok(kept);
         }
         match &self.quads.backend {
             Backend::InMemory(memory) => self.keep_in_memory(memory, column, keep),

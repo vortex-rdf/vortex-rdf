@@ -472,11 +472,45 @@ pub(crate) fn components_from(
 ///
 /// [`base_row`]: super::base_row
 pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
-    use vortex_array::builtins::ArrayBuiltins;
-
     if row_id_column.is_empty() {
         return Ok(Buffer::empty());
     }
+    // The freshly-executed buffer is normally uniquely owned, so the sort
+    // runs in place with no copy.
+    let mut ids = owned(decoded_row_ids(row_id_column)?);
+    sort_unique_ids(ids.as_mut_slice());
+    check_addressable(&ids)?;
+    Ok(ids.freeze())
+}
+
+/// A row-id column decoded into the base rows its ids name ([`base_row`]),
+/// in the column's own order: a component run's ids in the order its index
+/// keeps them. Ids past what a `usize` holds are refused.
+///
+/// [`base_row`]: super::base_row
+pub(crate) fn run_order_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
+    if row_id_column.is_empty() {
+        return Ok(Buffer::empty());
+    }
+    let ids = decoded_row_ids(row_id_column)?;
+    check_all_addressable(&ids)?;
+    Ok(ids)
+}
+
+/// `ids`, unique row ids in any order, sorted ascending into a buffer of
+/// their own ([`sort_unique_ids`]).
+pub(super) fn sorted_copy(ids: &[RowId]) -> Result<Buffer<RowId>> {
+    let mut ids = BufferMut::copy_from(ids);
+    sort_unique_ids(ids.as_mut_slice());
+    check_addressable(&ids)?;
+    Ok(ids.freeze())
+}
+
+/// `row_id_column` (non-empty) decoded into the base rows its ids name, in
+/// the column's order.
+fn decoded_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
+    use vortex_array::builtins::ArrayBuiltins;
+
     observe!(RidsDecoded(row_id_column.len()));
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     // A no-op cast for the u64 column every writer here produces.
@@ -484,21 +518,41 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
         .cast(DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable))?
         .execute::<PrimitiveArray>(&mut ctx)?
         .into_buffer::<RowId>();
+    #[cfg(test)]
+    let ids = {
+        let mut ids = owned(ids);
+        for id in ids.as_mut_slice() {
+            *id = super::base_row(*id);
+        }
+        ids.freeze()
+    };
+    Ok(ids)
+}
 
-    // The freshly-executed buffer is normally uniquely owned, so the sort
-    // runs in place with no copy; a shared buffer (someone else still holds
-    // the execution's output) falls back to one copy.
-    let mut ids = match ids.try_into_mut() {
+/// `ids` as a buffer this call owns: the buffer itself when nothing else
+/// holds it (a fresh execution's output), else one copy.
+fn owned(ids: Buffer<RowId>) -> BufferMut<RowId> {
+    match ids.try_into_mut() {
         Ok(ids) => ids,
         Err(ids) => BufferMut::copy_from(ids.as_slice()),
-    };
-    #[cfg(test)]
-    for id in ids.as_mut_slice() {
-        *id = super::base_row(*id);
     }
-    sort_unique_ids(ids.as_mut_slice());
-    check_addressable(&ids)?;
-    Ok(ids.freeze())
+}
+
+/// Refuses ids, in any order, past what a `usize` holds: nothing to check on
+/// a 64-bit target.
+fn check_all_addressable(ids: &[RowId]) -> Result<()> {
+    #[cfg(target_pointer_width = "64")]
+    {
+        let _ = ids;
+        Ok(())
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        match ids.iter().max() {
+            Some(&max) => super::row_index(max).map(|_| ()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// How [`sort_unique_ids`] sorted its ids.

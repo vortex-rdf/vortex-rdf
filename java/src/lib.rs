@@ -4,18 +4,39 @@
 //! ([`ThrowVortexException`]) and never unwinds into the JVM.
 //!
 //! Conventions: a store handle is the address of a boxed [`engine::Store`] (the Java side owns it and never calls
-//! after `close`); a term code is a non-negative `long`, and `-1` means "no code" (a free pattern position, a term
-//! the dictionary lacks); a `null` string is a free pattern position, while `""` is the default graph.
+//! after `close`); a stream handle is the address of a boxed [`Stream`], which the Java side frees once, within
+//! the call that opened it for `quads()` and through its `NativeStream` otherwise; a term code is a non-negative
+//! `long`, and `-1` means "no code" (a free pattern position, a term the dictionary lacks); a `null` string is a
+//! free pattern position, while `""` is the default graph.
+//!
+//! Terms cross in packed chunks (`Payload.java`, [`java_payload`]): the UTF-8 text of a chunk's distinct terms
+//! once, and an `int` per position naming its term.
 
 pub mod engine;
+pub mod payload;
+pub mod streams;
 
-use engine::{ROW_BYTES, Store};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use engine::Store;
 use jni::errors::ErrorPolicy;
-use jni::objects::{JByteBuffer, JClass, JLongArray, JObjectArray, JString};
+use jni::objects::{JByteBuffer, JClass, JIntArray, JLongArray, JObject, JObjectArray, JString};
 use jni::strings::JNIString;
 use jni::sys::{jboolean, jint, jlong};
 use jni::{Env, EnvUnowned, jni_str};
+use payload::{Limits, Pace, Payload, ROW_BYTES};
+use streams::{CodeStream, TermStream};
 use vortex_rdf_core::CodePattern;
+
+/// One runtime for every store of the process, as in the Python bindings: a store's reads are async, the
+/// caller's threads block on them.
+pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("start the vortex-rdf native library's async runtime")
+});
 
 /// A native call's failure: the store's own, or a JNI call's.
 type Failure = Box<dyn std::error::Error>;
@@ -72,13 +93,90 @@ fn store<'a>(h: jlong) -> &'a Store {
     unsafe { &*(h as *const Store) }
 }
 
-/// A pattern position's term: `None` for a `null` string, a free position.
-fn term(env: &Env<'_>, s: &JString<'_>) -> Result<Option<String>, Failure> {
-    Ok(if s.is_null() {
-        None
-    } else {
-        Some(s.try_to_string(env)?)
-    })
+/// A pattern's four positions, `(s, p, o, g)`, as N-Triples spellings: `None` for a `null` string, a free
+/// position.
+fn pattern_terms(
+    env: &Env<'_>,
+    positions: [&JString<'_>; 4],
+) -> Result<[Option<String>; 4], Failure> {
+    let term = |s: &JString<'_>| -> Result<Option<String>, Failure> {
+        Ok(if s.is_null() {
+            None
+        } else {
+            Some(s.try_to_string(env)?)
+        })
+    };
+    let [s, p, o, g] = positions;
+    Ok([term(s)?, term(p)?, term(o)?, term(g)?])
+}
+
+/// Native objects the Java side holds by handle and has not freed: term and code streams.
+static OPEN_HANDLES: AtomicI64 = AtomicI64::new(0);
+
+/// The most rows a read hands over: what a Java `ArrayList` holds.
+const MAX_JAVA_LIST: usize = i32::MAX as usize - 8;
+
+/// A size a native call's `int` gives: a negative one is 0, which every size check refuses.
+fn size(value: jint) -> usize {
+    usize::try_from(value).unwrap_or(0)
+}
+
+/// The chunk limits a native call's `int`s give; out of range (a negative value included) is `InvalidInput`.
+fn limits(rows: jint, bytes: jint, large_term: jint) -> Result<Limits, Failure> {
+    Ok(Limits::new(size(rows), size(bytes), size(large_term))?)
+}
+
+/// A chunk as the `Object[5]` `Payload.java` reads: the text (`byte[]`), the distinct terms' bounds and each
+/// position's term (`int[]` each), the large terms (`String[]`, or `null` when there are none), and `tail`
+/// (`long[]`, or `null`).
+fn java_payload<'local>(
+    env: &mut Env<'local>,
+    payload: &Payload,
+    tail: Option<&[i64]>,
+) -> Result<JObjectArray<'local, JObject<'local>>, Failure> {
+    let array = JObjectArray::<JObject>::new(env, 5, JObject::null())?;
+    let text = env.byte_array_from_slice(&payload.text)?;
+    array.set_element(env, 0, &text)?;
+    for (slot, ints) in [(1, &payload.bounds), (2, &payload.terms)] {
+        let java = JIntArray::new(env, ints.len())?;
+        java.set_region(env, 0, ints)?;
+        array.set_element(env, slot, &java)?;
+    }
+    if !payload.large.is_empty() {
+        let large = java_strings(env, payload.large.iter().map(|t| Some(t.as_str())))?;
+        array.set_element(env, 3, &large)?;
+    }
+    if let Some(tail) = tail {
+        let tail = java_longs(env, tail)?;
+        array.set_element(env, 4, &tail)?;
+    }
+    Ok(array)
+}
+
+/// A `long[]` of `values`.
+fn java_longs<'local>(
+    env: &mut Env<'local>,
+    values: &[i64],
+) -> Result<JLongArray<'local>, Failure> {
+    let array = JLongArray::new(env, values.len())?;
+    array.set_region(env, 0, values)?;
+    Ok(array)
+}
+
+/// `count` codes of the `long[]` `codes` from `from`, each a term code; a negative one is no code, read as
+/// `u64::MAX`, which is outside every dictionary and so decodes to `None`.
+fn java_codes(
+    env: &Env<'_>,
+    codes: &JLongArray<'_>,
+    from: jint,
+    count: usize,
+) -> Result<Vec<u64>, Failure> {
+    let mut buf = vec![0i64; count];
+    codes.get_region(env, from, &mut buf)?;
+    Ok(buf
+        .into_iter()
+        .map(|c| code(c).unwrap_or(u64::MAX))
+        .collect())
 }
 
 /// A `String[]` of `strings`, a `null` element for a `None`.
@@ -95,6 +193,30 @@ fn java_strings<'local, 'a>(
         }
     }
     Ok(array)
+}
+
+/// The first `max_rows` rows of the direct buffer `buf`, `ROW_BYTES` each, for `call` to write codes into; an
+/// error naming `call` when `buf` is not a direct buffer of that many rows.
+fn direct_rows<'a>(
+    env: &Env<'_>,
+    buf: &JByteBuffer<'_>,
+    max_rows: jint,
+    call: &str,
+) -> Result<&'a mut [[u8; ROW_BYTES]], Failure> {
+    let not_a_buffer = || format!("{call}: not a direct buffer of 32 * maxRows bytes");
+    let addr = env
+        .get_direct_buffer_address(buf)
+        .map_err(|_| not_a_buffer())?;
+    let capacity = env
+        .get_direct_buffer_capacity(buf)
+        .map_err(|_| not_a_buffer())?;
+    let rows = size(max_rows);
+    if rows.checked_mul(ROW_BYTES).is_none_or(|len| len > capacity) {
+        return Err(not_a_buffer().into());
+    }
+    // SAFETY: the buffer's memory holds `rows` rows (checked above) and stays valid for the native call, the
+    // Java caller holding the buffer.
+    Ok(unsafe { std::slice::from_raw_parts_mut(addr.cast::<[u8; ROW_BYTES]>(), rows) })
 }
 
 /// A term code from a `long`: `None` for `-1` (and any negative value).
@@ -177,19 +299,17 @@ pub extern "system" fn Java_org_vortexrdf_Native_count<'local>(
     g: JString<'local>,
 ) -> jlong {
     call(&mut env, |env| {
-        let [s, p, o, g] = [
-            term(env, &s)?,
-            term(env, &p)?,
-            term(env, &o)?,
-            term(env, &g)?,
-        ];
+        let [s, p, o, g] = pattern_terms(env, [&s, &p, &o, &g])?;
         Ok(store(h).count(s.as_deref(), p.as_deref(), o.as_deref(), g.as_deref())? as jlong)
     })
 }
 
-/// The matching quads as a flat `String[]`, four terms per quad; `limit < 0` takes every row.
+/// A read of every quad matching a pattern, as its first chunk; the last slot is `{stream, rows}`: the term stream
+/// of the chunks left ([`Java_org_vortexrdf_Native_termStreamNext`]), `0` when this one ends the read, and the
+/// read's rows. A chunk holds at most `chunkRows` rows and `chunkBytes` bytes of terms; terms over `largeTerm`
+/// bytes cross on their own.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vortexrdf_Native_quads<'local>(
+pub extern "system" fn Java_org_vortexrdf_Native_quadsOpen<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
     h: jlong,
@@ -197,27 +317,195 @@ pub extern "system" fn Java_org_vortexrdf_Native_quads<'local>(
     p: JString<'local>,
     o: JString<'local>,
     g: JString<'local>,
-    offset: jlong,
-    limit: jint,
-) -> JObjectArray<'local, JString<'local>> {
+    chunk_rows: jint,
+    chunk_bytes: jint,
+    large_term: jint,
+) -> JObjectArray<'local, JObject<'local>> {
     call(&mut env, |env| {
-        let [s, p, o, g] = [
-            term(env, &s)?,
-            term(env, &p)?,
-            term(env, &o)?,
-            term(env, &g)?,
-        ];
-        let rows = store(h).quads(
+        let [s, p, o, g] = pattern_terms(env, [&s, &p, &o, &g])?;
+        let limits = limits(chunk_rows, chunk_bytes, large_term)?;
+        let (mut stream, rows) = store(h).quads(
             s.as_deref(),
             p.as_deref(),
             o.as_deref(),
             g.as_deref(),
-            offset.max(0) as u64,
-            (limit >= 0).then_some(limit as usize),
+            limits,
         )?;
-        let flat: Vec<&str> = rows.iter().flatten().map(String::as_str).collect();
-        java_strings(env, flat.into_iter().map(Some))
+        if rows > MAX_JAVA_LIST {
+            return Err("the match has more rows than a Java list holds".into());
+        }
+        let first = stream.next_payload()?.unwrap_or_default();
+        let handle = if first.positions() / 4 < rows {
+            Stream::Terms(stream).open()
+        } else {
+            0
+        };
+        java_payload(env, &first, Some(&[handle, rows as i64])).inspect_err(|_| {
+            // SAFETY: the handle was just opened and never reached the Java side.
+            unsafe { Stream::close(handle) }
+        })
     })
+}
+
+/// The native stream behind a Java read, its terms or its codes, which the Java side holds by handle: counted
+/// in [`OPEN_HANDLES`] from [`open`](Self::open) to its drop.
+enum Stream {
+    Terms(TermStream),
+    Codes(CodeStream),
+}
+
+impl Stream {
+    /// Boxes the stream for the Java side; returns its handle.
+    fn open(self) -> jlong {
+        OPEN_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Box::into_raw(Box::new(self)) as jlong
+    }
+
+    /// The stream a handle addresses.
+    ///
+    /// # Safety
+    ///
+    /// `h` came from [`open`](Self::open), is not closed, and no other call uses it meanwhile.
+    unsafe fn get<'a>(h: jlong) -> &'a mut Stream {
+        // SAFETY: as the caller promises.
+        unsafe { &mut *(h as *mut Stream) }
+    }
+
+    /// Frees a handle; `0` is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// As for [`get`](Self::get), and nothing uses the handle afterwards.
+    unsafe fn close(h: jlong) {
+        if h != 0 {
+            // SAFETY: as the caller promises.
+            drop(unsafe { Box::from_raw(h as *mut Stream) });
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        OPEN_HANDLES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A read of the quads matching a pattern as a stream of chunks of at most `batchRows` rows, in the match's order
+/// (a `secondary-by-copy` index's for a pattern it serves, else base row order), sent as
+/// [`Java_org_vortexrdf_Native_quadsOpen`] sends its chunks; the pattern is parsed and matched now. Returns the
+/// stream's handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_termStreamOpen<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    h: jlong,
+    s: JString<'local>,
+    p: JString<'local>,
+    o: JString<'local>,
+    g: JString<'local>,
+    batch_rows: jint,
+    chunk_rows: jint,
+    chunk_bytes: jint,
+    large_term: jint,
+) -> jlong {
+    call(&mut env, |env| {
+        let [s, p, o, g] = pattern_terms(env, [&s, &p, &o, &g])?;
+        let limits = limits(chunk_rows, chunk_bytes, large_term)?;
+        let stream = store(h).term_stream(
+            s.as_deref(),
+            p.as_deref(),
+            o.as_deref(),
+            g.as_deref(),
+            size(batch_rows),
+            limits,
+        )?;
+        Ok(Stream::Terms(stream).open())
+    })
+}
+
+/// A term stream's next payload (`Payload.java`, its last slot `null`); `null` once every row was sent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_termStreamNext<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    stream: jlong,
+) -> JObjectArray<'local, JObject<'local>> {
+    call(&mut env, |env| {
+        // SAFETY: the Java side passes a stream `quadsOpen` or `termStreamOpen` returned, before freeing it, one
+        // call at a time (the call that opened it, or its `NativeStream`, which serializes them).
+        let Stream::Terms(terms) = (unsafe { Stream::get(stream) }) else {
+            return Err("termStreamNext: not a term stream".into());
+        };
+        match terms.next_payload()? {
+            Some(payload) => java_payload(env, &payload, None),
+            None => Ok(JObjectArray::default()),
+        }
+    })
+}
+
+/// A read of the quads matching a code pattern (`-1` is free) as a stream of their codes, in chunks of at
+/// most `batchRows` rows, in the match's order (a `secondary-by-copy` index's for a pattern it serves, else
+/// base row order). Returns the stream's handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_codeStreamOpen<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    h: jlong,
+    s: jlong,
+    p: jlong,
+    o: jlong,
+    g: jlong,
+    batch_rows: jint,
+) -> jlong {
+    call(&mut env, |_| {
+        let stream = store(h).code_stream(pattern(s, p, o, g), size(batch_rows))?;
+        Ok(Stream::Codes(stream).open())
+    })
+}
+
+/// Writes a code stream's next rows, up to `maxRows`, from the start of the direct buffer `buf` as
+/// `matchCodes` writes them. Returns the rows written, 0 once every row was.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_codeStreamNext<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    stream: jlong,
+    buf: JByteBuffer<'local>,
+    max_rows: jint,
+) -> jint {
+    call(&mut env, |env| {
+        let out = direct_rows(env, &buf, max_rows, "codeStreamNext")?;
+        // SAFETY: the Java side passes a stream `codeStreamOpen` returned, before freeing it, one call at a
+        // time (its `NativeStream` serializes them).
+        let Stream::Codes(codes) = (unsafe { Stream::get(stream) }) else {
+            return Err("codeStreamNext: not a code stream".into());
+        };
+        Ok(codes.next(out)? as jint)
+    })
+}
+
+/// Frees a term or code stream; `0` is a no-op.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_streamClose<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    stream: jlong,
+) {
+    call(&mut env, |_| {
+        // SAFETY: the Java side passes a stream `quadsOpen`, `termStreamOpen` or `codeStreamOpen` returned, once
+        // (the call that opened it, or its `NativeStream`), and nothing uses the stream afterwards.
+        unsafe { Stream::close(stream) };
+        Ok(())
+    })
+}
+
+/// The native objects the Java side holds by handle and has not freed, in this process.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_openHandles<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+) -> jlong {
+    call(&mut env, |_| Ok(OPEN_HANDLES.load(Ordering::Relaxed)))
 }
 
 #[unsafe(no_mangle)]
@@ -238,9 +526,7 @@ pub extern "system" fn Java_org_vortexrdf_Native_engineCounters<'local>(
 ) -> JLongArray<'local> {
     call(&mut env, |env| {
         let values = vortex_rdf_encoded_search::counters::snapshot().map(|v| v as i64);
-        let array = JLongArray::new(env, values.len())?;
-        array.set_region(env, 0, &values)?;
-        Ok(array)
+        java_longs(env, &values)
     })
 }
 
@@ -284,9 +570,7 @@ pub extern "system" fn Java_org_vortexrdf_Native_ranges<'local>(
             r.blanks.start as i64,
             r.blanks.end as i64,
         ];
-        let array = JLongArray::new(env, values.len())?;
-        array.set_region(env, 0, &values)?;
-        Ok(array)
+        java_longs(env, &values)
     })
 }
 
@@ -320,20 +604,49 @@ pub extern "system" fn Java_org_vortexrdf_Native_decode<'local>(
     })
 }
 
+/// Each code's term, one `String` apiece (`null` for a negative code or one outside the dictionary): the
+/// per-term call, for a lookup too small for a chunk's fixed cost to pay off.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vortexrdf_Native_decodeMany<'local>(
+pub extern "system" fn Java_org_vortexrdf_Native_decodeStrings<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
     h: jlong,
     codes: JLongArray<'local>,
 ) -> JObjectArray<'local, JString<'local>> {
     call(&mut env, |env| {
-        let mut buf = vec![0i64; codes.len(env)?];
-        codes.get_region(env, 0, &mut buf)?;
-        // A negative code is no code: u64::MAX is outside every dictionary, so it decodes to `None`.
-        let codes: Vec<u64> = buf.iter().map(|&c| code(c).unwrap_or(u64::MAX)).collect();
+        let codes = java_codes(env, &codes, 0, codes.len(env)?)?;
         let terms = store(h).decode_many(&codes)?;
         java_strings(env, terms.iter().map(|t| t.as_deref()))
+    })
+}
+
+/// The terms of `codes[from, from + count)` from the first, as one chunk of at most `chunkBytes` bytes of terms
+/// and at least one code (unless `count` is 0); a negative code and one outside the dictionary hold no term.
+/// The last slot is `{next}`, the codes the next slice should offer ([`Pace::next_slice`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vortexrdf_Native_decodeMany<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    h: jlong,
+    codes: JLongArray<'local>,
+    from: jint,
+    count: jint,
+    chunk_bytes: jint,
+    large_term: jint,
+) -> JObjectArray<'local, JObject<'local>> {
+    call(&mut env, |env| {
+        let len = codes.len(env)?;
+        let (Ok(start), Ok(n)) = (usize::try_from(from), usize::try_from(count)) else {
+            return Err("decodeMany: from and count must not be negative".into());
+        };
+        if start.checked_add(n).is_none_or(|end| end > len) {
+            return Err("decodeMany: from + count passes the end of codes".into());
+        }
+        let codes = java_codes(env, &codes, from, n)?;
+        let limits = limits(count.max(1), chunk_bytes, large_term)?;
+        let (payload, held) = store(h).decode_payload(&codes, limits)?;
+        let next = Pace::next_slice(n, held, payload.bytes(), limits.chunk_bytes);
+        java_payload(env, &payload, Some(&[next.min(i64::MAX as usize) as i64]))
     })
 }
 
@@ -368,20 +681,7 @@ pub extern "system" fn Java_org_vortexrdf_Native_matchCodes<'local>(
     max_rows: jint,
 ) -> jint {
     call(&mut env, |env| {
-        const NOT_A_BUFFER: &str = "matchCodes: not a direct buffer of 32 * maxRows bytes";
-        let addr = env
-            .get_direct_buffer_address(&buf)
-            .map_err(|_| NOT_A_BUFFER)?;
-        let capacity = env
-            .get_direct_buffer_capacity(&buf)
-            .map_err(|_| NOT_A_BUFFER)?;
-        let rows = max_rows.max(0) as usize;
-        if rows.checked_mul(ROW_BYTES).is_none_or(|len| len > capacity) {
-            return Err(NOT_A_BUFFER.into());
-        }
-        // SAFETY: the buffer's memory holds `rows` rows (checked above) and stays valid for this call, the Java
-        // caller holding the buffer.
-        let out = unsafe { std::slice::from_raw_parts_mut(addr.cast::<[u8; ROW_BYTES]>(), rows) };
+        let out = direct_rows(env, &buf, max_rows, "matchCodes")?;
         let written = store(h).match_codes(pattern(s, p, o, g), offset.max(0) as u64, out)?;
         Ok(written as jint)
     })

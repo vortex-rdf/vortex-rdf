@@ -128,6 +128,21 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 }
 ```
 
+**Java**:
+
+```java
+import java.nio.file.Paths;
+import org.vortexrdf.VortexStore;
+
+try (VortexStore store = VortexStore.open(Paths.get("data.vortex"))) {   // memory-mapped, layout auto-detected
+    store.size();                                                         // number of quads
+    store.count(null, "<http://xmlns.com/foaf/0.1/name>", null, null);    // match count, no terms materialized
+    for (String[] quad : store.quads(null, "<http://xmlns.com/foaf/0.1/name>", null, null)) {
+        System.out.println(quad[0] + " " + quad[2]);                      // {s, p, o, g}
+    }
+}
+```
+
 ## Main concepts overview
 
 - **Column layouts** — `Default` stores the four terms as N-Triples strings; `TypedObject` splits the object into kind/value/datatype/language columns; `Dictionary` stores `u64` codes into one sorted term dictionary of at most `i32::MAX` terms, held as the file's `dictionary` child and read in place from the mapped file, one FSST window at a time. See [docs/file-format.md §4–5](docs/file-format.md#4-the-quad-table).

@@ -76,11 +76,11 @@ export type CodeKeep = {
 /**
  * How `matchCodes`, `countQuads` and `matchCodeChunks` narrow a pattern's
  * match: `keep` first, then a window of the kept rows. A window that cuts
- * rows takes them in base row order. A `limit` that cannot cut a row (no
- * `offset`, and at least the match's row count, or a bound on it, known
- * without reading) leaves the match as it is, which `matchCodes` reads in
- * the order it reads the match without a limit and `matchCodeChunks` in base
- * row order.
+ * rows takes them in the match's order: a `secondary-by-copy` index's for a
+ * pattern it serves, else base row order. A `limit` that cannot cut a row
+ * (no `offset`, and at least the match's row count, or a bound on it, known
+ * without reading) leaves the match as it is, which `matchCodes` and
+ * `matchCodeChunks` read in the order they read the match without a limit.
  * A value of the wrong type or an unknown key throws a `TypeError`, a number
  * outside its range a `RangeError`.
  */
@@ -244,7 +244,7 @@ export class VortexRdfStore {
     matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ReadOptions): CodeColumns | null;
     /**
      * Low-level. `matchCodes` in chunks: an iterable whose items hold at most
-     * `options.batchRows` rows (8,192 by default) in base row order, each a
+     * `options.batchRows` rows (8,192 by default) in `matchCodes`' order, each a
      * `Float64Array` copy of the columns `options.columns` names (all four
      * by default). `null` under the same conditions as `matchCodes`. The
      * call resolves the match, narrowed by `options` (`ReadOptions`); each

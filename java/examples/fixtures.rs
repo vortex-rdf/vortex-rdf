@@ -1,6 +1,7 @@
 //! `cargo run -p vortex-rdf-java --example fixtures -- <dir>`: the stores the Java tests open, one per layout
-//! and index set (`dictionary.vortex`, `copy.vortex`, `reference.vortex`, `default.vortex`), and `oracle.tsv`,
-//! their quads as four tab-separated N-Triples spellings per line (the default graph is an empty field).
+//! and index set (`dictionary.vortex`, `copy.vortex`, `reference.vortex`, `default.vortex`, `typed.vortex`), and
+//! `oracle.tsv`, their quads as four tab-separated N-Triples spellings per line (the default graph is an empty
+//! field), in the stores' row order.
 
 #[path = "../tests/common/mod.rs"]
 mod common;

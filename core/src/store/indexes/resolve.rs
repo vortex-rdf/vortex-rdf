@@ -5,13 +5,14 @@
 //! file resolver.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use vortex_array::IntoArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 
 use super::components::{ComponentIdentity, IndexComponent};
 use super::serve::{InMemoryServePlan, ServeDecode};
-use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
+use super::{COL_RID, ComponentRun, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::Result;
 use crate::store::layouts::{PatternCodes, TermRef};
 
@@ -99,20 +100,24 @@ pub(super) fn resolve_in_memory(
     let run = run.expect("`IndexType::choose` hands out only probes with keys");
     let rows = component.rows()?;
     let rids = rows.unmasked_field_by_name(COL_RID)?.slice(run.clone())?;
+    let ids = Arc::new(ComponentRun::new(rids, probe.rids_ascend));
+    // The matched quads are the contiguous matched run of the serving
+    // component, so a read can slice them straight from it instead of
+    // gathering the primary columns at the row ids. The plan shares the run
+    // with the lazy ids: its ids decode once for both.
+    let serve = probe.serve.map(|decode| {
+        InMemoryServePlan::new(
+            decode,
+            component.identity.name,
+            rows.clone().into_array(),
+            run,
+            Arc::clone(&ids),
+            component.probes_arc(),
+        )
+    });
     Ok(IndexResolution::Resolved {
-        row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_component_run(rids, probe.rids_ascend)),
+        row_ids: ResolvedRowIds::Lazy(LazyRowIds::Component(ids)),
         resolves: probe.resolves,
-        // The matched quads are the contiguous matched run of the serving
-        // component, so a read can slice them straight from it instead of
-        // gathering the primary columns at the row ids.
-        serve: probe.serve.map(|decode| {
-            InMemoryServePlan::new(
-                decode,
-                component.identity.name,
-                rows.clone().into_array(),
-                run,
-                component.probes_arc(),
-            )
-        }),
+        serve,
     })
 }

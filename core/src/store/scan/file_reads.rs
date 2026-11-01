@@ -5,7 +5,6 @@
 //! them. Functions of the file, with no store state.
 
 use std::borrow::Cow;
-use std::ops::Range;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -78,13 +77,15 @@ pub(crate) async fn file_point_codes(
 /// What a point read by id reads: the chunk-probe handle of each read
 /// column, the code equalities of the pending filter, and the rows that pass
 /// them.
-struct PointRows {
+struct PointRows<'a> {
     handles: Vec<Arc<vortex_rdf_encoded_search::ColumnChunks>>,
     eqs: CodeEqs,
-    live: Vec<u64>,
+    /// The rows read: those a filtered read's checks passed, or a served
+    /// read's positions, borrowed.
+    live: Cow<'a, [u64]>,
 }
 
-impl PointRows {
+impl PointRows<'_> {
     /// The point read of `columns` at `rows` with `filter` pending: `None`
     /// when the filter is not code equalities, a column has no chunk probes,
     /// or a chunk the filter's reads reach has no probe.
@@ -123,7 +124,11 @@ impl PointRows {
         let Some(live) = rows_reading(file, &checks, rows).await? else {
             return Ok(None);
         };
-        Ok(Some(Self { handles, eqs, live }))
+        Ok(Some(Self {
+            handles,
+            eqs,
+            live: Cow::Owned(live),
+        }))
     }
 
     /// The live rows' values of `columns`, the columns `handles` read, in
@@ -583,32 +588,58 @@ fn u64_struct(
     Ok(Some(named_struct(columns, children, len)?.into_array()))
 }
 
-/// A located serve run's projected component columns, read point by point
-/// through the component's cached chunk probes into one canonical
-/// child-named chunk: the serve path's counterpart of [`file_point_rows`].
-/// `Ok(None)` declines (a column or chunk without a probe); the caller keeps
-/// its filter scan.
-pub(crate) async fn component_point_chunk(
+/// The rows of a serving `component` at its child rows `positions`
+/// (ascending), every column of `columns` read, under no filter: what the
+/// component's point reads take. `None` for a column the file holds no chunk
+/// probes of.
+fn component_points<'a>(
     file: &NativeStoreFile,
     component: &str,
     columns: &[&'static str],
-    range: Range<u64>,
-) -> Result<Option<ArrayRef>> {
-    let Some(handles) = columns
+    positions: &'a [u64],
+) -> Option<PointRows<'a>> {
+    let handles = columns
         .iter()
         .map(|c| file.component_column_chunks(component, c))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(None);
-    };
-    // The run's rows, under no filter: every column is read.
-    let run = PointRows {
+        .collect::<Option<Vec<_>>>()?;
+    Some(PointRows {
         handles,
         eqs: CodeEqs::default(),
-        live: range.collect(),
-    };
-    let Some(values) = run.columns(file, columns).await? else {
+        live: Cow::Borrowed(positions),
+    })
+}
+
+/// [`component_point_rows`] as one value column per column of `columns`, in
+/// that order, without building the chunk: the values a code read of a
+/// served run takes. `Ok(None)` declines as [`component_point_rows`] does.
+pub(crate) async fn component_point_values(
+    file: &NativeStoreFile,
+    component: &str,
+    columns: &[&'static str],
+    positions: &[u64],
+) -> Result<Option<Vec<Vec<u64>>>> {
+    match component_points(file, component, columns, positions) {
+        Some(rows) => rows.columns(file, columns).await,
+        None => Ok(None),
+    }
+}
+
+/// The component's `columns` at the child rows `positions` (ascending),
+/// read point by point through its cached chunk probes into one canonical
+/// child-named chunk, in the order of `positions`: a located run's rows, or
+/// the rows a narrowed served view kept of one. `Ok(None)` declines (a column
+/// or chunk without a probe).
+pub(crate) async fn component_point_rows(
+    file: &NativeStoreFile,
+    component: &str,
+    columns: &[&'static str],
+    positions: &[u64],
+) -> Result<Option<ArrayRef>> {
+    let Some(rows) = component_points(file, component, columns, positions) else {
         return Ok(None);
     };
-    u64_struct(&run.handles, columns, values, run.live.len())
+    let Some(values) = rows.columns(file, columns).await? else {
+        return Ok(None);
+    };
+    u64_struct(&rows.handles, columns, values, rows.live.len())
 }

@@ -10,21 +10,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use vortex_rdf_core::VortexRdfError as CoreError;
-use vortex_rdf_core::{CaseMap, DictReader, TermCode, TermPredicate, TextOptions};
+use vortex_rdf_core::{CaseMap, DictReader, TermCode, TermPredicate, TextOptions, distinct_codes};
 
 use crate::kernels::U64Column;
 use crate::u64s::extract_u64s;
 use crate::{detached, py_err};
-
-/// Buckets in the decode-sharing cache (see [`decode_slice`]).
-/// A power of two, so the bucket index is a mask rather than a division; 256
-/// entries keep the table at 4 KiB, small enough to stay cache-resident and to
-/// zero cheaply for a short column.
-const RECENT_BUCKETS: usize = 256;
-
-/// Slot sentinel for an empty cache bucket. Code 0 is a legitimate term code,
-/// so emptiness has to be carried by the slot rather than the code.
-const NO_SLOT: usize = usize::MAX;
 
 /// Bytes of text a [`PackedTerms`] reserves per position up front: a short
 /// IRI or literal is longer, so the buffer grows only a few times.
@@ -91,11 +81,10 @@ pub struct TermDict {
 /// which cannot cross the GIL release: callers pass a column's buffer or the
 /// buffer [`extract_u64s`] returns.
 ///
-/// A direct-mapped cache of `RECENT_BUCKETS` entries, indexed by the
-/// code's low bits (`code & (RECENT_BUCKETS - 1)`), holds the
-/// `(code, slot)` most recently decoded into each bucket; an occurrence
-/// whose bucket holds its own code reuses that slot instead of
-/// decompressing and allocating again. A hit
+/// The distinct codes are found as every binding finds them
+/// ([`distinct_codes`]): a direct-mapped cache of recent codes, indexed by
+/// the code's low bits, so an occurrence whose bucket holds its own code
+/// reuses that slot instead of decompressing and allocating again. A hit
 /// requires the stored code to match, so a collision — or a column holding
 /// more live terms than there are buckets — costs only a re-decode and
 /// never yields a wrong term.
@@ -116,27 +105,7 @@ pub(crate) fn decode_slice(
     // `slots[i]` indexes `decoded` for the i-th code, so the mapping from
     // occurrence to decoded term survives the GIL boundary as plain data.
     let (slots, decoded) = detached(py, || {
-        let mut slots: Vec<usize> = Vec::with_capacity(codes.len());
-        let mut distinct: Vec<TermCode> = Vec::new();
-        let mut recent = [(0 as TermCode, NO_SLOT); RECENT_BUCKETS];
-        for &code in codes {
-            // The low bits pick the bucket: masked before the
-            // narrowing, so they are the code's own.
-            let bucket = (code & (RECENT_BUCKETS as TermCode - 1)) as usize;
-            let (cached_code, cached_slot) = recent[bucket];
-            let slot = if cached_slot != NO_SLOT && cached_code == code {
-                cached_slot
-            } else {
-                let slot = distinct.len();
-                distinct.push(code);
-                // Overwrites whatever shared this bucket; a hit is
-                // gated on the stored code, so a lost entry only
-                // costs a re-decode.
-                recent[bucket] = (code, slot);
-                slot
-            };
-            slots.push(slot);
-        }
+        let (distinct, slots) = distinct_codes::<1>(codes.iter().copied());
         // One read of the distinct codes: a cursor over the resident terms,
         // or one batched read of the file-backed child.
         async move {

@@ -19,7 +19,6 @@ use std::thread::LocalKey;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::{Struct, StructArray};
 
-#[cfg(feature = "file-io")]
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
@@ -258,6 +257,15 @@ impl VortexRdfStore {
         }
     }
 
+    /// This view's rows as an exact selection in base row order, with no
+    /// serve plan: what an unserved view of the same rows reads, a served
+    /// view's base-order expectation.
+    pub(crate) async fn debug_unserved(&self) -> Result<VortexRdfStore> {
+        let selection = self.quads.materialized_selection().await?;
+        let quads = self.quads.with_selection(ViewSelection::Exact(selection));
+        Ok(self.derived(quads, self.tail.clone()))
+    }
+
     /// The exact row range this view's base selection is, when it is one
     /// (what the prefix probe leaves behind); `None` for every other shape.
     pub(crate) fn debug_selection_range(&self) -> Option<Range<u64>> {
@@ -276,6 +284,22 @@ impl VortexRdfStore {
             ViewSelection::Pending { ids, .. } => Some(ids.len_if_known()),
             ViewSelection::Residual(residual) => Some(residual.len_if_known()),
             ViewSelection::Exact(_) => None,
+        }
+    }
+
+    /// The window by position (`offset`, `limit`) of a pending selection's
+    /// lazy ids, as a located window reads it
+    /// ([`LazyRowIds::window`](crate::store::indexes::LazyRowIds::window)):
+    /// `Ok(None)` when the ids decline it, or for a view whose selection is
+    /// not pending.
+    pub(crate) async fn debug_pending_window(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<vortex_buffer::Buffer<crate::store::schema::RowId>>> {
+        match &self.quads.selection {
+            ViewSelection::Pending { ids, .. } => ids.window(offset, limit).await,
+            ViewSelection::Residual(_) | ViewSelection::Exact(_) => Ok(None),
         }
     }
 
@@ -503,7 +527,11 @@ impl VortexRdfStore {
     /// The index-child row range a file view's serve plan located for its
     /// run. `None` without a plan, or when the plan's run is unlocated.
     pub(crate) fn debug_serve_row_range(&self) -> Option<Range<u64>> {
-        self.quads.file()?.serve.as_ref()?.row_range()
+        use crate::store::indexes::ServedSpan;
+        match self.quads.file()?.serve.as_ref()?.span()? {
+            ServedSpan::Range(range) => Some(range),
+            ServedSpan::Kept(_) => None,
+        }
     }
 
     /// The zone-map row range a bound subject prunes to on a file view:

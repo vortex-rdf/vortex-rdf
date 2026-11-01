@@ -18,7 +18,7 @@ use crate::kernels::U64Column;
 use crate::{RUNTIME, settled};
 
 /// A match's term-code columns in chunks of at most `batch_rows` rows, in
-/// base row order (`VortexRdfStore.match_code_chunks`). Each `__next__`
+/// the match's order (`VortexRdfStore.match_code_chunks`). Each `__next__`
 /// pulls one chunk on the bindings' runtime, GIL-released and raced with
 /// the call's cancel token if it passed one, and returns one zero-copy
 /// [`U64Column`] per requested column. The end of the match, an error or a

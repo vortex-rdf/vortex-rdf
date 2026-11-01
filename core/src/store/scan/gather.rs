@@ -7,12 +7,14 @@ use vortex_array::arrays::{PrimitiveArray, Struct, StructArray};
 use vortex_array::dtype::PType;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
+use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 use vortex_rdf_encoded_search::SortedProbe;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::probes::StructProbes;
-use crate::store::view::selection::RowSelection;
+use crate::store::schema::RowId;
+use crate::store::view::selection::{RowSelection, point_sized};
 
 /// The rows of `base` that `selection` covers and `deleted` has not
 /// tombstoned: the one place the in-memory reads turn a view into rows, so
@@ -38,6 +40,25 @@ pub(crate) fn gather_live(
     rows.filter(live).map_err(VortexRdfError::Vortex)
 }
 
+/// The rows of `base` at the base row ids `ids`, in the order of `ids` (any
+/// order, each id once, none tombstoned): point by point through `probes`
+/// when they are few ([`point_sized`]), else one take. A served view's rows
+/// read off the base in its index's order.
+pub(crate) fn gather_rows_at(
+    base: &ArrayRef,
+    ids: &Buffer<RowId>,
+    probes: Option<&StructProbes>,
+) -> Result<ArrayRef> {
+    if point_sized(ids.len() as u64) {
+        let positions: Vec<usize> = ids.iter().map(|&id| id as usize).collect();
+        if let Some(rows) = point_rows(base, &positions, probes)? {
+            return Ok(rows);
+        }
+    }
+    let indices = PrimitiveArray::new(ids.clone(), Validity::NonNullable).into_array();
+    base.take(indices).map_err(VortexRdfError::Vortex)
+}
+
 /// The live rows of a point-sized selection, read point by point through
 /// encoded-search probes into canonical columns, skipping the per-column
 /// slice/canonicalize pipeline whose fixed cost dominates tiny reads of a
@@ -55,17 +76,30 @@ pub(crate) fn gather_by_point_reads(
         return Ok(None);
     };
     let live: Vec<usize> = live.into_iter().map(|i| i as usize).collect();
+    point_rows(base, &live, probes)
+}
+
+/// The rows of the struct `base` at `positions`, every column read point by
+/// point ([`point_read_columns`]) into one canonical struct, in the order of
+/// `positions`. `None` declines: a non-struct base, or a column no probe
+/// resolves.
+#[inline]
+fn point_rows(
+    base: &ArrayRef,
+    positions: &[usize],
+    probes: Option<&StructProbes>,
+) -> Result<Option<ArrayRef>> {
     let Some(fields) = base.dtype().as_struct_fields_opt() else {
         return Ok(None);
     };
     let names = fields.names().clone();
-    let Some(children) = point_read_columns(base, names.iter().map(AsRef::as_ref), &live, probes)
+    let Some(children) =
+        point_read_columns(base, names.iter().map(AsRef::as_ref), positions, probes)
     else {
         return Ok(None);
     };
-    let rows =
-        StructArray::try_new(names, children, live.len(), Validity::NonNullable)?.into_array();
-    Ok(Some(rows))
+    let rows = StructArray::try_new(names, children, positions.len(), Validity::NonNullable)?;
+    Ok(Some(rows.into_array()))
 }
 
 /// The `names` columns of the struct `array`, in that order, each read point

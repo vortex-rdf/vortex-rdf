@@ -2,16 +2,55 @@
 //! built from it, one per layout and index set.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use futures::stream;
 use vortex_rdf_core::io::quads_stream_to_vortex_file;
-use vortex_rdf_core::{IndexType, LayoutStrategy, RawQuad};
+use vortex_rdf_core::{IndexType, LayoutStrategy, Probe, RawQuad, VortexRdfStore};
+use vortex_rdf_jni::payload::{Limits, Payload};
+use vortex_rdf_jni::streams::TermStream;
 
 pub type Quad = [String; 4];
 
-/// Quads over named and blank subjects, IRI, blank and literal objects (plain, language-tagged, typed, with
-/// non-BMP characters) and three graphs, the default one included.
+/// Spellings that are hard to carry across JNI: escapes (tab, quote, backslash, NUL and another control
+/// character), characters outside the BMP in a literal and in an IRI, BMP characters of two and three UTF-8
+/// bytes, a zero-width space, a region language tag and a blank object.
+const SPELLINGS: &[[&str; 4]] = &[
+    [
+        "<http://example.org/s1>",
+        "<http://example.org/p0>",
+        "\"tab\\there \\\"q\\\" back\\\\slash\"",
+        "",
+    ],
+    [
+        "<http://example.org/s2>",
+        "<http://example.org/p0>",
+        "\"astral \u{1F600} \u{10348} end\"@en-gb",
+        "<http://example.org/g1>",
+    ],
+    [
+        "<http://example.org/s3>",
+        "<http://example.org/p1>",
+        "\"bmp é ß 中文 \u{200B}\"",
+        "",
+    ],
+    [
+        "<http://example.org/é/s7>",
+        "<http://example.org/p1>",
+        "_:b1",
+        "<http://example.org/g/\u{1F600}>",
+    ],
+    [
+        "<http://example.org/s4>",
+        "<http://example.org/p2>",
+        "\"nul \\u0000 ctl \\u0001\"",
+        "<http://example.org/g2>",
+    ],
+];
+
+/// `count` quads over named and blank subjects, IRI, blank and literal objects (plain, language-tagged,
+/// typed, with non-BMP characters) and three graphs, the default one included, then the [`SPELLINGS`].
 pub fn quads(count: usize) -> Vec<Quad> {
     let mut seen = BTreeSet::new();
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -46,6 +85,10 @@ pub fn quads(count: usize) -> Vec<Quad> {
         let q = RawQuad::canonical(&s, &p, &o, &g).expect("canonical quad");
         seen.insert([q.s, q.p, q.o, q.g]);
     }
+    for [s, p, o, g] in SPELLINGS {
+        let q = RawQuad::canonical(s, p, o, g).expect("canonical quad");
+        seen.insert([q.s, q.p, q.o, q.g]);
+    }
     seen.into_iter().collect()
 }
 
@@ -78,6 +121,11 @@ pub fn builds() -> Vec<Built> {
             layout: LayoutStrategy::Default,
             indexes: vec![],
         },
+        Built {
+            name: "typed",
+            layout: LayoutStrategy::TypedObject,
+            indexes: vec![],
+        },
     ]
 }
 
@@ -107,4 +155,174 @@ pub fn write(dir: &std::path::Path, built: &Built, quads: &[Quad]) -> String {
         ))
         .expect("write the store");
     path.to_str().unwrap().to_string()
+}
+
+/// The reference reads' runtime and the stores they opened, by path and residency.
+struct Reference {
+    runtime: tokio::runtime::Runtime,
+    opened: RefCell<HashMap<(String, bool), VortexRdfStore>>,
+}
+
+thread_local! {
+    /// One [`Reference`] per test thread: opening a store costs far more than reading a small one, and each
+    /// test writes its paths once, in its own temporary directory.
+    static REFERENCE: Reference = Reference {
+        runtime: tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+        opened: RefCell::new(HashMap::new()),
+    };
+}
+
+/// The rows a pattern matches, read one `String` per term as the bindings read them before the packed
+/// transfer: a Dictionary store's matched codes decoded a column at a time, the matched quads' terms
+/// otherwise. The tests' reference for the rows the engine hands over, their order included.
+pub fn reference_quads(path: &str, in_memory: bool, pattern: [Option<&str>; 4]) -> Vec<Quad> {
+    REFERENCE.with(|Reference { runtime, opened }| {
+        let store = opened
+            .borrow_mut()
+            .entry((path.to_string(), in_memory))
+            .or_insert_with(|| {
+                runtime
+                    .block_on(async {
+                        if in_memory {
+                            VortexRdfStore::from_file_in_memory(path).await
+                        } else {
+                            VortexRdfStore::from_file(path).await
+                        }
+                    })
+                    .expect("open the store")
+            })
+            .clone();
+        runtime.block_on(async {
+            let [s, p, o, g] = pattern;
+            let probe = Probe::parse(s, p, o, g).expect("parse the pattern");
+            let view = store.run_probe(&probe).await.expect("run the probe");
+            if let Some(dict) = store.dict_reader()
+                && let Some(columns) = view.code_columns_gathered().await.expect("gather codes")
+            {
+                let mut decoded = Vec::with_capacity(4);
+                for column in &columns {
+                    decoded.push(dict.decode_many(column).await.expect("decode a column"));
+                }
+                return (0..decoded[0].len())
+                    .map(|row| {
+                        std::array::from_fn(|i| {
+                            decoded[i][row]
+                                .clone()
+                                .expect("a matched row holds a code outside the dictionary")
+                        })
+                    })
+                    .collect();
+            }
+            view.shared_quads_vec()
+                .await
+                .expect("read the quads")
+                .iter()
+                .map(|q| {
+                    [
+                        q.s.to_string(),
+                        q.p.to_string(),
+                        q.o.to_string(),
+                        q.g.to_string(),
+                    ]
+                })
+                .collect()
+        })
+    })
+}
+
+/// The chunk limits the Java side reads with: `Payload.java`'s `CHUNK_ROWS`, `CHUNK_BYTES` and `LARGE_TERM`.
+pub const JAVA_LIMITS: Limits = Limits {
+    rows: 65_536,
+    chunk_bytes: 16 << 20,
+    large_term: 1 << 20,
+};
+
+/// The term at `position` of a payload, read as `Payload.java` reads it; `None` for a lookup's miss.
+pub fn term(payload: &Payload, position: usize) -> Option<&str> {
+    match payload.terms[position] {
+        -1 => None,
+        large if large < 0 => Some(&payload.large[(-2 - large) as usize]),
+        k => {
+            let k = 2 * k as usize;
+            let bytes = &payload.text[payload.bounds[k] as usize..payload.bounds[k + 1] as usize];
+            Some(std::str::from_utf8(bytes).expect("a term's bounds hold whole characters"))
+        }
+    }
+}
+
+/// A payload's rows, four positions each, spelled through [`term`].
+pub fn payload_rows(payload: &Payload) -> Vec<Quad> {
+    let positions = payload.positions();
+    assert_eq!(positions % 4, 0, "{positions} positions");
+    (0..positions / 4)
+        .map(|row| {
+            std::array::from_fn(|c| {
+                term(payload, 4 * row + c)
+                    .expect("a row position holds a term")
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
+/// Every row a term stream opened with `limits` sends, each payload holding whole rows, at least one and at
+/// most `limits.rows`; checks that an ended stream stays ended.
+pub fn drain(mut stream: TermStream, limits: Limits) -> Vec<Quad> {
+    let mut rows = Vec::new();
+    while let Some(payload) = stream.next_payload().expect("read a payload") {
+        let held = payload.positions() / 4;
+        assert!((1..=limits.rows).contains(&held), "{held} rows");
+        rows.extend(payload_rows(&payload));
+    }
+    assert!(
+        stream.next_payload().expect("read past the end").is_none(),
+        "an ended stream stays ended"
+    );
+    rows
+}
+
+/// The quads matching a pattern of spellings, by scan.
+pub fn scan(quads: &[Quad], pattern: &[Option<&str>; 4]) -> BTreeSet<Quad> {
+    quads
+        .iter()
+        .filter(|q| {
+            pattern
+                .iter()
+                .zip(q.iter())
+                .all(|(want, have)| want.is_none_or(|w| w == have))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Patterns: every subset of positions bound to a stored quad's own terms, for a spread of stored quads, plus
+/// a pattern per position bound to a well-formed term no quad holds.
+pub fn patterns(quads: &[Quad]) -> Vec<[Option<String>; 4]> {
+    let mut out = Vec::new();
+    for quad in quads.iter().step_by(29) {
+        for mask in 0..16u8 {
+            out.push(std::array::from_fn(|i| {
+                (mask & (1 << i) != 0).then(|| quad[i].clone())
+            }));
+        }
+    }
+    let absent = [
+        "<http://example.org/absent>",
+        "<http://example.org/absent>",
+        "<http://example.org/absent>",
+        "<http://example.org/absent>",
+    ];
+    for i in 0..4 {
+        out.push(std::array::from_fn(|j| {
+            (i == j).then(|| absent[j].to_string())
+        }));
+    }
+    out
+}
+
+pub fn as_refs(pattern: &[Option<String>; 4]) -> [Option<&str>; 4] {
+    std::array::from_fn(|i| pattern[i].as_deref())
 }

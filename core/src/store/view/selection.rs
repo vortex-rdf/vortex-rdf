@@ -64,6 +64,17 @@ impl ViewSelection {
         ViewSelection::Pending { ids, matches: None }
     }
 
+    /// The ids a narrowing of a served view (a window, keep, partition or
+    /// chained match) holds, live and in the index's order: what a read in
+    /// the index's order gathers at, with no run decoded. `None` for any
+    /// other selection.
+    pub(crate) fn held_index_order(&self) -> Option<&Buffer<RowId>> {
+        match self {
+            ViewSelection::Pending { ids, .. } => ids.live_index_order(),
+            ViewSelection::Exact(_) | ViewSelection::Residual(_) => None,
+        }
+    }
+
     /// Whether every base row is selected. A pending selection never is: it
     /// exists only on a view an index resolution restricted.
     pub(crate) fn is_all(&self) -> bool {
@@ -98,8 +109,9 @@ impl ViewSelection {
     /// The live rows this selection covers out of `base_len`, when known
     /// without I/O: an exact selection's rows less the `deleted` tombstones;
     /// a pending run's width while nothing is tombstoned
-    /// ([`LazyRowIds::len_if_known`]); under tombstones, its ids less them
-    /// when they take no I/O ([`LazyRowIds::ids_without_io`]). An in-memory
+    /// ([`LazyRowIds::len_if_known`]); under tombstones, its live ids counted
+    /// without I/O, never sorted ([`LazyRowIds::live_len_without_io`]): a
+    /// file run's only once read. An in-memory
     /// run's ids are decoded and cached here, the one way this fails, and a
     /// pending residual's matches are known once every piece was compared,
     /// and computed here under tombstones. Passed no tombstones, it counts the
@@ -112,9 +124,9 @@ impl ViewSelection {
         Ok(match (self, deleted) {
             (ViewSelection::Exact(selection), _) => Some(selection.live_len(deleted, base_len)),
             (ViewSelection::Pending { ids, .. }, None) => ids.len_if_known(),
-            (ViewSelection::Pending { ids, .. }, Some(deleted)) => ids
-                .ids_without_io()?
-                .map(|ids| RowSelection::Ids(ids).live_len(Some(deleted), base_len)),
+            (ViewSelection::Pending { ids, .. }, Some(deleted)) => {
+                ids.live_len_without_io(deleted)?
+            }
             (ViewSelection::Residual(residual), None) => residual.len_if_known(),
             (ViewSelection::Residual(residual), Some(deleted)) => {
                 Some(RowSelection::Ids(residual.materialized()?).live_len(Some(deleted), base_len))

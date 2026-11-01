@@ -44,11 +44,11 @@ use super::resolve::IndexProbe;
 use super::serve::ServeDecode;
 use super::{COL_RID, IndexInput, IndexType, ResolvedRoles};
 use crate::error::Result;
-use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{QuadPattern, ResolvedLayout, TermRef};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
+use crate::store::{RawQuad, SortOrder};
 
 /// One of the two sorted copy families this index maintains, named after its
 /// sort order. Each family owns five columns: the four quad components plus
@@ -172,24 +172,30 @@ pub(super) fn choose<'a>(
     if pattern.subject.is_some() {
         return None;
     }
-    let (family, lead, second, resolves) = match (pattern.predicate, pattern.object) {
+    // Each run reads in its copy's order, which reduces to base order where
+    // the bound columns lead the sort: only `index:posg` with the object
+    // unbound puts a column ahead of the subject.
+    let (family, lead, second, resolves, order) = match (pattern.predicate, pattern.object) {
         (Some(predicate), Some(object)) => (
             CopyFamily::Posg,
             TermRef::Predicate(predicate),
             Some(TermRef::Object(object)),
             ResolvedRoles::PredicateObject,
+            SortOrder::Spog,
         ),
         (Some(predicate), None) => (
             CopyFamily::Posg,
             TermRef::Predicate(predicate),
             None,
             ResolvedRoles::Predicate,
+            SortOrder::Posg,
         ),
         (None, Some(object)) => (
             CopyFamily::Ospg,
             TermRef::Object(object),
             None,
             ResolvedRoles::Object,
+            SortOrder::Spog,
         ),
         (None, None) => return None,
     };
@@ -209,6 +215,7 @@ pub(super) fn choose<'a>(
         resolves,
         serve: Some(ServeDecode {
             decode_layout: copy_decode_layout(layout),
+            order,
         }),
         rids_ascend: false,
     })

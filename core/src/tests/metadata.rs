@@ -183,6 +183,17 @@ async fn test_generation_and_dictionary_identity() {
     }
 }
 
+/// The order a view of [`views_of`] named `name` reads in: the `index:posg`
+/// copy's for the `?p1??` match it serves, whose object is unbound; base
+/// order for every other view (a served one's index order is base order).
+fn read_order(name: &str, stats: &crate::store::ViewStatistics) -> SortOrder {
+    if name == "predicate" && stats.served_component == Some("index:posg") {
+        SortOrder::Posg
+    } else {
+        SortOrder::Spog
+    }
+}
+
 /// `view`'s row count hint against its size: a bound the size stays within,
 /// and the size itself wherever it is exact.
 async fn assert_rows_bound(view: &VortexRdfStore, stats: &crate::store::ViewStatistics, tag: &str) {
@@ -220,7 +231,7 @@ async fn test_view_statistics_in_memory() {
                 RowCountHint::exact(view.size().await.unwrap()),
                 "{tag}"
             );
-            assert_eq!(stats.sort_order, Some(SortOrder::Spog), "{tag}");
+            assert_eq!(stats.sort_order, Some(read_order(name, &stats)), "{tag}");
             assert_eq!(stats.tombstones, tombstones, "{tag}");
             assert!(!stats.pending_filter && !stats.file_backed, "{tag}");
             assert_eq!(stats.tail_rows, 0, "{tag}");
@@ -320,7 +331,7 @@ async fn test_view_statistics_file_backed() {
                     );
                 }
                 assert_eq!(stats.file_backed, mapped, "{tag}");
-                assert_eq!(stats.sort_order, Some(SortOrder::Spog), "{tag}");
+                assert_eq!(stats.sort_order, Some(read_order(name, &stats)), "{tag}");
                 assert_eq!(stats.tombstones, tombstones, "{tag}");
                 assert_eq!(stats.generation, base.generation(), "{tag}");
             }
@@ -558,12 +569,14 @@ const PAST_THE_ROWS: usize = 100_000;
 const PAST_THE_ROWS_VIEW_ROWS: usize = 256;
 
 /// Partitions tile `view`: at each of [`PARTITION_COUNTS`], and at
-/// [`PAST_THE_ROWS`] on a small view, at most that many and never none, read
-/// in turn they give the view's base-ordered codes, and their sizes add up
-/// to its size.
+/// [`PAST_THE_ROWS`] on a small view, at most that many and never none, served
+/// as the view is when it has rows, each gathered in turn they give the view's
+/// codes in the order its reads yield them ([`read_order_codes`]), and their
+/// sizes add up to its size.
 async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
-    let expected = base_ordered_codes(view).await;
-    let past_the_rows = (expected.len() <= PAST_THE_ROWS_VIEW_ROWS).then_some(PAST_THE_ROWS);
+    let served = served_component(view).is_some();
+    let in_order = read_order_codes(view).await;
+    let past_the_rows = (in_order.len() <= PAST_THE_ROWS_VIEW_ROWS).then_some(PAST_THE_ROWS);
     for n in PARTITION_COUNTS.into_iter().chain(past_the_rows) {
         let parts = view
             .partitions(NonZeroUsize::new(n).unwrap())
@@ -574,14 +587,21 @@ async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
             "{tag}: {n} -> {}",
             parts.len()
         );
+        if !in_order.is_empty() {
+            let parts_served = parts.iter().all(|part| served_component(part).is_some());
+            assert_eq!(
+                parts_served, served,
+                "{tag}: partitions({n}) served as the view is"
+            );
+        }
         let mut got = Vec::new();
         let mut total = 0;
         for part in &parts {
-            got.extend(base_ordered_codes(part).await);
+            got.extend(row_list(part).await);
             total += part.size().await.unwrap();
         }
-        assert_eq!(got, expected, "{tag}: partitions({n}) tile the view");
-        assert_eq!(total, expected.len(), "{tag}: sizes add up");
+        assert_eq!(got, in_order, "{tag}: partitions({n}) tile the view");
+        assert_eq!(total, in_order.len(), "{tag}: sizes add up");
     }
 }
 

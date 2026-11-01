@@ -19,15 +19,16 @@ use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::RawQuad;
 use crate::store::array::subject_sorted;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout, StringLayout};
 use crate::store::probes::StructProbes;
+use crate::store::resident::CodeAccess;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::view::tail_keys::TailKeys;
 use crate::store::zones::ZoneTable;
+use crate::store::{RawQuad, SortOrder};
 
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
@@ -86,10 +87,15 @@ pub(crate) struct MemoryBase {
     /// The per-zone code bounds of `base`'s code columns ([`ZoneTable`]),
     /// shared by every view of this base; empty when the base has none.
     pub(crate) zones: Arc<ZoneTable>,
+    /// How `base`'s code columns read ([`CodeAccess`]), fixed when the base
+    /// was built.
+    pub(crate) code_access: CodeAccess,
     /// The index's plan for reading this view's rows from the index's own
-    /// columns ([`InMemoryServePlan`]). Present only while the selection is
-    /// exactly the plan's run: any narrowing drops it, materializing a
-    /// pending selection first (see [`ViewSelection`]).
+    /// columns ([`InMemoryServePlan`]), in its order. A match keeps it only
+    /// when its resolution is the view's sole restriction; a window, keep,
+    /// partition or chained match of a served view narrows it (its range, or
+    /// the rows it kept), the selection staying pending beside it (see
+    /// [`ViewSelection`]).
     pub(crate) serve: Option<InMemoryServePlan>,
 }
 
@@ -109,9 +115,12 @@ pub(crate) struct FileBase {
     /// left it ([`FileFilter`]).
     pub(crate) filter: FileFilter,
     /// The index's plan for reading this view's rows from the index's own
-    /// columns ([`FileServePlan`]). Present only while the selection is
-    /// exactly the plan's run: any narrowing drops it, materializing a
-    /// pending selection first (see [`ViewSelection`]).
+    /// columns ([`FileServePlan`]), in its order. A match keeps it only
+    /// when its resolution is the view's sole restriction (the filter it
+    /// leaves beside the plan is a residual the plan's terms cover); a
+    /// window, keep, partition or chained match of a served view narrows it
+    /// (its located range, or the rows it kept), the selection staying
+    /// pending and the filter resolved beside it (see [`ViewSelection`]).
     pub(crate) serve: Option<FileServePlan>,
 }
 
@@ -333,6 +342,28 @@ impl QuadsSource {
         }
     }
 
+    /// The order the view's base rows read in, when it is a known sort: a
+    /// served view's, its plan's (`(p, o, s, g)` for an `index:posg` run with
+    /// the object unbound, else base order; none over a file child whose
+    /// rows are not globally sorted), any other view's `(s, p, o, g)` over a
+    /// globally sorted base.
+    pub(crate) fn read_order(&self) -> Option<SortOrder> {
+        match &self.backend {
+            Backend::InMemory(memory) => {
+                if let Some(plan) = &memory.serve {
+                    return Some(plan.read_order());
+                }
+            }
+            #[cfg(feature = "file-io")]
+            Backend::File(base) => {
+                if let Some(plan) = &base.serve {
+                    return plan.read_order();
+                }
+            }
+        }
+        self.subject_sorted().then_some(SortOrder::Spog)
+    }
+
     /// The index component whose serve plan answers this view's reads, if
     /// any.
     pub(crate) fn served_component(&self) -> Option<&'static str> {
@@ -412,6 +443,7 @@ impl QuadsSource {
                 components: Arc::clone(&memory.components),
                 probes: Arc::clone(&memory.probes),
                 zones: Arc::clone(&memory.zones),
+                code_access: memory.code_access,
                 serve,
             }),
         }

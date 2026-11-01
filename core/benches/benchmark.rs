@@ -1005,6 +1005,25 @@ enum PairSide {
 /// The limit vortex-rdflib's `triples()` probes a pattern's size with.
 const PROBING_LIMIT: usize = 65_537;
 
+/// The rows a chunk holds at the Python binding's default batch.
+const PYTHON_BATCH: usize = 65_536;
+
+/// The rows of `view`'s code columns, gathered: the bindings' `match_codes`.
+async fn gathered_rows(view: &VortexRdfStore) -> usize {
+    let columns = view.code_columns_gathered().await.expect("gather");
+    columns.expect("a Dictionary view has code columns")[0].len()
+}
+
+/// The rows of `view`'s code chunks of `columns`, drained `batch` rows a chunk.
+async fn drain_code_chunks(view: &VortexRdfStore, columns: &[QuadColumn], batch: usize) -> usize {
+    let mut chunks = view.code_chunks(columns, batch).expect("code_chunks");
+    let mut rows = 0;
+    while let Some(chunk) = chunks.next().await {
+        rows += chunk.expect("code chunk")[0].len();
+    }
+    rows
+}
+
 /// One cell of a limit pair: `shape` matched on a Dictionary store of the given
 /// `source` and `index` (opened once, before timing) and read as the bindings
 /// read it, `run_probe` then `how`. The [`Plain`](PairSide::Plain) cell times
@@ -1027,11 +1046,8 @@ fn run_limit_pair(
         rt().block_on(async {
             let view = store.run_probe(probe).await.expect("run_probe");
             match how {
-                PairRead::Gathered => {
-                    let columns = view.code_columns_gathered().await.expect("gather");
-                    columns.expect("a Dictionary view has code columns")[0].len()
-                }
-                PairRead::Chunks => drain_code_chunks(&view, &QuadColumn::ALL).await,
+                PairRead::Gathered => gathered_rows(&view).await,
+                PairRead::Chunks => drain_code_chunks(&view, &QuadColumn::ALL, PYTHON_BATCH).await,
             }
         })
     };
@@ -1083,6 +1099,8 @@ limit_pairs!(
     Gathered (Index::ByCopy, Source::InMemory, [P, PO]) => match_codes_plain_dict_bycopy_mem / match_codes_limit_dict_bycopy_mem,
     // The chunk stream, the no-index file store.
     Chunks (Index::None, Source::File, [P, PO, O, G]) => chunks_codes_plain_dict_noindex_file / chunks_codes_limit_dict_noindex_file,
+    // The chunk stream, the by-copy file store: P, PO and O are index-served runs.
+    Chunks (Index::ByCopy, Source::File, [P, PO, O]) => chunks_codes_plain_dict_bycopy_file / chunks_codes_limit_dict_bycopy_file,
 );
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1124,17 +1142,6 @@ impl fmt::Debug for ChunkColumns {
 
 const CHUNK_COLUMNS: &[ChunkColumns] = &[ChunkColumns::O, ChunkColumns::Spog];
 
-/// The rows of `view`'s code chunks of `columns`, drained at the Python
-/// binding's default of 65,536 rows a chunk.
-async fn drain_code_chunks(view: &VortexRdfStore, columns: &[QuadColumn]) -> usize {
-    let mut chunks = view.code_chunks(columns, 65_536).expect("code_chunks");
-    let mut rows = 0;
-    while let Some(chunk) = chunks.next().await {
-        rows += chunk.expect("code chunk")[0].len();
-    }
-    rows
-}
-
 /// `code_chunks` over a predicate-bound view of the in-memory store (a 32nd
 /// of its rows, an id list), drained at the Python binding's default of
 /// 65,536 rows a chunk: `o` alone, and all four columns. The match, and a
@@ -1148,7 +1155,7 @@ fn chunks_codes(bencher: divan::Bencher, columns: &ChunkColumns) {
     let view = rt()
         .block_on(store.match_pattern(None, p.as_ref(), None, None))
         .expect("match P");
-    let drain = || rt().block_on(drain_code_chunks(&view, columns));
+    let drain = || rt().block_on(drain_code_chunks(&view, columns, PYTHON_BATCH));
     assert!(drain() > 0, "the predicate-bound view has rows");
     bencher.bench(|| black_box(drain()));
 }
@@ -1167,8 +1174,212 @@ fn chunks_codes_cold(bencher: divan::Bencher, columns: &ChunkColumns) {
             rt().block_on(store.match_pattern(None, p.as_ref(), None, None))
                 .expect("match P")
         })
-        .bench_values(|view| black_box(rt().block_on(drain_code_chunks(&view, columns))));
+        .bench_values(|view| {
+            black_box(rt().block_on(drain_code_chunks(&view, columns, PYTHON_BATCH)))
+        });
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4e — SERVED READS (a run of a by-copy index)
+//
+// The reads a query engine makes of a view a by-copy index serves: the
+// predicate-bound (`P`) view of the Group 2 by-copy Dictionary store, whose
+// rows are one run of `index:posg`. Each cell is one read of that view: a
+// window near its start and a deep one, a keep of a sparse and of a dense set
+// of objects, the sparse keep's count, four partitions, the code-chunk stream
+// at the Python binding's default batch and at a small one, and (reused only)
+// the decoded quads. Every view a read returns is gathered
+// (`code_columns_gathered`), as the bindings' `match_codes` reads it.
+//
+// Two regimes per source: `served_fresh_*` matches the view inside the
+// measurement, as a query runs one read on a view it has just matched;
+// `served_reused_*` matches once, untimed, and times the read alone, as an
+// engine paging through one view does.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// One read of a served view: an argument of the served-read cells.
+#[derive(Copy, Clone)]
+enum ServedRead {
+    /// `window(10, 100)`, a page near the start.
+    CutWindow,
+    /// `window(n / 2, n / 4)`, a quarter of the view's `n` rows from its middle.
+    DeepWindow,
+    /// `keep` of every 16th distinct object.
+    KeepSparse,
+    /// `keep` of the lower half of the objects' code range.
+    KeepDense,
+    /// The sparse keep's `size`.
+    CountKeep,
+    /// `partitions(4)`, each gathered.
+    Partitions,
+    /// Every chunk of `code_chunks` over the four columns, 65,536 rows a chunk.
+    Chunks,
+    /// Every chunk of `code_chunks` over the four columns, 64 rows a chunk.
+    ChunksSmall,
+    /// `quads_vec`.
+    Quads,
+}
+
+impl fmt::Debug for ServedRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CutWindow => "cut_window",
+            Self::DeepWindow => "deep_window",
+            Self::KeepSparse => "keep_sparse",
+            Self::KeepDense => "keep_dense",
+            Self::CountKeep => "count_keep",
+            Self::Partitions => "partitions",
+            Self::Chunks => "chunks",
+            Self::ChunksSmall => "chunks_small",
+            Self::Quads => "quads",
+        })
+    }
+}
+
+/// The reads timed on a reused view: every [`ServedRead`], [`ServedRead::Quads`]
+/// last.
+const SERVED_REUSED_READS: &[ServedRead] = &[
+    ServedRead::CutWindow,
+    ServedRead::DeepWindow,
+    ServedRead::KeepSparse,
+    ServedRead::KeepDense,
+    ServedRead::CountKeep,
+    ServedRead::Partitions,
+    ServedRead::Chunks,
+    ServedRead::ChunksSmall,
+    ServedRead::Quads,
+];
+
+/// The reads timed on a fresh match each: all but the last, [`ServedRead::Quads`],
+/// which `match_cold_*` and `match_warm_*` already time with the match.
+const SERVED_FRESH_READS: &[ServedRead] = SERVED_REUSED_READS.split_last().unwrap().1;
+
+/// When a served-read cell matches its view.
+#[derive(Copy, Clone)]
+enum ServedMatch {
+    /// Inside the measurement, once per iteration.
+    Fresh,
+    /// Once, before the measurement.
+    Reused,
+}
+
+/// What a served read needs besides its view, derived once, untimed, from the
+/// view: its row count and the two keeps.
+struct ServedInputs {
+    rows: usize,
+    sparse: vortex_rdf_core::Keep,
+    dense: vortex_rdf_core::Keep,
+}
+
+/// `view` kept to the rows whose object `keep` admits.
+async fn kept_objects(view: &VortexRdfStore, keep: &vortex_rdf_core::Keep) -> VortexRdfStore {
+    view.keep(QuadColumn::O, keep).await.expect("keep")
+}
+
+impl ServedRead {
+    /// This read of `view`, as the rows it returns.
+    async fn rows(self, view: &VortexRdfStore, inputs: &ServedInputs) -> usize {
+        match self {
+            Self::CutWindow => gathered_rows(&view.window(10, 100).await.expect("window")).await,
+            Self::DeepWindow => {
+                let (offset, limit) = (inputs.rows / 2, inputs.rows / 4);
+                gathered_rows(&view.window(offset, limit).await.expect("window")).await
+            }
+            Self::KeepSparse => gathered_rows(&kept_objects(view, &inputs.sparse).await).await,
+            Self::KeepDense => gathered_rows(&kept_objects(view, &inputs.dense).await).await,
+            Self::CountKeep => {
+                let kept = kept_objects(view, &inputs.sparse).await;
+                kept.size().await.expect("size")
+            }
+            Self::Partitions => {
+                let four = std::num::NonZeroUsize::new(4).expect("four is not zero");
+                let parts = view.partitions(four).await.expect("partitions");
+                let mut rows = 0;
+                for part in &parts {
+                    rows += gathered_rows(part).await;
+                }
+                rows
+            }
+            Self::Chunks => drain_code_chunks(view, &QuadColumn::ALL, PYTHON_BATCH).await,
+            Self::ChunksSmall => drain_code_chunks(view, &QuadColumn::ALL, 64).await,
+            Self::Quads => view.quads_vec().await.expect("quads").len(),
+        }
+    }
+}
+
+/// One served-read cell: `read` of the `P` view of the by-copy Dictionary store
+/// of `source` (opened untimed), matched as `matched` says. The setup derives
+/// the read's inputs from one match and reads it once, and panics, naming
+/// `cell` and the read, unless it returns rows.
+fn served_read(
+    bencher: divan::Bencher,
+    cell: &str,
+    source: Source,
+    matched: ServedMatch,
+    read: ServedRead,
+) {
+    use vortex_rdf_core::{Keep, TermCode};
+
+    let store = make_store(source, Layout::Dictionary, Index::ByCopy, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let (store, p) = (&store, p.as_ref());
+    let view_of = move || async move {
+        store
+            .match_pattern(None, p, None, None)
+            .await
+            .expect("match P")
+    };
+    let view = rt().block_on(view_of());
+    let inputs = rt().block_on(async {
+        let columns = view.code_columns_gathered().await.expect("gather");
+        let columns = columns.expect("a Dictionary view has code columns");
+        let mut objects: Vec<TermCode> = columns[2].iter().copied().collect();
+        objects.sort_unstable();
+        objects.dedup();
+        ServedInputs {
+            rows: view.size().await.expect("size"),
+            sparse: Keep::set(objects.iter().step_by((objects.len() / 16).max(1)).copied()),
+            dense: Keep::range(objects[0]..objects[objects.len() / 2]),
+        }
+    });
+    let rows = rt().block_on(read.rows(&view, &inputs));
+    assert!(rows > 0, "{cell}/{read:?}: the read returned no rows");
+    match matched {
+        ServedMatch::Fresh => {
+            drop(view);
+            bencher.bench(|| {
+                black_box(rt().block_on(async {
+                    let view = view_of().await;
+                    read.rows(&view, &inputs).await
+                }))
+            });
+        }
+        ServedMatch::Reused => {
+            bencher.bench(|| black_box(rt().block_on(read.rows(&view, &inputs))))
+        }
+    }
+}
+
+/// The served-read cells: one `name (source, match, reads)` row per benchmark
+/// function, a [`Source`] and a [`ServedMatch`], each swept over its reads.
+macro_rules! served_reads {
+    ($($name:ident ($source:ident, $matched:ident, $reads:ident),)*) => {
+        $(
+            #[divan::bench(args = $reads, sample_count = QUERY_SAMPLES)]
+            fn $name(bencher: divan::Bencher, read: &ServedRead) {
+                let (source, matched) = (Source::$source, ServedMatch::$matched);
+                served_read(bencher, stringify!($name), source, matched, *read);
+            }
+        )*
+    };
+}
+
+served_reads!(
+    served_fresh_file(File, Fresh, SERVED_FRESH_READS),
+    served_fresh_mem(InMemory, Fresh, SERVED_FRESH_READS),
+    served_reused_file(File, Reused, SERVED_REUSED_READS),
+    served_reused_mem(InMemory, Reused, SERVED_REUSED_READS),
+);
 
 // ══════════════════════════════════════════════════════════════════════════
 // Group 5 — MUTATE (append / delete / compact)

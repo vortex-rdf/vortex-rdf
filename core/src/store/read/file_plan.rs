@@ -100,6 +100,7 @@ impl VortexRdfStore {
     ) -> Result<StreamedPlan<'a>> {
         let (scope, read) = self.file_read(base, columns).await?;
         if let (ExactRead::Masks, Some(filter)) = (&read, scope.filter) {
+            observe!(MasksFirstStream);
             let reads = file_reads::masks_first_split_reads(
                 scope.file,
                 filter,

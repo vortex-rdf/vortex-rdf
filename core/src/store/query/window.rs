@@ -17,12 +17,12 @@ use vortex_buffer::Buffer;
 use crate::debug;
 use crate::error::Result;
 use crate::observe::observe;
-use crate::store::VortexRdfStore;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, read_plan};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 #[cfg(feature = "file-io")]
 use crate::store::{FileBase, FileFilter};
+use crate::store::{Tail, VortexRdfStore};
 
 impl VortexRdfStore {
     /// The view's rows after skipping `offset` and taking at most `limit`.
@@ -32,23 +32,26 @@ impl VortexRdfStore {
     /// pending filter and row order included: one with no `offset` whose
     /// `limit` is at least the view's row count, or a bound on it, known
     /// without reading (the `rows.upper_bound` of
-    /// [`view_statistics`](Self::view_statistics)). With no `offset`, a
-    /// served file view whose run's width is unknown reads the run's ids
-    /// first, kept on the view for the window below, and is the view as it
-    /// is when they fit. A file view whose reads take a pending filter of
-    /// code equalities by its masks first is never the view as it is: its
-    /// window evaluates the filter whatever the bound, as below, and so finds
-    /// whether it cuts.
+    /// [`view_statistics`](Self::view_statistics)). A file view whose reads
+    /// take a pending filter of code equalities by its masks first is never
+    /// the view as it is: its window evaluates the filter whatever the bound,
+    /// as below, and so finds whether it cuts.
     ///
-    /// Any other window is a position range over base order: base rows in
-    /// base row order, then the tail's. Its serve plan is dropped, so a
-    /// served view's rows come back in base order, not the index's. A
-    /// pending file filter is resolved only as far as the window reaches
-    /// (its splits evaluated in file order, stopping at the first that fills
-    /// the window), so `LIMIT` over a filtered scan costs the matching prefix
-    /// of the file. A window with no `offset` whose filter matches fewer rows
-    /// than its limit finds that it cuts no base row: the view keeps its rows,
-    /// known exactly from then on, its reads and counts taking them from the
+    /// A window of a view a by-copy index serves is served too: rows
+    /// `offset..offset + limit` of the view in its index's order, then the
+    /// tail's, read off the index as the view's are. A served file run whose
+    /// width is unknown (a string layout's, or one a residual term filters)
+    /// is read once by row index first, kept on the view for every narrowing
+    /// of it, and windowed whether or not the limit cuts. Any other window is
+    /// a position range over base order: base rows in base row order, then
+    /// the tail's, with no serve plan. Either order is the same on every
+    /// call, so paging by repeated windows reads each row once. A pending
+    /// file filter is resolved only as far as the window reaches (its splits
+    /// evaluated in file order, stopping at the first that fills the window),
+    /// so `LIMIT` over a filtered scan costs the matching prefix of the file.
+    /// A window with no `offset` whose filter matches fewer rows than its
+    /// limit finds that it cuts no base row: the view keeps its rows, known
+    /// exactly from then on, its reads and counts taking them from the
     /// filter's evaluation, which is never run again, and its tail is
     /// windowed to the rest of the limit.
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
@@ -71,25 +74,20 @@ impl VortexRdfStore {
             debug::step!(t, "[window] limit {limit} cuts no row: the view as it is");
             return Ok(None);
         };
-        // A served file run whose width is unknown until its ids are read
-        // reads them into the view's shared cell, where any window below
-        // takes them from, and is the view as it is when they fit.
-        #[cfg(feature = "file-io")]
-        let base_live = if offset == 0
-            && let Some(FileBase { serve: Some(_), .. }) = self.quads.file()
-            && let ViewSelection::Pending { ids: lazy, .. } = &self.quads.selection
-            && lazy.len_if_known().is_none()
-        {
-            lazy.materialized_async().await?;
-            let WindowCheck::MayCut { base_live } = self.window_check(offset, limit)? else {
-                debug::step!(t, "[window] limit {limit} cuts no row of the served run");
-                return Ok(None);
-            };
-            base_live
-        } else {
-            base_live
-        };
         observe!(Window);
+        // A served view's window is served too, in its index's order.
+        if let Some(windowed) = self.served_window_in_memory(offset, limit)? {
+            debug::step!(t, "[window] offset {offset} limit {limit} of a served run");
+            return Ok(Some(windowed));
+        }
+        #[cfg(feature = "file-io")]
+        if let Some(windowed) = self.served_window_file(offset, limit).await? {
+            debug::step!(
+                t,
+                "[window] offset {offset} limit {limit} of a served file run"
+            );
+            return Ok(Some(windowed));
+        }
         #[cfg(feature = "file-io")]
         if offset == 0
             && let Some(windowed) = self.filter_window(limit).await?
@@ -116,19 +114,32 @@ impl VortexRdfStore {
             .quads
             .with_selection(ViewSelection::Exact(windowed))
             .with_filter_resolved();
-        // Whatever the base could not fill falls to the tail: the offset it
-        // did not consume, the limit it did not take.
-        let tail = self.tail.as_ref().map(|tail| {
-            tail.window(
-                offset.saturating_sub(base_live),
-                limit.saturating_sub(base_taken),
-            )
-        });
+        let tail = self.windowed_tail(offset, limit, base_live, base_taken);
         debug::step!(
             t,
             "[window] offset {offset} limit {limit}: {base_taken} base rows"
         );
         Ok(Some(self.derived(quads, tail)))
+    }
+
+    /// The tail of a window of this view whose base held `base_live` rows
+    /// and gave `base_taken` of them: whatever the base could not fill falls
+    /// to the tail, the offset it did not consume, the limit it did not
+    /// take.
+    #[inline]
+    pub(in crate::store) fn windowed_tail(
+        &self,
+        offset: usize,
+        limit: usize,
+        base_live: usize,
+        base_taken: usize,
+    ) -> Option<Tail> {
+        self.tail.as_ref().map(|tail| {
+            tail.window(
+                offset.saturating_sub(base_live),
+                limit.saturating_sub(base_taken),
+            )
+        })
     }
 
     /// Whether a window of `limit` rows after `offset` can cut a row of this
@@ -227,9 +238,10 @@ impl VortexRdfStore {
         else {
             return Ok(None);
         };
-        if base.serve.is_some() {
-            return Ok(None);
-        }
+        debug_assert!(
+            base.serve.is_none(),
+            "a served view's window is cut in its index's order first"
+        );
         let (file, deleted) = (&base.file, self.quads.deleted.as_ref());
         let masks = match &base.filter {
             FileFilter::Kept { masks, .. } => Arc::clone(masks),

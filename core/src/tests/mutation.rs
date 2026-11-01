@@ -470,6 +470,7 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
     ] {
         let cols = view
             .code_columns()
+            .unwrap()
             .unwrap_or_else(|| panic!("{tag}: the in-memory fast path must serve codes"));
         assert_eq!(cols[0].len(), live, "{tag}");
         assert_eq!(

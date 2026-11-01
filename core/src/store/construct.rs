@@ -10,6 +10,7 @@ use crate::store::builders::SortedStreamBuilder;
 use crate::store::builders::{BuiltArray, VortexArrayBuilder, build_struct_array};
 use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
+use crate::store::resident::CodeAccess;
 use crate::store::zones::ZoneTable;
 use crate::store::{
     Backend, MemoryBase, QuadsSource, RawQuad, VortexRdfStore, next_generation, probes, resident,
@@ -169,6 +170,7 @@ impl VortexRdfStore {
         for component in components.iter() {
             component.warm_probes();
         }
+        let code_access = CodeAccess::of(&base);
         Ok(Self {
             layout,
             indexes,
@@ -178,6 +180,7 @@ impl VortexRdfStore {
                 components,
                 probes: store_probes,
                 zones,
+                code_access,
                 serve: None,
             })),
             tail: None,

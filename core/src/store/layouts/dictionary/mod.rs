@@ -5,8 +5,9 @@
 //! [`storage`] holds a resident dictionary's terms and reads and writes the
 //! `dictionary` child, [`term_dict`] is the frozen dictionary,
 //! [`file_backed`] reads the terms from the file on demand, [`handles`] is
-//! the residency seam and the public handles, and [`predicates`] evaluates
-//! term predicates on spellings.
+//! the residency seam and the public handles, [`predicates`] evaluates
+//! term predicates on spellings, and [`sharing`] finds a run of codes'
+//! distinct ones for a binding's decode.
 //!
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
@@ -16,6 +17,7 @@ pub(crate) mod file_backed;
 mod handles;
 pub(crate) mod ingest;
 pub mod predicates;
+mod sharing;
 pub(crate) mod storage;
 pub(crate) mod term_dict;
 
@@ -32,4 +34,5 @@ pub use self::ingest::DictionaryQuadSink;
 pub use self::predicates::{
     CaseMap, KindRanges, NumOp, Number, TermPredicate, TextOptions, TextPredicate, Verdict,
 };
+pub use self::sharing::distinct_codes;
 pub(crate) use self::term_dict::TermDictionary;

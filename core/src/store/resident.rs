@@ -170,6 +170,54 @@ pub(crate) fn shared_code_primitive(
     (prim.ptype() == CODE_PTYPE).then_some(prim)
 }
 
+/// How an in-memory base's four code columns read, fixed when the base is
+/// built ([`CodeAccess::of`]): what decides whether a served view's reads
+/// gather the base at the view's row ids or read the serving index's own
+/// columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodeAccess {
+    /// Each keeps its decode once made: a canonical column, or a
+    /// `vortex.shared` wrapper, whose one-way cache holds its decoded
+    /// source (a built store's). A gather at scattered row ids decodes
+    /// nothing twice.
+    Resident,
+    /// Encoded (a store read off a file or adopted from bytes keeps its
+    /// columns wire-encoded): every take decodes them again, so a gather at
+    /// scattered ids is a whole-column decode per chunk. Also a base whose
+    /// code columns are not where the schema puts them.
+    Encoded,
+}
+
+impl CodeAccess {
+    /// The access of `base`'s code columns, each found at its schema
+    /// position and its name checked there (a base of another shape reads as
+    /// encoded). Decodes nothing.
+    pub(crate) fn of(base: &ArrayRef) -> Self {
+        use vortex_array::arrays::Struct;
+        use vortex_layout::arrays::shared::Shared;
+
+        let Some(base) = base.as_opt::<Struct>() else {
+            return CodeAccess::Encoded;
+        };
+        let names = base.names();
+        let resident = schema::QuadColumn::ALL.iter().all(|column| {
+            let k = column.index();
+            names
+                .iter()
+                .nth(k)
+                .is_some_and(|name| name.as_ref() == column.name())
+                && base
+                    .unmasked_field_opt(k)
+                    .is_some_and(|child| child.is_canonical() || child.as_opt::<Shared>().is_some())
+        });
+        if resident {
+            CodeAccess::Resident
+        } else {
+            CodeAccess::Encoded
+        }
+    }
+}
+
 /// The non-decoding half of [`shared_code_primitive`]: a base child's
 /// canonical code primitive when one already exists (the column itself, or a
 /// `vortex.shared` wrapper whose cache an earlier read filled). `None` when

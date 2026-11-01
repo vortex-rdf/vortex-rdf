@@ -66,6 +66,7 @@ impl NQuadLines {
 
     /// Append `term` (a subject, a predicate or an object) and the space
     /// after it.
+    #[inline]
     pub(crate) fn term(&mut self, term: &str) {
         self.text.push_str(term);
         self.text.push(' ');
@@ -73,6 +74,7 @@ impl NQuadLines {
 
     /// End the line: `graph` and a space unless it is the default graph's
     /// `""`, then `.` and a newline.
+    #[inline]
     pub(crate) fn end(&mut self, graph: &str) {
         if !graph.is_empty() {
             self.named_graph = true;
@@ -81,7 +83,9 @@ impl NQuadLines {
         self.text.push_str(".\n");
     }
 
-    /// Append one row's line.
+    /// Append one row's line: the export's per-row step, kept inline in
+    /// its loop.
+    #[inline]
     pub(crate) fn push(&mut self, [s, p, o, g]: [&str; 4]) {
         self.term(s);
         self.term(p);
