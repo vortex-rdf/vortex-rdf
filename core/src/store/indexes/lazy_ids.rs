@@ -13,6 +13,7 @@ use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use super::components::{self, run_order_row_ids, sorted_row_ids};
+use super::get_or_try_init;
 #[cfg(feature = "file-io")]
 use super::rid_reads::{read_located_rids, scan_index_row_ids};
 use crate::error::Result;
@@ -118,11 +119,7 @@ impl ComponentRun {
     /// ([`run_order_row_ids`]) and kept: the one decode a served view's reads
     /// and its lazy ids share.
     pub(crate) fn run_order(&self) -> Result<Buffer<RowId>> {
-        if let Some(ids) = self.run_order.get() {
-            return Ok(ids.clone());
-        }
-        let ids = run_order_row_ids(self.rids.clone())?;
-        Ok(self.run_order.get_or_init(|| ids).clone())
+        get_or_try_init(&self.run_order, || run_order_row_ids(self.rids.clone()))
     }
 }
 
@@ -326,26 +323,25 @@ impl LazyRowIds {
     /// that `materialized_async` has already read come from the cache, which
     /// is how the file match folds them; unread ones never reach here.
     pub(crate) fn materialized(&self) -> Result<Buffer<RowId>> {
-        if let Some(ids) = self.sorted_cell().get() {
-            return Ok(ids.clone());
-        }
-        let ids = match self {
-            // A run already decoded in its component's order sorts a copy of
-            // that, rather than decoding the rids again.
-            LazyRowIds::Component(run) => match run.run_order.get() {
-                Some(run_order) => components::sorted_copy(run_order)?,
-                None => sorted_row_ids(run.rids.clone())?,
-            },
-            LazyRowIds::Unsorted { ids, .. } => components::sorted_copy(ids)?,
-            #[cfg(feature = "file-io")]
-            LazyRowIds::IndexChild { .. } | LazyRowIds::LocatedRun { .. } => {
-                unreachable!(
-                    "an in-memory view only ever carries a component's pending ids, and \
-                     the file match reads a file run's ids before it folds them"
-                )
-            }
-        };
-        observe!(IdsSorted(ids.len()));
-        Ok(self.sorted_cell().get_or_init(|| ids).clone())
+        get_or_try_init(self.sorted_cell(), || {
+            let ids = match self {
+                // A run already decoded in its component's order sorts a copy
+                // of that, rather than decoding the rids again.
+                LazyRowIds::Component(run) => match run.run_order.get() {
+                    Some(run_order) => components::sorted_copy(run_order)?,
+                    None => sorted_row_ids(run.rids.clone())?,
+                },
+                LazyRowIds::Unsorted { ids, .. } => components::sorted_copy(ids)?,
+                #[cfg(feature = "file-io")]
+                LazyRowIds::IndexChild { .. } | LazyRowIds::LocatedRun { .. } => {
+                    unreachable!(
+                        "an in-memory view only ever carries a component's pending ids, and \
+                         the file match reads a file run's ids before it folds them"
+                    )
+                }
+            };
+            observe!(IdsSorted(ids.len()));
+            Ok(ids)
+        })
     }
 }

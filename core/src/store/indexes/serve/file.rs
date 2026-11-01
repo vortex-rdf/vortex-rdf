@@ -23,7 +23,7 @@ use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::SortOrder;
 use crate::store::indexes::copy::CHILD_COLUMNS;
-use crate::store::indexes::{COL_RID, LazyRowIds, base_row};
+use crate::store::indexes::{COL_RID, LazyRowIds, base_row, get_or_try_init};
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
 use crate::store::read::chunks::extract_codes;
 use crate::store::scan::file_exprs::eq_conjunction;
@@ -110,18 +110,6 @@ struct PlanCells {
     located: OnceLock<ServedSpan>,
 }
 
-/// The expression `cell` holds, bound by `bind` on the first call.
-fn bound_once(
-    cell: &OnceLock<BoundExpression>,
-    bind: impl FnOnce() -> Result<BoundExpression>,
-) -> Result<BoundExpression> {
-    if let Some(bound) = cell.get() {
-        return Ok(bound.clone());
-    }
-    let bound = bind()?;
-    Ok(cell.get_or_init(|| bound).clone())
-}
-
 /// The child rows `range` beside the base row id each mirrors, `rids` being
 /// the range's rid column.
 fn child_rows(range: Range<u64>, rids: &Buffer<u64>) -> impl Iterator<Item = (u64, RowId)> + '_ {
@@ -171,9 +159,9 @@ impl FileServePlan {
 
     /// The rows of an unlocated run in the child's order, which is the
     /// index's: one scan of the child under the plan's filter, projecting
-    /// each row's child position (vortex's `#row_idx`) beside its base row
-    /// id.
-    async fn read_run_rows(&self) -> Result<ServedRows> {
+    /// each row's child position (vortex's `#row_idx`) beside its rid
+    /// column's value.
+    async fn read_run_rows(&self) -> Result<(Buffer<u64>, Buffer<u64>)> {
         observe!(ServedRunLocated);
         let filter = self.filter()?;
         let projection = self.child.bind(&pack(
@@ -187,11 +175,8 @@ impl FileServePlan {
         )
         .await?;
         let mut columns = extract_codes(rows, &["position", "rid"])?;
-        let rids = columns.remove(1).iter().map(|&rid| base_row(rid)).collect();
-        Ok(ServedRows {
-            positions: columns.remove(0),
-            rids,
-        })
+        let rids = columns.remove(1);
+        Ok((columns.remove(0), rids))
     }
 
     /// The decode the plan's reads take, tombstones included.
@@ -217,12 +202,23 @@ impl FileServePlan {
         if let Some(span) = self.span().or_else(|| self.cells.located.get().cloned()) {
             return Ok(span);
         }
-        let rows = self.read_run_rows().await?;
-        let span = match (rows.positions.first(), rows.positions.last()) {
-            (Some(&first), Some(&last)) if last - first + 1 == rows.len() as u64 => {
+        let (positions, rids) = self.read_run_rows().await?;
+        let span = match (positions.first(), positions.last()) {
+            (Some(&first), Some(&last)) if last - first + 1 == positions.len() as u64 => {
                 ServedSpan::Range(first..last + 1)
             }
-            _ => ServedSpan::Kept(Arc::new(rows.live(deleted))),
+            // Scattered: its live rows, each beside its base row id, built
+            // in one pass.
+            _ => {
+                let rows = positions
+                    .iter()
+                    .copied()
+                    .zip(rids.iter().map(|&rid| base_row(rid)));
+                let live = ServedRows::collect(rows, positions.len(), |(position, rid)| {
+                    is_live(deleted, rid).then_some((position, rid))
+                });
+                ServedSpan::Kept(Arc::new(live))
+            }
         };
         Ok(self.cells.located.get_or_init(|| span).clone())
     }
@@ -435,7 +431,7 @@ impl FileServePlan {
     /// columns, and the row-id column for tombstones), bound through the
     /// handle's memo on first use and shared across clones thereafter.
     fn projection(&self) -> Result<BoundExpression> {
-        bound_once(&self.cells.projection, || {
+        get_or_try_init(&self.cells.projection, || {
             self.child.bind(&select(CHILD_COLUMNS, root()))
         })
     }
@@ -445,7 +441,7 @@ impl FileServePlan {
     /// least one constraint (the resolved lead component), so the
     /// conjunction is never empty.
     fn filter(&self) -> Result<BoundExpression> {
-        bound_once(&self.cells.filter, || {
+        get_or_try_init(&self.cells.filter, || {
             let filter = eq_conjunction(self.constraints.iter().cloned())
                 .expect("a serve plan constrains at least one column");
             self.child.bind(&filter)
@@ -573,7 +569,7 @@ impl FileServePlan {
     /// row id read only under `deleted` tombstones, to drop those rows.
     /// `None` declines (a column or chunk without a probe, or a term that is
     /// not a code): the caller reads the rows' chunk.
-    pub(crate) async fn point_codes(
+    async fn point_codes(
         &self,
         file: &NativeStoreFile,
         positions: &[u64],

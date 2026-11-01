@@ -16,6 +16,7 @@
 
 #[cfg(feature = "file-io")]
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[cfg(feature = "file-io")]
 use vortex_buffer::Buffer;
@@ -48,6 +49,20 @@ pub(crate) use serve::ServedSpan;
 #[cfg(feature = "file-io")]
 pub(crate) use serve::{FileServePlan, PlanRead};
 pub(crate) use serve::{InMemoryServePlan, LiveRows, ServedRows};
+
+/// What `cell` holds, computed by `init` on the first call and kept; two
+/// callers racing on the first call may both compute, and whichever stores
+/// first wins.
+pub(in crate::store::indexes) fn get_or_try_init<T: Clone>(
+    cell: &OnceLock<T>,
+    init: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(value) = cell.get() {
+        return Ok(value.clone());
+    }
+    let value = init()?;
+    Ok(cell.get_or_init(|| value).clone())
+}
 
 /// The primary-row-id column every persisted index child carries beside its
 /// own columns: the currency every resolution answers in, and the one column

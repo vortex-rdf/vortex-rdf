@@ -196,9 +196,8 @@ impl ServeDecode {
 /// Rows of a plan's run in the index's order: each one's position in the
 /// serving component (in memory) or index child (on file) beside the base
 /// row id it mirrors. As a narrowing keeps them (a keep's result, and the
-/// windows and partitions cut from it) every row is live; as an unlocated
-/// file run is first read, before its narrowing filters them
-/// ([`ServedRows::live`]), tombstoned rows are among them.
+/// windows and partitions cut from it, and an unlocated file run's scattered
+/// rows as its first narrowing locates them) every row is live.
 #[derive(Clone)]
 pub(crate) struct ServedRows {
     pub(crate) positions: Buffer<u64>,
@@ -258,18 +257,6 @@ impl ServedRows {
             positions: self.positions.slice(range.clone()),
             rids: self.rids.slice(range),
         }
-    }
-
-    /// These rows less the `deleted` tombstones: themselves, shared, when
-    /// nothing is tombstoned.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn live(&self, deleted: Option<&Mask>) -> Self {
-        let Some(deleted) = deleted else {
-            return self.clone();
-        };
-        Self::collect(self.positions_and_rids(), self.len(), |(position, rid)| {
-            (!deleted.value(rid as usize)).then_some((position, rid))
-        })
     }
 }
 

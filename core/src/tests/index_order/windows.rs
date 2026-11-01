@@ -365,18 +365,38 @@ async fn unlocated_runs_read_once_then_narrow() {
     .await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let twin = built_store(graphed, LayoutStrategy::Default, vec![]).await;
-    views.push((
-        "Dictionary ?p2?g".into(),
-        matched_view(&store, None, Some(&p2), None, Some(&default)).await,
-        posg_quads(
-            &matched_view(&twin, None, Some(&p2), None, Some(&default))
-                .await
-                .quads_vec()
-                .await
-                .unwrap(),
-        ),
-        false,
-    ));
+    // The scattered run as it is, and with one object's rows tombstoned: its
+    // kept rows are the live ones.
+    let doomed = plain_literal("object 3");
+    let tombstoned = store
+        .delete_matching(None, None, Some(&doomed), None)
+        .await
+        .unwrap();
+    let twin_tombstoned = twin
+        .delete_matching(None, None, Some(&doomed), None)
+        .await
+        .unwrap();
+    for (tag, store, twin) in [
+        ("Dictionary ?p2?g", &store, &twin),
+        ("Dictionary ?p2?g tombstoned", &tombstoned, &twin_tombstoned),
+    ] {
+        views.push((
+            tag.into(),
+            matched_view(store, None, Some(&p2), None, Some(&default)).await,
+            posg_quads(
+                &matched_view(twin, None, Some(&p2), None, Some(&default))
+                    .await
+                    .quads_vec()
+                    .await
+                    .unwrap(),
+            ),
+            false,
+        ));
+    }
+    assert!(
+        views[3].2.len() < views[2].2.len(),
+        "the tombstones fall inside the run"
+    );
     dirs.push(dir);
 
     for (tag, view, want, located) in views {

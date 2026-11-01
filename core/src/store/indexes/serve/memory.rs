@@ -10,7 +10,7 @@ use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::FieldNames;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
-use vortex_buffer::Buffer;
+use vortex_buffer::{Buffer, BufferMut};
 use vortex_mask::Mask;
 
 use super::{LiveRows, ServeDecode, ServedRows, ServedSpan};
@@ -138,7 +138,7 @@ impl InMemoryServePlan {
                 })
             }
             ServedSpan::Range(range) => {
-                let run = self.run_rids()?;
+                let run = self.ids.run_order()?;
                 let rows = range.clone().zip(run[self.slots(range)].iter().copied());
                 let len = (range.end - range.start) as usize;
                 match deleted {
@@ -214,18 +214,12 @@ impl InMemoryServePlan {
         Some(self.probes.by_name(&self.array, name).flatten()?.probe())
     }
 
-    /// The run's base row ids in the component's order, decoded once for
-    /// the plan and the view's lazy ids ([`ComponentRun::run_order`]).
-    fn run_rids(&self) -> Result<Buffer<RowId>> {
-        self.ids.run_order()
-    }
-
     /// The base row ids of the component rows `range` (a part of the run), in
     /// its order: a slice of the run's ids, shared. What a window or
     /// partition of a range holds.
     #[inline]
     pub(crate) fn range_rids(&self, range: Range<u64>) -> Result<Buffer<RowId>> {
-        Ok(self.run_rids()?.slice(self.slots(&range)))
+        Ok(self.ids.run_order()?.slice(self.slots(&range)))
     }
 
     /// The base row ids of the view's rows in the component's order, less
@@ -237,15 +231,18 @@ impl InMemoryServePlan {
             ServedSpan::Kept(kept) => return Ok(kept.rids.clone()),
             ServedSpan::Range(range) => range,
         };
-        let rids = self.run_rids()?.slice(self.slots(range));
-        Ok(match deleted {
-            None => rids,
-            Some(deleted) => rids
-                .iter()
+        let rids = self.ids.run_order()?.slice(self.slots(range));
+        let Some(deleted) = deleted else {
+            return Ok(rids);
+        };
+        // Reserved whole: a filter offers no length to reserve by.
+        let mut live = BufferMut::with_capacity(rids.len());
+        live.extend(
+            rids.iter()
                 .copied()
-                .filter(|&rid| !deleted.value(rid as usize))
-                .collect(),
-        })
+                .filter(|&rid| !deleted.value(rid as usize)),
+        );
+        Ok(live.freeze())
     }
 
     /// Where the component rows `range` sit in the run: the slots of the
