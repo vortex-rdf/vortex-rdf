@@ -166,26 +166,17 @@ impl TermStream {
         match &mut self.terms {
             Terms::Codes { dict, codes } => codes.take(|columns, at| {
                 let rest = std::array::from_fn(|c| &columns[c][at..]);
-                let encoded = RUNTIME.block_on(encode_codes(dict, rest, limits))?;
-                Ok(paced(pace, limits, columns.rows() - at, encoded))
+                let (payload, held) = RUNTIME.block_on(encode_codes(dict, rest, limits))?;
+                pace.learn(columns.rows() - at, held, payload.bytes());
+                Ok((payload, held))
             }),
             Terms::Shared(quads) => quads.take(|rows, at| {
-                let encoded = encode_shared(&rows[at..], limits);
-                Ok(paced(pace, limits, rows.len() - at, encoded))
+                let (payload, held) = encode_shared(&rows[at..], limits);
+                pace.learn(rows.len() - at, held, payload.bytes());
+                Ok((payload, held))
             }),
         }
     }
-}
-
-/// A payload and the rows it holds, of `left` rows offered under `limits`, after `pace` learns from it.
-fn paced(
-    pace: &mut Pace,
-    limits: Limits,
-    left: usize,
-    (payload, held): (Payload, usize),
-) -> (Payload, usize) {
-    pace.learn(left.min(limits.rows), held, payload.bytes());
-    (payload, held)
 }
 
 /// A match's term codes in the match's order, written into the caller's rows as `match_codes` writes them: the

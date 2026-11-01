@@ -371,32 +371,6 @@ impl Stream {
         unsafe { &mut *(h as *mut Stream) }
     }
 
-    /// The term stream a handle addresses; an error naming `call` for a code stream.
-    ///
-    /// # Safety
-    ///
-    /// As for [`get`](Self::get).
-    unsafe fn terms<'a>(h: jlong, call: &str) -> Result<&'a mut TermStream, Failure> {
-        // SAFETY: as the caller promises.
-        match unsafe { Self::get(h) } {
-            Stream::Terms(terms) => Ok(terms),
-            Stream::Codes(_) => Err(format!("{call}: not a term stream").into()),
-        }
-    }
-
-    /// The code stream a handle addresses; an error naming `call` for a term stream.
-    ///
-    /// # Safety
-    ///
-    /// As for [`get`](Self::get).
-    unsafe fn codes<'a>(h: jlong, call: &str) -> Result<&'a mut CodeStream, Failure> {
-        // SAFETY: as the caller promises.
-        match unsafe { Self::get(h) } {
-            Stream::Codes(codes) => Ok(codes),
-            Stream::Terms(_) => Err(format!("{call}: not a code stream").into()),
-        }
-    }
-
     /// Frees a handle; `0` is a no-op.
     ///
     /// # Safety
@@ -459,7 +433,9 @@ pub extern "system" fn Java_org_vortexrdf_Native_termStreamNext<'local>(
     call(&mut env, |env| {
         // SAFETY: the Java side passes a stream `quadsOpen` or `termStreamOpen` returned, before freeing it, one
         // call at a time (the call that opened it, or its `NativeStream`, which serializes them).
-        let terms = unsafe { Stream::terms(stream, "termStreamNext") }?;
+        let Stream::Terms(terms) = (unsafe { Stream::get(stream) }) else {
+            return Err("termStreamNext: not a term stream".into());
+        };
         match terms.next_payload()? {
             Some(payload) => java_payload(env, &payload, None),
             None => Ok(JObjectArray::default()),
@@ -501,7 +477,9 @@ pub extern "system" fn Java_org_vortexrdf_Native_codeStreamNext<'local>(
         let out = direct_rows(env, &buf, max_rows, "codeStreamNext")?;
         // SAFETY: the Java side passes a stream `codeStreamOpen` returned, before freeing it, one call at a
         // time (its `NativeStream` serializes them).
-        let codes = unsafe { Stream::codes(stream, "codeStreamNext") }?;
+        let Stream::Codes(codes) = (unsafe { Stream::get(stream) }) else {
+            return Err("codeStreamNext: not a code stream".into());
+        };
         Ok(codes.next(out)? as jint)
     })
 }

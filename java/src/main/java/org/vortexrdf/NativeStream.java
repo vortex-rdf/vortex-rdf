@@ -13,7 +13,7 @@ import java.util.function.LongFunction;
  * still tracks this. Its native calls and its freeing are serialized on it, so threads misusing one iterator can
  * interleave rows but never reach a freed stream. Lock order: the store's lock, then this.
  */
-final class NativeStream implements Runnable {
+final class NativeStream {
 	private static final Cleaner CLEANER = Cleaner.create();
 
 	private final VortexStore store;
@@ -29,7 +29,7 @@ final class NativeStream implements Runnable {
 
 	/** Frees this stream when {@code iterator}, which reads it, becomes unreachable unclosed. */
 	void freeWith(Object iterator) {
-		cleanable = CLEANER.register(iterator, this);
+		cleanable = CLEANER.register(iterator, this::free);
 	}
 
 	/**
@@ -100,11 +100,5 @@ final class NativeStream implements Runnable {
 			store.forget(this);
 			Native.streamClose(freed);
 		}
-	}
-
-	/** The cleaner's action: {@link #free()}. */
-	@Override
-	public void run() {
-		free();
 	}
 }

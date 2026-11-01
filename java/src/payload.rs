@@ -117,8 +117,8 @@ pub async fn encode_codes(
 ) -> Result<(Payload, usize)> {
     let rows = columns[0].len().min(limits.rows);
     let at = |position: usize| columns[position % 4][position / 4];
-    let (payload, positions) = encode_distinct::<4>(dict, 4 * rows, at, limits).await?;
-    if payload.terms.contains(&NONE) {
+    let (payload, positions, missed) = encode_distinct::<4>(dict, 4 * rows, at, limits).await?;
+    if missed {
         return Err(VortexRdfError::Deserialization(
             "a matched row holds a code outside the dictionary".into(),
         ));
@@ -134,12 +134,14 @@ pub async fn encode_lookup(
     limits: Limits,
 ) -> Result<(Payload, usize)> {
     let count = codes.len().min(limits.rows);
-    encode_distinct::<1>(dict, count, |position| codes[position], limits).await
+    let (payload, held, _) =
+        encode_distinct::<1>(dict, count, |position| codes[position], limits).await?;
+    Ok((payload, held))
 }
 
 /// The first `positions` positions, `W` to a row, the code at position `p` being `code(p)`, as one chunk:
-/// cut at a row boundary to keep the distinct terms within the budget, at least one row. Returns the chunk and
-/// the positions it holds. The distinct codes are found as the bindings find them ([`distinct_codes`], a
+/// cut at a row boundary to keep the distinct terms within the budget, at least one row. Returns the chunk, the
+/// positions it holds, and whether one of them holds a code outside the dictionary. The distinct codes are found as the bindings find them ([`distinct_codes`], a
 /// cache of recent codes per column), and slots are made in position order, so a prefix of rows gets the same
 /// slots however many follow it.
 ///
@@ -150,23 +152,22 @@ async fn encode_distinct<const W: usize>(
     positions: usize,
     code: impl Fn(usize) -> TermCode,
     limits: Limits,
-) -> Result<(Payload, usize)> {
+) -> Result<(Payload, usize, bool)> {
     if positions == 0 {
-        return Ok((Payload::default(), 0));
+        return Ok((Payload::default(), 0, false));
     }
     let (distinct, slots) = distinct_codes::<W>((0..positions).map(code));
     let first = decode(dict, &distinct, limits.large_term, limits.chunk_bytes).await?;
     if !first.over {
-        return Ok((first.payload.with_terms(&slots, &first.entries), positions));
+        let payload = first.payload.with_terms(&slots, &first.entries);
+        return Ok((payload, positions, first.missed));
     }
     let kept = W * fitting_rows(&slots, W, &first.lengths, limits.chunk_bytes);
-    // Slots are made in position order, so the slots of the kept positions are the first ones.
+    // Slots are made in position order, so the slots of the kept positions are the first ones, each held by one.
     let used = slots[..kept].iter().max().map_or(0, |&slot| slot + 1);
     let second = decode(dict, &distinct[..used], limits.large_term, usize::MAX).await?;
-    Ok((
-        second.payload.with_terms(&slots[..kept], &second.entries),
-        kept,
-    ))
+    let payload = second.payload.with_terms(&slots[..kept], &second.entries);
+    Ok((payload, kept, second.missed))
 }
 
 /// A chunk's distinct terms, decoded.
@@ -179,6 +180,8 @@ struct Decoded {
     lengths: Vec<usize>,
     /// Whether the terms passed the budget, which leaves the payload partial.
     over: bool,
+    /// Whether a distinct code is outside the dictionary.
+    missed: bool,
 }
 
 impl Payload {
@@ -200,15 +203,16 @@ async fn decode(
     let mut payload = Payload::default();
     let mut entries = vec![NONE; distinct.len()];
     let mut lengths = vec![0; distinct.len()];
-    let mut bytes = 0usize;
-    dict.decode_many_with(distinct, |i, term| {
-        if let Some(term) = term {
+    let (mut bytes, mut missed) = (0usize, false);
+    dict.decode_many_with(distinct, |i, term| match term {
+        Some(term) => {
             lengths[i] = term.len();
             bytes += term.len();
             if bytes <= budget {
                 entries[i] = payload.push(term, large_term);
             }
         }
+        None => missed = true,
     })
     .await?;
     Ok(Decoded {
@@ -216,6 +220,7 @@ async fn decode(
         entries,
         lengths,
         over: bytes > budget,
+        missed,
     })
 }
 
@@ -248,26 +253,31 @@ pub fn encode_shared(rows: &[SharedQuad], limits: Limits) -> (Payload, usize) {
     let (mut bytes, mut held) = (0, 0);
     for quad in rows.iter().take(limits.rows) {
         let terms = [&quad.s, &quad.p, &quad.o, &quad.g];
+        let keys = terms.map(shared);
+        let sent_as = keys.map(|key| key.and_then(|key| sent.get(&key).copied()));
         // A shared term twice in the row counts twice: an estimate from above.
         let new: usize = terms
             .iter()
-            .filter(|term| shared(term).is_none_or(|key| !sent.contains_key(&key)))
-            .map(|term| term.len())
+            .zip(&sent_as)
+            .filter(|(_, entry)| entry.is_none())
+            .map(|(term, _)| term.len())
             .sum();
         if held > 0 && bytes + new > limits.chunk_bytes {
             break;
         }
-        for term in terms {
-            let key = shared(term);
-            let entry = match key.and_then(|key| sent.get(&key)) {
-                Some(&entry) => entry,
+        for ((term, key), entry) in terms.into_iter().zip(keys).zip(sent_as) {
+            let entry = match entry {
+                Some(entry) => entry,
                 None => {
-                    bytes += term.len();
-                    let entry = payload.push(term, limits.large_term);
-                    if let Some(key) = key {
-                        sent.insert(key, entry);
+                    let mut add = || {
+                        bytes += term.len();
+                        payload.push(term, limits.large_term)
+                    };
+                    // Keyed through its entry: a shared term twice in the row is sent once.
+                    match key {
+                        Some(key) => *sent.entry(key).or_insert_with(add),
+                        None => add(),
                     }
-                    entry
                 }
             };
             payload.terms.push(entry);
@@ -302,8 +312,10 @@ impl Pace {
         }
     }
 
-    /// Learns from a chunk that held `held` of the `offered` rows, in `bytes` bytes of distinct terms.
-    pub fn learn(&mut self, offered: usize, held: usize, bytes: usize) {
+    /// Learns from a chunk that held `held` rows in `bytes` bytes of distinct terms, the read having had `left`
+    /// rows to send (the chunk was offered as many, up to the pace's rows).
+    pub fn learn(&mut self, left: usize, held: usize, bytes: usize) {
+        let offered = left.min(self.rows);
         self.rows =
             paced(self.rows, offered, held, bytes, self.limits.chunk_bytes).min(self.limits.rows);
     }

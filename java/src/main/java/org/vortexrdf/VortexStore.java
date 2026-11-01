@@ -50,12 +50,11 @@ public final class VortexStore implements AutoCloseable {
 	public static final int DEFAULT_BATCH_ROWS = 65_536;
 
 	private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-	private long handle;
+	/** The native store; 0 once {@link #close()} released it. Calls read it under {@link #lock}. */
+	private volatile long handle;
 	private final TermDictionary dictionary;
 	/** The native streams of this store's open iterators, not the iterators, so a forgotten one can be collected. */
 	private final Set<NativeStream> streams = ConcurrentHashMap.newKeySet();
-	/** Set by {@link #close()}: an iterator that has not ended refuses to go on. */
-	private volatile boolean closed;
 
 	private VortexStore(long handle) {
 		this.handle = handle;
@@ -125,7 +124,6 @@ public final class VortexStore implements AutoCloseable {
 		lock.writeLock().lock();
 		try {
 			if (handle != 0) {
-				closed = true;
 				try {
 					// Freeing a stream removes it from the set, which the iteration tolerates.
 					for (NativeStream stream : streams) {
@@ -143,9 +141,9 @@ public final class VortexStore implements AutoCloseable {
 		}
 	}
 
-	/** Whether {@link #close()} has run. */
+	/** Whether {@link #close()} has released the store: an iterator that has not ended refuses to go on. */
 	boolean isClosed() {
-		return closed;
+		return handle == 0;
 	}
 
 	/** The native stream {@code open} opens on the open store's handle, tracked for {@link #close()} to free. */
@@ -205,7 +203,10 @@ public final class VortexStore implements AutoCloseable {
 		return callLong(h -> Native.count(h, s, p, o, g));
 	}
 
-	/** Every quad matching a pattern of terms, as {@code {s, p, o, g}} spellings, in the store's row order. */
+	/**
+	 * Every quad matching a pattern of terms, as {@code {s, p, o, g}} spellings, in base row order
+	 * ({@code (s, p, o, g)}) except on a pattern a {@code secondary-by-copy} index serves, read in that index's order.
+	 */
 	public List<String[]> quads(String s, String p, String o, String g) {
 		return quads(s, p, o, g, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
 	}
