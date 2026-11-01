@@ -43,11 +43,11 @@ pub(crate) use components::{
     indexes_from_components, known_component,
 };
 pub(crate) use lazy_ids::{ComponentRun, LazyRowIds};
+#[cfg(test)]
+pub(crate) use serve::ServedSpan;
 #[cfg(feature = "file-io")]
 pub(crate) use serve::{FileServePlan, PlanRead};
 pub(crate) use serve::{InMemoryServePlan, LiveRows, ServedRows};
-#[cfg(test)]
-pub(crate) use serve::ServedSpan;
 
 /// The primary-row-id column every persisted index child carries beside its
 /// own columns: the currency every resolution answers in, and the one column

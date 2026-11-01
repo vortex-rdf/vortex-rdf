@@ -49,17 +49,10 @@ pub(crate) fn gather_rows_at(
     ids: &Buffer<RowId>,
     probes: Option<&StructProbes>,
 ) -> Result<ArrayRef> {
-    if point_sized(ids.len() as u64)
-        && let Some(fields) = base.dtype().as_struct_fields_opt()
-    {
+    if point_sized(ids.len() as u64) {
         let positions: Vec<usize> = ids.iter().map(|&id| id as usize).collect();
-        let names = fields.names().clone();
-        if let Some(children) =
-            point_read_columns(base, names.iter().map(AsRef::as_ref), &positions, probes)
-        {
-            let rows =
-                StructArray::try_new(names, children, positions.len(), Validity::NonNullable)?;
-            return Ok(rows.into_array());
+        if let Some(rows) = point_rows(base, &positions, probes)? {
+            return Ok(rows);
         }
     }
     let indices = PrimitiveArray::new(ids.clone(), Validity::NonNullable).into_array();
@@ -83,17 +76,30 @@ pub(crate) fn gather_by_point_reads(
         return Ok(None);
     };
     let live: Vec<usize> = live.into_iter().map(|i| i as usize).collect();
+    point_rows(base, &live, probes)
+}
+
+/// The rows of the struct `base` at `positions`, every column read point by
+/// point ([`point_read_columns`]) into one canonical struct, in the order of
+/// `positions`. `None` declines: a non-struct base, or a column no probe
+/// resolves.
+#[inline]
+fn point_rows(
+    base: &ArrayRef,
+    positions: &[usize],
+    probes: Option<&StructProbes>,
+) -> Result<Option<ArrayRef>> {
     let Some(fields) = base.dtype().as_struct_fields_opt() else {
         return Ok(None);
     };
     let names = fields.names().clone();
-    let Some(children) = point_read_columns(base, names.iter().map(AsRef::as_ref), &live, probes)
+    let Some(children) =
+        point_read_columns(base, names.iter().map(AsRef::as_ref), positions, probes)
     else {
         return Ok(None);
     };
-    let rows =
-        StructArray::try_new(names, children, live.len(), Validity::NonNullable)?.into_array();
-    Ok(Some(rows))
+    let rows = StructArray::try_new(names, children, positions.len(), Validity::NonNullable)?;
+    Ok(Some(rows.into_array()))
 }
 
 /// The `names` columns of the struct `array`, in that order, each read point

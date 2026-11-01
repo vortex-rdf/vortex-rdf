@@ -5,7 +5,6 @@
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-use futures::stream::{self, BoxStream, StreamExt};
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::{BoundExpression, col, pack, root, select};
@@ -29,7 +28,7 @@ use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
 use crate::store::read::chunks::extract_codes;
 use crate::store::scan::file_exprs::eq_conjunction;
 use crate::store::scan::file_reads::{component_point_rows, component_point_values};
-use crate::store::scan::file_scans::{read_all_rows, stream_rows};
+use crate::store::scan::file_scans::read_all_rows;
 use crate::store::schema::{RowId, TermCode};
 use crate::store::view::selection::point_sized;
 
@@ -261,9 +260,7 @@ impl FileServePlan {
         columns: &[&'static str],
         positions: &Buffer<u64>,
     ) -> Result<ArrayRef> {
-        if let Some(rows) =
-            component_point_rows(file, self.child.name, columns, positions.to_vec()).await?
-        {
+        if let Some(rows) = component_point_rows(file, self.child.name, columns, positions).await? {
             return Ok(rows);
         }
         let (first, last) = (positions[0], positions[positions.len() - 1]);
@@ -602,7 +599,7 @@ impl FileServePlan {
             read.push(COL_RID);
         }
         let Some(mut values) =
-            component_point_values(file, self.child.name, &read, positions.to_vec()).await?
+            component_point_values(file, self.child.name, &read, positions).await?
         else {
             return Ok(None);
         };
@@ -631,34 +628,6 @@ impl FileServePlan {
                 }
             }
         })))
-    }
-
-    /// The served rows as chunks of the child's columns, in the index's
-    /// order, as `read` (the plan's [`read`](Self::read)) takes them: rows
-    /// taken point by point `batch_rows` a chunk, or the plan's scan split by
-    /// split. Nothing is read until the stream is polled.
-    pub(crate) fn read_chunks(
-        &self,
-        read: PlanRead,
-        file: Arc<NativeStoreFile>,
-        batch_rows: usize,
-    ) -> Result<BoxStream<'static, Result<ArrayRef>>> {
-        Ok(match read {
-            PlanRead::Points(positions) => {
-                let plan = self.clone();
-                stream::iter(crate::store::read::chunks::batch_ranges(
-                    positions.len(),
-                    batch_rows,
-                ))
-                .then(move |batch| {
-                    let (plan, file) = (plan.clone(), Arc::clone(&file));
-                    let batch = positions.slice(batch);
-                    async move { plan.rows_at(&file, &batch).await }
-                })
-                .boxed()
-            }
-            PlanRead::Scan(scan) => stream_rows(scan)?,
-        })
     }
 }
 

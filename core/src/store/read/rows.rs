@@ -7,6 +7,8 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::FileBase;
 use crate::store::RawQuad;
 use crate::store::array::{rechunk, with_subject_stamp};
+#[cfg(feature = "file-io")]
+use crate::store::read::chunks::cut_each;
 use crate::store::read::chunks::{RowChunkStream, extract_codes};
 #[cfg(feature = "file-io")]
 use crate::store::read::file_plan::{CollectedPlan, masked_codes};
@@ -61,12 +63,9 @@ impl BaseRead {
         match self {
             BaseRead::Rows(rows) => Ok(stream::iter(rechunk(rows, batch_rows)).boxed()),
             #[cfg(feature = "file-io")]
-            BaseRead::Scan(scan) => Ok(file_scans::stream_rows(*scan)?
-                .flat_map(move |chunk| match chunk {
-                    Ok(chunk) => stream::iter(rechunk(chunk, batch_rows)).left_stream(),
-                    Err(e) => stream::iter([Err(e)]).right_stream(),
-                })
-                .boxed()),
+            BaseRead::Scan(scan) => Ok(cut_each(file_scans::stream_rows(*scan)?, move |chunk| {
+                rechunk(chunk, batch_rows)
+            })),
         }
     }
 }

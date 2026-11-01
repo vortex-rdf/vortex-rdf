@@ -6,6 +6,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::schema;
+use std::ops::Range;
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
@@ -123,6 +124,17 @@ pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Resu
     }
 }
 
+/// The ranges `len` rows are cut into, at most `batch_rows` (> 0) each, in
+/// row order; none for no rows.
+pub(crate) fn batch_ranges(
+    len: usize,
+    batch_rows: usize,
+) -> impl Iterator<Item = Range<usize>> + Clone + Send + 'static {
+    (0..len)
+        .step_by(batch_rows)
+        .map(move |start| start..start.saturating_add(batch_rows).min(len))
+}
+
 /// `rows` cut into slices of at most `batch_rows` (> 0) rows, in row order,
 /// each cut when the iterator reaches it: the array itself when it fits, no
 /// slice for an empty array.
@@ -130,17 +142,15 @@ pub(crate) fn rechunk(
     rows: ArrayRef,
     batch_rows: usize,
 ) -> impl Iterator<Item = Result<ArrayRef>> + Send + 'static {
-    let len = rows.len();
-    let fits = len <= batch_rows;
-    (0..len).step_by(batch_rows).map(move |start| {
+    let fits = rows.len() <= batch_rows;
+    batch_ranges(rows.len(), batch_rows).map(move |range| {
         if fits {
             return Ok(rows.clone());
         }
         observe!(RechunkCut);
         #[cfg(test)]
         crate::store::test_hooks::rechunk_cut()?;
-        rows.slice(start..start.saturating_add(batch_rows).min(len))
-            .map_err(VortexRdfError::Vortex)
+        rows.slice(range).map_err(VortexRdfError::Vortex)
     })
 }
 

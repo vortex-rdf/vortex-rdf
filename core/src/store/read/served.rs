@@ -3,19 +3,22 @@
 //! alike ([`MemoryRead`]), a file view's for its chunk streams beside it
 //! ([`ServedRead`]); and the code and row chunks each way yields.
 
-#[cfg(feature = "file-io")]
 use std::sync::Arc;
 
+#[cfg(feature = "file-io")]
+use futures::stream::BoxStream;
 use futures::stream::{self, StreamExt};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
+#[cfg(feature = "file-io")]
+use super::chunks::cut_each;
 use super::chunks::{
-    CodeChunkStream, RowChunkStream, batch_ranges, gathered_code_chunks, gathered_row_chunks,
-    id_windows,
+    CodeChunkStream, RowChunkStream, gathered_code_chunks, gathered_row_chunks, id_windows,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
+use crate::store::array::batch_ranges;
 use crate::store::indexes::InMemoryServePlan;
 #[cfg(feature = "file-io")]
 use crate::store::indexes::{FileServePlan, PlanRead};
@@ -140,7 +143,7 @@ impl ServedRead<'_> {
         batch_rows: usize,
     ) -> Result<CodeChunkStream> {
         observe!(ServedRunChunks);
-        let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
+        let picked: Arc<[usize]> = columns.iter().map(|c| c.index()).collect();
         Ok(match self {
             ServedRead::Memory(MemoryRead::Gather { ids, .. }) => {
                 // A base whose code columns decode once hands them out.
@@ -173,14 +176,11 @@ impl ServedRead<'_> {
                     // Kept rows, or a point-sized run: each batch's codes
                     // point by point, straight into code buffers.
                     PlanRead::Points(positions) => {
-                        stream::iter(batch_ranges(positions.len(), batch_rows))
-                            .then(move |batch| {
-                                let (plan, file, deleted) =
-                                    (plan.clone(), Arc::clone(&file), deleted.clone());
-                                let batch = positions.slice(batch);
-                                async move { plan.codes_at(&file, &batch, deleted.as_ref()).await }
-                            })
-                            .boxed()
+                        point_batches(positions, batch_rows, move |batch| {
+                            let (plan, file, deleted) =
+                                (plan.clone(), Arc::clone(&file), deleted.clone());
+                            async move { plan.codes_at(&file, &batch, deleted.as_ref()).await }
+                        })
                     }
                     PlanRead::Scan(scan) => stream_rows(scan)?
                         .map(move |chunk| {
@@ -190,14 +190,9 @@ impl ServedRead<'_> {
                         })
                         .boxed(),
                 };
-                codes
-                    .flat_map(move |codes| {
-                        stream::iter(match codes {
-                            Ok(codes) => code_slices(codes, &picked, batch_rows),
-                            Err(e) => vec![Err(e)],
-                        })
-                    })
-                    .boxed()
+                cut_each(codes, move |codes| {
+                    code_slices(codes, Arc::clone(&picked), batch_rows)
+                })
             }
         })
     }
@@ -208,7 +203,7 @@ impl ServedRead<'_> {
     /// rows read off the component; on file each of the plan's chunks as the
     /// primary columns, tombstoned rows dropped, or for a TypedObject
     /// `store` each batch of its ids taken from the base.
-    pub(super) fn row_chunks(
+    pub(super) async fn row_chunks(
         self,
         #[cfg_attr(not(feature = "file-io"), allow(unused_variables))] store: &VortexRdfStore,
         columns: &[&'static str],
@@ -235,27 +230,26 @@ impl ServedRead<'_> {
                 // A TypedObject view's copies hold string objects, not the
                 // layout's typed ones.
                 if store.layout.strategy() == LayoutStrategy::TypedObject {
-                    return Ok(typed_rows(
-                        plan.clone(),
-                        Arc::clone(file),
-                        deleted.cloned(),
-                        columns,
-                        batch_rows,
-                    ));
+                    return typed_rows(plan, file, deleted, columns, batch_rows).await;
                 }
                 let (read, deleted) = plan.read(deleted)?;
-                let chunks = plan.read_chunks(read, Arc::clone(file), batch_rows)?;
-                let (plan, deleted) = (plan.clone(), deleted.cloned());
-                chunks
-                    .flat_map(move |chunk| {
-                        let rows = chunk
-                            .and_then(|chunk| plan.decoder().chunk_rows(&chunk, deleted.as_ref()));
-                        stream::iter(match rows {
-                            Ok(rows) => rechunk(rows, batch_rows).collect(),
-                            Err(e) => vec![Err(e)],
+                let (plan, file, deleted) = (plan.clone(), Arc::clone(file), deleted.cloned());
+                // Kept rows, or a point-sized run: each batch's rows point by
+                // point; else the plan's scan, split by split.
+                let chunks = match read {
+                    PlanRead::Points(positions) => {
+                        let plan = plan.clone();
+                        point_batches(positions, batch_rows, move |batch| {
+                            let (plan, file) = (plan.clone(), Arc::clone(&file));
+                            async move { plan.rows_at(&file, &batch).await }
                         })
-                    })
-                    .boxed()
+                    }
+                    PlanRead::Scan(scan) => stream_rows(scan)?,
+                };
+                let rows = chunks.map(move |chunk| {
+                    chunk.and_then(|chunk| plan.decoder().chunk_rows(&chunk, deleted.as_ref()))
+                });
+                cut_each(rows, move |rows| rechunk(rows, batch_rows))
             }
         })
     }
@@ -266,31 +260,38 @@ impl ServedRead<'_> {
 /// order ([`FileServePlan::live_rows`], the `deleted` tombstones left out)
 /// taken from the base ([`file_rows_in_order`]), one batch a chunk.
 #[cfg(feature = "file-io")]
-fn typed_rows(
-    plan: FileServePlan,
-    file: Arc<NativeStoreFile>,
-    deleted: Option<Mask>,
+async fn typed_rows(
+    plan: &FileServePlan,
+    file: &Arc<NativeStoreFile>,
+    deleted: Option<&Mask>,
     columns: &[&'static str],
     batch_rows: usize,
-) -> RowChunkStream {
-    let columns: Arc<[&'static str]> = Arc::from(columns);
-    stream::once(async move {
-        let rows = plan.live_rows(&file, deleted.as_ref()).await?;
-        Ok::<_, VortexRdfError>((rows.rids, file))
-    })
-    .flat_map(move |read| match read {
-        Ok((ids, file)) => {
-            let columns = Arc::clone(&columns);
-            stream::iter(id_windows(ids, batch_rows))
-                .then(move |window| {
-                    let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
-                    async move { file_rows_in_order(&file, &columns, &window).await }
-                })
-                .left_stream()
-        }
-        Err(e) => stream::iter([Err(e)]).right_stream(),
-    })
-    .boxed()
+) -> Result<RowChunkStream> {
+    let ids = plan.live_rows(file, deleted).await?.rids;
+    let (file, columns): (_, Arc<[&'static str]>) = (Arc::clone(file), Arc::from(columns));
+    Ok(stream::iter(id_windows(ids, batch_rows))
+        .then(move |window| {
+            let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
+            async move { file_rows_in_order(&file, &columns, &window).await }
+        })
+        .boxed())
+}
+
+/// The plan's rows at `positions`, `batch_rows` of them a batch, each batch
+/// read by `read` when it is pulled: a served file stream's point reads.
+#[cfg(feature = "file-io")]
+fn point_batches<T, Fut>(
+    positions: Buffer<u64>,
+    batch_rows: usize,
+    read: impl Fn(Buffer<u64>) -> Fut + Send + 'static,
+) -> BoxStream<'static, Result<T>>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+{
+    stream::iter(batch_ranges(positions.len(), batch_rows))
+        .then(move |batch| read(positions.slice(batch)))
+        .boxed()
 }
 
 /// The base's `columns` at the base row ids `ids` (any order, each once, not
@@ -326,19 +327,18 @@ async fn file_rows_in_order(
 }
 
 /// The `picked` columns of `codes` cut into slices of at most `batch_rows`
-/// rows, sharing their buffers: a served file chunk's code chunks.
+/// rows, sharing their buffers, each cut when it is reached: a served file
+/// chunk's code chunks.
 #[cfg(feature = "file-io")]
 fn code_slices(
     codes: [Buffer<TermCode>; 4],
-    picked: &[usize],
+    picked: Arc<[usize]>,
     batch_rows: usize,
-) -> Vec<Result<Vec<Buffer<TermCode>>>> {
-    batch_ranges(codes[0].len(), batch_rows)
-        .map(|rows| {
-            Ok(picked
-                .iter()
-                .map(|&k| codes[k].slice(rows.clone()))
-                .collect())
-        })
-        .collect()
+) -> impl Iterator<Item = Result<Vec<Buffer<TermCode>>>> + Send + 'static {
+    batch_ranges(codes[0].len(), batch_rows).map(move |rows| {
+        Ok(picked
+            .iter()
+            .map(|&k| codes[k].slice(rows.clone()))
+            .collect())
+    })
 }

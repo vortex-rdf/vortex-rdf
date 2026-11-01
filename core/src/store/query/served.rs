@@ -15,12 +15,12 @@ use super::keep::Keep;
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
+use crate::store::array::batch_ranges;
 use crate::store::array::bool_array_to_mask;
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
 use crate::store::indexes::{InMemoryServePlan, LazyRowIds, LiveRows, ServedRows};
 use crate::store::layouts::{PatternCodes, QuadPattern};
-use crate::store::read::chunks::batch_ranges;
 use crate::store::scan::residual::mask_for;
 use crate::store::schema::{QuadColumn, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection, window_rows};

@@ -77,13 +77,15 @@ pub(crate) async fn file_point_codes(
 /// What a point read by id reads: the chunk-probe handle of each read
 /// column, the code equalities of the pending filter, and the rows that pass
 /// them.
-struct PointRows {
+struct PointRows<'a> {
     handles: Vec<Arc<vortex_rdf_encoded_search::ColumnChunks>>,
     eqs: CodeEqs,
-    live: Vec<u64>,
+    /// The rows read: those a filtered read's checks passed, or a served
+    /// read's positions, borrowed.
+    live: Cow<'a, [u64]>,
 }
 
-impl PointRows {
+impl PointRows<'_> {
     /// The point read of `columns` at `rows` with `filter` pending: `None`
     /// when the filter is not code equalities, a column has no chunk probes,
     /// or a chunk the filter's reads reach has no probe.
@@ -122,7 +124,11 @@ impl PointRows {
         let Some(live) = rows_reading(file, &checks, rows).await? else {
             return Ok(None);
         };
-        Ok(Some(Self { handles, eqs, live }))
+        Ok(Some(Self {
+            handles,
+            eqs,
+            live: Cow::Owned(live),
+        }))
     }
 
     /// The live rows' values of `columns`, the columns `handles` read, in
@@ -586,12 +592,12 @@ fn u64_struct(
 /// (ascending), every column of `columns` read, under no filter: what the
 /// component's point reads take. `None` for a column the file holds no chunk
 /// probes of.
-fn component_points(
+fn component_points<'a>(
     file: &NativeStoreFile,
     component: &str,
     columns: &[&'static str],
-    positions: Vec<u64>,
-) -> Option<PointRows> {
+    positions: &'a [u64],
+) -> Option<PointRows<'a>> {
     let handles = columns
         .iter()
         .map(|c| file.component_column_chunks(component, c))
@@ -599,7 +605,7 @@ fn component_points(
     Some(PointRows {
         handles,
         eqs: CodeEqs::default(),
-        live: positions,
+        live: Cow::Borrowed(positions),
     })
 }
 
@@ -610,7 +616,7 @@ pub(crate) async fn component_point_values(
     file: &NativeStoreFile,
     component: &str,
     columns: &[&'static str],
-    positions: Vec<u64>,
+    positions: &[u64],
 ) -> Result<Option<Vec<Vec<u64>>>> {
     match component_points(file, component, columns, positions) {
         Some(rows) => rows.columns(file, columns).await,
@@ -627,7 +633,7 @@ pub(crate) async fn component_point_rows(
     file: &NativeStoreFile,
     component: &str,
     columns: &[&'static str],
-    positions: Vec<u64>,
+    positions: &[u64],
 ) -> Result<Option<ArrayRef>> {
     let Some(rows) = component_points(file, component, columns, positions) else {
         return Ok(None);

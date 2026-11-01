@@ -349,16 +349,19 @@ impl QuadsSource {
     /// globally sorted base.
     pub(crate) fn read_order(&self) -> Option<SortOrder> {
         match &self.backend {
-            Backend::InMemory(memory) => match &memory.serve {
-                Some(plan) => Some(plan.read_order()),
-                None => subject_sorted(&memory.base).then_some(SortOrder::Spog),
-            },
+            Backend::InMemory(memory) => {
+                if let Some(plan) = &memory.serve {
+                    return Some(plan.read_order());
+                }
+            }
             #[cfg(feature = "file-io")]
-            Backend::File(base) => match &base.serve {
-                Some(plan) => plan.read_order(),
-                None => base.file.quads_sorted().then_some(SortOrder::Spog),
-            },
+            Backend::File(base) => {
+                if let Some(plan) = &base.serve {
+                    return plan.read_order();
+                }
+            }
         }
+        self.subject_sorted().then_some(SortOrder::Spog)
     }
 
     /// The index component whose serve plan answers this view's reads, if

@@ -30,6 +30,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+#[cfg(feature = "file-io")]
+use futures::stream::Stream;
 use futures::stream::{self, BoxStream, StreamExt};
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::{ArrayRef, VortexSessionExecute as _};
@@ -43,7 +45,7 @@ use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
-use crate::store::array::{field_as, into_struct_array, rechunk};
+use crate::store::array::{batch_ranges, field_as, into_struct_array, rechunk};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::read::file_plan::StreamedPlan;
@@ -162,7 +164,7 @@ impl VortexRdfStore {
         let tail = self.tail_chunks(batch_rows)?;
         let primary = self.layout.strategy().primary_column_names();
         let base = match self.served_read()? {
-            Some(served) => served.row_chunks(self, primary, batch_rows)?,
+            Some(served) => served.row_chunks(self, primary, batch_rows).await?,
             None => self.base_chunks(primary, batch_rows).await?,
         };
         Ok(base.chain(stream::iter(tail)).boxed())
@@ -257,7 +259,9 @@ impl VortexRdfStore {
     /// How this in-memory view's base rows are cut into chunks of at most
     /// `batch_rows` rows: a contiguous selection without tombstones is a
     /// [`MemoryRows::Run`], and any other is cut into windows of live ids. A
-    /// served view's pending selection materializes here.
+    /// pending selection (an unserved index run's ids) materializes here; a
+    /// served view's streams read in its index's order instead
+    /// ([`served_read`](Self::served_read)).
     fn memory_rows(&self, batch_rows: usize) -> Result<MemoryRows> {
         let base_len = self.quads.base_len();
         let selection = self.quads.selection.materialized()?;
@@ -291,14 +295,9 @@ impl VortexRdfStore {
     ) -> Result<RowChunkStream> {
         let (scope, read) = match self.streamed_plan(base, columns).await? {
             StreamedPlan::SplitReads(reads) => {
-                return Ok(stream_split_reads(reads)
-                    .flat_map(move |rows| {
-                        stream::iter(match rows {
-                            Ok(rows) => rechunk(rows, batch_rows).collect(),
-                            Err(e) => vec![Err(e)],
-                        })
-                    })
-                    .boxed());
+                return Ok(cut_each(stream_split_reads(reads), move |rows| {
+                    rechunk(rows, batch_rows)
+                }));
             }
             StreamedPlan::Exact(scope, read) => (scope, read),
         };
@@ -422,13 +421,26 @@ pub(super) fn id_windows(
 
 /// Rows `0..len` cut into consecutive windows of at most `batch_rows`
 /// (positive), in order: the windows a chunk stream reads one at a time.
-pub(crate) fn batch_ranges(
-    len: usize,
-    batch_rows: usize,
-) -> impl Iterator<Item = Range<usize>> + Clone + Send + 'static {
-    (0..len)
-        .step_by(batch_rows)
-        .map(move |start| start..start.saturating_add(batch_rows).min(len))
+/// Each chunk of `chunks` cut into the pieces `cut` makes of it, in order,
+/// each piece cut when it is pulled; a chunk's error carried as its item. The
+/// one way a stream of chunks is re-cut: rows to a batch ([`rechunk`]), a
+/// served file view's code columns to the ones asked for.
+#[cfg(feature = "file-io")]
+pub(in crate::store) fn cut_each<T, U, I>(
+    chunks: impl Stream<Item = Result<T>> + Send + 'static,
+    mut cut: impl FnMut(T) -> I + Send + 'static,
+) -> BoxStream<'static, Result<U>>
+where
+    T: Send + 'static,
+    U: Send + 'static,
+    I: Iterator<Item = Result<U>> + Send + 'static,
+{
+    chunks
+        .flat_map(move |chunk| match chunk {
+            Ok(chunk) => stream::iter(cut(chunk)).left_stream(),
+            Err(e) => stream::iter([Err(e)]).right_stream(),
+        })
+        .boxed()
 }
 
 /// The live ids of `selection` over a base of `base_len` rows, the `deleted`
