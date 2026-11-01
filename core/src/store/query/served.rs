@@ -306,7 +306,7 @@ impl<'a> Served<'a> {
             }
             Cut::Listed { span, rids } => (span, rids),
         };
-        let ids = LazyRowIds::from_unsorted_ids(rids, true);
+        let ids = LazyRowIds::from_unsorted_ids(rids);
         Ok(self.quads.in_memory_with(
             memory,
             ViewSelection::pending(ids),
@@ -325,7 +325,7 @@ impl<'a> Served<'a> {
                 let ids = plan.range_ids(&base.file, range.clone());
                 (ServedSpan::Range(range), ids)
             }
-            Cut::Listed { span, rids } => (span, LazyRowIds::from_unsorted_ids(rids, true)),
+            Cut::Listed { span, rids } => (span, LazyRowIds::from_unsorted_ids(rids)),
         };
         self.quads
             .file_with(

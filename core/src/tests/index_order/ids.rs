@@ -13,12 +13,12 @@ use vortex_mask::Mask;
 
 #[tokio::test]
 async fn unsorted_ids_sort_only_when_asked() {
-    let ids = LazyRowIds::from_unsorted_ids(Buffer::from(vec![5u64, 1, 3]), true);
+    let ids = LazyRowIds::from_unsorted_ids(Buffer::from(vec![5u64, 1, 3]));
     let mut rec = Recorder::start();
     assert_eq!(ids.len_if_known(), Some(3));
     let deleted = Mask::from_indices(8, vec![1]);
     // Live: the ids already leave every tombstone out, so the mask is not read.
-    assert_eq!(ids.live_len_without_sort(&deleted).unwrap(), Some(3));
+    assert_eq!(ids.live_len_without_io(&deleted).unwrap(), Some(3));
     assert_eq!(
         rec.take_picked(|e| matches!(e, Event::IdsSorted(_)).then_some(()))
             .len(),
@@ -31,15 +31,6 @@ async fn unsorted_ids_sort_only_when_asked() {
             .len(),
         1
     );
-}
-
-#[tokio::test]
-async fn unsorted_ids_not_known_live_count_against_the_tombstones() {
-    let ids = LazyRowIds::from_unsorted_ids(Buffer::from(vec![5u64, 1, 3]), false);
-    let rec = Recorder::start();
-    let deleted = Mask::from_indices(8, vec![1, 6]);
-    assert_eq!(ids.live_len_without_sort(&deleted).unwrap(), Some(2));
-    assert_eq!(ids_sorted(&rec), 0);
 }
 
 /// Under tombstones an in-memory served run is counted off its ids in the
@@ -91,7 +82,10 @@ async fn a_run_decodes_once_for_both_orders() {
     let rids = PrimitiveArray::from_iter([5u64, 1, 3]).into_array();
     let ids = LazyRowIds::Component(Arc::new(ComponentRun::new(rids, false)));
     let rec = Recorder::start();
-    let run_order = |ids: &LazyRowIds| ids.run_order_ids().unwrap().unwrap();
+    let run_order = |ids: &LazyRowIds| match ids {
+        LazyRowIds::Component(run) => run.run_order().unwrap(),
+        _ => unreachable!("an in-memory run"),
+    };
     assert_eq!(run_order(&ids).as_slice(), &[5, 1, 3]);
     assert_eq!(run_order(&ids.clone()).as_slice(), &[5, 1, 3]);
     assert_eq!(ids.materialized().unwrap().as_slice(), &[1, 3, 5]);
