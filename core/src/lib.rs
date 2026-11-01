@@ -69,7 +69,7 @@ pub use store::{
     LocatedCodes, NumOp, Number, Probe, QuadColumn, RawQuad, RowChunkStream, RowCountHint, RowId,
     SelectionKind, SharedQuad, SortOrder, SortedInMemoryBuilder, TermCode, TermPredicate,
     TextOptions, TextPredicate, Verdict, ViewStatistics, VortexArrayBuilder, VortexRdfStore,
-    export_rdf,
+    distinct_codes, export_rdf,
 };
 
 /// The vortex session holding this crate's store layout, encodings and write

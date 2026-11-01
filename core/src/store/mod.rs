@@ -28,7 +28,7 @@ pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{
     CaseMap, DictReader, DictSnapshot, KindRanges, NumOp, Number, TermPredicate, TextOptions,
-    TextPredicate, Verdict,
+    TextPredicate, Verdict, distinct_codes,
 };
 pub use persist::export::export_rdf;
 pub use query::batch::Probe;

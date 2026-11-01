@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use vortex_buffer::Buffer;
-use vortex_rdf_core::{DictReader, Result, SharedQuad, TermCode, VortexRdfError};
+use vortex_rdf_core::{DictReader, Result, SharedQuad, TermCode, VortexRdfError, distinct_codes};
 
 /// Bytes per row [`Store::match_codes`](crate::engine::Store::match_codes) writes: four codes of eight bytes.
 pub const ROW_BYTES: usize = 32;
@@ -117,7 +117,7 @@ pub async fn encode_codes(
 ) -> Result<(Payload, usize)> {
     let rows = columns[0].len().min(limits.rows);
     let at = |position: usize| columns[position % 4][position / 4];
-    let (payload, positions) = encode_distinct(dict, 4 * rows, 4, at, limits).await?;
+    let (payload, positions) = encode_distinct::<4>(dict, 4 * rows, at, limits).await?;
     if payload.terms.contains(&NONE) {
         return Err(VortexRdfError::Deserialization(
             "a matched row holds a code outside the dictionary".into(),
@@ -134,70 +134,39 @@ pub async fn encode_lookup(
     limits: Limits,
 ) -> Result<(Payload, usize)> {
     let count = codes.len().min(limits.rows);
-    encode_distinct(dict, count, 1, |position| codes[position], limits).await
+    encode_distinct::<1>(dict, count, |position| codes[position], limits).await
 }
 
-/// Buckets of the per-column cache that finds a chunk's repeated codes.
-const BUCKETS: usize = 256;
-
-/// The first `positions` positions, `width` to a row, the code at position `p` being `code(p)`, as one
-/// chunk: cut at a row boundary to keep the distinct terms within the budget, at least one row. Returns the
-/// chunk and the positions it holds.
+/// The first `positions` positions, `W` to a row, the code at position `p` being `code(p)`, as one chunk:
+/// cut at a row boundary to keep the distinct terms within the budget, at least one row. Returns the chunk and
+/// the positions it holds. The distinct codes are found as the bindings find them ([`distinct_codes`], a
+/// cache of recent codes per column), and slots are made in position order, so a prefix of rows gets the same
+/// slots however many follow it.
 ///
 /// The distinct codes are decoded in one call, the common case. When their terms pass the budget, that call
 /// copies only what fits and measures the rest, and a second call decodes the rows that fit.
-async fn encode_distinct(
+async fn encode_distinct<const W: usize>(
     dict: &DictReader,
     positions: usize,
-    width: usize,
     code: impl Fn(usize) -> TermCode,
     limits: Limits,
 ) -> Result<(Payload, usize)> {
     if positions == 0 {
         return Ok((Payload::default(), 0));
     }
-    let (distinct, slots) = distinct_codes(positions, width, code);
+    let (distinct, slots) = distinct_codes::<W>((0..positions).map(code));
     let first = decode(dict, &distinct, limits.large_term, limits.chunk_bytes).await?;
     if !first.over {
         return Ok((first.payload.with_terms(&slots, &first.entries), positions));
     }
-    let kept = width * fitting_rows(&slots, width, &first.lengths, limits.chunk_bytes);
+    let kept = W * fitting_rows(&slots, W, &first.lengths, limits.chunk_bytes);
     // Slots are made in position order, so the slots of the kept positions are the first ones.
-    let used = slots[..kept]
-        .iter()
-        .max()
-        .map_or(0, |&slot| slot as usize + 1);
+    let used = slots[..kept].iter().max().map_or(0, |&slot| slot + 1);
     let second = decode(dict, &distinct[..used], limits.large_term, usize::MAX).await?;
     Ok((
         second.payload.with_terms(&slots[..kept], &second.entries),
         kept,
     ))
-}
-
-/// The distinct codes of the first `positions` positions, `width` to a row, and each position's slot among
-/// them, found as Python's `decode_slice` finds them: a direct-mapped cache of recent codes per column; a
-/// hit shares its slot, a miss (a new code, or one its bucket lost) makes a new one. Slots are made in
-/// position order, and the cache's size does not depend on how many rows are offered, so a prefix of rows
-/// gets the same slots however many follow it.
-fn distinct_codes(
-    positions: usize,
-    width: usize,
-    code: impl Fn(usize) -> TermCode,
-) -> (Vec<TermCode>, Vec<u32>) {
-    let mut recent = vec![(0, u32::MAX); width * BUCKETS];
-    let mut distinct = Vec::new();
-    let mut slots = Vec::with_capacity(positions);
-    for position in 0..positions {
-        let code = code(position);
-        let bucket = (code % BUCKETS as TermCode) as usize;
-        let entry = &mut recent[position % width * BUCKETS + bucket];
-        if entry.1 == u32::MAX || entry.0 != code {
-            *entry = (code, distinct.len() as u32);
-            distinct.push(code);
-        }
-        slots.push(entry.1);
-    }
-    (distinct, slots)
 }
 
 /// A chunk's distinct terms, decoded.
@@ -214,8 +183,8 @@ struct Decoded {
 
 impl Payload {
     /// The payload with each position's entry, from its slot.
-    fn with_terms(mut self, slots: &[u32], entries: &[i32]) -> Payload {
-        self.terms = slots.iter().map(|&slot| entries[slot as usize]).collect();
+    fn with_terms(mut self, slots: &[usize], entries: &[i32]) -> Payload {
+        self.terms = slots.iter().map(|&slot| entries[slot]).collect();
         self
     }
 }
@@ -252,11 +221,11 @@ async fn decode(
 
 /// How many rows from the first keep their distinct terms within `budget` bytes, at least one. Walked in
 /// position order, a slot's term counts at the slot's first position, where it was made.
-fn fitting_rows(slots: &[u32], width: usize, lengths: &[usize], budget: usize) -> usize {
+fn fitting_rows(slots: &[usize], width: usize, lengths: &[usize], budget: usize) -> usize {
     let (mut made, mut bytes) = (0, 0);
     for (row, positions) in slots.chunks(width).enumerate() {
         for &slot in positions {
-            if slot as usize == made {
+            if slot == made {
                 bytes += lengths[made];
                 made += 1;
             }
