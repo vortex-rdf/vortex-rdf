@@ -1,16 +1,99 @@
 //! A match read a chunk at a time, for the Java side: sent as packed payloads ([`TermStream`]) or as rows of codes
-//! ([`CodeStream`]). A stream owns what it reads (the view whose chunks it pulls, or a read already done), so it
-//! lives on after the store handle that opened it is dropped.
+//! ([`CodeStream`]), each taking its rows through a [`Cursor`]. A stream owns what it reads (the chunks of the view
+//! it pulls, or a read already done), so it lives on after the store handle that opened it is dropped.
 
-use futures::StreamExt;
+use futures::stream::{BoxStream, StreamExt};
 use vortex_buffer::Buffer;
-use vortex_rdf_core::{
-    CodeChunkStream, DictReader, QuadColumn, Result, RowChunkStream, SharedQuad, TermCode,
-    VortexRdfStore,
-};
+use vortex_rdf_core::{DictReader, QuadColumn, Result, SharedQuad, TermCode, VortexRdfStore};
 
-use crate::engine::{ROW_BYTES, RUNTIME, write_rows};
-use crate::payload::{Limits, Pace, Payload, encode_codes, encode_shared};
+use crate::RUNTIME;
+use crate::payload::{Limits, Pace, Payload, ROW_BYTES, encode_codes, encode_shared, write_rows};
+
+/// A Dictionary store's rows as code columns, `(s, p, o, g)`.
+type Codes = [Buffer<TermCode>; 4];
+
+/// Rows taken a chunk at a time: the chunk being taken and its first row not taken yet, beside the chunks not pulled
+/// yet. Once every row was taken it holds nothing.
+struct Cursor<C> {
+    /// The chunks not pulled yet; `None` once the last was, or for a read already done.
+    chunks: Option<BoxStream<'static, Result<C>>>,
+    /// The chunk being taken.
+    chunk: Option<C>,
+    /// The chunk's first row not taken yet.
+    at: usize,
+}
+
+/// How many rows a chunk holds.
+trait Rows {
+    fn rows(&self) -> usize;
+}
+
+impl Rows for Codes {
+    fn rows(&self) -> usize {
+        self[0].len()
+    }
+}
+
+impl Rows for Vec<SharedQuad> {
+    fn rows(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<C: Rows> Cursor<C> {
+    /// The rows of `chunks`, pulled as they are taken.
+    fn pulling(chunks: BoxStream<'static, Result<C>>) -> Self {
+        Cursor {
+            chunks: Some(chunks),
+            chunk: None,
+            at: 0,
+        }
+    }
+
+    /// The rows of one chunk read already.
+    fn of(chunk: C) -> Self {
+        Cursor {
+            chunks: None,
+            chunk: Some(chunk),
+            at: 0,
+        }
+    }
+
+    /// No rows.
+    fn spent() -> Self {
+        Cursor {
+            chunks: None,
+            chunk: None,
+            at: 0,
+        }
+    }
+
+    /// What `take` makes of the current chunk from its first row not taken (some are left), beside the rows it took
+    /// (at least one); the next chunk is pulled once the current one is spent. `None` once every row was taken:
+    /// what the cursor held goes then, not when it is dropped.
+    fn take<T>(&mut self, take: impl FnOnce(&C, usize) -> Result<(T, usize)>) -> Result<Option<T>> {
+        loop {
+            if let Some(chunk) = &self.chunk
+                && self.at < chunk.rows()
+            {
+                let (taken, rows) = take(chunk, self.at)?;
+                self.at += rows;
+                return Ok(Some(taken));
+            }
+            let pulled = match &mut self.chunks {
+                Some(chunks) => RUNTIME.block_on(chunks.next()).transpose()?,
+                None => None,
+            };
+            match pulled {
+                Some(chunk) => (self.chunk, self.at) = (Some(chunk), 0),
+                None => {
+                    *self = Cursor::spent();
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
 
 /// A match's terms in the match's order, a payload a call under the limits it was opened with: a Dictionary
 /// store's codes encoded with [`encode_codes`], any other store's quads with [`encode_shared`]. The rows come
@@ -18,57 +101,20 @@ use crate::payload::{Limits, Pace, Payload, encode_codes, encode_shared};
 /// chunk ([`codes`](Self::codes), [`shared`](Self::shared)); a chunk larger than one payload is sent over
 /// several calls.
 pub struct TermStream {
-    /// The chunks not pulled yet; `None` once the last was, or for a read already done.
-    source: Option<Source>,
-    /// The current chunk.
-    chunk: Chunk,
-    /// The current chunk's rows already sent.
-    sent: usize,
+    terms: Terms,
     /// The rows the next payload offers.
     pace: Pace,
 }
 
-enum Source {
+/// A term stream's rows.
+enum Terms {
+    /// A Dictionary store's codes, and the dictionary that spells them.
     Codes {
         dict: DictReader,
-        chunks: CodeChunkStream,
-    },
-    Rows {
-        /// The view the chunks are read from, which decodes them.
-        view: Box<VortexRdfStore>,
-        chunks: RowChunkStream,
-    },
-}
-
-/// Rows to send.
-enum Chunk {
-    /// A Dictionary store's codes, a column each, and the dictionary that spells them.
-    Codes {
-        dict: DictReader,
-        columns: [Buffer<TermCode>; 4],
+        codes: Cursor<Codes>,
     },
     /// Quads' terms.
-    Shared(Vec<SharedQuad>),
-}
-
-impl Chunk {
-    fn rows(&self) -> usize {
-        match self {
-            Chunk::Codes { columns, .. } => columns[0].len(),
-            Chunk::Shared(rows) => rows.len(),
-        }
-    }
-
-    /// The rows from `at` (some left) as one payload under `limits`, and the rows it holds.
-    fn encode(&self, at: usize, limits: Limits) -> Result<(Payload, usize)> {
-        match self {
-            Chunk::Codes { dict, columns } => {
-                let rest = std::array::from_fn(|c| &columns[c][at..]);
-                RUNTIME.block_on(encode_codes(dict, rest, limits))
-            }
-            Chunk::Shared(rows) => Ok(encode_shared(&rows[at..], limits)),
-        }
-    }
+    Shared(Cursor<Vec<SharedQuad>>),
 }
 
 impl TermStream {
@@ -80,106 +126,81 @@ impl TermStream {
         batch_rows: usize,
         limits: Limits,
     ) -> Result<Self> {
-        let source = match dict {
-            Some(dict) => Source::Codes {
+        let terms = match dict {
+            Some(dict) => Terms::Codes {
                 dict,
-                chunks: view.code_chunks(&QuadColumn::ALL, batch_rows)?,
+                codes: Cursor::pulling(code_chunks(&view, batch_rows)?),
             },
-            None => Source::Rows {
-                chunks: view.row_chunks(batch_rows)?,
-                view: Box::new(view),
-            },
+            None => {
+                let chunks = view.row_chunks(batch_rows)?;
+                // The view decodes its own chunks, so the stream holds it.
+                let terms = chunks.map(move |chunk| view.decode_row_chunk(&chunk?));
+                Terms::Shared(Cursor::pulling(terms.boxed()))
+            }
         };
-        Ok(Self::new(Some(source), Chunk::Shared(Vec::new()), limits))
+        Ok(Self::new(terms, limits))
     }
 
     /// A stream of rows read already: a Dictionary store's codes, a column each.
-    pub(crate) fn codes(dict: DictReader, columns: [Buffer<TermCode>; 4], limits: Limits) -> Self {
-        Self::new(None, Chunk::Codes { dict, columns }, limits)
+    pub(crate) fn codes(dict: DictReader, columns: Codes, limits: Limits) -> Self {
+        let codes = Cursor::of(columns);
+        Self::new(Terms::Codes { dict, codes }, limits)
     }
 
     /// A stream of rows read already: quads' terms.
     pub(crate) fn shared(rows: Vec<SharedQuad>, limits: Limits) -> Self {
-        Self::new(None, Chunk::Shared(rows), limits)
+        Self::new(Terms::Shared(Cursor::of(rows)), limits)
     }
 
-    fn new(source: Option<Source>, chunk: Chunk, limits: Limits) -> Self {
+    fn new(terms: Terms, limits: Limits) -> Self {
         TermStream {
-            source,
-            chunk,
-            sent: 0,
+            terms,
             pace: Pace::new(limits),
         }
     }
 
     /// The next payload; `None` once every row was sent.
     pub fn next_payload(&mut self) -> Result<Option<Payload>> {
-        loop {
-            let left = self.chunk.rows() - self.sent;
-            if left > 0 {
-                let limits = self.pace.limits();
-                let (payload, held) = self.chunk.encode(self.sent, limits)?;
-                self.pace
-                    .learn(left.min(limits.rows), held, payload.bytes());
-                self.sent += held;
-                return Ok(Some(payload));
-            }
-            match self.pull()? {
-                Some(chunk) => (self.chunk, self.sent) = (chunk, 0),
-                None => {
-                    // The end: what the stream holds goes now, not when it is freed.
-                    self.source = None;
-                    (self.chunk, self.sent) = (Chunk::Shared(Vec::new()), 0);
-                    return Ok(None);
-                }
-            }
+        let pace = &mut self.pace;
+        let limits = pace.limits();
+        match &mut self.terms {
+            Terms::Codes { dict, codes } => codes.take(|columns, at| {
+                let rest = std::array::from_fn(|c| &columns[c][at..]);
+                let encoded = RUNTIME.block_on(encode_codes(dict, rest, limits))?;
+                Ok(paced(pace, limits, columns.rows() - at, encoded))
+            }),
+            Terms::Shared(quads) => quads.take(|rows, at| {
+                let encoded = encode_shared(&rows[at..], limits);
+                Ok(paced(pace, limits, rows.len() - at, encoded))
+            }),
         }
     }
+}
 
-    /// The source's next chunk; `None` once the last was pulled.
-    fn pull(&mut self) -> Result<Option<Chunk>> {
-        Ok(match &mut self.source {
-            None => None,
-            Some(Source::Codes { dict, chunks }) => {
-                next_codes(chunks)?.map(|columns| Chunk::Codes {
-                    dict: dict.clone(),
-                    columns,
-                })
-            }
-            Some(Source::Rows { view, chunks }) => {
-                match RUNTIME.block_on(chunks.next()).transpose()? {
-                    Some(chunk) => Some(Chunk::Shared(view.decode_row_chunk(&chunk)?)),
-                    None => None,
-                }
-            }
-        })
-    }
+/// A payload and the rows it holds, of `left` rows offered under `limits`, after `pace` learns from it.
+fn paced(
+    pace: &mut Pace,
+    limits: Limits,
+    left: usize,
+    (payload, held): (Payload, usize),
+) -> (Payload, usize) {
+    pace.learn(left.min(limits.rows), held, payload.bytes());
+    (payload, held)
 }
 
 /// A match's term codes in the match's order, written into the caller's rows as `match_codes` writes them: the
 /// current chunk's rest is kept for the next call, so the rows a call takes are independent of the chunks'.
-pub struct CodeStream {
-    /// The chunks; `None` once the last was read, or for a pattern no quad can match.
-    chunks: Option<CodeChunkStream>,
-    /// The current chunk and its first row not written yet.
-    rest: Option<([Buffer<TermCode>; 4], usize)>,
-}
+pub struct CodeStream(Cursor<Codes>);
 
 impl CodeStream {
     /// A stream of `view`'s codes in chunks of at most `batch_rows` (at least 1).
     pub(crate) fn open(view: &VortexRdfStore, batch_rows: usize) -> Result<Self> {
-        Ok(CodeStream {
-            chunks: Some(view.code_chunks(&QuadColumn::ALL, batch_rows)?),
-            rest: None,
-        })
+        Ok(CodeStream(Cursor::pulling(code_chunks(view, batch_rows)?)))
     }
 
     /// The stream of a pattern no quad can match.
     pub(crate) fn empty() -> Self {
-        CodeStream {
-            chunks: None,
-            rest: None,
-        }
+        CodeStream(Cursor::spent())
     }
 
     /// Writes up to `out.len()` rows, each its `(s, p, o, g)` codes, eight native-endian bytes apiece; returns
@@ -188,34 +209,28 @@ impl CodeStream {
         if out.is_empty() {
             return Ok(0);
         }
-        loop {
-            if let Some((columns, at)) = &mut self.rest
-                && *at < columns[0].len()
-            {
-                let rows = write_rows(columns, *at, out);
-                *at += rows;
-                return Ok(rows);
-            }
-            let Some(chunks) = &mut self.chunks else {
-                return Ok(0);
-            };
-            match next_codes(chunks)? {
-                Some(columns) => self.rest = Some((columns, 0)),
-                None => {
-                    self.chunks = None;
-                    self.rest = None;
-                }
-            }
-        }
+        let written = self.0.take(|columns, at| {
+            let rows = write_rows(columns, at, out);
+            Ok((rows, rows))
+        })?;
+        Ok(written.unwrap_or(0))
     }
 }
 
-/// The next chunk of a stream of all four code columns, as `code_chunks(&QuadColumn::ALL, ..)` yields them;
-/// `None` at its end.
-fn next_codes(chunks: &mut CodeChunkStream) -> Result<Option<[Buffer<TermCode>; 4]>> {
-    Ok(RUNTIME.block_on(chunks.next()).transpose()?.map(|columns| {
-        columns
-            .try_into()
-            .unwrap_or_else(|columns: Vec<_>| panic!("{} code columns, not four", columns.len()))
-    }))
+/// `view`'s rows as chunks of all four code columns, at most `batch_rows` rows each, as
+/// `code_chunks(&QuadColumn::ALL, ..)` yields them.
+fn code_chunks(
+    view: &VortexRdfStore,
+    batch_rows: usize,
+) -> Result<BoxStream<'static, Result<Codes>>> {
+    let chunks = view.code_chunks(&QuadColumn::ALL, batch_rows)?;
+    Ok(chunks
+        .map(|columns| {
+            columns.map(|columns| {
+                columns.try_into().unwrap_or_else(|columns: Vec<_>| {
+                    panic!("{} code columns, not four", columns.len())
+                })
+            })
+        })
+        .boxed())
 }

@@ -1,11 +1,32 @@
-//! The packed form a chunk of terms crosses JNI in: the UTF-8 text of the chunk's distinct terms, once each,
-//! and one small integer per position naming its term. The Java side builds one `String` per distinct term
-//! of a chunk rather than one per position, and the text crosses as one `byte[]`.
+//! The two forms a match's rows cross JNI in. Terms cross packed ([`Payload`]): the UTF-8 text of the chunk's
+//! distinct terms, once each, and one small integer per position naming its term, so the Java side builds one
+//! `String` per distinct term of a chunk rather than one per position, and the text crosses as one `byte[]`.
+//! Codes cross as rows of [`ROW_BYTES`] bytes ([`write_rows`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use vortex_buffer::Buffer;
 use vortex_rdf_core::{DictReader, Result, SharedQuad, TermCode, VortexRdfError};
+
+/// Bytes per row [`Store::match_codes`](crate::engine::Store::match_codes) writes: four codes of eight bytes.
+pub const ROW_BYTES: usize = 32;
+
+/// Writes rows `from..` of `columns`, as many as `out` holds, into `out`: each its `(s, p, o, g)` codes, eight
+/// native-endian bytes apiece. Returns the rows written.
+pub(crate) fn write_rows(
+    columns: &[Buffer<TermCode>; 4],
+    from: usize,
+    out: &mut [[u8; ROW_BYTES]],
+) -> usize {
+    let rows = out.len().min(columns[0].len() - from);
+    for (row, bytes) in out[..rows].iter_mut().enumerate() {
+        for (code, column) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(columns) {
+            *code = column[from + row].to_ne_bytes();
+        }
+    }
+    rows
+}
 
 /// How much one chunk may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

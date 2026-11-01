@@ -10,8 +10,8 @@ use common::{
     reference_quads, scan, term, write,
 };
 use vortex_rdf_core::{CodePattern, LayoutStrategy};
-use vortex_rdf_jni::engine::{ROW_BYTES, Store};
-use vortex_rdf_jni::payload::Limits;
+use vortex_rdf_jni::engine::Store;
+use vortex_rdf_jni::payload::{Limits, ROW_BYTES};
 
 fn quads() -> Vec<Quad> {
     make_quads(400)

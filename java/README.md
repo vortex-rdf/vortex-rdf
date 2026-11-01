@@ -68,7 +68,7 @@ These calls raise `VortexException` on a store without a dictionary, which `stor
 TermDictionary dict = store.dictionary().orElseThrow();       // absent for other layouts
 long name = dict.encode("<http://xmlns.com/foaf/0.1/name>");  // code of a term, or NONE
 dict.decode(name);                                            // N-Triples spelling, or null past the dictionary
-dict.decodeMany(codes);                                       // one native call for a whole column
+dict.decodeMany(codes);                                       // a whole column, its distinct terms once a chunk
 dict.ranges().literals().contains(code);                      // a code's term kind: literals, IRIs or blank nodes
 
 if (name != VortexStore.NONE) {                               // the store holds the term

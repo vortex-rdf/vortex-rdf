@@ -11,8 +11,7 @@ import java.util.function.LongFunction;
  * exactly once: then, when its store closes, or, as the iterator's {@link Cleaner} action, when the iterator becomes
  * unreachable unclosed. It holds no reference to its iterator, so the iterator can become unreachable while its store
  * still tracks this. Its native calls and its freeing are serialized on it, so threads misusing one iterator can
- * interleave rows but never reach a freed stream. Lock order: the store's lock, then this, then the store's set of
- * streams.
+ * interleave rows but never reach a freed stream. Lock order: the store's lock, then this.
  */
 final class NativeStream implements Runnable {
 	private static final Cleaner CLEANER = Cleaner.create();
@@ -60,8 +59,9 @@ final class NativeStream implements Runnable {
 
 	/**
 	 * What {@code next} reads off the native stream, the store held open meanwhile; {@code end}, which ends the
-	 * iteration, at its end or once it was freed. A read error ends the iteration too; a store closed meanwhile does
-	 * not, so the iteration goes on refusing.
+	 * iteration, at its end or once it was freed. A failed read ends the iteration too, whatever was thrown (an
+	 * {@link Error} as well: the native stream may have moved past the rows it failed to hand over); a store closed
+	 * meanwhile does not, so the iteration goes on refusing.
 	 */
 	private <T> T pull(LongFunction<T> next, T end) {
 		T read;
@@ -69,7 +69,7 @@ final class NativeStream implements Runnable {
 			read = store.call(h -> read(next, end));
 		} catch (IllegalStateException closed) {
 			throw closed;
-		} catch (RuntimeException failed) {
+		} catch (Throwable failed) {
 			close();
 			throw failed;
 		}

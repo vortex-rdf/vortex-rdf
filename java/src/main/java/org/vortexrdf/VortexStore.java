@@ -5,13 +5,13 @@ import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongFunction;
 import java.util.function.LongToIntFunction;
@@ -53,7 +53,7 @@ public final class VortexStore implements AutoCloseable {
 	private long handle;
 	private final TermDictionary dictionary;
 	/** The native streams of this store's open iterators, not the iterators, so a forgotten one can be collected. */
-	private final Set<NativeStream> streams = new HashSet<>();
+	private final Set<NativeStream> streams = ConcurrentHashMap.newKeySet();
 	/** Set by {@link #close()}: an iterator that has not ended refuses to go on. */
 	private volatile boolean closed;
 
@@ -126,12 +126,9 @@ public final class VortexStore implements AutoCloseable {
 		try {
 			if (handle != 0) {
 				closed = true;
-				NativeStream[] open;
-				synchronized (streams) {
-					open = streams.toArray(new NativeStream[0]);
-				}
 				try {
-					for (NativeStream stream : open) {
+					// Freeing a stream removes it from the set, which the iteration tolerates.
+					for (NativeStream stream : streams) {
 						stream.free();
 					}
 				} finally {
@@ -155,18 +152,14 @@ public final class VortexStore implements AutoCloseable {
 	private NativeStream openStream(LongUnaryOperator open) {
 		return call(h -> {
 			NativeStream stream = new NativeStream(this, open.applyAsLong(h));
-			synchronized (streams) {
-				streams.add(stream);
-			}
+			streams.add(stream);
 			return stream;
 		});
 	}
 
 	/** Stops tracking a freed native stream. */
 	void forget(NativeStream stream) {
-		synchronized (streams) {
-			streams.remove(stream);
-		}
+		streams.remove(stream);
 	}
 
 	/** The number of quads. */

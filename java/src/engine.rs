@@ -5,34 +5,13 @@
 //! default graph is spelled `""`, which is also how a pattern selects it. A term code is the store's own,
 //! starting at 0.
 
-use std::sync::LazyLock;
-
-use vortex_buffer::Buffer;
 use vortex_rdf_core::{
-    CodePattern, DictReader, KindRanges, Probe, Result, TermCode, VortexRdfError, VortexRdfStore,
+    CodePattern, DictReader, KindRanges, Probe, Result, VortexRdfError, VortexRdfStore,
 };
 
-use crate::payload::{Limits, Payload, encode_lookup};
+use crate::RUNTIME;
+use crate::payload::{Limits, Payload, ROW_BYTES, encode_lookup, write_rows};
 use crate::streams::{CodeStream, TermStream};
-
-/// Bytes per row [`Store::match_codes`] writes: four codes of eight bytes.
-pub const ROW_BYTES: usize = 32;
-
-/// Writes rows `from..` of `columns`, as many as `out` holds, into `out`: each its `(s, p, o, g)` codes, eight
-/// native-endian bytes apiece. Returns the rows written.
-pub(crate) fn write_rows(
-    columns: &[Buffer<TermCode>; 4],
-    from: usize,
-    out: &mut [[u8; ROW_BYTES]],
-) -> usize {
-    let rows = out.len().min(columns[0].len() - from);
-    for (row, bytes) in out[..rows].iter_mut().enumerate() {
-        for (code, column) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(columns) {
-            *code = column[from + row].to_ne_bytes();
-        }
-    }
-    rows
-}
 
 /// `InvalidInput` for a chunk of no rows: checked before a stream's pattern is matched.
 fn check_batch_rows(batch_rows: usize) -> Result<()> {
@@ -43,15 +22,6 @@ fn check_batch_rows(batch_rows: usize) -> Result<()> {
     }
     Ok(())
 }
-
-/// One runtime for every store of the process, as in the Python bindings: a store's reads are async, the
-/// caller's threads block on them.
-pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("start the vortex-rdf native library's async runtime")
-});
 
 pub struct Store {
     store: VortexRdfStore,

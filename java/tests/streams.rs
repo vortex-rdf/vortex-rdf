@@ -12,8 +12,8 @@ use common::{
     reference_quads, scan, write,
 };
 use vortex_rdf_core::{CodePattern, IndexType, LayoutStrategy};
-use vortex_rdf_jni::engine::{ROW_BYTES, Store};
-use vortex_rdf_jni::payload::Limits;
+use vortex_rdf_jni::engine::Store;
+use vortex_rdf_jni::payload::{Limits, ROW_BYTES};
 use vortex_rdf_jni::streams::{CodeStream, TermStream};
 
 fn quads() -> Vec<Quad> {

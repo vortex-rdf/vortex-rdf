@@ -4,7 +4,7 @@
 //! ([`ThrowVortexException`]) and never unwinds into the JVM.
 //!
 //! Conventions: a store handle is the address of a boxed [`engine::Store`] (the Java side owns it and never calls
-//! after `close`); a stream handle is the address of a boxed [`Handle`], which the Java side frees once, within
+//! after `close`); a stream handle is the address of a boxed [`Stream`], which the Java side frees once, within
 //! the call that opened it for `quads()` and through its `NativeStream` otherwise; a term code is a non-negative
 //! `long`, and `-1` means "no code" (a free pattern position, a term the dictionary lacks); a `null` string is a
 //! free pattern position, while `""` is the default graph.
@@ -16,17 +16,27 @@ pub mod engine;
 pub mod payload;
 pub mod streams;
 
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use engine::{ROW_BYTES, Store};
+use engine::Store;
 use jni::errors::ErrorPolicy;
 use jni::objects::{JByteBuffer, JClass, JIntArray, JLongArray, JObject, JObjectArray, JString};
 use jni::strings::JNIString;
 use jni::sys::{jboolean, jint, jlong};
 use jni::{Env, EnvUnowned, jni_str};
-use payload::{Limits, Pace, Payload};
+use payload::{Limits, Pace, Payload, ROW_BYTES};
 use streams::{CodeStream, TermStream};
 use vortex_rdf_core::CodePattern;
+
+/// One runtime for every store of the process, as in the Python bindings: a store's reads are async, the
+/// caller's threads block on them.
+pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("start the vortex-rdf native library's async runtime")
+});
 
 /// A native call's failure: the store's own, or a JNI call's.
 type Failure = Box<dyn std::error::Error>;
@@ -103,52 +113,16 @@ fn pattern_terms(
 /// Native objects the Java side holds by handle and has not freed: term and code streams.
 static OPEN_HANDLES: AtomicI64 = AtomicI64::new(0);
 
-/// A native object the Java side holds by handle, counted in [`OPEN_HANDLES`] from [`open`](Self::open) to
-/// its drop.
-struct Handle<T>(T);
-
-impl<T> Handle<T> {
-    /// Boxes `value` for the Java side; returns its handle.
-    fn open(value: T) -> jlong {
-        OPEN_HANDLES.fetch_add(1, Ordering::Relaxed);
-        Box::into_raw(Box::new(Handle(value))) as jlong
-    }
-
-    /// The object a handle addresses.
-    ///
-    /// # Safety
-    ///
-    /// `h` came from [`open`](Self::open) with this `T`, is not closed, and no other call uses it meanwhile.
-    unsafe fn get<'a>(h: jlong) -> &'a mut T {
-        // SAFETY: as the caller promises.
-        unsafe { &mut (*(h as *mut Handle<T>)).0 }
-    }
-
-    /// Frees a handle; `0` is a no-op.
-    ///
-    /// # Safety
-    ///
-    /// As for [`get`](Self::get), and nothing uses the handle afterwards.
-    unsafe fn close(h: jlong) {
-        if h != 0 {
-            // SAFETY: as the caller promises.
-            drop(unsafe { Box::from_raw(h as *mut Handle<T>) });
-        }
-    }
-}
-
-impl<T> Drop for Handle<T> {
-    fn drop(&mut self) {
-        OPEN_HANDLES.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// The most rows a read hands over: what a Java `ArrayList` holds.
 const MAX_JAVA_LIST: usize = i32::MAX as usize - 8;
 
+/// A size a native call's `int` gives: a negative one is 0, which every size check refuses.
+fn size(value: jint) -> usize {
+    usize::try_from(value).unwrap_or(0)
+}
+
 /// The chunk limits a native call's `int`s give; out of range (a negative value included) is `InvalidInput`.
 fn limits(rows: jint, bytes: jint, large_term: jint) -> Result<Limits, Failure> {
-    let size = |value: jint| usize::try_from(value).unwrap_or(0);
     Ok(Limits::new(size(rows), size(bytes), size(large_term))?)
 }
 
@@ -236,7 +210,7 @@ fn direct_rows<'a>(
     let capacity = env
         .get_direct_buffer_capacity(buf)
         .map_err(|_| not_a_buffer())?;
-    let rows = max_rows.max(0) as usize;
+    let rows = size(max_rows);
     if rows.checked_mul(ROW_BYTES).is_none_or(|len| len > capacity) {
         return Err(not_a_buffer().into());
     }
@@ -362,32 +336,49 @@ pub extern "system" fn Java_org_vortexrdf_Native_quadsOpen<'local>(
         }
         let first = stream.next_payload()?.unwrap_or_default();
         let handle = if first.positions() / 4 < rows {
-            Handle::open(Stream::Terms(stream))
+            Stream::Terms(stream).open()
         } else {
             0
         };
         java_payload(env, &first, Some(&[handle, rows as i64])).inspect_err(|_| {
             // SAFETY: the handle was just opened and never reached the Java side.
-            unsafe { Handle::<Stream>::close(handle) }
+            unsafe { Stream::close(handle) }
         })
     })
 }
 
-/// The native stream behind a Java read: its terms, or its codes.
+/// The native stream behind a Java read, its terms or its codes, which the Java side holds by handle: counted
+/// in [`OPEN_HANDLES`] from [`open`](Self::open) to its drop.
 enum Stream {
     Terms(TermStream),
     Codes(CodeStream),
 }
 
 impl Stream {
+    /// Boxes the stream for the Java side; returns its handle.
+    fn open(self) -> jlong {
+        OPEN_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Box::into_raw(Box::new(self)) as jlong
+    }
+
+    /// The stream a handle addresses.
+    ///
+    /// # Safety
+    ///
+    /// `h` came from [`open`](Self::open), is not closed, and no other call uses it meanwhile.
+    unsafe fn get<'a>(h: jlong) -> &'a mut Stream {
+        // SAFETY: as the caller promises.
+        unsafe { &mut *(h as *mut Stream) }
+    }
+
     /// The term stream a handle addresses; an error naming `call` for a code stream.
     ///
     /// # Safety
     ///
-    /// As for [`Handle::get`].
+    /// As for [`get`](Self::get).
     unsafe fn terms<'a>(h: jlong, call: &str) -> Result<&'a mut TermStream, Failure> {
         // SAFETY: as the caller promises.
-        match unsafe { Handle::<Stream>::get(h) } {
+        match unsafe { Self::get(h) } {
             Stream::Terms(terms) => Ok(terms),
             Stream::Codes(_) => Err(format!("{call}: not a term stream").into()),
         }
@@ -397,13 +388,31 @@ impl Stream {
     ///
     /// # Safety
     ///
-    /// As for [`Handle::get`].
+    /// As for [`get`](Self::get).
     unsafe fn codes<'a>(h: jlong, call: &str) -> Result<&'a mut CodeStream, Failure> {
         // SAFETY: as the caller promises.
-        match unsafe { Handle::<Stream>::get(h) } {
+        match unsafe { Self::get(h) } {
             Stream::Codes(codes) => Ok(codes),
             Stream::Terms(_) => Err(format!("{call}: not a code stream").into()),
         }
+    }
+
+    /// Frees a handle; `0` is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// As for [`get`](Self::get), and nothing uses the handle afterwards.
+    unsafe fn close(h: jlong) {
+        if h != 0 {
+            // SAFETY: as the caller promises.
+            drop(unsafe { Box::from_raw(h as *mut Stream) });
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        OPEN_HANDLES.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -433,10 +442,10 @@ pub extern "system" fn Java_org_vortexrdf_Native_termStreamOpen<'local>(
             p.as_deref(),
             o.as_deref(),
             g.as_deref(),
-            batch_rows.max(0) as usize,
+            size(batch_rows),
             limits,
         )?;
-        Ok(Handle::open(Stream::Terms(stream)))
+        Ok(Stream::Terms(stream).open())
     })
 }
 
@@ -473,8 +482,8 @@ pub extern "system" fn Java_org_vortexrdf_Native_codeStreamOpen<'local>(
     batch_rows: jint,
 ) -> jlong {
     call(&mut env, |_| {
-        let stream = store(h).code_stream(pattern(s, p, o, g), batch_rows.max(0) as usize)?;
-        Ok(Handle::open(Stream::Codes(stream)))
+        let stream = store(h).code_stream(pattern(s, p, o, g), size(batch_rows))?;
+        Ok(Stream::Codes(stream).open())
     })
 }
 
@@ -507,7 +516,7 @@ pub extern "system" fn Java_org_vortexrdf_Native_streamClose<'local>(
     call(&mut env, |_| {
         // SAFETY: the Java side passes a stream `quadsOpen`, `termStreamOpen` or `codeStreamOpen` returned, once
         // (the call that opened it, or its `NativeStream`), and nothing uses the stream afterwards.
-        unsafe { Handle::<Stream>::close(stream) };
+        unsafe { Stream::close(stream) };
         Ok(())
     })
 }
