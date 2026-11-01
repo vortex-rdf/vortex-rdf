@@ -1005,6 +1005,25 @@ enum PairSide {
 /// The limit vortex-rdflib's `triples()` probes a pattern's size with.
 const PROBING_LIMIT: usize = 65_537;
 
+/// The rows a chunk holds at the Python binding's default batch.
+const PYTHON_BATCH: usize = 65_536;
+
+/// The rows of `view`'s code columns, gathered: the bindings' `match_codes`.
+async fn gathered_rows(view: &VortexRdfStore) -> usize {
+    let columns = view.code_columns_gathered().await.expect("gather");
+    columns.expect("a Dictionary view has code columns")[0].len()
+}
+
+/// The rows of `view`'s code chunks of `columns`, drained `batch` rows a chunk.
+async fn drain_code_chunks(view: &VortexRdfStore, columns: &[QuadColumn], batch: usize) -> usize {
+    let mut chunks = view.code_chunks(columns, batch).expect("code_chunks");
+    let mut rows = 0;
+    while let Some(chunk) = chunks.next().await {
+        rows += chunk.expect("code chunk")[0].len();
+    }
+    rows
+}
+
 /// One cell of a limit pair: `shape` matched on a Dictionary store of the given
 /// `source` and `index` (opened once, before timing) and read as the bindings
 /// read it, `run_probe` then `how`. The [`Plain`](PairSide::Plain) cell times
@@ -1027,11 +1046,8 @@ fn run_limit_pair(
         rt().block_on(async {
             let view = store.run_probe(probe).await.expect("run_probe");
             match how {
-                PairRead::Gathered => {
-                    let columns = view.code_columns_gathered().await.expect("gather");
-                    columns.expect("a Dictionary view has code columns")[0].len()
-                }
-                PairRead::Chunks => drain_code_chunks(&view, &QuadColumn::ALL).await,
+                PairRead::Gathered => gathered_rows(&view).await,
+                PairRead::Chunks => drain_code_chunks(&view, &QuadColumn::ALL, PYTHON_BATCH).await,
             }
         })
     };
@@ -1126,17 +1142,6 @@ impl fmt::Debug for ChunkColumns {
 
 const CHUNK_COLUMNS: &[ChunkColumns] = &[ChunkColumns::O, ChunkColumns::Spog];
 
-/// The rows of `view`'s code chunks of `columns`, drained at the Python
-/// binding's default of 65,536 rows a chunk.
-async fn drain_code_chunks(view: &VortexRdfStore, columns: &[QuadColumn]) -> usize {
-    let mut chunks = view.code_chunks(columns, 65_536).expect("code_chunks");
-    let mut rows = 0;
-    while let Some(chunk) = chunks.next().await {
-        rows += chunk.expect("code chunk")[0].len();
-    }
-    rows
-}
-
 /// `code_chunks` over a predicate-bound view of the in-memory store (a 32nd
 /// of its rows, an id list), drained at the Python binding's default of
 /// 65,536 rows a chunk: `o` alone, and all four columns. The match, and a
@@ -1150,7 +1155,7 @@ fn chunks_codes(bencher: divan::Bencher, columns: &ChunkColumns) {
     let view = rt()
         .block_on(store.match_pattern(None, p.as_ref(), None, None))
         .expect("match P");
-    let drain = || rt().block_on(drain_code_chunks(&view, columns));
+    let drain = || rt().block_on(drain_code_chunks(&view, columns, PYTHON_BATCH));
     assert!(drain() > 0, "the predicate-bound view has rows");
     bencher.bench(|| black_box(drain()));
 }
@@ -1169,7 +1174,9 @@ fn chunks_codes_cold(bencher: divan::Bencher, columns: &ChunkColumns) {
             rt().block_on(store.match_pattern(None, p.as_ref(), None, None))
                 .expect("match P")
         })
-        .bench_values(|view| black_box(rt().block_on(drain_code_chunks(&view, columns))));
+        .bench_values(|view| {
+            black_box(rt().block_on(drain_code_chunks(&view, columns, PYTHON_BATCH)))
+        });
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1229,20 +1236,8 @@ impl fmt::Debug for ServedRead {
     }
 }
 
-/// The reads timed on a fresh match each: all but [`ServedRead::Quads`], which
-/// `match_cold_*` and `match_warm_*` already time with the match.
-const SERVED_FRESH_READS: &[ServedRead] = &[
-    ServedRead::CutWindow,
-    ServedRead::DeepWindow,
-    ServedRead::KeepSparse,
-    ServedRead::KeepDense,
-    ServedRead::CountKeep,
-    ServedRead::Partitions,
-    ServedRead::Chunks,
-    ServedRead::ChunksSmall,
-];
-
-/// The reads timed on a reused view: every [`ServedRead`].
+/// The reads timed on a reused view: every [`ServedRead`], [`ServedRead::Quads`]
+/// last.
 const SERVED_REUSED_READS: &[ServedRead] = &[
     ServedRead::CutWindow,
     ServedRead::DeepWindow,
@@ -1254,6 +1249,10 @@ const SERVED_REUSED_READS: &[ServedRead] = &[
     ServedRead::ChunksSmall,
     ServedRead::Quads,
 ];
+
+/// The reads timed on a fresh match each: all but the last, [`ServedRead::Quads`],
+/// which `match_cold_*` and `match_warm_*` already time with the match.
+const SERVED_FRESH_READS: &[ServedRead] = SERVED_REUSED_READS.split_last().unwrap().1;
 
 /// When a served-read cell matches its view.
 #[derive(Copy, Clone)]
@@ -1270,25 +1269,6 @@ struct ServedInputs {
     rows: usize,
     sparse: vortex_rdf_core::Keep,
     dense: vortex_rdf_core::Keep,
-}
-
-/// The rows of `view`'s code columns, gathered: the bindings' `match_codes`.
-async fn gathered_rows(view: &VortexRdfStore) -> usize {
-    let columns = view.code_columns_gathered().await.expect("gather");
-    columns.expect("a Dictionary view has code columns")[0].len()
-}
-
-/// The rows of `view`'s code chunks over the four columns, `batch` rows a
-/// chunk.
-async fn drained_rows(view: &VortexRdfStore, batch: usize) -> usize {
-    let mut chunks = view
-        .code_chunks(&QuadColumn::ALL, batch)
-        .expect("code_chunks");
-    let mut rows = 0;
-    while let Some(chunk) = chunks.next().await {
-        rows += chunk.expect("code chunk")[0].len();
-    }
-    rows
 }
 
 /// `view` kept to the rows whose object `keep` admits.
@@ -1320,8 +1300,8 @@ impl ServedRead {
                 }
                 rows
             }
-            Self::Chunks => drained_rows(view, 65_536).await,
-            Self::ChunksSmall => drained_rows(view, 64).await,
+            Self::Chunks => drain_code_chunks(view, &QuadColumn::ALL, PYTHON_BATCH).await,
+            Self::ChunksSmall => drain_code_chunks(view, &QuadColumn::ALL, 64).await,
             Self::Quads => view.quads_vec().await.expect("quads").len(),
         }
     }
@@ -1380,53 +1360,26 @@ fn served_read(
     }
 }
 
-/// [`served_read`] on the file store, matching in each iteration.
-#[divan::bench(args = SERVED_FRESH_READS, sample_count = QUERY_SAMPLES)]
-fn served_fresh_file(bencher: divan::Bencher, read: &ServedRead) {
-    served_read(
-        bencher,
-        "served_fresh_file",
-        Source::File,
-        ServedMatch::Fresh,
-        *read,
-    );
+/// The served-read cells: one `name (source, match, reads)` row per benchmark
+/// function, a [`Source`] and a [`ServedMatch`], each swept over its reads.
+macro_rules! served_reads {
+    ($($name:ident ($source:ident, $matched:ident, $reads:ident),)*) => {
+        $(
+            #[divan::bench(args = $reads, sample_count = QUERY_SAMPLES)]
+            fn $name(bencher: divan::Bencher, read: &ServedRead) {
+                let (source, matched) = (Source::$source, ServedMatch::$matched);
+                served_read(bencher, stringify!($name), source, matched, *read);
+            }
+        )*
+    };
 }
 
-/// [`served_read`] on the in-memory store, matching in each iteration.
-#[divan::bench(args = SERVED_FRESH_READS, sample_count = QUERY_SAMPLES)]
-fn served_fresh_mem(bencher: divan::Bencher, read: &ServedRead) {
-    served_read(
-        bencher,
-        "served_fresh_mem",
-        Source::InMemory,
-        ServedMatch::Fresh,
-        *read,
-    );
-}
-
-/// [`served_read`] on the file store, one view reused by every iteration.
-#[divan::bench(args = SERVED_REUSED_READS, sample_count = QUERY_SAMPLES)]
-fn served_reused_file(bencher: divan::Bencher, read: &ServedRead) {
-    served_read(
-        bencher,
-        "served_reused_file",
-        Source::File,
-        ServedMatch::Reused,
-        *read,
-    );
-}
-
-/// [`served_read`] on the in-memory store, one view reused by every iteration.
-#[divan::bench(args = SERVED_REUSED_READS, sample_count = QUERY_SAMPLES)]
-fn served_reused_mem(bencher: divan::Bencher, read: &ServedRead) {
-    served_read(
-        bencher,
-        "served_reused_mem",
-        Source::InMemory,
-        ServedMatch::Reused,
-        *read,
-    );
-}
+served_reads!(
+    served_fresh_file(File, Fresh, SERVED_FRESH_READS),
+    served_fresh_mem(InMemory, Fresh, SERVED_FRESH_READS),
+    served_reused_file(File, Reused, SERVED_REUSED_READS),
+    served_reused_mem(InMemory, Reused, SERVED_REUSED_READS),
+);
 
 // ══════════════════════════════════════════════════════════════════════════
 // Group 5 — MUTATE (append / delete / compact)
