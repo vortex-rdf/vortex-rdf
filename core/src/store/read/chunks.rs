@@ -47,14 +47,14 @@ use crate::store::array::{field_as, into_struct_array, rechunk};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::read::file_plan::StreamedPlan;
-use crate::store::scan::gather::gather_live;
+use crate::store::scan::gather::gather_rows_at;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{
     file_reads::take_file_rows, file_scans::stream_split_reads, read_plan::ExactRead,
 };
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, SelectedRows};
-use crate::store::{SharedQuad, VortexRdfStore};
+use crate::store::{MemoryBase, SharedQuad, VortexRdfStore};
 
 /// A view's rows as struct chunks in the layout's primary dtype, each of at
 /// most the requested `batch_rows` rows.
@@ -244,16 +244,7 @@ impl VortexRdfStore {
         if let Some(memory) = self.quads.in_memory()
             && let MemoryRows::Windows(windows) = self.memory_rows(batch_rows)?
         {
-            // Only the columns asked for are gathered.
-            let base = projected(&memory.base, columns)?;
-            let probes = Arc::clone(&memory.probes);
-            return Ok(stream::iter(windows.map(move |ids| {
-                observe!(Gather {
-                    width: base.dtype().as_struct_fields_opt().map(|f| f.nfields())
-                });
-                gather_live(&base, &RowSelection::Ids(ids), None, Some(&probes))
-            }))
-            .boxed());
+            return gathered_row_chunks(memory, columns, windows);
         }
         #[cfg(feature = "file-io")]
         if let Some(base) = self.quads.file() {
@@ -396,6 +387,27 @@ pub(super) fn gathered_code_chunks(
         })
     }))
     .boxed()
+}
+
+/// Row chunks of `columns` (primary column names), one per window of base
+/// row ids (each id once and live, in any order), each gathered off
+/// `memory`'s base when its chunk is pulled ([`gather_rows_at`]): only the
+/// columns asked for, point by point through the base's probes when the
+/// window is small, else by one take.
+pub(super) fn gathered_row_chunks(
+    memory: &MemoryBase,
+    columns: &[&'static str],
+    windows: impl Iterator<Item = Buffer<RowId>> + Send + 'static,
+) -> Result<RowChunkStream> {
+    let base = projected(&memory.base, columns)?;
+    let probes = Arc::clone(&memory.probes);
+    Ok(stream::iter(windows.map(move |ids| {
+        observe!(Gather {
+            width: base.dtype().as_struct_fields_opt().map(|f| f.nfields())
+        });
+        gather_rows_at(&base, &ids, Some(&probes))
+    }))
+    .boxed())
 }
 
 /// `ids` cut into consecutive windows of at most `batch_rows`, each a slice

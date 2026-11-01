@@ -3,6 +3,7 @@
 //! alike ([`MemoryRead`]), a file view's for its chunk streams beside it
 //! ([`ServedRead`]); and the code and row chunks each way yields.
 
+#[cfg(feature = "file-io")]
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
@@ -10,7 +11,8 @@ use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use super::chunks::{
-    CodeChunkStream, RowChunkStream, batch_ranges, gathered_code_chunks, id_windows, projected,
+    CodeChunkStream, RowChunkStream, batch_ranges, gathered_code_chunks, gathered_row_chunks,
+    id_windows,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
@@ -18,7 +20,6 @@ use crate::store::indexes::InMemoryServePlan;
 #[cfg(feature = "file-io")]
 use crate::store::indexes::{FileServePlan, PlanRead};
 use crate::store::resident::CodeAccess;
-use crate::store::scan::gather::gather_rows_at;
 use crate::store::schema::{QuadColumn, RowId};
 #[cfg(feature = "file-io")]
 use crate::store::{
@@ -151,7 +152,7 @@ impl ServedRead<'_> {
                 gathered_code_chunks(all, asked, columns, id_windows(ids, batch_rows))
             }
             ServedRead::Memory(MemoryRead::Component { plan, deleted }) => {
-                let rows = plan.live_component_rows(deleted)?;
+                let rows = plan.live(deleted)?;
                 let plan = plan.clone();
                 stream::iter(batch_ranges(rows.len(), batch_rows))
                     .map(move |window| {
@@ -216,18 +217,10 @@ impl ServedRead<'_> {
         observe!(ServedRunChunks);
         Ok(match self {
             ServedRead::Memory(MemoryRead::Gather { memory, ids }) => {
-                let base = projected(&memory.base, columns)?;
-                let probes = Arc::clone(&memory.probes);
-                stream::iter(id_windows(ids, batch_rows).map(move |ids| {
-                    observe!(Gather {
-                        width: base.dtype().as_struct_fields_opt().map(|f| f.nfields())
-                    });
-                    gather_rows_at(&base, &ids, Some(&probes))
-                }))
-                .boxed()
+                gathered_row_chunks(memory, columns, id_windows(ids, batch_rows))?
             }
             ServedRead::Memory(MemoryRead::Component { plan, deleted }) => {
-                let rows = plan.live_component_rows(deleted)?;
+                let rows = plan.live(deleted)?;
                 let plan = plan.clone();
                 stream::iter(batch_ranges(rows.len(), batch_rows))
                     .map(move |window| plan.window_rows(&rows, window))

@@ -18,7 +18,7 @@ use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
 use vortex_mask::Mask;
 
-use super::{ServeDecode, ServedRows, ServedSpan};
+use super::{LiveRows, ServeDecode, ServedRows, ServedSpan};
 use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
@@ -327,6 +327,25 @@ impl FileServePlan {
             ServedSpan::Kept(kept) => Ok((*kept).clone()),
             ServedSpan::Range(range) => self.range_rows(file, range, deleted).await,
         }
+    }
+
+    /// The view's live rows in the child's order ([`LiveRows`]): a range with
+    /// nothing tombstoned as it is, else the live rows listed, each beside
+    /// its base row id (a range's rid column read), an unlocated run located
+    /// first ([`located_span`](Self::located_span)). What a narrowing of the
+    /// view cuts.
+    pub(crate) async fn live(
+        &self,
+        file: &NativeStoreFile,
+        deleted: Option<&Mask>,
+    ) -> Result<LiveRows> {
+        Ok(match self.located_span(deleted).await? {
+            ServedSpan::Kept(kept) => LiveRows::Kept((*kept).clone()),
+            ServedSpan::Range(range) if deleted.is_none() => LiveRows::Range(range),
+            ServedSpan::Range(range) => {
+                LiveRows::Spanned(self.range_rows(file, range, deleted).await?)
+            }
+        })
     }
 
     /// The child rows `range` with their base row ids (the range's rid

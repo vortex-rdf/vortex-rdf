@@ -292,21 +292,26 @@ impl ServedSpan {
     }
 }
 
-/// A served in-memory view's live rows in its component, as a stream reads
-/// them ([`InMemoryServePlan::live_component_rows`]).
-pub(crate) enum ComponentRows {
-    /// A run of the component with nothing kept or tombstoned.
-    Range(Range<usize>),
-    /// The live rows' positions in the component, in its order.
-    Positions(Buffer<u64>),
+/// A served view's live rows in its index's order, as its plan lists them
+/// ([`InMemoryServePlan::live`], `FileServePlan::live`): what a narrowing of
+/// the view cuts, and what an in-memory stream of it reads a window at a
+/// time.
+pub(crate) enum LiveRows {
+    /// A range with nothing tombstoned: every row of it live, unlisted.
+    Range(Range<u64>),
+    /// A range's live rows under tombstones, listed.
+    Spanned(ServedRows),
+    /// Kept rows, each live.
+    Kept(ServedRows),
 }
 
-impl ComponentRows {
+impl LiveRows {
     /// How many rows.
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         match self {
-            ComponentRows::Range(range) => range.len(),
-            ComponentRows::Positions(positions) => positions.len(),
+            LiveRows::Range(range) => (range.end - range.start) as usize,
+            LiveRows::Spanned(rows) | LiveRows::Kept(rows) => rows.len(),
         }
     }
 }

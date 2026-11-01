@@ -22,8 +22,9 @@ use crate::store::FileBase;
 use crate::store::array::bool_array_to_mask;
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
-use crate::store::indexes::{InMemoryServePlan, LazyRowIds, ServedRows, ServedSpan};
+use crate::store::indexes::{InMemoryServePlan, LazyRowIds, LiveRows, ServedRows, ServedSpan};
 use crate::store::layouts::{PatternCodes, QuadPattern};
+use crate::store::read::chunks::batch_ranges;
 use crate::store::scan::residual::mask_for;
 use crate::store::schema::{QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection, window_rows};
@@ -52,32 +53,13 @@ enum Backend<'a> {
     },
 }
 
-/// A served view's live rows, as a window or partition cuts them.
-enum LiveRows {
-    /// A range with nothing tombstoned: every row of it live, unlisted, its
-    /// ids the run's where its backend holds them (in memory; on file a cut
-    /// reads its own lazily).
-    Range {
-        range: Range<u64>,
-        rids: Option<Buffer<RowId>>,
-    },
-    /// A range's live rows under tombstones, listed.
-    Spanned(ServedRows),
-    /// Kept rows, each live.
-    Kept(ServedRows),
-}
-
 /// What a window or partition (or a keep or chained match) leaves of a
 /// served view's rows: the span its plan covers, beside the row ids the
 /// narrowed view holds, in the index's order.
 enum Cut {
-    /// A range with nothing tombstoned, beside its ids where its backend
-    /// holds them (a slice of the run's in memory; on file read off the
-    /// child on first need).
-    Range {
-        range: Range<u64>,
-        rids: Option<Buffer<RowId>>,
-    },
+    /// A range with nothing tombstoned, its ids its plan's (a slice of the
+    /// run's in memory; on file read off the child on first need).
+    Range(Range<u64>),
     /// Listed live rows: the range a tombstoned range's cut spans, or kept
     /// rows, beside their ids.
     Listed {
@@ -86,27 +68,18 @@ enum Cut {
     },
 }
 
-impl LiveRows {
+impl Cut {
+    /// Rows `piece` (not empty) of the `live` rows, in their order: a part
+    /// of the range; under tombstones the range from the first of the piece's
+    /// live rows to its last (the tombstoned rows inside dropped at read
+    /// through their row ids); or a slice of the kept rows.
     #[inline]
-    fn len(&self) -> usize {
-        match self {
-            LiveRows::Range { range, .. } => (range.end - range.start) as usize,
-            LiveRows::Spanned(rows) | LiveRows::Kept(rows) => rows.len(),
-        }
-    }
-
-    /// Rows `piece` (not empty) of these, in their order: a part of the
-    /// range; under tombstones the range from the first of the piece's live
-    /// rows to its last (the tombstoned rows inside dropped at read through
-    /// their row ids); or a slice of the kept rows.
-    #[inline]
-    fn cut(&self, piece: Range<usize>) -> Cut {
+    fn of(live: &LiveRows, piece: Range<usize>) -> Self {
         debug_assert!(!piece.is_empty());
-        match self {
-            LiveRows::Range { range, rids } => Cut::Range {
-                range: range.start + piece.start as u64..range.start + piece.end as u64,
-                rids: rids.as_ref().map(|rids| rids.slice(piece)),
-            },
+        match live {
+            LiveRows::Range(range) => {
+                Cut::Range(range.start + piece.start as u64..range.start + piece.end as u64)
+            }
             LiveRows::Spanned(rows) => {
                 let rows = rows.slice(piece);
                 let (first, last) = (rows.positions[0], rows.positions[rows.len() - 1]);
@@ -118,9 +91,7 @@ impl LiveRows {
             LiveRows::Kept(rows) => Cut::kept(rows.slice(piece)),
         }
     }
-}
 
-impl Cut {
     /// Kept rows, each live.
     #[inline]
     fn kept(rows: ServedRows) -> Self {
@@ -135,7 +106,7 @@ impl Cut {
     #[inline]
     fn len(&self) -> usize {
         match self {
-            Cut::Range { range, .. } => (range.end - range.start) as usize,
+            Cut::Range(range) => (range.end - range.start) as usize,
             Cut::Listed { rids, .. } => rids.len(),
         }
     }
@@ -194,10 +165,7 @@ impl<'a> Served<'a> {
         let Some((served, plan)) = Self::in_memory(quads) else {
             return Ok(None);
         };
-        let live = match served.live_unlisted() {
-            Some(live) => live,
-            None => LiveRows::Spanned(plan.live_rows(served.deleted())?),
-        };
+        let live = plan.live(served.deleted())?;
         Ok(Some((served, live)))
     }
 
@@ -208,10 +176,7 @@ impl<'a> Served<'a> {
         let Some(served) = Self::file(quads).await? else {
             return Ok(None);
         };
-        let live = match served.live_unlisted() {
-            Some(live) => live,
-            None => LiveRows::Spanned(served.live_rows().await?),
-        };
+        let live = served.live().await?;
         Ok(Some((served, live)))
     }
 
@@ -241,32 +206,14 @@ impl<'a> Served<'a> {
         self.quads.deleted.as_ref()
     }
 
-    /// The view's live rows where known without listing a tombstoned
-    /// range's (`None` for that): the kept rows, or a range with nothing
-    /// tombstoned, its ids not yet read.
-    #[inline]
-    fn live_unlisted(&self) -> Option<LiveRows> {
-        match (&self.span, self.deleted()) {
-            (ServedSpan::Kept(rows), _) => Some(LiveRows::Kept((**rows).clone())),
-            (ServedSpan::Range(range), None) => Some(LiveRows::Range {
-                range: range.clone(),
-                rids: None,
-            }),
-            (ServedSpan::Range(_), Some(_)) => None,
+    /// The view's live rows as its plan lists them ([`LiveRows`]): what its
+    /// windows and partitions cut.
+    #[cfg(feature = "file-io")]
+    async fn live(&self) -> Result<LiveRows> {
+        match &self.backend {
+            Backend::Memory { plan, .. } => plan.live(self.deleted()),
+            Backend::File { base, plan } => plan.live(&base.file, self.deleted()).await,
         }
-    }
-
-    /// `live` with a range's ids where its backend holds them (in memory, a
-    /// slice of the run's), so cutting it many times (into partitions)
-    /// decodes the run's ids once.
-    fn holding_ids(&self, live: LiveRows) -> Result<LiveRows> {
-        Ok(match (live, &self.backend) {
-            (LiveRows::Range { range, rids: None }, Backend::Memory { plan, .. }) => {
-                let rids = Some(plan.range_rids(range.clone())?);
-                LiveRows::Range { range, rids }
-            }
-            (live, _) => live,
-        })
     }
 
     /// The view's live rows listed, each with its base row id: the kept
@@ -353,11 +300,8 @@ impl<'a> Served<'a> {
         cut: Cut,
     ) -> Result<QuadsSource> {
         let (span, rids) = match cut {
-            Cut::Range { range, rids } => {
-                let rids = match rids {
-                    Some(rids) => rids,
-                    None => plan.range_rids(range.clone())?,
-                };
+            Cut::Range(range) => {
+                let rids = plan.range_rids(range.clone())?;
                 (ServedSpan::Range(range), rids)
             }
             Cut::Listed { span, rids } => (span, rids),
@@ -377,7 +321,7 @@ impl<'a> Served<'a> {
     #[cfg(feature = "file-io")]
     fn narrowed_file(&self, base: &FileBase, plan: &FileServePlan, cut: Cut) -> QuadsSource {
         let (span, ids) = match cut {
-            Cut::Range { range, .. } => {
+            Cut::Range(range) => {
                 let ids = plan.range_ids(&base.file, range.clone());
                 (ServedSpan::Range(range), ids)
             }
@@ -448,7 +392,7 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         let base_live = live.len();
         let cut = window_rows(offset, limit, base_live as u64)
-            .map(|rows| live.cut(rows.start as usize..rows.end as usize));
+            .map(|rows| Cut::of(live, rows.start as usize..rows.end as usize));
         let base_taken = cut.as_ref().map_or(0, Cut::len);
         let tail = self.windowed_tail(offset, limit, base_live, base_taken);
         let quads = match cut {
@@ -471,7 +415,7 @@ impl VortexRdfStore {
         let Some((served, live)) = Served::in_memory_live(&self.quads)? else {
             return Ok(None);
         };
-        self.served_partitions_of(&served, live, n)
+        self.served_partitions_of(&served, &live, n)
     }
 
     /// A view a file plan serves cut into served windows, as
@@ -486,7 +430,7 @@ impl VortexRdfStore {
         let Some((served, live)) = Served::file_live(&self.quads).await? else {
             return Ok(None);
         };
-        self.served_partitions_of(&served, live, n)
+        self.served_partitions_of(&served, &live, n)
     }
 
     /// A served view (`served`, its `live` rows) cut into at most `n` served
@@ -498,19 +442,18 @@ impl VortexRdfStore {
     fn served_partitions_of(
         &self,
         served: &Served<'_>,
-        live: LiveRows,
+        live: &LiveRows,
         n: usize,
     ) -> Result<Option<Vec<Self>>> {
         let rows = live.len();
         if rows == 0 {
             return Ok(None);
         }
-        let live = served.holding_ids(live)?;
         let size = rows.div_ceil(n);
         let count = rows.div_ceil(size);
         let mut parts = Vec::with_capacity(count);
-        for (i, start) in (0..rows).step_by(size).enumerate() {
-            let quads = served.narrowed(live.cut(start..(start + size).min(rows)))?;
+        for (i, piece) in batch_ranges(rows, size).enumerate() {
+            let quads = served.narrowed(Cut::of(live, piece))?;
             parts.push(self.derived(quads, self.partition_tail(i + 1 == count)));
         }
         Ok(Some(parts))
