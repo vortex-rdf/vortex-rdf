@@ -96,14 +96,8 @@ impl VortexRdfStore {
     /// the plan reads its own rows ([`FileServePlan::read`]), and a
     /// TypedObject view's chunks are taken from the base; in memory, as
     /// [`memory_read`](Self::memory_read) decides for a chunk read. `None`
-    /// for a view no plan serves (or while a
-    /// [`LegacyChunkPaths`](crate::store::test_hooks::LegacyChunkPaths)
-    /// guard sends every stream down the base-order paths).
+    /// for a view no plan serves.
     pub(super) fn served_read(&self) -> Result<Option<ServedRead<'_>>> {
-        #[cfg(test)]
-        if crate::store::test_hooks::legacy_chunk_paths() {
-            return Ok(None);
-        }
         #[cfg(feature = "file-io")]
         if let Some(base) = self.quads.file() {
             let Some(plan) = &base.serve else {
@@ -148,7 +142,7 @@ impl VortexRdfStore {
         let deleted = self.quads.deleted.as_ref();
         let held = self.quads.selection.held_index_order();
         if plan.decoder().decodes_codes()
-            && (memory.code_access() == CodeAccess::Encoded
+            && (memory.code_access == CodeAccess::Encoded
                 || (shape == ReadShape::Whole && held.is_none()))
         {
             return Ok(Some(MemoryRead::Component { plan, deleted }));

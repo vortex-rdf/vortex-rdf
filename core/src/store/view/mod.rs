@@ -88,7 +88,7 @@ pub(crate) struct MemoryBase {
     /// shared by every view of this base; empty when the base has none.
     pub(crate) zones: Arc<ZoneTable>,
     /// How `base`'s code columns read ([`CodeAccess`]), fixed when the base
-    /// was built; the reads ask `MemoryBase::code_access()`.
+    /// was built.
     pub(crate) code_access: CodeAccess,
     /// The index's plan for reading this view's rows from the index's own
     /// columns ([`InMemoryServePlan`]), in its order. A match keeps it only
@@ -97,19 +97,6 @@ pub(crate) struct MemoryBase {
     /// the rows it kept), the selection staying pending beside it (see
     /// [`ViewSelection`]).
     pub(crate) serve: Option<InMemoryServePlan>,
-}
-
-impl MemoryBase {
-    /// How the base's code columns read, as the base was built, or as
-    /// encoded while a [`NoCodeCache`](crate::store::test_hooks::NoCodeCache)
-    /// guard emulates an encoded base.
-    pub(crate) fn code_access(&self) -> CodeAccess {
-        #[cfg(test)]
-        if crate::store::test_hooks::no_code_cache() {
-            return CodeAccess::Encoded;
-        }
-        self.code_access
-    }
 }
 
 /// A file base: the file handle, the filter a match pushed down to its

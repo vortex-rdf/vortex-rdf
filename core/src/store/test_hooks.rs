@@ -78,66 +78,6 @@ impl<T: Copy + 'static> Drop for Override<T> {
 }
 
 thread_local! {
-    /// Whether this thread's chunk streams take their old paths, while a
-    /// [`LegacyChunkPaths`] guard is live.
-    static LEGACY_CHUNK_PATHS: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-/// Whether a [`LegacyChunkPaths`] guard forced this thread's chunk streams
-/// onto their old paths.
-pub(crate) fn legacy_chunk_paths() -> bool {
-    LEGACY_CHUNK_PATHS.get().unwrap_or(false)
-}
-
-/// While alive, this thread's chunk streams take the paths they took before
-/// the served-run read ([`code_chunks`](VortexRdfStore::code_chunks) off a
-/// served file run) and the masks-first stream (a pending filter read a
-/// split at a time): the base read by id, and the restricted scan. A test
-/// holds the two to the same rows. Dropping it restores what it replaced
-/// ([`Override`]).
-pub(crate) struct LegacyChunkPaths {
-    _guard: Override<bool>,
-}
-
-impl LegacyChunkPaths {
-    /// Force the old paths until the guard drops.
-    pub(crate) fn set() -> Self {
-        Self {
-            _guard: Override::set(&LEGACY_CHUNK_PATHS, true),
-        }
-    }
-}
-
-thread_local! {
-    /// Whether this thread's in-memory reads find no base code column the
-    /// shared cache hands out, while a [`NoCodeCache`] guard is live.
-    static NO_CODE_CACHE: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-/// Whether a [`NoCodeCache`] guard keeps the shared code cache from handing
-/// out this thread's base code columns.
-pub(crate) fn no_code_cache() -> bool {
-    NO_CODE_CACHE.get().unwrap_or(false)
-}
-
-/// While alive, this thread's in-memory reads find no base code column the
-/// shared cache hands out as a primitive, as over a chunked or wire-encoded
-/// base, so they take the paths such a base takes. Dropping it restores
-/// what it replaced ([`Override`]).
-pub(crate) struct NoCodeCache {
-    _guard: Override<bool>,
-}
-
-impl NoCodeCache {
-    /// Withhold the cache's primitives until the guard drops.
-    pub(crate) fn set() -> Self {
-        Self {
-            _guard: Override::set(&NO_CODE_CACHE, true),
-        }
-    }
-}
-
-thread_local! {
     /// The split limit forced on this thread's row scans, while a
     /// [`ForcedLimit`] guard is live.
     static SPLIT_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };

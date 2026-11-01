@@ -7,11 +7,12 @@
 use super::*;
 
 /// Every stream of a served view reads its rows off the index, in its
-/// order, once off the plan, and the one-shot read agrees: `?p2??` over the
-/// run the index locates, in `index:posg`'s (o, s) order; `??o?` and `?po?`,
-/// whose index order is base order, in base order. In memory and on file;
-/// on file also `?p2?g` (the default graph, every row's) over the rows the
-/// plan's filter keeps, in `index:posg`'s order.
+/// order, once off the plan with no read of the base chosen, a row at a
+/// time or many, any columns in any order, and the one-shot read agrees:
+/// `?p2??` over the run the index locates, in `index:posg`'s (o, s) order;
+/// `??o?` and `?po?`, whose index order is base order, in base order. In
+/// memory and on file; on file also `?p2?g` (the default graph, every
+/// row's) over the rows the plan's filter keeps, in `index:posg`'s order.
 #[tokio::test]
 async fn streams_follow_index_order() {
     for (residency, _dir, store) in served_stores().await {
@@ -55,7 +56,7 @@ async fn streams_follow_index_order() {
                 assert_eq!(served_component(&view), Some("index:posg"), "{tag}");
                 assert_ne!(want, base, "{tag}: the orders differ");
             }
-            for batch in [64, 65_536] {
+            for batch in [1, 64, 65_536] {
                 let rec = Recorder::start();
                 assert_eq!(
                     collect_code_chunks(&view, &QuadColumn::ALL, batch).await.0,
@@ -63,12 +64,19 @@ async fn streams_follow_index_order() {
                     "{tag} at {batch}"
                 );
                 assert_eq!(served_streams(&rec), 1, "{tag} at {batch}: off the plan");
+                assert_eq!(
+                    rec.count(&Event::ExactRead),
+                    0,
+                    "{tag} at {batch}: no read of the base chosen"
+                );
             }
-            let objects: Vec<[TermCode; 1]> = want.iter().map(|r| [r[2]]).collect();
+            let objects_subjects: Vec<[TermCode; 2]> = want.iter().map(|r| [r[2], r[0]]).collect();
             assert_eq!(
-                collect_code_chunks(&view, &[QuadColumn::O], 64).await.0,
-                objects,
-                "{tag}: o"
+                collect_code_chunks(&view, &[QuadColumn::O, QuadColumn::S], 64)
+                    .await
+                    .0,
+                objects_subjects,
+                "{tag}: o, s"
             );
             let rec = Recorder::start();
             assert_eq!(
@@ -280,31 +288,6 @@ async fn encoded_memory_streams_read_off_the_component() {
         component_rows(&rec).is_empty(),
         "a built store gathers its base"
     );
-}
-
-/// Over a base whose code columns the shared cache cannot hand out (as a
-/// chunked or wire-encoded one), a served view's code chunks read its rows
-/// and its keeps test the serving component's column at the rows'
-/// positions: both still in the index's order.
-#[tokio::test]
-async fn served_reads_without_the_code_cache() {
-    let (_dir, store) = memory_store(LayoutStrategy::Dictionary).await;
-    let (p, want) = p2_view(&store).await;
-    let sparse = Keep::set(objects_of(&want).into_iter().step_by(3));
-    let filtered: Vec<_> = want
-        .iter()
-        .copied()
-        .filter(|r| sparse.admits(r[2]))
-        .collect();
-    let _uncached = crate::store::test_hooks::NoCodeCache::set();
-    assert_eq!(collect_code_chunks(&p, &QuadColumn::ALL, 64).await.0, want);
-    let kept = p.keep(QuadColumn::O, &sparse).await.unwrap();
-    assert_eq!(served_component(&kept), Some("index:posg"));
-    assert_eq!(
-        collect_code_chunks(&kept, &QuadColumn::ALL, 64).await.0,
-        filtered
-    );
-    assert_eq!(row_list(&kept).await, filtered);
 }
 
 /// What does not depend on order reads a narrowed served view as before:

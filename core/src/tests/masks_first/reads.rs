@@ -10,14 +10,6 @@ use super::*;
 use crate::store::scan::read_plan::MaskedRead;
 use crate::store::test_hooks::ForcedLimit;
 
-/// The masked reads `rec` saw since its last take, in order.
-fn masked_reads(rec: &mut Recorder) -> Vec<MaskedRead> {
-    rec.take_picked(|e| match e {
-        Event::MaskedRead(read) => Some(*read),
-        _ => None,
-    })
-}
-
 /// Each of [`masks_probes`] on `file` against `memory`: a view with a pending
 /// filter whose one-shot code read chooses the probe's masked read once and
 /// answers the rows, in order, of the view's scan (`row_chunks`) and of

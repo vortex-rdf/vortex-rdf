@@ -214,7 +214,7 @@ impl VortexRdfStore {
     ) -> Option<PrimitiveArray> {
         use vortex_array::arrays::Struct;
         let memory = self.quads.in_memory()?;
-        if memory.code_access() == CodeAccess::Encoded {
+        if memory.code_access == CodeAccess::Encoded {
             return None;
         }
         let base = &memory.base;

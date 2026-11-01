@@ -5,8 +5,9 @@
 //! patterns match at three densities, with a tail to append and deletes that
 //! keep each pattern's read, and a file of more splits than a scan keeps in
 //! flight. [`reads`] holds the one-shot reads and the drivers under them,
-//! [`windows`] the windows that keep what the filter found and the streams
-//! over them.
+//! [`streams`] the chunk streams that read a pending filter's masks a split at
+//! a time, and [`windows`] the windows that keep what the filter found and the
+//! streams over them.
 
 use super::*;
 
@@ -222,6 +223,15 @@ async fn read_rows(view: &VortexRdfStore) -> ReadRows {
     }
 }
 
+/// The masked reads `rec` saw since its last take, in order.
+fn masked_reads(rec: &mut Recorder) -> Vec<crate::store::scan::read_plan::MaskedRead> {
+    rec.take_picked(|e| match e {
+        Event::MaskedRead(read) => Some(*read),
+        _ => None,
+    })
+}
+
 mod pieces;
 mod reads;
+mod streams;
 mod windows;

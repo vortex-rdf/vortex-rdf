@@ -99,13 +99,7 @@ impl VortexRdfStore {
         columns: &'a [&'static str],
     ) -> Result<StreamedPlan<'a>> {
         let (scope, read) = self.file_read(base, columns).await?;
-        #[cfg(test)]
-        let legacy = crate::store::test_hooks::legacy_chunk_paths();
-        #[cfg(not(test))]
-        let legacy = false;
-        if let (ExactRead::Masks, Some(filter)) = (&read, scope.filter)
-            && !legacy
-        {
+        if let (ExactRead::Masks, Some(filter)) = (&read, scope.filter) {
             observe!(MasksFirstStream);
             let reads = file_reads::masks_first_split_reads(
                 scope.file,
