@@ -11,13 +11,12 @@ folded into a sink -- the same rule the Rust and JavaScript harnesses apply --
 so what a cell times is producing results, not walking index entries. Each
 library still delivers its own natural result form (Vortex N-Triples strings
 built in Rust, pyoxigraph Quad objects whose `.value` reads build the Python
-strings, rdflib str-subclass terms, pycottas/lightrdf tuples of strings);
+strings, rdflib str-subclass terms, pycottas tuples of strings);
 producing that form for every matched row is exactly the measured work.
 
 On a triple pattern the result widths differ, and that is not normalized away:
 Vortex, pyoxigraph and rdflib all deliver quads (four terms per row), while
-pycottas returns 3-tuples and lightrdf, reading the triples projection, has no
-graph to return.
+pycottas returns 3-tuples.
 
 `count_only` is the COUNT/ASK twin: resolve the same pattern and return only
 how many rows matched, reading nothing else -- each library's cheapest correct
@@ -27,8 +26,8 @@ a term; the others walk their iterators or result lists unread.
 TERM SPELLING. The canonical form throughout the harness is N-Triples
 (`<iri>`, `"literal"`) -- what `datasets.py` writes and what the generated file
 contains. Adapters convert inward through `prepare`, once per pattern and
-outside the timed region: Vortex and lightrdf accept that form directly;
-pyoxigraph, rdflib, and pycottas need parsed term objects.
+outside the timed region: Vortex accepts that form directly; pyoxigraph,
+rdflib and pycottas need parsed term objects.
 """
 
 from __future__ import annotations
@@ -361,56 +360,6 @@ class PycottasAdapter(Adapter):
         return len(handle.search(query))
 
 
-# ─── lightrdf ───────────────────────────────────────────────────────────────
-
-
-class LightrdfAdapter(Adapter):
-    """A streaming pattern-filtered parser, not a store.
-
-    `RDFDocument.search_triples` re-parses the entire source file on every
-    call -- there is no index and no build step, so this adapter is the
-    no-index baseline: what every pattern costs when nothing is precomputed.
-
-    supports_quads is False: `search_triples(s, p, o)` takes no graph argument.
-    mutation_unsupported: there is nothing to mutate. Opening is distinct from
-    building: it wraps the path and parses nothing.
-    """
-
-    slug, label = "lightrdf", "lightrdf"
-    supports_quads = False
-    mutation_unsupported = "a streaming parser, with no store to mutate"
-
-    def artifact_path(self, workdir: str, src: str) -> str:
-        return src  # its "artifact" is the source file itself
-
-    def build(self, src: str, artifact: str) -> Any:
-        # No store to construct. The honest ingest-equivalent is one full parse
-        # of the source, which is what every other adapter's build must also do
-        # before it can index anything.
-        import lightrdf
-
-        doc = lightrdf.RDFDocument(src)
-        for _ in doc.search_triples(None, None, None):
-            pass
-        return doc
-
-    def open(self, artifact: str, src: str) -> Any:
-        import lightrdf
-
-        return lightrdf.RDFDocument(src)
-
-    def count(self, handle: Any, pat: Pat) -> int:
-        acc = rows = 0
-        for s, p, o in handle.search_triples(pat.s, pat.p, pat.o):
-            acc += len(s) + len(p) + len(o)
-            rows += 1
-        consume(acc)
-        return rows
-
-    def count_only(self, handle: Any, pat: Pat) -> int:
-        return sum(1 for _ in handle.search_triples(pat.s, pat.p, pat.o))
-
-
 # ─── rdflib ─────────────────────────────────────────────────────────────────
 
 
@@ -522,7 +471,7 @@ VORTEX_SLUGS = [v.slug for v in VORTEX_VARIANTS]
 
 #: The other libraries' adapters, in dashboard row order, each named by its
 #: class's `slug`.
-LIBRARY_ADAPTERS = (PyoxigraphAdapter, PycottasAdapter, RdflibAdapter, LightrdfAdapter)
+LIBRARY_ADAPTERS = (PyoxigraphAdapter, PycottasAdapter, RdflibAdapter)
 
 
 def build_adapter(slug: str) -> Adapter:

@@ -73,7 +73,6 @@ ADAPTERS: list[tuple[str, str]] = [
     ("jena_tim", "jena"),
     ("jena_tdb2", "jena"),
     ("rdf4j_memory", "rdf4j"),
-    ("rdf4j_native", "rdf4j"),
     ("rdf4j_lmdb", "rdf4j"),
 ]
 MODULE_FOR = dict(ADAPTERS)

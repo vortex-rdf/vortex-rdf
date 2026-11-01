@@ -19,7 +19,6 @@ import org.eclipse.rdf4j.sail.Sail;
 import org.eclipse.rdf4j.sail.lmdb.LmdbStore;
 import org.eclipse.rdf4j.sail.lmdb.config.LmdbStoreConfig;
 import org.eclipse.rdf4j.sail.memory.MemoryStore;
-import org.eclipse.rdf4j.sail.nativerdf.NativeStore;
 import org.vortexrdf.bench.Adapter;
 import org.vortexrdf.bench.Pattern;
 import org.vortexrdf.bench.Quad;
@@ -30,7 +29,7 @@ import org.vortexrdf.bench.Terms;
  * One of RDF4J's stores behind a {@link SailRepository}, read and written through a {@link RepositoryConnection},
  * as an RDF4J program does. A pattern without a graph searches every graph; one with a graph, that graph alone.
  *
- * <p>The two on-disk stores get the triple indexes {@value #TRIPLE_INDEXES}. Their default, spoc and posc, leaves
+ * <p>The on-disk store, LMDB, gets the triple indexes {@value #TRIPLE_INDEXES}. Its default, spoc and posc, leaves
  * an object- or graph-bound pattern a full scan, where every other store here answers it from an index. A bulk
  * load runs in one transaction at isolation level NONE, as RDF4J's documentation advises for loading.
  */
@@ -40,7 +39,7 @@ public final class Rdf4jAdapter implements Adapter<Rdf4jAdapter.Handle, Rdf4jAda
 
 	/** Which RDF4J store. */
 	public enum Store {
-		MEMORY, NATIVE, LMDB
+		MEMORY, LMDB
 	}
 
 	/** An open store: its repository and the connection every call goes through. */
@@ -151,7 +150,6 @@ public final class Rdf4jAdapter implements Adapter<Rdf4jAdapter.Handle, Rdf4jAda
 	private Handle connect(Path location) {
 		Sail sail = switch (store) {
 		case MEMORY -> new MemoryStore();
-		case NATIVE -> new NativeStore(location.toFile(), TRIPLE_INDEXES);
 		case LMDB -> new LmdbStore(location.toFile(), new LmdbStoreConfig(TRIPLE_INDEXES));
 		};
 		SailRepository repo = new SailRepository(sail);

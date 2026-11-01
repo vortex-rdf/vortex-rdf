@@ -69,7 +69,6 @@ VENV_PACKAGES = {
     "pyoxigraph": ["pyoxigraph"],
     "pycottas": ["pycottas"],
     "rdflib": ["rdflib"],
-    "lightrdf": ["lightrdf"],
 }
 
 
@@ -197,8 +196,8 @@ def main() -> int:
     qm = dataset.moduli
     provenance = (
         f"Measured {measured_now()} · Python {py_ver} · {cpu_model()}, {os.cpu_count()} threads · "
-        f"{N_TRIPLES:,} quads over {qm.n_graph} named graphs ({qm.terms:,} terms; "
-        f"lightrdf reads their triples projection), MUT_BATCH={MUT_BATCH:,} · "
+        f"{N_TRIPLES:,} quads over {qm.n_graph} named graphs ({qm.terms:,} terms), "
+        f"MUT_BATCH={MUT_BATCH:,} · "
         f"wall-clock (perf_counter_ns) · {lib_str} · one adapter per process and per virtualenv, isolated"
     )
 

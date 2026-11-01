@@ -1,6 +1,6 @@
 # Java benchmarks
 
-`run.py` measures the Java bindings against [hdt-java](https://github.com/rdfhdt/hdt-java), [qEndpoint](https://github.com/the-qa-company/qEndpoint)'s HDT library (`qendpoint-core`), [Apache Jena](https://jena.apache.org/) (its in-memory dataset and TDB2) and [Eclipse RDF4J](https://rdf4j.org/) (MemoryStore, NativeStore and the LMDB store). The workload is file → store → query, and the results go to `target/bench/java.json` at the repository root for [the dashboard's Java tab](https://vortex-rdf.github.io/vortex-rdf/#java). `scripts/refresh.sh` runs every suite and renders the dashboard; `--only java,render` re-measures this one.
+`run.py` measures the Java bindings against [hdt-java](https://github.com/rdfhdt/hdt-java), [qEndpoint](https://github.com/the-qa-company/qEndpoint)'s HDT library (`qendpoint-core`), [Apache Jena](https://jena.apache.org/) (its in-memory dataset and TDB2) and [Eclipse RDF4J](https://rdf4j.org/) (MemoryStore and the LMDB store). The workload is file → store → query, and the results go to `target/bench/java.json` at the repository root for [the dashboard's Java tab](https://vortex-rdf.github.io/vortex-rdf/#java). `scripts/refresh.sh` runs every suite and renders the dashboard; `--only java,render` re-measures this one.
 
 ```bash
 scripts/refresh.sh --only java              # build what the suite needs, then the full run

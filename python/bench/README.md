@@ -1,6 +1,6 @@
 # Python benchmarks
 
-`run.py` measures the bindings against [pyoxigraph](https://pypi.org/project/pyoxigraph/), [pycottas](https://pypi.org/project/pycottas/), [rdflib](https://pypi.org/project/rdflib/) and [lightrdf](https://pypi.org/project/lightrdf/) on a file → store → query workload and writes `target/bench/python.json` at the repository root for [the dashboard's Python tab](https://vortex-rdf.github.io/vortex-rdf/#py); `test_codspeed.py` is the instrumented suite CodSpeed runs. `scripts/refresh.sh` runs every suite and renders the dashboard (`--only python,render` re-measures this one); it needs GNU coreutils (`sha256sum`, `sort -z`).
+`run.py` measures the bindings against [pyoxigraph](https://pypi.org/project/pyoxigraph/), [pycottas](https://pypi.org/project/pycottas/) and [rdflib](https://pypi.org/project/rdflib/) on a file → store → query workload and writes `target/bench/python.json` at the repository root for [the dashboard's Python tab](https://vortex-rdf.github.io/vortex-rdf/#py); `test_codspeed.py` is the instrumented suite CodSpeed runs. `scripts/refresh.sh` runs every suite and renders the dashboard (`--only python,render` re-measures this one); it needs GNU coreutils (`sha256sum`, `sort -z`).
 
 ```bash
 python3 python/bench/run.py                 # full run, from the repository root
