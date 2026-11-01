@@ -22,12 +22,10 @@ concurrency:
   cancel-in-progress: false
 
 # What every suite reads. BENCH_SIZE puts all four tabs on the same data: the
-# JS hdt adapter opens the .hdt artifact the cross-library suite builds from
-# this dataset, and the internals suites' own default is the much smaller
-# CodSpeed size, where instrumented runs measure instructions and a bigger
-# dataset only multiplies valgrind cost. MUT_BATCH is the comparative suites'
-# add/delete batch; refresh.sh keeps it from the internals suite, which uses
-# its own.
+# internals suites' own default is the much smaller CodSpeed size, where
+# instrumented runs measure instructions and a bigger dataset only multiplies
+# valgrind cost. MUT_BATCH is the comparative suites' add/delete batch;
+# refresh.sh keeps it from the internals suite, which uses its own.
 env:
   BENCH_SIZE: 1048576
   MUT_BATCH: 10000
@@ -88,21 +86,8 @@ jobs:
           name: results-rust
           path: results-rust.tar
 
-      # The .hdt artifact the cross-library suite built from this run's
-      # dataset, which the JavaScript suite's hdt adapter opens: its wasm
-      # bindings cannot build one.
-      - name: Upload the HDT artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: hdt-data
-          path: target/bench_compare/hdt/data.hdt
-          retention-days: 1
-
   js:
     name: JavaScript suite
-    # For the .hdt artifact the rust job uploads; the other suites start at
-    # once.
-    needs: rust
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -139,15 +124,14 @@ jobs:
           path: js/bench/hdt-pkg
           key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
 
-      # Without the file (the hdt adapter failed in the cross-library suite),
-      # the suite records the hdt adapter as failed and measures the rest, as
-      # it does within one refresh.sh run.
-      - name: Download the HDT artifact
-        uses: actions/download-artifact@v8
-        continue-on-error: true
+      # The hdt crate's CLI, which builds the hdt adapter's HDT file (see
+      # hdt_artifact in refresh.sh, which pins its version): a cargo install
+      # costs about a minute, and a restored one is skipped.
+      - name: Cache the hdt CLI
+        uses: actions/cache@v6
         with:
-          name: hdt-data
-          path: target/bench_compare/hdt
+          path: target/hdt-cli
+          key: hdt-cli-${{ hashFiles('scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
 
       - name: Run the JavaScript suite
         run: scripts/refresh.sh --only js

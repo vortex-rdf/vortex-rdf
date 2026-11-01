@@ -1445,7 +1445,7 @@ function renderJs(){
   // Ingest — every adapter, fastest first
   renderMatrixPanel(document.getElementById("js-ingest-panels"), {
     title:"Build and open",
-    note:"<b>hdt has no Build cell</b>: HDT wasm bindings are read-only. Its artifact is built <em>natively</em> by the Rust tab's comparative bench from this same dataset, and this adapter only opens it — checking the triple count matches. <b>Open</b> here is adopting an already-built store's bytes — <b>rdf-stores and oxigraph</b> cannot hand theirs out as bytes, so there is nothing to adopt and a fresh process just builds again. <span class=\"best-key\">Green</span> = fastest per column.",
+    note:"<b>hdt has no Build cell</b>: HDT wasm bindings are read-only. Its artifact is built <em>natively</em>, by the hdt crate's own converter, from this same dataset, and this adapter only opens it — checking the triple count matches. <b>Open</b> here is adopting an already-built store's bytes — <b>rdf-stores and oxigraph</b> cannot hand theirs out as bytes, so there is nothing to adopt and a fresh process just builds again. <span class=\"best-key\">Green</span> = fastest per column.",
     rowHeaders:["Store"], columns:["Build","Open"], sortByColumn:0,
     rows: JS_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
   }, jsById);

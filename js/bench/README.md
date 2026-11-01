@@ -54,7 +54,7 @@ The dataset knobs, `BENCH_SUBJ_RATIO` through `BENCH_LITERAL_FRAC`, are read by 
 | `BENCH_OUT` | `target/bench/js.json` | where the run's JSON is written; a relative path resolves against `bench/` |
 | `CONSUME_BUDGET_MS` | 120000 | a consume loop past this budget throws and lands in the run's `failures` as a failed cell |
 | `WORKER_TIMEOUT_MS` | 1800000 | hard kill for a worker stalled inside a single wasm call |
-| `HDT_FILE` | `target/bench_compare/hdt/data.hdt` | the natively built HDT artifact the hdt adapter opens |
+| `HDT_FILE` | `target/bench_js/data.hdt` | the natively built HDT artifact the hdt adapter opens; `scripts/refresh.sh --only js` builds it |
 
 Each adapter process peaks at several GB at the default scale — check available memory before running, because a swapping run produces numbers that look like regressions.
 

@@ -11,7 +11,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # The same version the Rust comparative bench uses (bench-compare/Cargo.toml),
-# so the two tabs' hdt rows measure the same implementation.
+# so the two tabs' hdt rows measure the same implementation, and the version of
+# the CLI that builds the file this reads (HDT_CLI_VERSION in scripts/refresh.sh).
 hdt = "0.7"
 wasm-bindgen = "0.2"
 # Transitive dependency of hdt; on wasm32 it must be told its randomness source
