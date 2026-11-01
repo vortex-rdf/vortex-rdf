@@ -6,9 +6,29 @@ They are a thin layer over the Rust core, for any JVM program that wants to quer
 
 Requires Java 11 or later. The API is `org.vortexrdf.VortexStore`, with `TermDictionary` for term codes and `QuadIterator` and `CodeChunks` for streaming a match; every class is documented in its Javadoc.
 
+## Install
+
+From 0.14.0 the bindings are on Maven Central as `io.github.vortex-rdf:vortex-rdf` (the Java package stays `org.vortexrdf`). With Maven:
+
+```xml
+<dependency>
+  <groupId>io.github.vortex-rdf</groupId>
+  <artifactId>vortex-rdf</artifactId>
+  <version>0.14.0</version>
+</dependency>
+```
+
+With Gradle:
+
+```kotlin
+implementation("io.github.vortex-rdf:vortex-rdf:0.14.0")
+```
+
+The jar carries the native library for Linux on x86_64 and arm64 (glibc 2.28 or later), macOS on Intel and Apple Silicon, and Windows on x64, and loads the one for its platform with nothing to set. [Build](#build) says how the JVM finds the library, how to point it at another, and the flag Java 24 and later want.
+
 ## Build
 
-The artifact is not published yet. From a checkout of this repository:
+To build the bindings from a checkout of this repository:
 
 ```bash
 cargo build --release -p vortex-rdf-java        # target/release/libvortex_rdf_jni.so (.dylib on macOS, vortex_rdf_jni.dll on Windows)
@@ -25,7 +45,7 @@ java -Dvortexrdf.library=/path/to/libvortex_rdf_jni.so -cp vortex-rdf-X.Y.Z.jar:
 
 The jar's copy is unpacked into a private directory under `java.io.tmpdir`, which must allow executing files: where it is mounted `noexec`, set `-Djava.io.tmpdir` to a directory that does, or point `vortexrdf.library` at the library. The directory is removed when the JVM exits; on Windows the DLL stays until the next JVM to start removes it, and a JVM killed before it exits leaves its directory behind.
 
-On Java 24 and later, loading a native library is a restricted operation. Add `--enable-native-access=ALL-UNNAMED`, or name the module that holds the jar, so the JVM does not print a warning.
+On Java 24 and later, loading a native library is a restricted operation. Add `--enable-native-access=ALL-UNNAMED` on the class path, or `--enable-native-access=org.vortexrdf` (the jar's module name) on the module path, so the JVM does not print a warning.
 
 ## Quick start
 

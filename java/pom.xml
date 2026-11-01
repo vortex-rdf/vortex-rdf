@@ -4,7 +4,8 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <groupId>org.vortexrdf</groupId>
+  <!-- The project's Maven Central namespace; the Java package is org.vortexrdf. -->
+  <groupId>io.github.vortex-rdf</groupId>
   <artifactId>vortex-rdf</artifactId>
   <!-- The workspace version (Cargo.toml): the jar and the native library it loads are released together. -->
   <version>0.13.1</version>
@@ -19,6 +20,18 @@
       <url>https://opensource.org/licenses/MIT</url>
     </license>
   </licenses>
+  <developers>
+    <developer>
+      <id>vortex-rdf</id>
+      <name>The Vortex-RDF authors</name>
+      <url>https://github.com/vortex-rdf</url>
+    </developer>
+  </developers>
+  <scm>
+    <url>https://github.com/vortex-rdf/vortex-rdf</url>
+    <connection>scm:git:https://github.com/vortex-rdf/vortex-rdf.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/vortex-rdf/vortex-rdf.git</developerConnection>
+  </scm>
 
   <properties>
     <maven.compiler.release>11</maven.compiler.release>
@@ -52,6 +65,19 @@
           <compilerArgs>
             <arg>-Xlint:all</arg>
           </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.5.1</version>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <!-- A stable module name on the module path, the one Java 24's native-access flag names. -->
+              <Automatic-Module-Name>org.vortexrdf</Automatic-Module-Name>
+            </manifestEntries>
+          </archive>
         </configuration>
       </plugin>
       <plugin>
@@ -133,6 +159,125 @@
       <properties>
         <argLine>--enable-native-access=ALL-UNNAMED</argLine>
       </properties>
+    </profile>
+    <!-- The release build (.github/workflows/release.yml): the jar carries the native library of each platform,
+         staged under target/natives/org/vortexrdf/native/<platform>/ (all five, or the build stops), beside sources and
+         javadoc jars; every file is signed with the key in MAVEN_GPG_KEY (passphrase MAVEN_GPG_PASSPHRASE), and
+         `deploy` uploads to Maven Central with the credentials of server `central` and publishes. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <version>3.7.0</version>
+            <executions>
+              <execution>
+                <id>natives-staged</id>
+                <phase>validate</phase>
+                <goals>
+                  <goal>enforce</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <requireFilesExist>
+                      <files>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/linux-x86_64/libvortex_rdf_jni.so</file>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/linux-aarch64/libvortex_rdf_jni.so</file>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/macos-x86_64/libvortex_rdf_jni.dylib</file>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/macos-aarch64/libvortex_rdf_jni.dylib</file>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/windows-x86_64/vortex_rdf_jni.dll</file>
+                      </files>
+                      <message>The release jar carries every platform's native library: stage them under target/natives/org/vortexrdf/native/</message>
+                    </requireFilesExist>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.6.2</version>
+            <executions>
+              <execution>
+                <id>natives</id>
+                <phase>generate-resources</phase>
+                <goals>
+                  <goal>add-resource</goal>
+                </goals>
+                <configuration>
+                  <resources>
+                    <resource>
+                      <directory>${project.build.directory}/natives</directory>
+                    </resource>
+                  </resources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.4.0</version>
+            <configuration>
+              <!-- The resources are the native libraries: the sources jar holds the Java sources only. -->
+              <excludeResources>true</excludeResources>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.12.0</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.8</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <!-- Bouncy Castle: no gpg binary; the key and passphrase come from the environment. -->
+                  <signer>bc</signer>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.12.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
     </profile>
   </profiles>
 </project>

@@ -26,7 +26,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 | CLI | `cargo install vortex-rdf-cli` | |
 | JavaScript | `npm install @vortex-rdf/vortex-rdf-store` | [js/README.md](js/README.md) |
 | Python | `pip install vortex-rdf` | [python/README.md](python/README.md); [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) builds an rdflib integration on it |
-| Java | build from source (not published yet) | [java/README.md](java/README.md); a JNI library and the `org.vortexrdf` API, for any JVM program |
+| Java | `io.github.vortex-rdf:vortex-rdf` on Maven Central, from 0.14.0 (before it, build from source) | [java/README.md](java/README.md); a JNI library and the `org.vortexrdf` API, for any JVM program |
 
 ## Quick start
 
@@ -128,7 +128,7 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 }
 ```
 
-**Java**:
+**Java** (`io.github.vortex-rdf:vortex-rdf` on Maven Central from 0.14.0; see [java/README.md](java/README.md#install)):
 
 ```java
 import java.nio.file.Paths;
