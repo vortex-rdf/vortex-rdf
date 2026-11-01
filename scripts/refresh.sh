@@ -18,6 +18,8 @@
 # Measurement stages run strictly sequentially on purpose: parallel stages
 # contend for CPU and memory and contaminate each other's timings — the
 # process-per-adapter isolation inside each suite exists for the same reason.
+# The dashboard workflow runs them at once instead, each on a runner of its
+# own, and renders their outputs in a job of its own.
 #
 # The wasm, Python and Java bindings, and the CLI the Java suite builds its
 # Vortex stores with, are rebuilt only when their stamp no longer matches (see
@@ -117,6 +119,10 @@ if has rust; then
   # The internals suite keeps its own clamped mutate batch, not MUT_BATCH.
   env -u MUT_BATCH cargo bench --bench benchmark | tee "$OUT/rust.txt"
   env -u MUT_BATCH cargo bench --bench match_lazy | tee -a "$OUT/rust.txt"
+  # The host the suite ran on, which the tab's provenance line names: the page
+  # may be rendered on another one (see render_bench_dashboard.py's
+  # parse_machine).
+  PYTHONPATH=scripts python3 -c 'import render_bench_dashboard as r; print(r.machine_line())' >> "$OUT/rust.txt"
 fi
 
 if has compare; then

@@ -7,9 +7,10 @@ Usage (`scripts/refresh.sh` runs the suites, then this over their outputs):
         [--python target/bench/python.json] [--java target/bench/java.json]
 
 The first argument is the log of `cargo bench --bench benchmark` and
-`--bench match_lazy`, whose `#dataset` line gives the run's dataset; the
-other four suites write dashboard-shaped JSON (see `load_suite`), and a
-suite left out renders as its tab's placeholder.
+`--bench match_lazy`, whose `#dataset` line gives the run's dataset and whose
+`#machine` line, which refresh.sh appends, the host it ran on; the other four
+suites write dashboard-shaped JSON (see `load_suite`), and a suite left out
+renders as its tab's placeholder.
 
 Divan (via codspeed-divan-compat) has no machine-readable output mode, so this
 parses its tree-table text output directly. The tree-drawing glyph (U+2502,
@@ -199,6 +200,31 @@ def cpu_model():
     return "unknown CPU"
 
 
+def machine():
+    """This host, as the Rust tab's provenance line names it."""
+    return {"cpu": cpu_model(), "threads": os.cpu_count()}
+
+
+def machine_line():
+    """The `#machine {...}` line scripts/refresh.sh appends to the Rust log
+    once the internals have run: the host that measured them. The page can be
+    rendered on another (the dashboard workflow renders in a job of its own),
+    so it names the host the log records rather than its own."""
+    return "#machine " + json.dumps(machine())
+
+
+def parse_machine(text):
+    """The host the log's `#machine` line records, or this one for a log
+    without the line (a bare `cargo bench` run, rendered where it ran)."""
+    for line in reversed(text.splitlines()):
+        if line.startswith("#machine "):
+            try:
+                return json.loads(line[len("#machine "):])
+            except json.JSONDecodeError:
+                print(f"note: unparseable machine line: {line!r}", file=sys.stderr)
+    return machine()
+
+
 def measured_at(source=None):
     """The dashboard's shared "Measured …" stamp: UTC, to the minute.
 
@@ -234,10 +260,11 @@ def sample_counts(results):
     return [c for c, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
-def build_provenance(results, timer_precision, quads, source):
+def build_provenance(results, timer_precision, quads, source, host):
     """The Rust tab's provenance line. Divan's text output carries no config,
-    so the run's repetition counts are read off its rows and its size off its
-    `#dataset` stamp: `quads` is the row count the binary generated."""
+    so the run's repetition counts are read off its rows, its size off its
+    `#dataset` stamp (`quads` is the row count the binary generated) and its
+    host off its `#machine` line (`host`, see `parse_machine`)."""
     commit = os.environ.get("GITHUB_SHA", git("rev-parse", "HEAD"))[:7]
     branch = os.environ.get("GITHUB_REF_NAME", git("rev-parse", "--abbrev-ref", "HEAD", default="unknown"))
     samples = sample_counts(results)
@@ -247,7 +274,7 @@ def build_provenance(results, timer_precision, quads, source):
     precision = f", {timer_precision} precision" if timer_precision else ""
 
     return (
-        f"Measured {measured_at(source)} · commit {commit} ({branch}) · {cpu_model()}, {os.cpu_count()} threads · "
+        f"Measured {measured_at(source)} · commit {commit} ({branch}) · {host['cpu']}, {host['threads']} threads · "
         f"BENCH_SIZE = {quads:,} quads · {samples_str} · "
         f"codspeed-divan-compat, wall-clock (os) timer{precision}"
     )
@@ -404,7 +431,8 @@ def main():
     # The template's placeholders, each filled with its value as JSON.
     values = {
         "__BENCH_DATA__": results,
-        "__PROVENANCE__": build_provenance(results, timer_precision, quads, args.rust_log),
+        "__PROVENANCE__": build_provenance(results, timer_precision, quads, args.rust_log,
+                                           parse_machine(bench_text)),
         "__RUST_CONFIG_DATA__": {"benchSize": quads, "dataset": dataset},
         "__RUST_COMPARE_DATA__": compare["results"],
         "__RUST_COMPARE_SIZES__": compare["sizes"],
