@@ -91,12 +91,13 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
         ),
     );
     for (view_tag, view) in &views {
-        let rows = sorted_rows(view).await;
+        // A keep filters its view's rows in the order the view reads them.
+        let rows = row_list(view).await;
         for column in QuadColumn::ALL {
             for keep in keeps_for(store, column).await {
                 let narrowed = view.keep(column, &keep).await.unwrap();
                 let want = brute_keep(&rows, column, &keep);
-                let got = sorted_rows(&narrowed).await;
+                let got = row_list(&narrowed).await;
                 assert_eq!(got, want, "{tag}/{view_tag}: keep {column:?} {keep:?}");
                 assert_eq!(
                     narrowed.size().await.unwrap(),
@@ -117,8 +118,11 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
                     .await
                     .unwrap()
                     .unwrap();
-                let want_chained: Vec<[TermCode; 4]> =
+                // The later match reads in its own order (its index's, where
+                // one serves it), so its rows compare as a multiset.
+                let mut want_chained: Vec<[TermCode; 4]> =
                     want.iter().copied().filter(|r| r[1] == p1_code).collect();
+                want_chained.sort_unstable();
                 assert_eq!(
                     sorted_rows(&chained).await,
                     want_chained,
@@ -144,7 +148,7 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
             &keeps[1].1,
         );
         assert_eq!(
-            sorted_rows(&narrowed).await,
+            row_list(&narrowed).await,
             want,
             "{tag}/{view_tag}: keep_many"
         );
@@ -177,6 +181,7 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
     for ((view_tag, view), (_, plain)) in views.iter().zip(&plain_views) {
         let rows = row_list(plain).await;
         let base_rows = base_ordered_codes(view).await;
+        let served = served_component(plain).is_some();
         let n = rows.len();
         let quads = plain.quads_vec().await.unwrap();
         for (offset, limit) in [
@@ -192,23 +197,18 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
             (1, n),
         ] {
             let windowed = view.window(offset, limit).await.unwrap();
-            let cuts = !(offset == 0 && limit >= n);
             let slice = |rows: &[[TermCode; 4]]| -> Vec<[TermCode; 4]> {
                 rows.iter().copied().skip(offset).take(limit).collect()
             };
-            let stays_served = served_component(&windowed).is_some();
-            let want = if stays_served || !cuts {
-                slice(&rows)
-            } else {
-                slice(&base_rows)
-            };
-            if served_component(plain).is_some() && !want.is_empty() {
-                assert!(
-                    stays_served,
-                    "{tag}/{view_tag}: window({offset}, {limit}) of a served view"
+            let want = slice(&rows);
+            if !want.is_empty() {
+                assert_eq!(
+                    served_component(&windowed).is_some(),
+                    served,
+                    "{tag}/{view_tag}: window({offset}, {limit}) is served as its view is"
                 );
             }
-            let read = if stays_served {
+            if served {
                 let in_order: Vec<Quad> = quads.iter().skip(offset).take(limit).cloned().collect();
                 assert_eq!(
                     windowed.quads_vec().await.unwrap(),
@@ -216,13 +216,10 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
                     "{tag}/{view_tag}: window({offset}, {limit}): the plain quads, in order"
                 );
                 index_ordered += usize::from(want != slice(&base_rows));
-                want.clone()
-            } else {
-                want.clone()
-            };
+            }
             assert_eq!(
                 row_list(&windowed).await,
-                read,
+                want,
                 "{tag}/{view_tag}: window({offset}, {limit})"
             );
             assert_eq!(
@@ -236,16 +233,17 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
                 "{tag}/{view_tag}: size_capped({})",
                 offset + limit
             );
-            // Windows compose: a window of a window re-bases on the first,
-            // and one that drops the plan reads the first's rows in base
-            // order.
+            // Windows compose: a window of a window re-bases on the first, and
+            // is served as the first is.
             let inner = windowed.window(1, 2).await.unwrap();
-            let outer = if served_component(&inner).is_some() {
-                want.clone()
-            } else {
-                base_ordered_codes(&windowed).await
-            };
-            let want_inner: Vec<[TermCode; 4]> = outer.iter().copied().skip(1).take(2).collect();
+            let want_inner: Vec<[TermCode; 4]> = want.iter().copied().skip(1).take(2).collect();
+            if !want_inner.is_empty() {
+                assert_eq!(
+                    served_component(&inner).is_some(),
+                    served,
+                    "{tag}/{view_tag}: nested window served as its view is"
+                );
+            }
             assert_eq!(
                 row_list(&inner).await,
                 want_inner,

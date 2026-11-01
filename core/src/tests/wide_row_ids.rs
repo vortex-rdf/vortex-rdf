@@ -71,7 +71,7 @@ async fn partition_strings(view: &VortexRdfStore, n: usize) -> (Vec<String>, boo
     );
     let mut rows = Vec::new();
     for part in &parts {
-        rows.extend(part.quads_vec().await.unwrap().iter().map(Quad::to_string));
+        rows.extend(read_strings(part).await);
     }
     let served = parts.iter().all(|part| served_component(part).is_some());
     (rows, served)
@@ -83,15 +83,19 @@ async fn partition_strings(view: &VortexRdfStore, n: usize) -> (Vec<String>, boo
 /// sorted strings `rows` (the subjects are unique).
 async fn narrowing_order(view: &VortexRdfStore, rows: &[String], served: bool) -> Vec<String> {
     match served {
-        true => view
-            .quads_vec()
-            .await
-            .unwrap()
-            .iter()
-            .map(Quad::to_string)
-            .collect(),
+        true => read_strings(view).await,
         false => rows.to_vec(),
     }
+}
+
+/// The quads of `view` as strings, in the order its `quads_vec` reads them.
+async fn read_strings(view: &VortexRdfStore) -> Vec<String> {
+    view.quads_vec()
+        .await
+        .unwrap()
+        .iter()
+        .map(Quad::to_string)
+        .collect()
 }
 
 /// Every row-id-reading surface of `store`, which holds [`dataset`] and was
@@ -140,11 +144,12 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         ("both", &both, both_rows.clone()),
         ("chained", &chained, both_rows.clone()),
     ] {
-        let (parts, served) = partition_strings(view, 4).await;
-        let stats = view.view_statistics().unwrap();
-        if stats.served_component.is_some() && !stats.file_backed {
-            assert!(served, "{label}: partitions of the {tag} match are served");
-        }
+        let (parts, parts_served) = partition_strings(view, 4).await;
+        let served = served_component(view).is_some();
+        assert_eq!(
+            parts_served, served,
+            "{label}: partitions of the {tag} match are served as it is"
+        );
         assert_eq!(
             parts,
             narrowing_order(view, &rows, served).await,
@@ -168,20 +173,24 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         vec![300, 129, 10, 9],
         "{label}: counts"
     );
-    // A window is a slice of the match in its order ([`narrowing_order`]).
+    // A window is a slice of the match in its order ([`narrowing_order`]),
+    // served as the match is.
+    let p_served = served_component(&by_p).is_some();
+    let p_order = narrowing_order(&by_p, &p_rows, p_served).await;
     for (offset, limit) in [(0, 5), (7, 20), (100, 180), (250, 10), (295, 10), (0, 300)] {
         let window = store
             .run_probe(&probe_p.clone().window(offset, Some(limit)))
             .await
             .unwrap();
-        let served = served_component(&window).is_some();
-        let p_order = narrowing_order(&by_p, &p_rows, served).await;
-        let end = (offset + limit).min(p_rows.len());
-        let mut want = p_order[offset..end].to_vec();
-        want.sort();
         assert_eq!(
-            view_strings(&window).await,
-            want,
+            served_component(&window).is_some(),
+            p_served,
+            "{label}: window ({offset}, {limit}) served as its match is"
+        );
+        let end = (offset + limit).min(p_rows.len());
+        assert_eq!(
+            read_strings(&window).await,
+            p_order[offset..end],
             "{label}: window ({offset}, {limit})"
         );
     }
@@ -204,10 +213,15 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         "{label}: by predicate after deletes"
     );
     let live_rows = rows_where(quads, |i| i % 3 == 1 && live(i));
-    let (parts, served) = partition_strings(&by_p, 4).await;
+    let (parts, parts_served) = partition_strings(&by_p, 4).await;
+    let p_served = served_component(&by_p).is_some();
     assert_eq!(
-        parts,
-        narrowing_order(&by_p, &live_rows, served).await,
+        parts_served, p_served,
+        "{label}: partitions after deletes served as the match is"
+    );
+    let live_order = narrowing_order(&by_p, &live_rows, p_served).await;
+    assert_eq!(
+        parts, live_order,
         "{label}: partitions of the predicate match after deletes"
     );
     let by_o = matched_view(&deleted, None, None, Some(&o2), None).await;
@@ -228,13 +242,14 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .run_probe(&probe_p.clone().window(0, Some(3)))
         .await
         .unwrap();
-    let served = served_component(&window).is_some();
-    let live_order = narrowing_order(&by_p, &live_rows, served).await;
-    let mut want = live_order[..3].to_vec();
-    want.sort();
     assert_eq!(
-        view_strings(&window).await,
-        want,
+        served_component(&window).is_some(),
+        p_served,
+        "{label}: window after deletes served as the match is"
+    );
+    assert_eq!(
+        read_strings(&window).await,
+        live_order[..3],
         "{label}: window after deletes"
     );
 }

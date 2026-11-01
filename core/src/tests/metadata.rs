@@ -569,13 +569,12 @@ const PAST_THE_ROWS: usize = 100_000;
 const PAST_THE_ROWS_VIEW_ROWS: usize = 256;
 
 /// Partitions tile `view`: at each of [`PARTITION_COUNTS`], and at
-/// [`PAST_THE_ROWS`] on a small view, at most that many and never none, read
-/// in turn they give the view's codes in the order its reads yield them
-/// ([`read_order_codes`]) when they are served (an in-memory served view's
-/// always are), else in base order, and their sizes add up to its size.
+/// [`PAST_THE_ROWS`] on a small view, at most that many and never none, served
+/// as the view is when it has rows, read in turn they give the view's codes
+/// in the order its reads yield them ([`read_order_codes`]), and their sizes
+/// add up to its size.
 async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
-    let stats = view.view_statistics().unwrap();
-    let (file, served) = (stats.file_backed, stats.served_component.is_some());
+    let served = served_component(view).is_some();
     let in_order = read_order_codes(view).await;
     let base = base_ordered_codes(view).await;
     let past_the_rows = (base.len() <= PAST_THE_ROWS_VIEW_ROWS).then_some(PAST_THE_ROWS);
@@ -589,14 +588,14 @@ async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
             "{tag}: {n} -> {}",
             parts.len()
         );
-        let parts_served = parts.iter().all(|part| served_component(part).is_some());
-        if served && !file {
-            assert!(
-                parts_served,
-                "{tag}: partitions({n}) of an in-memory served view"
+        if !base.is_empty() {
+            let parts_served = parts.iter().all(|part| served_component(part).is_some());
+            assert_eq!(
+                parts_served, served,
+                "{tag}: partitions({n}) served as the view is"
             );
         }
-        let expected = if parts_served { &in_order } else { &base };
+        let expected = &in_order;
         let mut got = Vec::new();
         let mut total = 0;
         for part in &parts {
