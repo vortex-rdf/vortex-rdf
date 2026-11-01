@@ -32,35 +32,9 @@ class ChunkedTransferTest {
 		VortexStoreTest.loadOracle();
 	}
 
-	/** The oracle's rows matching a pattern, tab-joined, in the oracle's order. */
-	static List<String> inOracleOrder(String[] pattern) {
-		return VortexStoreTest.quads.stream().filter(q -> {
-			for (int i = 0; i < 4; i++) {
-				if (pattern[i] != null && !pattern[i].equals(q[i])) {
-					return false;
-				}
-			}
-			return true;
-		}).map(VortexStoreTest::key).collect(Collectors.toList());
-	}
-
 	/** Rows tab-joined, in their order. */
 	static List<String> joined(List<String[]> rows) {
 		return rows.stream().map(VortexStoreTest::key).collect(Collectors.toList());
-	}
-
-	@ParameterizedTest
-	@ValueSource(strings = { "dictionary", "default", "typed" })
-	void quadsComeInOracleOrderOnUnindexedStores(String name) {
-		for (boolean inMemory : new boolean[] { false, true }) {
-			try (VortexStore store = VortexStoreTest.open(name, inMemory)) {
-				for (String[] p : VortexStoreTest.patterns()) {
-					String tag = name + " inMemory=" + inMemory + " " + Arrays.toString(p);
-					List<String> want = inOracleOrder(p);
-					assertEquals(want, joined(store.quads(p[0], p[1], p[2], p[3])), tag);
-				}
-			}
-		}
 	}
 
 	@ParameterizedTest
@@ -86,7 +60,7 @@ class ChunkedTransferTest {
 			// Every term over 16 bytes (most of them) crosses on its own.
 			List<String> large = joined(store.quads(null, null, null, null, Payload.CHUNK_ROWS, 64, 16));
 			assertEquals(whole, large, name);
-			assertEquals(new TreeSet<>(inOracleOrder(new String[4])), new TreeSet<>(large), name);
+			assertEquals(new TreeSet<>(VortexStoreTest.inOracleOrder(new String[4])), new TreeSet<>(large), name);
 			// The hard spellings: escapes, and characters outside ASCII and outside the BMP.
 			int hard = 0;
 			for (String[] q : VortexStoreTest.quads) {

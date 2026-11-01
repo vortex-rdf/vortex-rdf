@@ -51,7 +51,7 @@ class IteratorTest {
 	 */
 	private static List<String> readOrder(VortexStore store, String name, String[] p, String tag) {
 		List<String> want = ChunkedTransferTest.joined(store.quads(p[0], p[1], p[2], p[3]));
-		List<String> oracle = ChunkedTransferTest.inOracleOrder(p);
+		List<String> oracle = VortexStoreTest.inOracleOrder(p);
 		assertEquals(new TreeSet<>(oracle), new TreeSet<>(want), tag + ": the oracle's rows");
 		assertEquals(oracle.size(), want.size(), tag + ": each row once");
 		if (!name.equals("copy")) {
@@ -131,7 +131,7 @@ class IteratorTest {
 			assertEquals(0, Native.openHandles());
 			List<String> all = store.iterateQuads(null, null, null, null).stream().map(VortexStoreTest::key)
 					.collect(Collectors.toList());
-			assertEquals(ChunkedTransferTest.inOracleOrder(new String[4]), all);
+			assertEquals(VortexStoreTest.inOracleOrder(new String[4]), all);
 			assertEquals(0, Native.openHandles(), "a drained iterator frees its stream");
 		}
 	}

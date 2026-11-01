@@ -66,19 +66,21 @@ class VortexStoreTest {
 		return rows.stream().map(VortexStoreTest::key).collect(Collectors.toCollection(TreeSet::new));
 	}
 
-	/** The oracle's quads matching a pattern, by scan. */
-	static Set<String> scan(String[] pattern) {
-		Set<String> out = new TreeSet<>();
-		for (String[] q : quads) {
-			boolean all = true;
+	/** The oracle's rows matching a pattern, tab-joined, in the oracle's order. */
+	static List<String> inOracleOrder(String[] pattern) {
+		return quads.stream().filter(q -> {
 			for (int i = 0; i < 4; i++) {
-				all &= pattern[i] == null || pattern[i].equals(q[i]);
+				if (pattern[i] != null && !pattern[i].equals(q[i])) {
+					return false;
+				}
 			}
-			if (all) {
-				out.add(key(q));
-			}
-		}
-		return out;
+			return true;
+		}).map(VortexStoreTest::key).collect(Collectors.toList());
+	}
+
+	/** The oracle's quads matching a pattern, as a set. */
+	static Set<String> scan(String[] pattern) {
+		return new TreeSet<>(inOracleOrder(pattern));
 	}
 
 	/** One pattern per way an argument arrives: all free, each position bound, all four, "", an absent term. */

@@ -1,17 +1,15 @@
-//! The native term and code streams against the stores' one-shot reads and a naive scan of the quads they
-//! were built from: the scan's rows in the one-shot read's order (base order, but a pattern the copy index
-//! serves in its order) on every build, chunk size and payload limit, the empty stream of a pattern no quad can
-//! match, the errors a caller can cause, and a stream that outlives its store's handle.
+//! The native term and code streams against the stores' one-shot reads (which tests/engine.rs holds to a naive
+//! scan of the quads the stores were built from, in base order but a pattern the copy index serves in its order),
+//! row for row, on every build, chunk size and payload limit; the empty stream of a pattern no quad can match, the
+//! errors a caller can cause, and a stream that outlives its store's handle.
 
 mod common;
 
-use std::collections::BTreeSet;
-
 use common::{
-    Built, JAVA_LIMITS, Quad, as_refs, builds, drain, patterns, quads as make_quads,
-    reference_quads, scan, write,
+    JAVA_LIMITS, Quad, as_refs, builds, drain, patterns, quads as make_quads, reference_quads,
+    scan, write,
 };
-use vortex_rdf_core::{CodePattern, IndexType, LayoutStrategy};
+use vortex_rdf_core::{CodePattern, LayoutStrategy};
 use vortex_rdf_jni::engine::Store;
 use vortex_rdf_jni::payload::{Limits, ROW_BYTES};
 use vortex_rdf_jni::streams::{CodeStream, TermStream};
@@ -44,34 +42,6 @@ fn drain_codes(mut stream: CodeStream, rows: usize) -> Vec<[u64; 4]> {
     codes
 }
 
-/// The rows a stream of `pattern` must send, in order: the one-shot read's, whose rows are the scan's, in base
-/// order (the scan's set is sorted as the base is: `(s, p, o, g)`) on a build without the copy index.
-fn stream_want(
-    path: &str,
-    built: &Built,
-    in_memory: bool,
-    quads: &[Quad],
-    r: [Option<&str>; 4],
-) -> Vec<Quad> {
-    let want = reference_quads(path, in_memory, r);
-    let scanned = scan(quads, &r);
-    assert_eq!(
-        want.iter().cloned().collect::<BTreeSet<_>>(),
-        scanned,
-        "{} {r:?}: the rows",
-        built.name
-    );
-    if !built.indexes.contains(&IndexType::SecondaryByCopy) {
-        assert_eq!(
-            want,
-            scanned.into_iter().collect::<Vec<_>>(),
-            "{} {r:?}: base order",
-            built.name
-        );
-    }
-    want
-}
-
 #[test]
 fn term_streams_yield_the_match_in_read_order() {
     let quads = quads();
@@ -82,7 +52,7 @@ fn term_streams_yield_the_match_in_read_order() {
             let store = Store::open(&path, in_memory).unwrap();
             for pattern in patterns(&quads) {
                 let r = as_refs(&pattern);
-                let want = stream_want(&path, &built, in_memory, &quads, r);
+                let want = reference_quads(&path, in_memory, r);
                 for batch_rows in [1, 7, 65_536] {
                     // One row a chunk is a pull per row: small matches hold the case.
                     if batch_rows == 1 && want.len() > 64 {
@@ -118,7 +88,7 @@ fn code_streams_yield_the_match_in_read_order() {
             let terms = store.term_count().unwrap();
             for pattern in patterns(&quads) {
                 let r = as_refs(&pattern);
-                let want = stream_want(&path, &built, in_memory, &quads, r);
+                let want = reference_quads(&path, in_memory, r);
                 // An absent term: a code past the dictionary.
                 let code = |i: usize| r[i].map(|t| store.encode(t).unwrap().unwrap_or(terms + 7));
                 let code_pattern = CodePattern::new(code(0), code(1), code(2), code(3));

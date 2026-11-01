@@ -9,7 +9,7 @@ use common::{
     Built, JAVA_LIMITS, Quad, as_refs, builds, drain, patterns, quads as make_quads,
     reference_quads, scan, term, write,
 };
-use vortex_rdf_core::{CodePattern, LayoutStrategy};
+use vortex_rdf_core::{CodePattern, IndexType, LayoutStrategy};
 use vortex_rdf_jni::engine::Store;
 use vortex_rdf_jni::payload::{Limits, ROW_BYTES};
 
@@ -42,26 +42,20 @@ fn term_patterns_match_a_scan_on_every_layout() {
                 let r = as_refs(&pattern);
                 let want = scan(&quads, &r);
                 let tag = format!("{tag} {pattern:?}");
+                // Its rows: the reference's, row for row (below), which are the scan's.
                 assert_eq!(
                     store.count(r[0], r[1], r[2], r[3]).unwrap(),
                     want.len() as u64,
                     "{tag}: count"
                 );
-                let (stream, _) = store.quads(r[0], r[1], r[2], r[3], JAVA_LIMITS).unwrap();
-                let all = drain(stream, JAVA_LIMITS);
-                assert_eq!(
-                    all.iter().cloned().collect::<BTreeSet<_>>(),
-                    want,
-                    "{tag}: quads"
-                );
-                assert_eq!(all.len(), want.len(), "{tag}: no duplicate rows");
             }
         }
     }
 }
 
 /// The per-term read the tests compare the packed transfer against is itself right: on every build, both
-/// residencies and every pattern it gives the scan's rows, once each.
+/// residencies and every pattern it gives the scan's rows, once each, in base order (the scan's set is sorted as
+/// the base is, `(s, p, o, g)`) on a build without the copy index, which reads a pattern it serves in its order.
 #[test]
 fn reference_reads_the_scan_on_every_build() {
     let quads = quads();
@@ -82,7 +76,15 @@ fn reference_reads_the_scan_on_every_build() {
                 let tag = format!("{} in_memory={in_memory} {pattern:?}", built.name);
                 let rows = reference_quads(&path, in_memory, r);
                 assert_eq!(rows.len(), want.len(), "{tag}: no duplicate rows");
-                assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), want, "{tag}");
+                if built.indexes.contains(&IndexType::SecondaryByCopy) {
+                    assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), want, "{tag}");
+                } else {
+                    assert_eq!(
+                        rows,
+                        want.into_iter().collect::<Vec<_>>(),
+                        "{tag}: base order"
+                    );
+                }
             }
         }
     }

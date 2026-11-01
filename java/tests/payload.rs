@@ -6,7 +6,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{JAVA_LIMITS, Quad, builds, payload_rows, quads, term, write};
+use common::{JAVA_LIMITS, Quad, builds, payload_rows, quads, reference_quads, term, write};
 use vortex_rdf_core::{DictReader, LayoutStrategy, Probe, SharedQuad, TermCode, VortexRdfStore};
 use vortex_rdf_jni::payload::{Limits, Pace, Payload, encode_codes, encode_lookup, encode_shared};
 
@@ -18,9 +18,17 @@ fn block_on<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+/// A fixture store, opened, beside where and how, for [`reference_quads`].
+struct Opened {
+    tag: String,
+    store: VortexRdfStore,
+    path: String,
+    in_memory: bool,
+}
+
 /// The stores of the fixture builds with `layout`, written into `dir`, each opened in place and loaded whole:
 /// a file-backed dictionary visits codes in code order, a resident one in the order given.
-fn stores(dir: &Path, layout: LayoutStrategy) -> Vec<(String, VortexRdfStore)> {
+fn stores(dir: &Path, layout: LayoutStrategy) -> Vec<Opened> {
     let quads = quads(400);
     let mut out = Vec::new();
     for built in builds().into_iter().filter(|b| b.layout == layout) {
@@ -34,7 +42,12 @@ fn stores(dir: &Path, layout: LayoutStrategy) -> Vec<(String, VortexRdfStore)> {
                 }
             })
             .unwrap();
-            out.push((format!("{} in_memory={in_memory}", built.name), store));
+            out.push(Opened {
+                tag: format!("{} in_memory={in_memory}", built.name),
+                store,
+                path: path.clone(),
+                in_memory,
+            });
         }
     }
     out
@@ -53,17 +66,6 @@ async fn columns(store: &VortexRdfStore, pattern: [Option<&str>; 4]) -> [Vec<Ter
         .unwrap()
         .expect("a code view");
     columns.map(|column| column.to_vec())
-}
-
-/// The rows of the columns, each code decoded alone.
-async fn decoded(dict: &DictReader, columns: &[Vec<TermCode>; 4]) -> Vec<Quad> {
-    let mut spelled = Vec::new();
-    for column in columns {
-        spelled.push(dict.decode_many(column).await.unwrap());
-    }
-    (0..columns[0].len())
-        .map(|row| std::array::from_fn(|c| spelled[c][row].clone().expect("a stored code")))
-        .collect()
 }
 
 /// Every payload `encode_codes` cuts the columns into, each with the rows it holds, checked against the
@@ -99,12 +101,19 @@ fn spelled(payloads: &[(Payload, usize)]) -> Vec<Quad> {
 fn codes_round_trip_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let stores = stores(dir.path(), LayoutStrategy::Dictionary);
-    for (tag, store) in &stores {
+    for Opened {
+        tag,
+        store,
+        path,
+        in_memory,
+    } in &stores
+    {
+        let want = reference_quads(path, *in_memory, [None; 4]);
         block_on(async {
             let dict = store.dict_reader().unwrap();
             let columns = columns(store, [None; 4]).await;
             let payloads = drain_codes(&dict, &columns, JAVA_LIMITS).await;
-            assert_eq!(spelled(&payloads), decoded(&dict, &columns).await, "{tag}");
+            assert_eq!(spelled(&payloads), want, "{tag}");
         });
     }
 }
@@ -114,7 +123,7 @@ fn repeats_share_a_slot() {
     let quads = quads(400);
     let dir = tempfile::tempdir().unwrap();
     let stores = stores(dir.path(), LayoutStrategy::Dictionary);
-    for (tag, store) in &stores {
+    for Opened { tag, store, .. } in &stores {
         block_on(async {
             let dict = store.dict_reader().unwrap();
             let columns = columns(store, [None, Some(quads[0][1].as_str()), None, None]).await;
@@ -134,11 +143,17 @@ fn repeats_share_a_slot() {
 fn limits_cut_chunks() {
     let dir = tempfile::tempdir().unwrap();
     let stores = stores(dir.path(), LayoutStrategy::Dictionary);
-    for (tag, store) in &stores {
+    for Opened {
+        tag,
+        store,
+        path,
+        in_memory,
+    } in &stores
+    {
+        let want = reference_quads(path, *in_memory, [None; 4]);
         block_on(async {
             let dict = store.dict_reader().unwrap();
             let columns = columns(store, [None; 4]).await;
-            let want = decoded(&dict, &columns).await;
 
             let rows = Limits::new(7, 1 << 20, 1 << 18).unwrap();
             let payloads = drain_codes(&dict, &columns, rows).await;
@@ -174,11 +189,17 @@ fn huge_terms_take_the_large_list() {
     let dir = tempfile::tempdir().unwrap();
     let stores = stores(dir.path(), LayoutStrategy::Dictionary);
     let limits = Limits::new(65_536, 64, 16).unwrap();
-    for (tag, store) in &stores {
+    for Opened {
+        tag,
+        store,
+        path,
+        in_memory,
+    } in &stores
+    {
+        let want = reference_quads(path, *in_memory, [None; 4]);
         block_on(async {
             let dict = store.dict_reader().unwrap();
             let columns = columns(store, [None; 4]).await;
-            let want = decoded(&dict, &columns).await;
             let payloads = drain_codes(&dict, &columns, limits).await;
             assert_eq!(spelled(&payloads), want, "{tag}");
             for (payload, _) in &payloads {
@@ -226,7 +247,7 @@ fn shared_rows_round_trip() {
     let mut all = stores(dir.path(), LayoutStrategy::Default);
     all.extend(stores(dir.path(), LayoutStrategy::TypedObject));
     assert_eq!(all.len(), 4);
-    for (tag, store) in &all {
+    for Opened { tag, store, .. } in &all {
         let rows = block_on(async {
             let view = store
                 .run_probe(&Probe::parse(None, None, None, None).unwrap())
@@ -280,7 +301,7 @@ fn shared_rows_round_trip() {
 fn lookup_maps_misses_to_null() {
     let dir = tempfile::tempdir().unwrap();
     let stores = stores(dir.path(), LayoutStrategy::Dictionary);
-    for (tag, store) in &stores {
+    for Opened { tag, store, .. } in &stores {
         block_on(async {
             let dict = store.dict_reader().unwrap();
             let c0 = dict
@@ -327,8 +348,22 @@ fn lookup_maps_misses_to_null() {
 fn a_code_outside_the_dictionary_fails_a_row_read() {
     let dir = tempfile::tempdir().unwrap();
     let stores = stores(dir.path(), LayoutStrategy::Dictionary);
-    for (tag, store) in &stores {
+    // A budget a long row passes alone, by its subject, predicate and object: a chunk is cut after it.
+    let tight = Limits::new(65_536, 64, 16).unwrap();
+    for Opened {
+        tag,
+        store,
+        path,
+        in_memory,
+    } in &stores
+    {
+        let long = reference_quads(path, *in_memory, [None; 4])
+            .iter()
+            .position(|q| q[..3].iter().map(String::len).sum::<usize>() > 64)
+            .expect("a long row");
         block_on(async {
+            let all = columns(store, [None; 4]).await;
+            let row: [TermCode; 4] = std::array::from_fn(|c| all[c][long]);
             let dict = store.dict_reader().unwrap();
             let bad = dict.len() as u64 + 5;
             let columns: [&[TermCode]; 4] = [&[0, 1], &[2, 2], &[3, bad], &[0, 0]];
@@ -337,6 +372,29 @@ fn a_code_outside_the_dictionary_fails_a_row_read() {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("outside the dictionary"), "{tag}: {error}");
+            // The two rows `first` and `second`, the long row but for the graph `bad` takes in the one marked.
+            let rows = |bad_first: bool| -> [Vec<TermCode>; 4] {
+                std::array::from_fn(|c| {
+                    let graph = |marked: bool| if c == 3 && marked { bad } else { row[c] };
+                    vec![graph(bad_first), graph(!bad_first)]
+                })
+            };
+            // Past the cut, the miss is the next chunk's: this one holds the long row.
+            let past = rows(false);
+            let (_, held) = encode_codes(&dict, past.each_ref().map(Vec::as_slice), tight)
+                .await
+                .unwrap();
+            assert_eq!(held, 1, "{tag}: the long row alone");
+            // In the row the chunk holds, it fails the chunk.
+            let within = rows(true);
+            let error = encode_codes(&dict, within.each_ref().map(Vec::as_slice), tight)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("outside the dictionary"),
+                "{tag}: cut: {error}"
+            );
         });
     }
 }
