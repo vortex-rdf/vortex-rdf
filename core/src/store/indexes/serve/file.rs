@@ -360,10 +360,11 @@ impl FileServePlan {
             .range_columns(file, range.clone(), &[COL_RID])
             .await?
             .remove(0);
-        let live = child_rows(range.clone(), &rids).filter(|&(_, rid)| is_live(deleted, rid));
+        let len = (range.end - range.start) as usize;
         Ok(ServedRows::collect(
-            live,
-            (range.end - range.start) as usize,
+            child_rows(range, &rids),
+            len,
+            |(position, rid)| is_live(deleted, rid).then_some((position, rid)),
         ))
     }
 
@@ -383,24 +384,18 @@ impl FileServePlan {
             ServedSpan::Kept(kept) => {
                 let read = self.columns_at(file, &[column], &kept.positions).await?;
                 let codes = extract_codes(read, &[column])?.remove(0);
-                let admitted = kept
-                    .positions_and_rids()
-                    .zip(codes.iter())
-                    .filter_map(|(row, &code)| admits(code).then_some(row));
-                ServedRows::collect(admitted, kept.len())
+                let rows = kept.positions_and_rids().zip(codes.iter());
+                ServedRows::collect(rows, kept.len(), |(row, &code)| admits(code).then_some(row))
             }
             ServedSpan::Range(range) => {
                 let mut columns = self
                     .range_columns(file, range.clone(), &[column, COL_RID])
                     .await?;
                 let (rids, codes) = (columns.remove(1), columns.remove(0));
-                let admitted =
-                    child_rows(range, &rids)
-                        .zip(codes.iter())
-                        .filter_map(|(row, &code)| {
-                            (admits(code) && is_live(deleted, row.1)).then_some(row)
-                        });
-                ServedRows::collect(admitted, codes.len())
+                let rows = child_rows(range, &rids).zip(codes.iter());
+                ServedRows::collect(rows, codes.len(), |(row, &code)| {
+                    (admits(code) && is_live(deleted, row.1)).then_some(row)
+                })
             }
         })
     }

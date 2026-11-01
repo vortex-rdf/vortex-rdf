@@ -133,26 +133,23 @@ impl InMemoryServePlan {
     ) -> Result<ServedRows> {
         Ok(match &self.span {
             // Kept rows are live: only `admit` tests them.
-            ServedSpan::Kept(kept) => ServedRows::collect(
-                kept.positions_and_rids()
-                    .filter(|&(position, rid)| admit(position, rid)),
-                kept.len(),
-            ),
+            ServedSpan::Kept(kept) => {
+                ServedRows::collect(kept.positions_and_rids(), kept.len(), |(position, rid)| {
+                    admit(position, rid).then_some((position, rid))
+                })
+            }
             ServedSpan::Range(range) => {
                 let run = self.run_rids()?;
                 let rows = range.clone().zip(run[self.slots(range)].iter().copied());
                 let len = (range.end - range.start) as usize;
                 match deleted {
-                    None => ServedRows::collect(
-                        rows.filter(|&(position, rid)| admit(position, rid)),
-                        len,
-                    ),
-                    Some(deleted) => ServedRows::collect(
-                        rows.filter(|&(position, rid)| {
-                            !deleted.value(rid as usize) && admit(position, rid)
-                        }),
-                        len,
-                    ),
+                    None => ServedRows::collect(rows, len, |(position, rid)| {
+                        admit(position, rid).then_some((position, rid))
+                    }),
+                    Some(deleted) => ServedRows::collect(rows, len, |(position, rid)| {
+                        (!deleted.value(rid as usize) && admit(position, rid))
+                            .then_some((position, rid))
+                    }),
                 }
             }
         })

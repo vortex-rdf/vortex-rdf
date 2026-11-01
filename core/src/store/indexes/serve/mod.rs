@@ -219,20 +219,28 @@ impl ServedRows {
             .zip(self.rids.iter().copied())
     }
 
-    /// The kept `rows` (positions beside base row ids, in order), out of at
-    /// most `capacity` offered: every narrowing that filters rows (a keep, a
-    /// chained match, the tombstones of a range) collects what its filter
-    /// leaves here. Each row is pushed once to buffers reserved for every
-    /// row offered: two allocations, which a doubling buffer would spend on
-    /// its growth. Keeping fewer than a quarter of them gives the rest back
-    /// (two more): the buffers live as long as the narrowed view and every
-    /// window of it.
-    pub(crate) fn collect(rows: impl Iterator<Item = (u64, RowId)>, capacity: usize) -> Self {
+    /// The rows `keep` keeps of `rows` (at most `capacity` offered), in
+    /// order: `keep` takes each row offered, with whatever its caller zipped
+    /// beside it, and returns the position and base row id of a row it keeps.
+    /// Every narrowing that filters rows (a keep, a chained match, the
+    /// tombstones of a range) builds its rows here, in one loop that inlines
+    /// `keep`. Each kept row is pushed once to buffers reserved for every row
+    /// offered: two allocations, which a doubling buffer would spend on its
+    /// growth. Keeping fewer than a quarter of them gives the rest back (two
+    /// more): the buffers live as long as the narrowed view and every window
+    /// of it.
+    pub(crate) fn collect<T>(
+        rows: impl IntoIterator<Item = T>,
+        capacity: usize,
+        mut keep: impl FnMut(T) -> Option<(u64, RowId)>,
+    ) -> Self {
         let (mut positions, mut rids) =
             (Vec::with_capacity(capacity), Vec::with_capacity(capacity));
-        for (position, rid) in rows {
-            positions.push(position);
-            rids.push(rid);
+        for row in rows {
+            if let Some((position, rid)) = keep(row) {
+                positions.push(position);
+                rids.push(rid);
+            }
         }
         if positions.len() < capacity / 4 {
             positions.shrink_to_fit();
@@ -259,10 +267,9 @@ impl ServedRows {
         let Some(deleted) = deleted else {
             return self.clone();
         };
-        let live = self
-            .positions_and_rids()
-            .filter(|&(_, rid)| !deleted.value(rid as usize));
-        Self::collect(live, self.len())
+        Self::collect(self.positions_and_rids(), self.len(), |(position, rid)| {
+            (!deleted.value(rid as usize)).then_some((position, rid))
+        })
     }
 }
 
@@ -334,14 +341,15 @@ mod tests {
     #[test]
     fn sparse_keeps_hold_only_their_rows() {
         let rows = || (0..10_000u64).map(|position| (position, position as RowId));
-        let sparse = ServedRows::collect(
-            rows().filter(|&(position, _)| position % 1_000 == 0),
-            10_000,
-        );
+        let sparse = ServedRows::collect(rows(), 10_000, |(position, rid)| {
+            (position % 1_000 == 0).then_some((position, rid))
+        });
         assert_eq!(sparse.len(), 10);
         assert!(capacity(sparse.positions) < 10_000 / 4, "positions");
         assert!(capacity(sparse.rids) < 10_000 / 4, "row ids");
-        let dense = ServedRows::collect(rows().filter(|&(position, _)| position % 2 == 0), 10_000);
+        let dense = ServedRows::collect(rows(), 10_000, |(position, rid)| {
+            (position % 2 == 0).then_some((position, rid))
+        });
         assert_eq!(dense.len(), 5_000);
         assert_eq!(dense.positions.as_slice()[..3], [0, 2, 4]);
     }

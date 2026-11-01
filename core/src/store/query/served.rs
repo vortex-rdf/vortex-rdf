@@ -523,11 +523,11 @@ impl VortexRdfStore {
         let names: Vec<&'static str> = eqs.iter().map(|(name, _)| *name).collect();
         let read = served.columns_at(&names, &rows.positions).await?;
         let holding = bool_array_to_mask(mask_for(&read, &eqs)?)?;
-        let holding = rows
-            .positions_and_rids()
-            .zip(0..)
-            .filter_map(|(row, i)| holding.value(i).then_some(row));
-        let kept = ServedRows::collect(holding, rows.len());
+        let kept = ServedRows::collect(
+            rows.positions_and_rids().zip(0..),
+            rows.len(),
+            |(row, i)| holding.value(i).then_some(row),
+        );
         if kept.len() == 0 {
             return Ok(self.empty_view());
         }
