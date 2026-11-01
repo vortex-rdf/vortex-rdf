@@ -532,6 +532,9 @@
       values that cross the boundary on read, while the pure-JS stores hold eager objects —
       reading them all makes materialization part of the measured work and puts forward the wasm boundary cost.
       <strong>Count-only</strong> is the the same pattern resolved, and only how many rows matched — no value read at all.
+      A <span class="mono">timeout</span> cell is a phase the store can run, but not within the suite's
+      time budget at this size, so it is not attempted: oxigraph's full scan, which runs past the
+      120 s consume budget.
     </p>
     <div class="panel-grid" id="js-query-panels"></div>
   </section>
@@ -871,8 +874,8 @@ const rustById = new Map(RUST_DATA.map(d => [d.id, d]));
 const jsById = new Map(JS_DATA.map(d => [byKey(d), d]));
   // A phase the harness attempted and the store could not survive is a result,
   // not a gap: render it as its own labelled cell, with the error as the
-  // tooltip. Without this, oxigraph trapping on the materialized full scan
-  // would look like a benchmark nobody ran.
+  // tooltip. Without this, a store trapping mid-phase would look like a
+  // benchmark nobody ran.
   for (const f of JS_FAILURES ?? []){
     const id = `${f.slug}::${f.phase}`;
     if (!jsById.has(id))
@@ -1012,9 +1015,11 @@ function renderMatrixPanel(container, cfg, map){
         // the library has no API for, an artifact it never writes, or one it
         // has nothing to reopen. It is already out of `best` (the ?? Infinity
         // above); printing a ratio against the winner would imply it lost a
-        // race it never entered. Every such cell reads "unsupported" and
-        // carries its own reason as the tooltip: one word for every absence,
-        // so a reader never has to work out which kind of blank this is.
+        // race it never entered. Every such cell reads one word, its row's own
+        // ("unsupported"; "failed" for a phase the store could not survive;
+        // "timeout" for one it cannot finish within the suite's time budget),
+        // and carries its reason as the tooltip, so a reader never has to work
+        // out which kind of blank this is.
         if (rec.unsupported || rec.median_ns == null) {
           const why = (rec.reason || "not supported by this library").replace(/"/g, "&quot;");
           return `<td class="num unsup${sep}" title="${why}">${rec.median ?? "unsupported"}</td>`;
