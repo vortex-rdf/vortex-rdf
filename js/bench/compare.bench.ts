@@ -36,8 +36,8 @@ import { dirname, resolve } from 'node:path';
 
 import {
     ADAPTERS, MUT_ADAPTERS, N_TRIPLES, GRAPHS, MUT_BATCH,
-    QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, timeoutRow, unsupportedRow,
-    type Row, type StoreAdapter, type WorkerOutput,
+    QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, unsupportedRow,
+    type Row, type WorkerOutput,
 } from './shared.js';
 import { runWorkerProcess } from './util.js';
 
@@ -68,13 +68,6 @@ type Role = 'query' | 'querycold' | 'fullscan' | 'mutate';
  *  the page as failures, not as benchmarks nobody ran. */
 function runWorker(slug: string, role: Role): WorkerOutput | null {
     return runWorkerProcess<WorkerOutput>(workerPath, [slug, role], `${slug}/${role}`);
-}
-
-/** Why `a`'s full scan is not run at this run's size, when it is known to time
- *  out here (see `fullScanTimeout`). */
-function fullScanTimeout(a: StoreAdapter): string | undefined {
-    const t = a.fullScanTimeout;
-    return t && N_TRIPLES >= t.fromRows ? t.reason : undefined;
 }
 
 async function main(): Promise<void> {
@@ -162,18 +155,8 @@ async function main(): Promise<void> {
     // The full scan gets its own process per adapter, for the same reason each
     // adapter gets one: it is heavy enough that a store's retained memory makes
     // it order-dependent, so sharing a process with the query and ingest phases
-    // measures the residue of those on top of the scan. See runFullScan. A
-    // store whose scan is known to time out at this size is not run: its
-    // cells, materialized and count-only, read "timeout".
-    runRole(ADAPTERS.filter((a) => !fullScanTimeout(a)), 'fullscan', (a, out) => mergeMatched(a.label, out));
-    for (const a of ADAPTERS) {
-        const reason = fullScanTimeout(a);
-        if (!reason) continue;
-        console.log(`[${a.label}] full scan: timeout (${reason})`);
-        for (const id of [`${a.slug}::full`, `${a.slug}::full::count`]) {
-            results.push({ ...timeoutRow(id, reason), regime: 'warm' });
-        }
-    }
+    // measures the residue of those on top of the scan. See runFullScan.
+    runRole(ADAPTERS, 'fullscan', (a, out) => mergeMatched(a.label, out));
 
     runRole(MUT_ADAPTERS, 'mutate', (a, out) => {
         memory.push({ slug: a.slug, label: a.label, role: 'mutate', peakRssMb: out.peakRssMb });

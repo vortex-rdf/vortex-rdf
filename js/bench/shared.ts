@@ -87,12 +87,6 @@ export interface StoreAdapter<H = unknown> {
     ingestUnsupported?: string;
     quadsUnsupported?: string;
     mutationUnsupported?: string;
-    // A phase a store can run, but not within the suite's time budget: from
-    // `fromRows` rows up, its materialized full scan is known to run past the
-    // consume budget (CONSUME_BUDGET_MS). The suite does not attempt it there,
-    // which would only spend the budget to fail again; its cells read
-    // `timeout`, with `reason` as their tooltip.
-    fullScanTimeout?: { fromRows: number; reason: string };
     // Both Vortex and oxigraph are wasm-bindgen: `.free()` deterministically drops
     // the WASM-side allocation. The generated FinalizationRegistry is a fallback
     // only — V8 has no visibility into WASM linear-memory pressure, so it can defer
@@ -198,13 +192,6 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
         // No count API: match() materializes its result array either way, so
         // walking its length is this store's floor for a count.
         countOnly: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
-        // Measured on the dashboard's runner at its 2^20 rows: the scan read
-        // 917,504 quads in 132 s before the 120 s budget stopped it.
-        fullScanTimeout: {
-            fromRows: 1_048_576,
-            reason: 'not run: at this size the full scan runs past the 120 s consume budget '
-                + '(the last attempt read 917,504 of 1,048,576 quads in 132 s)',
-        },
         // oxigraph's shipped `.d.ts` does not declare the wasm-bindgen `free()`.
         dispose: (h) => (h as unknown as { free(): void }).free(),
     };
@@ -350,8 +337,8 @@ export interface Row {
     regime?: 'cold' | 'warm';
     /** An operation this store cannot perform, as opposed to a slow one. */
     unsupported?: boolean;
-    /** A phase this store can run, but not within the suite's time budget at
-     *  this size, so it was not attempted (see `fullScanTimeout`). */
+    /** A cell whose one probing run took longer than the suite's time limit,
+     *  so it was not measured (see TIMEOUT_MS in compare.worker.ts). */
     timeout?: boolean;
     /** Why, shown as the cell's tooltip. */
     reason?: string;
@@ -409,8 +396,8 @@ export function unsupportedRow(id: string, reason: string): Row {
     return { ...unmeasuredRow(id, 'unsupported', reason), unsupported: true };
 }
 
-/** A row the dashboard renders as 'timeout': a phase the store can run, but
- *  not within the suite's time budget at this size. */
+/** A row the dashboard renders as 'timeout': a cell whose one probing run
+ *  took longer than the suite's time limit. */
 export function timeoutRow(id: string, reason: string): Row {
     return { ...unmeasuredRow(id, 'timeout', reason), timeout: true };
 }
