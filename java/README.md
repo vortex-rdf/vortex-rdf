@@ -17,11 +17,13 @@ cd java && mvn package -DskipTests              # target/vortex-rdf-X.Y.Z.jar, X
 
 The tests are skipped here because they read fixture stores built separately (see [Development](#development)).
 
-The JVM finds the native library, in this order, at the path in the system property `vortexrdf.library`, at the path in the environment variable `VORTEX_RDF_JNI_LIB`, or under the name `vortex_rdf_jni` on `java.library.path`:
+The JVM finds the native library, in this order: at the path in the system property `vortexrdf.library`; at the path in the environment variable `VORTEX_RDF_JNI_LIB`; as the copy the jar carries for its platform; or under the name `vortex_rdf_jni` on `java.library.path`. A blank property or variable counts as unset. A jar built from a checkout as above carries no library, so it takes one of the other three:
 
 ```bash
 java -Dvortexrdf.library=/path/to/libvortex_rdf_jni.so -cp vortex-rdf-X.Y.Z.jar:. MyApp
 ```
+
+The jar's copy is unpacked into a private directory under `java.io.tmpdir`, which must allow executing files: where it is mounted `noexec`, set `-Djava.io.tmpdir` to a directory that does, or point `vortexrdf.library` at the library. The directory is removed when the JVM exits; on Windows the DLL stays until the next JVM to start removes it, and a JVM killed before it exits leaves its directory behind.
 
 On Java 24 and later, loading a native library is a restricted operation. Add `--enable-native-access=ALL-UNNAMED`, or name the module that holds the jar, so the JVM does not print a warning.
 
