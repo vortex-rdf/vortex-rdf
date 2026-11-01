@@ -95,11 +95,10 @@ impl InMemoryServePlan {
         &self.decode
     }
 
-    /// The rows of the component the view covers: the run, or what a
-    /// narrowing left of it.
-    #[inline]
-    pub(crate) fn span(&self) -> ServedSpan {
-        self.span.clone()
+    /// How many rows of the component the view covers: the run's, or what a
+    /// narrowing left of it, tombstoned rows in a range included.
+    pub(crate) fn span_len(&self) -> usize {
+        self.span.len()
     }
 
     /// Whether a narrowing (a window, keep, partition or chained match) left
@@ -155,27 +154,58 @@ impl InMemoryServePlan {
         })
     }
 
-    /// The component's `columns` at its rows `positions`, in that order, as
-    /// one struct array: what a filter of the view's rows compares (a pattern
-    /// chained on the view), the other columns never read.
-    pub(crate) fn columns_at(
+    /// The view's live rows where `holds` holds, in the component's order:
+    /// what a pattern chained on the view keeps. `holds` tests the
+    /// component's `columns` over every row the view covers (a slice of a
+    /// range, its tombstoned rows among them, or one take at the kept rows'
+    /// positions), the other columns never read; the rows are then kept in
+    /// one pass, as [`kept_rows`](Self::kept_rows) keeps them.
+    pub(crate) fn rows_where(
         &self,
+        deleted: Option<&Mask>,
         columns: &[&'static str],
-        positions: &Buffer<u64>,
-    ) -> Result<ArrayRef> {
+        holds: impl FnOnce(&ArrayRef) -> Result<Mask>,
+    ) -> Result<ServedRows> {
         let rows = into_struct_array(self.array.clone())?;
-        let indices = PrimitiveArray::new(positions.clone(), Validity::NonNullable).into_array();
+        let kept = match &self.span {
+            ServedSpan::Kept(kept) => Some(
+                PrimitiveArray::new(kept.positions.clone(), Validity::NonNullable).into_array(),
+            ),
+            ServedSpan::Range(_) => None,
+        };
         let fields = columns
             .iter()
-            .map(|name| Ok(rows.unmasked_field_by_name(name)?.take(indices.clone())?))
+            .map(|name| {
+                let column = rows.unmasked_field_by_name(name)?;
+                Ok(match (&self.span, &kept) {
+                    (ServedSpan::Range(range), _) => {
+                        column.slice(range.start as usize..range.end as usize)?
+                    }
+                    (_, Some(positions)) => column.take(positions.clone())?,
+                    (ServedSpan::Kept(_), None) => unreachable!("kept rows take their positions"),
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
-        Ok(StructArray::try_new(
+        let read = StructArray::try_new(
             FieldNames::from(columns),
             fields,
-            positions.len(),
+            self.span.len(),
             Validity::NonNullable,
-        )?
-        .into_array())
+        )?;
+        let holding = holds(&read.into_array())?;
+        Ok(match &self.span {
+            ServedSpan::Kept(kept) => ServedRows::collect(
+                kept.positions_and_rids().zip(0..),
+                kept.len(),
+                |(row, i)| holding.value(i).then_some(row),
+            ),
+            ServedSpan::Range(range) => {
+                let start = range.start;
+                self.kept_rows(deleted, |position, _| {
+                    holding.value((position - start) as usize)
+                })?
+            }
+        })
     }
 
     /// The serving component's `name` column through its cached probe, which
@@ -216,16 +246,6 @@ impl InMemoryServePlan {
                 .filter(|&rid| !deleted.value(rid as usize))
                 .collect(),
         })
-    }
-
-    /// The view's live rows in the component's order: each one's position in
-    /// the component beside its base row id, the `deleted` tombstones left
-    /// out (kept rows are live).
-    pub(crate) fn live_rows(&self, deleted: Option<&Mask>) -> Result<ServedRows> {
-        match &self.span {
-            ServedSpan::Kept(kept) => Ok((**kept).clone()),
-            ServedSpan::Range(_) => self.kept_rows(deleted, |_, _| true),
-        }
     }
 
     /// Where the component rows `range` sit in the run: the slots of the
@@ -393,7 +413,9 @@ impl InMemoryServePlan {
         Ok(match (&self.span, deleted) {
             (ServedSpan::Kept(kept), _) => LiveRows::Kept((**kept).clone()),
             (ServedSpan::Range(range), None) => LiveRows::Range(range.clone()),
-            (ServedSpan::Range(_), Some(_)) => LiveRows::Spanned(self.live_rows(deleted)?),
+            (ServedSpan::Range(_), Some(_)) => {
+                LiveRows::Spanned(self.kept_rows(deleted, |_, _| true)?)
+            }
         })
     }
 

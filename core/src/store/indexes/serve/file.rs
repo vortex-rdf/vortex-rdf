@@ -228,16 +228,6 @@ impl FileServePlan {
         Ok(self.cells.located.get_or_init(|| span).clone())
     }
 
-    /// The located child rows the view covers, a range: the run, or the part
-    /// of it a window cut. `None` for an unlocated run or kept rows.
-    #[cfg(test)]
-    pub(crate) fn located_range(&self) -> Option<Range<u64>> {
-        match self.span()? {
-            ServedSpan::Range(range) => Some(range),
-            ServedSpan::Kept(_) => None,
-        }
-    }
-
     /// Whether a narrowing (a window, keep, partition or chained match) left
     /// the view only part of its match's run.
     pub(crate) fn is_narrowed(&self) -> bool {
@@ -293,9 +283,24 @@ impl FileServePlan {
         self.columns_at(file, &CHILD_COLUMNS, positions).await
     }
 
-    /// The child's `columns` over the child rows `range`, as `u64` buffers in
-    /// the child's order: point by point when the range is point-sized, else
-    /// a scan of the range projecting them.
+    /// The child's `columns` over the child rows `range` (not empty), in the
+    /// child's order: point by point when the range is point-sized, else a
+    /// scan of the range projecting them.
+    async fn range_read(
+        &self,
+        file: &NativeStoreFile,
+        range: Range<u64>,
+        columns: &[&'static str],
+    ) -> Result<ArrayRef> {
+        if point_sized(range.end - range.start) {
+            let positions: Buffer<u64> = range.collect();
+            self.columns_at(file, columns, &positions).await
+        } else {
+            read_all_rows(self.child.scan(columns)?.with_row_range(range)).await
+        }
+    }
+
+    /// [`range_read`](Self::range_read) of code columns, as `u64` buffers.
     async fn range_columns(
         &self,
         file: &NativeStoreFile,
@@ -305,13 +310,7 @@ impl FileServePlan {
         if range.is_empty() {
             return Ok(columns.iter().map(|_| Buffer::empty()).collect());
         }
-        let rows = if point_sized(range.end - range.start) {
-            let positions: Buffer<u64> = range.collect();
-            self.columns_at(file, columns, &positions).await?
-        } else {
-            read_all_rows(self.child.scan(columns)?.with_row_range(range)).await?
-        };
-        extract_codes(rows, columns)
+        extract_codes(self.range_read(file, range, columns).await?, columns)
     }
 
     /// The view's live rows in the child's order, each with its base row id:
@@ -395,6 +394,41 @@ impl FileServePlan {
                 let rows = child_rows(range, &rids).zip(codes.iter());
                 ServedRows::collect(rows, codes.len(), |(row, &code)| {
                     (admits(code) && is_live(deleted, row.1)).then_some(row)
+                })
+            }
+        })
+    }
+
+    /// The view's live rows where `holds` holds, in the child's order: what a
+    /// pattern chained on the view keeps. `holds` tests the child's `columns`
+    /// over every row the view covers, read once: a range's beside its rid
+    /// column (its tombstoned rows among them, then left out), kept rows' at
+    /// their positions. An unlocated run is located first
+    /// ([`located_span`](Self::located_span)).
+    pub(crate) async fn rows_where(
+        &self,
+        file: &NativeStoreFile,
+        deleted: Option<&Mask>,
+        columns: &[&'static str],
+        holds: impl FnOnce(&ArrayRef) -> Result<Mask>,
+    ) -> Result<ServedRows> {
+        Ok(match self.located_span(deleted).await? {
+            ServedSpan::Kept(kept) => {
+                let holding = holds(&self.columns_at(file, columns, &kept.positions).await?)?;
+                ServedRows::collect(
+                    kept.positions_and_rids().zip(0..),
+                    kept.len(),
+                    |(row, i)| holding.value(i).then_some(row),
+                )
+            }
+            ServedSpan::Range(range) => {
+                let with_rids = [columns, &[COL_RID]].concat();
+                let read = self.range_read(file, range.clone(), &with_rids).await?;
+                let holding = holds(&read)?;
+                let rids = extract_codes(read, &[COL_RID])?.remove(0);
+                let rows = child_rows(range, &rids).zip(0..);
+                ServedRows::collect(rows, rids.len(), |(row, i)| {
+                    (holding.value(i) && is_live(deleted, row.1)).then_some(row)
                 })
             }
         })

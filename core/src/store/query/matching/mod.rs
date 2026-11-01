@@ -132,7 +132,7 @@ impl VortexRdfStore {
         // A narrowed served view (a window, keep or partition of a served
         // match) keeps its rows the pattern matches, in its index's order.
         // Boxed, so every other match's future stays its own size.
-        if let Some(served) = Served::of_narrowed(&self.quads) {
+        if let Some(served) = Served::of(&self.quads).filter(Served::is_narrowed) {
             return Box::pin(self.served_chain(served, pattern, &mut codes)).await;
         }
 

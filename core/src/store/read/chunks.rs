@@ -214,6 +214,7 @@ impl VortexRdfStore {
         &self,
         columns: &[QuadColumn],
     ) -> Option<(Option<[PrimitiveArray; 4]>, Vec<PrimitiveArray>)> {
+        let memory = self.quads.in_memory()?;
         let every = QuadColumn::ALL.iter().all(|c| columns.contains(c));
         let all = if every {
             Some(self.base_code_primitives()?)
@@ -224,7 +225,7 @@ impl VortexRdfStore {
             Some(all) => columns.iter().map(|c| all[c.index()].clone()).collect(),
             None => columns
                 .iter()
-                .map(|&c| self.base_code_primitive(c))
+                .map(|&c| memory.base_code_primitive(c))
                 .collect::<Option<_>>()?,
         };
         Some((all, asked))

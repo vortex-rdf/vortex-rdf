@@ -7,12 +7,8 @@
 //! one place a narrowing reads through a backend (the view's live rows, the
 //! index's columns at them) and builds the narrowed view.
 
-use std::ops::Range;
-use std::sync::Arc;
-
 use vortex_array::ArrayRef;
 use vortex_array::scalar::Scalar;
-use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use super::keep::Keep;
@@ -22,22 +18,18 @@ use crate::store::FileBase;
 use crate::store::array::bool_array_to_mask;
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
-use crate::store::indexes::{InMemoryServePlan, LazyRowIds, LiveRows, ServedRows, ServedSpan};
+use crate::store::indexes::{InMemoryServePlan, LazyRowIds, LiveRows, ServedRows};
 use crate::store::layouts::{PatternCodes, QuadPattern};
 use crate::store::read::chunks::batch_ranges;
 use crate::store::scan::residual::mask_for;
-use crate::store::schema::{QuadColumn, RowId, TermCode};
+use crate::store::schema::{QuadColumn, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection, window_rows};
 use crate::store::{MemoryBase, QuadsSource, VortexRdfStore};
 
-/// A served view's plan beside its base, with the rows of the index it
-/// covers located: what every narrowing of the view reads and builds
-/// through.
+/// A served view's plan beside its base: what every narrowing of the view
+/// reads and builds through.
 pub(in crate::store::query) struct Served<'a> {
     quads: &'a QuadsSource,
-    /// The rows of the index the view covers, which a narrowing cuts or
-    /// filters.
-    span: ServedSpan,
     backend: Backend<'a>,
 }
 
@@ -53,109 +45,36 @@ enum Backend<'a> {
     },
 }
 
-/// What a window or partition (or a keep or chained match) leaves of a
-/// served view's rows: the span its plan covers, beside the row ids the
-/// narrowed view holds, in the index's order.
-enum Cut {
-    /// A range with nothing tombstoned, its ids its plan's (a slice of the
-    /// run's in memory; on file read off the child on first need).
-    Range(Range<u64>),
-    /// Listed live rows: the range a tombstoned range's cut spans, or kept
-    /// rows, beside their ids.
-    Listed {
-        span: ServedSpan,
-        rids: Buffer<RowId>,
-    },
-}
-
-impl Cut {
-    /// Rows `piece` (not empty) of the `live` rows, in their order: a part
-    /// of the range; under tombstones the range from the first of the piece's
-    /// live rows to its last (the tombstoned rows inside dropped at read
-    /// through their row ids); or a slice of the kept rows.
-    #[inline]
-    fn of(live: &LiveRows, piece: Range<usize>) -> Self {
-        debug_assert!(!piece.is_empty());
-        match live {
-            LiveRows::Range(range) => {
-                Cut::Range(range.start + piece.start as u64..range.start + piece.end as u64)
-            }
-            LiveRows::Spanned(rows) => {
-                let rows = rows.slice(piece);
-                let (first, last) = (rows.positions[0], rows.positions[rows.len() - 1]);
-                Cut::Listed {
-                    span: ServedSpan::Range(first..last + 1),
-                    rids: rows.rids,
-                }
-            }
-            LiveRows::Kept(rows) => Cut::kept(rows.slice(piece)),
-        }
-    }
-
-    /// Kept rows, each live.
-    #[inline]
-    fn kept(rows: ServedRows) -> Self {
-        let rids = rows.rids.clone();
-        Cut::Listed {
-            span: ServedSpan::Kept(Arc::new(rows)),
-            rids,
-        }
-    }
-
-    /// How many base rows the narrowed view holds.
-    #[inline]
-    fn len(&self) -> usize {
-        match self {
-            Cut::Range(range) => (range.end - range.start) as usize,
-            Cut::Listed { rids, .. } => rids.len(),
-        }
-    }
-}
-
 impl<'a> Served<'a> {
-    /// The view `quads` selects, when a plan serves it, with the rows its
-    /// plan covers: on file an unlocated run is located first, read once by
-    /// row index ([`located_span`](FileServePlan::located_span)). `None` for
-    /// a view no plan serves.
-    pub(in crate::store::query) async fn of(quads: &'a QuadsSource) -> Result<Option<Self>> {
+    /// The view `quads` selects, when a plan serves it; `None` for a view no
+    /// plan serves. Nothing is read.
+    pub(in crate::store::query) fn of(quads: &'a QuadsSource) -> Option<Self> {
         if let Some((served, _)) = Self::in_memory(quads) {
-            return Ok(Some(served));
+            return Some(served);
         }
         #[cfg(feature = "file-io")]
-        return Self::file(quads).await;
-        #[cfg(not(feature = "file-io"))]
-        Ok(None)
+        if let Some((served, ..)) = Self::file(quads) {
+            return Some(served);
+        }
+        None
     }
 
-    /// [`of`](Self::of) an in-memory view, which reads nothing, beside its
-    /// plan.
+    /// [`of`](Self::of) an in-memory view, beside its plan.
     #[inline]
     fn in_memory(quads: &'a QuadsSource) -> Option<(Self, &'a InMemoryServePlan)> {
         let memory = quads.in_memory()?;
         let plan = memory.serve.as_ref()?;
-        let served = Served {
-            quads,
-            span: plan.span(),
-            backend: Backend::Memory { memory, plan },
-        };
-        Some((served, plan))
+        let backend = Backend::Memory { memory, plan };
+        Some((Served { quads, backend }, plan))
     }
 
-    /// [`of`](Self::of) a file view.
+    /// [`of`](Self::of) a file view, beside its base and plan.
     #[cfg(feature = "file-io")]
-    async fn file(quads: &'a QuadsSource) -> Result<Option<Self>> {
-        let Some(base) = quads.file() else {
-            return Ok(None);
-        };
-        let Some(plan) = &base.serve else {
-            return Ok(None);
-        };
-        let span = plan.located_span(quads.deleted.as_ref()).await?;
-        Ok(Some(Served {
-            quads,
-            span,
-            backend: Backend::File { base, plan },
-        }))
+    fn file(quads: &'a QuadsSource) -> Option<(Self, &'a FileBase, &'a FileServePlan)> {
+        let base = quads.file()?;
+        let plan = base.serve.as_ref()?;
+        let backend = Backend::File { base, plan };
+        Some((Served { quads, backend }, base, plan))
     }
 
     /// An in-memory served view beside its live rows, known at once: what
@@ -173,71 +92,54 @@ impl<'a> Served<'a> {
     /// tombstoned range's rid column read.
     #[cfg(feature = "file-io")]
     async fn file_live(quads: &'a QuadsSource) -> Result<Option<(Self, LiveRows)>> {
-        let Some(served) = Self::file(quads).await? else {
+        let Some((served, base, plan)) = Self::file(quads) else {
             return Ok(None);
         };
-        let live = served.live().await?;
+        let live = plan.live(&base.file, served.deleted()).await?;
         Ok(Some((served, live)))
     }
 
-    /// [`of`](Self::of) a view a narrowing left part of its run (a window,
-    /// keep, partition or chained match of a served view), whose rows are
-    /// known without reading: what a pattern chained on the view filters.
-    pub(in crate::store::query) fn of_narrowed(quads: &'a QuadsSource) -> Option<Self> {
-        #[cfg(feature = "file-io")]
-        if let Some(base) = quads.file() {
-            let plan = base.serve.as_ref().filter(|plan| plan.is_narrowed())?;
-            return Some(Served {
-                quads,
-                span: plan.span()?,
-                backend: Backend::File { base, plan },
-            });
+    /// Whether a narrowing left the view part of its run (a window, keep,
+    /// partition or chained match of a served view): what a pattern chained
+    /// on the view filters in the index's order.
+    pub(in crate::store::query) fn is_narrowed(&self) -> bool {
+        match &self.backend {
+            Backend::Memory { plan, .. } => plan.is_narrowed(),
+            #[cfg(feature = "file-io")]
+            Backend::File { plan, .. } => plan.is_narrowed(),
         }
-        let memory = quads.in_memory()?;
-        let plan = memory.serve.as_ref().filter(|plan| plan.is_narrowed())?;
-        Some(Served {
-            quads,
-            span: plan.span(),
-            backend: Backend::Memory { memory, plan },
-        })
     }
 
     fn deleted(&self) -> Option<&'a Mask> {
         self.quads.deleted.as_ref()
     }
 
-    /// The view's live rows as its plan lists them ([`LiveRows`]): what its
-    /// windows and partitions cut.
-    #[cfg(feature = "file-io")]
-    async fn live(&self) -> Result<LiveRows> {
-        match &self.backend {
-            Backend::Memory { plan, .. } => plan.live(self.deleted()),
-            Backend::File { base, plan } => plan.live(&base.file, self.deleted()).await,
-        }
-    }
-
-    /// The view's live rows listed, each with its base row id: the kept
-    /// rows, or a range's (in memory its run's ids, on file its rid column)
-    /// less the tombstones.
-    async fn live_rows(&self) -> Result<ServedRows> {
-        match &self.backend {
-            Backend::Memory { plan, .. } => plan.live_rows(self.deleted()),
+    /// How many rows of the index the view covers, tombstoned ones in a
+    /// range included: on file, an unlocated run located first, read once by
+    /// row index ([`located_span`](FileServePlan::located_span)).
+    async fn span_len(&self) -> Result<usize> {
+        Ok(match &self.backend {
+            Backend::Memory { plan, .. } => plan.span_len(),
             #[cfg(feature = "file-io")]
-            Backend::File { base, plan } => plan.live_rows(&base.file, self.deleted()).await,
-        }
+            Backend::File { plan, .. } => plan.located_span(self.deleted()).await?.len(),
+        })
     }
 
-    /// The index's `columns` at its rows `positions` (ascending on file, not
-    /// empty), in that order.
-    async fn columns_at(
+    /// The view's live rows where `holds` holds of the index's `columns`
+    /// there, in the index's order: the columns read once over the rows the
+    /// view covers (the plans' `rows_where`). What a chained pattern keeps.
+    async fn rows_where(
         &self,
         columns: &[&'static str],
-        positions: &Buffer<u64>,
-    ) -> Result<ArrayRef> {
+        holds: impl FnOnce(&ArrayRef) -> Result<Mask>,
+    ) -> Result<ServedRows> {
         match &self.backend {
-            Backend::Memory { plan, .. } => plan.columns_at(columns, positions),
+            Backend::Memory { plan, .. } => plan.rows_where(self.deleted(), columns, holds),
             #[cfg(feature = "file-io")]
-            Backend::File { base, plan } => plan.columns_at(&base.file, columns, positions).await,
+            Backend::File { base, plan } => {
+                plan.rows_where(&base.file, self.deleted(), columns, holds)
+                    .await
+            }
         }
     }
 
@@ -248,14 +150,13 @@ impl<'a> Served<'a> {
     /// the kept rows. `None` for an in-memory column neither reads.
     async fn admitted(
         &self,
-        store: &VortexRdfStore,
         column: QuadColumn,
         admits: impl Fn(TermCode) -> bool,
     ) -> Result<Option<ServedRows>> {
         let deleted = self.deleted();
         match &self.backend {
-            Backend::Memory { plan, .. } => {
-                if let Some(codes) = store.base_code_primitive(column) {
+            Backend::Memory { memory, plan } => {
+                if let Some(codes) = memory.base_code_primitive(column) {
                     let codes = codes.as_slice::<TermCode>();
                     return Ok(Some(
                         plan.kept_rows(deleted, |_, rid| admits(codes[rid as usize]))?,
@@ -276,65 +177,37 @@ impl<'a> Served<'a> {
         }
     }
 
-    /// The view narrowed to `cut`, served: its plan over the cut's span, its
-    /// ids the cut's in the index's order, which leave out every tombstone
-    /// (a narrowing takes live rows).
+    /// The view narrowed to `rows` (some of its live rows), served: its plan
+    /// over the span they cover, its ids theirs in the index's order (a
+    /// range's its plan's: a slice of the run's in memory, read on first need
+    /// from those rows of the child's rid column on file), each live.
     // Inlined, so a narrowing of a view known to be in memory (its windows)
     // builds the view in place, the file arm left out.
     #[inline(always)]
-    fn narrowed(&self, cut: Cut) -> Result<QuadsSource> {
+    fn narrowed(&self, rows: LiveRows) -> Result<QuadsSource> {
         match &self.backend {
-            Backend::Memory { memory, plan } => self.narrowed_in_memory(memory, plan, cut),
+            Backend::Memory { memory, plan } => {
+                let (span, ids) = rows.into_span(|range| {
+                    Ok(LazyRowIds::from_unsorted_ids(plan.range_rids(range)?))
+                })?;
+                let plan = Some(plan.with_span(span));
+                Ok(self
+                    .quads
+                    .in_memory_with(memory, ViewSelection::pending(ids), plan))
+            }
+            // Every narrowed row passes the view's filter, so its counts and
+            // reads take the plan's rows, the filter's pinned codes kept for
+            // reads by id.
             #[cfg(feature = "file-io")]
-            Backend::File { base, plan } => Ok(self.narrowed_file(base, plan, cut)),
+            Backend::File { base, plan } => {
+                let (span, ids) = rows.into_span(|range| Ok(plan.range_ids(&base.file, range)))?;
+                let (filter, plan) = (base.filter.clone(), Some(plan.with_span(span)));
+                Ok(self
+                    .quads
+                    .file_with(base, filter, ViewSelection::pending(ids), plan)
+                    .with_filter_resolved())
+            }
         }
-    }
-
-    /// [`narrowed`](Self::narrowed) in memory: a range's ids a slice of the
-    /// run's.
-    #[inline(always)]
-    fn narrowed_in_memory(
-        &self,
-        memory: &MemoryBase,
-        plan: &InMemoryServePlan,
-        cut: Cut,
-    ) -> Result<QuadsSource> {
-        let (span, rids) = match cut {
-            Cut::Range(range) => {
-                let rids = plan.range_rids(range.clone())?;
-                (ServedSpan::Range(range), rids)
-            }
-            Cut::Listed { span, rids } => (span, rids),
-        };
-        let ids = LazyRowIds::from_unsorted_ids(rids);
-        Ok(self.quads.in_memory_with(
-            memory,
-            ViewSelection::pending(ids),
-            Some(plan.with_span(span)),
-        ))
-    }
-
-    /// [`narrowed`](Self::narrowed) on file: a range's ids read on first
-    /// need off those rows of the child's rid column. Every narrowed row
-    /// passes the view's filter, so its counts and reads take the plan's
-    /// rows, the filter's pinned codes kept for reads by id.
-    #[cfg(feature = "file-io")]
-    fn narrowed_file(&self, base: &FileBase, plan: &FileServePlan, cut: Cut) -> QuadsSource {
-        let (span, ids) = match cut {
-            Cut::Range(range) => {
-                let ids = plan.range_ids(&base.file, range.clone());
-                (ServedSpan::Range(range), ids)
-            }
-            Cut::Listed { span, rids } => (span, LazyRowIds::from_unsorted_ids(rids)),
-        };
-        self.quads
-            .file_with(
-                base,
-                base.filter.clone(),
-                ViewSelection::pending(ids),
-                Some(plan.with_span(span)),
-            )
-            .with_filter_resolved()
     }
 }
 
@@ -376,7 +249,7 @@ impl VortexRdfStore {
     /// order, a part of its range (whose ids a slice of the run's in memory,
     /// read on first need from those rows of the child's rid column on file)
     /// or a slice of its kept rows, their ids kept unsorted
-    /// ([`LazyRowIds::from_unsorted_ids`]); under tombstones the cut counts
+    /// ([`LazyRowIds::from_unsorted_ids`]); under tombstones the window counts
     /// live rows. The tail is windowed with what the base did not fill, as
     /// [`window_cutting`](Self::window_cutting) windows it. A window that
     /// holds no base row selects none, with no plan.
@@ -392,8 +265,8 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         let base_live = live.len();
         let cut = window_rows(offset, limit, base_live as u64)
-            .map(|rows| Cut::of(live, rows.start as usize..rows.end as usize));
-        let base_taken = cut.as_ref().map_or(0, Cut::len);
+            .map(|rows| live.slice(rows.start as usize..rows.end as usize));
+        let base_taken = cut.as_ref().map_or(0, LiveRows::len);
         let tail = self.windowed_tail(offset, limit, base_live, base_taken);
         let quads = match cut {
             Some(cut) => served.narrowed(cut)?,
@@ -453,7 +326,7 @@ impl VortexRdfStore {
         let count = rows.div_ceil(size);
         let mut parts = Vec::with_capacity(count);
         for (i, piece) in batch_ranges(rows, size).enumerate() {
-            let quads = served.narrowed(Cut::of(live, piece))?;
+            let quads = served.narrowed(live.slice(piece))?;
             parts.push(self.derived(quads, self.partition_tail(i + 1 == count)));
         }
         Ok(Some(parts))
@@ -470,33 +343,26 @@ impl VortexRdfStore {
         column: QuadColumn,
         keep: &Keep,
     ) -> Result<Option<Self>> {
-        let Some(served) = Served::of(&self.quads).await? else {
+        let Some(served) = Served::of(&self.quads) else {
             return Ok(None);
         };
-        if served.span.len() == 0 {
+        let rows = served.span_len().await?;
+        if rows == 0 {
             return Ok(Some(self.empty_view()));
         }
-        let test = keep.test(served.span.len());
-        let Some(kept) = served
-            .admitted(self, column, |code| test.admits(code))
-            .await?
-        else {
+        let test = keep.test(rows);
+        let Some(kept) = served.admitted(column, |code| test.admits(code)).await? else {
             return Ok(None);
         };
-        if kept.len() == 0 {
-            return Ok(Some(self.empty_view()));
-        }
-        let quads = served.narrowed(Cut::kept(kept))?;
-        Ok(Some(self.derived(quads, self.tail.clone())))
+        self.served_kept(&served, kept).map(Some)
     }
 
     /// `pattern` matched over the base of a view a narrowing left part of a
     /// served run (`served`): each bound role's probe value, as the copy's
-    /// columns spell it (`codes`), compared with the copy's column at the
-    /// view's live rows in the index's order (the component's columns in
-    /// memory; on file the child's, point by point or over the rows they
-    /// span), the matching rows kept on the plan with their row ids
-    /// unsorted. A term the layout proves absent, or no row matching, gives
+    /// columns spell it (`codes`), compared with the copy's columns over the
+    /// rows the view covers, read once ([`Served::rows_where`]: the
+    /// component's in memory, the child's on file), the matching live rows
+    /// kept on the plan with their row ids unsorted. A term the layout proves absent, or no row matching, gives
     /// the empty view; a pattern binding nothing, the view as it is. The tail
     /// is left as it is: [`match_pattern_for`](Self::match_pattern_for)
     /// matches it.
@@ -516,22 +382,20 @@ impl VortexRdfStore {
         if eqs.is_empty() {
             return Ok(self.clone());
         }
-        let rows = served.live_rows().await?;
-        if rows.len() == 0 {
-            return Ok(self.empty_view());
-        }
         let names: Vec<&'static str> = eqs.iter().map(|(name, _)| *name).collect();
-        let read = served.columns_at(&names, &rows.positions).await?;
-        let holding = bool_array_to_mask(mask_for(&read, &eqs)?)?;
-        let kept = ServedRows::collect(
-            rows.positions_and_rids().zip(0..),
-            rows.len(),
-            |(row, i)| holding.value(i).then_some(row),
-        );
+        let kept = served
+            .rows_where(&names, |read| bool_array_to_mask(mask_for(read, &eqs)?))
+            .await?;
+        self.served_kept(&served, kept)
+    }
+
+    /// The view `served` narrowed to the `kept` rows (a keep's or a chained
+    /// match's), its tail as it is; the empty view when none was kept.
+    fn served_kept(&self, served: &Served<'_>, kept: ServedRows) -> Result<Self> {
         if kept.len() == 0 {
             return Ok(self.empty_view());
         }
-        let quads = served.narrowed(Cut::kept(kept))?;
+        let quads = served.narrowed(LiveRows::Kept(kept))?;
         Ok(self.derived(quads, self.tail.clone()))
     }
 }

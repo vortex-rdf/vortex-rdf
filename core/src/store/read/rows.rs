@@ -101,6 +101,28 @@ fn gather(prim: &PrimitiveArray, ids: &[RowId]) -> Buffer<TermCode> {
     Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
 }
 
+impl MemoryBase {
+    /// The base's `column` code column as a canonical primitive, as
+    /// [`base_code_primitives`](VortexRdfStore::base_code_primitives) reads
+    /// each of the four: a builder-compressed column is decoded into its own
+    /// shared cache, the other columns' caches left as they are. `None` for a
+    /// base whose code columns are encoded ([`CodeAccess::Encoded`]), which a
+    /// gather would decode again.
+    pub(in crate::store) fn base_code_primitive(
+        &self,
+        column: QuadColumn,
+    ) -> Option<PrimitiveArray> {
+        use vortex_array::arrays::Struct;
+        if self.code_access == CodeAccess::Encoded {
+            return None;
+        }
+        let struct_arr = self.base.clone().try_downcast::<Struct>().ok()?;
+        crate::store::resident::shared_code_primitive(
+            struct_arr.unmasked_field_by_name(column.name()).ok()?,
+        )
+    }
+}
+
 impl VortexRdfStore {
     /// The rows this view selects as four [`TermCode`] columns (`s`, `p`,
     /// `o`, `g`), with no row read: off the answering index's own columns
@@ -190,35 +212,14 @@ impl VortexRdfStore {
     /// cache cannot hand out as a non-nullable code primitive (chunked or
     /// wire-encoded).
     pub(in crate::store) fn base_code_primitives(&self) -> Option<[PrimitiveArray; 4]> {
+        let memory = self.quads.in_memory()?;
         let [s, p, o, g] = QuadColumn::ALL;
         Some([
-            self.base_code_primitive(s)?,
-            self.base_code_primitive(p)?,
-            self.base_code_primitive(o)?,
-            self.base_code_primitive(g)?,
+            memory.base_code_primitive(s)?,
+            memory.base_code_primitive(p)?,
+            memory.base_code_primitive(o)?,
+            memory.base_code_primitive(g)?,
         ])
-    }
-
-    /// The base's `column` code column as a canonical primitive, as
-    /// [`base_code_primitives`](Self::base_code_primitives) reads each of
-    /// the four: a builder-compressed column is decoded into its own shared
-    /// cache, the other columns' caches left as they are. `None` off memory,
-    /// or for a base whose code columns are encoded
-    /// ([`CodeAccess::Encoded`]), which a gather would decode again.
-    pub(in crate::store) fn base_code_primitive(
-        &self,
-        column: QuadColumn,
-    ) -> Option<PrimitiveArray> {
-        use vortex_array::arrays::Struct;
-        let memory = self.quads.in_memory()?;
-        if memory.code_access == CodeAccess::Encoded {
-            return None;
-        }
-        let base = &memory.base;
-        let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
-        crate::store::resident::shared_code_primitive(
-            struct_arr.unmasked_field_by_name(column.name()).ok()?,
-        )
     }
 
     /// The rows this view selects as four [`TermCode`] columns (`s`, `p`,

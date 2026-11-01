@@ -34,7 +34,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
-use super::COL_RID;
+use super::{COL_RID, LazyRowIds};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::SortOrder;
@@ -320,6 +320,47 @@ impl LiveRows {
             LiveRows::Range(range) => (range.end - range.start) as usize,
             LiveRows::Spanned(rows) | LiveRows::Kept(rows) => rows.len(),
         }
+    }
+
+    /// Rows `piece` (not empty) of these, in their order, sharing their
+    /// buffers: what a window or partition of the view cuts.
+    #[inline]
+    pub(crate) fn slice(&self, piece: Range<usize>) -> Self {
+        debug_assert!(!piece.is_empty());
+        match self {
+            LiveRows::Range(range) => {
+                LiveRows::Range(range.start + piece.start as u64..range.start + piece.end as u64)
+            }
+            LiveRows::Spanned(rows) => LiveRows::Spanned(rows.slice(piece)),
+            LiveRows::Kept(rows) => LiveRows::Kept(rows.slice(piece)),
+        }
+    }
+
+    /// The span a plan narrowed to these rows (not none) covers, beside their
+    /// ids in the index's order, each live: a range's ids are what
+    /// `range_ids` gives (its plan's); a tombstoned range's listed rows span
+    /// from the first to the last, the tombstoned rows inside dropped at read
+    /// through their row ids; kept rows are the span.
+    #[inline(always)]
+    pub(crate) fn into_span(
+        self,
+        range_ids: impl FnOnce(Range<u64>) -> Result<LazyRowIds>,
+    ) -> Result<(ServedSpan, LazyRowIds)> {
+        Ok(match self {
+            LiveRows::Range(range) => {
+                let ids = range_ids(range.clone())?;
+                (ServedSpan::Range(range), ids)
+            }
+            LiveRows::Spanned(rows) => {
+                let (first, last) = (rows.positions[0], rows.positions[rows.len() - 1]);
+                let span = ServedSpan::Range(first..last + 1);
+                (span, LazyRowIds::from_unsorted_ids(rows.rids))
+            }
+            LiveRows::Kept(rows) => {
+                let ids = LazyRowIds::from_unsorted_ids(rows.rids.clone());
+                (ServedSpan::Kept(Arc::new(rows)), ids)
+            }
+        })
     }
 }
 

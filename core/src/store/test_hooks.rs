@@ -527,7 +527,11 @@ impl VortexRdfStore {
     /// The index-child row range a file view's serve plan located for its
     /// run. `None` without a plan, or when the plan's run is unlocated.
     pub(crate) fn debug_serve_row_range(&self) -> Option<Range<u64>> {
-        self.quads.file()?.serve.as_ref()?.located_range()
+        use crate::store::indexes::ServedSpan;
+        match self.quads.file()?.serve.as_ref()?.span()? {
+            ServedSpan::Range(range) => Some(range),
+            ServedSpan::Kept(_) => None,
+        }
     }
 
     /// The zone-map row range a bound subject prunes to on a file view:
