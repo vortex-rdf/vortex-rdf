@@ -19,32 +19,22 @@ fn ids_sorted(rec: &Recorder) -> usize {
     rec.count_where(|e| matches!(e, Event::IdsSorted(_)))
 }
 
-/// The by-copy store of `modular_quads(20_000, 7, 11)` under `layout`,
-/// written once per process per layout (see [`cached_store_file`]), and its
-/// path. Keep the `TempDir` alive while the file is used.
-async fn store_file(layout: LayoutStrategy) -> (tempfile::TempDir, std::path::PathBuf) {
-    static FILES: [OnceLock<Vec<u8>>; 3] = [const { OnceLock::new() }; 3];
-    let cell = &FILES[LAYOUTS.iter().position(|&l| l == layout).unwrap()];
-    let quads = || modular_quads(20_000, 7, 11);
-    cached_store_file(cell, quads, layout, vec![IndexType::SecondaryByCopy]).await
-}
-
-/// [`store_file`]'s store under `layout`, opened in memory.
+/// The by-copy [`stock_file`] under `layout`, opened in memory.
 async fn memory_store(layout: LayoutStrategy) -> (tempfile::TempDir, VortexRdfStore) {
-    let (dir, path) = store_file(layout).await;
+    let (dir, path) = stock_file(layout, IndexConfig::Copy).await;
     (
         dir,
         VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
     )
 }
 
-/// [`store_file`]'s Dictionary store, opened from its file.
+/// The by-copy Dictionary [`stock_file`], opened from its file.
 async fn file_store() -> (tempfile::TempDir, VortexRdfStore) {
-    let (dir, path) = store_file(LayoutStrategy::Dictionary).await;
+    let (dir, path) = stock_file(LayoutStrategy::Dictionary, IndexConfig::Copy).await;
     (dir, VortexRdfStore::from_file(&path).await.unwrap())
 }
 
-/// [`store_file`]'s Dictionary store three ways, each beside its name, for
+/// The by-copy Dictionary [`stock_file`] three ways, each beside its name, for
 /// a case that runs over all of them: built in memory (its code columns
 /// resident, so a served read gathers the base at the view's ids), read into
 /// memory (its code columns encoded, so a served read takes the index's own

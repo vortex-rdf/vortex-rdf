@@ -392,6 +392,21 @@ async fn cached_store_file(
     temp_store_file(bytes)
 }
 
+/// The stock store file of the stream and index-order tests,
+/// `modular_quads(20_000, 7, 11)` under `layout` with `config`'s indexes,
+/// written once per process per pair ([`cached_store_file`]). Keep the
+/// `TempDir` alive while the file is used.
+async fn stock_file(
+    layout: LayoutStrategy,
+    config: IndexConfig,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    static FILES: [[OnceLock<Vec<u8>>; 3]; 3] = [const { [const { OnceLock::new() }; 3] }; 3];
+    let by_layout = &FILES[LAYOUTS.iter().position(|&l| l == layout).unwrap()];
+    let cell = &by_layout[IndexConfig::ALL.iter().position(|&c| c == config).unwrap()];
+    let quads = || modular_quads(20_000, 7, 11);
+    cached_store_file(cell, quads, layout, config.types()).await
+}
+
 /// A Dictionary-layout store file of `modular_quads(160_000, 3, 8)`, without
 /// indexes, in a fresh temp dir: about 160,012 terms, so a dictionary of
 /// three 65,536-term windows, and rows past one scan split. Serialized once

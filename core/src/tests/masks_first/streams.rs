@@ -90,9 +90,7 @@ async fn test_masked_streams_of_rare_and_absent_codes() {
 
 #[tokio::test]
 async fn test_masked_streams_are_taken() {
-    static FILE: OnceLock<Vec<u8>> = OnceLock::new();
-    let quads = || modular_quads(20_000, 7, 11);
-    let (_dir, path) = cached_store_file(&FILE, quads, LayoutStrategy::Dictionary, vec![]).await;
+    let (_dir, path) = stock_file(LayoutStrategy::Dictionary, IndexConfig::NoIndex).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let (p2, o3) = (iri("p2"), plain_literal("object 3"));
     for (name, view) in [

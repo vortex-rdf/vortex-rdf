@@ -177,16 +177,7 @@ async fn assert_row_chunks_in_read_order(view: &VortexRdfStore, batch_rows: usiz
     );
 }
 
-/// The Dictionary store file of `modular_quads(20_000, 7, 11)` with `config`'s indexes, written once per process per
-/// configuration ([`cached_store_file`]). Keep the `TempDir` alive while the file is used.
-async fn matrix_file(config: IndexConfig) -> (tempfile::TempDir, std::path::PathBuf) {
-    static FILES: [OnceLock<Vec<u8>>; 3] = [const { OnceLock::new() }; 3];
-    let cell = &FILES[IndexConfig::ALL.iter().position(|&c| c == config).unwrap()];
-    let quads = || modular_quads(20_000, 7, 11);
-    cached_store_file(cell, quads, LayoutStrategy::Dictionary, config.types()).await
-}
-
-/// The patterns the stream matrix reads on [`matrix_file`], each beside whether a by-copy index serves it: one
+/// The patterns the stream matrix reads on the Dictionary [`stock_file`], each beside whether a by-copy index serves it: one
 /// subject, a predicate and an object each bound alone, the default graph (every row), the predicate and object
 /// together, the subject with its predicate, and nothing bound.
 const MATRIX_PATTERNS: [(&str, [Option<&str>; 4], bool); 7] = [
@@ -230,7 +221,7 @@ const MATRIX_PATTERNS: [(&str, [Option<&str>; 4], bool); 7] = [
 #[tokio::test]
 async fn chunk_streams_follow_read_order() {
     for config in IndexConfig::ALL {
-        let (_dir, path) = matrix_file(config).await;
+        let (_dir, path) = stock_file(LayoutStrategy::Dictionary, config).await;
         for open in [Open::Mapped, Open::Loaded] {
             let store = open.open(&path).await.unwrap();
             // About a fifth of every view's rows tombstoned: p0's and "object 0"'s.
@@ -346,8 +337,9 @@ async fn served_runs_of_any_width_and_with_tombstones() {
 /// with no scan; a by-reference index's run is read off the base.
 #[tokio::test]
 async fn which_runs_stream_off_the_index() {
-    let (_copy_dir, copy) = matrix_file(IndexConfig::Copy).await;
-    let (_reference_dir, reference) = matrix_file(IndexConfig::Reference).await;
+    let (_copy_dir, copy) = stock_file(LayoutStrategy::Dictionary, IndexConfig::Copy).await;
+    let (_reference_dir, reference) =
+        stock_file(LayoutStrategy::Dictionary, IndexConfig::Reference).await;
     let memory = VortexRdfStore::from_file_in_memory(&copy).await.unwrap();
     let reference = VortexRdfStore::from_file(&reference).await.unwrap();
     for (name, store, off_the_index) in [
