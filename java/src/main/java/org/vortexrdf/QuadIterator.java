@@ -10,7 +10,7 @@ import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
 /**
- * The quads matching a pattern, read a chunk at a time ({@link VortexStore#iterateQuads}): rows {@code {s, p, o, g}}
+ * The quads matching a pattern, read a chunk at a time ({@link VortexRdfStore#iterateQuads}): rows {@code {s, p, o, g}}
  * of N-Triples spellings, in the match's order, each a fresh array; rows of one chunk that hold the same term share its
  * {@code String}. Close it when done, or drain it: either frees its native stream, as does closing its store, and an
  * iterator left unreachable unclosed is freed by a cleaner.

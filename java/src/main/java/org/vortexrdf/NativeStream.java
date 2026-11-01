@@ -16,13 +16,13 @@ import java.util.function.LongFunction;
 final class NativeStream {
 	private static final Cleaner CLEANER = Cleaner.create();
 
-	private final VortexStore store;
+	private final VortexRdfStore store;
 	private long handle;
 	private Cleaner.Cleanable cleanable;
 	/** Set once the iteration ended or closed: it reads no more. */
 	private boolean ended;
 
-	NativeStream(VortexStore store, long handle) {
+	NativeStream(VortexRdfStore store, long handle) {
 		this.store = store;
 		this.handle = handle;
 	}

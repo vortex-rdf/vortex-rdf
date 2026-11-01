@@ -5,7 +5,7 @@ import java.lang.ProcessBuilder.Redirect;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import org.vortexrdf.VortexStore;
+import org.vortexrdf.VortexRdfStore;
 import org.vortexrdf.bench.Adapter;
 import org.vortexrdf.bench.Pattern;
 import org.vortexrdf.bench.Sink;
@@ -17,7 +17,7 @@ import org.vortexrdf.bench.Sink;
  * gets a store; the Build cell times that process, and the Open cell what the bindings pay to open its file.
  * Patterns are N-Triples spellings, which the bindings take as they are: a null position is free.
  */
-public final class VortexAdapter implements Adapter<VortexStore, Pattern> {
+public final class VortexAdapter implements Adapter<VortexRdfStore, Pattern> {
 	private static final String STORE_FILE = "store.vortex";
 
 	private final String slug;
@@ -57,7 +57,7 @@ public final class VortexAdapter implements Adapter<VortexStore, Pattern> {
 	}
 
 	@Override
-	public VortexStore build(Path src, Path location) throws Exception {
+	public VortexRdfStore build(Path src, Path location) throws Exception {
 		List<String> cmd = new ArrayList<>(List.of(cli(), "serialize", "--layout", "dictionary"));
 		for (String index : indexes) {
 			cmd.add("--indexes");
@@ -74,8 +74,8 @@ public final class VortexAdapter implements Adapter<VortexStore, Pattern> {
 	}
 
 	@Override
-	public VortexStore open(Path src, Path location) {
-		return VortexStore.open(location.resolve(STORE_FILE), inMemory);
+	public VortexRdfStore open(Path src, Path location) {
+		return VortexRdfStore.open(location.resolve(STORE_FILE), inMemory);
 	}
 
 	@Override
@@ -84,7 +84,7 @@ public final class VortexAdapter implements Adapter<VortexStore, Pattern> {
 	}
 
 	@Override
-	public long count(VortexStore store, Pattern p) {
+	public long count(VortexRdfStore store, Pattern p) {
 		// quads() is the bindings' term read: four N-Triples spellings per row, built in one native call.
 		List<String[]> rows = store.quads(p.s(), p.p(), p.o(), p.g());
 		long acc = 0;
@@ -98,12 +98,12 @@ public final class VortexAdapter implements Adapter<VortexStore, Pattern> {
 	}
 
 	@Override
-	public long countOnly(VortexStore store, Pattern p) {
+	public long countOnly(VortexRdfStore store, Pattern p) {
 		return store.count(p.s(), p.p(), p.o(), p.g());
 	}
 
 	@Override
-	public void dispose(VortexStore store) {
+	public void dispose(VortexRdfStore store) {
 		store.close();
 	}
 

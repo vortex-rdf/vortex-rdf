@@ -36,7 +36,7 @@ import java.util.function.LongUnaryOperator;
  * <p>Thread safe: any number of threads may query one store. {@link #close()} waits for the calls in progress and
  * later calls raise {@link IllegalStateException}. The native library is located as described in {@code Native}.
  */
-public final class VortexStore implements AutoCloseable {
+public final class VortexRdfStore implements AutoCloseable {
 	/**
 	 * "No code": a free position of a code pattern, and what {@link TermDictionary#encode} answers for an unknown term.
 	 * Check {@code encode}'s answer before putting it into a pattern, where {@code NONE} matches every quad.
@@ -56,13 +56,13 @@ public final class VortexStore implements AutoCloseable {
 	/** The native streams of this store's open iterators, not the iterators, so a forgotten one can be collected. */
 	private final Set<NativeStream> streams = ConcurrentHashMap.newKeySet();
 
-	private VortexStore(long handle) {
+	private VortexRdfStore(long handle) {
 		this.handle = handle;
 		this.dictionary = Native.hasDictionary(handle) ? new TermDictionary(this) : null;
 	}
 
 	/** Opens a store memory-mapped: the operating system's page cache holds what queries touch. */
-	public static VortexStore open(Path file) {
+	public static VortexRdfStore open(Path file) {
 		return open(file, false);
 	}
 
@@ -70,9 +70,9 @@ public final class VortexStore implements AutoCloseable {
 	 * Opens a store; with {@code inMemory} the whole file is loaded and later queries do not read it again.
 	 * A mapped file must not be modified while open: replace it by renaming a new file over it.
 	 */
-	public static VortexStore open(Path file, boolean inMemory) {
+	public static VortexRdfStore open(Path file, boolean inMemory) {
 		Objects.requireNonNull(file, "file");
-		return new VortexStore(Native.open(file.toAbsolutePath().toString(), inMemory));
+		return new VortexRdfStore(Native.open(file.toAbsolutePath().toString(), inMemory));
 	}
 
 	/** {@code call}'s answer for the open store's handle, the store held open until it returns. */
