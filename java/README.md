@@ -136,4 +136,4 @@ cargo run -p vortex-rdf-java --example fixtures -- java/target/fixtures
 cd java && mvn test        # reads ../target/debug's library; -Dvortexrdf.library=<path> for another
 ```
 
-`scripts/ci-check.sh java-tests` does both. The JNI functions live in `src/lib.rs`; their Java declarations are the package-private `Native` class.
+`scripts/ci-check.sh java-tests` does both. It also copies the library to `target/natives/org/vortexrdf/native/<platform>/`, where the published jar carries its copy, and `BundledLibraryTest` loads it from there in a JVM of its own, with neither `vortexrdf.library` nor `VORTEX_RDF_JNI_LIB` set; a plain `mvn test` skips that test. The JNI functions live in `src/lib.rs`; their Java declarations are the package-private `Native` class.

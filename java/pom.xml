@@ -28,6 +28,9 @@
          vortex-rdf-java crate writes (scripts/ci-check.sh java-tests builds both). -->
     <vortexrdf.library>${project.basedir}/../target/debug/libvortex_rdf_jni.so</vortexrdf.library>
     <vortexrdf.fixtures>${project.basedir}/target/fixtures</vortexrdf.fixtures>
+    <!-- True makes BundledLibraryTest fail, not skip, when no library is staged under target/natives
+         (scripts/ci-check.sh java-tests stages this machine's). -->
+    <vortexrdf.bundled.required>false</vortexrdf.bundled.required>
   </properties>
 
   <dependencies>
@@ -55,12 +58,44 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.2</version>
-        <configuration>
-          <systemPropertyVariables>
-            <vortexrdf.library>${vortexrdf.library}</vortexrdf.library>
-            <vortexrdf.fixtures>${vortexrdf.fixtures}</vortexrdf.fixtures>
-          </systemPropertyVariables>
-        </configuration>
+        <executions>
+          <!-- Every test but BundledLibraryTest, with the library vortexrdf.library names. -->
+          <execution>
+            <id>default-test</id>
+            <configuration>
+              <excludes>
+                <exclude>**/BundledLibraryTest.java</exclude>
+              </excludes>
+              <systemPropertyVariables>
+                <vortexrdf.library>${vortexrdf.library}</vortexrdf.library>
+                <vortexrdf.fixtures>${vortexrdf.fixtures}</vortexrdf.fixtures>
+              </systemPropertyVariables>
+            </configuration>
+          </execution>
+          <!-- BundledLibraryTest alone, in a JVM of its own: target/natives is on the class path, as the jar's
+               libraries would be, and nothing names a library (no -D property reaches it, VORTEX_RDF_JNI_LIB is
+               removed). Set in the POM, <test> keeps a command-line -Dtest from redirecting it. -->
+          <execution>
+            <id>bundled-library</id>
+            <goals>
+              <goal>test</goal>
+            </goals>
+            <configuration>
+              <test>BundledLibraryTest</test>
+              <additionalClasspathElements>
+                <additionalClasspathElement>${project.build.directory}/natives</additionalClasspathElement>
+              </additionalClasspathElements>
+              <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+              <systemPropertyVariables>
+                <vortexrdf.fixtures>${vortexrdf.fixtures}</vortexrdf.fixtures>
+                <vortexrdf.bundled.required>${vortexrdf.bundled.required}</vortexrdf.bundled.required>
+              </systemPropertyVariables>
+              <excludedEnvironmentVariables>
+                <excludedEnvironmentVariable>VORTEX_RDF_JNI_LIB</excludedEnvironmentVariable>
+              </excludedEnvironmentVariables>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>
