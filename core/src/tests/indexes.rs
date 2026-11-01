@@ -1111,9 +1111,18 @@ async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
                     to - from,
                     "{index:?} ({offset}, {limit})"
                 );
-                let expected = match served_component(view) {
-                    Some(_) => &served_order[from..to],
-                    None => &base_order[from..to],
+                // A window holding no row selects none, with no plan.
+                if from < to {
+                    assert_eq!(
+                        served_component(view).is_some(),
+                        served,
+                        "{index:?} ({offset}, {limit}) served as the match is"
+                    );
+                }
+                let expected = if served {
+                    &served_order[from..to]
+                } else {
+                    &base_order[from..to]
                 };
                 assert_eq!(
                     row_list(view).await,

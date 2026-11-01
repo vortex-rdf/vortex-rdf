@@ -126,7 +126,7 @@ async fn chained_match_on_a_window_filters_in_index_order() {
 
 /// A pattern chained on a served view no window or keep narrowed is matched
 /// as one match of both patterns, as before: the rows of the merged pattern.
-/// The run is wide enough for its view to name its pattern (1,428 rows).
+/// The run is wide enough for its view to name its pattern (1,429 rows).
 #[tokio::test]
 async fn chained_match_on_an_unnarrowed_view_is_unchanged() {
     let quads = modular_quads(10_000, 7, 11);
