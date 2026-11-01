@@ -4,8 +4,10 @@
 //! without a sort, and a located run's ids decline what they cannot answer by
 //! position.
 
+use std::sync::Arc;
+
 use super::*;
-use crate::store::indexes::LazyRowIds;
+use crate::store::indexes::{ComponentRun, LazyRowIds};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
@@ -87,7 +89,7 @@ async fn a_run_decodes_once_for_both_orders() {
     use vortex_array::arrays::PrimitiveArray;
 
     let rids = PrimitiveArray::from_iter([5u64, 1, 3]).into_array();
-    let ids = LazyRowIds::from_component_run(rids, false);
+    let ids = LazyRowIds::Component(Arc::new(ComponentRun::new(rids, false)));
     let rec = Recorder::start();
     let run_order = |ids: &LazyRowIds| ids.run_order_ids().unwrap().unwrap();
     assert_eq!(run_order(&ids).as_slice(), &[5, 1, 3]);

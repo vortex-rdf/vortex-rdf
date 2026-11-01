@@ -13,12 +13,12 @@ use vortex_array::{ArrayRef, IntoArray};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
-use super::{ComponentRows, ServeDecode, ServedRows, ServedSpan, served_order};
+use super::{ComponentRows, ServeDecode, ServedRows, ServedSpan};
 use crate::error::Result;
 use crate::observe::observe;
 use crate::store::SortOrder;
 use crate::store::array::into_struct_array;
-use crate::store::indexes::{COL_RID, LazyCells};
+use crate::store::indexes::{COL_RID, ComponentRun};
 use crate::store::layouts::ChunkDecode;
 use crate::store::probes::StructProbes;
 use crate::store::schema::{PRIMARY_COLUMNS, RowId, TermCode};
@@ -37,8 +37,6 @@ pub(crate) struct InMemoryServePlan {
     decode: ServeDecode,
     /// The serving component's name (`index:posg`, `index:ospg`).
     component: &'static str,
-    /// The order the view's reads follow ([`served_order`]).
-    order: SortOrder,
     /// The index component's rows, in child schema.
     array: ArrayRef,
     /// The rows of the component the match resolved: the run.
@@ -47,12 +45,9 @@ pub(crate) struct InMemoryServePlan {
     /// match) left the view; `None` for the match's own plan, which covers
     /// the whole run.
     narrowed: Option<ServedSpan>,
-    /// The run's slice of the component's rid column, the slice the view's
-    /// lazy ids hold.
-    rids: ArrayRef,
-    /// The caches the view's lazy ids fill, shared, so the run's ids decode
+    /// The run's row ids, shared with the view's lazy ids, so they decode
     /// once for the plan's reads and the ids alike.
-    cells: Arc<LazyCells>,
+    ids: Arc<ComponentRun>,
     /// The component's shared probe cache, so a small run reads
     /// point-by-point at its global positions instead of slicing (a slice's
     /// probe would be re-resolved per call).
@@ -62,29 +57,22 @@ pub(crate) struct InMemoryServePlan {
 impl InMemoryServePlan {
     /// A plan serving the contiguous `range` of the rows `array` of the
     /// in-memory index component named `component`, decoded through
-    /// `decode`, its keys binding the object or not (`object_bound`). `rids`
-    /// is the run's slice of the component's rid column and `cells` the
-    /// caches of the lazy ids built over it.
-    #[allow(clippy::too_many_arguments)]
+    /// `decode`; `ids` is the run's row ids, which the view's lazy ids share.
     pub(in crate::store::indexes) fn new(
         decode: ServeDecode,
         component: &'static str,
-        object_bound: bool,
         array: ArrayRef,
         range: Range<usize>,
-        rids: ArrayRef,
+        ids: Arc<ComponentRun>,
         probes: Arc<StructProbes>,
-        cells: Arc<LazyCells>,
     ) -> Self {
         Self {
             decode,
             component,
-            order: served_order(component, object_bound),
             array,
             run: range,
             narrowed: None,
-            rids,
-            cells,
+            ids,
             probes,
         }
     }
@@ -93,11 +81,9 @@ impl InMemoryServePlan {
         self.component
     }
 
-    /// The order the view's reads follow: the component's, `(p, o, s, g)`,
-    /// for an `index:posg` run with the object unbound, else base order (see
-    /// [`served_order`]).
+    /// The order the view's reads follow ([`ServeDecode::order`]).
     pub(crate) fn read_order(&self) -> SortOrder {
-        self.order
+        self.decode.order
     }
 
     /// The decode the plan's reads take, tombstones included.
@@ -126,12 +112,10 @@ impl InMemoryServePlan {
         Self {
             decode: self.decode.clone(),
             component: self.component,
-            order: self.order,
             array: self.array.clone(),
             run: self.run.clone(),
             narrowed: Some(span),
-            rids: self.rids.clone(),
-            cells: Arc::clone(&self.cells),
+            ids: Arc::clone(&self.ids),
             probes: Arc::clone(&self.probes),
         }
     }
@@ -203,10 +187,10 @@ impl InMemoryServePlan {
         Some(self.probes.by_name(&self.array, name).flatten()?.probe())
     }
 
-    /// The run's base row ids in the component's order, decoded once into
-    /// the caches the view's lazy ids share ([`LazyCells::run_order_of`]).
+    /// The run's base row ids in the component's order, decoded once for
+    /// the plan and the view's lazy ids ([`ComponentRun::run_order`]).
     fn run_rids(&self) -> Result<Buffer<RowId>> {
-        self.cells.run_order_of(&self.rids)
+        self.ids.run_order()
     }
 
     /// The base row ids of the component rows `range` (a part of the run), in

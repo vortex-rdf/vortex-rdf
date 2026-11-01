@@ -5,16 +5,16 @@
 //! file resolver.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use vortex_array::IntoArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 
 use super::components::{ComponentIdentity, IndexComponent};
 use super::serve::{InMemoryServePlan, ServeDecode};
-use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
+use super::{COL_RID, ComponentRun, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::Result;
 use crate::store::layouts::{PatternCodes, TermRef};
-use crate::store::schema::COL_O;
 
 /// What an index probes for a pattern shape it covers: the shared front half
 /// of resolution, chosen by the index's leaf module (`copy::choose`,
@@ -100,25 +100,23 @@ pub(super) fn resolve_in_memory(
     let run = run.expect("`IndexType::choose` hands out only probes with keys");
     let rows = component.rows()?;
     let rids = rows.unmasked_field_by_name(COL_RID)?.slice(run.clone())?;
-    let ids = LazyRowIds::from_component_run(rids.clone(), probe.rids_ascend);
+    let ids = Arc::new(ComponentRun::new(rids, probe.rids_ascend));
     // The matched quads are the contiguous matched run of the serving
     // component, so a read can slice them straight from it instead of
-    // gathering the primary columns at the row ids. The plan shares the ids'
-    // caches: the run's ids decode once for both.
+    // gathering the primary columns at the row ids. The plan shares the run
+    // with the lazy ids: its ids decode once for both.
     let serve = probe.serve.map(|decode| {
         InMemoryServePlan::new(
             decode,
             component.identity.name,
-            probe.keys.iter().any(|&(column, _)| column == COL_O),
             rows.clone().into_array(),
             run,
-            rids,
+            Arc::clone(&ids),
             component.probes_arc(),
-            ids.cells(),
         )
     });
     Ok(IndexResolution::Resolved {
-        row_ids: ResolvedRowIds::Lazy(ids),
+        row_ids: ResolvedRowIds::Lazy(LazyRowIds::Component(ids)),
         resolves: probe.resolves,
         serve,
     })

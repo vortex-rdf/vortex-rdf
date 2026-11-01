@@ -35,7 +35,6 @@ use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use super::COL_RID;
-use super::copy::CopyFamily;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::SortOrder;
@@ -60,6 +59,12 @@ pub(crate) struct ServeDecode {
     /// stores whole terms decodes them as strings, or dictionary codes under
     /// the Dictionary layout).
     pub(super) decode_layout: ResolvedLayout,
+    /// The order the plan's reads follow, which the copy that chose the run
+    /// knows: `(p, o, s, g)` for an `index:posg` run whose terms leave the
+    /// object unbound (`?p??`, `?p?g`); else base order, `(s, p, o, g)`, which
+    /// every other served run's order reduces to (its bound columns lead the
+    /// copy's sort).
+    pub(super) order: SortOrder,
 }
 
 impl ServeDecode {
@@ -308,19 +313,6 @@ impl ComponentRows {
             ComponentRows::Range(range) => range.len(),
             ComponentRows::Positions(positions) => positions.len(),
         }
-    }
-}
-
-/// The order a plan serving a run of the copy `component` reads in, its
-/// terms binding the object or not: `(p, o, s, g)` for the `index:posg` copy
-/// with the object unbound (`?p??`, `?p?g`); else base order,
-/// `(s, p, o, g)`, which every other served run's order reduces to (its
-/// bound columns lead the copy's sort).
-pub(super) fn served_order(component: &str, object_bound: bool) -> SortOrder {
-    if component == CopyFamily::Posg.identity().name && !object_bound {
-        SortOrder::Posg
-    } else {
-        SortOrder::Spog
     }
 }
 

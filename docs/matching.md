@@ -1497,7 +1497,8 @@ checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 | Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs) |
 | `RowSelection` / `ViewSelection`, `POINT_GATHER_MAX_ROWS` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | Gathering selected rows, point reads through cached probes | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) |
-| `IndexResolution`, `ResolvedRowIds`, `LazyRowIds`, planners | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs) |
+| `IndexResolution`, `ResolvedRowIds`, planners | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs) |
+| `LazyRowIds` and the in-memory `ComponentRun` they share with a serve plan | [`core/src/store/indexes/lazy_ids.rs`](../core/src/store/indexes/lazy_ids.rs) |
 | `IndexProbe` and the in-memory resolver | [`core/src/store/indexes/resolve.rs`](../core/src/store/indexes/resolve.rs) |
 | The file resolver, locating index runs on file, rid point reads and scans | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`rid_reads.rs`](../core/src/store/indexes/rid_reads.rs) |
 | Sorted quad copies (POSG / OSPG) | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs) |

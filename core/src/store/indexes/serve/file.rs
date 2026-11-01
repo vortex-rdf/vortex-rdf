@@ -30,7 +30,7 @@ use crate::store::read::chunks::extract_codes;
 use crate::store::scan::file_exprs::eq_conjunction;
 use crate::store::scan::file_reads::{component_point_rows, component_point_values};
 use crate::store::scan::file_scans::{read_all_rows, stream_rows};
-use crate::store::schema::{COL_O, TermCode};
+use crate::store::schema::TermCode;
 use crate::store::view::selection::point_sized;
 
 /// An index's serving plan for a file-backed view: the matched rows are those
@@ -379,15 +379,11 @@ impl FileServePlan {
         self.child.name
     }
 
-    /// The order the view's reads follow, the child's: `(p, o, s, g)` for
-    /// an `index:posg` run whose terms leave the object unbound, else base
-    /// order (see [`served_order`](super::served_order)). `None` for
-    /// a child whose rows are not globally sorted, read in its own order.
+    /// The order the view's reads follow, the child's
+    /// ([`ServeDecode::order`]). `None` for a child whose rows are not
+    /// globally sorted, read in its own order.
     pub(crate) fn read_order(&self) -> Option<SortOrder> {
-        let object_bound = self.constraints.iter().any(|&(column, _)| column == COL_O);
-        self.child
-            .sorted
-            .then(|| super::served_order(self.child.name, object_bound))
+        self.child.sorted.then_some(self.decode.order)
     }
 
     /// How the plan reads the view's rows, decided once from what it covers:
