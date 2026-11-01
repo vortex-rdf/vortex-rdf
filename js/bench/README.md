@@ -36,7 +36,7 @@ These knobs mean the same in every suite that reads one, in all four languages. 
 | `BENCH_DIM` | unset | JS, Python and Java compare | optional cube shorthand, `D³` rows; an explicit `BENCH_SIZE` wins |
 | `BENCH_GRAPHS_QUADS` | 8 | JS, Python and Java compare | named graphs the comparative bench asks for, before the generator's coprimality nudge |
 | `MUT_BATCH` | 10000; 512 in `benchmark.rs`, which clamps it to 1-4,095 | JS, Python, Java and Rust compare; `benchmark.rs` | quads per add/delete batch |
-| `BENCH_SLOW_PHASE_MS` | 30000 | Python, Java and Rust compare | a phase slower than this is measured once, without warmup (`samples: 1` in the row) |
+| `BENCH_TIMEOUT_MS` | 30000 | JS, Python, Java and Rust compare | the time limit, the same for every library: a cell whose first run takes longer than this is not measured, and reads `timeout`; `0` disables it |
 | `BENCH_SUBJ_RATIO` | 0.1 | JS and Python compare and CodSpeed; Java compare | distinct subjects / rows — the reciprocal of triples per subject |
 | `BENCH_OBJ_RATIO` | 0.5 | JS and Python compare and CodSpeed; Java compare | distinct objects / rows |
 | `BENCH_PREDICATES` | 32 | JS and Python compare and CodSpeed; JS dict-memory; Java compare | distinct predicates (a closed vocabulary) |
@@ -52,7 +52,6 @@ The dataset knobs, `BENCH_SUBJ_RATIO` through `BENCH_LITERAL_FRAC`, are read by 
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `BENCH_OUT` | `target/bench/js.json` | where the run's JSON is written; a relative path resolves against `bench/` |
-| `BENCH_TIMEOUT_MS` | 30000 | the time limit, the same for every library: a cell whose one probing run takes longer than this is not measured, and reads `timeout`; `0` disables it |
 | `CONSUME_BUDGET_MS` | 120000 | a consume loop past this budget throws and lands in the run's `failures` as a failed cell |
 | `WORKER_TIMEOUT_MS` | 1800000 | hard kill for a worker stalled inside a single wasm call |
 | `HDT_FILE` | `target/bench_js/data.hdt` | the natively built HDT artifact the hdt adapter opens; `scripts/refresh.sh --only js` builds it |

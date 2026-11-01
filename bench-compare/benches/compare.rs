@@ -236,6 +236,8 @@ struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     unsupported: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    timeout: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
 
@@ -273,32 +275,57 @@ fn row_from(id: &str, mut samples_ns: Vec<f64>, regime: Option<&'static str>) ->
         samples: n.to_string(),
         regime,
         unsupported: None,
+        timeout: None,
         reason: None,
     }
 }
 
-/// A cell with no measurement to make. Mirrors `unsupported_row` in
-/// `python/bench/worker.py` and `unsupportedRow` in `js/bench/shared.ts`: the null
-/// median keeps it out of its column's best/ratio arithmetic, and one word covers
-/// every kind of absence with the specifics in the tooltip.
-fn unsupported_row(id: &str, reason: &str) -> Row {
+/// A row with no measurement, whose cell reads `word` with `reason` as its
+/// tooltip. Mirrors `unmeasured_row` in `python/bench/worker.py` and
+/// `unmeasuredRow` in `js/bench/shared.ts`: the null median keeps it out of its
+/// column's best/ratio arithmetic, and one word covers each kind of absence with
+/// the specifics in the tooltip.
+fn unmeasured_row(id: &str, word: &str, reason: String) -> Row {
     let (group, variant) = split_id(id);
     Row {
         group,
         variant,
         id: id.to_string(),
-        fastest: "unsupported".into(),
-        slowest: "unsupported".into(),
-        median: "unsupported".into(),
-        mean: "unsupported".into(),
+        fastest: word.into(),
+        slowest: word.into(),
+        median: word.into(),
+        mean: word.into(),
         fastest_ns: None,
         slowest_ns: None,
         median_ns: None,
         mean_ns: None,
         samples: "0".into(),
         regime: None,
+        unsupported: None,
+        timeout: None,
+        reason: Some(reason),
+    }
+}
+
+/// A cell with no measurement to make: an operation the library cannot perform.
+fn unsupported_row(id: &str, reason: &str) -> Row {
+    Row {
         unsupported: Some(true),
-        reason: Some(reason.to_string()),
+        ..unmeasured_row(id, "unsupported", reason.to_string())
+    }
+}
+
+/// A cell whose first run took `ns`, past the time limit (see [`timeout_ns`]).
+fn timeout_row(id: &str, ns: f64, regime: Option<&'static str>) -> Row {
+    let reason = format!(
+        "not measured: one run took {}, past the {} s limit",
+        fmt_ns(ns),
+        timeout_ns() / 1e9
+    );
+    Row {
+        regime,
+        timeout: Some(true),
+        ..unmeasured_row(id, "timeout", reason)
     }
 }
 
@@ -309,18 +336,17 @@ fn split_id(id: &str) -> (String, Option<String>) {
     }
 }
 
-/// A phase whose single execution already exceeds this stops after one sample
-/// (and skips any remaining warmup); `0` disables the rule.
+/// The time limit, the same for every library in every suite: a cell whose
+/// first run, warmup or sample, takes longer than this is not measured, and
+/// reads "timeout" with that run's time as its tooltip; `0` disables it.
 ///
-/// Repetition exists to average out noise that is small relative to the
-/// reading — on a ten-second bulk phase the extra runs cost real minutes to
-/// remove noise orders of magnitude below the number. The reduced count is
-/// reported honestly through the row's `samples` field, which the dashboard
-/// displays. Same knob and default as the JS and Python workers.
-fn slow_phase_cutoff_ns() -> f64 {
+/// A cell that takes tens of seconds per run is orders of magnitude slower
+/// than the rest of its column, and its repetitions would cost minutes for one
+/// number. Same knob and default as the JS, Python and Java harnesses.
+fn timeout_ns() -> f64 {
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("BENCH_SLOW_PHASE_MS")
+        std::env::var("BENCH_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(30_000.0)
@@ -332,8 +358,8 @@ fn slow_phase_cutoff_ns() -> f64 {
 /// `id`'s row. Each run gets a fresh `setup()` product, made before its clock
 /// starts — the shape of the cold query arms (a per-iteration `open`) and of the
 /// mutation phases (a store rebuilt or cleared per iteration). Only `f(target)`
-/// is timed; whatever it returns is dropped after the clock stops. Both loops
-/// honor [`slow_phase_cutoff_ns`].
+/// is timed; whatever it returns is dropped after the clock stops. The first
+/// run, warmup or sample, is held to [`timeout_ns`].
 fn measure<T, R>(
     id: &str,
     mut setup: impl FnMut() -> T,
@@ -343,7 +369,6 @@ fn measure<T, R>(
     warmup: usize,
     regime: Option<&'static str>,
 ) {
-    let cutoff = slow_phase_cutoff_ns();
     let mut timed = || {
         let target = setup();
         let t = Instant::now();
@@ -352,21 +377,22 @@ fn measure<T, R>(
         drop(r);
         ns
     };
-    for _ in 0..warmup {
-        let ns = timed();
-        // A warmup run this long says the phase needs no more warming.
-        if cutoff > 0.0 && ns > cutoff {
-            break;
-        }
+    let first = timed();
+    let limit = timeout_ns();
+    if limit > 0.0 && first > limit {
+        rows.push(timeout_row(id, first, regime));
+        return;
     }
+    // The first run is a warmup run when there are any, else the first sample.
     let mut samples = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let ns = timed();
-        samples.push(ns);
-        // See `slow_phase_cutoff_ns`: one sample of a multi-ten-second phase.
-        if cutoff > 0.0 && samples.len() == 1 && ns > cutoff {
-            break;
-        }
+    if warmup == 0 {
+        samples.push(first);
+    }
+    for _ in 1..warmup {
+        timed();
+    }
+    while samples.len() < iters {
+        samples.push(timed());
     }
     rows.push(row_from(id, samples, regime));
 }

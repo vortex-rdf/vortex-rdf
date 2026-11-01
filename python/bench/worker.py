@@ -42,13 +42,14 @@ QUERY_WARMUP = int(os.environ.get("PY_BENCH_QUERY_WARMUP", 5))
 HEAVY_ITERS = int(os.environ.get("PY_BENCH_HEAVY_ITERS", 3))
 FULL_SCAN_ITERS = int(os.environ.get("PY_BENCH_FULL_SCAN_ITERS", 3))
 
-#: A phase whose single execution already exceeds this stops after one sample
-#: (and skips any remaining warmup); ``0`` disables the rule. Repetition exists
-#: to average out noise that is small relative to the reading, which a
-#: multi-ten-second phase does not need. The reduced count is reported through
-#: the row's ``samples`` field, which the dashboard displays. Same knob and
-#: default as the JS worker and ``compare.rs``.
-SLOW_PHASE_NS = float(os.environ.get("BENCH_SLOW_PHASE_MS", 30_000)) * 1e6
+#: The time limit, the same for every library in every suite: a cell whose
+#: first run, warmup or sample, takes longer than this is not measured, and
+#: reads "timeout" with that run's time as its tooltip; ``0`` disables it. A
+#: cell that takes tens of seconds per run is orders of magnitude slower than
+#: the rest of its column, and its repetitions would cost minutes for one
+#: number. Same knob and default as the JS worker, the Java harness and
+#: ``compare.rs``.
+TIMEOUT_NS = float(os.environ.get("BENCH_TIMEOUT_MS", 30_000)) * 1e6
 
 
 def fmt_ns(ns: float) -> str:
@@ -92,6 +93,7 @@ def measure(
     gc.freeze()
     try:
         remaining_warmup = warmup
+        first = True
         while len(samples) < iters:
             state = setup() if setup else None
             # Keeps an automatic collection from firing inside a timed call.
@@ -103,17 +105,16 @@ def measure(
             if teardown:
                 teardown(state, out)
             del state, out
+            # See TIMEOUT_NS: the first run decides.
+            if first:
+                first = False
+                if TIMEOUT_NS and elapsed > TIMEOUT_NS:
+                    rows.append(timeout_row(ident, elapsed, regime))
+                    return
             if remaining_warmup > 0:
                 remaining_warmup -= 1
-                # A warmup run this long says the phase needs no more warming:
-                # whatever caches move is noise beside a 30 s+ reading.
-                if SLOW_PHASE_NS and elapsed > SLOW_PHASE_NS:
-                    remaining_warmup = 0
                 continue
             samples.append(float(elapsed))
-            # See SLOW_PHASE_NS: one sample of a multi-ten-second phase.
-            if SLOW_PHASE_NS and len(samples) == 1 and elapsed > SLOW_PHASE_NS:
-                break
     finally:
         gc.unfreeze()
 
@@ -140,31 +141,48 @@ def measure(
     )
 
 
-def unsupported_row(ident: str, reason: str) -> dict:
-    """A row the dashboard renders as 'unsupported' rather than a missing cell.
+def unmeasured_row(ident: str, word: str, reason: str) -> dict:
+    """A row with no measurement, whose cell reads `word` rather than rendering
+    as a missing cell, which reads as a benchmark nobody ran.
 
     `median_ns` is None so the panel excludes it from the column's best/ratio
-    arithmetic: an operation a library cannot perform is not a slow operation.
-    The reason rides along as the cell's tooltip, so one word covers every kind
-    of absence on the page and the specifics stay one hover away.
+    arithmetic. The reason rides along as the cell's tooltip, so one word
+    covers each kind of absence on the page and the specifics stay one hover
+    away.
     """
     group, _, variant = ident.partition("::")
     return {
         "group": group,
         "variant": variant or None,
         "id": ident,
-        "unsupported": True,
         "reason": reason,
-        "fastest": "unsupported",
-        "slowest": "unsupported",
-        "median": "unsupported",
-        "mean": "unsupported",
+        "fastest": word,
+        "slowest": word,
+        "median": word,
+        "mean": word,
         "fastest_ns": None,
         "slowest_ns": None,
         "median_ns": None,
         "mean_ns": None,
         "samples": "0",
     }
+
+
+def unsupported_row(ident: str, reason: str) -> dict:
+    """A row the dashboard renders as 'unsupported': an operation a library
+    cannot perform is not a slow operation."""
+    return unmeasured_row(ident, "unsupported", reason) | {"unsupported": True}
+
+
+def timeout_row(ident: str, elapsed_ns: float, regime: Optional[str] = None) -> dict:
+    """A row the dashboard renders as 'timeout': a cell whose first run took
+    `elapsed_ns`, past the time limit (see TIMEOUT_NS)."""
+    reason = f"not measured: one run took {fmt_ns(elapsed_ns)}, past the {TIMEOUT_NS / 1e9:g} s limit"
+    return (
+        unmeasured_row(ident, "timeout", reason)
+        | {"timeout": True}
+        | ({"regime": regime} if regime else {})
+    )
 
 
 # ─── Memory ─────────────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class MeasureTest {
-	private static Knobs slowPhaseNs(long ns) {
+	private static Knobs timeoutNs(long ns) {
 		return new Knobs(10, 5, 3, 3, ns, 0);
 	}
 
@@ -21,7 +21,7 @@ class MeasureTest {
 		AtomicInteger bodies = new AtomicInteger(), teardowns = new AtomicInteger();
 		List<Map<String, Object>> rows = new ArrayList<>();
 
-		new Measure(slowPhaseNs(0)).time("list::S", "warm", 10, 5, null, s -> bodies.incrementAndGet(),
+		new Measure(timeoutNs(0)).time("list::S", "warm", 10, 5, null, s -> bodies.incrementAndGet(),
 				(s, out) -> teardowns.incrementAndGet(), rows);
 
 		assertEquals(15, bodies.get());
@@ -35,23 +35,47 @@ class MeasureTest {
 	}
 
 	@Test
-	void aSlowPhaseKeepsOneSample() throws Exception {
+	void aFirstRunPastTheLimitTimesTheCellOut() throws Exception {
+		AtomicInteger bodies = new AtomicInteger();
 		List<Map<String, Object>> rows = new ArrayList<>();
 
-		new Measure(slowPhaseNs(1)).time("ingest::list", null, 10, 5, null, s -> {
+		new Measure(timeoutNs(1)).time("ingest::list", null, 10, 5, null, s -> {
+			bodies.incrementAndGet();
 			Thread.sleep(2);
 			return null;
 		}, null, rows);
 
-		assertEquals("1", rows.get(0).get("samples"));
-		assertTrue(!rows.get(0).containsKey("regime"));
+		assertEquals(1, bodies.get());
+		Map<String, Object> row = rows.get(0);
+		assertEquals(true, row.get("timeout"));
+		assertEquals("timeout", row.get("median"));
+		assertNull(row.get("median_ns"));
+		assertEquals("0", row.get("samples"));
+		assertTrue(((String) row.get("reason")).startsWith("not measured: one run took "), (String) row.get("reason"));
+		assertTrue(!row.containsKey("regime"));
+	}
+
+	@Test
+	void onlyTheFirstRunIsHeldToTheLimit() throws Exception {
+		AtomicInteger bodies = new AtomicInteger();
+		List<Map<String, Object>> rows = new ArrayList<>();
+
+		new Measure(timeoutNs(1_000_000)).time("list::S", "warm", 3, 1, null, s -> {
+			if (bodies.getAndIncrement() > 0) {
+				Thread.sleep(2);
+			}
+			return null;
+		}, null, rows);
+
+		assertEquals(4, bodies.get());
+		assertEquals("3", rows.get(0).get("samples"));
 	}
 
 	@Test
 	void setupAndTeardownStayOutsideTheTiming() throws Exception {
 		List<Map<String, Object>> rows = new ArrayList<>();
 
-		new Measure(slowPhaseNs(0)).time("open::list", null, 3, 0, () -> {
+		new Measure(timeoutNs(0)).time("open::list", null, 3, 0, () -> {
 			Thread.sleep(50);
 			return null;
 		}, s -> null, (s, out) -> Thread.sleep(50), rows);
@@ -66,7 +90,7 @@ class MeasureTest {
 		List<Object> tornDown = new ArrayList<>();
 
 		IllegalStateException thrown = assertThrows(IllegalStateException.class,
-				() -> new Measure(slowPhaseNs(0)).time("list::S", "cold", 3, 0, () -> state, s -> {
+				() -> new Measure(timeoutNs(0)).time("list::S", "cold", 3, 0, () -> state, s -> {
 					throw new IllegalStateException("boom");
 				}, (s, out) -> tornDown.add(s), new ArrayList<>()));
 

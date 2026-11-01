@@ -29,7 +29,7 @@ Harness design:
   - Store sizes are allocated blocks.
 - **The fixture and the adapters.** Every adapter must pass `AdapterContract` on the committed 512-row fixture, which `run.py --fixture` regenerates. Each library's setup is in its module's adapter.
 
-The knobs this suite shares with the others (`BENCH_SIZE`, `BENCH_DIM`, `BENCH_GRAPHS_QUADS`, `MUT_BATCH`, `BENCH_SLOW_PHASE_MS` and the dataset shape) are in [the shared table](../../js/bench/README.md#shared-knobs). This suite's own:
+The knobs this suite shares with the others (`BENCH_SIZE`, `BENCH_DIM`, `BENCH_GRAPHS_QUADS`, `MUT_BATCH`, `BENCH_TIMEOUT_MS` and the dataset shape) are in [the shared table](../../js/bench/README.md#shared-knobs). This suite's own:
 
 | Var | Default | Meaning |
 | --- | --- | --- |
