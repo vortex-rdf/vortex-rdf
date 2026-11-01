@@ -1314,6 +1314,39 @@ async fn read_order_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     }
 }
 
+/// Both chunk exports of `view` at `batch_rows` rows a chunk give `expected`
+/// (its codes in the order its reads yield them, [`read_order_codes`]), row
+/// for row; returns each export's chunk lengths, code chunks' first.
+async fn assert_exports_at(
+    view: &VortexRdfStore,
+    expected: &[[TermCode; 4]],
+    batch_rows: usize,
+    tag: &str,
+) -> (Vec<usize>, Vec<usize>) {
+    let (rows, code_sizes) = collect_code_chunks(view, &QuadColumn::ALL, batch_rows).await;
+    assert_eq!(rows, expected, "{tag}: code_chunks at batch {batch_rows}");
+    let chunks = collect_row_chunks(view, batch_rows).await;
+    assert_eq!(
+        struct_chunk_codes(&chunks),
+        expected,
+        "{tag}: row_chunks at batch {batch_rows}"
+    );
+    (code_sizes, chunks.iter().map(|c| c.len()).collect())
+}
+
+/// `view`'s code chunks of `(o, s)` at `batch_rows` rows a chunk: those
+/// columns of `expected` (its four-column read), in the order asked.
+async fn assert_object_subject_chunks(
+    view: &VortexRdfStore,
+    expected: &[[TermCode; 4]],
+    batch_rows: usize,
+    tag: &str,
+) {
+    let (rows, _) = collect_code_chunks(view, &[QuadColumn::O, QuadColumn::S], batch_rows).await;
+    let want: Vec<[TermCode; 2]> = expected.iter().map(|r| [r[2], r[0]]).collect();
+    assert_eq!(rows, want, "{tag}: a column subset in the requested order");
+}
+
 /// The rows of one [`code_chunks`](VortexRdfStore::code_chunks) chunk over
 /// `N` columns, in the chunk's column order ([`code_rows`]). Asserts one
 /// buffer per column, all of one length.

@@ -480,3 +480,115 @@ async fn point_sized_served_runs_read_only_their_unpinned_codes() {
         }
     }
 }
+
+/// A view's code-chunk stream at `batch_rows`, drained, and whether it was read off its serving index's run.
+async fn drain_served(view: &VortexRdfStore, batch_rows: usize) -> (Vec<[TermCode; 4]>, bool) {
+    let rec = Recorder::start();
+    let (rows, _) = collect_code_chunks(view, &QuadColumn::ALL, batch_rows).await;
+    let served = served_streams(&rec);
+    assert!(served <= 1, "one stream, one run");
+    (rows, served == 1)
+}
+
+/// A served file run of any width streams off the index, whatever the batch, and its tombstoned rows are dropped.
+#[tokio::test]
+async fn served_runs_of_any_width_and_with_tombstones() {
+    // p0 holds every even row: a run of 4,096 rows, which chunks of 256 divide and chunks of 255 leave a short last
+    // one of; its objects cycle 0, 2, 1, so "object 0" is every third of its rows.
+    let (_dir, path) = write_store_file(
+        modular_quads(8_192, 2, 3),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p0 = iri("p0");
+    let view = matched_view(&store, None, Some(&p0), None, None).await;
+    let expected = read_order_codes(&view).await;
+    assert_eq!(expected.len(), 4_096);
+    for batch_rows in [256, 255] {
+        let (rows, served) = drain_served(&view, batch_rows).await;
+        assert!(served, "at {batch_rows}: read off the index");
+        assert_eq!(rows, expected, "at {batch_rows}: the run in read order");
+    }
+
+    let tombstoned = store
+        .delete_matching(None, None, Some(&plain_literal("object 0")), None)
+        .await
+        .unwrap();
+    let deleted = store
+        .dict_reader()
+        .unwrap()
+        .encode("\"object 0\"")
+        .await
+        .unwrap()
+        .unwrap();
+    let view = matched_view(&tombstoned, None, Some(&p0), None, None).await;
+    let (rows, served) = drain_served(&view, 256).await;
+    assert!(served, "tombstones keep the index path");
+    assert_eq!(
+        rows.len(),
+        4_096 - 1_366,
+        "every third row of the run deleted"
+    );
+    assert!(rows.iter().all(|row| row[2] != deleted), "no deleted row");
+    assert_eq!(
+        rows,
+        read_order_codes(&view).await,
+        "tombstoned: in read order"
+    );
+}
+
+/// Which runs stream off their index: an in-memory copy's, off its plan, and a point-sized file run, point by point
+/// with no scan; a by-reference index's run is read off the base.
+#[tokio::test]
+async fn which_runs_stream_off_the_index() {
+    let (_copy_dir, copy) = stock_file(LayoutStrategy::Dictionary, IndexConfig::Copy).await;
+    let (_reference_dir, reference) =
+        stock_file(LayoutStrategy::Dictionary, IndexConfig::Reference).await;
+    let memory = VortexRdfStore::from_file_in_memory(&copy).await.unwrap();
+    let reference = VortexRdfStore::from_file(&reference).await.unwrap();
+    for (name, store, off_the_index) in [
+        ("copy in memory", memory, true),
+        ("reference on file", reference, false),
+    ] {
+        let view = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+        let expected = read_order_codes(&view).await;
+        for batch_rows in [256, 65_536] {
+            let (rows, served) = drain_served(&view, batch_rows).await;
+            assert_eq!(served, off_the_index, "{name} at {batch_rows}");
+            assert_eq!(rows, expected, "{name} at {batch_rows}: in read order");
+        }
+    }
+    let mut quads = modular_quads(2_000, 7, 11);
+    for s in ["rare-a", "rare-b"] {
+        quads.push(make_quad(
+            &format!("http://example.org/{s}"),
+            "http://example.org/p0",
+            "rare",
+            GraphName::DefaultGraph,
+        ));
+    }
+    let (_rare_dir, rare) = write_store_file(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&rare).await.unwrap();
+    let view = matched_view(&store, None, None, Some(&plain_literal("rare")), None).await;
+    let rec = Recorder::start();
+    let (rows, served) = drain_served(&view, 256).await;
+    assert_eq!(rows.len(), 2);
+    assert!(served, "a point-sized run is read off the index");
+    assert_eq!(
+        rec.count(&Event::RowScan),
+        0,
+        "point by point, with no scan"
+    );
+    assert_eq!(
+        rows,
+        read_order_codes(&view).await,
+        "point-sized: in read order"
+    );
+}

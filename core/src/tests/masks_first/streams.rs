@@ -97,32 +97,25 @@ async fn test_masked_streams_are_taken() {
         ("P", matched_view(&store, None, Some(&p2), None, None).await),
         ("O", matched_view(&store, None, None, Some(&o3), None).await),
     ] {
+        // No index serves the view: both streams read in base order.
+        let want = base_ordered_codes(&view).await;
         for batch_rows in [1, 256, 65_536] {
             let mut rec = Recorder::start();
-            collect_code_chunks(&view, &QuadColumn::ALL, batch_rows).await;
+            let (rows, _) = collect_code_chunks(&view, &QuadColumn::ALL, batch_rows).await;
             assert_eq!(
                 rec.take_count(&Event::MasksFirstStream),
                 1,
                 "{name}: code_chunks at {batch_rows}"
             );
-            collect_row_chunks(&view, batch_rows).await;
+            assert_eq!(rows, want, "{name}: code_chunks rows at {batch_rows}");
+            let chunks = collect_row_chunks(&view, batch_rows).await;
             assert_eq!(
                 rec.take_count(&Event::MasksFirstStream),
                 1,
                 "{name}: row_chunks at {batch_rows}"
             );
-            drop(rec);
-            // No index serves the view: both streams read in base order.
-            let want = base_ordered_codes(&view).await;
             assert_eq!(
-                collect_code_chunks(&view, &QuadColumn::ALL, batch_rows)
-                    .await
-                    .0,
-                want,
-                "{name}: code_chunks rows at {batch_rows}"
-            );
-            assert_eq!(
-                struct_chunk_codes(&collect_row_chunks(&view, batch_rows).await),
+                struct_chunk_codes(&chunks),
                 want,
                 "{name}: row_chunks rows at {batch_rows}"
             );
