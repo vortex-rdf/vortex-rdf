@@ -21,7 +21,7 @@ mutations are layered on top of it as two side structures
 
 | Layer | For | Held as |
 |---|---|---|
-| **Tail** | additions | an in-memory array of appended rows beside the base ([`Tail`](../core/src/store/view/mod.rs#L567)) |
+| **Tail** | additions | an in-memory array of appended rows beside the base ([`Tail`](../core/src/store/view/mod.rs#L554)) |
 | **Tombstones** | deletions | one bit per base row, `None` until the first delete (the source's [`deleted`](../core/src/store/view/mod.rs#L56) field, whichever backend holds the base) |
 
 ```mermaid
@@ -82,8 +82,8 @@ flowchart TD
   geometrically — once their rows rival the flat prefix (with a floor so a
   small tail does not flatten on every add), or once enough chunks pile up
   that tail scans, which visit every chunk, would stop being dense
-  ([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L589),
-  [`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L593)). Amortized, each
+  ([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L576),
+  [`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L580)). Amortized, each
   appended row is copied O(1) times. An append keys only its own rows
   ([`TailKeys`](../core/src/store/view/tail_keys.rs)); the one that drops a
   tombstoned row renumbers the tail and keys it again.
@@ -95,7 +95,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`Tail::layout_for`](../core/src/store/view/mod.rs#L600));
+  stores Default-layout N-Triples strings ([`Tail::layout_for`](../core/src/store/view/mod.rs#L587));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -135,7 +135,7 @@ flowchart TD
   That set is folded into `deleted: Option<Mask>` — one bit per base row —
   carried beside the base, and separately beside the tail. A later delete
   unions into the existing mask
-  ([`union_deleted`](../core/src/store/view/mod.rs#L750)), so it composes
+  ([`union_deleted`](../core/src/store/view/mod.rs#L737)), so it composes
   with rows already tombstoned; the matcher does not consult the existing
   tombstones, and the union absorbs a doomed set that names already-dead
   rows.
@@ -152,7 +152,7 @@ flowchart TD
   — the single place a view becomes rows — so applying the mask cannot be
   forgotten by one of them. [`size`](../core/src/store/read/count.rs#L16) counts
   the live bits without gathering; the tail applies its own mask through
-  [`Tail::live_rows`](../core/src/store/view/mod.rs#L667).
+  [`Tail::live_rows`](../core/src/store/view/mod.rs#L654).
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L227) (through
@@ -184,7 +184,7 @@ decoded, once each, and merged with the tail's terms into the fresh
 dictionary, every base code moves to its term's new code (code order being
 term order) and the rows, the tail's beside them, sort as integers, each
 quad once. Otherwise from the quads spelled out
-([`live_raw_quads`](../core/src/store/read/rows.rs#L371): base rows first, in
+([`live_raw_quads`](../core/src/store/read/rows.rs#L370): base rows first, in
 view order, then tail rows, tombstones already excluded), put in order by
 [`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L108): the tail
 is sorted alone and merged into the sorted base in one linear pass (a base
@@ -344,8 +344,8 @@ runs the mutation on the store the view came from.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `TAIL_FLATTEN_FLOOR` | 1,024 | [`view/mod.rs`](../core/src/store/view/mod.rs#L589) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
-| `TAIL_MAX_CHUNKS` | 64 | [`view/mod.rs`](../core/src/store/view/mod.rs#L593) | the tail is flattened once it holds more chunks than this, whatever their row counts |
+| `TAIL_FLATTEN_FLOOR` | 1,024 | [`view/mod.rs`](../core/src/store/view/mod.rs#L576) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
+| `TAIL_MAX_CHUNKS` | 64 | [`view/mod.rs`](../core/src/store/view/mod.rs#L580) | the tail is flattened once it holds more chunks than this, whatever their row counts |
 | `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/write/compaction.rs#L173) | below this many tail rows `add_quads` never compacts |
 | `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/write/compaction.rs#L177) | compact once the tail reaches base / 10 |
 | `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/write/compaction.rs#L183) | compact once the tail could fill a builder chunk, however large the base |
