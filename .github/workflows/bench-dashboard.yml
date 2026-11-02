@@ -226,7 +226,7 @@ jobs:
       # Maven comes with the runner image. The Maven cache is keyed on the
       # bench's poms, which pin every library's version.
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '25'
