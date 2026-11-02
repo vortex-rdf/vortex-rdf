@@ -4,7 +4,7 @@ import java.util.Objects;
 
 /**
  * The terms of a store of the {@code dictionary} layout, by code: the translation between a term's N-Triples
- * spelling and the integer the store's columns hold. Obtained from {@link VortexStore#dictionary()}; it lives as
+ * spelling and the integer the store's columns hold. Obtained from {@link VortexRdfStore#dictionary()}; it lives as
  * long as the store and fails with {@link IllegalStateException} after it is closed. A file store reads terms from
  * the mapped file on demand.
  */
@@ -15,9 +15,9 @@ public final class TermDictionary {
 	 */
 	static final int CHUNKED_CODES = 10;
 
-	private final VortexStore store;
+	private final VortexRdfStore store;
 
-	TermDictionary(VortexStore store) {
+	TermDictionary(VortexRdfStore store) {
 		this.store = store;
 	}
 
@@ -27,8 +27,8 @@ public final class TermDictionary {
 	}
 
 	/**
-	 * The code of a term, or {@link VortexStore#NONE} when the dictionary lacks it, which in a code pattern is a free
-	 * position: check for it before putting the code into one. The spelling is tolerated: an IRI with or without
+	 * The code of a term, or {@link VortexRdfStore#NONE} when the dictionary lacks it, which in a code pattern is a
+	 * free position: check for it before putting the code into one. The spelling is tolerated: an IRI with or without
 	 * angle brackets, a literal with an explicit {@code xsd:string} type or an upper-case language tag, and the
 	 * default graph as {@code ""} all resolve to the stored form's code.
 	 */
@@ -92,7 +92,7 @@ public final class TermDictionary {
 			blanks = new CodeRange(r[5], r[6]);
 		}
 
-		/** The code of {@code ""}, the default graph's name, or {@link VortexStore#NONE} when it is not a term. */
+		/** The code of {@code ""}, the default graph's name, or {@link VortexRdfStore#NONE} when it is not a term. */
 		public long defaultGraph() {
 			return defaultGraph;
 		}

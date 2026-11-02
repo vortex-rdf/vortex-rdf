@@ -132,9 +132,9 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 
 ```java
 import java.nio.file.Paths;
-import org.vortexrdf.VortexStore;
+import org.vortexrdf.VortexRdfStore;
 
-try (VortexStore store = VortexStore.open(Paths.get("data.vortex"))) {   // memory-mapped, layout auto-detected
+try (VortexRdfStore store = VortexRdfStore.open(Paths.get("data.vortex"))) {   // memory-mapped, layout auto-detected
     store.size();                                                         // number of quads
     store.count(null, "<http://xmlns.com/foaf/0.1/name>", null, null);    // match count, no terms materialized
     for (String[] quad : store.quads(null, "<http://xmlns.com/foaf/0.1/name>", null, null)) {

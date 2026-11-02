@@ -34,13 +34,13 @@ import org.junit.jupiter.params.provider.ValueSource;
 class IteratorTest {
 	@BeforeAll
 	static void loadOracle() throws IOException {
-		VortexStoreTest.loadOracle();
+		VortexRdfStoreTest.loadOracle();
 	}
 
 	private static List<String> drained(QuadIterator rows) {
 		List<String> out = new ArrayList<>();
 		while (rows.hasNext()) {
-			out.add(VortexStoreTest.key(rows.next()));
+			out.add(VortexRdfStoreTest.key(rows.next()));
 		}
 		return out;
 	}
@@ -49,9 +49,9 @@ class IteratorTest {
 	 * The rows a stream of pattern {@code p} must yield, in order: {@code quads()}'s, whose rows are the oracle's, in
 	 * the oracle's order on a store without the copy index (a pattern the copy index serves reads in its order).
 	 */
-	private static List<String> readOrder(VortexStore store, String name, String[] p, String tag) {
+	private static List<String> readOrder(VortexRdfStore store, String name, String[] p, String tag) {
 		List<String> want = ChunkedTransferTest.joined(store.quads(p[0], p[1], p[2], p[3]));
-		List<String> oracle = VortexStoreTest.inOracleOrder(p);
+		List<String> oracle = VortexRdfStoreTest.inOracleOrder(p);
 		assertEquals(new TreeSet<>(oracle), new TreeSet<>(want), tag + ": the oracle's rows");
 		assertEquals(oracle.size(), want.size(), tag + ": each row once");
 		if (!name.equals("copy")) {
@@ -62,16 +62,16 @@ class IteratorTest {
 
 	/** The rows of a code-chunk stream, spelled through {@code decode}. */
 	private static List<String> drainedCodes(CodeChunks chunks, TermDictionary dict, int maxRows) {
-		ByteBuffer out = ByteBuffer.allocateDirect(maxRows * VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
+		ByteBuffer out = ByteBuffer.allocateDirect(maxRows * VortexRdfStore.ROW_BYTES).order(ByteOrder.nativeOrder());
 		List<String> rows = new ArrayList<>();
 		for (int n; (n = chunks.next(out, maxRows)) > 0;) {
 			assertTrue(n <= maxRows);
 			for (int row = 0; row < n; row++) {
 				String[] q = new String[4];
 				for (int i = 0; i < 4; i++) {
-					q[i] = dict.decode(out.getLong(row * VortexStore.ROW_BYTES + 8 * i));
+					q[i] = dict.decode(out.getLong(row * VortexRdfStore.ROW_BYTES + 8 * i));
 				}
-				rows.add(VortexStoreTest.key(q));
+				rows.add(VortexRdfStoreTest.key(q));
 			}
 		}
 		return rows;
@@ -81,11 +81,11 @@ class IteratorTest {
 	@ValueSource(strings = { "dictionary", "copy", "reference", "default", "typed" })
 	void iteratorsYieldTheReadInOrder(String name) {
 		for (boolean inMemory : new boolean[] { false, true }) {
-			try (VortexStore store = VortexStoreTest.open(name, inMemory)) {
-				for (String[] p : VortexStoreTest.patterns()) {
+			try (VortexRdfStore store = VortexRdfStoreTest.open(name, inMemory)) {
+				for (String[] p : VortexRdfStoreTest.patterns()) {
 					String read = name + " inMemory=" + inMemory + " " + Arrays.toString(p);
 					List<String> want = readOrder(store, name, p, read);
-					for (int batchRows : new int[] { 1, 7, VortexStore.DEFAULT_BATCH_ROWS }) {
+					for (int batchRows : new int[] { 1, 7, VortexRdfStore.DEFAULT_BATCH_ROWS }) {
 						String tag = read + " batch " + batchRows;
 						try (QuadIterator rows = store.iterateQuads(p[0], p[1], p[2], p[3], batchRows)) {
 							assertEquals(want, drained(rows), tag);
@@ -100,15 +100,15 @@ class IteratorTest {
 	@ParameterizedTest
 	@ValueSource(strings = { "dictionary", "copy", "reference" })
 	void codeChunksYieldTheReadInOrder(String name) {
-		try (VortexStore store = VortexStoreTest.open(name, false)) {
+		try (VortexRdfStore store = VortexRdfStoreTest.open(name, false)) {
 			TermDictionary dict = store.dictionary().get();
 			long terms = dict.size();
-			for (String[] p : VortexStoreTest.patterns()) {
+			for (String[] p : VortexRdfStoreTest.patterns()) {
 				long[] pattern = new long[4];
 				for (int i = 0; i < 4; i++) {
 					// An absent term: a code past the dictionary, not NONE, which would free the position.
-					long code = p[i] == null ? VortexStore.NONE : dict.encode(p[i]);
-					pattern[i] = p[i] != null && code == VortexStore.NONE ? terms + 7 : code;
+					long code = p[i] == null ? VortexRdfStore.NONE : dict.encode(p[i]);
+					pattern[i] = p[i] != null && code == VortexRdfStore.NONE ? terms + 7 : code;
 				}
 				List<String> want = readOrder(store, name, p, name + " " + Arrays.toString(p));
 				for (int maxRows : new int[] { 1, 5, 4_096 }) {
@@ -124,21 +124,21 @@ class IteratorTest {
 
 	@Test
 	void streamClosesItsIterator() {
-		try (VortexStore store = VortexStoreTest.open("dictionary", false)) {
+		try (VortexRdfStore store = VortexRdfStoreTest.open("dictionary", false)) {
 			try (Stream<String[]> rows = store.iterateQuads(null, null, null, null).stream()) {
 				assertEquals(2, rows.limit(2).count());
 			}
 			assertEquals(0, Native.openHandles());
-			List<String> all = store.iterateQuads(null, null, null, null).stream().map(VortexStoreTest::key)
+			List<String> all = store.iterateQuads(null, null, null, null).stream().map(VortexRdfStoreTest::key)
 					.collect(Collectors.toList());
-			assertEquals(VortexStoreTest.inOracleOrder(new String[4]), all);
+			assertEquals(VortexRdfStoreTest.inOracleOrder(new String[4]), all);
 			assertEquals(0, Native.openHandles(), "a drained iterator frees its stream");
 		}
 	}
 
 	@Test
 	void storeCloseEndsIteratorsOnOtherThreads() throws Exception {
-		VortexStore store = VortexStoreTest.open("dictionary", false);
+		VortexRdfStore store = VortexRdfStoreTest.open("dictionary", false);
 		CountDownLatch started = new CountDownLatch(1);
 		AtomicReference<Throwable> thrown = new AtomicReference<>();
 		int[] rows = { 0 };
@@ -161,7 +161,7 @@ class IteratorTest {
 		assertTrue(rows[0] > 0, "rows before the close");
 		Throwable t = thrown.get();
 		// The store may close after the puller drained every row; otherwise the puller sees the close.
-		if (rows[0] < VortexStoreTest.quads.size()) {
+		if (rows[0] < VortexRdfStoreTest.quads.size()) {
 			assertTrue(t instanceof IllegalStateException, String.valueOf(t));
 		} else {
 			assertNull(t);
@@ -171,17 +171,17 @@ class IteratorTest {
 
 	@Test
 	void forgottenIteratorsAreFreedByTheStore() {
-		VortexStore store = VortexStoreTest.open("dictionary", false);
+		VortexRdfStore store = VortexRdfStoreTest.open("dictionary", false);
 		List<Object> forgotten = new ArrayList<>();
 		for (int i = 0; i < 3; i++) {
 			QuadIterator it = store.iterateQuads(null, null, null, null, 7);
 			it.next();
 			forgotten.add(it);
 		}
-		ByteBuffer out = ByteBuffer.allocateDirect(VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
+		ByteBuffer out = ByteBuffer.allocateDirect(VortexRdfStore.ROW_BYTES).order(ByteOrder.nativeOrder());
 		for (int i = 0; i < 2; i++) {
-			CodeChunks chunks = store.matchCodeChunks(VortexStore.NONE, VortexStore.NONE, VortexStore.NONE,
-					VortexStore.NONE, 7);
+			CodeChunks chunks = store.matchCodeChunks(VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE,
+					VortexRdfStore.NONE, 7);
 			assertEquals(1, chunks.next(out, 1));
 			forgotten.add(chunks);
 		}
@@ -193,8 +193,8 @@ class IteratorTest {
 
 	@Test
 	void closedOrExhaustedIteratorsAnswerNoMoreRows() {
-		VortexStore store = VortexStoreTest.open("dictionary", false);
-		String subject = VortexStoreTest.quads.get(0)[0];
+		VortexRdfStore store = VortexRdfStoreTest.open("dictionary", false);
+		String subject = VortexRdfStoreTest.quads.get(0)[0];
 		QuadIterator exhausted = store.iterateQuads(subject, null, null, null);
 		drained(exhausted);
 		assertThrows(NoSuchElementException.class, exhausted::next);
@@ -202,11 +202,11 @@ class IteratorTest {
 		closed.close();
 		closed.close();
 		assertFalse(closed.hasNext());
-		CodeChunks chunks = store.matchCodeChunks(VortexStore.NONE, VortexStore.NONE, VortexStore.NONE,
-				VortexStore.NONE);
+		CodeChunks chunks = store.matchCodeChunks(VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE,
+				VortexRdfStore.NONE);
 		chunks.close();
 		chunks.close();
-		ByteBuffer out = ByteBuffer.allocateDirect(VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
+		ByteBuffer out = ByteBuffer.allocateDirect(VortexRdfStore.ROW_BYTES).order(ByteOrder.nativeOrder());
 		assertEquals(0, chunks.next(out, 1));
 		QuadIterator open = store.iterateQuads(null, null, null, null, 1);
 		open.next();
@@ -224,7 +224,7 @@ class IteratorTest {
 
 	@Test
 	void twoThreadsPullingOneIteratorDoNotCrash() throws Exception {
-		try (VortexStore store = VortexStoreTest.open("dictionary", false)) {
+		try (VortexRdfStore store = VortexRdfStoreTest.open("dictionary", false)) {
 			QuadIterator it = store.iterateQuads(null, null, null, null, 1);
 			Runnable drain = () -> {
 				try {
@@ -249,19 +249,20 @@ class IteratorTest {
 
 	@Test
 	void badArgumentsAreRefused() {
-		try (VortexStore store = VortexStoreTest.open("dictionary", false);
-				VortexStore flat = VortexStoreTest.open("default", false)) {
+		try (VortexRdfStore store = VortexRdfStoreTest.open("dictionary", false);
+				VortexRdfStore flat = VortexRdfStoreTest.open("default", false)) {
 			assertThrows(IllegalArgumentException.class, () -> store.iterateQuads(null, null, null, null, 0));
 			assertThrows(IllegalArgumentException.class,
-					() -> store.matchCodeChunks(VortexStore.NONE, VortexStore.NONE, VortexStore.NONE, VortexStore.NONE, 0));
+					() -> store.matchCodeChunks(VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE,
+							VortexRdfStore.NONE, 0));
 			VortexException malformed = assertThrows(VortexException.class,
 					() -> store.iterateQuads(null, "not a term", null, null));
 			assertTrue(malformed.getMessage().contains("pattern predicate"), malformed.getMessage());
 			VortexException none = assertThrows(VortexException.class,
-					() -> flat.matchCodeChunks(VortexStore.NONE, VortexStore.NONE, VortexStore.NONE, VortexStore.NONE));
+					() -> flat.matchCodeChunks(VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE));
 			assertTrue(none.getMessage().contains("no term dictionary"), none.getMessage());
-			try (CodeChunks chunks = store.matchCodeChunks(VortexStore.NONE, VortexStore.NONE, VortexStore.NONE,
-					VortexStore.NONE)) {
+			try (CodeChunks chunks = store.matchCodeChunks(VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE,
+					VortexRdfStore.NONE)) {
 				ByteBuffer heap = ByteBuffer.allocate(64);
 				ByteBuffer small = ByteBuffer.allocateDirect(8).order(ByteOrder.nativeOrder());
 				ByteBuffer swapped = ByteBuffer.allocateDirect(64)
@@ -280,7 +281,7 @@ class IteratorTest {
 
 	@Test
 	void anUnreachableIteratorIsFreed() throws InterruptedException {
-		try (VortexStore store = VortexStoreTest.open("dictionary", false)) {
+		try (VortexRdfStore store = VortexRdfStoreTest.open("dictionary", false)) {
 			forget(store);
 			long deadline = System.currentTimeMillis() + 10_000;
 			while (Native.openHandles() != 0) {
@@ -294,7 +295,7 @@ class IteratorTest {
 	}
 
 	/** Opens an iterator, pulls a row and drops it, in a frame of its own so nothing keeps it reachable. */
-	private static void forget(VortexStore store) {
+	private static void forget(VortexRdfStore store) {
 		QuadIterator it = store.iterateQuads(null, null, null, null, 7);
 		it.next();
 		assertEquals(1, Native.openHandles());

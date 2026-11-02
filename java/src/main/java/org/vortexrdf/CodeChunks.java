@@ -4,8 +4,8 @@ import java.nio.ByteBuffer;
 
 /**
  * The term codes of the quads matching a pattern of codes, read a chunk at a time
- * ({@link VortexStore#matchCodeChunks}), in the match's order, written into the caller's buffer as
- * {@link VortexStore#matchCodes(long, long, long, long, long, ByteBuffer, int)} writes them. Close it when done, or
+ * ({@link VortexRdfStore#matchCodeChunks}), in the match's order, written into the caller's buffer as
+ * {@link VortexRdfStore#matchCodes(long, long, long, long, long, ByteBuffer, int)} writes them. Close it when done, or
  * drain it: either frees its native stream, as does closing its store, and one left unreachable unclosed is freed by a
  * cleaner.
  *
@@ -22,7 +22,7 @@ public final class CodeChunks implements AutoCloseable {
 
 	/**
 	 * Writes the next rows, up to {@code maxRows}, as {@code (s, p, o, g)} codes of eight bytes each
-	 * ({@link VortexStore#ROW_BYTES} a row), from the start of {@code out} (its position and limit are neither read
+	 * ({@link VortexRdfStore#ROW_BYTES} a row), from the start of {@code out} (its position and limit are neither read
 	 * nor changed), and returns the rows written: 0 once every row was.
 	 *
 	 * @param out a writable direct buffer in native byte order of at least {@code maxRows * ROW_BYTES} bytes
@@ -30,7 +30,7 @@ public final class CodeChunks implements AutoCloseable {
 	 * @throws IllegalStateException if the store was closed before this stream ended
 	 */
 	public int next(ByteBuffer out, int maxRows) {
-		VortexStore.checkCodeBuffer(out, maxRows);
+		VortexRdfStore.checkCodeBuffer(out, maxRows);
 		if (maxRows < 1) {
 			throw new IllegalArgumentException("maxRows must be at least 1");
 		}

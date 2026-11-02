@@ -4,7 +4,7 @@ Java bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a colu
 
 They are a thin layer over the Rust core, for any JVM program that wants to query a store: a JNI library (`libvortex_rdf_jni`, this crate) and the small `org.vortexrdf` API on top of it. They are not tied to a query engine; `vortex-qendpoint`, a separate repository, is one integration built on them: it serves a store through qEndpoint (RDF4J) in place of an HDT file.
 
-Requires Java 11 or later. The API is `org.vortexrdf.VortexStore`, with `TermDictionary` for term codes and `QuadIterator` and `CodeChunks` for streaming a match; every class is documented in its Javadoc.
+Requires Java 11 or later. The API is `org.vortexrdf.VortexRdfStore`, with `TermDictionary` for term codes and `QuadIterator` and `CodeChunks` for streaming a match; every class is documented in its Javadoc.
 
 ## Build
 
@@ -29,9 +29,9 @@ On Java 24 and later, loading a native library is a restricted operation. Add `-
 
 ```java
 import java.nio.file.Paths;
-import org.vortexrdf.VortexStore;
+import org.vortexrdf.VortexRdfStore;
 
-try (VortexStore store = VortexStore.open(Paths.get("data.vortex"))) {   // memory-mapped, layout auto-detected
+try (VortexRdfStore store = VortexRdfStore.open(Paths.get("data.vortex"))) {   // memory-mapped, layout auto-detected
     store.size();                                                         // number of quads
     store.count(null, "<http://xmlns.com/foaf/0.1/name>", null, null);    // match count, no terms materialized
     for (String[] quad : store.quads(null, "<http://xmlns.com/foaf/0.1/name>", null, null)) {
@@ -59,7 +59,7 @@ They work on every layout, with identical results. `quads` is served from the te
 A store of the `dictionary` layout keeps each term once in a sorted dictionary and its columns hold integer **term codes**. A query engine that holds codes (a join's per-binding lookup, say) can ask for a pattern of codes and skip the terms altogether.
 
 - A code is a non-negative `long`.
-- `VortexStore.NONE` (`-1`) is a free position of a pattern.
+- `VortexRdfStore.NONE` (`-1`) is a free position of a pattern.
 - `encode` answers that same `NONE` for a term the store lacks. Check its answer before putting it into a pattern: there `NONE` is a free position, so an absent term would match every quad.
 
 These calls raise `VortexException` on a store without a dictionary, which `store.dictionary()` tells in advance.
@@ -71,16 +71,16 @@ dict.decode(name);                                            // N-Triples spell
 dict.decodeMany(codes);                                       // a whole column, its distinct terms once a chunk
 dict.ranges().literals().contains(code);                      // a code's term kind: literals, IRIs or blank nodes
 
-if (name != VortexStore.NONE) {                               // the store holds the term
-    long n = store.countCodes(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE);
+if (name != VortexRdfStore.NONE) {                            // the store holds the term
+    long n = store.countCodes(VortexRdfStore.NONE, name, VortexRdfStore.NONE, VortexRdfStore.NONE);
 
-    ByteBuffer rows = ByteBuffer.allocateDirect(4096 * VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
-    int got = store.matchCodes(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE, 0, rows, 4096);
+    ByteBuffer rows = ByteBuffer.allocateDirect(4096 * VortexRdfStore.ROW_BYTES).order(ByteOrder.nativeOrder());
+    int got = store.matchCodes(VortexRdfStore.NONE, name, VortexRdfStore.NONE, VortexRdfStore.NONE, 0, rows, 4096);
     for (int i = 0; i < got; i++) {
-        long s = rows.getLong(i * VortexStore.ROW_BYTES), o = rows.getLong(i * VortexStore.ROW_BYTES + 16);
+        long s = rows.getLong(i * VortexRdfStore.ROW_BYTES), o = rows.getLong(i * VortexRdfStore.ROW_BYTES + 16);
     }
 
-    try (CodeChunks chunks = store.matchCodeChunks(VortexStore.NONE, name, VortexStore.NONE, VortexStore.NONE)) {
+    try (CodeChunks chunks = store.matchCodeChunks(VortexRdfStore.NONE, name, VortexRdfStore.NONE, VortexRdfStore.NONE)) {
         for (int n; (n = chunks.next(rows, 4096)) > 0; ) {          // the whole match, up to 4096 rows a call
             // rows 0 .. n-1 of the buffer, as above
         }
@@ -96,7 +96,7 @@ if (name != VortexStore.NONE) {                               // the store holds
 
 When a file store can locate the pattern's rows by binary search (a prefix of the quad table's `(s, p, o, g)` order, or with `secondary-by-copy` the predicate- and object-led orders), a code lookup is one located run with no dictionary search; it takes the general path otherwise, and returns the same rows.
 
-For measurements, two switches are read once when the native library loads: `VORTEX_RDF_LOCATE=0` makes every code lookup take the general path, and `VORTEX_RDF_COUNTERS=1` makes `VortexStore.engineCounters()` count the encoded-search work (leaves searched encoded or decoded, probes, gathers, equality scans; all zero without it).
+For measurements, two switches are read once when the native library loads: `VORTEX_RDF_LOCATE=0` makes every code lookup take the general path, and `VORTEX_RDF_COUNTERS=1` makes `VortexRdfStore.engineCounters()` count the encoded-search work (leaves searched encoded or decoded, probes, gathers, equality scans; all zero without it).
 
 ## Streaming a match
 
@@ -120,7 +120,7 @@ Both read a match in the order `quads` and `matchCodes` return it: base row orde
 
 ## Threads, memory and lifetime
 
-A store is safe to query from any number of threads. `close()` waits for the calls in progress, and later calls raise `IllegalStateException`. A file store is memory-mapped: what stays in RAM is the operating system's page cache plus a few MiB of rebuilt dictionary windows, and the file must not be modified while open (replace it by renaming a new file over it). `VortexStore.open(path, true)` loads the whole store instead. Besides its result, a read holds one chunk of terms in transit: at most 16 MiB of them, or one row when that row's terms are larger.
+A store is safe to query from any number of threads. `close()` waits for the calls in progress, and later calls raise `IllegalStateException`. A file store is memory-mapped: what stays in RAM is the operating system's page cache plus a few MiB of rebuilt dictionary windows, and the file must not be modified while open (replace it by renaming a new file over it). `VortexRdfStore.open(path, true)` loads the whole store instead. Besides its result, a read holds one chunk of terms in transit: at most 16 MiB of them, or one row when that row's terms are larger.
 
 An iterator (`QuadIterator` or `CodeChunks`) holds a native stream of its match until it ends: drain it or close it, best with try-with-resources. An open iterator holds one chunk of the match, at most `batchRows` rows, besides the rows it has handed out. Closing the store ends its iterators: one that has not ended then raises `IllegalStateException`, and one that has ended answers no more rows. An iterator left unreachable without being closed is freed by a cleaner, when the garbage collector finds it. An iterator is not thread-safe; give each thread its own.
 

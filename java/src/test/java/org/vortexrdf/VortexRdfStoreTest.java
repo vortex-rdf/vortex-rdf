@@ -38,7 +38,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * each native method, how its arguments arrive (null, "", -1, offsets, limits, buffers), its errors, and a store's
  * lifetime and threads.
  */
-class VortexStoreTest {
+class VortexRdfStoreTest {
 	private static Path fixtures;
 	static List<String[]> quads;
 
@@ -54,8 +54,8 @@ class VortexStoreTest {
 		assertTrue(quads.size() > 100);
 	}
 
-	static VortexStore open(String name, boolean inMemory) {
-		return VortexStore.open(fixtures.resolve(name + ".vortex"), inMemory);
+	static VortexRdfStore open(String name, boolean inMemory) {
+		return VortexRdfStore.open(fixtures.resolve(name + ".vortex"), inMemory);
 	}
 
 	static String key(String[] quad) {
@@ -63,7 +63,7 @@ class VortexStoreTest {
 	}
 
 	private static Set<String> keys(List<String[]> rows) {
-		return rows.stream().map(VortexStoreTest::key).collect(Collectors.toCollection(TreeSet::new));
+		return rows.stream().map(VortexRdfStoreTest::key).collect(Collectors.toCollection(TreeSet::new));
 	}
 
 	/** The oracle's rows matching a pattern, tab-joined, in the oracle's order. */
@@ -75,7 +75,7 @@ class VortexStoreTest {
 				}
 			}
 			return true;
-		}).map(VortexStoreTest::key).collect(Collectors.toList());
+		}).map(VortexRdfStoreTest::key).collect(Collectors.toList());
 	}
 
 	/** The oracle's quads matching a pattern, as a set. */
@@ -95,7 +95,7 @@ class VortexStoreTest {
 	@ParameterizedTest
 	@ValueSource(strings = { "dictionary", "copy", "reference", "default", "typed" })
 	void termPatternsCrossTheBoundary(String name) {
-		try (VortexStore store = open(name, false); VortexStore loaded = open(name, true)) {
+		try (VortexRdfStore store = open(name, false); VortexRdfStore loaded = open(name, true)) {
 			assertEquals(quads.size(), store.size());
 			assertEquals(store.size(), loaded.size());
 			assertEquals(!name.equals("default") && !name.equals("typed"), store.dictionary().isPresent());
@@ -113,7 +113,7 @@ class VortexStoreTest {
 	@ParameterizedTest
 	@ValueSource(strings = { "dictionary", "copy", "reference" })
 	void codesCrossTheBoundary(String name) {
-		try (VortexStore store = open(name, false)) {
+		try (VortexRdfStore store = open(name, false)) {
 			TermDictionary dict = store.dictionary().get();
 			long terms = dict.size();
 			TermDictionary.Ranges ranges = dict.ranges();
@@ -122,7 +122,7 @@ class VortexStoreTest {
 				kinds += r.end() - r.start();
 			}
 			assertEquals(dict.encode(""), ranges.defaultGraph());
-			assertEquals(terms, kinds + (ranges.defaultGraph() == VortexStore.NONE ? 0 : 1));
+			assertEquals(terms, kinds + (ranges.defaultGraph() == VortexRdfStore.NONE ? 0 : 1));
 
 			Set<String> distinct = new TreeSet<>();
 			for (String[] q : quads) {
@@ -133,27 +133,27 @@ class VortexStoreTest {
 			for (int i = 0; i < codes.length; i++) {
 				String t = spellings.get(i);
 				codes[i] = dict.encode(t);
-				assertNotEquals(VortexStore.NONE, codes[i], t);
+				assertNotEquals(VortexRdfStore.NONE, codes[i], t);
 				assertEquals(t, dict.decode(codes[i]));
 				TermDictionary.CodeRange kind = t.startsWith("\"") ? ranges.literals()
 						: t.startsWith("_:") ? ranges.blanks() : ranges.iris();
 				assertEquals(!t.isEmpty(), kind.contains(codes[i]), t);
 			}
 			assertArrayEquals(spellings.toArray(new String[0]), dict.decodeMany(codes));
-			assertEquals(VortexStore.NONE, dict.encode("<http://example.org/absent>"));
+			assertEquals(VortexRdfStore.NONE, dict.encode("<http://example.org/absent>"));
 			assertNull(dict.decode(terms + 5));
-			assertNull(dict.decode(VortexStore.NONE));
+			assertNull(dict.decode(VortexRdfStore.NONE));
 			assertArrayEquals(new String[] { spellings.get(0), null, null },
-					dict.decodeMany(new long[] { codes[0], VortexStore.NONE, terms + 1 }));
+					dict.decodeMany(new long[] { codes[0], VortexRdfStore.NONE, terms + 1 }));
 
-			ByteBuffer out = ByteBuffer.allocateDirect(5 * VortexStore.ROW_BYTES).order(ByteOrder.nativeOrder());
+			ByteBuffer out = ByteBuffer.allocateDirect(5 * VortexRdfStore.ROW_BYTES).order(ByteOrder.nativeOrder());
 			for (String[] p : patterns()) {
 				Set<String> want = scan(p);
 				long[] pattern = new long[4];
 				for (int i = 0; i < 4; i++) {
 					// An absent term: a code past the dictionary, not NONE, which would free the position.
-					long code = p[i] == null ? VortexStore.NONE : dict.encode(p[i]);
-					pattern[i] = p[i] != null && code == VortexStore.NONE ? terms + 7 : code;
+					long code = p[i] == null ? VortexRdfStore.NONE : dict.encode(p[i]);
+					pattern[i] = p[i] != null && code == VortexRdfStore.NONE ? terms + 7 : code;
 				}
 				String tag = name + " " + Arrays.toString(p);
 				assertEquals(want.size(), store.countCodes(pattern[0], pattern[1], pattern[2], pattern[3]), tag);
@@ -163,7 +163,7 @@ class VortexStoreTest {
 					for (int row = 0; row < n; row++) {
 						String[] q = new String[4];
 						for (int i = 0; i < 4; i++) {
-							q[i] = dict.decode(out.getLong(row * VortexStore.ROW_BYTES + 8 * i));
+							q[i] = dict.decode(out.getLong(row * VortexRdfStore.ROW_BYTES + 8 * i));
 						}
 						assertTrue(seen.add(key(q)), tag + " repeated row");
 					}
@@ -193,21 +193,21 @@ class VortexStoreTest {
 			}
 		}
 		assertTrue(emoji != null, "the oracle holds a literal with a non-BMP character");
-		try (VortexStore store = open("dictionary", false)) {
+		try (VortexRdfStore store = open("dictionary", false)) {
 			List<String[]> rows = store.quads(null, null, emoji, null);
 			assertFalse(rows.isEmpty());
 			for (String[] row : rows) {
 				assertEquals(emoji, row[2]);
 			}
 			long code = store.dictionary().get().encode(emoji);
-			assertNotEquals(VortexStore.NONE, code);
+			assertNotEquals(VortexRdfStore.NONE, code);
 			assertEquals(emoji, store.dictionary().get().decode(code));
 		}
 	}
 
 	@Test
 	void engineCountersNameEveryValueAndStayZeroWhenOff() {
-		Map<String, Long> counters = VortexStore.engineCounters();
+		Map<String, Long> counters = VortexRdfStore.engineCounters();
 		assertEquals(18, counters.size());
 		assertTrue(counters.containsKey("leaf_decoded") && counters.containsKey("typed_eq_probe_values"));
 		if (!"1".equals(System.getenv("VORTEX_RDF_COUNTERS"))) {
@@ -217,8 +217,8 @@ class VortexStoreTest {
 
 	@Test
 	void layoutsIndexesAndTheDefaultGraphAreReported() {
-		try (VortexStore plain = open("dictionary", false); VortexStore copy = open("copy", false);
-				VortexStore reference = open("reference", true); VortexStore flat = open("default", false)) {
+		try (VortexRdfStore plain = open("dictionary", false); VortexRdfStore copy = open("copy", false);
+				VortexRdfStore reference = open("reference", true); VortexRdfStore flat = open("default", false)) {
 			assertEquals("dictionary", plain.layout());
 			assertEquals("default", flat.layout());
 			assertTrue(plain.indexes().isEmpty());
@@ -233,7 +233,7 @@ class VortexStoreTest {
 
 	@Test
 	void callersMistakesAreReportedNotAnswered() {
-		try (VortexStore store = open("dictionary", false); VortexStore flat = open("default", false)) {
+		try (VortexRdfStore store = open("dictionary", false); VortexRdfStore flat = open("default", false)) {
 			VortexException subject = assertThrows(VortexException.class,
 					() -> store.count("\"a literal\"", null, null, null));
 			assertTrue(subject.getMessage().contains("pattern subject"), subject.getMessage());
@@ -243,12 +243,12 @@ class VortexStoreTest {
 
 			assertTrue(flat.dictionary().isEmpty());
 			VortexException none = assertThrows(VortexException.class,
-					() -> flat.countCodes(VortexStore.NONE, VortexStore.NONE, VortexStore.NONE, VortexStore.NONE));
+					() -> flat.countCodes(VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE));
 			assertTrue(none.getMessage().contains("no term dictionary"), none.getMessage());
 
 			// A literal's code as a subject cannot match: no rows, no error.
 			long literal = store.dictionary().get().encode(quads.stream().filter(q -> q[2].startsWith("\"")).findFirst().get()[2]);
-			assertEquals(0, store.countCodes(literal, VortexStore.NONE, VortexStore.NONE, VortexStore.NONE));
+			assertEquals(0, store.countCodes(literal, VortexRdfStore.NONE, VortexRdfStore.NONE, VortexRdfStore.NONE));
 
 			ByteBuffer heap = ByteBuffer.allocate(64);
 			ByteBuffer small = ByteBuffer.allocateDirect(8).order(ByteOrder.nativeOrder());
@@ -262,12 +262,12 @@ class VortexStoreTest {
 			ByteBuffer good = ByteBuffer.allocateDirect(64).order(ByteOrder.nativeOrder());
 			assertThrows(IllegalArgumentException.class, () -> store.matchCodes(-1, -1, -1, -1, -1, good, 2));
 		}
-		assertThrows(VortexException.class, () -> VortexStore.open(fixtures.resolve("missing.vortex")));
+		assertThrows(VortexException.class, () -> VortexRdfStore.open(fixtures.resolve("missing.vortex")));
 	}
 
 	@Test
 	void aClosedStoreRefusesCallsAndClosingTwiceIsHarmless() {
-		VortexStore store = open("dictionary", false);
+		VortexRdfStore store = open("dictionary", false);
 		TermDictionary dict = store.dictionary().get();
 		store.close();
 		store.close();
@@ -279,7 +279,7 @@ class VortexStoreTest {
 	@Test
 	void oneStoreServesManyThreads() throws Exception {
 		ExecutorService pool = Executors.newFixedThreadPool(8);
-		try (VortexStore store = open("copy", false)) {
+		try (VortexRdfStore store = open("copy", false)) {
 			TermDictionary dict = store.dictionary().get();
 			List<Future<Long>> results = new ArrayList<>();
 			for (int t = 0; t < 8; t++) {
@@ -288,7 +288,7 @@ class VortexStoreTest {
 					for (int i = 0; i < 300; i++) {
 						String[] q = quads.get((i * 7) % quads.size());
 						total += store.count(q[0], null, null, null);
-						total += store.countCodes(dict.encode(q[0]), VortexStore.NONE, dict.encode(q[2]), VortexStore.NONE);
+						total += store.countCodes(dict.encode(q[0]), VortexRdfStore.NONE, dict.encode(q[2]), VortexRdfStore.NONE);
 					}
 					return total;
 				}));
