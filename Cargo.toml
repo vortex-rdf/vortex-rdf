@@ -9,7 +9,7 @@ exclude = ["bench-compare"]
 default-members = ["core", "encoded-search", "js", "cli", "java"]
 
 [workspace.package]
-version = "0.13.1"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Julián Rojas <julianandres.rojasmelendez@ugent.be>"]
@@ -21,8 +21,8 @@ keywords = ["rdf", "columnar", "vortex", "semantic-web", "quad-store"]
 categories = ["database-implementations", "encoding", "data-structures"]
 
 [workspace.dependencies]
-vortex-rdf-core = { path = "core", version = "0.13.1" }
-vortex-rdf-encoded-search = { path = "encoded-search", version = "0.13.1" }
+vortex-rdf-core = { path = "core", version = "0.14.0" }
+vortex-rdf-encoded-search = { path = "encoded-search", version = "0.14.0" }
 vortex = { version = "0.90.0", default-features = false }
 vortex-array = { version = "0.90.0" }
 vortex-btrblocks = "0.90.0"
