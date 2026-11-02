@@ -10,8 +10,8 @@ import java.util.Map;
 /**
  * Times one cell and appends its dashboard-shaped row, by the rules of {@code measure} in
  * {@code python/bench/worker.py}: setup and teardown run outside the timed region, warm-up runs are discarded, and
- * a cell whose first run, warm-up or sample, takes longer than the time limit is not measured: it gets a
- * "timeout" row instead (see {@link Knobs#timeoutNs()}).
+ * a query cell whose first run, warm-up or sample, takes longer than the time limit is not measured: it gets a
+ * "timeout" row instead (see {@link #timeQuery} and {@link Knobs#timeoutNs()}).
  *
  * <p>Garbage is collected once before each cell, never per sample: with a gigabyte-sized store live in the heap, a
  * full collection per sample would cost more than the queries it separates. The median absorbs the occasional
@@ -48,12 +48,29 @@ public final class Measure {
 	 * Run {@code body} {@code warmup + iters} times, each on the state {@code setup} returns (null when there is no
 	 * setup), with {@code teardown} given that state and the body's result, and append one row for {@code id}.
 	 * {@code regime} ({@code warm} or {@code cold}) is written only when not null. A body that throws still has its
-	 * state torn down (with a null result) before the throw goes on, so a store its setup opened is closed.
+	 * state torn down (with a null result) before the throw goes on, so a store its setup opened is closed. The cell
+	 * is measured however long it takes: a build, an open or a mutation.
 	 */
 	public <S> void time(String id, String regime, int iters, int warmup, ThrowingSupplier<S> setup,
 			ThrowingFunction<S, Object> body, ThrowingBiConsumer<S, Object> teardown, List<Map<String, Object>> rows)
 			throws Exception {
-		long limit = knobs.timeoutNs();
+		measure(id, regime, iters, warmup, setup, body, teardown, rows, 0);
+	}
+
+	/**
+	 * {@link #time} for a query cell, a match or count, warm or cold, the full scan included: its first run is held to
+	 * the time limit, and one past it leaves the cell unmeasured, with a "timeout" row in its place.
+	 */
+	public <S> void timeQuery(String id, String regime, int iters, int warmup, ThrowingSupplier<S> setup,
+			ThrowingFunction<S, Object> body, ThrowingBiConsumer<S, Object> teardown, List<Map<String, Object>> rows)
+			throws Exception {
+		measure(id, regime, iters, warmup, setup, body, teardown, rows, knobs.timeoutNs());
+	}
+
+	/** {@link #time}, with the first run held to {@code limit} nanoseconds; 0 holds it to none. */
+	private <S> void measure(String id, String regime, int iters, int warmup, ThrowingSupplier<S> setup,
+			ThrowingFunction<S, Object> body, ThrowingBiConsumer<S, Object> teardown, List<Map<String, Object>> rows,
+			long limit) throws Exception {
 		List<Long> samples = new ArrayList<>(iters);
 		System.gc();
 		int remainingWarmup = warmup;
@@ -82,7 +99,7 @@ public final class Measure {
 			if (first) {
 				first = false;
 				if (limit > 0 && elapsed > limit) {
-					rows.add(timedOut(id, regime, elapsed));
+					rows.add(timedOut(id, regime, elapsed, limit));
 					return;
 				}
 			}
@@ -124,12 +141,12 @@ public final class Measure {
 	}
 
 	/**
-	 * A row the dashboard renders as "timeout": a cell whose first run took {@code elapsedNs}, past the time limit.
-	 * {@code regime} is written only when not null.
+	 * A row the dashboard renders as "timeout": a query cell whose first run took {@code elapsedNs}, past the time
+	 * limit {@code limitNs}. {@code regime} is written only when not null.
 	 */
-	Map<String, Object> timedOut(String id, String regime, long elapsedNs) {
+	static Map<String, Object> timedOut(String id, String regime, long elapsedNs, long limitNs) {
 		Map<String, Object> row = unmeasured(id, "timeout",
-				"not measured: one run took " + fmt(elapsedNs) + ", past the " + fmt(knobs.timeoutNs()) + " limit");
+				"not measured: one run took " + fmt(elapsedNs) + ", past the " + fmt(limitNs) + " limit");
 		row.put("timeout", true);
 		if (regime != null) {
 			row.put("regime", regime);

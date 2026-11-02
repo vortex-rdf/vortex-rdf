@@ -337,8 +337,8 @@ export interface Row {
     regime?: 'cold' | 'warm';
     /** An operation this store cannot perform, as opposed to a slow one. */
     unsupported?: boolean;
-    /** A cell whose one probing run took longer than the suite's time limit,
-     *  so it was not measured (see TIMEOUT_MS in compare.worker.ts). */
+    /** A query cell whose one probing run took longer than the suite's time
+     *  limit, so it was not measured (see TIMEOUT_MS in compare.worker.ts). */
     timeout?: boolean;
     /** Why, shown as the cell's tooltip. */
     reason?: string;
@@ -396,8 +396,8 @@ export function unsupportedRow(id: string, reason: string): Row {
     return { ...unmeasuredRow(id, 'unsupported', reason), unsupported: true };
 }
 
-/** A row the dashboard renders as 'timeout': a cell whose one probing run
- *  took longer than the suite's time limit. */
+/** A row the dashboard renders as 'timeout': a query cell whose one probing
+ *  run took longer than the suite's time limit. */
 export function timeoutRow(id: string, reason: string): Row {
     return { ...unmeasuredRow(id, 'timeout', reason), timeout: true };
 }

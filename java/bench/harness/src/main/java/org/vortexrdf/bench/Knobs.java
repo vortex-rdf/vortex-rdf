@@ -4,8 +4,9 @@ package org.vortexrdf.bench;
  * The repetition counts, as {@code python/bench/worker.py} has them: a selective query is cheap enough to repeat,
  * a build or a full materialization is not.
  *
- * @param timeoutNs the time limit, the same for every library in every suite: a cell whose first run takes longer
- *        than this is not measured, and reads "timeout"; 0 disables it
+ * @param timeoutNs the time limit for query cells, the same for every library in every suite: a match or count
+ *        cell whose first run takes longer than this is not measured, and reads "timeout"; 0 disables it. Builds,
+ *        opens and mutations are always measured.
  * @param jitWarmupMs the JIT warm-up budget, split evenly between the patterns: each runs, discarded, for its share
  *        before any pattern is timed
  */

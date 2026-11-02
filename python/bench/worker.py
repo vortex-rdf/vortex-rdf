@@ -42,13 +42,14 @@ QUERY_WARMUP = int(os.environ.get("PY_BENCH_QUERY_WARMUP", 5))
 HEAVY_ITERS = int(os.environ.get("PY_BENCH_HEAVY_ITERS", 3))
 FULL_SCAN_ITERS = int(os.environ.get("PY_BENCH_FULL_SCAN_ITERS", 3))
 
-#: The time limit, the same for every library in every suite: a cell whose
-#: first run, warmup or sample, takes longer than this is not measured, and
-#: reads "timeout" with that run's time as its tooltip; ``0`` disables it. A
-#: cell that takes tens of seconds per run is orders of magnitude slower than
-#: the rest of its column, and its repetitions would cost minutes for one
-#: number. Same knob and default as the JS worker, the Java harness and
-#: ``compare.rs``.
+#: The time limit for query cells, the same for every library in every suite:
+#: a match or count cell, warm or cold, the full scan included, whose first
+#: run, warmup or sample, takes longer than this is not measured, and reads
+#: "timeout" with that run's time as its tooltip; ``0`` disables it. Builds,
+#: opens and mutations are always measured. A query that takes tens of seconds
+#: per run is orders of magnitude slower than the rest of its column, and its
+#: repetitions would cost minutes for one number. Same knob and default as the
+#: JS worker, the Java harness and ``compare.rs``.
 TIMEOUT_NS = float(os.environ.get("BENCH_TIMEOUT_MS", 30_000)) * 1e6
 
 
@@ -72,6 +73,7 @@ def measure(
     setup: Optional[Callable[[], Any]] = None,
     teardown: Optional[Callable[[Any, object], None]] = None,
     regime: Optional[str] = None,
+    limit_ns: float = 0.0,
 ) -> None:
     """Time `fn` and append one dashboard-shaped row.
 
@@ -105,11 +107,11 @@ def measure(
             if teardown:
                 teardown(state, out)
             del state, out
-            # See TIMEOUT_NS: the first run decides.
+            # `limit_ns`, TIMEOUT_NS for a query cell, holds its first run.
             if first:
                 first = False
-                if TIMEOUT_NS and elapsed > TIMEOUT_NS:
-                    rows.append(timeout_row(ident, elapsed, regime))
+                if limit_ns and elapsed > limit_ns:
+                    rows.append(timeout_row(ident, elapsed, limit_ns, regime))
                     return
             if remaining_warmup > 0:
                 remaining_warmup -= 1
@@ -174,10 +176,10 @@ def unsupported_row(ident: str, reason: str) -> dict:
     return unmeasured_row(ident, "unsupported", reason) | {"unsupported": True}
 
 
-def timeout_row(ident: str, elapsed_ns: float, regime: Optional[str] = None) -> dict:
-    """A row the dashboard renders as 'timeout': a cell whose first run took
-    `elapsed_ns`, past the time limit (see TIMEOUT_NS)."""
-    reason = f"not measured: one run took {fmt_ns(elapsed_ns)}, past the {TIMEOUT_NS / 1e9:g} s limit"
+def timeout_row(ident: str, elapsed_ns: float, limit_ns: float, regime: Optional[str] = None) -> dict:
+    """A row the dashboard renders as 'timeout': a query cell whose first run
+    took `elapsed_ns`, past the time limit `limit_ns` (see TIMEOUT_NS)."""
+    reason = f"not measured: one run took {fmt_ns(elapsed_ns)}, past the {limit_ns / 1e9:g} s limit"
     return (
         unmeasured_row(ident, "timeout", reason)
         | {"timeout": True}
@@ -307,11 +309,20 @@ def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
 
     def measure_both(name: str, query: Any, iters: int, warmup: int, regime: str) -> None:
         """Time `count` and `count_only` of `query` as `<slug>::<name>` and
-        `<slug>::<name>::count`: warm on the open handle, or cold."""
+        `<slug>::<name>::count`: warm on the open handle, or cold. Query cells,
+        so each one's first run is held to TIMEOUT_NS."""
         for suffix, fn in (("", a.count), ("::count", a.count_only)):
             ident = f"{a.slug}::{name}{suffix}"
             if regime == "warm":
-                measure(ident, lambda _, fn=fn: fn(handle, query), rows, iters, warmup, regime="warm")
+                measure(
+                    ident,
+                    lambda _, fn=fn: fn(handle, query),
+                    rows,
+                    iters,
+                    warmup,
+                    regime="warm",
+                    limit_ns=TIMEOUT_NS,
+                )
             else:
                 measure(
                     ident,
@@ -322,6 +333,7 @@ def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
                     setup=open_cold,
                     teardown=drop_cold,
                     regime="cold",
+                    limit_ns=TIMEOUT_NS,
                 )
 
     # Term parsing happens once per pattern, outside every timed region.

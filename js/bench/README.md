@@ -36,7 +36,7 @@ These knobs mean the same in every suite that reads one, in all four languages. 
 | `BENCH_DIM` | unset | JS, Python and Java compare | optional cube shorthand, `D³` rows; an explicit `BENCH_SIZE` wins |
 | `BENCH_GRAPHS_QUADS` | 8 | JS, Python and Java compare | named graphs the comparative bench asks for, before the generator's coprimality nudge |
 | `MUT_BATCH` | 10000; 512 in `benchmark.rs`, which clamps it to 1-4,095 | JS, Python, Java and Rust compare; `benchmark.rs` | quads per add/delete batch |
-| `BENCH_TIMEOUT_MS` | 30000 | JS, Python, Java and Rust compare | the time limit, the same for every library: a cell whose first run takes longer than this is not measured, and reads `timeout`; `0` disables it |
+| `BENCH_TIMEOUT_MS` | 30000 | JS, Python, Java and Rust compare | the time limit for query cells, the same for every library: a match or count (the full scan included) whose first run takes longer than this is not measured, and reads `timeout`; builds, opens and mutations are always measured; `0` disables it |
 | `BENCH_SUBJ_RATIO` | 0.1 | JS and Python compare and CodSpeed; Java compare | distinct subjects / rows — the reciprocal of triples per subject |
 | `BENCH_OBJ_RATIO` | 0.5 | JS and Python compare and CodSpeed; Java compare | distinct objects / rows |
 | `BENCH_PREDICATES` | 32 | JS and Python compare and CodSpeed; JS dict-memory; Java compare | distinct predicates (a closed vocabulary) |
