@@ -158,6 +158,17 @@ job_js_tests() {
   run -C js npm test
 }
 
+# This machine's platform as the Java jar names it (NativeLibrary.platform),
+# or nothing for one the jar carries no library for.
+host_platform() {
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) echo linux-x86_64 ;;
+    Linux-aarch64 | Linux-arm64) echo linux-aarch64 ;;
+    Darwin-x86_64) echo macos-x86_64 ;;
+    Darwin-arm64) echo macos-aarch64 ;;
+  esac
+}
+
 # The Java bindings: the crate's own Rust tests run under rust-tests; this job
 # builds the JNI library and the stores and oracle the JUnit suite reads (the
 # crate's `fixtures` example), then runs Maven.
@@ -166,12 +177,21 @@ job_java_tests() {
     skip_job "no JDK or Maven" "install JDK 11 or later and Maven"
     return 0
   fi
-  local target="${CARGO_TARGET_DIR:-target}" lib
+  local target="${CARGO_TARGET_DIR:-target}" lib platform bundled=""
   case $target in /*) ;; *) target="$PWD/$target" ;; esac
   run cargo build -p vortex-rdf-java
   run cargo run -p vortex-rdf-java --example fixtures -- java/target/fixtures
   lib=$(compgen -G "$target/debug/libvortex_rdf_jni.*" | grep -E '\.(so|dylib)$' | head -n 1)
-  run -C java mvn -B test "-Dvortexrdf.library=$lib" "-Dvortexrdf.fixtures=$PWD/java/target/fixtures"
+  # The library also goes where the jar carries its copy, so that
+  # BundledLibraryTest loads it as the published jar does.
+  platform=$(host_platform)
+  if [ -n "$platform" ]; then
+    run mkdir -p "java/target/natives/org/vortexrdf/native/$platform"
+    run cp "$lib" "java/target/natives/org/vortexrdf/native/$platform/"
+    bundled=-Dvortexrdf.bundled.required=true
+  fi
+  run -C java mvn -B test "-Dvortexrdf.library=$lib" "-Dvortexrdf.fixtures=$PWD/java/target/fixtures" \
+    ${bundled:+"$bundled"}
 }
 
 join_list() {

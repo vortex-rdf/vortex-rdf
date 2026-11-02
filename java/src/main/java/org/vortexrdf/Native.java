@@ -1,34 +1,20 @@
 package org.vortexrdf;
 
 import java.nio.ByteBuffer;
-import java.nio.file.Paths;
 
 /**
  * The native methods of {@code libvortex_rdf_jni}, one JNI function each; the public classes check their
  * arguments and hold the handle. A handle is the address of a native store and is never used after close.
  * <p>
  * The library is found, in this order, at the path in the system property {@code vortexrdf.library}, at the path
- * in the environment variable {@code VORTEX_RDF_JNI_LIB}, or by {@link System#loadLibrary} under the name
- * {@code vortex_rdf_jni} (on {@code java.library.path}). On Java 24 and later loading it is a restricted method:
+ * in the environment variable {@code VORTEX_RDF_JNI_LIB}, as the copy the jar carries for this platform, or by
+ * {@link System#loadLibrary} under the name {@code vortex_rdf_jni} (on {@code java.library.path}); see
+ * {@link NativeLibrary}. On Java 24 and later loading it is a restricted method:
  * {@code --enable-native-access=ALL-UNNAMED} (or the jar's module) keeps the JVM from warning.
  */
 final class Native {
 	static {
-		String path = System.getProperty("vortexrdf.library");
-		if (path == null) {
-			path = System.getenv("VORTEX_RDF_JNI_LIB");
-		}
-		try {
-			if (path != null) {
-				System.load(Paths.get(path).toAbsolutePath().toString());
-			} else {
-				System.loadLibrary("vortex_rdf_jni");
-			}
-		} catch (UnsatisfiedLinkError e) {
-			throw new UnsatisfiedLinkError("cannot load the vortex-rdf native library ("
-					+ (path != null ? path : "vortex_rdf_jni on java.library.path")
-					+ "); set -Dvortexrdf.library=<path to libvortex_rdf_jni> or VORTEX_RDF_JNI_LIB: " + e.getMessage());
-		}
+		NativeLibrary.load();
 	}
 
 	private Native() {
