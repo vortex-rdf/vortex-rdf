@@ -43,7 +43,7 @@ vortex-layout = "0.90.0"
 vortex-buffer = "0.90.0"
 fastlanes = "0.7"
 self_cell = "1.2"
-divan = { package = "codspeed-divan-compat", version = "5.0.1" }
+divan = { package = "codspeed-divan-compat", version = "6.0.0" }
 
 tokio = { version = "1.53", features = ["sync", "macros", "rt"] }
 futures = "0.3.33"
