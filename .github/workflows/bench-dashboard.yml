@@ -21,8 +21,34 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+# What every suite reads. BENCH_SIZE puts all four tabs on the same data: the
+# internals suites' own default is the much smaller CodSpeed size, where
+# instrumented runs measure instructions and a bigger dataset only multiplies
+# valgrind cost. MUT_BATCH is the comparative suites' add/delete batch;
+# refresh.sh keeps it from the internals suite, which uses its own.
+env:
+  BENCH_SIZE: 1048576
+  MUT_BATCH: 10000
+
+# The suites measure at once, each on a runner of its own: run one after
+# another, as scripts/refresh.sh runs them locally, they took over an hour and
+# a half, where now the slowest suite sets the pace. No suite spans runners,
+# so every table compares libraries measured on one machine, and each tab
+# names the machine it ran on.
+#
+# Each suite job packs its results with tar, which keeps their mtimes (an
+# artifact upload does not), and the page dates the Rust tab by them. The
+# render job unpacks them all into target/bench, the tree refresh.sh renders
+# from, as if every stage had run there.
+#
+# The built bindings are cached with the stamp scripts/refresh.sh writes
+# beside each one: a restored artifact whose stamp still matches is not
+# rebuilt. Each key hashes every input of its stamp: the files it is built
+# from, refresh.sh (the build command) and the setup-rust pin (the compiler),
+# so a key hit never restores a stamp that would make every run rebuild.
 jobs:
-  build:
+  rust:
+    name: Rust suites
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -46,6 +72,39 @@ jobs:
           shared-key: bench
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The internals and the cross-library suite share a runner: the page
+      # shows both under the Rust tab's one provenance line.
+      - name: Run the Rust suites
+        run: scripts/refresh.sh --only rust,compare
+
+      - name: Pack the results
+        run: tar -C target/bench -cf results-rust.tar rust.txt rust-compare.json
+
+      - name: Upload the results
+        uses: actions/upload-artifact@v7
+        with:
+          name: results-rust
+          path: results-rust.tar
+
+  js:
+    name: JavaScript suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Restored, never saved here: ci.yml's js-tests keeps this entry,
+          # and builds the same wasm32 release (`npm run build`).
+          shared-key: wasm
+          save-if: false
+
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
@@ -53,16 +112,6 @@ jobs:
           cache: npm
           cache-dependency-path: js/package-lock.json
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v10.3.3
-
-      # The built bindings, each with the stamp scripts/refresh.sh writes
-      # beside it: a restored artifact whose stamp still matches is not rebuilt
-      # (wasm-pack plus wasm-opt cost ~10 minutes, `maturin develop --release`
-      # ~4). Each key hashes every input of its stamp: the files it is built
-      # from, refresh.sh (the build command) and the setup-rust pin (the
-      # compiler), so a key hit never restores a stamp that would make every
-      # run rebuild.
       - name: Cache wasm bindings
         uses: actions/cache@v6
         with:
@@ -74,6 +123,48 @@ jobs:
         with:
           path: js/bench/hdt-pkg
           key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
+
+      # The hdt crate's CLI, which builds the hdt adapter's HDT file (see
+      # hdt_artifact in refresh.sh, which pins its version): a cargo install
+      # costs about a minute, and a restored one is skipped.
+      - name: Cache the hdt CLI
+        uses: actions/cache@v6
+        with:
+          path: target/hdt-cli
+          key: hdt-cli-${{ hashFiles('scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
+
+      - name: Run the JavaScript suite
+        run: scripts/refresh.sh --only js
+
+      - name: Pack the results
+        run: tar -C target/bench -cf results-js.tar js.json
+
+      - name: Upload the results
+        uses: actions/upload-artifact@v7
+        with:
+          name: results-js
+          path: results-js.tar
+
+  python:
+    name: Python suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Restored, never saved here: ci.yml's python-tests keeps this
+          # entry, and builds the extension through maturin at the release
+          # profile too.
+          shared-key: py-release
+          save-if: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
 
       - name: Cache Python native extension
         uses: actions/cache@v6
@@ -102,6 +193,35 @@ jobs:
             ~/.local/share/uv/python
           key: py-bench-venvs-${{ hashFiles('python/bench/adapters.py', 'python/bench/run.py') }}
 
+      - name: Run the Python suite
+        run: scripts/refresh.sh --only python
+
+      - name: Pack the results
+        run: tar -C target/bench -cf results-python.tar python.json
+
+      - name: Upload the results
+        uses: actions/upload-artifact@v7
+        with:
+          name: results-python
+          path: results-python.tar
+
+  java:
+    name: Java suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # No other job builds the JNI library and the CLI at the release
+          # profile, so this entry is this job's own.
+          shared-key: bench-java
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       # The Java suite compiles and runs on JDK 25, which RDF4J 6 requires;
       # Maven comes with the runner image. The Maven cache is keyed on the
       # bench's poms, which pin every library's version.
@@ -114,9 +234,9 @@ jobs:
           cache-dependency-path: java/bench/**/pom.xml
 
       # The JNI library and the CLI the Java stage builds, each with the stamp
-      # refresh.sh writes beside it, keyed like the Python extension. This step
-      # comes after the Rust cache on purpose: post steps run in reverse order,
-      # so these files are saved before rust-cache cleans target/.
+      # refresh.sh writes beside it. This step comes after the Rust cache on
+      # purpose: post steps run in reverse order, so these files are saved
+      # before rust-cache cleans target/.
       - name: Cache Java native library and CLI
         uses: actions/cache@v6
         with:
@@ -127,21 +247,38 @@ jobs:
             target/release/vortex-rdf-cli.sha256
           key: java-native-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'java/src/**', 'java/Cargo.toml', 'cli/src/**', 'cli/Cargo.toml', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
 
-      # Every stage of refresh.sh in its order: the Rust internals and
-      # cross-library suites, the JavaScript, Python and Java comparative
-      # suites (wall-clock, never uploaded to CodSpeed), then the render into
-      # target/bench/public. BENCH_SIZE puts all four tabs on the same data:
-      # the JS hdt adapter opens the .hdt artifact the cross-library stage
-      # builds from this dataset, and the internals suites' own default is the
-      # much smaller CodSpeed size, where instrumented runs measure
-      # instructions and a bigger dataset only multiplies valgrind cost.
-      # MUT_BATCH is the comparative suites' add/delete batch; refresh.sh keeps
-      # it from the internals suite, which uses its own.
-      - name: Run the benchmarks and render the dashboard
-        env:
-          BENCH_SIZE: 1048576
-          MUT_BATCH: 10000
-        run: scripts/refresh.sh
+      - name: Run the Java suite
+        run: scripts/refresh.sh --only java
+
+      - name: Pack the results
+        run: tar -C target/bench -cf results-java.tar java.json
+
+      - name: Upload the results
+        uses: actions/upload-artifact@v7
+        with:
+          name: results-java
+          path: results-java.tar
+
+  render:
+    name: Render the dashboard
+    needs: [rust, js, python, java]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: results-*
+          path: target/bench
+          merge-multiple: true
+
+      - name: Render the dashboard
+        run: |
+          for results in target/bench/results-*.tar; do
+            tar -C target/bench -xf "$results"
+          done
+          scripts/refresh.sh --only render
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
@@ -149,7 +286,7 @@ jobs:
           path: target/bench/public
 
   deploy:
-    needs: build
+    needs: render
     runs-on: ubuntu-latest
     environment:
       name: github-pages

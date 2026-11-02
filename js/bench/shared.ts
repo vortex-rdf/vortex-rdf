@@ -201,15 +201,15 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
 //
 // The hdt crate's wasm surface is read-only: HDT *construction* (`read_nt`)
 // spawns OS threads and uses rayon, which trap on wasm32, so the artifact is
-// built natively and only opened here. The Rust comparative bench writes one
-// from the same shared dataset as part of its run (`cargo bench --manifest-path
-// bench-compare/Cargo.toml`, at BENCH_SIZE = this tab's D³) — point `HDT_FILE`
-// elsewhere to override. The wasm module itself is the bench's own build of the
-// crate's bindings: `npm run build:hdt-wasm` → bench/hdt-pkg (see bench/hdt-wasm).
+// built natively and only opened here. scripts/refresh.sh's js stage builds it
+// before the suite runs (see its `hdt_artifact`): this run's dataset, as
+// triples, converted by the hdt crate's own CLI — point `HDT_FILE` elsewhere to
+// override. The wasm module itself is the bench's own build of the crate's
+// bindings: `npm run build:hdt-wasm` → bench/hdt-pkg (see bench/hdt-wasm).
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const HDT_FILE = process.env.HDT_FILE
-    ?? resolve(here, '../../target/bench_compare/hdt/data.hdt');
+    ?? resolve(here, '../../target/bench_js/data.hdt');
 
 type HdtModule = typeof import('./hdt-pkg/hdt_wasm_bench.js');
 type Hdt = import('./hdt-pkg/hdt_wasm_bench.js').Hdt;
@@ -251,7 +251,7 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
         label: 'hdt',
         ingestUnsupported:
             'the wasm bindings are read-only — the artifact is built natively '
-            + '(the Rust comparative bench writes it) and only opened here',
+            + '(by the hdt crate\'s own CLI) and only opened here',
         quadsUnsupported: 'the HDT format has no named graphs — triples only',
         mutationUnsupported: 'an HDT file is immutable once built',
         // `build` opens the pre-built artifact; the quads argument is only the
@@ -261,8 +261,7 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
         build: async (quads) => {
             if (!existsSync(HDT_FILE)) {
                 throw new Error(
-                    `no HDT artifact at ${HDT_FILE} — the Rust comparative bench builds it `
-                    + '(cargo bench --manifest-path bench-compare/Cargo.toml), '
+                    `no HDT artifact at ${HDT_FILE} — scripts/refresh.sh --only js builds it, `
                     + 'or point HDT_FILE at one');
             }
             const mod = await hdtMod();
@@ -273,7 +272,7 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
                 throw new Error(
                     `HDT artifact at ${HDT_FILE} holds ${n} triples but this run's dataset has `
                     + `${quads.length} — rebuild it: BENCH_SIZE=${quads.length} `
-                    + 'cargo bench --manifest-path bench-compare/Cargo.toml');
+                    + 'scripts/refresh.sh --only js');
             }
             return h;
         },
@@ -338,6 +337,9 @@ export interface Row {
     regime?: 'cold' | 'warm';
     /** An operation this store cannot perform, as opposed to a slow one. */
     unsupported?: boolean;
+    /** A cell whose one probing run took longer than the suite's time limit,
+     *  so it was not measured (see TIMEOUT_MS in compare.worker.ts). */
+    timeout?: boolean;
     /** Why, shown as the cell's tooltip. */
     reason?: string;
 }
@@ -373,22 +375,31 @@ export interface DictMemoryPoint {
     fullRows: number; firstQueryRows: number; decodedChars: number;
 }
 
-/** A row the dashboard renders as 'unsupported' rather than as a missing cell.
- *
- *  Mirrors `unsupported_row` in python/bench/worker.py, down to the null
- *  `median_ns` that keeps the row out of its column's best/ratio arithmetic:
- *  an operation a store cannot perform is not a slow result, and a blank cell
- *  reads as a benchmark nobody ran. */
-export function unsupportedRow(id: string, reason: string): Row {
+/** A row with no measurement, whose cell reads `word` with `reason` as its
+ *  tooltip rather than rendering as a missing cell, which reads as a benchmark
+ *  nobody ran. Its null `median_ns` keeps it out of its column's best/ratio
+ *  arithmetic. */
+function unmeasuredRow(id: string, word: string, reason: string): Row {
     const [group, variant] = id.split('::');
     return {
-        group, variant: variant ?? null, id,
-        unsupported: true, reason,
-        fastest: 'unsupported', slowest: 'unsupported',
-        median: 'unsupported', mean: 'unsupported',
+        group, variant: variant ?? null, id, reason,
+        fastest: word, slowest: word, median: word, mean: word,
         fastest_ns: null, slowest_ns: null, median_ns: null, mean_ns: null,
         samples: '0',
     };
+}
+
+/** A row the dashboard renders as 'unsupported'. Mirrors `unsupported_row` in
+ *  python/bench/worker.py: an operation a store cannot perform is not a slow
+ *  result. */
+export function unsupportedRow(id: string, reason: string): Row {
+    return { ...unmeasuredRow(id, 'unsupported', reason), unsupported: true };
+}
+
+/** A row the dashboard renders as 'timeout': a cell whose one probing run
+ *  took longer than the suite's time limit. */
+export function timeoutRow(id: string, reason: string): Row {
+    return { ...unmeasuredRow(id, 'timeout', reason), timeout: true };
 }
 
 export function collect(bench: Bench, results: Row[], regime?: 'cold' | 'warm'): void {

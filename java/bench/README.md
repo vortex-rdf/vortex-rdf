@@ -1,6 +1,6 @@
 # Java benchmarks
 
-`run.py` measures the Java bindings against [hdt-java](https://github.com/rdfhdt/hdt-java), [qEndpoint](https://github.com/the-qa-company/qEndpoint)'s HDT library (`qendpoint-core`), [Apache Jena](https://jena.apache.org/) (its in-memory dataset and TDB2) and [Eclipse RDF4J](https://rdf4j.org/) (MemoryStore, NativeStore and the LMDB store). The workload is file → store → query, and the results go to `target/bench/java.json` at the repository root for [the dashboard's Java tab](https://vortex-rdf.github.io/vortex-rdf/#java). `scripts/refresh.sh` runs every suite and renders the dashboard; `--only java,render` re-measures this one.
+`run.py` measures the Java bindings against [hdt-java](https://github.com/rdfhdt/hdt-java), [qEndpoint](https://github.com/the-qa-company/qEndpoint)'s HDT library (`qendpoint-core`), [Apache Jena](https://jena.apache.org/) (its in-memory dataset and TDB2) and [Eclipse RDF4J](https://rdf4j.org/) (MemoryStore and the LMDB store). The workload is file → store → query, and the results go to `target/bench/java.json` at the repository root for [the dashboard's Java tab](https://vortex-rdf.github.io/vortex-rdf/#java). `scripts/refresh.sh` runs every suite and renders the dashboard; `--only java,render` re-measures this one.
 
 ```bash
 scripts/refresh.sh --only java              # build what the suite needs, then the full run
@@ -29,7 +29,7 @@ Harness design:
   - Store sizes are allocated blocks.
 - **The fixture and the adapters.** Every adapter must pass `AdapterContract` on the committed 512-row fixture, which `run.py --fixture` regenerates. Each library's setup is in its module's adapter.
 
-The knobs this suite shares with the others (`BENCH_SIZE`, `BENCH_DIM`, `BENCH_GRAPHS_QUADS`, `MUT_BATCH`, `BENCH_SLOW_PHASE_MS` and the dataset shape) are in [the shared table](../../js/bench/README.md#shared-knobs). This suite's own:
+The knobs this suite shares with the others (`BENCH_SIZE`, `BENCH_DIM`, `BENCH_GRAPHS_QUADS`, `MUT_BATCH`, `BENCH_TIMEOUT_MS` and the dataset shape) are in [the shared table](../../js/bench/README.md#shared-knobs). This suite's own:
 
 | Var | Default | Meaning |
 | --- | --- | --- |

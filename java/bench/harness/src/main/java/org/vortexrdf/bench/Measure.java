@@ -10,7 +10,8 @@ import java.util.Map;
 /**
  * Times one cell and appends its dashboard-shaped row, by the rules of {@code measure} in
  * {@code python/bench/worker.py}: setup and teardown run outside the timed region, warm-up runs are discarded, and
- * a phase whose single run exceeds the slow-phase threshold keeps one sample.
+ * a cell whose first run, warm-up or sample, takes longer than the time limit is not measured: it gets a
+ * "timeout" row instead (see {@link Knobs#timeoutNs()}).
  *
  * <p>Garbage is collected once before each cell, never per sample: with a gigabyte-sized store live in the heap, a
  * full collection per sample would cost more than the queries it separates. The median absorbs the occasional
@@ -52,10 +53,11 @@ public final class Measure {
 	public <S> void time(String id, String regime, int iters, int warmup, ThrowingSupplier<S> setup,
 			ThrowingFunction<S, Object> body, ThrowingBiConsumer<S, Object> teardown, List<Map<String, Object>> rows)
 			throws Exception {
-		long slow = knobs.slowPhaseNs();
+		long limit = knobs.timeoutNs();
 		List<Long> samples = new ArrayList<>(iters);
 		System.gc();
 		int remainingWarmup = warmup;
+		boolean first = true;
 		while (samples.size() < iters) {
 			S state = setup == null ? null : setup.get();
 			long t0 = System.nanoTime();
@@ -76,18 +78,19 @@ public final class Measure {
 			if (teardown != null) {
 				teardown.accept(state, out);
 			}
+			// The first run decides: one past the limit leaves the cell unmeasured.
+			if (first) {
+				first = false;
+				if (limit > 0 && elapsed > limit) {
+					rows.add(timedOut(id, regime, elapsed));
+					return;
+				}
+			}
 			if (remainingWarmup > 0) {
 				remainingWarmup--;
-				// A warm-up run this long says the phase needs no more warming.
-				if (slow > 0 && elapsed > slow) {
-					remainingWarmup = 0;
-				}
 				continue;
 			}
 			samples.add(elapsed);
-			if (slow > 0 && samples.size() == 1 && elapsed > slow) {
-				break;
-			}
 		}
 		Collections.sort(samples);
 		int n = samples.size();
@@ -115,11 +118,34 @@ public final class Measure {
 	 * out of the column's best and ratio arithmetic, and the reason as its tooltip.
 	 */
 	public static Map<String, Object> unsupported(String id, String reason) {
-		Map<String, Object> row = head(id);
+		Map<String, Object> row = unmeasured(id, "unsupported", reason);
 		row.put("unsupported", true);
+		return row;
+	}
+
+	/**
+	 * A row the dashboard renders as "timeout": a cell whose first run took {@code elapsedNs}, past the time limit.
+	 * {@code regime} is written only when not null.
+	 */
+	Map<String, Object> timedOut(String id, String regime, long elapsedNs) {
+		Map<String, Object> row = unmeasured(id, "timeout",
+				"not measured: one run took " + fmt(elapsedNs) + ", past the " + fmt(knobs.timeoutNs()) + " limit");
+		row.put("timeout", true);
+		if (regime != null) {
+			row.put("regime", regime);
+		}
+		return row;
+	}
+
+	/**
+	 * A row with no numbers, whose cell reads {@code word} with {@code reason} as its tooltip; its null timings keep it
+	 * out of the column's best and ratio arithmetic.
+	 */
+	private static Map<String, Object> unmeasured(String id, String word, String reason) {
+		Map<String, Object> row = head(id);
 		row.put("reason", reason);
 		for (String key : List.of("fastest", "slowest", "median", "mean")) {
-			row.put(key, "unsupported");
+			row.put(key, word);
 		}
 		for (String key : List.of("fastest_ns", "slowest_ns", "median_ns", "mean_ns")) {
 			row.put(key, null);

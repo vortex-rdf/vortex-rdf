@@ -18,6 +18,8 @@
 # Measurement stages run strictly sequentially on purpose: parallel stages
 # contend for CPU and memory and contaminate each other's timings — the
 # process-per-adapter isolation inside each suite exists for the same reason.
+# The dashboard workflow runs them at once instead, each on a runner of its
+# own, and renders their outputs in a job of its own.
 #
 # The wasm, Python and Java bindings, and the CLI the Java suite builds its
 # Vortex stores with, are rebuilt only when their stamp no longer matches (see
@@ -111,12 +113,34 @@ BINDING_DEPS=(src Cargo.toml ../core/src ../core/Cargo.toml
   ../encoded-search/src ../encoded-search/Cargo.toml ../Cargo.toml ../Cargo.lock
   ../.cargo/config.toml)
 
+# hdt_artifact — writes target/bench_js/data.hdt, the HDT file the JS suite's
+# hdt adapter opens (js/bench/shared.ts's HDT_FILE): the dataset's triples
+# projection, written by the Python suite's generator (a port of the JS one),
+# then converted by the hdt crate's own CLI at the version js/bench/hdt-wasm
+# reads it with, since the crate builds no HDT file under wasm. Rebuilt every
+# run: seconds, once the CLI is installed in target/hdt-cli.
+HDT_CLI_VERSION=0.7.3
+hdt_artifact() {
+  local dir=target/bench_js
+  mkdir -p "$dir"
+  cargo install --quiet hdt --version "$HDT_CLI_VERSION" --features cli --locked --root target/hdt-cli
+  PYTHONPATH=python/bench python3 -c \
+    'import sys; from datasets import write_dataset; from suite import bench_rows; write_dataset(sys.argv[1], bench_rows(), drop_graph=True)' \
+    "$dir/triples.nt"
+  target/hdt-cli/bin/hdt convert "$dir/triples.nt" "$dir/data.hdt"
+  rm "$dir/triples.nt"
+}
+
 if has rust; then
   stage "Rust internals (benchmark + match_lazy → $OUT/rust.txt, BENCH_SIZE=$BENCH_SIZE)"
   mkdir -p "$OUT"
   # The internals suite keeps its own clamped mutate batch, not MUT_BATCH.
   env -u MUT_BATCH cargo bench --bench benchmark | tee "$OUT/rust.txt"
   env -u MUT_BATCH cargo bench --bench match_lazy | tee -a "$OUT/rust.txt"
+  # The host the suite ran on, which the tab's provenance line names: the page
+  # may be rendered on another one (see render_bench_dashboard.py's
+  # parse_machine).
+  PYTHONPATH=scripts python3 -c 'import render_bench_dashboard as r; print(r.machine_line())' >> "$OUT/rust.txt"
 fi
 
 if has compare; then
@@ -131,6 +155,7 @@ fi
 
 if has js; then
   stage "JavaScript comparative (→ $OUT/js.json, BENCH_SIZE=$BENCH_SIZE)"
+  hdt_artifact
   (
     cd js
     [ -d node_modules ] || npm ci

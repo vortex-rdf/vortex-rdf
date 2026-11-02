@@ -360,6 +360,8 @@
       <strong>oxigraph</strong> enters twice — its in-memory store and its RocksDB-backed
       one, the same library across the residency axis the Vortex (file, memory) pairs
       cross; <strong>sophia</strong> only holds its data in memory.
+      A cell whose first run takes longer than 30 s is not measured, and reads
+      <span class="mono">timeout</span>, that run's time as its tooltip.
     </p>
     <p class="lede mono" id="compare-provenance"></p>
     <div class="panel-grid" id="compare-ingest-panels"></div>
@@ -500,6 +502,8 @@
       <a href="https://github.com/KonradHoeffner/hdt#web-assembly">hdt-wasm</a> (the Rust crate's read-only
       wasm bindings), on a
       synthetic dataset generated in-process of named-graph quads (triples for hdt), across build, open, query in both cache regimes, full scan, add and delete.
+      A cell whose first run takes longer than 30 s is not measured, and reads
+      <span class="mono">timeout</span>, that run's time as its tooltip.
     </p>
     <div class="kpi-row" id="js-kpi-row"></div>
     <p class="lede mono" id="js-matched-rows"></p>
@@ -602,12 +606,13 @@
     <p class="lede">
       One <code>python/bench/run.py</code> run — the <code>vortex_rdf</code> bindings compared
       against <a href="https://pypi.org/project/pyoxigraph/">pyoxigraph</a>,
-      <a href="https://pypi.org/project/pycottas/">pycottas</a>,
-      <a href="https://pypi.org/project/rdflib/">rdflib</a>, and
-      <a href="https://pypi.org/project/lightrdf/">lightrdf</a> (does not support graphs), across
+      <a href="https://pypi.org/project/pycottas/">pycottas</a> and
+      <a href="https://pypi.org/project/rdflib/">rdflib</a>, across
       build, open, query in both cache regimes, full scan, add and delete.
       Vortex appears with variant build configurations, all using the <em>Dictionary</em>
       layout and different source and indexes.
+      A cell whose first run takes longer than 30 s is not measured, and reads
+      <span class="mono">timeout</span>, that run's time as its tooltip.
     </p>
     <div class="kpi-row" id="py-kpi-row"></div>
     <p class="lede mono" id="py-matched-rows"></p>
@@ -622,13 +627,10 @@
     <p class="group-desc">
       <strong>Build</strong> is each library's idiomatic path from a shared N-Quads file
       to a queryable store (<code>serialize_rdf</code>, <code>bulk_load</code>,
-      <code>rdf2cottas</code>, <code>Dataset.parse</code>) — lightrdf reads the triples
-      projection instead. <strong>Open</strong> is what a fresh
+      <code>rdf2cottas</code>, <code>Dataset.parse</code>). <strong>Open</strong> is what a fresh
       process pays to query an already-built artifact. pyoxigraph and rdflib hold their store
       in memory and have no artifact to open, so those cells read
       <span class="mono">unsupported</span>.
-      lightrdf builds nothing; its “build” is one full parse, the same pass every other
-      library must do before it can index anything.
     </p>
     <div class="panel-grid" id="py-ingest-panels"></div>
   </section>
@@ -645,13 +647,11 @@
       <strong>Materialized</strong> delivers the results by
       iterating its matches in Python and reading every term's string 
       so each library pays for delivering its results (Vortex builds N-Triples strings in Rust,
-      pyoxigraph's <span class="mono">.value</span> reads built Python strings, pycottas and
-      lightrdf yield tuples of strings). <strong>Count-only</strong> skips the reads entirely:
+      pyoxigraph's <span class="mono">.value</span> reads built Python strings, pycottas
+      yields tuples of strings). <strong>Count-only</strong> skips the reads entirely:
       the same pattern resolved, only how many rows matched. Residency differs
       too: the Vortex <em>(file)</em> rows and pycottas read from disk per query, while the
       Vortex <em>(memory)</em>, pyoxigraph and rdflib answer from memory.
-      <strong>lightrdf is the no-index baseline</strong>: it has no store, so every pattern
-      re-parses the whole source file and costs about the same regardless of selectivity.
     </p>
     <div class="panel-grid" id="py-query-panels"></div>
   </section>
@@ -662,10 +662,9 @@
       <h2>Add &amp; delete</h2>
     </div>
     <p class="group-desc">
-      Per-quad addition and deletion of a fixed batch. Only two of the five libraries support mutations: 
-      the Vortex <em>Python</em> bindings expose no mutation API so far, pycottas's store raises
-      <span class="mono">“The COTTAS store is read only!”</span>, and lightrdf is a parser with
-      no store to mutate.
+      Per-quad addition and deletion of a fixed batch. Only two of the four libraries support mutations:
+      the Vortex <em>Python</em> bindings expose no mutation API so far, and pycottas's store raises
+      <span class="mono">“The COTTAS store is read only!”</span>.
     </p>
     <div class="panel-grid" id="py-mut-panels"></div>
   </section>
@@ -679,8 +678,8 @@
       Each adapter runs in its own process <em>and its own virtualenv</em>, so peak RSS is the
       kernel-tracked high-water mark (<span class="mono">VmHWM</span>) for one library alone.
       On-disk size is the artifact the build produced, listed only for the libraries that write
-      one — a store that lives only in memory has no artifact to size, and for lightrdf it is
-      the triples projection it re-reads. Lower is better in both tables.
+      one — a store that lives only in memory has no artifact to size. Lower is better in both
+      tables.
     </p>
     <div class="panel-grid" id="py-footprint-panels"></div>
   </section>
@@ -729,10 +728,12 @@
       against <a href="https://github.com/rdfhdt/hdt-java">hdt-java</a>,
       <a href="https://github.com/the-qa-company/qEndpoint">qEndpoint</a>'s HDT library,
       <a href="https://jena.apache.org/">Apache Jena</a> (its in-memory dataset and TDB2) and
-      <a href="https://rdf4j.org/">Eclipse RDF4J</a> (MemoryStore, NativeStore and LMDB), across
+      <a href="https://rdf4j.org/">Eclipse RDF4J</a> (MemoryStore and LMDB), across
       build, open, query in both cache regimes, full scan, add and delete.
       Vortex appears with the Python tab's six build configurations, all using the <em>Dictionary</em>
       layout. Each adapter runs in its own JVM, on its own library's classpath.
+      A cell whose first run takes longer than 30 s is not measured, and reads
+      <span class="mono">timeout</span>, that run's time as its tooltip.
     </p>
     <div class="kpi-row" id="java-kpi-row"></div>
     <p class="lede mono" id="java-matched-rows"></p>
@@ -753,9 +754,7 @@
       dataset; an RDF4J connection's <code>add</code> in one transaction. <strong>Open</strong> is what
       a fresh process pays to query an already-built artifact. Jena's in-memory dataset and RDF4J's
       MemoryStore hold their store in memory and have no artifact to open, so those cells read
-      <span class="mono">unsupported</span>. RDF4J 6.1's NativeStore keeps a write-ahead log of its
-      value store and reads it back each time it opens, so its Open cell includes that read, and the log
-      is part of its on-disk size.
+      <span class="mono">unsupported</span>.
     </p>
     <div class="panel-grid" id="java-ingest-panels"></div>
   </section>
@@ -774,11 +773,10 @@
       strings, Jena's nodes, RDF4J's values). <strong>Count-only</strong> resolves the same pattern and
       counts the rows without reading a term. Before any pattern is timed, every pattern runs for a fixed
       warm-up budget, discarded, so each library is measured with its query path JIT-compiled.
-      Residency differs too: the Vortex <em>(file)</em> rows, both HDT files, TDB2, the NativeStore and
-      LMDB read from disk, while the Vortex <em>(memory)</em> rows, Jena's in-memory dataset and the
-      MemoryStore answer from memory. RDF4J's two on-disk stores carry the spoc, posc, ospc and cspo
-      indexes, so object- and graph-bound patterns are served from an index, as in every other store
-      here. hdt-java has no graphs, so its <span class="mono">G</span> and
+      Residency differs too: the Vortex <em>(file)</em> rows, both HDT files, TDB2 and LMDB read from
+      disk, while the Vortex <em>(memory)</em> rows, Jena's in-memory dataset and the MemoryStore answer
+      from memory. RDF4J's LMDB store carries the spoc, posc, ospc and cspo indexes, so object- and
+      graph-bound patterns are served from an index, as in every other store here. hdt-java has no graphs, so its <span class="mono">G</span> and
       <span class="mono">SPOG</span> cells read <span class="mono">unsupported</span>.
     </p>
     <div class="panel-grid" id="java-query-panels"></div>
@@ -791,9 +789,9 @@
     </div>
     <p class="group-desc">
       Per-quad addition and deletion of a fixed batch, the batch in one transaction, each store
-      committing with its library's default durability: TDB2's commits are durable, RDF4J's NativeStore
-      and LMDB store do not force a sync at commit, and Jena's in-memory dataset and the MemoryStore keep
-      nothing on disk. Five of the eight stores support mutations: the Vortex <em>Java</em> bindings are
+      committing with its library's default durability: TDB2's commits are durable, RDF4J's LMDB store
+      does not force a sync at commit, and Jena's in-memory dataset and the MemoryStore keep nothing on
+      disk. Four of the seven stores support mutations: the Vortex <em>Java</em> bindings are
       read-only, and an HDT file cannot change — qEndpoint's updates live in its store layer, which this
       tab does not measure.
     </p>
@@ -881,8 +879,8 @@ const rustById = new Map(RUST_DATA.map(d => [d.id, d]));
 const jsById = new Map(JS_DATA.map(d => [byKey(d), d]));
   // A phase the harness attempted and the store could not survive is a result,
   // not a gap: render it as its own labelled cell, with the error as the
-  // tooltip. Without this, oxigraph trapping on the materialized full scan
-  // would look like a benchmark nobody ran.
+  // tooltip. Without this, a store trapping mid-phase would look like a
+  // benchmark nobody ran.
   for (const f of JS_FAILURES ?? []){
     const id = `${f.slug}::${f.phase}`;
     if (!jsById.has(id))
@@ -1022,9 +1020,11 @@ function renderMatrixPanel(container, cfg, map){
         // the library has no API for, an artifact it never writes, or one it
         // has nothing to reopen. It is already out of `best` (the ?? Infinity
         // above); printing a ratio against the winner would imply it lost a
-        // race it never entered. Every such cell reads "unsupported" and
-        // carries its own reason as the tooltip: one word for every absence,
-        // so a reader never has to work out which kind of blank this is.
+        // race it never entered. Every such cell reads one word, its row's own
+        // ("unsupported"; "failed" for a phase the store could not survive;
+        // "timeout" for one whose first run took longer than the time limit),
+        // and carries its reason as the tooltip, so a reader never has to work
+        // out which kind of blank this is.
         if (rec.unsupported || rec.median_ns == null) {
           const why = (rec.reason || "not supported by this library").replace(/"/g, "&quot;");
           return `<td class="num unsup${sep}" title="${why}">${rec.median ?? "unsupported"}</td>`;
@@ -1455,7 +1455,7 @@ function renderJs(){
   // Ingest — every adapter, fastest first
   renderMatrixPanel(document.getElementById("js-ingest-panels"), {
     title:"Build and open",
-    note:"<b>hdt has no Build cell</b>: HDT wasm bindings are read-only. Its artifact is built <em>natively</em> by the Rust tab's comparative bench from this same dataset, and this adapter only opens it — checking the triple count matches. <b>Open</b> here is adopting an already-built store's bytes — <b>rdf-stores and oxigraph</b> cannot hand theirs out as bytes, so there is nothing to adopt and a fresh process just builds again. <span class=\"best-key\">Green</span> = fastest per column.",
+    note:"<b>hdt has no Build cell</b>: HDT wasm bindings are read-only. Its artifact is built <em>natively</em>, by the hdt crate's own converter, from this same dataset, and this adapter only opens it — checking the triple count matches. <b>Open</b> here is adopting an already-built store's bytes — <b>rdf-stores and oxigraph</b> cannot hand theirs out as bytes, so there is nothing to adopt and a fresh process just builds again. <span class=\"best-key\">Green</span> = fastest per column.",
     rowHeaders:["Store"], columns:["Build","Open"], sortByColumn:0,
     rows: JS_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
   }, jsById);
@@ -1716,12 +1716,11 @@ const PY_VORTEX = [
   { slug:"vortex_dict_byref",      label:"vortex-rdf Dict+ByRef (file)" },
   { slug:"vortex_dict_byref_mem",  label:"vortex-rdf Dict+ByRef (memory)" },
 ];
-// The four libraries Vortex is measured against.
+// The three libraries Vortex is measured against.
 const PY_OTHER_LIBS = [
   { slug:"pyoxigraph", label:"pyoxigraph (memory)" },
   { slug:"pycottas",   label:"pycottas (file)" },
   { slug:"rdflib",     label:"rdflib (memory)" },
-  { slug:"lightrdf",   label:"lightrdf (no index)" },
 ];
 // One row per library, for the facts that are about a library rather than a
 // build: whether it has a mutation API, and how many libraries there are.
@@ -1729,12 +1728,12 @@ const PY_LIBRARIES = [{ slug:PY_VORTEX[0].slug, label:"vortex-rdf" }, ...PY_OTHE
 const PY_TAB = {
   key:"py", data:PY_DATA, memory:PY_MEMORY, sizes:PY_SIZES, config:PY_CONFIG, provenance:PY_PROVENANCE,
   failures:[], vortex:PY_VORTEX, others:PY_OTHER_LIBS, libraries:PY_LIBRARIES,
-  libraryCount:PY_LIBRARIES.length, librariesSub:"vortex · pyoxigraph · pycottas · rdflib · lightrdf",
+  libraryCount:PY_LIBRARIES.length, librariesSub:"vortex · pyoxigraph · pycottas · rdflib",
   emptyLabel:"No Python results",
   emptyHint:"run <code>python3 python/bench/run.py</code>, then re-render with <code>--python</code>",
   notes:{
     rss:"Peak resident set size of each adapter's own process and virtualenv: build + open + every pattern. Smallest first; <span class=\"best-key\">green</span> = smallest footprint, the multiplier is vs it.",
-    size:"Bytes the build wrote. Only the libraries that write an artifact are listed — a store that lives only in memory has none; for lightrdf it is the triples projection it re-reads, since that re-read is its query path. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
+    size:"Bytes the build wrote. Only the libraries that write an artifact are listed — a store that lives only in memory has none. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
   },
 };
 
@@ -1748,7 +1747,6 @@ const JAVA_OTHER_LIBS = [
   { slug:"jena_tim",      label:"Jena TIM (memory)" },
   { slug:"jena_tdb2",     label:"Jena TDB2 (file)" },
   { slug:"rdf4j_memory",  label:"RDF4J MemoryStore (memory)" },
-  { slug:"rdf4j_native",  label:"RDF4J NativeStore (file)" },
   { slug:"rdf4j_lmdb",    label:"RDF4J LMDB (file)" },
 ];
 const JAVA_TAB = {
