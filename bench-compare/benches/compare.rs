@@ -315,12 +315,13 @@ fn unsupported_row(id: &str, reason: &str) -> Row {
     }
 }
 
-/// A cell whose first run took `ns`, past the time limit (see [`timeout_ns`]).
-fn timeout_row(id: &str, ns: f64, regime: Option<&'static str>) -> Row {
+/// A query cell whose first run took `ns`, past the time limit `limit_ns` (see
+/// [`timeout_ns`]).
+fn timeout_row(id: &str, ns: f64, limit_ns: f64, regime: Option<&'static str>) -> Row {
     let reason = format!(
         "not measured: one run took {}, past the {} s limit",
         fmt_ns(ns),
-        timeout_ns() / 1e9
+        limit_ns / 1e9
     );
     Row {
         regime,
@@ -336,11 +337,13 @@ fn split_id(id: &str) -> (String, Option<String>) {
     }
 }
 
-/// The time limit, the same for every library in every suite: a cell whose
-/// first run, warmup or sample, takes longer than this is not measured, and
-/// reads "timeout" with that run's time as its tooltip; `0` disables it.
+/// The time limit for query cells, the same for every library in every suite:
+/// a match or count cell, warm or cold, the full scan included, whose first
+/// run, warmup or sample, takes longer than this is not measured, and reads
+/// "timeout" with that run's time as its tooltip; `0` disables it. Builds,
+/// opens and mutations are always measured (see [`measure_query`]).
 ///
-/// A cell that takes tens of seconds per run is orders of magnitude slower
+/// A query that takes tens of seconds per run is orders of magnitude slower
 /// than the rest of its column, and its repetitions would cost minutes for one
 /// number. Same knob and default as the JS, Python and Java harnesses.
 fn timeout_ns() -> f64 {
@@ -358,9 +361,42 @@ fn timeout_ns() -> f64 {
 /// `id`'s row. Each run gets a fresh `setup()` product, made before its clock
 /// starts — the shape of the cold query arms (a per-iteration `open`) and of the
 /// mutation phases (a store rebuilt or cleared per iteration). Only `f(target)`
-/// is timed; whatever it returns is dropped after the clock stops. The first
-/// run, warmup or sample, is held to [`timeout_ns`].
+/// is timed; whatever it returns is dropped after the clock stops. The cell is
+/// measured however long it takes: a build, an open or a mutation.
 fn measure<T, R>(
+    id: &str,
+    setup: impl FnMut() -> T,
+    f: impl FnMut(T) -> R,
+    rows: &mut Vec<Row>,
+    iters: usize,
+    warmup: usize,
+    regime: Option<&'static str>,
+) {
+    measure_within(id, setup, f, rows, iters, warmup, regime, 0.0);
+}
+
+/// [`measure`] for a query cell, a match or count, warm or cold, the full scan
+/// included: its first run is held to [`timeout_ns`], and one past it leaves
+/// the cell unmeasured, with a "timeout" row in its place.
+fn measure_query<T, R>(
+    id: &str,
+    setup: impl FnMut() -> T,
+    f: impl FnMut(T) -> R,
+    rows: &mut Vec<Row>,
+    iters: usize,
+    warmup: usize,
+    regime: Option<&'static str>,
+) {
+    measure_within(id, setup, f, rows, iters, warmup, regime, timeout_ns());
+}
+
+/// [`measure`], with the first run, warmup or sample, held to `limit_ns`; `0`
+/// holds it to none.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "measure's seven, plus the limit its two callers set"
+)]
+fn measure_within<T, R>(
     id: &str,
     mut setup: impl FnMut() -> T,
     mut f: impl FnMut(T) -> R,
@@ -368,6 +404,7 @@ fn measure<T, R>(
     iters: usize,
     warmup: usize,
     regime: Option<&'static str>,
+    limit_ns: f64,
 ) {
     let mut timed = || {
         let target = setup();
@@ -378,9 +415,8 @@ fn measure<T, R>(
         ns
     };
     let first = timed();
-    let limit = timeout_ns();
-    if limit > 0.0 && first > limit {
-        rows.push(timeout_row(id, first, regime));
+    if limit_ns > 0.0 && first > limit_ns {
+        rows.push(timeout_row(id, first, limit_ns, regime));
         return;
     }
     // The first run is a warmup run when there are any, else the first sample.
@@ -1431,7 +1467,7 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
                 probe.name
             );
             log(&format!("{} {} (warm)…", read.verb(), probe.name));
-            measure(
+            measure_query(
                 &id,
                 || (),
                 |()| {
@@ -1450,7 +1486,7 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
             // other tab, which all exclude it.
             if a.has_distinct_open() {
                 log(&format!("{} {} (cold)…", read.verb(), probe.name));
-                measure(
+                measure_query(
                     &id,
                     || a.open(&run),
                     |h| {

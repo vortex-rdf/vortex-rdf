@@ -360,8 +360,9 @@
       <strong>oxigraph</strong> enters twice — its in-memory store and its RocksDB-backed
       one, the same library across the residency axis the Vortex (file, memory) pairs
       cross; <strong>sophia</strong> only holds its data in memory.
-      A cell whose first run takes longer than 30 s is not measured, and reads
-      <span class="mono">timeout</span>, that run's time as its tooltip.
+      A query (a match or count, the full scan included) whose first run takes longer
+      than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
+      tooltip.
     </p>
     <p class="lede mono" id="compare-provenance"></p>
     <div class="panel-grid" id="compare-ingest-panels"></div>
@@ -502,8 +503,9 @@
       <a href="https://github.com/KonradHoeffner/hdt#web-assembly">hdt-wasm</a> (the Rust crate's read-only
       wasm bindings), on a
       synthetic dataset generated in-process of named-graph quads (triples for hdt), across build, open, query in both cache regimes, full scan, add and delete.
-      A cell whose first run takes longer than 30 s is not measured, and reads
-      <span class="mono">timeout</span>, that run's time as its tooltip.
+      A query (a match or count, the full scan included) whose first run takes longer
+      than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
+      tooltip.
     </p>
     <div class="kpi-row" id="js-kpi-row"></div>
     <p class="lede mono" id="js-matched-rows"></p>
@@ -611,8 +613,9 @@
       build, open, query in both cache regimes, full scan, add and delete.
       Vortex appears with variant build configurations, all using the <em>Dictionary</em>
       layout and different source and indexes.
-      A cell whose first run takes longer than 30 s is not measured, and reads
-      <span class="mono">timeout</span>, that run's time as its tooltip.
+      A query (a match or count, the full scan included) whose first run takes longer
+      than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
+      tooltip.
     </p>
     <div class="kpi-row" id="py-kpi-row"></div>
     <p class="lede mono" id="py-matched-rows"></p>
@@ -732,8 +735,9 @@
       build, open, query in both cache regimes, full scan, add and delete.
       Vortex appears with the Python tab's six build configurations, all using the <em>Dictionary</em>
       layout. Each adapter runs in its own JVM, on its own library's classpath.
-      A cell whose first run takes longer than 30 s is not measured, and reads
-      <span class="mono">timeout</span>, that run's time as its tooltip.
+      A query (a match or count, the full scan included) whose first run takes longer
+      than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
+      tooltip.
     </p>
     <div class="kpi-row" id="java-kpi-row"></div>
     <p class="lede mono" id="java-matched-rows"></p>

@@ -287,8 +287,8 @@ public final class Worker {
 					counts.put(p.name(), counted(handle, p.name(), q));
 					String id = slug + "::" + p.name();
 					int iters = scan ? k.fullScanIters() : k.queryIters(), warmup = scan ? 0 : k.queryWarmup();
-					m.time(id, "warm", iters, warmup, null, s -> a.count(handle, q), null, rows);
-					m.time(id + "::count", "warm", iters, warmup, null, s -> a.countOnly(handle, q), null, rows);
+					m.timeQuery(id, "warm", iters, warmup, null, s -> a.count(handle, q), null, rows);
+					m.timeQuery(id + "::count", "warm", iters, warmup, null, s -> a.countOnly(handle, q), null, rows);
 				} catch (Exception | OutOfMemoryError e) {
 					// A pattern that fails warm fails cold too: its cold cells go with it.
 					failures.add(failure(p.name(), keys(p.name()), e));
@@ -308,9 +308,9 @@ public final class Worker {
 				String id = slug + "::" + p.name();
 				int iters = scan ? k.fullScanIters() : k.queryIters(), warmup = scan ? 0 : k.queryWarmup();
 				try {
-					m.<H>time(id, "cold", iters, warmup, () -> a.open(src, location), h -> a.count(h, q),
+					m.<H>timeQuery(id, "cold", iters, warmup, () -> a.open(src, location), h -> a.count(h, q),
 							(h, out) -> a.dispose(h), rows);
-					m.<H>time(id + "::count", "cold", iters, warmup, () -> a.open(src, location),
+					m.<H>timeQuery(id + "::count", "cold", iters, warmup, () -> a.open(src, location),
 							h -> a.countOnly(h, q), (h, out) -> a.dispose(h), rows);
 				} catch (Exception | OutOfMemoryError e) {
 					failures.add(failure(p.name(), coldKeys(p.name()), e));

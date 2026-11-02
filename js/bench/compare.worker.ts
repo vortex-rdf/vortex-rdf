@@ -54,12 +54,14 @@ async function bench(
  *  its match count. */
 const matched: Record<string, number> = {};
 
-/** The time limit, the same for every library: a cell whose one probing run
- *  takes longer than this is not measured, and reads "timeout", with that run's
- *  time as its tooltip. `0` disables the limit.
+/** The time limit for query cells, the same for every library: a match or
+ *  count cell, warm or cold, the full scan included, whose one probing run
+ *  takes longer than this is not measured, and reads "timeout", with that
+ *  run's time as its tooltip. `0` disables the limit. Builds, opens and
+ *  mutations are always measured.
  *
- *  Every cell runs once before it is measured (see `measure`), so the limit
- *  costs a timed-out cell one run, never its repetitions: a 34 s cell at
+ *  Every query cell runs once before it is measured (see `measure`), so the
+ *  limit costs a timed-out cell one run, never its repetitions: a 34 s cell at
  *  10 iterations + 5 warmups would be 8½ minutes for one number, three orders
  *  of magnitude slower than the rest of its column. */
 const TIMEOUT_MS = Number(process.env.BENCH_TIMEOUT_MS ?? 30_000);
@@ -77,10 +79,10 @@ async function timeOnce<T>(run: () => Promise<T> | T): Promise<Probe<T>> {
         : { value };
 }
 
-/** `ids` as cells that timed out, in `regime` where they have one. */
-function timeouts(ids: string[], reason: string, regime?: 'warm' | 'cold'): Row[] {
+/** `ids` as query cells that timed out in `regime`. */
+function timeouts(ids: string[], reason: string, regime: 'warm' | 'cold'): Row[] {
     console.log(`  [${ids.join(', ')}] timeout — ${reason}`);
-    return ids.map((id) => ({ ...timeoutRow(id, reason), ...(regime ? { regime } : {}) }));
+    return ids.map((id) => ({ ...timeoutRow(id, reason), regime }));
 }
 
 /** How a phase reaches its store: `probe` runs one call on it, timed against
@@ -217,10 +219,7 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     // array it does not force us to regenerate it for the ingest phase.
     const isVortex = a.slug.startsWith('vortex');
     const before = await memSnapshot(isVortex);
-    // The build is also the ingest cell's probe: one past the time limit leaves
-    // that cell unmeasured, though its store still serves the queries below.
-    const built = await timeOnce(() => a.build(triples));
-    let th: unknown = built.value;
+    let th: unknown = await a.build(triples);
     const after = await memSnapshot(isVortex);
     Object.assign(storeFootprint, {
         rssMb: delta(after.rss, before.rss),
@@ -236,8 +235,6 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
 
     if (a.ingestUnsupported) {
         rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
-    } else if (built.late) {
-        rows.push(...timeouts([`ingest::${a.slug}`], built.late));
     } else {
         console.log(`[${a.label}] ingest…`);
         await bench('ingest', rows, HEAVY_OPTS, (b) => {

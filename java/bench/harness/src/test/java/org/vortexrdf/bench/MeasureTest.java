@@ -35,11 +35,11 @@ class MeasureTest {
 	}
 
 	@Test
-	void aFirstRunPastTheLimitTimesTheCellOut() throws Exception {
+	void aQueryWhoseFirstRunIsPastTheLimitTimesOut() throws Exception {
 		AtomicInteger bodies = new AtomicInteger();
 		List<Map<String, Object>> rows = new ArrayList<>();
 
-		new Measure(timeoutNs(1)).time("ingest::list", null, 10, 5, null, s -> {
+		new Measure(timeoutNs(1)).timeQuery("list::S", "cold", 10, 5, null, s -> {
 			bodies.incrementAndGet();
 			Thread.sleep(2);
 			return null;
@@ -52,7 +52,23 @@ class MeasureTest {
 		assertNull(row.get("median_ns"));
 		assertEquals("0", row.get("samples"));
 		assertTrue(((String) row.get("reason")).startsWith("not measured: one run took "), (String) row.get("reason"));
-		assertTrue(!row.containsKey("regime"));
+		assertEquals("cold", row.get("regime"));
+	}
+
+	@Test
+	void aBuildIsMeasuredHoweverSlow() throws Exception {
+		AtomicInteger bodies = new AtomicInteger();
+		List<Map<String, Object>> rows = new ArrayList<>();
+
+		new Measure(timeoutNs(1)).time("ingest::list", null, 3, 0, null, s -> {
+			bodies.incrementAndGet();
+			Thread.sleep(2);
+			return null;
+		}, null, rows);
+
+		assertEquals(3, bodies.get());
+		assertEquals("3", rows.get(0).get("samples"));
+		assertTrue(!rows.get(0).containsKey("timeout"));
 	}
 
 	@Test
@@ -60,7 +76,7 @@ class MeasureTest {
 		AtomicInteger bodies = new AtomicInteger();
 		List<Map<String, Object>> rows = new ArrayList<>();
 
-		new Measure(timeoutNs(1_000_000)).time("list::S", "warm", 3, 1, null, s -> {
+		new Measure(timeoutNs(1_000_000)).timeQuery("list::S", "warm", 3, 1, null, s -> {
 			if (bodies.getAndIncrement() > 0) {
 				Thread.sleep(2);
 			}
