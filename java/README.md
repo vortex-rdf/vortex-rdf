@@ -4,7 +4,7 @@ Java bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a colu
 
 They are a thin layer over the Rust core, for any JVM program that wants to query a store: a JNI library (`libvortex_rdf_jni`, this crate) and the small `org.vortexrdf` API on top of it. They are not tied to a query engine; `vortex-qendpoint`, a separate repository, is one integration built on them: it serves a store through qEndpoint (RDF4J) in place of an HDT file.
 
-Requires Java 11 or later. The API is `org.vortexrdf.VortexRdfStore`, with `TermDictionary` for term codes and `QuadIterator` and `CodeChunks` for streaming a match; every class is documented in its Javadoc.
+Requires Java 17 or later. The API is `org.vortexrdf.VortexRdfStore`, with `TermDictionary` for term codes and `QuadIterator` and `CodeChunks` for streaming a match; every class is documented in its Javadoc.
 
 ## Install
 
