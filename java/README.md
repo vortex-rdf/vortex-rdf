@@ -1,4 +1,5 @@
 # Vortex-RDF for Java
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.vortex-rdf/vortex-rdf.svg)](https://central.sonatype.com/artifact/io.github.vortex-rdf/vortex-rdf)
 
 Java bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a columnar RDF store format built on Vortex. A store is opened memory-mapped from a `.vortex` file and queried in place, without loading the dataset into memory. The bindings are read-only: build `.vortex` files with the [CLI](../README.md) (`vortex-rdf-cli serialize`) or the Python and JavaScript bindings, then open and query them from Java.
 

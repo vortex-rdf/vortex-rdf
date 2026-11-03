@@ -170,13 +170,20 @@ host_platform() {
 }
 
 # The Java bindings: the crate's own Rust tests run under rust-tests; this job
-# builds the JNI library and the stores and oracle the JUnit suite reads (the
-# crate's `fixtures` example), then runs Maven.
+# builds the Javadoc, which fails on any warning (the POM sets failOnWarnings,
+# and only the release build otherwise runs it), then the JNI library and the
+# stores and oracle the JUnit suite reads (the crate's `fixtures` example),
+# then runs the JUnit suite.
 job_java_tests() {
   if ! command -v java >/dev/null 2>&1 || ! command -v mvn >/dev/null 2>&1; then
     skip_job "no JDK or Maven" "install JDK 17 or later and Maven"
     return 0
   fi
+  # First: it needs no native library, so a doc warning fails before the cargo build.
+  # The plugin skips a run its record of the last one calls up to date, and that
+  # record misses an edit to an existing source file; without it, it always runs.
+  rm -f java/target/maven-javadoc-plugin-stale-data.txt
+  run -C java mvn -B javadoc:javadoc
   local target="${CARGO_TARGET_DIR:-target}" lib platform bundled=""
   case $target in /*) ;; *) target="$PWD/$target" ;; esac
   run cargo build -p vortex-rdf-java

@@ -21,28 +21,39 @@ public final class TermDictionary {
 		this.store = store;
 	}
 
-	/** The number of terms; codes are {@code 0} to {@code size() - 1}. */
+	/** {@return the number of terms; codes are {@code 0} to {@code size() - 1}} */
 	public long size() {
 		return store.callLong(Native::termCount);
 	}
 
 	/**
-	 * The code of a term, or {@link VortexRdfStore#NONE} when the dictionary lacks it, which in a code pattern is a
-	 * free position: check for it before putting the code into one. The spelling is tolerated: an IRI with or without
-	 * angle brackets, a literal with an explicit {@code xsd:string} type or an upper-case language tag, and the
-	 * default graph as {@code ""} all resolve to the stored form's code.
+	 * {@return the code of a term, or {@link VortexRdfStore#NONE} when the dictionary lacks it} In a code pattern,
+	 * {@code NONE} is a free position: check for it before putting the code into one. The spelling is tolerated: an
+	 * IRI with or without angle brackets, a literal with an explicit {@code xsd:string} type or an upper-case language
+	 * tag, and the default graph as {@code ""} all resolve to the stored form's code.
+	 *
+	 * @param term the term's N-Triples spelling
 	 */
 	public long encode(String term) {
 		Objects.requireNonNull(term, "term");
 		return store.callLong(h -> Native.encode(h, term));
 	}
 
-	/** The N-Triples spelling of a code; {@code null} for a code outside the dictionary. */
+	/**
+	 * {@return the N-Triples spelling of a code; {@code null} for a code outside the dictionary}
+	 *
+	 * @param code the term's code
+	 */
 	public String decode(long code) {
 		return store.call(h -> Native.decode(h, code));
 	}
 
-	/** {@link #decode} of each code, in order, for codes in any order and with repeats. */
+	/**
+	 * {@link #decode} of each code, in order, for codes in any order and with repeats.
+	 *
+	 * @param codes the codes to decode
+	 * @return each code's N-Triples spelling at the code's index; {@code null} for a code outside the dictionary
+	 */
 	public String[] decodeMany(long[] codes) {
 		Objects.requireNonNull(codes, "codes");
 		return decodeMany(codes, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
@@ -72,7 +83,7 @@ public final class TermDictionary {
 		});
 	}
 
-	/** The code ranges of the term kinds. Terms of a kind are contiguous, so a code's kind is a range check. */
+	/** {@return the code ranges of the term kinds} Terms of a kind are contiguous, so a code's kind is a range check. */
 	public Ranges ranges() {
 		return new Ranges(store.call(Native::ranges));
 	}
@@ -92,22 +103,25 @@ public final class TermDictionary {
 			blanks = new CodeRange(r[5], r[6]);
 		}
 
-		/** The code of {@code ""}, the default graph's name, or {@link VortexRdfStore#NONE} when it is not a term. */
+		/**
+		 * {@return the code of {@code ""}, the default graph's name, or {@link VortexRdfStore#NONE} when it is not a
+		 * term}
+		 */
 		public long defaultGraph() {
 			return defaultGraph;
 		}
 
-		/** The literals' codes. */
+		/** {@return the literals' codes} */
 		public CodeRange literals() {
 			return literals;
 		}
 
-		/** The IRIs' codes. */
+		/** {@return the IRIs' codes} */
 		public CodeRange iris() {
 			return iris;
 		}
 
-		/** The blank nodes' codes. */
+		/** {@return the blank nodes' codes} */
 		public CodeRange blanks() {
 			return blanks;
 		}
@@ -123,17 +137,21 @@ public final class TermDictionary {
 			this.end = end;
 		}
 
-		/** The first code. */
+		/** {@return the first code} */
 		public long start() {
 			return start;
 		}
 
-		/** One past the last code. */
+		/** {@return one past the last code} */
 		public long end() {
 			return end;
 		}
 
-		/** Whether {@code code} is in the range. */
+		/**
+		 * {@return whether {@code code} is in the range}
+		 *
+		 * @param code the code to check
+		 */
 		public boolean contains(long code) {
 			return start <= code && code < end;
 		}
