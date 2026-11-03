@@ -123,6 +123,16 @@
           </execution>
         </executions>
       </plugin>
+      <!-- Bound to no phase here: the release profile attaches the javadoc jar, and scripts/ci-check.sh java-tests
+           runs `mvn javadoc:javadoc` so that a javadoc warning fails CI, not only the next release. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.12.0</version>
+        <configuration>
+          <failOnWarnings>true</failOnWarnings>
+        </configuration>
+      </plugin>
     </plugins>
   </build>
 
@@ -234,10 +244,10 @@
               </execution>
             </executions>
           </plugin>
+          <!-- Its version and configuration are the main build's. -->
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-javadoc-plugin</artifactId>
-            <version>3.12.0</version>
             <executions>
               <execution>
                 <id>attach-javadocs</id>
