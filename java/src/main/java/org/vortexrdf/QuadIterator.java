@@ -74,7 +74,7 @@ public final class QuadIterator implements Iterator<String[]>, AutoCloseable {
 		stream.close();
 	}
 
-	/** The rows left as a sequential, ordered stream, whose {@code close()} closes this iterator. */
+	/** {@return the rows left as a sequential, ordered stream, whose {@code close()} closes this iterator} */
 	public Stream<String[]> stream() {
 		Spliterator<String[]> rows = Spliterators.spliteratorUnknownSize(this,
 				Spliterator.ORDERED | Spliterator.NONNULL);

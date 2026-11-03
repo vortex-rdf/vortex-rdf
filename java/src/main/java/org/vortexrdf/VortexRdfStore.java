@@ -61,7 +61,12 @@ public final class VortexRdfStore implements AutoCloseable {
 		this.dictionary = Native.hasDictionary(handle) ? new TermDictionary(this) : null;
 	}
 
-	/** Opens a store memory-mapped: the operating system's page cache holds what queries touch. */
+	/**
+	 * Opens a store memory-mapped: the operating system's page cache holds what queries touch.
+	 *
+	 * @param file the {@code .vortex} file
+	 * @return the open store
+	 */
 	public static VortexRdfStore open(Path file) {
 		return open(file, false);
 	}
@@ -69,6 +74,10 @@ public final class VortexRdfStore implements AutoCloseable {
 	/**
 	 * Opens a store; with {@code inMemory} the whole file is loaded and later queries do not read it again.
 	 * A mapped file must not be modified while open: replace it by renaming a new file over it.
+	 *
+	 * @param file the {@code .vortex} file
+	 * @param inMemory whether to load the whole file rather than map it
+	 * @return the open store
 	 */
 	public static VortexRdfStore open(Path file, boolean inMemory) {
 		Objects.requireNonNull(file, "file");
@@ -160,27 +169,30 @@ public final class VortexRdfStore implements AutoCloseable {
 		streams.remove(stream);
 	}
 
-	/** The number of quads. */
+	/** {@return the number of quads} */
 	public long size() {
 		return callLong(Native::size);
 	}
 
-	/** The column layout: {@code "dictionary"}, {@code "default"} or {@code "typed-object"}. */
+	/** {@return the column layout: {@code "dictionary"}, {@code "default"} or {@code "typed-object"}} */
 	public String layout() {
 		return call(Native::layout);
 	}
 
-	/** The secondary indexes the file carries: {@code "secondary-by-copy"}, {@code "secondary-by-reference"}. */
+	/**
+	 * {@return the secondary indexes the file carries: {@code "secondary-by-copy"}, {@code "secondary-by-reference"}}
+	 */
 	public List<String> indexes() {
 		return List.of(call(Native::indexes));
 	}
 
-	/** The term dictionary, present for a store of the {@code dictionary} layout. */
 	/**
 	 * vortex-rdf's encoded-search work counters by name, cumulative in this process: the chunk leaves searched
 	 * encoded or decoded, resident probes, gathers, shared canonical decodes and equality-scan binds, each also by the
 	 * number of values. They count only with {@code VORTEX_RDF_COUNTERS=1} set when the native library loads; otherwise
 	 * every value is 0. Meant for measurements, not for applications.
+	 *
+	 * @return each counter's value by name, in an unmodifiable map
 	 */
 	public static Map<String, Long> engineCounters() {
 		String[] names = Native.engineCounterNames();
@@ -192,20 +204,33 @@ public final class VortexRdfStore implements AutoCloseable {
 		return Collections.unmodifiableMap(counters);
 	}
 
+	/** {@return the term dictionary, present for a store of the {@code dictionary} layout} */
 	public Optional<TermDictionary> dictionary() {
 		return Optional.ofNullable(dictionary);
 	}
 
 	// ---- term patterns ----
 
-	/** The number of quads matching a pattern of terms, counted without reading any term. */
+	/**
+	 * {@return the number of quads matching a pattern of terms, counted without reading any term}
+	 *
+	 * @param s the subject, or {@code null} for any
+	 * @param p the predicate, or {@code null} for any
+	 * @param o the object, or {@code null} for any
+	 * @param g the graph, {@code ""} for the default graph, or {@code null} for any
+	 */
 	public long count(String s, String p, String o, String g) {
 		return callLong(h -> Native.count(h, s, p, o, g));
 	}
 
 	/**
-	 * Every quad matching a pattern of terms, as {@code {s, p, o, g}} spellings, in base row order
-	 * ({@code (s, p, o, g)}) except on a pattern a {@code secondary-by-copy} index serves, read in that index's order.
+	 * {@return every quad matching a pattern of terms, as {@code {s, p, o, g}} spellings, in base row order
+	 * ({@code (s, p, o, g)}) except on a pattern a {@code secondary-by-copy} index serves, read in that index's order}
+	 *
+	 * @param s the subject, or {@code null} for any
+	 * @param p the predicate, or {@code null} for any
+	 * @param o the object, or {@code null} for any
+	 * @param g the graph, {@code ""} for the default graph, or {@code null} for any
 	 */
 	public List<String[]> quads(String s, String p, String o, String g) {
 		return quads(s, p, o, g, Payload.CHUNK_ROWS, Payload.CHUNK_BYTES, Payload.LARGE_TERM);
@@ -235,7 +260,15 @@ public final class VortexRdfStore implements AutoCloseable {
 		});
 	}
 
-	/** {@link #iterateQuads(String, String, String, String, int)} {@link #DEFAULT_BATCH_ROWS} rows at a time. */
+	/**
+	 * {@link #iterateQuads(String, String, String, String, int)} {@link #DEFAULT_BATCH_ROWS} rows at a time.
+	 *
+	 * @param s the subject, or {@code null} for any
+	 * @param p the predicate, or {@code null} for any
+	 * @param o the object, or {@code null} for any
+	 * @param g the graph, {@code ""} for the default graph, or {@code null} for any
+	 * @return an iterator over the matching quads; close it, or drain it, when done
+	 */
 	public QuadIterator iterateQuads(String s, String p, String o, String g) {
 		return iterateQuads(s, p, o, g, DEFAULT_BATCH_ROWS);
 	}
@@ -246,7 +279,12 @@ public final class VortexRdfStore implements AutoCloseable {
 	 * pattern a {@code secondary-by-copy} index serves, read in that index's order. The pattern is checked and matched
 	 * now; the rows are read as the iterator is pulled. Close the iterator, or drain it, when done.
 	 *
+	 * @param s the subject, or {@code null} for any
+	 * @param p the predicate, or {@code null} for any
+	 * @param o the object, or {@code null} for any
+	 * @param g the graph, {@code ""} for the default graph, or {@code null} for any
 	 * @param batchRows the most rows read at a time, at least 1
+	 * @return an iterator over the matching quads
 	 */
 	public QuadIterator iterateQuads(String s, String p, String o, String g, int batchRows) {
 		checkBatchRows(batchRows);
@@ -262,7 +300,15 @@ public final class VortexRdfStore implements AutoCloseable {
 
 	// ---- term codes ----
 
-	/** {@link #matchCodeChunks(long, long, long, long, int)} {@link #DEFAULT_BATCH_ROWS} rows at a time. */
+	/**
+	 * {@link #matchCodeChunks(long, long, long, long, int)} {@link #DEFAULT_BATCH_ROWS} rows at a time.
+	 *
+	 * @param s the subject's code, or negative (such as {@link #NONE}) for any
+	 * @param p the predicate's code, or negative for any
+	 * @param o the object's code, or negative for any
+	 * @param g the graph's code, or negative for any
+	 * @return the matching quads' codes, a chunk at a time; close them, or drain them, when done
+	 */
 	public CodeChunks matchCodeChunks(long s, long p, long o, long g) {
 		return matchCodeChunks(s, p, o, g, DEFAULT_BATCH_ROWS);
 	}
@@ -273,14 +319,26 @@ public final class VortexRdfStore implements AutoCloseable {
 	 * order except on a pattern a {@code secondary-by-copy} index serves, read in that index's order. A code that
 	 * cannot match gives no rows. Close the chunks, or drain them, when done.
 	 *
+	 * @param s the subject's code, or negative (such as {@link #NONE}) for any
+	 * @param p the predicate's code, or negative for any
+	 * @param o the object's code, or negative for any
+	 * @param g the graph's code, or negative for any
 	 * @param batchRows the most rows read at a time, at least 1
+	 * @return the matching quads' codes, a chunk at a time
 	 */
 	public CodeChunks matchCodeChunks(long s, long p, long o, long g, int batchRows) {
 		checkBatchRows(batchRows);
 		return new CodeChunks(openStream(h -> Native.codeStreamOpen(h, s, p, o, g, batchRows)));
 	}
 
-	/** The number of quads matching a pattern of codes, exact and without reading rows; negative is free. */
+	/**
+	 * {@return the number of quads matching a pattern of codes, exact and without reading rows}
+	 *
+	 * @param s the subject's code, or negative (such as {@link #NONE}) for any
+	 * @param p the predicate's code, or negative for any
+	 * @param o the object's code, or negative for any
+	 * @param g the graph's code, or negative for any
+	 */
 	public long countCodes(long s, long p, long o, long g) {
 		return callLong(h -> Native.countCodes(h, s, p, o, g));
 	}
@@ -291,9 +349,16 @@ public final class VortexRdfStore implements AutoCloseable {
 	 * (its position and limit are neither read nor changed), and returns the rows written; negative is free. A code
 	 * that cannot match (past the dictionary, or a term in a position it cannot take) gives no rows.
 	 *
+	 * @param s the subject's code, or negative (such as {@link #NONE}) for any
+	 * @param p the predicate's code, or negative for any
+	 * @param o the object's code, or negative for any
+	 * @param g the graph's code, or negative for any
+	 * @param offset the rows of the match to skip, not negative
 	 * @param out a writable direct buffer in native byte order
 	 *            ({@code ByteBuffer.allocateDirect(n).order(ByteOrder.nativeOrder())}) of at least
 	 *            {@code maxRows * ROW_BYTES} bytes; reuse one across calls
+	 * @param maxRows the most rows to write, not negative
+	 * @return the number of rows written
 	 */
 	public int matchCodes(long s, long p, long o, long g, long offset, ByteBuffer out, int maxRows) {
 		Objects.requireNonNull(out, "out");

@@ -8,6 +8,11 @@ package org.vortexrdf;
 public class VortexException extends RuntimeException {
 	private static final long serialVersionUID = 1L;
 
+	/**
+	 * A failure described by {@code message}.
+	 *
+	 * @param message the description, which {@link #getMessage()} returns
+	 */
 	public VortexException(String message) {
 		super(message);
 	}
