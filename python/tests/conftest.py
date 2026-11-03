@@ -1,12 +1,13 @@
 import pytest
+import pyarrow as pa
 
 from vortex_rdf import serialize_rdf
 
 FIXTURE_NT = """\
-<http://ex.org/alice> <http://xmlns.com/foaf/0.1/name> "Alice" .
+<http://ex.org/alice> <http://xmlns.com/foaf/0.1/name>  "Alice" .
 <http://ex.org/alice> <http://xmlns.com/foaf/0.1/knows> <http://ex.org/bob> .
-<http://ex.org/bob> <http://xmlns.com/foaf/0.1/name> "Bob"@en .
-<http://ex.org/bob> <http://ex.org/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex.org/bob>   <http://xmlns.com/foaf/0.1/name>  "Bob"@en .
+<http://ex.org/bob>   <http://ex.org/age>               "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
 _:b0 <http://xmlns.com/foaf/0.1/name> "Anon" .
 """
 
@@ -76,3 +77,40 @@ def quad_files(fixture_nq_path, tmp_path_factory):
         serialize_rdf(fixture_nq_path, out, layout=layout)
         files[layout] = out
     return files
+
+
+@pytest.fixture(scope="session")
+def arrow_table():
+    subject = pa.array(
+        [
+            "<http://ex.org/alice>",
+            "<http://ex.org/alice>",
+            "<http://ex.org/bob>",
+            "<http://ex.org/bob>",
+        ],
+        type=pa.string(),
+    )
+    predicate = pa.array(
+        [
+            "<http://xmlns.com/foaf/0.1/name>",
+            "<http://xmlns.com/foaf/0.1/knows>",
+            "<http://xmlns.com/foaf/0.1/name>",
+            "<http://ex.org/age>",
+        ],
+        type=pa.string(),
+    )
+    obj = pa.array(
+        [
+            "Alice",
+            "<http://ex.org/bob>",
+            'Bob"@en',
+            '42"^^<http://www.w3.org/2001/XMLSchema#integer>',
+        ],
+        type=pa.string(),
+    )
+
+    graph = pa.array(["", "", "", ""], type=pa.utf8())
+
+    table = pa.table([subject, predicate, obj, graph], names=["s", "p", "o", "g"])
+
+    return table
