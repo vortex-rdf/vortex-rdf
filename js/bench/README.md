@@ -40,6 +40,7 @@ These knobs mean the same in every suite that reads one, in all four languages. 
 | `BENCH_GRAPHS_QUADS` | 8 | JS, Python and Java compare | named graphs the comparative bench asks for, before the generator's coprimality nudge |
 | `MUT_BATCH` | 10000; 512 in `benchmark.rs`, which clamps it to 1-4,095 | JS, Python, Java and Rust compare; `benchmark.rs` | quads per add/delete batch |
 | `BENCH_TIMEOUT_MS` | 30000 | JS, Python, Java and Rust compare | the time limit for query cells, the same for every library: a match or count (the full scan included) whose first run takes longer than this is not measured, and reads `timeout`; builds, opens and mutations are always measured; `0` disables it |
+| `BENCH_MEMORY_RUNS` | 3 | JS, Python, Java and Rust compare | memory runs per adapter, each in a fresh process after the timed runs; `0` runs none, and the page then shows the old peak table |
 | `BENCH_SUBJ_RATIO` | 0.1 | JS and Python compare and CodSpeed; Java compare | distinct subjects / rows — the reciprocal of triples per subject |
 | `BENCH_OBJ_RATIO` | 0.5 | JS and Python compare and CodSpeed; Java compare | distinct objects / rows |
 | `BENCH_PREDICATES` | 32 | JS and Python compare and CodSpeed; JS dict-memory; Java compare | distinct predicates (a closed vocabulary) |
@@ -79,6 +80,32 @@ Each adapter process peaks at several GB at the default scale — check availabl
 | `DICT_MEM_OUT` | `bench/dict-memory.json` | where the points are written |
 
 ## Memory runs
+
+The dashboard's Store memory panels come from separate memory runs, not from the timed process. That process's peak is mostly harness: it holds collected reads and in-process builds, counts mapped pages twice (as anonymous and as file memory), includes the mutations, and moves by about 60 MB from one run to the next. All four comparative suites (JS, Python, Java and Rust compare) therefore measure each adapter's store on its own, the same way.
+
+After the timed runs, each suite makes `BENCH_MEMORY_RUNS` memory runs per adapter (default 3), each in a fresh process. One run:
+
+1. checks its counters: it holds an 8 MiB block and requires each counter to see it, so a counter that misses memory fails the run instead of reporting 0. Java's native counter must see at least 7 MiB of the block, since the JVM's own threads allocate natively during the check; every other counter sees all 8 MiB. A run that fails the check exits non-zero, naming the counter;
+2. takes a baseline before the store exists;
+3. obtains the store the way the timed queries use it, which the entry's `obtained` records: `mapped` (memory-mapped from its file), `loaded` (read from a file into memory), `built` (from the triples) or `opened` (an on-disk database);
+4. reads every probe pattern the adapter answers, and the full scan where the suite reads one, once;
+5. reads its figures, disposes the store, and reads them again.
+
+The figures are in MiB to one decimal, clamped at 0, and `null` where one does not apply:
+
+- **Store:** the live bytes after the reads minus those after the dispose. It is read after the reads, so it includes the caches they filled, which can be large for a store that caches decoded terms (the JS Vortex store, described below, is an example). The suites' own sections give the figures.
+- **Peaks:** the highest memory reached during the reads, above the baseline. Rust, Python and Java sample `/proc/self/status` every 2 ms and report `RssAnon` (process memory) and `RssFile` (mapped pages) at the sample with the highest sum; JS reports the peak of its live bytes. Mapped pages include the program's own code pages that the open and the reads first touch, a few MB to a few tens of MB by library, and the same for a library's file and in-memory rows. A store held in memory therefore reads that much there, not 0, and the gap between a pair's rows is the file's own pages.
+
+With `BENCH_MEMORY_RUNS=0` no suite writes memory entries, and the page shows the old table of query peaks. With 1 or more, every adapter gets an entry even if all its runs fail, and its row then reads "—".
+
+On the page, each cell is the median over the runs, and its tooltip gives the range, the number of runs and how the store was obtained. Each column is ranked with the smallest green and the others as a multiple of it; a figure under 1 MB reads "< 1 MB" and ranks as 1 MB, and "—" is never ranked. A "≈" marks a file / in-memory pair whose medians differ by less than the wider of their two ranges, which is run-to-run spread. Result files written without memory runs keep the query-peak table. A query entry's `peakRssMb` stays in the JSON, as the timed process's peak, for the memory-pressure warning.
+
+Each suite documents its own run:
+
+- Rust compare: `bench-compare/benches/compare.rs`, in `# Memory runs`;
+- Python: `python/bench/README.md`, in `## Memory runs`;
+- Java: `java/bench/README.md`, in `## Memory runs`;
+- JS: the subsection below.
 
 ### The JavaScript suite
 

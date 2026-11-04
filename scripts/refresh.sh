@@ -34,8 +34,11 @@ cd "$(git rev-parse --show-toplevel)"
 # (all of them read BENCH_SIZE): 2^20 rows, one dataset. MUT_BATCH is the
 # comparative suites' add/delete batch; the internals suite keeps its own
 # (see the rust stage). Same numbers .github/workflows/bench-dashboard.yml pins.
+# BENCH_MEMORY_RUNS is how many memory runs every comparative suite makes per
+# adapter, each in a fresh process.
 export BENCH_SIZE="${BENCH_SIZE:-1048576}"
 export MUT_BATCH="${MUT_BATCH:-10000}"
+export BENCH_MEMORY_RUNS="${BENCH_MEMORY_RUNS:-3}"
 OUT=target/bench
 
 ONLY="rust,compare,js,python,java,render"

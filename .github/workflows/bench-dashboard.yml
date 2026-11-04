@@ -26,9 +26,12 @@ concurrency:
 # instrumented runs measure instructions and a bigger dataset only multiplies
 # valgrind cost. MUT_BATCH is the comparative suites' add/delete batch;
 # refresh.sh keeps it from the internals suite, which uses its own.
+# BENCH_MEMORY_RUNS is how many memory runs each comparative suite makes per
+# adapter; the Store memory panels take their medians and ranges over them.
 env:
   BENCH_SIZE: 1048576
   MUT_BATCH: 10000
+  BENCH_MEMORY_RUNS: 3
 
 # The suites measure at once, each on a runner of its own: run one after
 # another, as scripts/refresh.sh runs them locally, they took over an hour and
