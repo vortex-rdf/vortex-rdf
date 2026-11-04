@@ -1,22 +1,36 @@
-r"""`TermDict.filter_codes` checked against rdflib's own evaluator.
+r"""`TermDict.filter_codes` checked against SPARQL engines' own evaluators.
 
-Every kind's verdicts are compared code by code with what rdflib 7.6's SPARQL
+Every kind's verdicts are compared code by code with an engine's answer for
+the same term. A passed code must be true for the engine, a failed one false;
+an undecided one is the caller's.
+
+The numeric kinds follow SPARQL 1.1 (§17.3 maps the comparisons between
+numbers to XPath's `op:numeric-*` operators and their type promotion), and
+are compared with Oxigraph's answers: pyoxigraph loads the stored spellings
+with its own N-Triples parser (one triple per code) and answers one
+`FILTER(?o op constant)` query per kind and constant, where an evaluation
+error is false. Oxigraph passes the W3C SPARQL test suite.
+
+Every other kind follows rdflib 7.6, and is compared with what its SPARQL
 operators answer for the same term, held the way an rdflib store holds it:
 each stored spelling is parsed by rdflib's N-Triples parser into a `Graph`
 (one document per corpus, one line per code), and so is every term-spelled
-constant (`contains`, `strstarts`, `strends`, the numeric kinds). rdflib's N3
-shorthand reader is not used: it rewrites a hex escape that follows an
-escaped backslash (`"C:\\x41"`), which the N-Triples parser and the native
-layer both read as written. A passed code must be true for rdflib, a failed
-one false; an undecided one is the caller's. Regex patterns drawn at random
-from the native allow-list grammar are compared with Python's `re.search` (the
-call rdflib makes), and the native layer must decide every text bar the
-documented gaps listed in `deliberate_gap`. The corpus covers language tags,
-`xsd:string`, other datatypes, IRIs, blank nodes, N-Triples escapes, trailing
-newlines, non-ASCII text and control characters; a table of 64-bit integers
-around the edges of `xsd:long` and `xsd:unsignedLong` checks the numeric
-kinds beyond f64's exact range. Set `VORTEX_RDF_BSBM10K_STORE` to a BSBM 10K
-Dictionary store to also compare its literals.
+constant (`contains`, `strstarts`, `strends`). rdflib's N3 shorthand reader
+is not used: it rewrites a hex escape that follows an escaped backslash
+(`"C:\\x41"`), which the N-Triples parser and the native layer both read as
+written. Regex patterns drawn at random from the native allow-list grammar
+are compared with Python's `re.search` (the call rdflib makes), and the
+native layer must decide every text bar the documented gaps listed in
+`deliberate_gap`.
+
+The corpus covers language tags, `xsd:string`, other datatypes, IRIs, blank
+nodes, N-Triples escapes, trailing newlines, non-ASCII text and control
+characters, and for the numeric kinds single-precision floats, promotion
+between the numeric types, ill-typed lexical forms and values outside their
+type's range; a table of 64-bit integers around the edges of `xsd:long` and
+`xsd:unsignedLong` checks which of them are decided. Set
+`VORTEX_RDF_BSBM10K_STORE` to a BSBM 10K Dictionary store to also compare its
+literals.
 
 `STR()` of a blank node is rdflib's label, and `STR()` of a literal whose
 datatype rdflib normalizes (the keys of `rdflib.term.XSDToPython`, plus
@@ -30,13 +44,14 @@ import os
 import random
 import re
 from collections import Counter
-from decimal import InvalidOperation
 from functools import cache
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import Any, NamedTuple
 
 import pytest
+from pyoxigraph import RdfFormat
+from pyoxigraph import Store as OxigraphStore
 from rdflib import BNode, Graph, Literal, URIRef
 from rdflib.plugins.sparql import operators as op
 from rdflib.plugins.sparql.sparql import SPARQLError
@@ -93,17 +108,29 @@ def constant(spelling: str) -> Any:
     return parse_terms([spelling])[0]
 
 
+def oxigraph_store(codes: list[int], spellings: list[str]) -> OxigraphStore:
+    """An Oxigraph store holding `<urn:s:CODE> <urn:p> SPELLING .` for every
+    code but the default graph's, its spelling read by Oxigraph's own
+    N-Triples parser."""
+    store = OxigraphStore()
+    lines = [f"<urn:s:{code}> <urn:p> {spelling} ." for code, spelling in zip(codes, spellings, strict=True) if spelling]
+    store.load("\n".join(lines) + "\n", format=RdfFormat.N_TRIPLES)
+    return store
+
+
 class Built(NamedTuple):
-    """A serialized corpus: its file, and its terms decoded once."""
+    """A serialized corpus: its file, its terms decoded once, and the same
+    terms in an Oxigraph store."""
 
     path: Path
     spellings: list[str]
     terms: list[Any]
+    oxigraph: OxigraphStore
 
 
 def build(tmp_path_factory, name: str, objects: list[str]) -> Built:
     """Serialize one triple per N-Triples object spelling into a Dictionary
-    store, and decode its terms."""
+    store, decode its terms, and load them into Oxigraph."""
     out = serialized(
         tmp_path_factory.mktemp(name),
         name,
@@ -112,8 +139,9 @@ def build(tmp_path_factory, name: str, objects: list[str]) -> Built:
         layout="dictionary",
     )
     term_dict = VortexRdfStore(out, in_memory=True).term_dict()
-    spellings = term_dict.decode_many(list(range(len(term_dict))))
-    return Built(out, spellings, parse_terms(spellings))
+    codes = list(range(len(term_dict)))
+    spellings = term_dict.decode_many(codes)
+    return Built(out, spellings, parse_terms(spellings), oxigraph_store(codes, spellings))
 
 
 class Corpus(NamedTuple):
@@ -124,6 +152,7 @@ class Corpus(NamedTuple):
     codes: list[int]
     spellings: list[str]
     terms: list[Any]  # None for the default graph's empty spelling
+    oxigraph: OxigraphStore  # the same terms, by code
 
 
 def open_corpus(built: Built, residency: str) -> Corpus:
@@ -132,17 +161,15 @@ def open_corpus(built: Built, residency: str) -> Corpus:
     assert term_dict.file_backed == (residency == "file")
     codes = list(range(len(term_dict)))
     assert term_dict.decode_many(codes) == built.spellings
-    return Corpus(store, term_dict, codes, built.spellings, built.terms)
+    return Corpus(store, term_dict, codes, built.spellings, built.terms, built.oxigraph)
 
 
 # --- The oracle ---------------------------------------------------------------
 
 
-def oracle(kind, arg, term, flags="", case=None, as_str=False) -> bool | None:
-    """rdflib 7.6's FILTER verdict on `term`; an evaluation error is false.
-    None when rdflib itself raises something that is no evaluation error: it
-    orders a NaN double against a decimal with `decimal.InvalidOperation`,
-    which no FILTER catches, so there is no verdict to agree with."""
+def oracle(kind, arg, term, flags="", case=None, as_str=False) -> bool:
+    """rdflib 7.6's FILTER verdict on `term` for every kind but the numeric
+    ones; an evaluation error is false."""
     try:
         if kind in TEXT_KINDS:
             text = term
@@ -159,8 +186,6 @@ def oracle(kind, arg, term, flags="", case=None, as_str=False) -> bool | None:
             else:
                 const = Literal(arg) if kind == "str_prefix" else constant(arg)
                 result = STR_FNS[kind](NS(arg1=text, arg2=const), None)
-        elif kind in NUM_OPS:
-            result = op.RelationalExpression(NS(expr=term, op=NUM_OPS[kind], other=constant(arg)), None)
         elif kind == "lang":
             lang = op.Builtin_LANG(NS(arg=term), None)
             result = op.RelationalExpression(NS(expr=lang, op="=", other=Literal(arg)), None)
@@ -176,8 +201,14 @@ def oracle(kind, arg, term, flags="", case=None, as_str=False) -> bool | None:
         return bool(op.EBV(result))
     except SPARQLError:
         return False
-    except InvalidOperation:
-        return None
+
+
+def oxigraph_passing(corpus: Corpus, kind: str, arg: str) -> set[int]:
+    """The codes whose term Oxigraph's FILTER keeps under a numeric `kind`
+    with the constant `arg` (an N-Triples literal or a bare SPARQL number):
+    SPARQL 1.1's verdict, where an evaluation error is false."""
+    query = f"SELECT ?s WHERE {{ ?s <urn:p> ?o FILTER(?o {NUM_OPS[kind]} {arg}) }}"
+    return {int(row["s"].value[len("urn:s:") :]) for row in corpus.oxigraph.query(query)}
 
 
 def str_undecided(term) -> bool:
@@ -189,7 +220,8 @@ def str_undecided(term) -> bool:
 
 
 def compare(corpus: Corpus, kind, arg, *, flags="", case=None, as_str=False):
-    """Native vs rdflib for every candidate; returns the native `(passed,
+    """Native vs the kind's engine (Oxigraph for the numeric kinds, rdflib
+    for the others) for every candidate; returns the native `(passed,
     undecided)` as sets of codes. Every disagreement is reported at once."""
     passed, undecided = corpus.term_dict.filter_codes(
         kind, arg, U64Column(corpus.codes), flags=flags, case=case, as_str=as_str
@@ -197,6 +229,8 @@ def compare(corpus: Corpus, kind, arg, *, flags="", case=None, as_str=False):
     passed = set(memoryview(passed).cast("Q"))
     undecided = set(memoryview(undecided).cast("Q"))
     where = f"{kind} {arg!r} flags={flags!r} case={case} as_str={as_str}"
+    sparql = oxigraph_passing(corpus, kind, arg) if kind in NUM_OPS else None
+    engine = "rdflib" if sparql is None else "Oxigraph"
     problems = []
     if passed & undecided:
         problems.append(f"{where}: codes {sorted(passed & undecided)[:5]} are both passed and undecided")
@@ -211,14 +245,11 @@ def compare(corpus: Corpus, kind, arg, *, flags="", case=None, as_str=False):
                 verdict = "passed" if code in passed else "failed"
                 problems.append(f"{where}: native {verdict} STR() of {spelling}, which is undecided by contract")
         else:
-            want = oracle(kind, arg, term, flags, case, as_str)
-            if want is None:
-                if code not in undecided:
-                    problems.append(f"{where}: native decided {spelling}, where rdflib raises")
-            elif code in passed and not want:
-                problems.append(f"{where}: native passed {spelling}, rdflib says false")
+            want = code in sparql if sparql is not None else oracle(kind, arg, term, flags, case, as_str)
+            if code in passed and not want:
+                problems.append(f"{where}: native passed {spelling}, {engine} says false")
             elif code not in passed and code not in undecided and want:
-                problems.append(f"{where}: native failed {spelling}, rdflib says true")
+                problems.append(f"{where}: native failed {spelling}, {engine} says true")
     assert not problems, f"{len(problems)} disagreements:\n" + "\n".join(problems[:20])
     return passed, undecided
 
@@ -271,6 +302,14 @@ DATATYPED = [
     ("true", "boolean"), ("1", "boolean"), ("2008-05-03T00:00:00", "dateTime"), ("300", "byte"),
     ("99999999999999999999", "long"), ("-1", "unsignedLong"), ("5", "long"), ("ab", "string"),
     ("0001", "gYear"),
+    # Single precision, promotion between the numeric types, and rounding.
+    ("0.1", "float"), ("16777217", "float"), ("4.25", "float"), ("16777216", "integer"),
+    ("16777217", "integer"), ("4.25", "double"), ("0.1", "double"), ("4.25", "decimal"), ("0.1", "decimal"),
+    ("8.53362226486206", "decimal"), ("2.9815061622519961", "decimal"), ("9007199254740993", "integer"),
+    # Ill-typed, out of the type's range, past the decided range, and special.
+    ("abc", "double"), ("1e", "double"), ("128", "byte"), ("-1", "nonNegativeInteger"),
+    ("1.0000000000000000001", "decimal"), ("9223372036854775808", "integer"), ("inf", "double"),
+    ("-nan", "double"), ("INF", "float"), ("1e39", "float"),
 ]
 
 
@@ -367,19 +406,46 @@ TOTAL_CASES = [
     ("lang_matches", "EN-GB"), ("lang_matches", "e"), ("lang_matches", "en-"), ("lang_matches", "-gb"),
     ("lang_matches", "en--gb"), ("lang_matches", "en-gb-x"),
 ]
-#: Integer-valued literals in range, which compare exactly with every numeric
-#: constant below (whatever its type) and so are always decided.
+#: Numbers every engine promotes alike, which compare with every numeric
+#: constant below (whatever its type) and so are always decided: integers
+#: below 2^53, decimals of at most 15 significant digits, floats, doubles.
 ALWAYS_DECIDED = [
     f'"{lex}"^^<{XSD}{dt}>'
-    for lex, dt in [("42", "integer"), ("01", "integer"), ("+7", "integer"), ("5", "long"), ("1e2", "double")]
+    for lex, dt in [
+        ("42", "integer"), ("01", "integer"), ("+7", "integer"), ("5", "long"), ("1e2", "double"),
+        ("0.1", "float"), ("16777217", "float"), ("4.25", "float"), ("16777216", "integer"),
+        ("16777217", "integer"), ("4.25", "double"), ("0.1", "double"), ("4.25", "decimal"), ("0.1", "decimal"),
+    ]
 ]
-#: Numeric constants, each run under all six operators.
+#: Numeric constants, each run under all six operators: typed literals of
+#: every model, and bare numbers typed by their syntax.
 NUMERIC_CONSTANTS = [
     f'"5"^^<{XSD}integer>', f'"42"^^<{XSD}integer>', f'"-0"^^<{XSD}integer>', f'"100"^^<{XSD}integer>',
     f'"1.5"^^<{XSD}decimal>', f'"1.50"^^<{XSD}decimal>', f'"4.5"^^<{XSD}decimal>',
     f'"1e2"^^<{XSD}double>', f'"2.5"^^<{XSD}double>', f'"5"^^<{XSD}long>', f'"1"^^<{XSD}unsignedLong>',
-    f'"7"^^<{XSD}byte>',
+    f'"7"^^<{XSD}byte>', f'"0.1"^^<{XSD}float>', f'"16777216"^^<{XSD}float>', f'"4.25"^^<{XSD}float>',
+    f'"0.1"^^<{XSD}double>', "5", "4.25", "1e1",
 ]
+#: The numeric XSD datatypes.
+NUMERIC_TYPES = {
+    XSD + local
+    for local in [
+        "integer", "decimal", "float", "double", "nonPositiveInteger", "negativeInteger", "long", "int", "short",
+        "byte", "nonNegativeInteger", "unsignedLong", "unsignedInt", "unsignedShort", "unsignedByte",
+        "positiveInteger",
+    ]
+}
+#: Corpus literals of a numeric datatype whose lexical form its grammar
+#: rejects: ill-typed, with no numeric value.
+ILL_TYPED = [f'"{lex}"^^<{XSD}{dt}>' for lex, dt in [("abc", "integer"), (" 7", "integer"), ("abc", "double"), ("1e", "double")]]
+
+
+def has_no_numeric_value(spelling: str, term) -> bool:
+    """Whether a corpus term is a literal without a numeric value: a string,
+    a language-tagged literal, another datatype, or an ill-typed number."""
+    if not isinstance(term, Literal):
+        return False
+    return term.datatype is None or str(term.datatype) not in NUMERIC_TYPES or spelling in ILL_TYPED
 
 
 @pytest.mark.parametrize("kind, arg", TOTAL_CASES)
@@ -413,10 +479,41 @@ def test_lang_matches_ranges_outside_the_basic_alphabet_are_undecided(corpus, ra
 
 @pytest.mark.parametrize("kind", NUM_OPS)
 @pytest.mark.parametrize("arg", NUMERIC_CONSTANTS)
-def test_numeric_kinds_agree_with_rdflib(corpus, kind, arg):
-    _, undecided = compare(corpus, kind, arg)
-    for spelling in ALWAYS_DECIDED:  # so the comparison above is not vacuous
+def test_numeric_kinds_agree_with_oxigraph(corpus, kind, arg):
+    """Every verdict agrees with Oxigraph's. The numbers every engine
+    promotes alike are decided, and so is every ordering of a literal without
+    a numeric value, which SPARQL makes a type error, so the comparison is not
+    vacuous."""
+    passed, undecided = compare(corpus, kind, arg)
+    for spelling in ALWAYS_DECIDED:
         assert corpus.spellings.index(spelling) not in undecided, f"{kind} {arg!r}: undecided on {spelling}"
+    if kind in ("num_lt", "num_le", "num_gt", "num_ge"):
+        no_value = {
+            code
+            for code, spelling, term in zip(corpus.codes, corpus.spellings, corpus.terms, strict=True)
+            if has_no_numeric_value(spelling, term)
+        }
+        assert len(no_value) > 50 and not no_value & (passed | undecided), (
+            f"{kind} {arg!r}: passed or undecided {sorted(no_value & (passed | undecided))[:5]}"
+        )
+
+
+#: Constants an engine may hold apart from the spec: an integer past 64 bits
+#: and a decimal past 18 fractional digits.
+WIDE_CONSTANTS = [f'"9223372036854775808"^^<{XSD}integer>', "99999999999999999999", "0.0000000000000000001"]
+
+
+@pytest.mark.parametrize("kind", NUM_OPS)
+@pytest.mark.parametrize("arg", WIDE_CONSTANTS)
+def test_a_constant_past_the_decided_range_leaves_numbers_undecided(corpus, kind, arg):
+    """Such a constant leaves every literal of a numeric datatype that has a
+    value undecided, while an ordering of a literal without a numeric value is
+    still a type error."""
+    passed, undecided = compare(corpus, kind, arg)
+    for spelling in ALWAYS_DECIDED:
+        assert corpus.spellings.index(spelling) in undecided, f"{kind} {arg!r}: decided {spelling}"
+    if kind not in ("num_eq", "num_ne"):
+        assert corpus.spellings.index('"abc"') not in passed | undecided
 
 
 # --- Regex over the corpus ----------------------------------------------------------
@@ -639,12 +736,13 @@ def test_random_allow_list_patterns_agree_with_python_re(regex_corpus):
 
 # --- The wide 64-bit integer table ------------------------------------------------
 
-#: The inclusive bounds the native value model holds `xsd:long` and
-#: `xsd:unsignedLong` to. rdflib holds a `long` to none and an `unsignedLong`
-#: to no upper bound, so beyond them rdflib compares and the native layer
-#: must not decide. Values this wide are where a comparison through f64
-#: would equate neighbours.
+#: The inclusive bounds of `xsd:long` and `xsd:unsignedLong`. A value outside
+#: its type's bounds is ill-typed for the spec while Oxigraph compares it,
+#: and Oxigraph holds integers of every type in 64 bits, past which it
+#: errors: the native layer decides a value only within both. Values this
+#: wide are where a comparison through f64 would equate neighbours.
 BOUNDS = {"long": (-(2**63), 2**63 - 1), "unsignedLong": (0, 2**64 - 1)}
+I64 = (-(2**63), 2**63 - 1)
 WIDE_LEXICALS = [
     "-9223372036854775809",  # -2^63 - 1: one past long's lower edge
     "-9223372036854775808",  # -2^63
@@ -681,20 +779,28 @@ def wide_corpus(request, built_wide_corpus):
     return open_corpus(built_wide_corpus, request.param)
 
 
+def within(value: int, bounds: tuple[int, int]) -> bool:
+    return bounds[0] <= value <= bounds[1]
+
+
 @pytest.mark.parametrize("kind", NUM_OPS)
 @pytest.mark.parametrize("arg", wide_constants())
-def test_wide_long_boundaries_agree_with_rdflib(wide_corpus, kind, arg):
-    """An in-range value is decided exactly as rdflib decides it; one past the
-    type's 64-bit bounds is undecided."""
-    bounded = {}
+def test_wide_integer_boundaries_agree_with_oxigraph(wide_corpus, kind, arg):
+    """A value within its type's bounds and 64 bits is decided exactly as
+    Oxigraph decides it, against a constant within 64 bits; any other is
+    undecided."""
+    constant_decided = within(int(arg.split('"')[1]), I64)
+    decided = {}
     for code, term in zip(wide_corpus.codes, wide_corpus.terms, strict=True):
-        if isinstance(term, Literal) and str(term.datatype) in (XSD + "long", XSD + "unsignedLong"):
-            lo, hi = BOUNDS[str(term.datatype)[len(XSD) :]]
-            bounded[code] = lo <= term.value <= hi
-    assert len(bounded) == 2 * len(WIDE_LEXICALS) and list(bounded.values()).count(False) == 10
+        if isinstance(term, Literal):
+            local = str(term.datatype)[len(XSD) :]
+            value = int(str(term))
+            decided[code] = within(value, I64) and within(value, BOUNDS.get(local, I64)) and constant_decided
+    assert len(decided) == 3 * len(WIDE_LEXICALS)
+    assert list(decided.values()).count(True) == (21 if constant_decided else 0)
     _, undecided = compare(wide_corpus, kind, arg)
-    expected = {code for code, in_range in bounded.items() if not in_range}
-    got = undecided & bounded.keys()
+    expected = {code for code, is_decided in decided.items() if not is_decided}
+    got = undecided & decided.keys()
     assert got == expected, (
         f"{kind} {arg}: wrongly undecided {[wide_corpus.spellings[c] for c in sorted(got - expected)]}, "
         f"wrongly decided {[wide_corpus.spellings[c] for c in sorted(expected - got)]}"
@@ -757,13 +863,13 @@ BSBM10K = os.environ.get("VORTEX_RDF_BSBM10K_STORE")
 
 
 @pytest.mark.skipif(not BSBM10K, reason="set VORTEX_RDF_BSBM10K_STORE to a BSBM 10K Dictionary store")
-def test_bsbm_10k_literals_agree_with_rdflib():
+def test_bsbm_10k_literals_agree_with_the_engines():
     store = VortexRdfStore(BSBM10K)
     term_dict = store.term_dict()
     lo, hi = term_dict.prefix_range('"')
     codes = list(range(lo, hi, max(1, (hi - lo) // 6000)))
     spellings = term_dict.decode_many(codes)
-    sample = Corpus(store, term_dict, codes, spellings, parse_terms(spellings))
+    sample = Corpus(store, term_dict, codes, spellings, parse_terms(spellings), oxigraph_store(codes, spellings))
     words = sorted({w for s in spellings[:3000] for w in re.findall(r"[a-z]{5,}", s)})[:10]
     for word in words:
         compare(sample, "regex", word)

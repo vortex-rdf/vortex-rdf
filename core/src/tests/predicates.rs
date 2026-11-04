@@ -1,4 +1,12 @@
-//! Term predicates against the rules a Python query layer's fast path
+//! Term predicates against the rules a query layer evaluates them by.
+//!
+//! The numeric kinds follow SPARQL 1.1, whose §17.3 maps `<`, `<=`, `>`,
+//! `>=`, `=` and `!=` between numbers to XPath's `op:numeric-*` operators.
+//! Every definite verdict below is also what Oxigraph 0.5 answers (an
+//! engine that passes the W3C SPARQL test suite), and wherever the spec and
+//! that engine can part, the expected verdict is `Unknown`.
+//!
+//! The other kinds follow the rules a Python query layer's fast path
 //! applies (vortex-rdflib's `filters.py`, validated there against rdflib):
 //! a native `True`/`False` must agree with that layer's `True`/`False`
 //! (its `ERROR` folds to `False` under a FILTER), and wherever that layer
@@ -14,94 +22,583 @@ fn typed(lexical: &str, datatype: &str) -> String {
     format!("\"{lexical}\"^^<{XSD}{datatype}>")
 }
 
-/// What the native verdict must be: exactly `Verdict` (`Definite`), the
-/// Python layer's answer or a deferral (`Allowed`), or a deferral
-/// (`Deferred`).
-#[derive(Clone, Copy)]
+/// What the native verdict must be: exactly that answer (`Definite`), or a
+/// deferral to the engine (`Deferred`).
+#[derive(Clone, Copy, Debug)]
 enum Expect {
     Definite(bool),
-    Allowed(bool),
     Deferred,
 }
-use Expect::{Allowed, Deferred, Definite};
+use Expect::{Deferred, Definite};
 
 fn check(spelling: &str, kind: &str, arg: &str, expect: Expect) {
     let predicate = TermPredicate::parse(kind, arg).unwrap();
     let got = predicate.eval(spelling);
-    let ok = match expect {
-        Definite(b) => got == Verdict::from(b),
-        Allowed(b) => got == Verdict::from(b) || got == Verdict::Unknown,
-        Deferred => got == Verdict::Unknown,
+    let want = match expect {
+        Definite(b) => Verdict::from(b),
+        Deferred => Verdict::Unknown,
     };
-    assert!(
-        ok,
-        "{kind} {arg:?} on {spelling}: got {got:?}, expected {}",
-        match expect {
-            Definite(b) => format!("exactly {b}"),
-            Allowed(b) => format!("{b} or Unknown"),
-            Deferred => "Unknown".to_string(),
-        }
-    );
+    assert_eq!(got, want, "{kind} {arg:?} on {spelling}");
 }
 
-/// `?v < 5` over the corpus: the numeric fast path where the lexical form
-/// is well-formed, datatype-IRI order across XSD datatypes, errors on
-/// non-literals, deferrals everywhere the Python layer defers.
+/// The six numeric kinds.
+const NUM_KINDS: [&str; 6] = ["num_lt", "num_le", "num_gt", "num_ge", "num_eq", "num_ne"];
+
+/// `?v < 5` over the corpus under SPARQL 1.1: a number compares by value. A
+/// literal without one (a string, another datatype, a lexical form its
+/// numeric datatype's grammar rejects) is a type error, so it fails, and so
+/// does a non-literal. A value an engine may hold apart from the spec (an
+/// integer past 64 bits, an `xsd:byte` out of its range, `NaN`, `INF`) is
+/// the engine's to decide.
 #[test]
 fn num_lt_integer_five() {
     let cases: Vec<(String, Expect)> = vec![
         (typed("5", "integer"), Definite(false)),
         (typed("01", "integer"), Definite(true)),
-        (typed("+7", "integer"), Allowed(false)),
-        (typed(" 7", "integer"), Allowed(false)),
-        (typed("1_0", "integer"), Allowed(false)),
-        (typed("1.5", "integer"), Deferred),
-        (typed("abc", "integer"), Deferred),
-        (typed("0x10", "integer"), Deferred),
-        (typed("99999999999999999999", "integer"), Definite(false)),
+        (typed("+7", "integer"), Definite(false)),
+        (typed(" 7", "integer"), Definite(false)),
+        (typed("1_0", "integer"), Definite(false)),
+        (typed("1.5", "integer"), Definite(false)),
+        (typed("abc", "integer"), Definite(false)),
+        (typed("0x10", "integer"), Definite(false)),
+        (typed("", "integer"), Definite(false)),
+        (typed("99999999999999999999", "integer"), Deferred),
         (typed("-3", "integer"), Definite(true)),
         (typed("1.5", "decimal"), Definite(true)),
         (typed("5", "decimal"), Definite(false)),
-        (typed("NaN", "double"), Allowed(false)),
-        (typed("INF", "double"), Allowed(false)),
-        (typed("-INF", "double"), Allowed(true)),
+        (typed("NaN", "double"), Deferred),
+        (typed("INF", "double"), Deferred),
+        (typed("-INF", "double"), Deferred),
         (typed("1e2", "double"), Definite(false)),
         (typed("5", "float"), Definite(false)),
+        (typed("4.5", "float"), Definite(true)),
         (typed("7", "byte"), Definite(false)),
-        // Out of range for its datatype: no value, so the datatypes order.
-        (typed("300", "byte"), Definite(true)),
+        // Out of its datatype's range: ill-typed for the spec, the integer
+        // 300 for Oxigraph.
+        (typed("300", "byte"), Deferred),
         (typed("5", "int"), Definite(false)),
         (typed("5", "short"), Definite(false)),
         (typed("5", "unsignedByte"), Definite(false)),
-        (typed("-1", "nonNegativeInteger"), Definite(false)),
+        (typed("-1", "nonNegativeInteger"), Deferred),
         (typed("5", "positiveInteger"), Definite(false)),
-        (typed("true", "boolean"), Definite(true)),
-        (typed("maybe", "boolean"), Definite(true)),
-        (typed("2020-01-01T00:00:00", "dateTime"), Definite(true)),
+        (typed("true", "boolean"), Definite(false)),
+        (typed("maybe", "boolean"), Definite(false)),
+        (typed("2020-01-01T00:00:00", "dateTime"), Definite(false)),
         ("\"5\"".into(), Definite(false)),
         ("\"\"".into(), Definite(false)),
         ("\"abc\"@en".into(), Definite(false)),
         ("\"5\"@en".into(), Definite(false)),
-        ("\"x\"^^<http://ex.org/dt>".into(), Allowed(true)),
+        ("\"x\"^^<http://ex.org/dt>".into(), Definite(false)),
         ("<http://ex.org/x>".into(), Definite(false)),
         ("_:b0".into(), Definite(false)),
     ];
     for (spelling, expect) in &cases {
         check(spelling, "num_lt", "5", *expect);
     }
-    // The mirror orderings follow from the same comparison.
+    // The mirror orderings follow from the same comparison, and a literal
+    // without a number passes none of them.
     check(&typed("-3", "integer"), "num_ge", "5", Definite(false));
     check(&typed("-3", "integer"), "num_gt", "5", Definite(false));
     check(&typed("-3", "integer"), "num_le", "5", Definite(true));
     check(&typed("5", "integer"), "num_le", "5", Definite(true));
     check(&typed("5", "integer"), "num_ge", "5", Definite(true));
-    check("\"abc\"@en", "num_gt", "5", Definite(true));
-    check("\"5\"", "num_gt", "5", Definite(true));
+    check("\"abc\"@en", "num_gt", "5", Definite(false));
+    check("\"5\"", "num_gt", "5", Definite(false));
     check(&typed("true", "boolean"), "num_gt", "5", Definite(false));
 }
 
-/// Equality and inequality: value equality for numbers, term inequality for
-/// non-literals, deferral where only an engine's canonicalization decides.
+/// The examples of issue #141, where SPARQL 1.1 parts from the rdflib rules
+/// this layer used to copy. An `xsd:float` is a single-precision value:
+/// 2^24 + 1 rounds to 2^24, and the float nearest 0.1 (0.100000001490116…)
+/// is no double's 0.1. And a literal without a number orders against none.
+#[test]
+fn xsd_float_is_single_precision_and_non_numbers_do_not_order() {
+    let five = typed("5", "integer");
+    for (spelling, kind, arg, expect) in [
+        (
+            typed("16777217", "float"),
+            "num_eq",
+            typed("16777216", "integer"),
+            Definite(true),
+        ),
+        (
+            typed("0.1", "float"),
+            "num_eq",
+            typed("0.1", "double"),
+            Definite(false),
+        ),
+        (
+            "\"abc\"".to_owned(),
+            "num_gt",
+            five.clone(),
+            Definite(false),
+        ),
+        ("\"abc\"@en".to_owned(), "num_gt", five, Definite(false)),
+        // A float's lexical form is rounded once, to the nearest float: this
+        // one is just past the midpoint of 2^24 and 2^24 + 2. One too small
+        // for a float is zero.
+        (
+            typed("16777217.0000000001", "float"),
+            "num_eq",
+            "16777218".to_owned(),
+            Definite(true),
+        ),
+        (
+            typed("1e-50", "float"),
+            "num_eq",
+            "0".to_owned(),
+            Definite(true),
+        ),
+    ] {
+        check(&spelling, kind, &arg, expect);
+    }
+}
+
+/// XPath's numeric type promotion, one pair of types at a time: an integer
+/// or a decimal meets a float as a float and a double as a double, rounded
+/// to the nearest one (ties to even); a float meets a double widened, which
+/// is exact; an integer and a decimal compare exactly. Derived integer
+/// types are integers.
+#[test]
+fn operands_are_promoted_as_xpath_does() {
+    let bare = str::to_owned;
+    for (spelling, kind, arg, expect) in [
+        // integer with decimal
+        (typed("5", "integer"), "num_lt", bare("5.5"), Definite(true)),
+        (typed("5.5", "decimal"), "num_gt", bare("5"), Definite(true)),
+        (typed("5.0", "decimal"), "num_eq", bare("5"), Definite(true)),
+        // integer with float: 2^24 + 1 is a tie, which goes to 2^24
+        (
+            typed("16777217", "integer"),
+            "num_eq",
+            typed("16777216", "float"),
+            Definite(true),
+        ),
+        (
+            typed("16777217", "integer"),
+            "num_gt",
+            typed("16777216", "float"),
+            Definite(false),
+        ),
+        (
+            typed("16777216", "float"),
+            "num_eq",
+            bare("16777217"),
+            Definite(true),
+        ),
+        (
+            typed("16777218", "float"),
+            "num_gt",
+            bare("16777217"),
+            Definite(true),
+        ),
+        (
+            typed("1073741889", "integer"),
+            "num_eq",
+            typed("1073741952", "float"),
+            Definite(true),
+        ),
+        // integer with double
+        (
+            typed("16777217", "integer"),
+            "num_eq",
+            typed("16777217", "double"),
+            Definite(true),
+        ),
+        (
+            typed("9007199254740991", "integer"),
+            "num_lt",
+            typed("9007199254740992", "double"),
+            Definite(true),
+        ),
+        // decimal with float
+        (
+            typed("16777216.5", "decimal"),
+            "num_eq",
+            typed("16777216", "float"),
+            Definite(true),
+        ),
+        (
+            typed("16777216.5", "decimal"),
+            "num_gt",
+            typed("16777216", "float"),
+            Definite(false),
+        ),
+        (typed("0.1", "float"), "num_eq", bare("0.1"), Definite(true)),
+        (
+            typed("0.1", "decimal"),
+            "num_eq",
+            typed("0.1", "float"),
+            Definite(true),
+        ),
+        (
+            typed("4.25", "float"),
+            "num_lt",
+            bare("4.5"),
+            Definite(true),
+        ),
+        (
+            typed("0.30000001", "decimal"),
+            "num_eq",
+            typed("0.3", "float"),
+            Definite(true),
+        ),
+        // decimal with double
+        (
+            typed("0.1", "double"),
+            "num_eq",
+            bare("0.1"),
+            Definite(true),
+        ),
+        (
+            typed("4.25", "double"),
+            "num_lt",
+            bare("4.5"),
+            Definite(true),
+        ),
+        (
+            typed("4.0", "double"),
+            "num_lt",
+            bare("4.5"),
+            Definite(true),
+        ),
+        (
+            typed("1.5", "decimal"),
+            "num_lt",
+            typed("2.5", "double"),
+            Definite(true),
+        ),
+        (
+            typed("4.25", "decimal"),
+            "num_lt",
+            bare("4.5e0"),
+            Definite(true),
+        ),
+        (
+            typed("4.00000000000001", "decimal"),
+            "num_gt",
+            bare("4e0"),
+            Definite(true),
+        ),
+        // float with double
+        (
+            typed("0.1", "float"),
+            "num_gt",
+            typed("0.1", "double"),
+            Definite(true),
+        ),
+        (
+            typed("0.5", "float"),
+            "num_eq",
+            typed("0.5", "double"),
+            Definite(true),
+        ),
+        (
+            typed("16777217", "float"),
+            "num_eq",
+            typed("16777217", "double"),
+            Definite(false),
+        ),
+        (
+            typed("0.1", "double"),
+            "num_lt",
+            typed("0.1", "float"),
+            Definite(true),
+        ),
+        // the same type
+        (
+            typed("0.1", "float"),
+            "num_eq",
+            typed("0.1", "float"),
+            Definite(true),
+        ),
+        (
+            typed("16777217", "float"),
+            "num_eq",
+            typed("16777216", "float"),
+            Definite(true),
+        ),
+        (
+            typed("0.1", "double"),
+            "num_eq",
+            bare("1e-1"),
+            Definite(true),
+        ),
+        (
+            typed("-0", "float"),
+            "num_eq",
+            typed("0", "double"),
+            Definite(true),
+        ),
+        // derived integer types
+        (
+            typed("5", "byte"),
+            "num_eq",
+            typed("5.0", "float"),
+            Definite(true),
+        ),
+        (
+            typed("5", "int"),
+            "num_lt",
+            typed("5.5", "float"),
+            Definite(true),
+        ),
+        (
+            typed("7", "long"),
+            "num_gt",
+            typed("6", "unsignedByte"),
+            Definite(true),
+        ),
+    ] {
+        check(&spelling, kind, &arg, expect);
+    }
+}
+
+/// A number promoted to a float or a double is decided only where engines
+/// round it alike. Oxigraph divides a decimal's digits in double precision,
+/// which is exact up to 15 significant digits but not past them
+/// (`2.9815061622519961` comes out one double low), and it rounds a decimal
+/// to a float through a double, which is a second rounding wherever that
+/// double is a tie between two floats (as for `8.53362226486206`): there a
+/// comparison both roundings settle alike is decided, one they settle
+/// apart is not. An integer from 2^53 on, which a double cannot always
+/// hold, meets a float or a double undecided: Python compares it exactly,
+/// XPath rounds it first.
+#[test]
+fn promotion_is_decided_where_engines_round_alike() {
+    // The two floats around 8.53362226486206, whose midpoint is the double
+    // nearest it: rounded once it is the lower, through a double the upper.
+    let lower = typed("8.533621788024902", "float");
+    let upper = typed("8.533622741699219", "float");
+    let tie = typed("8.53362226486206", "decimal");
+    for (spelling, kind, arg, expect) in [
+        (
+            typed("0.30000000000000004", "decimal"),
+            "num_eq",
+            typed("0.30000000000000004", "double"),
+            Deferred,
+        ),
+        (
+            typed("2.9815061622519961", "decimal"),
+            "num_eq",
+            typed("2.9815061622519963", "double"),
+            Deferred,
+        ),
+        (
+            typed("2.9815061622519961", "decimal"),
+            "num_lt",
+            typed("2.9815061622519963", "double"),
+            Deferred,
+        ),
+        (tie.clone(), "num_eq", upper.clone(), Deferred),
+        (tie.clone(), "num_eq", lower.clone(), Deferred),
+        (tie.clone(), "num_lt", upper.clone(), Deferred),
+        (tie.clone(), "num_gt", lower.clone(), Deferred),
+        (tie.clone(), "num_ge", lower, Definite(true)),
+        (tie.clone(), "num_le", upper, Definite(true)),
+        (tie.clone(), "num_lt", typed("9", "float"), Definite(true)),
+        (tie, "num_lt", typed("9", "double"), Definite(true)),
+        (
+            typed("9007199254740993", "integer"),
+            "num_eq",
+            typed("9007199254740992", "double"),
+            Deferred,
+        ),
+        (
+            typed("9007199254740993", "integer"),
+            "num_lt",
+            "1e300".to_owned(),
+            Deferred,
+        ),
+    ] {
+        check(&spelling, kind, &arg, expect);
+    }
+}
+
+/// SPARQL orders a number only against another number: an ordering of a
+/// literal without a numeric value (a string, a language-tagged literal,
+/// another datatype, a lexical form its numeric datatype's grammar rejects)
+/// is a type error, which a FILTER treats as false, whatever the constant.
+/// Equality and inequality stay the engine's: it may answer a type error,
+/// or compare the terms.
+#[test]
+fn orderings_without_a_numeric_value_are_type_errors() {
+    let no_value = [
+        "\"abc\"".to_owned(),
+        "\"5\"".into(),
+        "\"\"".into(),
+        "\"abc\"@en".into(),
+        "\"5\"@en".into(),
+        typed("5", "string"),
+        typed("true", "boolean"),
+        typed("2020-01-01T00:00:00", "dateTime"),
+        "\"x\"^^<http://ex.org/dt>".into(),
+        "\"1\"^^<http://ex.org/dt>".into(),
+        typed("abc", "integer"),
+        typed(" 7", "integer"),
+        typed("7 ", "integer"),
+        typed("", "integer"),
+        typed("1.5", "integer"),
+        typed("+-1", "integer"),
+        typed("1e2", "decimal"),
+        typed("1.5.2", "decimal"),
+        typed(".", "decimal"),
+        typed("abc", "double"),
+        typed("1e", "double"),
+        typed("0x1p3", "double"),
+        typed(" 1.5", "double"),
+        typed("e5", "double"),
+        typed("INF5", "double"),
+        typed("", "float"),
+    ];
+    let constants = [
+        "5".to_owned(),
+        "1.5".into(),
+        "1e3".into(),
+        typed("0.1", "float"),
+        typed("7", "byte"),
+    ];
+    for spelling in &no_value {
+        for kind in ["num_lt", "num_le", "num_gt", "num_ge"] {
+            for arg in &constants {
+                check(spelling, kind, arg, Definite(false));
+            }
+        }
+        check(spelling, "num_eq", "5", Deferred);
+        check(spelling, "num_ne", "5", Deferred);
+    }
+}
+
+/// Values an engine may hold apart from the spec are undecided under every
+/// operator: an integer type's value outside the type's range (ill-typed
+/// for the spec, while Oxigraph reads every integer type as `xsd:integer`),
+/// an integer past 64 bits or a decimal past 18 fractional digits (XSD lets
+/// an engine support no more, and Oxigraph errors there), a special float
+/// value in any spelling a parser takes, and a float lexical form past the
+/// type's range. The values at the edges of that range are decided, and a
+/// constant outside it leaves every number undecided.
+#[test]
+fn values_an_engine_may_hold_apart_are_undecided() {
+    for spelling in [
+        typed("300", "byte"),
+        typed("128", "byte"),
+        typed("-129", "byte"),
+        typed("-1", "unsignedLong"),
+        typed("-1", "nonNegativeInteger"),
+        typed("0", "positiveInteger"),
+        typed("65536", "unsignedShort"),
+        typed("1", "negativeInteger"),
+        typed("4294967296", "unsignedInt"),
+        typed("2147483648", "int"),
+        typed("9223372036854775808", "integer"),
+        typed("-9223372036854775809", "integer"),
+        typed("18446744073709551615", "unsignedLong"),
+        typed("99999999999999999999", "long"),
+        typed("1.0000000000000000001", "decimal"),
+        typed("170141183460469231731.687303715884105728", "decimal"),
+        typed("NaN", "double"),
+        typed("nan", "double"),
+        typed("NAN", "double"),
+        typed("-nan", "double"),
+        typed("INF", "double"),
+        typed("+INF", "double"),
+        typed("-INF", "double"),
+        typed("inf", "double"),
+        typed("infinity", "double"),
+        typed("Infinity", "float"),
+        typed("NaN", "float"),
+        typed("1e999", "double"),
+        typed("1e39", "float"),
+    ] {
+        for kind in NUM_KINDS {
+            check(&spelling, kind, "5", Deferred);
+        }
+    }
+    for (spelling, kind, arg, expect) in [
+        (
+            typed("9223372036854775807", "long"),
+            "num_gt",
+            "5",
+            Definite(true),
+        ),
+        (
+            typed("-9223372036854775808", "integer"),
+            "num_lt",
+            "5",
+            Definite(true),
+        ),
+        (typed("127", "byte"), "num_gt", "5", Definite(true)),
+        (typed("-128", "byte"), "num_lt", "5", Definite(true)),
+        (
+            typed("170141183460469231731.687303715884105727", "decimal"),
+            "num_gt",
+            "5",
+            Definite(true),
+        ),
+        (
+            typed("-170141183460469231731.687303715884105727", "decimal"),
+            "num_lt",
+            "5",
+            Definite(true),
+        ),
+        (
+            typed("0.000000000000000001", "decimal"),
+            "num_gt",
+            "0",
+            Definite(true),
+        ),
+        // Trailing zeros are no fractional digits.
+        (
+            typed("0.100000000000000000000", "decimal"),
+            "num_gt",
+            "0",
+            Definite(true),
+        ),
+        (
+            typed("3.4028234e38", "float"),
+            "num_gt",
+            "5",
+            Definite(true),
+        ),
+        (typed("-0", "unsignedInt"), "num_eq", "0", Definite(true)),
+    ] {
+        check(&spelling, kind, arg, expect);
+    }
+    for (spelling, kind, arg, expect) in [
+        (
+            typed("5", "integer"),
+            "num_lt",
+            "99999999999999999999",
+            Deferred,
+        ),
+        (
+            typed("5", "integer"),
+            "num_lt",
+            "0.0000000000000000001",
+            Deferred,
+        ),
+        // A type error is one whatever the constant, and a non-literal is
+        // no term equal to it.
+        (
+            "\"abc\"".to_owned(),
+            "num_lt",
+            "99999999999999999999",
+            Definite(false),
+        ),
+        (
+            "<http://ex.org/x>".to_owned(),
+            "num_ne",
+            "99999999999999999999",
+            Definite(true),
+        ),
+    ] {
+        check(&spelling, kind, arg, expect);
+    }
+}
+
+/// Equality and inequality: value equality for numbers, after the same
+/// promotion; term (in)equality for non-literals; the engine's call for a
+/// literal without a numeric value.
 #[test]
 fn num_eq_and_ne() {
     check(&typed("5", "integer"), "num_eq", "5", Definite(true));
@@ -113,33 +610,33 @@ fn num_eq_and_ne() {
     check(&typed("1e1", "double"), "num_eq", "10", Definite(true));
     check(&typed("5", "integer"), "num_eq", "1e1", Definite(false));
     check(&typed("5", "decimal"), "num_eq", "1e1", Definite(false));
-    check(&typed("1.5", "decimal"), "num_eq", "1e1", Allowed(false));
-    check(&typed("NaN", "double"), "num_eq", "5", Allowed(false));
+    check(&typed("1.5", "decimal"), "num_eq", "1e1", Definite(false));
+    check(&typed("NaN", "double"), "num_eq", "5", Deferred);
     check(&typed("abc", "integer"), "num_eq", "5", Deferred);
     check(&typed("1.5", "integer"), "num_eq", "5", Deferred);
-    check("\"5\"", "num_eq", "5", Allowed(false));
-    check("\"5\"@en", "num_eq", "5", Allowed(false));
-    check(&typed("true", "boolean"), "num_eq", "5", Allowed(false));
+    check("\"5\"", "num_eq", "5", Deferred);
+    check("\"5\"@en", "num_eq", "5", Deferred);
+    check(&typed("true", "boolean"), "num_eq", "5", Deferred);
     check("<http://ex.org/x>", "num_eq", "5", Definite(false));
     check("_:b0", "num_eq", "5", Definite(false));
 
     check(&typed("5", "integer"), "num_ne", "5", Definite(false));
     check(&typed("-3", "integer"), "num_ne", "5", Definite(true));
     check(&typed("1e2", "double"), "num_ne", "1e1", Definite(true));
-    check("\"5\"", "num_ne", "5", Allowed(true));
+    check("\"5\"", "num_ne", "5", Deferred);
     check(&typed("abc", "integer"), "num_ne", "5", Deferred);
     check("<http://ex.org/x>", "num_ne", "5", Definite(true));
     check("_:b0", "num_ne", "5", Definite(true));
 }
 
-/// Mixed-model comparisons: integers against decimals exactly, floats
-/// against small integers, and nothing where exactness is lost.
+/// Mixed-model comparisons: integers against decimals exactly, numbers
+/// against doubles once promoted, nothing past the decided range.
 #[test]
 fn num_mixed_models() {
     check(&typed("5", "integer"), "num_lt", "5.5", Definite(true));
     check(&typed("6", "integer"), "num_lt", "5.5", Definite(false));
     check(&typed("1.5", "decimal"), "num_lt", "5.5", Definite(true));
-    check(&typed("1e2", "double"), "num_lt", "5.5", Allowed(false));
+    check(&typed("1e2", "double"), "num_lt", "5.5", Definite(false));
     check(&typed("1e2", "double"), "num_lt", "-1", Definite(false));
     check(&typed("-3", "integer"), "num_lt", "-1", Definite(true));
     check(&typed("1e2", "double"), "num_gt", "1e100", Definite(false));
@@ -147,11 +644,11 @@ fn num_mixed_models() {
         &typed("99999999999999999999", "integer"),
         "num_gt",
         "1e100",
-        Allowed(false),
+        Deferred,
     );
     check(&typed("5", "integer"), "num_gt", "1e100", Definite(false));
     check(&typed("5", "decimal"), "num_gt", "1e100", Definite(false));
-    check(&typed("-INF", "double"), "num_lt", "1e100", Allowed(true));
+    check(&typed("-INF", "double"), "num_lt", "1e100", Deferred);
 }
 
 /// Datatype and language predicates are pure spelling tests over literals.
@@ -565,6 +1062,25 @@ fn parse_rejects_malformed() {
         ("num_lt", "abc"),
         ("num_eq", "1.5.2"),
         ("num_gt", "\"5\"^^<http://ex.org/dt>"),
+        // A constant must be a value of its datatype: none out of its range,
+        // ill-typed, or special.
+        ("num_lt", "\"300\"^^<http://www.w3.org/2001/XMLSchema#byte>"),
+        (
+            "num_lt",
+            "\"abc\"^^<http://www.w3.org/2001/XMLSchema#float>",
+        ),
+        (
+            "num_lt",
+            "\"INF\"^^<http://www.w3.org/2001/XMLSchema#double>",
+        ),
+        (
+            "num_lt",
+            "\"NaN\"^^<http://www.w3.org/2001/XMLSchema#float>",
+        ),
+        (
+            "num_lt",
+            "\"1e39\"^^<http://www.w3.org/2001/XMLSchema#float>",
+        ),
     ] {
         assert!(
             matches!(
@@ -579,10 +1095,11 @@ fn parse_rejects_malformed() {
     assert!(TermPredicate::parse("num_lt", "-5.5").is_ok());
     assert!(TermPredicate::parse("num_lt", "1e3").is_ok());
     assert!(TermPredicate::parse("num_lt", &typed("5", "byte")).is_ok());
+    assert!(TermPredicate::parse("num_lt", &typed("0.1", "float")).is_ok());
 }
 
-/// Spellings covering every kind, escapes and the 64-bit long rule, in a
-/// Dictionary store.
+/// Spellings covering every kind, escapes, single-precision floats and the
+/// 64-bit long rule, in a Dictionary store.
 async fn predicate_store() -> VortexRdfStore {
     let mut quads = dictionary_test_quads();
     let s = iri_subject("typed");
@@ -593,6 +1110,11 @@ async fn predicate_store() -> VortexRdfStore {
         typed("abc", "integer"),
         typed("1.5", "decimal"),
         typed("1e2", "double"),
+        typed("4.25", "double"),
+        typed("0.1", "float"),
+        typed("16777217", "float"),
+        typed("8.53362226486206", "decimal"),
+        typed("NaN", "double"),
         typed("300", "byte"),
         typed("true", "boolean"),
         typed("99999999999999999999", "long"),
@@ -647,6 +1169,16 @@ async fn filter_codes_matches_eval() {
         ("num_ge", "1e2"),
         ("num_eq", "5"),
         ("num_ne", "5"),
+        ("num_lt", "4.5"),
+        ("num_eq", "16777216"),
+        (
+            "num_gt",
+            "\"0.1\"^^<http://www.w3.org/2001/XMLSchema#double>",
+        ),
+        (
+            "num_le",
+            "\"8.533622741699219\"^^<http://www.w3.org/2001/XMLSchema#float>",
+        ),
     ]
     .map(|(kind, arg)| (kind, arg.to_owned(), TextOptions::default()))
     .into();

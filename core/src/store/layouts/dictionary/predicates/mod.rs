@@ -3,11 +3,14 @@
 //! `langMatches`, `?x < 5`, `strstarts`, `contains`, `regex`, …) read off one
 //! term's spelling, with a three-valued [`Verdict`]. Verdicts are
 //! conservative: `True` or `False` only where the SPARQL semantics over the
-//! stored spelling are total, `Unknown` otherwise (a lexical form outside
-//! the XSD grammar, a comparison the value model cannot settle exactly, an
-//! unknown datatype), for a full SPARQL engine to decide. A caller never gets
-//! a wrong definite answer. Over candidate codes, a code whose kind range
-//! decides it ([`TermPredicate::kind_verdict`]) is not read.
+//! stored spelling are total, `Unknown` otherwise (a number the value model
+//! cannot hold, or one an engine may hold apart from the spec; a regex
+//! outside the native subset; a case mapping of non-ASCII text), for a full
+//! SPARQL engine to decide. A caller never gets a wrong definite answer.
+//! The numeric kinds follow SPARQL 1.1, as the `numeric` submodule details;
+//! the others follow rdflib 7.6 where it reads a term in its own way. Over
+//! candidate codes, a code whose kind range decides it
+//! ([`TermPredicate::kind_verdict`]) is not read.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -185,7 +188,12 @@ pub enum TermPredicate {
     /// a character outside ASCII letters, digits and hyphens is undecided on
     /// a tagged literal: rdflib may read it differently.
     LangMatches(String),
-    /// `?x <op> <numeric constant>` under the SPARQL operator mapping.
+    /// `?x <op> <numeric constant>` under SPARQL 1.1's operator mapping:
+    /// XPath's numeric comparison of a number, after its type promotion (an
+    /// `xsd:float` is single precision); a type error, so false, for an
+    /// ordering of a term without a numeric value; term (in)equality for an
+    /// IRI or a blank node. Undecided wherever an engine may part from the
+    /// spec, and for `=` and `!=` on a literal without a numeric value.
     Num(NumOp, Number),
     /// A string kind: `str_prefix`, `contains`, `strstarts`, `strends`
     /// (and `regex`), read on the term's text under the [`TextOptions`] it
