@@ -178,8 +178,8 @@ const NO_QUADS = [];
 // chunk pulled (`_pull`), by a `data` drain, `read()` or the async iterator.
 // The handle's end ends the stream and a throw fails it, each emitting `end`
 // or `error` in a microtask; `destroy()` stops it without either. All three
-// free the handle and drop `_store`, the store it reads (the package entries
-// set it), and nothing is pulled after them.
+// free the handle and drop the buffered chunk and `_store`, the store it reads
+// (the package entries set it), and nothing is pulled after them.
 class QuadStream {
     constructor(chunks) {
         this._chunks = chunks;
@@ -239,12 +239,12 @@ class QuadStream {
             if (!this._ended) this.destroy();
         }
     }
-    // Stop the stream: done, without `end` or `error`.
+    // Stop the stream: done, without `end` or `error`. Returns the stream, as
+    // Node's `Readable#destroy` does.
     destroy() {
         this._done = true;
-        this._buffer = NO_QUADS;
-        this._pos = 0;
         this._release();
+        return this;
     }
     _emit(event, ...args) {
         const arr = this._listeners[event];
@@ -297,11 +297,13 @@ class QuadStream {
         this._release();
         queueMicrotask(() => this._emit(event, ...args));
     }
-    // Free the handle, once, and drop the store it reads.
+    // Free the handle, once, and drop the buffered chunk and the store it reads.
     _release() {
         const chunks = this._chunks;
         this._chunks = undefined;
         this._store = undefined;
+        this._buffer = NO_QUADS;
+        this._pos = 0;
         chunks?.free();
     }
 }

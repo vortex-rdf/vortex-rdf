@@ -53,6 +53,17 @@ function events(stream: Stream<Quad>, onData: () => void = () => {}) {
     });
 }
 
+/** `match`'s stream with what the stream rules reach beyond `Stream<Quad>`:
+ *  `destroy()`, the chunk of quads it buffers, and the store it reads. */
+type MatchStream = Stream<Quad> & { destroy(): MatchStream; _buffer: Quad[]; _store?: VortexRdfStore };
+
+/** Runs the microtasks queued so far and those they queue, a few rounds deep:
+ *  the stream's start, and the `end` or `error` it queues, are a round or
+ *  two away. No timer. */
+async function microtasks() {
+    for (let round = 0; round < 5; round++) await Promise.resolve();
+}
+
 describe('match streams the quads getQuads returns, in its order', () => {
     for (const { name, options } of VARIANTS) {
         test(name, async () => {
@@ -181,4 +192,145 @@ test('a mutation during the iteration leaves the matched snapshot', async () => 
         expect(store.has(NEW_QUAD), layout).toBe(true);
         expect(store.size(), layout).toBe(CHUNKED_ROWS);
     }
+});
+
+describe('the stream rules', () => {
+    test('destroy() stops the stream without end or error, and frees the handle once', async () => {
+        const next = vi.spyOn(QuadChunks.prototype, 'next');
+        const free = vi.spyOn(QuadChunks.prototype, 'free');
+        const store = await chunkedStore();
+        const ends: string[] = [];
+
+        // Before the start: nothing is pulled or emitted.
+        const early = store.match() as MatchStream;
+        let earlyData = 0;
+        early.on('data', () => earlyData++);
+        early.on('end', () => ends.push('end')).on('error', () => ends.push('error'));
+        expect(early.destroy()).toBe(early);
+        early.destroy();
+        await microtasks();
+        expect(earlyData).toBe(0);
+        expect(next).not.toHaveBeenCalled();
+        expect(free).toHaveBeenCalledTimes(1);
+        expect(early._store).toBeUndefined();
+        expect(early.read()).toBeNull();
+
+        // From a data listener: no data after it.
+        next.mockClear();
+        free.mockClear();
+        const midway = store.match() as MatchStream;
+        let data = 0;
+        midway.on('data', () => {
+            if (++data === 10) midway.destroy();
+        });
+        midway.on('end', () => ends.push('end')).on('error', () => ends.push('error'));
+        await microtasks();
+        expect(data).toBe(10);
+        expect(next).toHaveBeenCalledTimes(1);
+        expect(free).toHaveBeenCalledTimes(1);
+        expect(midway._store).toBeUndefined();
+        expect(ends).toEqual([]);
+    });
+
+    test('a data listener that reads or attaches another listener gets no quad twice and loses none', async () => {
+        const store = await chunkedStore();
+        const stream = store.match();
+        // Every quad the first listener takes, by data events and read(), in order.
+        const taken: Quad[] = [];
+        const second: Quad[] = [];
+        let takenAtAttach = 0;
+        stream.on('data', (quad: Quad) => {
+            taken.push(quad);
+            if (taken.length === 1) {
+                // A drain is running: the one this would start returns at once.
+                stream.on('data', (q: Quad) => second.push(q));
+                takenAtAttach = taken.length;
+            }
+            // Mid-chunk, and at the first chunk's last quad, where read() pulls the next.
+            if (taken.length === 5 || taken.length === 8192) taken.push(stream.read()!);
+        });
+        await new Promise((resolve) => stream.on('end', resolve));
+        expect(takenAtAttach).toBe(1);
+        expect(keys(taken)).toEqual(keys(store.getQuads()));
+        // The second listener has every data event after it was attached.
+        expect(keys(second)).toEqual(keys(taken.filter((_, i) => i !== 0 && i !== 5 && i !== 8192)));
+    });
+
+    test('a data listener attached after the start drains at once, and a readable one is called at once', async () => {
+        const store = await chunkedStore();
+        const stream = store.match();
+        await microtasks();
+        let readable = 0;
+        stream.on('readable', () => readable++);
+        expect(readable).toBe(1);
+        const quads: Quad[] = [];
+        stream.on('data', (quad: Quad) => quads.push(quad));
+        expect(quads).toHaveLength(CHUNKED_ROWS);
+        // Done: a readable listener is no longer called.
+        stream.on('readable', () => readable++);
+        expect(readable).toBe(1);
+        await new Promise((resolve) => stream.on('end', resolve));
+    });
+
+    test('for await rethrows a failure mid-loop, and frees the handle', async () => {
+        const free = vi.spyOn(QuadChunks.prototype, 'free');
+        const store = await chunkedStore();
+        const stream = store.match() as MatchStream;
+        let quads = 0;
+        const loop = async () => {
+            for await (const _ of stream as unknown as AsyncIterable<Quad>) {
+                // The first chunk is pulled: the next pull fails.
+                if (quads++ === 0) store.free();
+            }
+        };
+        await expect(loop()).rejects.toThrow(/VortexRdfStore .*freed/);
+        expect(quads).toBe(8192);
+        expect(free).toHaveBeenCalledTimes(1);
+        expect(stream._store).toBeUndefined();
+    });
+
+    test('the stream drops its store and its last chunk at the end, on an error and on destroy()', async () => {
+        const store = await chunkedStore();
+
+        const ended = store.match() as MatchStream;
+        expect(ended._store).toBe(store);
+        expect(await readEvents(ended)).toHaveLength(CHUNKED_ROWS);
+        expect(ended._store).toBeUndefined();
+        expect(ended._buffer).toHaveLength(0);
+        expect(ended.read()).toBeNull();
+
+        const destroyed = store.match() as MatchStream;
+        expect(destroyed.read()).not.toBeNull();
+        destroyed.destroy();
+        expect(destroyed._store).toBeUndefined();
+        expect(destroyed._buffer).toHaveLength(0);
+        expect(destroyed.read()).toBeNull();
+
+        // The store freed after the first chunk: the next pull fails.
+        const failed = store.match() as MatchStream;
+        expect(failed.read()).not.toBeNull();
+        store.free();
+        let rest = 0;
+        while (failed.read() !== null) rest++;
+        expect(rest).toBe(8191);
+        await new Promise((resolve) => failed.on('error', resolve));
+        expect(failed._store).toBeUndefined();
+        expect(failed._buffer).toHaveLength(0);
+        expect(failed.read()).toBeNull();
+    });
+
+    test('a mutation between match() and its first pull leaves the snapshot', async () => {
+        const next = vi.spyOn(QuadChunks.prototype, 'next');
+        for (const layout of ['dictionary', 'default'] as const) {
+            const store = await chunkedStore({ layout });
+            const want = keys(store.getQuads());
+            const last = store.getQuads().at(-1)!;
+            next.mockClear();
+            const stream = store.match();
+            await store.deleteQuad(last);
+            await store.addQuad(NEW_QUAD);
+            expect(next, layout).not.toHaveBeenCalled();
+            expect(keys(await collect(stream)), layout).toEqual(want);
+        }
+    });
 });
