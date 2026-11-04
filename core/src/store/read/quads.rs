@@ -21,7 +21,7 @@ use super::rows::BaseRead;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
 #[cfg(feature = "file-io")]
-use crate::io::read::{inline_splits, spawned_splits};
+use crate::io::read::{available_parallelism, inline_splits, spawned_splits};
 use crate::observe::observe;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
@@ -354,13 +354,16 @@ impl VortexRdfStore {
 
     /// `scan`'s chunks decoded through `decoder`, then the tail's chunk; a
     /// chunk's read error is one error chunk. The decode runs inside the
-    /// scan's split tasks (its map function), concurrently across the
-    /// runtime's workers. Those tasks cannot await, so under a file-backed
-    /// dictionary they decode a chunk only where its window reads complete
-    /// when first polled ([`ChunkDecoder::decode_now`]), as a mapped file's
-    /// always do; a chunk whose reads would wait, or of fewer than
-    /// [`TASK_DECODE_MIN_ROWS`] rows, passes on undecoded and decodes on the
-    /// scan's stream.
+    /// scan's split futures (its map function). Where a tokio runtime is
+    /// current, every split is spawned onto it ([`spawned_splits`]), so the
+    /// chunks decode concurrently across its workers; with none, there is
+    /// nothing to spawn onto, and the splits are polled inline
+    /// ([`inline_splits`]). A split future cannot await, so under a
+    /// file-backed dictionary it decodes a chunk only where its window reads
+    /// complete when first polled ([`ChunkDecoder::decode_now`]), as a
+    /// mapped file's always do; a chunk whose reads would wait, or of fewer
+    /// than [`TASK_DECODE_MIN_ROWS`] rows, passes on undecoded and decodes on
+    /// the stream.
     #[cfg(feature = "file-io")]
     fn scan_chunks<T: ChunkDecode>(
         &self,
@@ -369,11 +372,15 @@ impl VortexRdfStore {
         tail: Vec<Result<T>>,
     ) -> Result<Chunks<T>> {
         observe!(RowScan);
+        let window = scan.concurrency() * available_parallelism();
         let file_backed_dictionary =
             matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
-        let chunks: Chunks<T> = if file_backed_dictionary {
-            let in_task = decoder.clone();
-            scan.map(move |chunk| {
+        let in_task = decoder.clone();
+        let splits = scan
+            .map(move |chunk| {
+                if !file_backed_dictionary {
+                    return Ok(SplitChunk::Decoded(in_task.decode(&chunk)));
+                }
                 if chunk.len() < TASK_DECODE_MIN_ROWS {
                     return Ok(SplitChunk::Undecoded(chunk));
                 }
@@ -382,18 +389,16 @@ impl VortexRdfStore {
                     None => SplitChunk::Undecoded(chunk),
                 })
             })
-            .into_stream()?
-            .then(move |chunk| finished_on_stream(&decoder, chunk))
-            .boxed()
+            .build()?;
+        let splits = if tokio::runtime::Handle::try_current().is_ok() {
+            spawned_splits(splits, window).left_stream()
         } else {
-            scan.map(move |chunk| Ok(decoder.decode(&chunk)))
-                .into_stream()?
-                .map(|chunk| match chunk {
-                    Ok(rows) => rows,
-                    Err(e) => vec![Err(VortexRdfError::Vortex(e))],
-                })
-                .boxed()
+            inline_splits(splits).right_stream()
         };
+        let chunks = splits
+            .filter_map(|split| future::ready(split.transpose()))
+            .then(move |chunk| finished_on_stream(&decoder, chunk))
+            .boxed();
         Ok(with_tail(chunks, tail))
     }
 }
@@ -664,5 +669,59 @@ mod tests {
             !left.is_empty() && left.iter().all(|&rows| rows < TASK_DECODE_MIN_ROWS),
             "served chunks left to the stream: {left:?}"
         );
+    }
+
+    /// The reads that scan a file, with no tokio runtime: a bare executor on
+    /// a plain thread reads a store's every row (the restricted scan) and an
+    /// index's run too wide to read point by point (its serve plan's scan),
+    /// each whole, shared and exported. They run inline, spawning nothing,
+    /// and read the rows of the store loaded in memory, as they do inside a
+    /// runtime.
+    #[tokio::test]
+    async fn scanned_reads_read_a_file_outside_a_tokio_runtime() {
+        let quads = crate::tests::modular_quads(4000, 3, 50);
+        let (_dir, path) = crate::tests::write_store_file(
+            quads,
+            LayoutStrategy::Dictionary,
+            vec![crate::IndexType::SecondaryByCopy],
+        )
+        .await;
+        let p = oxrdf::NamedNode::new("http://example.org/p1").unwrap();
+        let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+        let mapped = VortexRdfStore::from_file(&path).await.unwrap();
+        let served = mapped
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            served.quads.file(),
+            Some(FileBase { serve: Some(_), .. })
+        ));
+        let loaded_served = loaded
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
+        for (label, view, want) in [
+            ("every row", mapped, read_whole(&loaded).await.0),
+            ("served run", served, read_whole(&loaded_served).await.0),
+        ] {
+            let (got, _) = read_whole(&view).await;
+            assert!(got == want, "{label}: rows inside a runtime");
+
+            let (got, spawned) = std::thread::spawn(move || {
+                futures::executor::block_on(async {
+                    let rec = Recorder::start();
+                    let (got, _) = read_whole(&view).await;
+                    (got, rec.count(&Event::SplitSpawned))
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| panic!("{label}: a scan must not panic without a tokio runtime"));
+            assert_eq!(
+                spawned, 0,
+                "{label}: no runtime to spawn onto, so nothing spawned"
+            );
+            assert!(got == want, "{label}: rows outside a runtime");
+        }
     }
 }

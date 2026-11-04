@@ -516,8 +516,8 @@ takes from their leaves for sparse ids
 ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
 A row scan — the reads that
 materialize a view's rows: serialization and the `from_file_in_memory` load, a
-compaction's gather, and the one-shot reads (`code_columns_gathered`,
-`quads_vec`, `shared_quads_vec`) the reads by id decline — filters and decodes
+compaction's gather, and `code_columns_gathered` where the reads by id
+decline — filters and decodes
 per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L65)
 (42) splits runs inline, a larger one is spawned across the runtime's workers.
 Without a Tokio runtime these scans run inline. A one-shot read under a
@@ -533,9 +533,13 @@ an uncapped count of a filtered view, the rows a delete tombstones, a
 `keep`'s pass over a column — spawns its splits from two up: each split's
 evaluation decodes and compares its rows, work that outlasts waking a
 worker.
-Streaming reads (`quads()` and its twins) decode inside the per-split tasks
-Vortex's scan stream spawns, or, over such a filter, inside the split reads
-that evaluate its masks a split at a time. Under a file-backed dictionary the
+The reads that decode quads (`quads_vec`, `shared_quads_vec`, and the
+streaming reads: `quads()` and its twins, the N-Triples/N-Quads export) decode
+each chunk inside the task that reads its split. Over a scan, every split is
+spawned across the runtime's workers whatever their count, so the chunks
+decode in parallel, and the splits are polled inline without a Tokio runtime;
+over such a filter, the split reads of the rows its masks keep decode them.
+Under a file-backed dictionary the
 decode may await the dictionary's own reads, which a scan's split task cannot
 do: there a chunk decodes in its task only when its window reads complete at
 once, as over a mapping they always do, and at the stream's consumer
