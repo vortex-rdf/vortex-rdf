@@ -11,6 +11,7 @@ import platform
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -38,21 +39,29 @@ needs_glibc = pytest.mark.skipif(
 )
 
 
-class Holding(Adapter):
-    """A store that is one block of memory, so what disposing it releases is known."""
+class Using(Adapter):
+    """A store of one block, whose opens and reads leave known amounts behind."""
 
-    slug, label, obtained = "holding", "Holding", "built"
+    slug, label, obtained = "using", "Using", "built"
 
-    def __init__(self, size):
-        self.size = size
+    def __init__(self, store, cache=0, first_open_leak=0, read_leak=0):
+        self.store, self.cache = store, cache
+        self.first_open_leak, self.read_leak = first_open_leak, read_leak
+        self.opens = 0
+        self.leaked = []
 
     def artifact_path(self, workdir, src):
         return ""
 
     def open(self, artifact, src):
-        return bytearray(self.size)
+        if self.opens == 0:
+            self.leaked.append(bytearray(self.first_open_leak))
+        self.opens += 1
+        return types.SimpleNamespace(block=bytearray(self.store), caches=[])
 
     def count(self, handle, query):
+        handle.caches.append(bytearray(self.cache))
+        self.leaked.append(bytearray(self.read_leak))
         return 7
 
 
@@ -62,18 +71,24 @@ class PycottasOverABlock(PycottasAdapter):
 
     def __init__(self, size):
         self.size = size
+        self.duck = 0  # the fake DuckDB count
 
     def import_library(self):
         pass
 
     def open(self, artifact, src):
+        self.duck += 3 << 20
         return bytearray(self.size)
 
     def prepare(self, pat):
         return pat
 
     def count(self, handle, query):
+        self.duck += 5 << 20
         return 7
+
+    def unseen_live_bytes(self):
+        return self.duck
 
 
 def memory_role(slug, ds, workdir, env):
@@ -192,26 +207,37 @@ def test_the_self_check_names_a_counter_that_misses_the_block():
 
 
 @needs_glibc
-def test_a_memory_run_measures_what_disposing_the_store_releases(tmp_path):
+def test_the_store_figure_is_what_a_store_no_read_has_touched_holds(tmp_path):
+    a = Using(32 << 20, cache=2 << 20, first_open_leak=8 << 20, read_leak=1 << 20)
     out = worker.run_memory(
-        Holding(32 << 20),
-        argparse.Namespace(quads="q.nq", triples="t.nt", workdir=str(tmp_path), n=64, graphs=8),
+        a, argparse.Namespace(quads="q.nq", triples="t.nt", workdir=str(tmp_path), n=64, graphs=8)
     )
     assert (out["obtained"], out["counts"]) == ("built", dict.fromkeys(PROBES, 7))
     assert abs(out["storeBytes"] - (32 << 20)) < 1 << 20
+    assert a.opens == 2
     assert out["peakAnonBytes"] >= 30 << 20
 
 
 @needs_glibc
-def test_a_pycottas_memory_run_leaves_the_store_blank_and_keeps_its_peaks(tmp_path):
-    # DuckDB allocates through its own allocator, which mallinfo2 cannot see.
+def test_a_pycottas_memory_run_adds_what_duckdb_tracked_over_the_open(tmp_path):
     out = worker.run_memory(
         PycottasOverABlock(32 << 20),
         argparse.Namespace(quads="q.nq", triples="t.nt", workdir=str(tmp_path), n=64, graphs=8),
     )
     assert out["obtained"] == "opened"
-    assert out["storeBytes"] is None
-    assert out["peakAnonBytes"] >= 30 << 20
+    assert abs(out["storeBytes"] - (35 << 20)) < 1 << 20
+
+
+def test_pycottas_counts_duckdbs_own_tracked_memory(monkeypatch):
+    seen = []
+
+    def execute(sql):
+        seen.append(sql)
+        return types.SimpleNamespace(fetchone=lambda: (123_456,))
+
+    monkeypatch.setitem(sys.modules, "duckdb", types.SimpleNamespace(execute=execute))
+    assert PycottasAdapter().unseen_live_bytes() == 123_456
+    assert "duckdb_memory()" in seen[0]
 
 
 @needs_glibc

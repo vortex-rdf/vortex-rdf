@@ -10,11 +10,13 @@ Results go to stdout as one JSON object; progress goes to stderr, so the
 orchestrator can stream progress to the terminal while parsing the result.
 
 The memory role (`--role memory`) measures one store's memory, and nothing
-else, in a process of its own: it opens the store, reads every pattern once
-under a 2 ms `/proc/self/status` sampler (the peaks, RssAnon and RssFile above
-a pre-open baseline), then disposes the store and reports the live bytes that
-disposing released (glibc's `mallinfo2`, with `PYTHONMALLOC=malloc` so Python's
-own objects are counted too). It first checks that the counter sees an 8 MiB
+else, in a process of its own: it opens the store and disposes it before any
+read, and reports the live bytes that dispose released (glibc's `mallinfo2`,
+with `PYTHONMALLOC=malloc` so Python's own objects are counted too; for
+pycottas, plus the growth of DuckDB's own tracked memory over the open). It
+then opens the store again and reads every pattern once under a 2 ms
+`/proc/self/status` sampler (the peaks, RssAnon and RssFile above a baseline
+taken before the first open). It first checks that the counter sees an 8 MiB
 block held; if it does not, the run exits non-zero, naming the counter, on
 stderr.
 """
@@ -579,8 +581,9 @@ def run_mutate(adapter: Adapter, args: argparse.Namespace) -> dict:
 
 
 def run_memory(adapter: Adapter, args: argparse.Namespace) -> dict:
-    """One store's memory: the peaks during its reads, and what disposing it
-    releases. Each figure is a difference in bytes."""
+    """One store's memory: what disposing a store no read has touched
+    releases, then the peaks during the reads on a second open. Each figure is
+    a difference in bytes."""
     a = adapter
     src = args.quads if a.supports_quads else args.triples
     artifact = a.artifact_path(args.workdir, src)
@@ -590,11 +593,24 @@ def run_memory(adapter: Adapter, args: argparse.Namespace) -> dict:
     prepared = [(pat.name, a.prepare(pat)) for pat in pats]
     self_check()
 
+    # May create DuckDB's connection, so its own allocations land in the baseline.
+    unseen_base = a.unseen_live_bytes()
     gc.collect()
     base = read_rss()
+
     log(a.label, "open…")
     handle = a.open(artifact, src)
-    # A store built here leaves its build garbage out of the read peak.
+    # A store built here leaves its build garbage out of the figure.
+    gc.collect()
+    opened = live_bytes()
+    unseen_opened = a.unseen_live_bytes()
+    a.dispose(handle)
+    del handle
+    gc.collect()
+    store = opened - live_bytes() + unseen_opened - unseen_base
+
+    log(a.label, "open again for the reads…")
+    handle = a.open(artifact, src)
     gc.collect()
 
     counts: dict[str, int] = {}
@@ -603,18 +619,14 @@ def run_memory(adapter: Adapter, args: argparse.Namespace) -> dict:
             log(a.label, f"read {name}…")
             counts[name] = a.count(handle, query)
 
-    gc.collect()
-    before = live_bytes()
     a.dispose(handle)
     del handle
-    gc.collect()
-    after = live_bytes()
 
+    log(a.label, f"store {store:,} bytes, {unseen_opened - unseen_base:,} of them outside mallinfo2")
     return {
         "obtained": a.obtained,
         "counts": counts,
-        # None where the counter cannot see the store's allocations.
-        "storeBytes": before - after if a.store_visible else None,
+        "storeBytes": store,
         "peakAnonBytes": sampler.peak.anon - base.anon,
         "peakFileBytes": sampler.peak.file - base.file,
     }

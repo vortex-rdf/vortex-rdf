@@ -693,22 +693,23 @@
     <p class="group-desc">
       The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
       (3 by default) fresh processes per adapter, each in that adapter's own <em>virtualenv</em>, after the
-      timed runs. Each run opens the store, reads every pattern once as the timed cells do, and disposes
-      it. <em>Store</em> is the live memory that disposing the store released, read after the reads, so it
-      includes the caches they filled. The two Peak columns are <span class="mono">RssAnon</span> (process
+      timed runs. Each run first opens the store and disposes it before any read: <em>Store</em> is the
+      live memory that dispose released, so it leaves out the caches reads fill. The run then opens the
+      store again, the same way, and reads every pattern once as the timed cells do. The two Peak columns are <span class="mono">RssAnon</span> (process
       memory) and <span class="mono">RssFile</span> (mapped pages) at the highest 2 ms sample
-      during the reads, above the baseline taken before the open. A file-backed store's pages show
+      during the reads, above the baseline taken before the first open. A file-backed store's pages show
       under mapped pages. A store held in memory shows only the program's own code pages that the open
       and reads first touched, which also count as mapped pages: a few MB to a few tens of MB depending on the
       library, the same for a library's file and in-memory rows, so a pair's gap is the file's own
       pages. The memory processes run with <span class="mono">PYTHONMALLOC=malloc</span> and read
       <span class="mono">mallinfo2</span>, so Python objects and native extensions are both
       counted; rdflib therefore carries glibc's per-allocation overhead instead of pymalloc's.
-      pycottas's Store is left blank, because DuckDB allocates through its own allocator, which
-      <span class="mono">mallinfo2</span> cannot see.
+      pycottas's Store adds DuckDB's own count of the memory it tracks, read before the open and right
+      after it: DuckDB allocates through its own allocator, which <span class="mono">mallinfo2</span>
+      cannot see, and its caches outlive the store.
       pycottas reads through <span class="mono">search()</span>, which collects every match, so its
       peak holds whole results. pyoxigraph and rdflib rebuild from the N-Quads file inside each
-      memory process, so their peaks include memory the allocator kept from the build.
+      memory process, so their peaks include memory the allocator kept from the builds.
       The query runs' peak RSS is no longer shown, but stays in the
       results file and still drives the memory-pressure warning. On-disk size is the artifact the
       build produced, listed only for the libraries that write one — a store that lives only in
