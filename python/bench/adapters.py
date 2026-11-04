@@ -118,6 +118,11 @@ class Adapter:
     #: `mapped` (a memory-mapped file), `loaded` (a file read into memory),
     #: `built` (built from the triples) or `opened` (an on-disk database).
     obtained: str = ""
+    #: Whether glibc's `mallinfo2`, the memory runs' live-byte counter, sees
+    #: the store's allocations. False for a library that allocates through an
+    #: allocator of its own: its memory runs report no Store figure, and keep
+    #: their peaks.
+    store_visible: bool = True
 
     def import_library(self) -> None:
         """Import the library under test, so its import-time allocations are
@@ -340,6 +345,10 @@ class PycottasAdapter(Adapter):
     mutation_unsupported = "COTTASStore raises: 'The COTTAS store is read only!'"
     # `opened`, not `mapped` or `loaded`: DuckDB reads the Parquet file per query.
     obtained = "opened"
+    # DuckDB allocates through its bundled jemalloc, which mallinfo2 cannot
+    # see: at 1,048,576 rows the Store figure read 0.0 MB in every run, while
+    # the process-memory peak was 507.6 MB.
+    store_visible = False
 
     def import_library(self) -> None:
         import pycottas  # noqa: F401

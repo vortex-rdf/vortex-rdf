@@ -19,7 +19,7 @@ BENCH = Path(__file__).resolve().parent
 sys.path.insert(0, str(BENCH))
 
 import worker  # noqa: E402
-from adapters import Adapter, build_adapter  # noqa: E402
+from adapters import Adapter, PycottasAdapter, build_adapter  # noqa: E402
 from suite import prepare_dataset  # noqa: E402
 
 PROBES = ("S", "P", "O", "SP", "PO", "SPO", "G", "SPOG", "full")
@@ -51,6 +51,26 @@ class Holding(Adapter):
 
     def open(self, artifact, src):
         return bytearray(self.size)
+
+    def count(self, handle, query):
+        return 7
+
+
+class PycottasOverABlock(PycottasAdapter):
+    """pycottas's adapter with its store swapped for one block of memory, so a
+    run needs no pycottas or DuckDB: only the adapter's declarations remain."""
+
+    def __init__(self, size):
+        self.size = size
+
+    def import_library(self):
+        pass
+
+    def open(self, artifact, src):
+        return bytearray(self.size)
+
+    def prepare(self, pat):
+        return pat
 
     def count(self, handle, query):
         return 7
@@ -179,6 +199,18 @@ def test_a_memory_run_measures_what_disposing_the_store_releases(tmp_path):
     )
     assert (out["obtained"], out["counts"]) == ("built", dict.fromkeys(PROBES, 7))
     assert abs(out["storeBytes"] - (32 << 20)) < 1 << 20
+    assert out["peakAnonBytes"] >= 30 << 20
+
+
+@needs_glibc
+def test_a_pycottas_memory_run_leaves_the_store_blank_and_keeps_its_peaks(tmp_path):
+    # DuckDB allocates through its own allocator, which mallinfo2 cannot see.
+    out = worker.run_memory(
+        PycottasOverABlock(32 << 20),
+        argparse.Namespace(quads="q.nq", triples="t.nt", workdir=str(tmp_path), n=64, graphs=8),
+    )
+    assert out["obtained"] == "opened"
+    assert out["storeBytes"] is None
     assert out["peakAnonBytes"] >= 30 << 20
 
 

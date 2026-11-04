@@ -705,6 +705,8 @@
       pages. The memory processes run with <span class="mono">PYTHONMALLOC=malloc</span> and read
       <span class="mono">mallinfo2</span>, so Python objects and native extensions are both
       counted; rdflib therefore carries glibc's per-allocation overhead instead of pymalloc's.
+      pycottas's Store is left blank, because DuckDB allocates through its own allocator, which
+      <span class="mono">mallinfo2</span> cannot see.
       pycottas reads through <span class="mono">search()</span>, which collects every match, so its
       peak holds whole results. The query runs' peak RSS is no longer shown, but stays in the
       results file and still drives the memory-pressure warning. On-disk size is the artifact the

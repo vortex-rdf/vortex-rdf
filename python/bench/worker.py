@@ -613,7 +613,8 @@ def run_memory(adapter: Adapter, args: argparse.Namespace) -> dict:
     return {
         "obtained": a.obtained,
         "counts": counts,
-        "storeBytes": before - after,
+        # None where the counter cannot see the store's allocations.
+        "storeBytes": before - after if a.store_visible else None,
         "peakAnonBytes": sampler.peak.anon - base.anon,
         "peakFileBytes": sampler.peak.file - base.file,
     }
