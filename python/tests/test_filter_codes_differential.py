@@ -406,7 +406,7 @@ TOTAL_CASES = [
     ("lang_matches", "EN-GB"), ("lang_matches", "e"), ("lang_matches", "en-"), ("lang_matches", "-gb"),
     ("lang_matches", "en--gb"), ("lang_matches", "en-gb-x"),
 ]
-#: Numbers every engine promotes alike, which compare with every numeric
+#: Numbers the spec and Oxigraph promote alike, which compare with every numeric
 #: constant below (whatever its type) and so are always decided: integers
 #: below 2^53, decimals of at most 15 significant digits, floats, doubles.
 ALWAYS_DECIDED = [
@@ -425,6 +425,8 @@ NUMERIC_CONSTANTS = [
     f'"1e2"^^<{XSD}double>', f'"2.5"^^<{XSD}double>', f'"5"^^<{XSD}long>', f'"1"^^<{XSD}unsignedLong>',
     f'"7"^^<{XSD}byte>', f'"0.1"^^<{XSD}float>', f'"16777216"^^<{XSD}float>', f'"4.25"^^<{XSD}float>',
     f'"0.1"^^<{XSD}double>', "5", "4.25", "1e1",
+    # Next to the corpus's tie decimal and its 17-digit decimal (see below).
+    f'"8.533621788024902"^^<{XSD}float>', f'"8.533622741699219"^^<{XSD}float>', f'"2.9815061622519963"^^<{XSD}double>',
 ]
 #: The numeric XSD datatypes.
 NUMERIC_TYPES = {
@@ -480,10 +482,10 @@ def test_lang_matches_ranges_outside_the_basic_alphabet_are_undecided(corpus, ra
 @pytest.mark.parametrize("kind", NUM_OPS)
 @pytest.mark.parametrize("arg", NUMERIC_CONSTANTS)
 def test_numeric_kinds_agree_with_oxigraph(corpus, kind, arg):
-    """Every verdict agrees with Oxigraph's. The numbers every engine
-    promotes alike are decided, and so is every ordering of a literal without
-    a numeric value, which SPARQL makes a type error, so the comparison is not
-    vacuous."""
+    """Every verdict agrees with Oxigraph's. The numbers the spec and
+    Oxigraph promote alike are decided, and so is every ordering of a literal
+    without a numeric value, which SPARQL makes a type error, so the
+    comparison is not vacuous."""
     passed, undecided = compare(corpus, kind, arg)
     for spelling in ALWAYS_DECIDED:
         assert corpus.spellings.index(spelling) not in undecided, f"{kind} {arg!r}: undecided on {spelling}"
@@ -496,6 +498,40 @@ def test_numeric_kinds_agree_with_oxigraph(corpus, kind, arg):
         assert len(no_value) > 50 and not no_value & (passed | undecided), (
             f"{kind} {arg!r}: passed or undecided {sorted(no_value & (passed | undecided))[:5]}"
         )
+
+
+#: The decimal 8.53362226486206, whose nearest double is the midpoint of two
+#: floats: rounded once, as the spec does, it is the lower float; rounded
+#: through the double, as Oxigraph does, the upper one.
+TIE = f'"8.53362226486206"^^<{XSD}decimal>'
+TIE_LOWER, TIE_UPPER = f'"8.533621788024902"^^<{XSD}float>', f'"8.533622741699219"^^<{XSD}float>'
+
+
+@pytest.mark.parametrize(
+    "kind, arg, decided",
+    [
+        ("num_eq", TIE_LOWER, False), ("num_eq", TIE_UPPER, False), ("num_lt", TIE_UPPER, False),
+        ("num_gt", TIE_LOWER, False), ("num_ge", TIE_LOWER, True), ("num_le", TIE_UPPER, True),
+        ("num_lt", f'"9"^^<{XSD}float>', True), ("num_gt", f'"8.5"^^<{XSD}float>', True),
+    ],
+)
+def test_a_decimal_rounded_to_a_float_two_ways_is_decided_where_both_agree(corpus, kind, arg, decided):
+    """The tie decimal is decided against a float exactly where both
+    roundings give the same verdict, and then as Oxigraph decides it."""
+    _, undecided = compare(corpus, kind, arg)
+    assert (corpus.spellings.index(TIE) not in undecided) == decided, f"{kind} {arg}"
+
+
+@pytest.mark.parametrize("kind", NUM_OPS)
+def test_a_decimal_past_15_significant_digits_against_a_double_is_undecided(corpus, kind):
+    """Oxigraph's division rounds such a decimal twice, which can land a
+    double away from the spec's: `2.9815061622519961` against the double
+    nearest it is undecided, and decided against an integer."""
+    long_decimal = corpus.spellings.index(f'"2.9815061622519961"^^<{XSD}decimal>')
+    _, undecided = compare(corpus, kind, f'"2.9815061622519963"^^<{XSD}double>')
+    assert long_decimal in undecided
+    _, undecided = compare(corpus, kind, "3")
+    assert long_decimal not in undecided
 
 
 #: Constants an engine may hold apart from the spec: an integer past 64 bits

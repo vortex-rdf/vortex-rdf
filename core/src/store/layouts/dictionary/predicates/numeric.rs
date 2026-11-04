@@ -504,3 +504,27 @@ impl Number {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::halfway_between_floats;
+
+    /// A double halfway between two adjacent floats is one on either side of
+    /// a binade's edge, where the gap between floats halves, and of zero; a
+    /// float, or a double off a midpoint, is none.
+    #[test]
+    fn halfway_between_floats_at_a_binade_edge() {
+        // 1 + 2^-24 is halfway between 1 and the float above it, 2^-23 away;
+        // 1 - 2^-25 halfway between 1 and the float below it, 2^-24 away.
+        // The double nearest 8.53362226486206 is a tie the predicate tests
+        // round both ways.
+        for x in [1.0 + 2f64.powi(-24), 1.0 - 2f64.powi(-25), 8.53362226486206] {
+            assert!(halfway_between_floats(x), "{x}");
+            assert!(halfway_between_floats(-x), "{}", -x);
+        }
+        for x in [0.0, 1.0, 1.0 + 2f64.powi(-25), 1.0 - 2f64.powi(-26), 8.5] {
+            assert!(!halfway_between_floats(x), "{x}");
+            assert!(!halfway_between_floats(-x), "{}", -x);
+        }
+    }
+}

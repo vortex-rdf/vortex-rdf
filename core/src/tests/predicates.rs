@@ -354,16 +354,17 @@ fn operands_are_promoted_as_xpath_does() {
     }
 }
 
-/// A number promoted to a float or a double is decided only where engines
-/// round it alike. Oxigraph divides a decimal's digits in double precision,
-/// which is exact up to 15 significant digits but not past them
-/// (`2.9815061622519961` comes out one double low), and it rounds a decimal
-/// to a float through a double, which is a second rounding wherever that
-/// double is a tie between two floats (as for `8.53362226486206`): there a
-/// comparison both roundings settle alike is decided, one they settle
-/// apart is not. An integer from 2^53 on, which a double cannot always
-/// hold, meets a float or a double undecided: Python compares it exactly,
-/// XPath rounds it first.
+/// A number promoted to a float or a double is decided only where the spec
+/// and Oxigraph round it alike. Oxigraph divides a decimal's digits in
+/// double precision, which is exact up to 15 significant digits but not
+/// past them (`2.9815061622519961` comes out one double low), and it rounds
+/// a decimal to a float through a double, which is a second rounding
+/// wherever that double is a tie between two floats (as for
+/// `8.53362226486206`, either sign, and on either side of the comparison):
+/// there a comparison both roundings settle alike is decided, one they
+/// settle apart is not. An integer from 2^53 on meets a float or a double
+/// undecided, as issue #141 asks: both round it alike, but a Python-based
+/// engine compares an integer with a float exactly instead.
 #[test]
 fn promotion_is_decided_where_engines_round_alike() {
     // The two floats around 8.53362226486206, whose midpoint is the double
@@ -371,6 +372,12 @@ fn promotion_is_decided_where_engines_round_alike() {
     let lower = typed("8.533621788024902", "float");
     let upper = typed("8.533622741699219", "float");
     let tie = typed("8.53362226486206", "decimal");
+    let (neg_lower, neg_upper) = (
+        typed("-8.533621788024902", "float"),
+        typed("-8.533622741699219", "float"),
+    );
+    let neg_tie = typed("-8.53362226486206", "decimal");
+    let tie_constant = || "8.53362226486206".to_owned();
     for (spelling, kind, arg, expect) in [
         (
             typed("0.30000000000000004", "decimal"),
@@ -394,10 +401,30 @@ fn promotion_is_decided_where_engines_round_alike() {
         (tie.clone(), "num_eq", lower.clone(), Deferred),
         (tie.clone(), "num_lt", upper.clone(), Deferred),
         (tie.clone(), "num_gt", lower.clone(), Deferred),
-        (tie.clone(), "num_ge", lower, Definite(true)),
-        (tie.clone(), "num_le", upper, Definite(true)),
+        (tie.clone(), "num_ge", lower.clone(), Definite(true)),
+        (tie.clone(), "num_le", upper.clone(), Definite(true)),
         (tie.clone(), "num_lt", typed("9", "float"), Definite(true)),
         (tie, "num_lt", typed("9", "double"), Definite(true)),
+        // The same tie below zero, where the roundings go the other way.
+        (neg_tie.clone(), "num_eq", neg_upper.clone(), Deferred),
+        (neg_tie.clone(), "num_eq", neg_lower.clone(), Deferred),
+        (neg_tie.clone(), "num_gt", neg_upper.clone(), Deferred),
+        (neg_tie.clone(), "num_le", neg_lower, Definite(true)),
+        (neg_tie.clone(), "num_ge", neg_upper, Definite(true)),
+        (neg_tie, "num_lt", typed("-9", "float"), Definite(false)),
+        // The tie as the constant, against the floats in the data.
+        (upper.clone(), "num_eq", tie_constant(), Deferred),
+        (upper.clone(), "num_gt", tie_constant(), Deferred),
+        (upper, "num_ge", tie_constant(), Definite(true)),
+        (lower.clone(), "num_eq", tie_constant(), Deferred),
+        (lower.clone(), "num_lt", tie_constant(), Deferred),
+        (lower, "num_le", tie_constant(), Definite(true)),
+        (
+            typed("9", "float"),
+            "num_gt",
+            tie_constant(),
+            Definite(true),
+        ),
         (
             typed("9007199254740993", "integer"),
             "num_eq",
@@ -1290,8 +1317,9 @@ fn malformed_spellings_are_never_true() {
 }
 
 /// A `xsd:long` / `xsd:unsignedLong` beyond its 64-bit bounds reaches the
-/// caller undecided under every comparison — rdflib compares such a value,
-/// which the model refuses — while a long within bounds is decided.
+/// caller undecided under every comparison (ill-typed for the spec, past
+/// Oxigraph's 64-bit integers or compared as a plain integer there), while
+/// a long within bounds is decided.
 #[tokio::test]
 async fn filter_codes_leaves_wide_longs_undecided() {
     let store = predicate_store().await;
