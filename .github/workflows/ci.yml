@@ -84,6 +84,11 @@ jobs:
           # extension through maturin at the same profile.
           shared-key: py-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The dashboard render test (scripts/test_render_bench_dashboard.py) runs the page's script in Node.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .tool-versions
       - name: Build the bindings and run the Python tests
         run: scripts/ci-check.sh python-tests
 

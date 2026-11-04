@@ -1009,7 +1009,31 @@ function storeMemoryById(memory, columns){
   return map;
 }
 
+// A results file with no memory runs (it predates them, or BENCH_MEMORY_RUNS=0)
+// still carries each query process's peak. A missing peak reads — and is left
+// out of the ranking: `?? 0` ranked it first and made every other cell ∞×.
+const LEGACY_PEAK_NOTE = `This results file has no memory runs (it predates them, or was made with <code>BENCH_MEMORY_RUNS=0</code>), so this is each adapter's query process's peak resident set size: build, open and every pattern. Smallest first; <span class="best-key">green</span> = smallest, the multiplier is vs it.`;
+
+function legacyPeakById(memory){
+  const map = new Map();
+  for (const m of memory ?? []){
+    const v = m.peakRssMb;
+    map.set(`${m.slug}::${m.role}`, Number.isFinite(v)
+      ? { median:`${v} MB`, median_ns:v }
+      : { median:"—", median_ns:null, unsupported:true, reason:"no peak was recorded for this process" });
+  }
+  return map;
+}
+
 function renderStoreMemoryPanel(host, memory, adapters, columns, rowHeader){
+  if (!(memory ?? []).some(m => m.role === "memory")){
+    renderMatrixPanel(host, {
+      title:"Query phase — peak RSS", note:LEGACY_PEAK_NOTE, rowHeaders:[rowHeader],
+      columns:["Peak RSS"], sortByColumn:0,
+      rows: adapters.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
+    }, legacyPeakById(memory));
+    return;
+  }
   const byId = storeMemoryById(memory, columns);
   const rows = adapters
     .filter(a => byId.has(`${a.slug}::${columns[0].key}`))

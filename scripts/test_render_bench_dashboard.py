@@ -282,3 +282,28 @@ def test_every_tab_leads_its_footprint_with_the_store_panel(new_panels):
 def test_the_note_marks_the_spread_sign_only_where_a_pair_exists(new_panels):
     assert "≈ marks a file / in-memory pair" in panel(new_panels["py-footprint-panels"], "Store memory")["note"]
     assert "≈" not in panel(new_panels["js-memory-panels"], "Store memory")["note"]
+
+
+PY_OLD = [query("vortex_dict", 250), query("pyoxigraph", 900), query("rdflib", None)]
+JAVA_OLD = JAVA_NEW[:1]          # a query entry with the retired retained fields
+
+
+@pytest.fixture(scope="module")
+def old_panels(tmp_path_factory):
+    return footprint_panels(render_page(tmp_path_factory.mktemp("old"), python=PY_OLD, java=JAVA_OLD))
+
+
+def test_a_results_file_without_memory_runs_keeps_the_query_peak_table(old_panels):
+    py = panel(old_panels["py-footprint-panels"], "Query phase — peak RSS")
+    assert py["head"] == ["Configuration", "Peak RSS"]
+    assert list(py["rows"]) == ["vortex-rdf Dict (file)", "pyoxigraph (memory)", "rdflib (memory)"]
+    assert [(c["text"], c["best"], c["ratio"]) for [c] in py["rows"].values()] == [
+        ("250 MB", True, None), ("900 MB", False, "3.6×"), ("—", False, None)]
+    assert panel(old_panels["java-footprint-panels"], "Query phase — peak RSS")["head"] == ["Configuration", "Peak RSS"]
+
+
+def test_the_syntax_check_rejects_a_script_that_does_not_parse(tmp_path):
+    import render_bench_dashboard as rbd
+    out = tmp_path / "index.html"
+    assert rbd.check_script_syntax("<script>const ok = 1;</script>", out) is True
+    assert rbd.check_script_syntax("<script>const broken = ;</script>", out) is False  # fails if node is missing
