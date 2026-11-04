@@ -8,23 +8,34 @@ set -- see the pyoxigraph pin note in `run.py`.
 
 Results go to stdout as one JSON object; progress goes to stderr, so the
 orchestrator can stream progress to the terminal while parsing the result.
+
+The memory role (`--role memory`) measures one store's memory, and nothing
+else, in a process of its own: it opens the store, reads every pattern once
+under a 2 ms `/proc/self/status` sampler (the peaks, RssAnon and RssFile above
+a pre-open baseline), then disposes the store and reports the live bytes that
+released (glibc's `mallinfo2`, with `PYTHONMALLOC=malloc` so Python's own
+objects are counted too). It first checks that the counter sees an 8 MiB block
+held; a counter that does not exits non-zero, naming itself, on stderr.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import json
 import os
 import re
 import statistics
 import sys
+import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from adapters import Adapter, build_adapter
 from datasets import (
     FULL_SCAN_PATTERN,
+    Pat,
     dataset_opts,
     dataset_prefix,
     dataset_probes,
@@ -205,11 +216,143 @@ def peak_rss_mb() -> Optional[int]:
         return None
 
 
+class Rss(NamedTuple):
+    """Resident set size by kind, in bytes."""
+
+    anon: int
+    file: int
+
+
+def read_rss() -> Rss:
+    """This process's `RssAnon` and `RssFile`, from `/proc/self/status`."""
+    fields: dict[str, int] = {}
+    with open("/proc/self/status", encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"(RssAnon|RssFile):\s+(\d+)\s+kB", line)
+            if m:
+                fields[m.group(1)] = int(m.group(2)) * 1024
+    return Rss(fields["RssAnon"], fields["RssFile"])
+
+
+class RssSampler:
+    """Keeps the highest `RssAnon + RssFile` seen while the block runs.
+
+    Samples on entry, every `INTERVAL_S` on a daemon thread, and once more on
+    exit. `peak` is the whole sample with the highest sum.
+    """
+
+    INTERVAL_S = 0.002
+
+    def __init__(self) -> None:
+        self.peak = Rss(0, 0)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._error: Optional[BaseException] = None
+        self._switch = sys.getswitchinterval()
+
+    def _sample(self) -> None:
+        rss = read_rss()
+        if rss.anon + rss.file > self.peak.anon + self.peak.file:
+            self.peak = rss
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.wait(self.INTERVAL_S):
+                self._sample()
+        except BaseException as e:  # re-raised from __exit__
+            self._error = e
+
+    def __enter__(self) -> "RssSampler":
+        # A main thread that holds the GIL for a whole native call would
+        # starve the sampler; a short switch interval makes it take the GIL
+        # back about every sample.
+        self._switch = sys.getswitchinterval()
+        sys.setswitchinterval(0.001)
+        self._sample()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        assert self._thread is not None
+        self._thread.join()
+        sys.setswitchinterval(self._switch)
+        if self._error is not None:
+            raise self._error
+        self._sample()
+
+
+class _Mallinfo2(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_size_t)
+        for name in (
+            "arena", "ordblks", "smblks", "hblks", "hblkhd",
+            "usmblks", "fsmblks", "uordblks", "fordblks", "keepcost",
+        )
+    ]
+
+
+_libc: Optional[ctypes.CDLL] = None
+
+
+def _libc_handle() -> ctypes.CDLL:
+    global _libc
+    if _libc is None:
+        _libc = ctypes.CDLL(None)
+    return _libc
+
+
+def live_bytes() -> int:
+    """Bytes glibc's malloc has handed out and not yet had freed: `uordblks`
+    (the arenas) plus `hblkhd` (the mmapped blocks)."""
+    libc = _libc_handle()
+    try:
+        mallinfo2 = libc.mallinfo2
+    except AttributeError:
+        raise RuntimeError("this libc has no mallinfo2 (glibc 2.33+ only)") from None
+    mallinfo2.restype = _Mallinfo2
+    info = mallinfo2()
+    return info.uordblks + info.hblkhd
+
+
+#: The block the self-check holds, and the least `live_bytes` must rise by.
+SELF_CHECK_BYTES = 8 << 20
+
+
+def self_check(live: Callable[[], int] = live_bytes) -> None:
+    """Exit non-zero, naming the counter, unless `live` sees 8 MiB held."""
+    before = live()
+    # 64 KiB blocks sit below glibc's mmap threshold, so freeing them leaves
+    # its dynamic threshold alone.
+    blocks = [bytearray(64 << 10) for _ in range(SELF_CHECK_BYTES // (64 << 10))]
+    rise = live() - before
+    del blocks
+    # Otherwise the bindings' 64 MiB trim threshold would keep these pages in
+    # the baseline.
+    try:
+        _libc_handle().malloc_trim(0)
+    except AttributeError:
+        pass
+    if rise < SELF_CHECK_BYTES:
+        raise SystemExit(
+            f"self-check failed: mallinfo2 (uordblks + hblkhd) rose by {rise:,} bytes "
+            "while the process held 8 MiB"
+        )
+
+
 # ─── Phases ─────────────────────────────────────────────────────────────────
 
 
 def log(label: str, msg: str) -> None:
     print(f"  [{label}] {msg}", file=sys.stderr, flush=True)
+
+
+def patterns(a: Adapter, args: argparse.Namespace) -> list[Pat]:
+    """The triple patterns, and the graph ones when the library's model has
+    graphs, that the query and memory roles both read."""
+    probes = dataset_probes(args.n, dataset_opts(graphs=args.graphs))
+    return list(probes["triples"]) + (list(probes["quads"]) if a.supports_quads else [])
 
 
 def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
@@ -269,10 +412,8 @@ def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
     probes = dataset_probes(args.n, dataset_opts(graphs=args.graphs))
     # The graph probes are part of the one pattern set now, not a second
     # dataset's; a library without graphs in its model reports them unsupported.
-    pattern_set = list(probes["triples"])
-    if a.supports_quads:
-        pattern_set += probes["quads"]
-    else:
+    pattern_set = patterns(a, args)
+    if not a.supports_quads:
         # Both regimes, matching the cold pass this adapter does run below, so
         # neither cell reads as a benchmark nobody bothered with.
         regimes = ["warm", "cold"] if a.has_distinct_open else ["warm"]
@@ -427,10 +568,51 @@ def run_mutate(adapter: Adapter, args: argparse.Namespace) -> dict:
     return {"rows": rows, "counts": {}, "artifact_bytes": None, "peak_rss_mb": peak_rss_mb()}
 
 
+def run_memory(adapter: Adapter, args: argparse.Namespace) -> dict:
+    """One store's memory: the peaks during its reads, and what disposing it
+    releases. Each figure is a difference in bytes."""
+    a = adapter
+    src = args.quads if a.supports_quads else args.triples
+    artifact = a.artifact_path(args.workdir, src)
+
+    a.import_library()
+    pats = patterns(a, args) + [FULL_SCAN_PATTERN]
+    prepared = [(pat.name, a.prepare(pat)) for pat in pats]
+    self_check()
+
+    gc.collect()
+    base = read_rss()
+    log(a.label, "open…")
+    handle = a.open(artifact, src)
+    # A store built here leaves its build garbage out of the read peak.
+    gc.collect()
+
+    counts: dict[str, int] = {}
+    with RssSampler() as sampler:
+        for name, query in prepared:
+            log(a.label, f"read {name}…")
+            counts[name] = a.count(handle, query)
+
+    gc.collect()
+    before = live_bytes()
+    a.dispose(handle)
+    del handle
+    gc.collect()
+    after = live_bytes()
+
+    return {
+        "obtained": a.obtained,
+        "counts": counts,
+        "storeBytes": before - after,
+        "peakAnonBytes": sampler.peak.anon - base.anon,
+        "peakFileBytes": sampler.peak.file - base.file,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--slug", required=True)
-    ap.add_argument("--role", choices=["query", "mutate"], default="query")
+    ap.add_argument("--role", choices=["query", "mutate", "memory"], default="query")
     ap.add_argument("--triples", required=True)
     ap.add_argument("--quads", required=True)
     ap.add_argument("--workdir", required=True)
@@ -439,8 +621,14 @@ def main() -> int:
     ap.add_argument("--mut-batch", type=int, default=10_000)
     args = ap.parse_args()
 
+    if args.role == "memory" and os.environ.get("PYTHONMALLOC") != "malloc":
+        sys.exit(
+            "the memory role needs PYTHONMALLOC=malloc (run.py sets it), "
+            "so that mallinfo2 counts Python objects too"
+        )
     adapter = build_adapter(args.slug)
-    result = run_query(adapter, args) if args.role == "query" else run_mutate(adapter, args)
+    run = {"query": run_query, "mutate": run_mutate, "memory": run_memory}[args.role]
+    result = run(adapter, args)
     result.update({"slug": adapter.slug, "label": adapter.label, "role": args.role})
     print(json.dumps(result))
     return 0

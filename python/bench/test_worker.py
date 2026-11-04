@@ -1,14 +1,62 @@
-"""Tests for `measure` in `worker.py`, the timing rule every Python cell goes through."""
+"""Tests for `worker.py`: `measure`, the timing rule every Python cell goes
+through, and the memory role (its `mallinfo2` counter, `/proc` sampler,
+self-check and the worker process itself)."""
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import platform
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pytest
+
+BENCH = Path(__file__).resolve().parent
+sys.path.insert(0, str(BENCH))
 
 import worker  # noqa: E402
+from adapters import Adapter, build_adapter  # noqa: E402
+from suite import prepare_dataset  # noqa: E402
+
+PROBES = ("S", "P", "O", "SP", "PO", "SPO", "G", "SPOG", "full")
+
+needs_glibc = pytest.mark.skipif(
+    platform.libc_ver()[0] != "glibc", reason="reads /proc and glibc's mallinfo2"
+)
+
+
+class Holding(Adapter):
+    """A store that is one block of memory, so what disposing it releases is known."""
+
+    slug, label, obtained = "holding", "Holding", "built"
+
+    def __init__(self, size):
+        self.size = size
+
+    def artifact_path(self, workdir, src):
+        return ""
+
+    def open(self, artifact, src):
+        return bytearray(self.size)
+
+    def count(self, handle, query):
+        return 7
+
+
+def memory_role(slug, ds, workdir, env):
+    return subprocess.run(
+        [
+            sys.executable, BENCH / "worker.py",
+            "--slug", slug, "--role", "memory",
+            "--triples", ds.triples, "--quads", ds.quads,
+            "--workdir", str(workdir), "--n", str(ds.n), "--graphs", "8",
+        ],
+        capture_output=True, text=True, env=env,
+    )
 
 
 def test_warmup_runs_are_discarded():
@@ -69,3 +117,81 @@ def test_only_the_first_run_is_held_to_the_limit():
 
     assert len(calls) == 4
     assert rows[0]["samples"] == "3"
+
+
+# ─── The memory role ────────────────────────────────────────────────────────
+
+
+@needs_glibc
+def test_live_bytes_count_a_block_until_it_is_freed():
+    before = worker.live_bytes()
+    block = bytearray(32 << 20)
+    held = worker.live_bytes()
+    assert held - before >= 32 << 20
+    del block
+    assert held - worker.live_bytes() >= 32 << 20
+
+
+@needs_glibc
+def test_the_sampler_keeps_the_highest_sample():
+    base = worker.read_rss()
+    assert base.anon > 0 and base.file > 0
+    with worker.RssSampler() as s:
+        block = bytearray(64 << 20)  # zero-filled, so its pages are resident
+        time.sleep(0.05)
+        del block
+    assert s.peak.anon - base.anon >= 60 << 20
+    assert worker.read_rss().anon - base.anon < 32 << 20
+
+
+@needs_glibc
+def test_the_self_check_names_a_counter_that_misses_the_block():
+    worker.self_check()
+    with pytest.raises(SystemExit, match="mallinfo2"):
+        worker.self_check(live=lambda: 0)
+
+
+@needs_glibc
+def test_a_memory_run_measures_what_disposing_the_store_releases(tmp_path):
+    out = worker.run_memory(
+        Holding(32 << 20),
+        argparse.Namespace(quads="q.nq", triples="t.nt", workdir=str(tmp_path), n=64, graphs=8),
+    )
+    assert (out["obtained"], out["counts"]) == ("built", dict.fromkeys(PROBES, 7))
+    assert abs(out["storeBytes"] - (32 << 20)) < 1 << 20
+    assert out["peakAnonBytes"] >= 30 << 20
+
+
+@needs_glibc
+@pytest.mark.parametrize("slug,obtained", [("vortex_dict", "mapped"), ("vortex_dict_mem", "loaded")])
+def test_the_memory_role_prints_one_run(slug, obtained, tmp_path):
+    ds = prepare_dataset(tmp_path, 4096, 8)
+    a = build_adapter(slug)
+    a.dispose(a.build(str(ds.quads), a.artifact_path(str(tmp_path), str(ds.quads))))
+
+    proc = memory_role(slug, ds, tmp_path, {**os.environ, "PYTHONMALLOC": "malloc"})
+    assert proc.returncode == 0, proc.stderr
+
+    out = json.loads(proc.stdout)
+    assert (out["slug"], out["role"], out["obtained"]) == (slug, "memory", obtained)
+    assert set(out["counts"]) == set(PROBES)
+    assert out["counts"]["full"] == 4096
+    assert all(type(out[k]) is int for k in ("storeBytes", "peakAnonBytes", "peakFileBytes"))
+    # The store's native memory goes through glibc and is released.
+    assert out["storeBytes"] > 0
+
+
+def test_the_memory_role_needs_the_malloc_allocator(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONMALLOC"}
+    proc = memory_role("vortex_dict", prepare_dataset(tmp_path, 64, 8), tmp_path, env)
+    assert proc.returncode == 1
+    assert "PYTHONMALLOC=malloc" in proc.stderr
+
+
+def test_only_memory_workers_run_with_the_malloc_allocator(monkeypatch):
+    import run
+
+    monkeypatch.delenv("PYTHONMALLOC", raising=False)
+    assert run.worker_env("vortex", "memory")["PYTHONMALLOC"] == "malloc"
+    assert "PYTHONMALLOC" not in run.worker_env("vortex", "query")
+    assert run.worker_env("rdflib", "memory")["PYTHONPATH"] == str(run.BENCH_DIR)
