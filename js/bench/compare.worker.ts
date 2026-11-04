@@ -364,7 +364,9 @@ let held: unknown = null;
  * event-loop turn repeat until one frees less than 1 MiB, so the finalizers a
  * dispose or a read left behind have run. A built store with a persistent
  * form (Vortex) is then measured again as `fromBytes` loads it, from the bytes
- * `toBytes()` gave before the built store was freed, after the same reads.
+ * `toBytes()` gave before the built store was freed, after the same reads,
+ * whose counts must be the built store's. A failed dispose, or a loaded store
+ * that counts other rows, throws as a failed self-check does.
  *
  * - Store: live bytes after the reads minus live bytes after the dispose, so
  *   it includes the caches the reads filled (Vortex's term cache, and a built
@@ -401,7 +403,9 @@ async function runMemory(a: StoreAdapter): Promise<JsMemoryRun> {
     const afterReads = live(); // the store, read after the reads
     const loads = a.obtained === 'built' && !!a.snapshot && !!a.open; // Vortex
     let bytes: unknown = loads ? await a.snapshot!(h) : null; // before the free
-    reclaim(a, h);
+    // Not through `reclaim`, which swallows a failed free(): that would leave
+    // Store at about 0, so it fails the run instead.
+    a.dispose?.(h);
     h = null;
     await settle(live);
     const first: StoreReadings = { held: afterReads, disposed: live() };
@@ -409,10 +413,18 @@ async function runMemory(a: StoreAdapter): Promise<JsMemoryRun> {
     if (loads) {
         let l: unknown = await a.open!(bytes);
         bytes = null;
-        for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) await a.countMatch(l, p); // the same reads
+        // The same reads, which must count the built store's rows.
+        for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) {
+            const rows = await a.countMatch(l, p);
+            if (rows !== matched[p.name]) {
+                throw new Error(
+                    `the store loaded from the snapshot matched ${rows} rows for '${p.name}', `
+                    + `the built store ${matched[p.name]}`);
+            }
+        }
         await settle(live);
         const lHeld = live();
-        reclaim(a, l);
+        a.dispose?.(l);
         l = null;
         await settle(live);
         loaded = { held: lHeld, disposed: live() };

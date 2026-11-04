@@ -220,6 +220,15 @@ async function main(): Promise<void> {
     }
     runRole(ADAPTERS.filter((a) => queried.has(a.slug)), 'memory', (a, out) => {
         const runs = (memoryRuns[a.slug] ??= []);
+        // Before the counts: an output without a run is a failed run, not a
+        // count mismatch.
+        if (!out.memoryRun) {
+            failures.push({
+                slug: a.slug, label: a.label, role: 'memory', phase: 'worker',
+                error: 'the memory worker wrote no memory run — see the run log',
+            });
+            return false;
+        }
         const own = ownMatched[a.slug] ?? {};
         const differ = Object.entries(own).filter(([pat, n]) => out.matched[pat] !== n);
         if (differ.length > 0) {
@@ -228,13 +237,6 @@ async function main(): Promise<void> {
                     .join(', ');
             countWarnings.push(msg);
             console.error(`  !! ${msg} — no more memory runs for it`);
-            return false;
-        }
-        if (!out.memoryRun) {
-            failures.push({
-                slug: a.slug, label: a.label, role: 'memory', phase: 'worker',
-                error: 'the memory worker wrote no memory run — see the run log',
-            });
             return false;
         }
         mergeMatched(a.label, out);

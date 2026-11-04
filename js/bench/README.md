@@ -1,6 +1,6 @@
 # JS benchmarks
 
-Three instruments, kept separate because they answer different questions and are trustworthy in different ways. Run them from `js/`. `npm run bench:codspeed` needs `npm run build`. `npm run bench` and `bench:dict-memory` run on `npm run build:bench-wasm`, the bench's own build of the bindings in `pkg/bench`. `npm run bench` also needs `hdt-pkg/` (`npm run build:hdt-wasm`), `oxigraph-pkg/` (`npm run build:oxigraph-wasm`) and the HDT file. `scripts/refresh.sh --only js` builds all of them.
+Three instruments, kept separate because they answer different questions and are trustworthy in different ways. Run them from `js/`. `npm run bench:codspeed` needs `npm run build`. `npm run bench` and `bench:dict-memory` run on `npm run build:bench-wasm`, the bench's own build of the bindings in `pkg/bench`. `npm run bench` also needs `hdt-pkg/` (`npm run build:hdt-wasm`), `oxigraph-pkg/` (`npm run build:oxigraph-wasm`) and the HDT file. `scripts/refresh.sh --only js` builds `pkg/bench`, `hdt-pkg/`, `oxigraph-pkg/` and the HDT file.
 
 | Command | Question | Output |
 | --- | --- | --- |
@@ -113,7 +113,7 @@ After the timed roles, `compare.bench.ts` runs each adapter's `memory` role `BEN
 
 - **Self-check:** before anything else, each counter must see an 8 MiB block held, from the module's own allocator for a wasm counter and an array of doubles for the JS heap. A run that fails it exits 1, naming the counter.
 - **The store:** built from the flattened dataset, which is then dropped; hdt is loaded from its HDT file. It is the store the timed cells query, which `obtained` names: `built` for Vortex, rdf-stores and oxigraph, `loaded` for hdt.
-- **The reads:** each probe and the full scan once, read the way the timed cells read them, with their row counts recorded.
+- **The reads:** each probe and the full scan once, read the way the timed cells read them, with their row counts recorded. The `fromBytes` store's reads must count the built store's rows, or the run fails.
 - **Settling:** before each reading and at each probe's start, rounds of GC, a 50 ms event-loop turn and GC again, repeated until a round frees less than 1 MiB of live bytes, and 10 rounds at most. The turn lets FinalizationRegistry callbacks run: `free()` leaves a Vortex store's term dictionary to one, and every oxigraph quad and term a read returns is freed by one. V8 runs one registry's callbacks per task, so after a large read one turn is not enough: after oxigraph's full scan at 1,048,576 rows they take seconds and several rounds.
 - **Vortex:** after the built store, the run measures the store `fromBytes` loads from its `toBytes()`, taken before the built store was freed, after the same reads.
 
