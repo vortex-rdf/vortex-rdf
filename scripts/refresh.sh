@@ -150,6 +150,8 @@ if has compare; then
   # built, then bench it.
   cargo fmt --manifest-path bench-compare/Cargo.toml --check
   cargo clippy --manifest-path bench-compare/Cargo.toml --all-targets --locked -- -D warnings
+  # The memory helpers' tests, in release to share the bench's dependency build.
+  cargo test --manifest-path bench-compare/Cargo.toml --release --locked
   cargo bench --manifest-path bench-compare/Cargo.toml
 fi
 

@@ -411,6 +411,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "bench-memory-stats"
+version = "0.1.0"
+
+[[package]]
 name = "better_io"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3969,8 +3973,11 @@ dependencies = [
 name = "vortex-rdf-bench-compare"
 version = "0.0.0"
 dependencies = [
+ "bench-memory-stats",
  "futures",
  "hdt",
+ "libc",
+ "mimalloc",
  "oxigraph",
  "oxrdf",
  "oxrdfio",
@@ -3990,7 +3997,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "log",
  "memmap2",
- "mimalloc",
  "oxrdf",
  "oxrdfio",
  "regex",
