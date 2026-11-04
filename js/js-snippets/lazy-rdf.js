@@ -2,9 +2,12 @@
 // local wasm-bindgen snippet (copied verbatim into the generated pkg; no runtime
 // npm dependency).
 //
-// `match()`/`getQuads()` hand back LazyQuads over columnar term data. A term's
-// string is decoded from UTF-8 bytes only when `.value`/`.termType` is read (and
-// then interned), never eagerly and never per-term across the wasm boundary.
+// `match()`/`getQuads()` hand back LazyQuads over columnar term data: `getQuads`
+// over one payload of the whole match, `match()` over a payload of at most
+// 8,192 rows at a time, which its stream pulls from a `QuadChunks` handle as
+// its quads are taken (`makeLazyQuadStream` below). A term's string is decoded
+// from UTF-8 bytes only when `.value`/`.termType` is read (and then interned),
+// never eagerly and never per-term across the wasm boundary.
 // Two column backings:
 //   - Dictionary layout: a Float64Array of codes (exact integers) + a shared LazyDict over an
 //     immutable snapshot of the store's term dictionary, decoding codes on
@@ -163,34 +166,41 @@ export function buildLazyQuads(payload) {
     return out;
 }
 
-export function makeLazyQuadStream(payloadPromise) {
-    return new QuadStream(Promise.resolve(payloadPromise).then(buildLazyQuads));
+export function makeLazyQuadStream(chunks) {
+    return new QuadStream(chunks);
 }
 
-// ── Minimal RDF/JS Stream over a Promise<item[]> (data/end/error, read(),
+const NO_QUADS = [];
+
+// ── Minimal RDF/JS Stream over a QuadChunks handle (data/end/error, read(),
 // Symbol.asyncIterator). ─────────────────────────────────────────────────────
+// The buffer holds one chunk's LazyQuads; only once it is empty is the next
+// chunk pulled (`_pull`), by a `data` drain, `read()` or the async iterator.
+// The handle's end ends the stream and a throw fails it, each emitting `end`
+// or `error` in a microtask; `destroy()` stops it without either. All three
+// free the handle and drop `_store`, the store it reads (the package entries
+// set it), and nothing is pulled after them.
 class QuadStream {
-    constructor(itemsPromise) {
-        this._promise = Promise.resolve(itemsPromise);
+    constructor(chunks) {
+        this._chunks = chunks;
+        this._store = undefined;
         this._listeners = { data: [], end: [], error: [], readable: [] };
-        this._buffer = null;
+        this._buffer = NO_QUADS;
         this._pos = 0;
-        this._flowing = false;
+        this._started = false;
+        this._draining = false;
+        // Ended, failed or destroyed.
         this._done = false;
-        this._promise.then(
-            (items) => {
-                this._buffer = items;
-                this._emit('readable');
-                if (this._flowing) this._drain();
-                else this._endIfDrained();
-            },
-            (err) => { this._done = true; this._emit('error', err); },
-        );
+        this._ended = false;
+        this._failed = false;
+        this._error = undefined;
+        // `match` returns first: listeners attached now see the events.
+        queueMicrotask(() => this._start());
     }
     on(event, fn) {
         (this._listeners[event] ||= []).push(fn);
-        if (event === 'data') { this._flowing = true; if (this._buffer) this._drain(); }
-        else if (event === 'readable' && this._buffer && this._pos < this._buffer.length) fn();
+        if (event === 'data') { if (this._started) this._drain(); }
+        else if (event === 'readable' && this._started && !this._done) fn();
         return this;
     }
     once(event, fn) {
@@ -205,32 +215,94 @@ class QuadStream {
     addListener(event, fn) { return this.on(event, fn); }
     removeListener(event, fn) { return this.off(event, fn); }
     emit(event, ...args) { this._emit(event, ...args); return true; }
+    // The next quad, pulling a chunk when the buffer is empty (before the
+    // stream has started too); `null` once the stream is done.
     read() {
-        if (this._buffer && this._pos < this._buffer.length) {
-            const item = this._buffer[this._pos++];
-            this._endIfDrained();
-            return item;
+        for (;;) {
+            if (this._done) return null;
+            if (this._pos < this._buffer.length) return this._buffer[this._pos++];
+            this._pull();
         }
-        return null;
     }
     async *[Symbol.asyncIterator]() {
-        const items = await this._promise;
-        yield* items;
+        try {
+            for (;;) {
+                if (this._done) {
+                    if (this._failed) throw this._error;
+                    return;
+                }
+                if (this._pos < this._buffer.length) yield this._buffer[this._pos++];
+                else this._pull();
+            }
+        } finally {
+            // Left early (a `break`, a throw), or failed: free the handle.
+            if (!this._ended) this.destroy();
+        }
+    }
+    // Stop the stream: done, without `end` or `error`.
+    destroy() {
+        this._done = true;
+        this._buffer = NO_QUADS;
+        this._pos = 0;
+        this._release();
     }
     _emit(event, ...args) {
         const arr = this._listeners[event];
         if (arr) for (const fn of arr.slice()) fn(...args);
     }
-    _drain() {
-        if (this._done || !this._buffer) return;
-        while (this._pos < this._buffer.length) this._emit('data', this._buffer[this._pos++]);
-        this._endIfDrained();
+    _start() {
+        this._started = true;
+        if (this._done) return;
+        this._emit('readable');
+        if (this._listeners.data.length > 0) this._drain();
     }
-    _endIfDrained() {
-        if (!this._done && this._buffer && this._pos >= this._buffer.length) {
-            this._done = true;
-            Promise.resolve().then(() => this._emit('end'));
+    // Emit the quads as `data`, a chunk pulled each time the buffer empties,
+    // until the stream is done; a call made while one drains returns.
+    _drain() {
+        if (this._draining) return;
+        this._draining = true;
+        try {
+            for (;;) {
+                if (this._done) return;
+                if (this._pos < this._buffer.length) this._emit('data', this._buffer[this._pos++]);
+                else this._pull();
+            }
+        } finally {
+            this._draining = false;
         }
+    }
+    // Refill the empty buffer with the handle's next chunk, or end or fail
+    // the stream.
+    _pull() {
+        if (this._done) return;
+        let payload;
+        try {
+            payload = this._chunks.next();
+        } catch (error) {
+            this._failed = true;
+            this._error = error;
+            this._finish('error', error);
+            return;
+        }
+        if (payload === undefined) {
+            this._ended = true;
+            this._finish('end');
+            return;
+        }
+        this._buffer = buildLazyQuads(payload);
+        this._pos = 0;
+    }
+    _finish(event, ...args) {
+        this._done = true;
+        this._release();
+        queueMicrotask(() => this._emit(event, ...args));
+    }
+    // Free the handle, once, and drop the store it reads.
+    _release() {
+        const chunks = this._chunks;
+        this._chunks = undefined;
+        this._store = undefined;
+        chunks?.free();
     }
 }
 

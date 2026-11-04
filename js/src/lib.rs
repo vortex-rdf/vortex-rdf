@@ -16,7 +16,7 @@ mod probes;
 mod store;
 mod terms;
 
-pub use chunks::{CodeChunks, ProbeAnswers};
+pub use chunks::{CodeChunks, ProbeAnswers, QuadChunks};
 pub use store::{TermDict, VortexRdfStore};
 
 /// The hand-written TypeScript surface of this crate (the Rust items carry

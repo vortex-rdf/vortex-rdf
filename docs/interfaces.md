@@ -69,14 +69,14 @@ without tombstones. On a file view whose pending filter no read by id
 serves, it evaluates the filter's masks split by split first and then reads
 only the rows they keep, point by point, by one take, or by projecting each
 split at its mask. The streams read such a view the same way, a split at a
-time as they are pulled. The chunk stream is the
-form for a match consumed
+time as they are pulled. The chunk stream is the form for a match consumed
 incrementally or of unknown size, and the bindings reach it through
 `match_code_chunks` (Python) and `matchCodeChunks` (JS and Java), and
-Java's `iterateQuads` and Python's `iter_quads` as terms, a chunk decoded at a time. A Python
-`match_codes` call given a cancel token returns its result when its gather
-completes before the cancel is observed, and raises `Cancelled` when the
-token is cancelled before the call or while the call waits for data.
+Java's `iterateQuads`, Python's `iter_quads` and JS's `match()` as terms, a
+chunk decoded at a time. A Python `match_codes` call given a cancel token
+returns its result when its gather completes before the cancel is observed,
+and raises `Cancelled` when the token is cancelled before the call or while
+the call waits for data.
 
 Two calls let a binding build its own chunked read of a pattern:
 [`code_probe`](../core/src/store/query/located.rs#L131) turns a `CodePattern` into

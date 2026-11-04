@@ -32,6 +32,7 @@ describe('api.d.ts covers the wasm exports', () => {
         ['termdict', 'TermDict'],
         ['codechunks', 'CodeChunks'],
         ['probeanswers', 'ProbeAnswers'],
+        ['quadchunks', 'QuadChunks'],
     ] as const;
     for (const [prefix, className] of classes) {
         test(className, () => {
