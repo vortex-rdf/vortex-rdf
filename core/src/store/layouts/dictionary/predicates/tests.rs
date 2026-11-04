@@ -8,6 +8,8 @@ fn p(kind: &str, arg: &str) -> TermPredicate {
 const INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const DEC: &str = "http://www.w3.org/2001/XMLSchema#decimal";
 const DBL: &str = "http://www.w3.org/2001/XMLSchema#double";
+const FLT: &str = "http://www.w3.org/2001/XMLSchema#float";
+const BYTE: &str = "http://www.w3.org/2001/XMLSchema#byte";
 
 fn typed(lex: &str, dt: &str) -> String {
     format!("\"{lex}\"^^<{dt}>")
@@ -137,67 +139,88 @@ fn numeric_values_compare_exactly() {
     assert_eq!(lt5.eval(&typed("4.5e0", DBL)), Verdict::True);
     assert_eq!(lt5.eval(&typed("-0", INT)), Verdict::True);
     assert_eq!(lt5.eval(&typed("+4", INT)), Verdict::True);
-    // Bounded types: in range compares by value; out of range has no
-    // value, so the datatypes order (`byte` sorts below `integer`).
-    assert_eq!(
-        lt5.eval(&typed("300", "http://www.w3.org/2001/XMLSchema#byte")),
-        Verdict::True
-    );
-    assert_eq!(
-        p("num_gt", "5").eval(&typed("300", "http://www.w3.org/2001/XMLSchema#byte")),
-        Verdict::False
-    );
+    // Bounded types: in range compares by value. Out of range is ill-typed
+    // for the spec but the plain integer to Oxigraph, so it is undecided.
+    assert_eq!(lt5.eval(&typed("3", BYTE)), Verdict::True);
+    assert_eq!(lt5.eval(&typed("300", BYTE)), Verdict::Unknown);
+    assert_eq!(p("num_gt", "5").eval(&typed("300", BYTE)), Verdict::Unknown);
     // Grammatical special values are outside the model and deferred.
-    for lex in ["NaN", "INF", "-INF"] {
+    for lex in ["NaN", "INF", "-INF", "+INF"] {
         assert_eq!(lt5.eval(&typed(lex, DBL)), Verdict::Unknown, "{lex}");
     }
-    assert_eq!(
-        lt5.eval(&typed("3", "http://www.w3.org/2001/XMLSchema#byte")),
-        Verdict::True
-    );
-    // Lexical forms outside the XSD grammar.
+    // A lexical form outside its datatype's grammar has no value: ordering
+    // it is a type error.
     for lex in ["abc", " 4", "4 ", "1_000", "0x10", "4.5", ""] {
-        assert_eq!(lt5.eval(&typed(lex, INT)), Verdict::Unknown, "{lex:?}");
+        assert_eq!(lt5.eval(&typed(lex, INT)), Verdict::False, "{lex:?}");
     }
-    // Specials are unknown; an integral float compares with a decimal
-    // exactly, a fractional one does not.
-    assert_eq!(lt5.eval(&typed("NaN", DBL)), Verdict::Unknown);
-    assert_eq!(lt5.eval(&typed("INF", DBL)), Verdict::Unknown);
+    // A decimal meets a double as the double nearest it.
     assert_eq!(p("num_lt", "4.5").eval(&typed("4.0", DBL)), Verdict::True);
     assert_eq!(p("num_lt", "4.5").eval(&typed("4", DBL)), Verdict::True);
+    assert_eq!(p("num_lt", "4.5").eval(&typed("4.25", DBL)), Verdict::True);
     assert_eq!(
-        p("num_lt", "4.5").eval(&typed("4.25", DBL)),
-        Verdict::Unknown
+        p("num_lt", "4.5e0").eval(&typed("4.25", DEC)),
+        Verdict::True
     );
     // Equality and inequality.
     assert_eq!(p("num_eq", "5").eval(&typed("5.0", DEC)), Verdict::True);
     assert_eq!(p("num_ne", "5").eval(&typed("5.0", DEC)), Verdict::False);
     assert_eq!(p("num_eq", "1e2").eval(&typed("100", INT)), Verdict::True);
-    // Float lexical forms the grammar rejects, and one past `f64`'s
-    // range, have no value; a negative float has its sign.
-    for lex in ["1e", "1e+", "1ex", "1e1.5", "1e999"] {
-        assert_eq!(lt5.eval(&typed(lex, DBL)), Verdict::Unknown, "{lex:?}");
+    // Float lexical forms the grammar rejects have no value; one past
+    // `f64`'s range is infinite, outside the model; a negative float has
+    // its sign.
+    for lex in ["1e", "1e+", "1ex", "1e1.5"] {
+        assert_eq!(lt5.eval(&typed(lex, DBL)), Verdict::False, "{lex:?}");
     }
+    assert_eq!(lt5.eval(&typed("1e999", DBL)), Verdict::Unknown);
     assert_eq!(lt5.eval(&typed("-6.5e0", DBL)), Verdict::True);
     assert_eq!(
         p("num_gt", "-6").eval(&typed("-6.5e0", DBL)),
         Verdict::False
     );
     // A float against a decimal without fractional digits compares as
-    // against an integer; a decimal against a fractional float has no
-    // exact comparison here.
+    // against an integer.
     assert_eq!(p("num_lt", "5.").eval(&typed("4.5e0", DBL)), Verdict::True);
     assert_eq!(p("num_gt", "5.").eval(&typed("4.5e0", DBL)), Verdict::False);
+}
+
+/// An `xsd:float` holds a single-precision value, and promotion widens it
+/// to a double exactly: the float nearest 0.1 lies above the double
+/// nearest 0.1, and 2^24 + 1 is no float (it rounds to 2^24).
+#[test]
+fn xsd_float_values_are_single_precision() {
+    let flt = |lex: &str| typed(lex, FLT);
     assert_eq!(
-        p("num_lt", "4.5e0").eval(&typed("4.25", DEC)),
-        Verdict::Unknown
+        p("num_gt", &typed("0.1", DBL)).eval(&flt("0.1")),
+        Verdict::True
     );
+    assert_eq!(
+        p("num_eq", &flt("0.1")).eval(&typed("0.1", DBL)),
+        Verdict::False
+    );
+    assert_eq!(p("num_eq", &flt("0.1")).eval(&flt("0.1")), Verdict::True);
+    assert_eq!(
+        p("num_eq", "16777216").eval(&flt("16777217")),
+        Verdict::True
+    );
+    assert_eq!(
+        p("num_eq", "16777217").eval(&flt("16777217")),
+        Verdict::True
+    );
+    assert_eq!(
+        p("num_eq", &typed("16777217", DBL)).eval(&flt("16777217")),
+        Verdict::False
+    );
+    // A decimal meets a float as the float nearest it.
+    assert_eq!(p("num_eq", "0.1").eval(&flt("0.1")), Verdict::True);
+    assert_eq!(p("num_lt", "4.5").eval(&flt("4.25")), Verdict::True);
 }
 
 /// A numeric predicate's constant hashes by its value, in every model
-/// (integer, decimal, float): equal constants are one set entry,
-/// different ones two. `0e0` and `-0e0` compare equal, so they hash
-/// alike.
+/// (integer, decimal, float, double): equal constants are one set entry,
+/// different ones two. `1.5` and `1.50` are one decimal, `0e0` and `-0e0`
+/// compare equal, so they hash alike, and so do a float's zeros. A float
+/// and a double of one value are two constants, as they promote
+/// differently.
 #[test]
 fn numeric_predicates_hash_by_value() {
     use std::hash::BuildHasher as _;
@@ -206,24 +229,54 @@ fn numeric_predicates_hash_by_value() {
         TermPredicate::Num(_, number) => number,
         other => panic!("{other:?}"),
     };
+    let (one_f, zero_f, neg_zero_f) = (typed("1", FLT), typed("0", FLT), typed("-0", FLT));
     let set: std::collections::HashSet<Number> = [
-        "5", "5", "6", "1.5", "1.5", "2.5", "1e3", "1e3", "2e3", "0e0", "-0e0",
+        "5",
+        "5",
+        "6",
+        "1.5",
+        "1.50",
+        "2.5",
+        "1e3",
+        "1e3",
+        "2e3",
+        "0e0",
+        "-0e0",
+        one_f.as_str(),
+        one_f.as_str(),
+        zero_f.as_str(),
+        neg_zero_f.as_str(),
     ]
     .map(number)
     .into_iter()
     .collect();
-    assert_eq!(set.len(), 7);
-    for arg in ["5", "1.5", "1e3", "0e0", "-0e0"] {
+    assert_eq!(set.len(), 9);
+    for arg in [
+        "5",
+        "1.5",
+        "1e3",
+        "0e0",
+        "-0e0",
+        one_f.as_str(),
+        zero_f.as_str(),
+    ] {
         assert!(set.contains(&number(arg)), "{arg}");
     }
     assert!(!set.contains(&number("7")));
+    assert_ne!(number(&one_f), number("1e0"));
     let hasher = std::collections::hash_map::RandomState::new();
-    assert_eq!(number("0e0"), number("-0e0"));
-    assert_eq!(
-        hasher.hash_one(number("0e0")),
-        hasher.hash_one(number("-0e0")),
-        "equal constants hash alike"
-    );
+    for (a, b) in [
+        ("1.5", "1.50"),
+        ("0e0", "-0e0"),
+        (zero_f.as_str(), neg_zero_f.as_str()),
+    ] {
+        assert_eq!(number(a), number(b));
+        assert_eq!(
+            hasher.hash_one(number(a)),
+            hasher.hash_one(number(b)),
+            "equal constants hash alike"
+        );
+    }
 }
 
 #[test]
@@ -232,31 +285,32 @@ fn non_literals_and_other_datatypes() {
     assert_eq!(p("num_ne", "5").eval("_:b"), Verdict::True);
     assert_eq!(p("num_eq", "5").eval("_:b"), Verdict::False);
     assert_eq!(p("num_lt", "5").eval("<http://x>"), Verdict::False);
-    // A plain string against an integer orders by datatype IRI
-    // ("…#string" > "…#integer"), as the Python fast path does.
-    assert_eq!(p("num_gt", "5").eval("\"abc\""), Verdict::True);
+    // A literal without a numeric value orders against no number: a type
+    // error, whatever its datatype's IRI.
+    assert_eq!(p("num_gt", "5").eval("\"abc\""), Verdict::False);
     assert_eq!(p("num_lt", "5").eval("\"abc\""), Verdict::False);
     assert_eq!(p("num_lt", "5").eval("\"abc\"@en"), Verdict::False);
-    // "…#string" < "…#unsignedInt".
     let u = typed("5", "http://www.w3.org/2001/XMLSchema#unsignedInt");
-    assert_eq!(p("num_lt", &u).eval("\"abc\""), Verdict::True);
-    // Equality against a plain non-numeric literal, and inequality
-    // against a plain or a language-tagged one, are left to the engine.
-    assert_eq!(p("num_eq", "5").eval("\"abc\""), Verdict::Unknown);
+    assert_eq!(p("num_lt", &u).eval("\"abc\""), Verdict::False);
+    // Equality with a literal without a numeric value fails (a type error
+    // for the spec, false for Oxigraph); inequality is left to the engine,
+    // where the spec and Oxigraph part.
+    assert_eq!(p("num_eq", "5").eval("\"abc\""), Verdict::False);
+    assert_eq!(p("num_eq", "5").eval("\"abc\"@en"), Verdict::False);
+    assert_eq!(p("num_eq", "5").eval(&typed("abc", INT)), Verdict::False);
     assert_eq!(p("num_ne", "5").eval("\"abc\""), Verdict::Unknown);
     assert_eq!(p("num_ne", "5").eval("\"abc\"@en"), Verdict::Unknown);
     // The default graph's empty spelling is no term the predicates speak of.
     assert_eq!(p("num_ne", "5").eval(""), Verdict::Unknown);
-    // Same datatype, unparseable lexical: unknown.
-    assert_eq!(p("num_lt", "5").eval(&typed("abc", INT)), Verdict::Unknown);
-    // Different numeric datatype, unparseable lexical: still unknown —
-    // the engine's own parser may accept forms this grammar rejects
-    // and compare by value.
-    assert_eq!(p("num_lt", "5").eval(&typed("abc", DEC)), Verdict::Unknown);
-    // Non-XSD datatype: unknown.
+    // A lexical form its numeric datatype's grammar rejects is ill-typed:
+    // no value, so ordering it is a type error, in the constant's datatype
+    // or another.
+    assert_eq!(p("num_lt", "5").eval(&typed("abc", INT)), Verdict::False);
+    assert_eq!(p("num_lt", "5").eval(&typed("abc", DEC)), Verdict::False);
+    // So is a datatype outside XSD.
     assert_eq!(
         p("num_lt", "5").eval(&typed("1", "http://ex/dt")),
-        Verdict::Unknown
+        Verdict::False
     );
 }
 
@@ -341,10 +395,13 @@ fn parse_rejects_bad_input_and_canonicalizes() {
         TermPredicate::Text(TextPredicate { .. })
     ));
 
+    let (flt_tenth, flt_tie) = (typed("0.1", FLT), typed("16777217", FLT));
     // Every kind but the string ones prints `kind(arg)`, or `kind` when
     // it takes no argument, and that pair parses back to the predicate. A
-    // constant prints canonically: a scale-0 decimal with no fraction, a
-    // double in its shortest round-trip form.
+    // constant prints canonically: a decimal without trailing fractional
+    // zeros (a scale-0 one with no fraction), a double or a float in its
+    // shortest round-trip form (a float's lexical form rounded to single
+    // precision first).
     for (kind, arg, shown) in [
         ("is_literal", "", "is_literal".to_owned()),
         ("is_iri", "", "is_iri".to_owned()),
@@ -355,9 +412,19 @@ fn parse_rejects_bad_input_and_canonicalizes() {
         ("num_lt", "1e3", format!("num_lt(\"1000.0\"^^<{DBL}>)")),
         ("num_le", "5.", format!("num_le(\"5\"^^<{DEC}>)")),
         ("num_gt", "-7", format!("num_gt(\"-7\"^^<{INT}>)")),
-        ("num_ge", "1.50", format!("num_ge(\"1.50\"^^<{DEC}>)")),
+        ("num_ge", "1.50", format!("num_ge(\"1.5\"^^<{DEC}>)")),
         ("num_eq", "-.5", format!("num_eq(\"-0.5\"^^<{DEC}>)")),
         ("num_ne", "0.25", format!("num_ne(\"0.25\"^^<{DEC}>)")),
+        (
+            "num_eq",
+            flt_tenth.as_str(),
+            format!("num_eq(\"0.1\"^^<{FLT}>)"),
+        ),
+        (
+            "num_lt",
+            flt_tie.as_str(),
+            format!("num_lt(\"16777216.0\"^^<{FLT}>)"),
+        ),
     ] {
         let predicate = p(kind, arg);
         assert_eq!(predicate.to_string(), shown, "{kind} {arg:?}");
@@ -547,10 +614,11 @@ fn wide_64_bit_longs_are_undecided() {
     }
     assert_eq!(p("num_lt", "5").eval(&typed("7", long)), Verdict::False);
     assert_eq!(p("num_lt", "9").eval(&typed("7", ulong)), Verdict::True);
-    // An unbounded integer still compares by value.
+    // Past 64 bits an integer of any type is undecided: Oxigraph holds
+    // integers in 64 bits.
     assert_eq!(
         p("num_lt", "5").eval(&typed("99999999999999999999", INT)),
-        Verdict::False
+        Verdict::Unknown
     );
 }
 
@@ -560,10 +628,25 @@ fn lexical_forms_are_read_unescaped() {
         p("num_eq", "5").eval("\"\\u0035\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
         Verdict::True
     );
-    assert_eq!(
-        p("num_lt", "5").eval("\"\\q\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
-        Verdict::Unknown
-    );
+    // A malformed escape leaves the lexical form unread: undecided, which
+    // `=` does not turn into a failure.
+    for kind in ["num_lt", "num_eq"] {
+        assert_eq!(
+            p(kind, "5").eval("\"\\q\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            Verdict::Unknown,
+            "{kind}"
+        );
+    }
+    // A datatype IRI spelled with escapes, which only a foreign writer's
+    // file holds, may name a numeric datatype once decoded: it is no type
+    // error then, so the numeric kinds leave it undecided.
+    for kind in ["num_lt", "num_eq"] {
+        assert_eq!(
+            p(kind, "9").eval("\"5\"^^<http://www.w3.org/2001/XMLSchema#\\u0069nteger>"),
+            Verdict::Unknown,
+            "{kind}"
+        );
+    }
     assert_eq!(p("str_prefix", "a\"").eval("\"a\\\"b\""), Verdict::True);
     assert_eq!(
         p("lang", "en").eval("\"a\\\"@fr\"@en"),
@@ -688,6 +771,11 @@ fn malformed_spellings_never_panic() {
             ("num_lt", "5"),
             ("num_eq", "5"),
             ("num_ne", "5"),
+            ("num_ge", "4.5"),
+            (
+                "num_gt",
+                "\"0.1\"^^<http://www.w3.org/2001/XMLSchema#float>",
+            ),
         ]
         .map(|(kind, arg)| p(kind, arg)),
     );

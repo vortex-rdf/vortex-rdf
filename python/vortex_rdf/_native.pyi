@@ -123,13 +123,43 @@ class TermDict:
         ``$`` and without flag ``m`` leaves a text ending in a newline
         undecided; a pattern with ``\B`` leaves the empty text undecided.
 
+        The numeric kinds ``num_lt``, ``num_le``, ``num_gt``, ``num_ge``,
+        ``num_eq`` and ``num_ne`` follow SPARQL 1.1. `arg` is an N-Triples
+        numeric literal (``"5"^^<http://www.w3.org/2001/XMLSchema#integer>``)
+        or a bare number typed by its syntax (``5`` an integer, ``1.5`` a
+        decimal, ``1e3`` a double). A number compares by value after XPath's
+        type promotion: an integer or a decimal meets an ``xsd:float``, a
+        single-precision value, as a float and an ``xsd:double`` as a
+        double, and a float meets a double as a double. Ordering a literal
+        without a numeric value (a string, a language-tagged literal,
+        another datatype, or a lexical form its numeric datatype's grammar
+        rejects) is a type error, so it fails, and so does ``num_eq``,
+        which Oxigraph answers false; ``num_ne`` leaves such a literal
+        undecided, where Oxigraph answers true. A non-literal fails every
+        numeric kind but ``num_ne``, which it passes.
+
+        A value an engine may hold apart from the spec is undecided under
+        every numeric kind: one outside its integer type's range, an integer
+        past 64 bits, a decimal past 18 fractional digits or of magnitude
+        about 1.7e20 or more (Oxigraph's limits), a special float (``INF``,
+        ``NaN``, and spellings such as ``inf``), and a float lexical form
+        past its type's range. So is an integer (or a decimal without a
+        fraction) from 2**53 on against a float or a double, a decimal with
+        a fraction and more than 15 significant digits against one, and a
+        decimal against a float where rounding it once (as the spec does)
+        and through a double (as Oxigraph does) give different verdicts. A
+        constant past 64 bits or 18 fractional digits leaves every number
+        undecided; one past 128 bits, or no value of its datatype (such as
+        ``"300"^^xsd:byte`` or ``"INF"^^xsd:double``), raises ``ValueError``.
+        Every definite verdict is the one Oxigraph gives.
+
         Other kinds: ``is_literal``, ``is_iri``, ``is_blank``, ``datatype``,
-        ``lang``, ``lang_matches``, ``num_lt`` … ``num_ne``. ``lang_matches``
-        is BCP 47 basic filtering, decided for ``*`` and for a range of ASCII
-        letters, digits and hyphens (``en``, ``en-GB``); any other range,
-        which rdflib may read differently (``en-*``, padding whitespace),
-        leaves the language-tagged literals undecided. An unknown kind, an
-        invalid argument or an option that does not apply to the kind raises
+        ``lang``, ``lang_matches``. ``lang_matches`` is BCP 47 basic
+        filtering, decided for ``*`` and for a range of ASCII letters, digits
+        and hyphens (``en``, ``en-GB``); any other range, which rdflib may
+        read differently (``en-*``, padding whitespace), leaves the
+        language-tagged literals undecided. An unknown kind, an invalid
+        argument or an option that does not apply to the kind raises
         ``ValueError``. No verdict is memoized."""
         ...
     def prefix_range(self, prefix: str) -> Tuple[int, int]:
