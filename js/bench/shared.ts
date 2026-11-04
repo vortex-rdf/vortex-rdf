@@ -23,7 +23,7 @@ import { dirname, resolve } from 'node:path';
 
 import { VortexRdfStore, vortexCounter, vortexWasm, type BuildOptions } from './vortex.js';
 import {
-    fmtNs, consumeQuads, consumeStream, consumeStrings, wasmCounter,
+    fmtNs, consumeQuads, consumeStream, consumeStrings, settleRounds, wasmCounter,
     type JsMemoryRun, type WasmCounter,
 } from './util.js';
 import { df, moduli, type Pat } from './datasets.js';
@@ -601,12 +601,18 @@ export function holdJsHeap(bytes: number): () => void {
     return () => { block = null; };
 }
 
-/** Let the process settle before a reading: collect, give the event loop a
- *  50 ms turn so FinalizationRegistry callbacks run (a freed Vortex store's
- *  term dictionary is released by one, and so is each oxigraph quad or term
- *  a read left unfreed), then collect what they released. */
-export async function settle(): Promise<void> {
-    global.gc!();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    global.gc!();
+/** Let the process settle before a reading of `live`, the run's live bytes.
+ *  A round collects, gives the event loop a 50 ms turn so FinalizationRegistry
+ *  callbacks run (a freed Vortex store's term dictionary is released by one,
+ *  and so is each oxigraph quad or term a read left unfreed), then collects
+ *  what they released. One turn does not always let them all run: V8 runs one
+ *  registry's callbacks per task, and after a large read they take seconds.
+ *  So rounds repeat until one frees less than 1 MiB, 10 at most
+ *  (`settleRounds` in util.ts). */
+export async function settle(live: () => number): Promise<void> {
+    await settleRounds(async () => {
+        global.gc!();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        global.gc!();
+    }, live);
 }

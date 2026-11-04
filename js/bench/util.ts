@@ -417,6 +417,25 @@ export function checkCounter(name: string, read: () => number, hold: (bytes: num
     }
 }
 
+/** A settle ends at the first round that frees less than this. */
+export const SETTLE_STEP_BYTES = 1 << 20;
+/** The most rounds a settle runs. */
+export const SETTLE_MAX_ROUNDS = 10;
+
+/** Settle the live bytes `live` reads: run `round` until one frees less than
+ *  [`SETTLE_STEP_BYTES`], compared with the reading before it, and at most
+ *  [`SETTLE_MAX_ROUNDS`] times. Returns the rounds run; the first always
+ *  runs. */
+export async function settleRounds(round: () => Promise<void>, live: () => number): Promise<number> {
+    let before = live();
+    for (let rounds = 1; ; rounds++) {
+        await round();
+        const after = live();
+        if (before - after < SETTLE_STEP_BYTES || rounds >= SETTLE_MAX_ROUNDS) return rounds;
+        before = after;
+    }
+}
+
 /** One store's two live-byte readings, each taken after settling: `held`
  *  after the reads, before the dispose, and `disposed` after it. */
 export interface StoreReadings { held: number; disposed: number }

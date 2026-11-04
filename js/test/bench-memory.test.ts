@@ -1,6 +1,6 @@
 import { describe, test, expect, vi } from 'vitest';
 
-import { SELF_CHECK_BYTES, checkCounter, memoryRunFigures, wasmCounter } from '../bench/util.js';
+import { SELF_CHECK_BYTES, checkCounter, memoryRunFigures, settleRounds, wasmCounter } from '../bench/util.js';
 
 const MiB = 1048576;
 
@@ -30,6 +30,32 @@ describe('memoryRunFigures', () => {
             loaded: { held: 100 * MiB, disposed: 100.25 * MiB },
             probeTotals: [90 * MiB, 99.5 * MiB],
         })).toEqual({ storeBuiltMb: 0, storeLoadedMb: 0, peakLiveMb: 0 });
+    });
+});
+
+describe('settleRounds', () => {
+    /** A reader that returns `mib` in turn, in MiB, and the rounds run. */
+    const fake = (mib: number[]) => {
+        let reads = 0;
+        let rounds = 0;
+        return {
+            round: async () => { rounds++; },
+            live: () => mib[reads++] * MiB,
+            rounds: () => rounds,
+        };
+    };
+
+    test('settleRounds repeats a round until it frees less than 1 MiB', async () => {
+        // Before, then after each round: 10 MiB freed, exactly 1, then 0.5.
+        const f = fake([100, 90, 89, 88.5, 0]);
+        expect(await settleRounds(f.round, f.live)).toBe(3);
+        expect(f.rounds()).toBe(3);
+    });
+
+    test('settleRounds stops after 10 rounds', async () => {
+        const f = fake(Array.from({ length: 20 }, (_, i) => 100 - 2 * i));
+        expect(await settleRounds(f.round, f.live)).toBe(10);
+        expect(f.rounds()).toBe(10);
     });
 });
 

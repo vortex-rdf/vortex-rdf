@@ -134,6 +134,9 @@ async function main(): Promise<void> {
     const keepOwn = (a: { slug: string }, out: WorkerOutput): void => {
         Object.assign(ownMatched[a.slug] ??= {}, out.matched);
     };
+    /** The adapters whose query worker reported counts: only these get memory
+     *  runs, whose counts are checked against them. */
+    const queried = new Set<string>();
 
     /** Run `role` for each of `adapters`, each in its own process, `times`
      *  times in a row: keep its rows and failures, and hand its output to
@@ -174,6 +177,7 @@ async function main(): Promise<void> {
             peakRssMb: out.peakRssMb,
         });
         keepOwn(a, out);
+        if (Object.keys(out.matched).length > 0) queried.add(a.slug);
         mergeMatched(a.label, out);
         console.log(`[${a.label}] peak RSS: ${out.peakRssMb ?? 'unknown'} MB`);
     });
@@ -203,10 +207,18 @@ async function main(): Promise<void> {
     // the store alone (see runMemory in compare.worker.ts). An adapter's runs
     // stop at its first failed worker, and at its first run whose counts
     // differ from its own query and full-scan runs': that run is dropped, and
-    // the difference is a count warning.
+    // the difference is a count warning. An adapter whose query worker failed,
+    // or counted nothing, gets none: there is nothing to check its counts by.
     const memoryRuns: Record<string, JsMemoryRun[]> = {};
     const mb = (x: number | null) => (x === null ? '—' : x.toFixed(1));
-    runRole(ADAPTERS, 'memory', (a, out) => {
+    if (MEMORY_RUNS > 0) {
+        for (const a of ADAPTERS) {
+            if (!queried.has(a.slug)) {
+                console.error(`  !! ${a.label}: no memory runs, as its query worker reported no counts`);
+            }
+        }
+    }
+    runRole(ADAPTERS.filter((a) => queried.has(a.slug)), 'memory', (a, out) => {
         const runs = (memoryRuns[a.slug] ??= []);
         const own = ownMatched[a.slug] ?? {};
         const differ = Object.entries(own).filter(([pat, n]) => out.matched[pat] !== n);
