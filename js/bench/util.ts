@@ -327,3 +327,118 @@ export function checkOxigraphVersion(lockPath: string, pkgDir: string): string {
     }
     return pinned;
 }
+
+// ─── Memory runs ─────────────────────────────────────────────────────────────
+//
+// compare.worker.ts's `memory` role measures one store in a process of its
+// own: the live bytes of the store's wasm module (the bench's counter, linked
+// into every module it loads) plus the JS heap, read around the store's reads
+// and its dispose. The pure parts of that run live here, so they are tested
+// without loading a store.
+
+/** The block each counter must see held at the start of a memory run. */
+export const SELF_CHECK_BYTES = 8 << 20;
+
+/** What the counter's `memoryStats()` returns: live and peak heap bytes since
+ *  counting was switched on (signed: a block allocated before and freed after
+ *  counts below 0), and the module's `memory.buffer.byteLength`. */
+export interface MemoryStats { liveBytes: number; peakLiveBytes: number; heapBytes: number }
+
+/** The counter's exports (`bench-memory-stats`), in a module built with it. */
+export interface MemoryStatsExports {
+    setMemoryCounting(on: boolean): void;
+    memoryStats(): MemoryStats;
+    resetMemoryPeak(): void;
+}
+
+/** One wasm module's counter. Every member is a closure over the module, with
+ *  no `this`, so each can be passed around bare. */
+export interface WasmCounter {
+    name: string;
+    setCounting(on: boolean): void;
+    stats(): MemoryStats;
+    /** `resetMemoryPeak()`: the peak becomes the current live bytes. */
+    resetPeak(): void;
+    /** Allocate `bytes` through the module's own allocator, which the counter
+     *  wraps; the returned function frees them. */
+    hold(bytes: number): () => void;
+}
+
+/** The counter of the wasm module `name`, from its JS exports and the exports
+ *  of its instance (`InitOutput`), whose allocator `hold` goes through.
+ *  Throws when the module was built without the counter. */
+export function wasmCounter(
+    name: string,
+    exports: object,
+    wasm: {
+        __wbindgen_malloc(size: number, align: number): number;
+        __wbindgen_free(ptr: number, size: number, align: number): void;
+    },
+): WasmCounter {
+    const m = exports as Partial<MemoryStatsExports>;
+    if (typeof m.setMemoryCounting !== 'function'
+        || typeof m.memoryStats !== 'function'
+        || typeof m.resetMemoryPeak !== 'function') {
+        throw new Error(`${name} has no memory-stats exports — rebuild it with the bench's counter (bench-memory-stats)`);
+    }
+    const { setMemoryCounting, memoryStats, resetMemoryPeak } = m as MemoryStatsExports;
+    return {
+        name,
+        setCounting: (on) => setMemoryCounting(on),
+        stats: () => memoryStats(),
+        resetPeak: () => resetMemoryPeak(),
+        hold: (bytes) => {
+            const ptr = wasm.__wbindgen_malloc(bytes, 8);
+            return () => wasm.__wbindgen_free(ptr, bytes, 8);
+        },
+    };
+}
+
+/** Bytes as MiB, to one decimal. */
+export function mib1(bytes: number): number {
+    return Math.round((bytes / 1048576) * 10) / 10;
+}
+
+/** The self-check every memory run starts with: `read` must rise by the whole
+ *  of a [`SELF_CHECK_BYTES`] block while `hold` holds it. Throws naming the
+ *  counter otherwise; the block is freed either way. */
+export function checkCounter(name: string, read: () => number, hold: (bytes: number) => () => void): void {
+    const before = read();
+    const release = hold(SELF_CHECK_BYTES);
+    try {
+        const rise = read() - before;
+        if (rise < SELF_CHECK_BYTES) {
+            throw new Error(
+                `memory self-check: the ${name} counter rose by ${mib1(rise).toFixed(1)} MiB `
+                + 'while an 8 MiB block was held (want at least 8)');
+        }
+    } finally {
+        release();
+    }
+}
+
+/** One store's two live-byte readings, each taken after settling: `held`
+ *  after the reads, before the dispose, and `disposed` after it. */
+export interface StoreReadings { held: number; disposed: number }
+
+/** One memory run's figures, in MiB: the store built from the triples, the
+ *  store loaded from a file, and the read peak, each null where the run did
+ *  not measure it. */
+export interface JsMemoryRun { storeBuiltMb: number | null; storeLoadedMb: number | null; peakLiveMb: number | null }
+
+/** A memory run's figures from its readings, in live bytes: each store is
+ *  what its dispose released after the reads, and the peak is the highest
+ *  probe total above the baseline. A missing input gives null, and every
+ *  figure is clamped at 0, since allocator noise can make a difference
+ *  negative. */
+export function memoryRunFigures(r: {
+    baseline: number; built: StoreReadings | null; loaded: StoreReadings | null; probeTotals: number[];
+}): JsMemoryRun {
+    const mb = (bytes: number) => mib1(Math.max(0, bytes));
+    const store = (s: StoreReadings | null) => (s ? mb(s.held - s.disposed) : null);
+    return {
+        storeBuiltMb: store(r.built),
+        storeLoadedMb: store(r.loaded),
+        peakLiveMb: r.probeTotals.length > 0 ? mb(Math.max(...r.probeTotals) - r.baseline) : null,
+    };
+}

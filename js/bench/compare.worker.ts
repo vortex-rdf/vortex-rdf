@@ -2,7 +2,8 @@
 // Process-level isolation, not just in-process dispose+gc: a crash in one adapter
 // can't take down the whole run, and each adapter gets a clean, uncontaminated
 // peak-memory reading (see shared.ts's `peakRssMb`) instead of one polluted by
-// whatever every earlier adapter left resident.
+// whatever every earlier adapter left resident. The `memory` role is one of an
+// adapter's memory runs, each in a process of its own too (see runMemory).
 import { Bench, type BenchOptions, type Fn, type FnOptions } from 'tinybench';
 import { writeFileSync } from 'node:fs';
 
@@ -12,14 +13,17 @@ import {
     ADAPTERS, MUT_ADAPTERS, N_TRIPLES, GRAPHS, MUT_BATCH,
     genDataset, flattenTerms, genFresh, genDatasetPrefix, datasetProbes, moduli,
     FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
-    reclaim, collect, timeoutRow, unsupportedRow, peakRssMb,
+    reclaim, collect, timeoutRow, unsupportedRow, peakRssMb, heapUsedBytes, holdJsHeap, settle,
     type Row, type Pat, type StoreAdapter, type WorkerOutput,
 } from './shared.js';
-import { fmtNs, making, makingLast, onFresh } from './util.js';
+import {
+    checkCounter, fmtNs, making, makingLast, memoryRunFigures, onFresh,
+    type JsMemoryRun, type StoreReadings,
+} from './util.js';
 
 const [, , slug, role, outFile] = process.argv;
 if (!slug || !role || !outFile) {
-    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate> <out-file>');
+    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate|memory> <out-file>');
     process.exit(1);
 }
 
@@ -342,6 +346,78 @@ async function runMutate(a: StoreAdapter): Promise<Row[]> {
     return rows;
 }
 
+/** A collected read's result, kept reachable at module scope until the run
+ *  has read the live bytes it holds. */
+let held: unknown = null;
+
+/**
+ * One memory run: the store alone, in a process of its own, run
+ * BENCH_MEMORY_RUNS times per adapter by compare.bench.ts.
+ *
+ * Live bytes are the store module's wasm counter plus the JS heap's
+ * `heapUsed` after a collection; rdf-stores has no wasm module, so the JS heap
+ * alone. Both counters must first see an 8 MiB block held, or the run throws
+ * and the worker exits 1. The store is obtained as `a.obtained` says (built
+ * from the flattened dataset, which is then dropped, or hdt's file loaded),
+ * read once per probe and full scan, the counts recorded, then disposed. Each
+ * reading is taken after `settle()`, so the finalizers a dispose or a read
+ * left behind have run. A built store with a persistent form (Vortex) is then
+ * measured again as `fromBytes` loads it, from the bytes `toBytes()` gave
+ * before the built store was freed, after the same reads.
+ *
+ * - Store: live bytes after the reads minus live bytes after the dispose, so
+ *   it includes the caches the reads filled (Vortex's term cache).
+ * - Peak: per probe, the counter's peak reset, the read, a collection, then
+ *   the counter's peak plus `heapUsed`; the highest above the baseline. A
+ *   collected result (oxigraph) is held until that reading; a streaming
+ *   read's current chunk cannot be seen.
+ */
+async function runMemory(a: StoreAdapter): Promise<JsMemoryRun> {
+    console.log(`[${a.label}] memory…`);
+    const counter = (await a.counter?.()) ?? null;
+    counter?.setCounting(true);
+    if (counter) checkCounter(`${counter.name} wasm`, () => counter.stats().liveBytes, counter.hold);
+    checkCounter('JS heap (heapUsed)', heapUsedBytes, holdJsHeap);
+    const live = () => heapUsedBytes() + (counter?.stats().liveBytes ?? 0);
+    await settle();
+    const baseline = live();
+    let input: Quad[] | null = inputFor(a);
+    let h: unknown = await a.build(input); // built, or hdt's file loaded
+    input = null;
+    await settle();
+    const probeTotals: number[] = [];
+    for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) {
+        await settle();
+        counter?.resetPeak();
+        const read = a.matchHeld ? a.matchHeld(h, p) : { rows: await a.countMatch(h, p), result: null };
+        held = read.result;
+        matched[p.name] = read.rows;
+        probeTotals.push(heapUsedBytes() + (counter?.stats().peakLiveBytes ?? 0));
+        held = null;
+    }
+    await settle();
+    const afterReads = live(); // the store, read after the reads
+    const loads = a.obtained === 'built' && !!a.snapshot && !!a.open; // Vortex
+    let bytes: unknown = loads ? await a.snapshot!(h) : null; // before the free
+    reclaim(a, h);
+    h = null;
+    await settle();
+    const first: StoreReadings = { held: afterReads, disposed: live() };
+    let loaded: StoreReadings | null = a.obtained === 'loaded' ? first : null;
+    if (loads) {
+        let l: unknown = await a.open!(bytes);
+        bytes = null;
+        for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) await a.countMatch(l, p); // the same reads
+        await settle();
+        const lHeld = live();
+        reclaim(a, l);
+        l = null;
+        await settle();
+        loaded = { held: lHeld, disposed: live() };
+    }
+    return memoryRunFigures({ baseline, built: a.obtained === 'built' ? first : null, loaded, probeTotals });
+}
+
 async function main(): Promise<void> {
     const list = role === 'mutate' ? MUT_ADAPTERS : ADAPTERS;
     const a = list.find((x) => x.slug === slug);
@@ -352,16 +428,21 @@ async function main(): Promise<void> {
     // Untimed, before any phase: no timed build pays the module's compile.
     await a.init?.();
 
-    const rows = role === 'query' ? await runQuery(a)
-        : role === 'querycold' ? await runQueryCold(a)
-            : role === 'fullscan' ? await runFullScan(a)
-                : await runMutate(a);
+    // A memory run that fails, its self-check included, throws out of here:
+    // the worker exits 1 with the reason, and writes nothing.
+    const memoryRun = role === 'memory' ? await runMemory(a) : undefined;
+    const rows = role === 'memory' ? []
+        : role === 'query' ? await runQuery(a)
+            : role === 'querycold' ? await runQueryCold(a)
+                : role === 'fullscan' ? await runFullScan(a)
+                    : await runMutate(a);
     const out: WorkerOutput = {
         rows,
         peakRssMb: peakRssMb(),
         matched,
         failures,
         cardinality: role === 'query' ? moduli(N_TRIPLES, { graphs: GRAPHS }) : undefined,
+        memoryRun,
     };
     writeFileSync(outFile, JSON.stringify(out));
 }

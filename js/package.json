@@ -56,7 +56,7 @@
         "test": "vitest run",
         "typecheck": "tsc -p tsconfig.json && tsc -p bench/tsconfig.json",
         "bench": "tsx --expose-gc --max-old-space-size=8192 bench/compare.bench.ts",
-        "bench:build": "npm run build && npm run bench",
+        "bench:build": "npm run build:bench-wasm && npm run bench",
         "bench:codspeed": "node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts",
         "bench:dict-memory": "tsx --expose-gc bench/dict-memory.bench.ts"
     },

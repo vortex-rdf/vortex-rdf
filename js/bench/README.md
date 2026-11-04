@@ -1,6 +1,6 @@
 # JS benchmarks
 
-Three instruments, kept separate because they answer different questions and are trustworthy in different ways. All require `npm run build` first (run from `js/`).
+Three instruments, kept separate because they answer different questions and are trustworthy in different ways. Run them from `js/`. `npm run bench:codspeed` needs `npm run build`. `npm run bench` and `bench:dict-memory` run on `npm run build:bench-wasm`, the bench's own build of the bindings in `pkg/bench`. `npm run bench` also needs `hdt-pkg/` (`npm run build:hdt-wasm`), `oxigraph-pkg/` (`npm run build:oxigraph-wasm`) and the HDT file. `scripts/refresh.sh --only js` builds all of them.
 
 | Command | Question | Output |
 | --- | --- | --- |
@@ -15,13 +15,14 @@ Both JSON files are generated and git-ignored. `scripts/refresh.sh` runs every s
 | File | Role |
 | --- | --- |
 | `compare.bench.ts` | Comparative wall-clock suite (tinybench): the Vortex build variants vs [rdf-stores.js](https://github.com/rubensworks/rdf-stores.js), [oxigraph](https://github.com/oxigraph/oxigraph) (its JS binding, [built from source](./oxigraph-wasm/build.sh)) and this [hdt-wasm](https://github.com/KonradHoeffner/hdt#web-assembly) library ([built locally](./hdt-wasm/Cargo.toml)), over the eight matching patterns (S/P/O/G/SP/PO/SPO/SPOG), the full scan, mutation and serialization. Every quad store is read through RDF/JS `match()`, consumed through its `data` events, except oxigraph, whose `match()` returns an array, and hdt, which reads all matched ids, then their strings window by window. A query run times three builds from the dataset, whose strings are flattened once after generation, and queries the last. Orchestrator only: it spawns one `compare.worker.ts` process per adapter and role and collects the rows into the JSON that `scripts/render_bench_dashboard.py` turns into the dashboard's JavaScript tab. Never uploaded to CodSpeed |
-| `compare.worker.ts` | One adapter's full lifecycle in its own process, so a crash loses only that adapter's rows and its peak RSS is attributable to it alone |
+| `compare.worker.ts` | One adapter's full lifecycle in its own process, so a crash loses only that adapter's rows and its peak RSS is attributable to it alone, and the `memory` role's runs (see [Memory runs](#memory-runs)) |
 | `codspeed.bench.ts` | Library-only instrumented suite, the JS counterpart of `core/benches/benchmark.rs`: layout × secondary index swept across the routing patterns, plus build, read-back and mutation. Runs under the CodSpeed action in instrumentation mode; locally it prints wall-clock numbers. Single process; CodSpeed ids each task as `<file that calls bench.add>::<task name>`, so task names never change and the `bench.add` calls stay in this file |
 | `dict-memory.bench.ts` | Attributes wasm linear memory to the term dictionary. Wasm memory never shrinks, so it measures by differentials — several stores held live at once in one `dict-memory.worker.ts` process per config, memory read after each, slope against store count — and either checks one config against the reference figures in its header or sweeps term cardinality (`DICT_MEM_RATIOS`) to fit the per-term cost |
 | `dict-memory.worker.ts` | One dictionary-memory config in its own process |
 | `datasets.ts` | The synthetic dataset generator (`genDataset`) and probe patterns, pure so the instrumented suite can import it. Term cardinality is an explicit config value: distinct subjects and objects scale with rows, and the Python suite's `bench/datasets.py` is a port with the same moduli and term spellings, so rows on the two dashboard tabs describe the same data |
 | `shared.ts` | Store adapters, the run configuration and the memory readers shared by the comparative and dict-memory instruments |
-| `util.ts` | Pure consume/timing helpers; imports nothing but Node builtins so the CodSpeed suite can load it without a foreign wasm module in the process |
+| `vortex.ts` | The Vortex bindings the comparative and dict-memory workers load: the bench's own build in `pkg/bench` (`npm run build:bench-wasm`, the js crate's `memory-stats` feature), loaded as `entry/node.js` loads `pkg/web`; the published build never carries the counter |
+| `util.ts` | Pure consume/timing helpers, the memory runs' self-check and figures, and the check that the oxigraph build is the version `bench-compare/Cargo.lock` pins (`checkOxigraphVersion`); imports nothing but Node builtins so the CodSpeed suite can load it without a foreign wasm module in the process |
 | `hdt-wasm/` | Wasm build of the `hdt` crate for the comparative suite (`npm run build:hdt-wasm` → `hdt-pkg/`); read-only, over an artifact built natively |
 | `oxigraph-wasm/` | Builds oxigraph's official JS binding from its GitHub source at the version `bench-compare/Cargo.lock` pins, with the bench's live-byte counter patched in (`memory-stats.patch`): `npm run build:oxigraph-wasm` → `oxigraph-pkg/`. The suite stops at start when that build's version is not the pinned one |
 | `memory-stats/` | The bench-only counting global allocator (`bench-memory-stats`): live and peak heap bytes behind `setMemoryCounting`, `memoryStats` and `resetMemoryPeak`. The js crate's `memory-stats` feature installs it; only `pkg/bench` (`npm run build:bench-wasm`) enables that feature, and it is never published. `hdt-wasm/` always links it, and so does the oxigraph build (`oxigraph-wasm/`), through its patch |
@@ -77,10 +78,33 @@ Each adapter process peaks at several GB at the default scale — check availabl
 | `DICT_MEM_DELETES` | 5 | deletes run before re-querying, exercising the dictionary-view rebuild |
 | `DICT_MEM_OUT` | `bench/dict-memory.json` | where the points are written |
 
+## Memory runs
+
+### The JavaScript suite
+
+After the timed roles, `compare.bench.ts` runs each adapter's `memory` role `BENCH_MEMORY_RUNS` times (default 3), each in a `compare.worker.ts` process of its own. A run reads live bytes: the store module's counter (the bench's own Vortex build, `hdt-wasm` and the oxigraph build all link it) plus `heapUsed` after `global.gc()`. rdf-stores has no wasm module, so it has the JS heap only. One run:
+
+- **Self-check:** before anything else, each counter must see an 8 MiB block held, from the module's own allocator for a wasm counter and an array of doubles for the JS heap. A run that fails it exits 1, naming the counter.
+- **The store:** built from the flattened dataset, which is then dropped; hdt is loaded from its HDT file. It is the store the timed cells query, which `obtained` names: `built` for Vortex, rdf-stores and oxigraph, `loaded` for hdt.
+- **The reads:** each probe and the full scan once, read the way the timed cells read them, with their row counts recorded.
+- **Settling:** GC, a 50 ms event-loop turn and GC again, before each store reading and at each probe's start. The turn lets FinalizationRegistry callbacks run: `free()` leaves a Vortex store's term dictionary to one, and every oxigraph quad and term a read returns is freed by one.
+- **Vortex:** after the built store, the run measures the store `fromBytes` loads from its `toBytes()`, taken before the built store was freed, after the same reads.
+
+The figures, in MiB to one decimal, clamped at 0 and `null` where they do not apply:
+
+- **Store, built from the triples** (`storeBuiltMb`: Vortex, rdf-stores and oxigraph) and **Store, loaded from a file** (`storeLoadedMb`: Vortex's `fromBytes`, and hdt): the live bytes after the reads minus the live bytes after the free, both settled. Store therefore includes the term cache the reads filled: Vortex's `LazyDict` keeps each term string a read decoded, in the JS heap, about 629k of them after the full scan at the dashboard's 1,048,576 rows.
+- **Peak: live memory** (`peakLiveMb`): per probe, `resetMemoryPeak()`, the read, GC, then the counter's peak plus `heapUsed`; the highest of these above the baseline, which is read before the store is obtained. oxigraph's `match()` collects its result, which the run holds until that reading. A streaming read's quads are collected by then, so its current chunk's JS objects are not seen.
+- No RSS figure: wasm memory never shrinks, so a freed store's pages stay with the process.
+
+An adapter's runs stop at its first failed worker, which `failures` records, and at its first run whose row counts differ from its own query and full-scan runs': that run is dropped, and the difference is a count warning. Every adapter still gets its entry, with the runs that finished, so its row reads "—" when none did; its `obtained` is then `null`. With `BENCH_MEMORY_RUNS=0` the suite writes no memory entries.
+
 ## Running
 
 ```bash
-npm run build
+npm run build:bench-wasm                    # pkg/bench: the bindings the comparative and dict-memory suites load
+npm run build:hdt-wasm                      # bench/hdt-pkg (the HDT file comes from scripts/refresh.sh --only js)
+npm run build:oxigraph-wasm                 # bench/oxigraph-pkg, at the version bench-compare pins
+npm run build                               # pkg/web: the published build, which the CodSpeed suite loads
 npm run bench                               # full comparative run
 BENCH_DIM=25 MUT_BATCH=2000 npm run bench   # quick local check (25³ rows)
 npm run bench:codspeed                      # instrumented suite, wall-clock locally

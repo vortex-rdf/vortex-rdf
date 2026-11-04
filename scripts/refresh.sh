@@ -161,7 +161,12 @@ if has js; then
   (
     cd js
     [ -d node_modules ] || npm ci
-    build "npm run build" pkg/web/vortex_rdf_bg.wasm "${BINDING_DEPS[@]}"
+    # The bench's own copy of the bindings, built with the js crate's
+    # memory-stats feature into pkg/bench. The published build (pkg/web,
+    # `npm run build`) never carries the counter, and the suite loads only
+    # this copy. js-snippets is compiled in too, but BINDING_DEPS lacks it.
+    build "npm run build:bench-wasm" pkg/bench/vortex_rdf_bg.wasm "${BINDING_DEPS[@]}" js-snippets \
+      bench/memory-stats/src bench/memory-stats/Cargo.toml
     build "npm run build:hdt-wasm" bench/hdt-pkg/hdt_wasm_bench_bg.wasm \
       bench/hdt-wasm/src bench/hdt-wasm/Cargo.toml bench/hdt-wasm/Cargo.lock \
       bench/memory-stats/src bench/memory-stats/Cargo.toml \

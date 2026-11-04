@@ -101,7 +101,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           # Restored, never saved here: ci.yml's js-tests keeps this entry,
-          # and builds the same wasm32 release (`npm run build`).
+          # and builds the same wasm32 release (`npm run build`; this job's
+          # build adds the js crate's memory-stats feature).
           shared-key: wasm
           save-if: false
 
@@ -112,11 +113,11 @@ jobs:
           cache: npm
           cache-dependency-path: js/package-lock.json
 
-      - name: Cache wasm bindings
+      - name: Cache the bench's wasm bindings
         uses: actions/cache@v6
         with:
-          path: js/pkg/web
-          key: wasm-pkg-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'js/src/**', 'js/Cargo.toml', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
+          path: js/pkg/bench
+          key: wasm-bench-pkg-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'js/src/**', 'js/Cargo.toml', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml', 'js/js-snippets/**', 'js/bench/memory-stats/src/**', 'js/bench/memory-stats/Cargo.toml') }}
 
       - name: Cache hdt wasm wrapper
         uses: actions/cache@v6

@@ -21,8 +21,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
-import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
-import { fmtNs, consumeQuads, consumeStream, consumeStrings } from './util.js';
+import { VortexRdfStore, vortexCounter, vortexWasm, type BuildOptions } from './vortex.js';
+import {
+    fmtNs, consumeQuads, consumeStream, consumeStrings, wasmCounter,
+    type JsMemoryRun, type WasmCounter,
+} from './util.js';
 import { df, moduli, type Pat } from './datasets.js';
 import {
     RdfStore,
@@ -59,12 +62,30 @@ export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete 
 // instrumented CodSpeed suite can import it too — and is re-exported above.
 
 // ─── Adapter interface ───────────────────────────────────────────────────────
+
+/** How a store is obtained, the vocabulary every tab's memory entries share:
+ *  mapped from a file, loaded from a file into memory, built from the triples,
+ *  or opened from an on-disk database. */
+export type Obtained = 'mapped' | 'loaded' | 'built' | 'opened';
+
 export interface StoreAdapter<H = unknown> {
     slug: string; // dashboard id segment
     label: string; // display name
+    /** How `build` obtains the store the timed cells and the memory runs'
+     *  peak use. */
+    obtained: Obtained;
     /** Load the library's wasm module, untimed; the worker calls it before
      *  any phase, so no timed build pays its compile. */
     init?(): Promise<void>;
+    /** The live-byte counter of the library's wasm module, which the memory
+     *  runs read beside the JS heap. Absent for a pure-JS library, whose
+     *  memory is all JS heap. */
+    counter?(): Promise<WasmCounter>;
+    /** A read that collects its whole result (oxigraph's `match()` returns an
+     *  array): the rows it matched, and the result itself, which the memory
+     *  run keeps reachable until it has read the live bytes. A streaming
+     *  read's `countMatch` keeps nothing past its end. */
+    matchHeld?(h: H, p: Pat): { rows: number; result: unknown };
     build(quads: Quad[]): Promise<H> | H; // ingest (idiomatic bulk API per lib)
     newEmpty(): Promise<H> | H; // empty store (add phase)
     addAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad add loop
@@ -145,6 +166,8 @@ export function vortexAdapter(variant: { slug: string; label: string; options: B
     return {
         slug: variant.slug,
         label: variant.label,
+        obtained: 'built',
+        counter: async () => vortexCounter(),
         build: (quads) => VortexRdfStore.fromQuads(quads, variant.options),
         newEmpty: () => VortexRdfStore.empty(),
         addAll: async (h, quads) => { for (const q of quads) await h.addQuad(q); },
@@ -179,6 +202,8 @@ export function rdfStoresAdapter(kind: 'default' | 'single', label: string): Sto
     return {
         slug: kind === 'default' ? 'rdfstores_default' : 'rdfstores_single',
         label,
+        // No counter: a pure-JS store's memory is all JS heap.
+        obtained: 'built',
         build: (quads) => { const s = newRdfStore(kind); for (const q of quads) s.addQuad(q); return s; },
         newEmpty: () => newRdfStore(kind),
         addAll: (h, quads) => { for (const q of quads) h.addQuad(q); },
@@ -228,12 +253,21 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
     return {
         slug: 'oxigraph',
         label: 'oxigraph',
+        obtained: 'built',
         init: async () => { await loadOxigraph(); },
+        counter: async () => {
+            const { mod, wasm } = await loadOxigraph();
+            return wasmCounter('oxigraph', mod, wasm);
+        },
         build: (quads) => newOxiStore(quads), // bulk via constructor
         newEmpty: () => newOxiStore(),
         addAll: (h, quads) => { for (const q of quads) h.add(q as never); },
         deleteAll: (h, quads) => { for (const q of quads) h.delete(q as never); },
         countMatch: (h, p) => consumeQuads(h.match(p.s as never, p.p as never, p.o as never, p.g as never)),
+        matchHeld: (h, p) => {
+            const result = h.match(p.s as never, p.p as never, p.o as never, p.g as never);
+            return { rows: consumeQuads(result), result };
+        },
         // No count API: match() materializes its result array either way, so
         // walking its length is this store's floor for a count.
         countOnly: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
@@ -256,19 +290,23 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
 export const HDT_FILE = process.env.HDT_FILE
     ?? resolve(here, '../../target/bench_js/data.hdt');
 
-type HdtModule = typeof import('./hdt-pkg/hdt_wasm_bench.js');
+type HdtWasm = {
+    mod: typeof import('./hdt-pkg/hdt_wasm_bench.js');
+    wasm: import('./hdt-pkg/hdt_wasm_bench.js').InitOutput;
+};
 type Hdt = import('./hdt-pkg/hdt_wasm_bench.js').Hdt;
-let hdtModule: HdtModule | null = null;
-async function hdtMod(): Promise<HdtModule> {
-    if (!hdtModule) {
+let hdtLoaded: HdtWasm | null = null;
+/** hdt-wasm's module and the exports of its wasm instance, loaded once. */
+async function hdtMod(): Promise<HdtWasm> {
+    if (!hdtLoaded) {
         // Same init path as entry/node.js: hand `init` the wasm bytes directly,
         // because Node's fetch does not speak file: URLs.
         const mod = await import('./hdt-pkg/hdt_wasm_bench.js');
         const wasmPath = resolve(here, 'hdt-pkg/hdt_wasm_bench_bg.wasm');
-        await mod.default({ module_or_path: readFileSync(wasmPath) });
-        hdtModule = mod;
+        const wasm = await mod.default({ module_or_path: readFileSync(wasmPath) });
+        hdtLoaded = { mod, wasm };
     }
-    return hdtModule;
+    return hdtLoaded;
 }
 
 /** A probe term in HDT dictionary spelling: IRIs bare, literals with their
@@ -294,6 +332,11 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
         // Not "(file)": the wasm bindings parse the artifact's bytes into wasm
         // linear memory, so this store answers from memory like the others.
         label: 'hdt',
+        obtained: 'loaded',
+        counter: async () => {
+            const { mod, wasm } = await hdtMod();
+            return wasmCounter('hdt-wasm', mod, wasm);
+        },
         ingestUnsupported:
             'the wasm bindings are read-only — the artifact is built natively '
             + '(by the hdt crate\'s own CLI) and only opened here',
@@ -309,7 +352,7 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
                     `no HDT artifact at ${HDT_FILE} — scripts/refresh.sh --only js builds it, `
                     + 'or point HDT_FILE at one');
             }
-            const mod = await hdtMod();
+            const { mod } = await hdtMod();
             const h = new mod.Hdt(readFileSync(HDT_FILE));
             const n = hdtNumTriples(h);
             if (n !== quads.length) {
@@ -340,7 +383,7 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
         // bytes, open parses them — the same reopen the other tabs measure.
         snapshot: async () => readFileSync(HDT_FILE),
         open: async (bytes) => {
-            const mod = await hdtMod();
+            const { mod } = await hdtMod();
             return new mod.Hdt(bytes as Uint8Array);
         },
         dispose: (h) => h.free(),
@@ -398,6 +441,8 @@ export interface WorkerOutput {
     matched: Record<string, number>;
     failures: { phase: string; error: string }[];
     cardinality?: ReturnType<typeof moduli>;
+    /** The `memory` role's figures. */
+    memoryRun?: JsMemoryRun;
 }
 
 /** What dict-memory.worker.ts writes for one cardinality point, and what
@@ -528,18 +573,40 @@ export function jsHeapMb(): number {
     return Math.round(process.memoryUsage().heapUsed / 1048576);
 }
 
-/** Vortex's wasm linear memory, in MB.
- *
- * `__wbg_init` short-circuits and returns the exports when the module is already
- * initialized (`entry/node.js` does that at import time), so re-invoking it is
- * just how one gets at the namespace. Linear memory only ever grows, so this is
+/** Vortex's wasm linear memory, in MB: the bench build's, which ./vortex.ts
+ * initialized at import. Linear memory only ever grows, so this is
  * simultaneously the current and the peak figure. */
-export async function wasmHeapMb(): Promise<number | null> {
-    try {
-        const mod = await import('../pkg/web/vortex_rdf.js');
-        const wasm = await mod.default();
-        return Math.round((wasm as { memory: WebAssembly.Memory }).memory.buffer.byteLength / 1048576);
-    } catch {
-        return null;
-    }
+export async function wasmHeapMb(): Promise<number> {
+    return Math.round(vortexWasm.memory.buffer.byteLength / 1048576);
+}
+
+// ─── Memory runs: the JS heap ────────────────────────────────────────────────
+//
+// The memory role reads live bytes: a store's wasm counter (WasmCounter in
+// util.ts) plus the JS heap's. These need `--expose-gc`, which every worker
+// spawn passes, and fail loudly without it.
+
+/** The JS heap's live bytes: `heapUsed`, after a full collection. */
+export function heapUsedBytes(): number {
+    global.gc!();
+    return process.memoryUsage().heapUsed;
+}
+
+/** Hold at least `bytes` of JS heap until the returned function is called:
+ *  an array of doubles 64 KiB larger than `bytes`, so the readings' own
+ *  garbage cannot pull the rise below `bytes`. Not a typed array, whose
+ *  memory is external, outside `heapUsed`. */
+export function holdJsHeap(bytes: number): () => void {
+    let block: number[] | null = new Array(Math.ceil(bytes / 8) + 8192).fill(0.5);
+    return () => { block = null; };
+}
+
+/** Let the process settle before a reading: collect, give the event loop a
+ *  50 ms turn so FinalizationRegistry callbacks run (a freed Vortex store's
+ *  term dictionary is released by one, and so is each oxigraph quad or term
+ *  a read left unfreed), then collect what they released. */
+export async function settle(): Promise<void> {
+    global.gc!();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    global.gc!();
 }
