@@ -87,14 +87,14 @@ After the timed runs, each suite makes `BENCH_MEMORY_RUNS` memory runs per adapt
 
 1. checks its counters: it holds an 8 MiB block and requires each counter to see it, so a counter that misses memory fails the run instead of reporting 0. Java's native counter must see at least 7 MiB of the block, since the JVM's own threads allocate natively during the check; every other counter sees all 8 MiB. A run that fails the check exits non-zero, naming the counter;
 2. takes a baseline before the store exists;
-3. obtains the store the way the timed queries use it, which the entry's `obtained` records: `mapped` (memory-mapped from its file), `loaded` (read from a file into memory), `built` (from the triples) or `opened` (an on-disk database);
-4. reads every probe pattern the adapter answers, the full scan included, once;
-5. reads its figures, disposes the store (the JS suite says "frees"), and reads them again.
+3. obtains the store the way the timed queries use it, which the entry's `obtained` records: `mapped` (memory-mapped from its file), `loaded` (read from a file into memory), `built` (from the triples) or `opened` (an on-disk database), reads its live bytes, disposes of it before any read (the JS suite says "frees"), and reads them again. That gives Store;
+4. obtains the store again, the same way, and reads every probe pattern the adapter answers, the full scan included, once;
+5. disposes of it.
 
 The figures are in MiB to one decimal, clamped at 0, and `null` where one does not apply:
 
-- **Store:** the live bytes after the reads minus those after the dispose. It is read after the reads, so it includes the caches they filled, which can be large for a store that caches decoded terms (the JS Vortex store, described below, is an example). The suites' own sections give the figures.
-- **Peaks:** the highest memory reached during the reads, above the baseline. Rust, Python and Java sample `/proc/self/status` every 2 ms and report `RssAnon` (process memory) and `RssFile` (mapped pages) at the sample with the highest sum; JS reports the peak of its live bytes. Mapped pages include the program's own code pages that the open and the reads first touch, a few MB to a few tens of MB by library, and the same for a library's file and in-memory rows. A store held in memory therefore reads that much there, not 0, and the gap between a pair's rows is the file's own pages.
+- **Store:** the live bytes right after the store is obtained minus those after its dispose, on a store no read has touched, so it leaves out the caches reads fill. The reads then run on a second store, obtained the same way. The suites' own sections give the figures.
+- **Peaks:** the highest memory reached during the reads, above the baseline taken before the first open. Rust, Python and Java sample `/proc/self/status` every 2 ms and report `RssAnon` (process memory) and `RssFile` (mapped pages) at the sample with the highest sum; JS reports the peak of its live bytes. Mapped pages include the program's own code pages that the open and the reads first touch, a few MB to a few tens of MB by library, and the same for a library's file and in-memory rows. A store held in memory therefore reads that much there, not 0, and the gap between a pair's rows is the file's own pages.
 
 With `BENCH_MEMORY_RUNS=0` no suite writes memory entries, and the page shows the old table of query peaks. With 1 or more, every adapter gets an entry even if all its runs fail, and its row then reads "—".
 

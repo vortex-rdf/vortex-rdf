@@ -53,6 +53,15 @@ pub fn keep_peak(peak: Rss, sample: Rss) -> Rss {
     }
 }
 
+/// What opening a store holds, on a store no read has touched: `live()` right after
+/// `open()`, minus `live()` once the handle is dropped.
+pub fn opened_store_bytes<H>(open: impl FnOnce() -> H, live: impl Fn() -> i64) -> i64 {
+    let handle = open();
+    let held = live();
+    drop(handle);
+    held - live()
+}
+
 pub const SAMPLE_EVERY: Duration = Duration::from_millis(2);
 
 /// A thread sampling `/proc/self/status` every [`SAMPLE_EVERY`].

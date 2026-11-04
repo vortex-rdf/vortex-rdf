@@ -23,13 +23,15 @@
 //! `0` for none) memory children of that adapter, each a process of its own
 //! (`--adapter <slug> --role memory`). A child opens its store the way
 //! `Adapter::obtained` says (mapped, loaded, built or opened), from the artifact or
-//! source the query child used, reads each probe the adapter answers once with the
-//! consuming read under a sampler of `/proc/self/status` every 2 ms, then
-//! disposes of the store. Store is the live
-//! bytes (the counting allocator, plus glibc's `mallinfo2` for C and C++
-//! allocations) after the reads minus those after the dispose, so it includes the
-//! caches the reads filled. The two peaks are the sample with the highest
-//! `RssAnon + RssFile`, less the baseline taken before the open. Mapped pages
+//! source the query child used, and disposes of it before any read.
+//! **Store:** the live bytes (the counting allocator, plus glibc's `mallinfo2` for
+//! C and C++ allocations) right after the store is obtained minus those after its
+//! dispose, on a store no read has touched, so it leaves out the caches reads fill.
+//! The reads then run on a second store, obtained the same way: each probe the
+//! adapter answers is read once with the consuming read under a sampler of
+//! `/proc/self/status` every 2 ms, and the store is disposed of again. The two
+//! peaks are the sample with the highest `RssAnon + RssFile` during the reads,
+//! above the baseline taken before the first open. Mapped pages
 //! include the program's own code pages that the open and the reads first touch,
 //! a few MB to a few tens of MB, depending on the library; the Vortex rows read
 //! about 7 to 8 MB of them. An in-memory store reads that much of file peak, and
@@ -75,7 +77,7 @@ use runtime::rt;
 
 #[path = "support/memory.rs"]
 mod memory;
-use memory::{MemoryRun, Obtained, Sampler, memory_entry, mib, read_rss};
+use memory::{MemoryRun, Obtained, Sampler, memory_entry, mib, opened_store_bytes, read_rss};
 
 // ─── Scale ──────────────────────────────────────────────────────────────────
 
@@ -1675,6 +1677,9 @@ fn run_memory(a: &dyn Adapter, n: usize) -> MemoryOut {
 
     let base_live = process_live_bytes();
     let base_rss = read_rss();
+    // Store: a store of its own, opened and disposed before any read.
+    let store_bytes = opened_store_bytes(|| a.open(&run), process_live_bytes);
+    // The reads run on a second open of the same store.
     let handle = a.open(&run);
     let sampler = Sampler::start();
     let mut counts = BTreeMap::new();
@@ -1686,10 +1691,9 @@ fn run_memory(a: &dyn Adapter, n: usize) -> MemoryOut {
     }
     let peak = sampler.finish();
 
-    let before = process_live_bytes();
     drop(handle);
     let after = process_live_bytes();
-    let run = MemoryRun::new(before - after, base_rss, peak);
+    let run = MemoryRun::new(store_bytes, base_rss, peak);
     eprintln!(
         "  [{}] memory: store {} MB, peak +{} MB anon, +{} MB file, {} MB left live",
         a.label(),

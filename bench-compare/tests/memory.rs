@@ -2,7 +2,8 @@
 mod memory;
 
 use memory::{
-    MemoryRun, Obtained, Rss, Sampler, keep_peak, memory_entry, mib, parse_rss, read_rss,
+    MemoryRun, Obtained, Rss, Sampler, keep_peak, memory_entry, mib, opened_store_bytes, parse_rss,
+    read_rss,
 };
 use serde_json::{Value, json, to_value};
 
@@ -97,4 +98,22 @@ fn sampler_sees_a_block_held_when_it_finishes() {
         peak.anon_kb - base.anon_kb >= 48 << 10,
         "{base:?} -> {peak:?}"
     );
+}
+
+/// An open holding 5 bytes until its handle drops, and leaving 2 that nothing frees.
+#[test]
+fn opened_store_bytes_is_what_the_open_holds_until_the_drop() {
+    let live = std::cell::Cell::new(100_i64);
+    struct Held<'a>(&'a std::cell::Cell<i64>);
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 5)
+        }
+    }
+    let open = || {
+        live.set(live.get() + 7);
+        Held(&live)
+    };
+    assert_eq!(opened_store_bytes(open, || live.get()), 5);
+    assert_eq!(live.get(), 102);
 }
