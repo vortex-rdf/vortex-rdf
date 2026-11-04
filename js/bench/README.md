@@ -23,6 +23,7 @@ Both JSON files are generated and git-ignored. `scripts/refresh.sh` runs every s
 | `shared.ts` | Store adapters, the run configuration and the memory readers shared by the comparative and dict-memory instruments |
 | `util.ts` | Pure consume/timing helpers; imports nothing but Node builtins so the CodSpeed suite can load it without a foreign wasm module in the process |
 | `hdt-wasm/` | Wasm build of the `hdt` crate for the comparative suite (`npm run build:hdt-wasm` → `hdt-pkg/`); read-only, over an artifact built natively |
+| `memory-stats/` | The bench-only counting global allocator (`bench-memory-stats`): live and peak heap bytes behind `setMemoryCounting`, `memoryStats` and `resetMemoryPeak`. The js crate's `memory-stats` feature installs it; only `pkg/bench` (`npm run build:bench-wasm`) and the oxigraph build enable that feature, and it is never published. `hdt-wasm/` always links it |
 
 ## Environment variables
 

@@ -43,6 +43,8 @@
     "scripts": {
         "build:wasm": "wasm-pack build --target web --out-dir pkg/web --no-pack",
         "build:wasm:fast": "wasm-pack build --target web --out-dir pkg/web --no-pack --no-opt",
+        "build:bench-wasm": "node -e \"require('fs').rmSync('pkg/bench',{recursive:true,force:true})\" && wasm-pack build --target web --out-dir pkg/bench --no-pack -- --features memory-stats && node -e \"const fs=require('fs');for (const f of ['pkg/bench/package.json','pkg/bench/.gitignore']) fs.rmSync(f,{force:true})\"",
+        "build:bench-wasm:fast": "node -e \"require('fs').rmSync('pkg/bench',{recursive:true,force:true})\" && wasm-pack build --target web --out-dir pkg/bench --no-pack --no-opt -- --features memory-stats && node -e \"const fs=require('fs');for (const f of ['pkg/bench/package.json','pkg/bench/.gitignore']) fs.rmSync(f,{force:true})\"",
         "build:hdt-wasm": "wasm-pack build bench/hdt-wasm --target web --out-dir ../hdt-pkg --no-pack && npm run build:hdt-clean-generated",
         "build:hdt-clean-generated": "node -e \"require('fs').rmSync('bench/hdt-pkg/.gitignore',{force:true})\"",
         "build:reset": "node -e \"require('fs').rmSync('pkg/web',{recursive:true,force:true})\"",

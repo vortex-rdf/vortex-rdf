@@ -76,3 +76,10 @@ pub(crate) fn resolve_now<T>(
         .ok_or_else(|| error::js_err("read suspended: no wasm read path performs I/O"))?
         .map_err(error::js_err)
 }
+
+/// Bench builds only: counts live heap bytes for the dashboard's memory panels
+/// (see `js/bench/memory-stats`). Absent from the published package.
+#[cfg(all(feature = "memory-stats", target_arch = "wasm32"))]
+#[global_allocator]
+static ALLOCATOR: bench_memory_stats::CountingAlloc<std::alloc::System> =
+    bench_memory_stats::CountingAlloc(std::alloc::System);

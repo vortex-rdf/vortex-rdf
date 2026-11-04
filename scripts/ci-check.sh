@@ -104,6 +104,8 @@ job_lint() {
   # that feature), which the native run cannot see.
   if have_wasm32_target; then
     run cargo clippy -p vortex-rdf --target wasm32-unknown-unknown --all-targets -- -D warnings
+    # The bench build's configuration: the counting allocator and its exports.
+    run cargo clippy -p vortex-rdf -p bench-memory-stats --target wasm32-unknown-unknown --all-targets --features vortex-rdf/memory-stats -- -D warnings
   else
     skip_step "the wasm32 clippy" "no wasm32-unknown-unknown target" \
       "rustup target add wasm32-unknown-unknown"
