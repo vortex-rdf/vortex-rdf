@@ -159,10 +159,6 @@ impl NumOp {
             NumOp::Ne => ord != Ordering::Equal,
         })
     }
-
-    fn is_equality(self) -> bool {
-        matches!(self, NumOp::Eq | NumOp::Ne)
-    }
 }
 
 /// A single-variable term predicate, parsed from `(kind, arg)` and, for the
@@ -190,10 +186,11 @@ pub enum TermPredicate {
     LangMatches(String),
     /// `?x <op> <numeric constant>` under SPARQL 1.1's operator mapping:
     /// XPath's numeric comparison of a number, after its type promotion (an
-    /// `xsd:float` is single precision); a type error, so false, for an
-    /// ordering of a term without a numeric value; term (in)equality for an
-    /// IRI or a blank node. Undecided wherever an engine may part from the
-    /// spec, and for `=` and `!=` on a literal without a numeric value.
+    /// `xsd:float` is single precision); false for an ordering of, or `=`
+    /// with, a term without a numeric value (a type error); term inequality
+    /// for `!=` with an IRI or a blank node. Undecided wherever an engine
+    /// may part from the spec, and for `!=` on a literal without a numeric
+    /// value.
     Num(NumOp, Number),
     /// A string kind: `str_prefix`, `contains`, `strstarts`, `strends`
     /// (and `regex`), read on the term's text under the [`TextOptions`] it

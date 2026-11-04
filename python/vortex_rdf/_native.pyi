@@ -133,9 +133,10 @@ class TermDict:
         double, and a float meets a double as a double. Ordering a literal
         without a numeric value (a string, a language-tagged literal,
         another datatype, or a lexical form its numeric datatype's grammar
-        rejects) is a type error, so it fails; ``num_eq`` and ``num_ne``
-        leave such a literal undecided. A non-literal fails every numeric
-        kind but ``num_ne``, which it passes.
+        rejects) is a type error, so it fails, and so does ``num_eq``,
+        which Oxigraph answers false; ``num_ne`` leaves such a literal
+        undecided, where Oxigraph answers true. A non-literal fails every
+        numeric kind but ``num_ne``, which it passes.
 
         A value an engine may hold apart from the spec is undecided under
         every numeric kind: one outside its integer type's range, an integer

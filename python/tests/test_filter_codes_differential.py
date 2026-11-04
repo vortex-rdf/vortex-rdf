@@ -483,19 +483,23 @@ def test_lang_matches_ranges_outside_the_basic_alphabet_are_undecided(corpus, ra
 @pytest.mark.parametrize("arg", NUMERIC_CONSTANTS)
 def test_numeric_kinds_agree_with_oxigraph(corpus, kind, arg):
     """Every verdict agrees with Oxigraph's. The numbers the spec and
-    Oxigraph promote alike are decided, and so is every ordering of a literal
-    without a numeric value, which SPARQL makes a type error, so the
-    comparison is not vacuous."""
+    Oxigraph promote alike are decided, and so is every comparison of a
+    literal without a numeric value but `!=`: an ordering or `=` fails (a
+    type error for SPARQL), while `!=` is undecided (Oxigraph answers true
+    where the spec errs). So the comparison is not vacuous."""
     passed, undecided = compare(corpus, kind, arg)
     for spelling in ALWAYS_DECIDED:
         assert corpus.spellings.index(spelling) not in undecided, f"{kind} {arg!r}: undecided on {spelling}"
-    if kind in ("num_lt", "num_le", "num_gt", "num_ge"):
-        no_value = {
-            code
-            for code, spelling, term in zip(corpus.codes, corpus.spellings, corpus.terms, strict=True)
-            if has_no_numeric_value(spelling, term)
-        }
-        assert len(no_value) > 50 and not no_value & (passed | undecided), (
+    no_value = {
+        code
+        for code, spelling, term in zip(corpus.codes, corpus.spellings, corpus.terms, strict=True)
+        if has_no_numeric_value(spelling, term)
+    }
+    assert len(no_value) > 50
+    if kind == "num_ne":
+        assert no_value <= undecided, f"{kind} {arg!r}: decided {sorted(no_value - undecided)[:5]}"
+    else:
+        assert not no_value & (passed | undecided), (
             f"{kind} {arg!r}: passed or undecided {sorted(no_value & (passed | undecided))[:5]}"
         )
 
@@ -543,12 +547,12 @@ WIDE_CONSTANTS = [f'"9223372036854775808"^^<{XSD}integer>', "9999999999999999999
 @pytest.mark.parametrize("arg", WIDE_CONSTANTS)
 def test_a_constant_past_the_decided_range_leaves_numbers_undecided(corpus, kind, arg):
     """Such a constant leaves every literal of a numeric datatype that has a
-    value undecided, while an ordering of a literal without a numeric value is
-    still a type error."""
+    value undecided, while a literal without a numeric value still fails
+    every kind but `num_ne`."""
     passed, undecided = compare(corpus, kind, arg)
     for spelling in ALWAYS_DECIDED:
         assert corpus.spellings.index(spelling) in undecided, f"{kind} {arg!r}: decided {spelling}"
-    if kind not in ("num_eq", "num_ne"):
+    if kind != "num_ne":
         assert corpus.spellings.index('"abc"') not in passed | undecided
 
 

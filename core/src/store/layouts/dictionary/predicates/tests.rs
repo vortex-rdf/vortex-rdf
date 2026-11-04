@@ -292,9 +292,12 @@ fn non_literals_and_other_datatypes() {
     assert_eq!(p("num_lt", "5").eval("\"abc\"@en"), Verdict::False);
     let u = typed("5", "http://www.w3.org/2001/XMLSchema#unsignedInt");
     assert_eq!(p("num_lt", &u).eval("\"abc\""), Verdict::False);
-    // Equality against a plain non-numeric literal, and inequality
-    // against a plain or a language-tagged one, are left to the engine.
-    assert_eq!(p("num_eq", "5").eval("\"abc\""), Verdict::Unknown);
+    // Equality with a literal without a numeric value fails (a type error
+    // for the spec, false for Oxigraph); inequality is left to the engine,
+    // where the spec and Oxigraph part.
+    assert_eq!(p("num_eq", "5").eval("\"abc\""), Verdict::False);
+    assert_eq!(p("num_eq", "5").eval("\"abc\"@en"), Verdict::False);
+    assert_eq!(p("num_eq", "5").eval(&typed("abc", INT)), Verdict::False);
     assert_eq!(p("num_ne", "5").eval("\"abc\""), Verdict::Unknown);
     assert_eq!(p("num_ne", "5").eval("\"abc\"@en"), Verdict::Unknown);
     // The default graph's empty spelling is no term the predicates speak of.
@@ -625,10 +628,15 @@ fn lexical_forms_are_read_unescaped() {
         p("num_eq", "5").eval("\"\\u0035\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
         Verdict::True
     );
-    assert_eq!(
-        p("num_lt", "5").eval("\"\\q\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
-        Verdict::Unknown
-    );
+    // A malformed escape leaves the lexical form unread: undecided, which
+    // `=` does not turn into a failure.
+    for kind in ["num_lt", "num_eq"] {
+        assert_eq!(
+            p(kind, "5").eval("\"\\q\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            Verdict::Unknown,
+            "{kind}"
+        );
+    }
     // A datatype IRI spelled with escapes, which only a foreign writer's
     // file holds, may name a numeric datatype once decoded: it is no type
     // error then, so the numeric kinds leave it undecided.

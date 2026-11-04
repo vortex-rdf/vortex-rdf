@@ -7,8 +7,9 @@
 //!
 //! A literal's lexical form is read into the model ([`parse_number`]) and
 //! classified ([`Operand`]): a number the model decides, no numeric value
-//! at all (ordering it against a number is a type error), or a value an
-//! engine may hold apart from the spec, which the caller's engine decides.
+//! at all (ordering it against a number, or testing the two with `=`,
+//! fails), or a value an engine may hold apart from the spec, which the
+//! caller's engine decides.
 //! A definite verdict is one the spec gives and Oxigraph, which passes the
 //! W3C SPARQL test suite, gives too; where they can part, the verdict is
 //! `Unknown`. [`Number`] is a predicate's parsed constant.
@@ -401,7 +402,8 @@ enum Operand {
     /// No numeric value: a literal of a non-numeric datatype (a string, a
     /// language-tagged literal, a boolean, a datatype outside XSD), or one
     /// whose lexical form its numeric datatype's grammar rejects. Ordering
-    /// it against a number is a type error.
+    /// it against a number is a type error, and so is testing it with `=`,
+    /// which Oxigraph answers false: both fail.
     NoValue,
     /// A value an engine may hold apart from the spec or the model cannot
     /// hold ([`Parsed::Unheld`], past [`Num::decided`]), a lexical form
@@ -490,15 +492,14 @@ impl Number {
                 Some([p, q]) if op.apply(p) == op.apply(q) => op.apply(p),
                 _ => Verdict::Unknown,
             },
-            // `=` and `!=` fall back to RDF term equality, which the spec
-            // makes a type error between two literals that are not the same
-            // term, and which an extended engine may answer instead (§17.3.1
-            // lets it replace a type error with a value). Oxigraph does for
-            // datatypes it knows: the terms differ, so `!=` holds there. The
-            // engine decides.
-            Operand::NoValue if op.is_equality() => Verdict::Unknown,
-            // No operator orders a number against a non-number: a type
-            // error.
+            // `!=` falls back to RDF term inequality, which the spec makes a
+            // type error between two literals that are not the same term,
+            // while Oxigraph, knowing both datatypes, answers that the terms
+            // differ: the engine decides.
+            Operand::NoValue if matches!(op, NumOp::Ne) => Verdict::Unknown,
+            // No operator orders a number against a non-number, and `=`'s
+            // term equality is a type error for the spec and false or an
+            // error for Oxigraph: false either way.
             Operand::NoValue => Verdict::False,
             Operand::Undecided => Verdict::Unknown,
         }

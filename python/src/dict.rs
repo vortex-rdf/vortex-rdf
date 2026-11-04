@@ -197,8 +197,8 @@ impl TermDict {
     /// undecided. The numeric kinds (`num_lt` … `num_ne`) follow SPARQL 1.1:
     /// a number compares by value after XPath's type promotion (an
     /// `xsd:float` is single precision), ordering a literal without a
-    /// numeric value is a type error, and a value an engine may hold apart
-    /// from the spec is undecided. An unknown kind or an invalid argument or
+    /// numeric value or testing it with `num_eq` fails, and a value an
+    /// engine may hold apart from the spec is undecided. An unknown kind or an invalid argument or
     /// option raises `ValueError`.
     #[pyo3(signature = (kind, arg, codes, *, flags = "", case = None, as_str = false))]
     // The parameters are the Python signature.

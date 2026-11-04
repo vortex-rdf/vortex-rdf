@@ -446,10 +446,11 @@ fn promotion_is_decided_where_engines_round_alike() {
 /// literal without a numeric value (a string, a language-tagged literal,
 /// another datatype, a lexical form its numeric datatype's grammar rejects)
 /// is a type error, which a FILTER treats as false, whatever the constant.
-/// Equality and inequality stay the engine's: it may answer a type error,
-/// or compare the terms.
+/// `=` falls back to RDF term equality, a type error too for the spec and
+/// false or an error for Oxigraph: false either way. `!=` is the engine's:
+/// the spec makes it a type error, Oxigraph answers that the terms differ.
 #[test]
-fn orderings_without_a_numeric_value_are_type_errors() {
+fn a_literal_without_a_numeric_value_fails_orderings_and_equality() {
     let no_value = [
         "\"abc\"".to_owned(),
         "\"5\"".into(),
@@ -478,21 +479,22 @@ fn orderings_without_a_numeric_value_are_type_errors() {
         typed("INF5", "double"),
         typed("", "float"),
     ];
+    // Constants of every model, and one past the decided range.
     let constants = [
         "5".to_owned(),
         "1.5".into(),
         "1e3".into(),
         typed("0.1", "float"),
         typed("7", "byte"),
+        "99999999999999999999".into(),
     ];
     for spelling in &no_value {
-        for kind in ["num_lt", "num_le", "num_gt", "num_ge"] {
-            for arg in &constants {
+        for arg in &constants {
+            for kind in ["num_lt", "num_le", "num_gt", "num_ge", "num_eq"] {
                 check(spelling, kind, arg, Definite(false));
             }
+            check(spelling, "num_ne", arg, Deferred);
         }
-        check(spelling, "num_eq", "5", Deferred);
-        check(spelling, "num_ne", "5", Deferred);
     }
 }
 
@@ -624,8 +626,8 @@ fn values_an_engine_may_hold_apart_are_undecided() {
 }
 
 /// Equality and inequality: value equality for numbers, after the same
-/// promotion; term (in)equality for non-literals; the engine's call for a
-/// literal without a numeric value.
+/// promotion; term (in)equality for non-literals; for a literal without a
+/// numeric value, `=` fails and `!=` is the engine's call.
 #[test]
 fn num_eq_and_ne() {
     check(&typed("5", "integer"), "num_eq", "5", Definite(true));
@@ -639,11 +641,11 @@ fn num_eq_and_ne() {
     check(&typed("5", "decimal"), "num_eq", "1e1", Definite(false));
     check(&typed("1.5", "decimal"), "num_eq", "1e1", Definite(false));
     check(&typed("NaN", "double"), "num_eq", "5", Deferred);
-    check(&typed("abc", "integer"), "num_eq", "5", Deferred);
-    check(&typed("1.5", "integer"), "num_eq", "5", Deferred);
-    check("\"5\"", "num_eq", "5", Deferred);
-    check("\"5\"@en", "num_eq", "5", Deferred);
-    check(&typed("true", "boolean"), "num_eq", "5", Deferred);
+    check(&typed("abc", "integer"), "num_eq", "5", Definite(false));
+    check(&typed("1.5", "integer"), "num_eq", "5", Definite(false));
+    check("\"5\"", "num_eq", "5", Definite(false));
+    check("\"5\"@en", "num_eq", "5", Definite(false));
+    check(&typed("true", "boolean"), "num_eq", "5", Definite(false));
     check("<http://ex.org/x>", "num_eq", "5", Definite(false));
     check("_:b0", "num_eq", "5", Definite(false));
 
