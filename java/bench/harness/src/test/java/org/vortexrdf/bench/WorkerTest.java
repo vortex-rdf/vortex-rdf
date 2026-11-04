@@ -261,12 +261,36 @@ class WorkerTest {
 
 	@Test
 	void aCounterThatMissesTheBlockFailsTheSelfCheck() {
+		// Thrown away, as the memory role does: a JVM's first sample is off by a few hundred KB.
+		Footprint.sample();
 		assertDoesNotThrow(() -> Worker.selfCheck(Footprint::sample));
 		assertTrue(assertThrows(IllegalStateException.class, () -> Worker.selfCheck(() -> new Footprint(0, 0)))
 				.getMessage().contains("heap"));
 		Iterator<Footprint> seen = List.of(new Footprint(0, 0), new Footprint(16L << 20, 0)).iterator();
 		assertTrue(assertThrows(IllegalStateException.class, () -> Worker.selfCheck(seen::next)).getMessage()
 				.contains("mallinfo2"));
+	}
+
+	/** The self-check on two samples: one before its block is held, and one while it is. */
+	private static void selfCheckSeeing(Footprint before, Footprint held) {
+		Iterator<Footprint> samples = List.of(before, held).iterator();
+		Worker.selfCheck(samples::next);
+	}
+
+	/**
+	 * The heap counter must see the whole 8 MiB array, and the native one 7 MiB of the 8 MiB block, since the JVM's own
+	 * threads allocate natively while the check runs.
+	 */
+	@Test
+	void theSelfCheckWantsTheWholeHeapBlockAndSevenMiBOfTheNativeOne() {
+		Footprint none = new Footprint(0, 0);
+
+		assertDoesNotThrow(() -> selfCheckSeeing(none, new Footprint(8L << 20, 7L << 20)));
+		String nativeShort = assertThrows(IllegalStateException.class,
+				() -> selfCheckSeeing(none, new Footprint(8L << 20, (7L << 20) - 1))).getMessage();
+		assertTrue(nativeShort.contains("mallinfo2") && nativeShort.contains("want at least 7 MiB"), nativeShort);
+		assertTrue(assertThrows(IllegalStateException.class,
+				() -> selfCheckSeeing(none, new Footprint((8L << 20) - 1, 7L << 20))).getMessage().contains("heap"));
 	}
 
 	@Test

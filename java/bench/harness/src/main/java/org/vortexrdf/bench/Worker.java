@@ -416,6 +416,7 @@ public final class Worker {
 		 */
 		private Footprint read(Map<String, Q> prepared) throws Exception {
 			H handle = a.open(src, location);
+			Footprint held;
 			try {
 				// Sampled for its collection: an open that builds its store leaves the build's garbage behind.
 				Footprint.sample();
@@ -426,10 +427,18 @@ public final class Worker {
 					}
 				}
 				peak = sampler.peak();
-				return Footprint.sample();
-			} finally {
-				a.dispose(handle);
+				held = Footprint.sample();
+			} catch (Throwable t) {
+				// The read's error is the run's: one the dispose adds after it rides along, rather than hiding it.
+				try {
+					a.dispose(handle);
+				} catch (Throwable suppressed) {
+					t.addSuppressed(suppressed);
+				}
+				throw t;
 			}
+			a.dispose(handle);
+			return held;
 		}
 	}
 

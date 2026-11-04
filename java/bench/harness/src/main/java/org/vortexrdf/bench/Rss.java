@@ -75,7 +75,10 @@ public record Rss(long anonBytes, long fileBytes) {
 			return peak;
 		}
 
-		/** Stop the thread, take a last sample, and throw what ended the thread early, if anything did. */
+		/**
+		 * Stop the thread, and throw what ended it early, if anything did; only a thread that ended cleanly is followed
+		 * by a last sample, so a failing read cannot hide the thread's error.
+		 */
 		@Override
 		public void close() {
 			stopped = true;
@@ -85,13 +88,13 @@ public record Rss(long anonBytes, long fileBytes) {
 				Thread.currentThread().interrupt();
 				throw new IllegalStateException("interrupted waiting for the RSS sampler's thread", e);
 			}
-			keep(read());
 			if (error instanceof Error e) {
 				throw e;
 			}
 			if (error != null) {
 				throw error instanceof RuntimeException e ? e : new IllegalStateException(error);
 			}
+			keep(read());
 		}
 
 		private void sample() {
