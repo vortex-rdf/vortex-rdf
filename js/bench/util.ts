@@ -213,7 +213,9 @@ export function consumeStream(
                     return;
                 }
             }
-            acc += readTerms([q], 0, 1);
+            // readTerms' reads, inline: no array per quad in the timed read.
+            acc += q.subject.value.length + q.predicate.value.length
+                + q.object.value.length + (q.graph?.value.length ?? 0);
             n++;
         });
     });
