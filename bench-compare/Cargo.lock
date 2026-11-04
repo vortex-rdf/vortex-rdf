@@ -3969,6 +3969,7 @@ dependencies = [
 name = "vortex-rdf-bench-compare"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "hdt",
  "oxigraph",
  "oxrdf",

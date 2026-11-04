@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use futures::StreamExt as _;
 use oxigraph::store::Store as OxigraphStore;
 use oxrdf::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term, TermRef};
 use sophia::api::MownStr;
@@ -820,15 +821,20 @@ impl Queryable for VortexStore {
                 .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
                 .await
                 .expect("match");
-            // Materialize, don't just read a row count: the view's `size`
-            // would answer a full scan from metadata in nanoseconds -- a number
-            // that compares nothing. `quads_vec` builds four terms per row, and
-            // the fold below reads them, which is what every other adapter here
-            // does too (see `Queryable::count`).
-            let quads = view.quads_vec().await.expect("materialize");
-            let bytes: usize = quads.iter().map(oxrdf_quad_bytes).sum();
+            // Read every term of every matched row, not just a row count: the
+            // view's `size` would answer a full scan from metadata in nanoseconds
+            // -- a number that compares nothing. `quads` decodes the match chunk
+            // by chunk and builds four terms per row, and this loop reads each
+            // row's as it arrives, so nothing collects the match. The other
+            // adapters' iterators decode a row at a time (see `Queryable::count`).
+            let mut quads = view.quads();
+            let (mut rows, mut bytes) = (0usize, 0usize);
+            while let Some(q) = quads.next().await {
+                bytes += oxrdf_quad_bytes(&q.expect("stream quads"));
+                rows += 1;
+            }
             std::hint::black_box(bytes);
-            quads.len()
+            rows
         })
     }
 

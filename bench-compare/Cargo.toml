@@ -28,6 +28,8 @@ oxrdf = "0.3.3"
 oxrdfio = "0.2.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The Vortex adapter's streamed read: VortexRdfStore::quads is a Stream.
+futures = "0.3.33"
 # Every tokio feature, as cli/Cargo.toml enables them: the dashboard measures
 # under the runtime configuration the CLI binary has.
 tokio = { version = "1.53", features = ["full"] }
