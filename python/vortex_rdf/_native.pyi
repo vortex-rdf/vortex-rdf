@@ -305,10 +305,20 @@ class CodeChunks:
         """The most rows a chunk holds."""
         ...
 
+class QuadIterator:
+    """The quads of `VortexRdfStore.iter_quads`: `get_quads`' rows, in its order and spelling, read a
+    chunk of at most `batch_rows` rows at a time. A `__next__` that has used up its chunk pulls the next
+    with the GIL released. The end of the match, an error or a cancelled `CancelToken` (`Cancelled`)
+    ends the iteration; every later `__next__` raises ``StopIteration``. Pull it from one thread at a
+    time: a `__next__` while another's runs raises ``RuntimeError``."""
+
+    def __iter__(self) -> "QuadIterator": ...
+    def __next__(self) -> Tuple[str, str, str, str]: ...
+
 class CancelToken:
     """A cancel token for one query's long calls: passed as ``cancel=`` to
     `VortexRdfStore.match_codes`, `count_quads`, `match_codes_many`,
-    `count_quads_many` and `match_code_chunks`, it stops them from any
+    `count_quads_many`, `match_code_chunks` and `iter_quads`, it stops them from any
     thread. A call or pull still in progress when the token is cancelled
     stops at its next wait for data (on file, the next split boundary) and
     raises `Cancelled`; one that finishes without waiting again (in memory,
@@ -457,6 +467,21 @@ class VortexRdfStore:
     ) -> List[Tuple[str, str, str, str]]:
         """Matching quads as (subject, predicate, object, graph) N-Triples
         strings; the default graph is the empty string."""
+        ...
+    def iter_quads(
+        self,
+        s: Optional[str] = None,
+        p: Optional[str] = None,
+        o: Optional[str] = None,
+        g: Optional[str] = None,
+        *,
+        batch_rows: int = 65536,
+        cancel: Optional[CancelToken] = None,
+    ) -> QuadIterator:
+        """`get_quads` as an iterator (`QuadIterator`): the same rows, order and spelling, read
+        `batch_rows` rows at a time, so it holds about one chunk's terms. This call matches the
+        pattern; each chunk is read when the iteration reaches it. With a `cancel` token this call and
+        every chunk pull race it (`CancelToken`). ``batch_rows=0`` or a malformed term raises ``ValueError``."""
         ...
     def count_quads(
         self,

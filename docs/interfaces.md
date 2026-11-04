@@ -73,7 +73,7 @@ time as they are pulled. The chunk stream is the
 form for a match consumed
 incrementally or of unknown size, and the bindings reach it through
 `match_code_chunks` (Python) and `matchCodeChunks` (JS and Java), and
-Java's `iterateQuads` as terms, a chunk decoded at a time. A Python
+Java's `iterateQuads` and Python's `iter_quads` as terms, a chunk decoded at a time. A Python
 `match_codes` call given a cancel token returns its result when its gather
 completes before the cancel is observed, and raises `Cancelled` when the
 token is cancelled before the call or while the call waits for data.
