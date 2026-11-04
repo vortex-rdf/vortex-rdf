@@ -125,8 +125,13 @@ def worker_env(venv_name: str, role: str) -> dict[str, str]:
     env["PYTHONPATH"] = os.pathsep.join(path_parts)
     if role == "memory":
         # glibc's malloc under Python's own allocator, so that `mallinfo2`
-        # counts Python objects too (see worker.py's memory role).
+        # counts Python objects too (see worker.py's memory role); no
+        # tracemalloc, whose traces would land in the store's bytes.
         env["PYTHONMALLOC"] = "malloc"
+        env.pop("PYTHONTRACEMALLOC", None)
+    else:
+        # An exported value must not change the allocator the timings run under.
+        env.pop("PYTHONMALLOC", None)
     return env
 
 

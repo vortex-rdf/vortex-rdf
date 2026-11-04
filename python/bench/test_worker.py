@@ -24,8 +24,17 @@ from suite import prepare_dataset  # noqa: E402
 
 PROBES = ("S", "P", "O", "SP", "PO", "SPO", "G", "SPOG", "full")
 
+def glibc_has_mallinfo2() -> bool:
+    name, version = platform.libc_ver()
+    try:
+        numbers = tuple(int(part) for part in version.split(".")[:2])
+    except ValueError:
+        return False
+    return name == "glibc" and numbers >= (2, 33)
+
+
 needs_glibc = pytest.mark.skipif(
-    platform.libc_ver()[0] != "glibc", reason="reads /proc and glibc's mallinfo2"
+    not glibc_has_mallinfo2(), reason="reads /proc and glibc's mallinfo2 (glibc 2.33+)"
 )
 
 
@@ -134,6 +143,8 @@ def test_live_bytes_count_a_block_until_it_is_freed():
 
 @needs_glibc
 def test_the_sampler_keeps_the_highest_sample():
+    worker.self_check()  # trims, so no free chunk left by earlier tests serves the block
+    switch = sys.getswitchinterval()
     base = worker.read_rss()
     assert base.anon > 0 and base.file > 0
     with worker.RssSampler() as s:
@@ -142,6 +153,15 @@ def test_the_sampler_keeps_the_highest_sample():
         del block
     assert s.peak.anon - base.anon >= 60 << 20
     assert worker.read_rss().anon - base.anon < 32 << 20
+    assert sys.getswitchinterval() == switch
+
+
+def test_a_libc_without_mallinfo2_is_named(monkeypatch):
+    monkeypatch.setattr(worker, "_libc", object())
+    with pytest.raises(RuntimeError, match="mallinfo2"):
+        worker.live_bytes()
+    with pytest.raises(RuntimeError, match="mallinfo2"):
+        worker.self_check()
 
 
 @needs_glibc
@@ -194,4 +214,12 @@ def test_only_memory_workers_run_with_the_malloc_allocator(monkeypatch):
     monkeypatch.delenv("PYTHONMALLOC", raising=False)
     assert run.worker_env("vortex", "memory")["PYTHONMALLOC"] == "malloc"
     assert "PYTHONMALLOC" not in run.worker_env("vortex", "query")
+    monkeypatch.setenv("PYTHONMALLOC", "pymalloc")
+    monkeypatch.setenv("PYTHONTRACEMALLOC", "1")
+    for role in ("query", "mutate"):
+        assert "PYTHONMALLOC" not in run.worker_env("vortex", role)
+    memory = run.worker_env("vortex", "memory")
+    assert memory["PYTHONMALLOC"] == "malloc"
+    assert "PYTHONTRACEMALLOC" not in memory
+    monkeypatch.delenv("PYTHONMALLOC")
     assert run.worker_env("rdflib", "memory")["PYTHONPATH"] == str(run.BENCH_DIR)

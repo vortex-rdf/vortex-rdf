@@ -13,9 +13,10 @@ The memory role (`--role memory`) measures one store's memory, and nothing
 else, in a process of its own: it opens the store, reads every pattern once
 under a 2 ms `/proc/self/status` sampler (the peaks, RssAnon and RssFile above
 a pre-open baseline), then disposes the store and reports the live bytes that
-released (glibc's `mallinfo2`, with `PYTHONMALLOC=malloc` so Python's own
-objects are counted too). It first checks that the counter sees an 8 MiB block
-held; a counter that does not exits non-zero, naming itself, on stderr.
+disposing released (glibc's `mallinfo2`, with `PYTHONMALLOC=malloc` so Python's
+own objects are counted too). It first checks that the counter sees an 8 MiB
+block held; if it does not, the run exits non-zero, naming the counter, on
+stderr.
 """
 
 from __future__ import annotations
@@ -263,24 +264,31 @@ class RssSampler:
             self._error = e
 
     def __enter__(self) -> "RssSampler":
-        # A main thread that holds the GIL for a whole native call would
-        # starve the sampler; a short switch interval makes it take the GIL
-        # back about every sample.
+        self._sample()
+        # A short switch interval bounds how long a thread running bytecode
+        # keeps the GIL once the sampler asks for it. A native call that holds
+        # the GIL still blocks the sampler until it returns.
         self._switch = sys.getswitchinterval()
         sys.setswitchinterval(0.001)
-        self._sample()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        try:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        except BaseException:
+            sys.setswitchinterval(self._switch)
+            raise
         return self
 
     def __exit__(self, *exc: object) -> None:
         self._stop.set()
         assert self._thread is not None
-        self._thread.join()
-        sys.setswitchinterval(self._switch)
+        try:
+            self._thread.join()
+            if self._error is None:
+                self._sample()
+        finally:
+            sys.setswitchinterval(self._switch)
         if self._error is not None:
             raise self._error
-        self._sample()
 
 
 class _Mallinfo2(ctypes.Structure):
@@ -299,7 +307,10 @@ _libc: Optional[ctypes.CDLL] = None
 def _libc_handle() -> ctypes.CDLL:
     global _libc
     if _libc is None:
-        _libc = ctypes.CDLL(None)
+        libc = ctypes.CDLL(None)
+        if hasattr(libc, "mallinfo2"):
+            libc.mallinfo2.restype = _Mallinfo2
+        _libc = libc
     return _libc
 
 
@@ -311,7 +322,6 @@ def live_bytes() -> int:
         mallinfo2 = libc.mallinfo2
     except AttributeError:
         raise RuntimeError("this libc has no mallinfo2 (glibc 2.33+ only)") from None
-    mallinfo2.restype = _Mallinfo2
     info = mallinfo2()
     return info.uordblks + info.hblkhd
 
