@@ -1607,12 +1607,14 @@ fn process_live_bytes() -> i64 {
 }
 
 /// At the start of every memory run each counter must see an 8 MiB block held;
-/// otherwise the run's Store figure would be silently wrong.
+/// otherwise the run's Store figure would be silently wrong. The failure line goes
+/// to stderr, which the parent inherits: its stdout is the child's JSON channel,
+/// discarded when the child exits non-zero.
 fn self_check() {
     const HELD: i64 = 8 << 20;
     let check = |name: &str, rose: i64| {
         if rose < HELD {
-            println!("memory self-check failed: {name} rose by {rose} bytes while 8 MiB was held");
+            eprintln!("memory self-check failed: {name} rose by {rose} bytes while 8 MiB was held");
             std::process::exit(1);
         }
     };
@@ -1787,6 +1789,10 @@ fn main() {
             // Carry on: a partial tab beats no tab, and the missing rows are
             // visible as absent cells rather than as silently wrong ones.
             eprintln!("!! {} failed ({}), skipping", a.label(), out.status);
+            // The adapter keeps its memory row, reading "—": every adapter has an
+            // entry. No memory child runs, with no query counts to compare against
+            // and an artifact that may be missing.
+            memory.push(memory_entry(a.slug(), a.label(), a.obtained(), Vec::new()));
             continue;
         }
         let parsed: serde_json::Value =
