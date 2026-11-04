@@ -602,8 +602,10 @@ def run_memory(adapter: Adapter, args: argparse.Namespace) -> dict:
     handle = a.open(artifact, src)
     # A store built here leaves its build garbage out of the figure.
     gc.collect()
-    opened = live_bytes()
+    # The library's own count first: its query may keep live bytes of its own,
+    # and read before this one they sit in both live_bytes readings and cancel.
     unseen_opened = a.unseen_live_bytes()
+    opened = live_bytes()
     a.dispose(handle)
     del handle
     gc.collect()

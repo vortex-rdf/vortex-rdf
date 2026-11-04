@@ -72,6 +72,7 @@ class PycottasOverABlock(PycottasAdapter):
     def __init__(self, size):
         self.size = size
         self.duck = 0  # the fake DuckDB count
+        self.kept = []  # live bytes the count's own query keeps, as a library's accounting call can
 
     def import_library(self):
         pass
@@ -88,6 +89,7 @@ class PycottasOverABlock(PycottasAdapter):
         return 7
 
     def unseen_live_bytes(self):
+        self.kept.append(bytearray(4 << 20))
         return self.duck
 
 
