@@ -46,10 +46,15 @@ fn memory_entry_has_the_contract_shape() {
         memory_entry(
             "vortex_dict_mem",
             "Vortex Dict (in-memory)",
-            Obtained::Loaded,
+            Some(Obtained::Loaded),
             vec![run]
         ),
         want
+    );
+    // No run kept: `obtained` is null, as on every tab.
+    assert_eq!(
+        memory_entry("hdt", "hdt", None, Vec::new()),
+        json!({"slug": "hdt", "label": "hdt", "role": "memory", "obtained": null, "runs": []})
     );
     let spelled = [
         Obtained::Mapped,

@@ -123,11 +123,12 @@ pub enum Obtained {
     Opened,
 }
 
-/// An adapter's `role: "memory"` entry; `runs` may be empty.
+/// An adapter's `role: "memory"` entry; `runs` may be empty, and `obtained` is
+/// then `None`, written as `null`, as on every tab.
 pub fn memory_entry(
     slug: &str,
     label: &str,
-    obtained: Obtained,
+    obtained: Option<Obtained>,
     runs: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     serde_json::json!({"slug": slug, "label": label, "role": "memory", "obtained": obtained, "runs": runs})

@@ -30,9 +30,10 @@
 //! allocations) after the reads minus those after the dispose, so it includes the
 //! caches the reads filled. The two peaks are the sample with the highest
 //! `RssAnon + RssFile`, less the baseline taken before the open. Mapped pages
-//! include the program's own code pages that the open and the reads first touch, a
-//! few MB on every row: an in-memory store reads a few MB of file peak, and a
-//! file-backed store reads that plus its file's touched pages. Every figure is
+//! include the program's own code pages that the open and the reads first touch,
+//! a few MB to a few tens of MB, depending on the library; the Vortex rows read
+//! about 7 to 8 MB of them. An in-memory store reads that much of file peak, and
+//! a file-backed store reads that plus its file's touched pages. Every figure is
 //! clamped at 0. A query entry's `peakRssMb` stays the timed process's `VmHWM`,
 //! which still drives the memory-pressure warning.
 //! `BENCH_MEMORY_RUNS=0` runs no memory children and writes no memory entries.
@@ -1810,11 +1811,12 @@ fn main() {
             // Carry on: a partial tab beats no tab, and the missing rows are
             // visible as absent cells rather than as silently wrong ones.
             eprintln!("!! {} failed ({}), skipping", a.label(), out.status);
-            // With memory runs on, the adapter keeps its memory row, reading "—":
-            // every adapter has an entry. No memory child runs, with no query
-            // counts to compare against and an artifact that may be missing.
+            // With memory runs on, the adapter keeps its memory row, reading "—",
+            // with `obtained` null: every adapter has an entry. No memory child
+            // runs, with no query counts to compare against and an artifact that
+            // may be missing.
             if memory_on {
-                memory.push(memory_entry(a.slug(), a.label(), a.obtained(), Vec::new()));
+                memory.push(memory_entry(a.slug(), a.label(), None, Vec::new()));
             }
             continue;
         }
@@ -1837,7 +1839,9 @@ fn main() {
         // BENCH_MEMORY_RUNS=0 there are none, so the page keeps the query-peak table.
         if memory_on {
             let runs = run_memory_children(&exe, a.as_ref(), n, &parsed["counts"], &mut warnings);
-            memory.push(memory_entry(a.slug(), a.label(), a.obtained(), runs));
+            // How the kept runs got their store; null when none was kept.
+            let obtained = (!runs.is_empty()).then(|| a.obtained());
+            memory.push(memory_entry(a.slug(), a.label(), obtained, runs));
         }
     }
 
