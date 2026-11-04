@@ -9,16 +9,22 @@
 //!
 //! [`count_code_pattern`](VortexRdfStore::count_code_pattern) and
 //! [`match_code_pattern`](VortexRdfStore::match_code_pattern) answer any
-//! pattern of codes: from a located run when one answers it, through the
-//! general match of the codes' terms otherwise.
+//! pattern of codes, and [`match_code_chunks`](VortexRdfStore::match_code_chunks)
+//! streams it: from a located run when one answers it, through the general
+//! match of the codes' terms otherwise. A located run's rows that the other
+//! bound slots are checked at are checked as they are read, and nothing is
+//! kept on the store between calls: a window checks its run again, where a
+//! stream holds its position in the run and reads each row once.
 
 use vortex_buffer::Buffer;
 
 use crate::common::terms::{self, Trust};
 use crate::error::{Result, VortexRdfError};
 
-/// Whether [`VortexRdfStore::locate_codes`] answers at all: `VORTEX_RDF_LOCATE=0` (an ablation switch, read once)
-/// makes it decline every pattern, so callers take the general match. Unset is on.
+/// Whether [`VortexRdfStore::locate_codes`] answers at all, and
+/// [`VortexRdfStore::match_code_chunks`] reads a located run: `VORTEX_RDF_LOCATE=0` (an ablation switch, read
+/// once) makes them decline every pattern, so callers take the general match. Unset is on.
+#[cfg(feature = "file-io")]
 pub fn locate_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VORTEX_RDF_LOCATE").as_deref() != Ok("0"))
@@ -96,6 +102,10 @@ impl VortexRdfStore {
     /// ([`locate_codes`](Self::locate_codes)), the general match's rows in its
     /// own order otherwise. Which of the two answers depends on the store and
     /// `pattern` alone, so every window of one pattern comes in the same order.
+    /// Each window is found anew: a run whose rows are checked is checked
+    /// from its start as far as the window's last row (no further, as no
+    /// count is asked), so a caller reading a long match through
+    /// [`match_code_chunks`](Self::match_code_chunks) reads it once.
     /// Matches nothing and fails as
     /// [`count_code_pattern`](Self::count_code_pattern) does.
     pub async fn match_code_pattern(
@@ -105,8 +115,9 @@ impl VortexRdfStore {
         limit: Option<usize>,
     ) -> Result<[Buffer<TermCode>; 4]> {
         let dict = self.code_dictionary()?;
-        if let Some(found) = self.locate_codes(pattern, offset, limit).await? {
-            return Ok(found.columns);
+        #[cfg(feature = "file-io")]
+        if let Some(run) = self.located_run(pattern).await? {
+            return run.window_rows(offset, limit).await;
         }
         let Some(probe) = probe_of_codes(&dict, pattern).await? else {
             return Ok(Default::default());
@@ -120,6 +131,42 @@ impl VortexRdfStore {
                     "the store's rows are not all in its term dictionary".into(),
                 )
             })
+    }
+
+    /// [`match_code_pattern`](Self::match_code_pattern)'s rows, unwindowed
+    /// and in its order, as a stream of chunks of at most `batch_rows` rows,
+    /// each the four `(s, p, o, g)` code columns of its rows. A located run
+    /// that answers the pattern ([`locate_codes`](Self::locate_codes)) is
+    /// read `batch_rows` of its rows at a time, each block checked as it is
+    /// read and yielding the rows it keeps (a block keeping none yields no
+    /// chunk), so every row of the run is read once; any other pattern
+    /// streams the general match's [`code_chunks`](Self::code_chunks). The
+    /// run is located when the stream is made and its rows read as it is
+    /// pulled; the stream holds its position in the run and handles to the
+    /// file's columns, nothing on the store, so what it reads goes with it.
+    /// A read error is a stream item. Empty for a pattern nothing can match.
+    /// Errors: `batch_rows == 0` (invalid input, checked first), and as
+    /// [`count_code_pattern`](Self::count_code_pattern).
+    pub async fn match_code_chunks(
+        &self,
+        pattern: CodePattern,
+        batch_rows: usize,
+    ) -> Result<crate::CodeChunkStream> {
+        use futures::StreamExt as _;
+
+        crate::store::read::chunks::check_batch(batch_rows)?;
+        let dict = self.code_dictionary()?;
+        #[cfg(feature = "file-io")]
+        if let Some(run) = self.located_run(pattern).await? {
+            return Ok(run.chunks(batch_rows));
+        }
+        match probe_of_codes(&dict, pattern).await? {
+            None => Ok(futures::stream::empty().boxed()),
+            Some(probe) => self
+                .run_probe(&probe)
+                .await?
+                .code_chunks(&crate::QuadColumn::ALL, batch_rows),
+        }
     }
 
     /// The probe of `pattern`'s terms, spelled by the store's own dictionary: what
@@ -155,16 +202,20 @@ impl VortexRdfStore {
     /// secondary-by-copy children `index:posg`'s `(p, o, s, g)` and
     /// `index:ospg`'s `(o, s, p, g)`. Rows come in that table's order. Bound
     /// slots that are no such prefix (a bound graph after a free slot) are the
-    /// run of the longest bound prefix, its rows checked against the others
-    /// ([`gap_filtered`]). Failing that, a bound `p` or `o` is located in the reference index
-    /// (`index:ref-p`, `index:ref-o`) and its rows read from the quad table in
-    /// its order, the other bound slots checked at them when its run is short
-    /// enough; a bound subject's run of a `quads_sorted` file is the rows
-    /// checked instead when no longer. A code past the dictionary, or one in
-    /// a position no quad holds, matches nothing. Whether it answers depends
-    /// on the store and `pattern` alone, never on the window, so every window
-    /// of one pattern comes from the same table, in the same order. With the
-    /// ablation switch `VORTEX_RDF_LOCATE=0` ([`locate_enabled`]) it declines every pattern.
+    /// run of the longest bound prefix, its rows checked against the others,
+    /// when it is no longer than [`GAP_ROWS`]. Failing that, a bound `p` or
+    /// `o` is located in the reference index (`index:ref-p`, `index:ref-o`)
+    /// and its rows read from the quad table in its order, the other bound
+    /// slots checked at them when its run is short enough; a bound subject's
+    /// run of a `quads_sorted` file is the rows checked instead when no
+    /// longer. A code past the dictionary, or one in a position no quad
+    /// holds, matches nothing. Whether it answers depends on the store and
+    /// `pattern` alone, never on the window, so every window of one pattern
+    /// comes from the same table, in the same order. A run whose rows are
+    /// checked is checked whole, a block at a time, to count them, and only
+    /// the window's rows are kept; nothing is kept between calls. With the
+    /// ablation switch `VORTEX_RDF_LOCATE=0` ([`locate_enabled`]) it declines
+    /// every pattern.
     ///
     /// [`match_pattern`]: VortexRdfStore::match_pattern
     /// [`run_probe`]: VortexRdfStore::run_probe
@@ -174,12 +225,12 @@ impl VortexRdfStore {
         offset: usize,
         limit: Option<usize>,
     ) -> Result<Option<LocatedCodes>> {
-        if !locate_enabled() {
-            return Ok(None);
-        }
         #[cfg(feature = "file-io")]
         {
-            self.locate_codes_in_file(pattern, offset, limit).await
+            match self.located_run(pattern).await? {
+                Some(run) => run.window(offset, limit).await.map(Some),
+                None => Ok(None),
+            }
         }
         #[cfg(not(feature = "file-io"))]
         {
@@ -188,16 +239,16 @@ impl VortexRdfStore {
         }
     }
 
+    /// The located run answering `pattern` ([`locate_codes`](Self::locate_codes)
+    /// says when one does), found by binary search; `None` when none does.
     #[cfg(feature = "file-io")]
-    async fn locate_codes_in_file(
-        &self,
-        pattern: CodePattern,
-        offset: usize,
-        limit: Option<usize>,
-    ) -> Result<Option<LocatedCodes>> {
+    async fn located_run(&self, pattern: CodePattern) -> Result<Option<LocatedRun>> {
         use crate::store::persist::native_file::LocatedTables;
         use crate::store::schema::PRIMARY_COLUMNS;
 
+        if !locate_enabled() {
+            return Ok(None);
+        }
         if !self.is_code_view() || self.quads.deleted.is_some() || !self.quads.selection.is_all() {
             return Ok(None);
         }
@@ -239,8 +290,15 @@ impl VortexRdfStore {
                     file.component_column_chunks(name, "rid")?,
                 ])
             }),
-            long_runs: Default::default(),
         });
+        let run = |columns: Columns, rows, checked| LocatedRun {
+            codes,
+            columns,
+            rows,
+            checked,
+            source: source.clone(),
+            session: session.clone(),
+        };
         // The table whose key order starts with the most bound slots, when
         // none starts with all of them: a bound graph after a free slot.
         let mut gap: Option<(usize, usize)> = None;
@@ -259,47 +317,44 @@ impl VortexRdfStore {
                 }
                 continue;
             }
-            let Some(run) = locate_run(columns, order, prefix, &codes, &source, session).await?
+            let Some(found) = locate_run(columns, order, prefix, &codes, &source, session).await?
             else {
                 continue;
             };
-            let total = run.end - run.start;
-            let window = window_of(total, offset, limit);
-            let rows = WindowRows::Run(run.start + window.start..run.start + window.end);
-            let columns = window_columns(&codes, columns, rows, &source, session).await?;
-            return Ok(Some(LocatedCodes { total, columns }));
+            return Ok(Some(run(
+                columns.clone(),
+                RunRows::Table(found),
+                Vec::new(),
+            )));
         }
+        // The run of the longest bound prefix, its rows checked against the
+        // bound slots past it, in the table's order.
         if let Some((table, prefix)) = gap {
             let columns = tables.sorted[table].as_ref().expect("a table with columns");
             let order = &TABLES[table].1;
-            let found = Box::pin(gap_filtered(
-                codes,
-                columns,
-                order,
-                prefix,
-                &tables.long_runs,
-                offset,
-                limit,
-                &source,
-                session,
-            ))
-            .await?;
-            if found.is_some() {
-                return Ok(found);
+            if let Some(found) =
+                locate_run(columns, order, prefix, &codes, &source, session).await?
+                && found.end - found.start <= GAP_ROWS
+            {
+                let checked = order[prefix..]
+                    .iter()
+                    .copied()
+                    .filter(|&slot| codes[slot].is_some())
+                    .collect();
+                return Ok(Some(run(columns.clone(), RunRows::Table(found), checked)));
             }
         }
         // Boxed: its state would otherwise enlarge every lookup's future,
         // the sorted tables' too.
-        Box::pin(by_reference(
+        let found = Box::pin(by_reference(
             codes,
             tables,
             file.quads_sorted(),
-            offset,
-            limit,
             &source,
             session,
         ))
-        .await
+        .await?;
+        Ok(found.map(|(columns, rows, checked)| run(columns, rows, checked)))
     }
 }
 
@@ -349,17 +404,294 @@ fn holds(kinds: &KindRanges, slot: usize, code: TermCode) -> bool {
     }
 }
 
+/// A column's chunk-probe handle.
+#[cfg(feature = "file-io")]
+type Chunks = std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>;
+
+/// A table's `(s, p, o, g)` chunk-probe handles.
+#[cfg(feature = "file-io")]
+type Columns = [Chunks; 4];
+
+/// The segments a file's reads fetch.
+#[cfg(feature = "file-io")]
+type Source = std::sync::Arc<dyn vortex_layout::segments::SegmentSource>;
+
+/// The run answering a pattern, as [`located_run`](VortexRdfStore::located_run)
+/// finds it: the table its rows are read from, where they are, and the
+/// bound slots each is checked against. It holds handles to the file's
+/// columns and nothing on the store, so a window or a stream of it reads only
+/// what it needs, and a stream of it outlives the store handle that found it.
+#[cfg(feature = "file-io")]
+struct LocatedRun {
+    codes: [Option<TermCode>; 4],
+    /// The `(s, p, o, g)` columns of the table the rows are read from: a
+    /// sorted table's, or the quad table's for a reference run.
+    columns: Columns,
+    rows: RunRows,
+    /// The bound slots the run does not pin, checked at each of its rows in
+    /// this order.
+    checked: Vec<usize>,
+    source: Source,
+    session: vortex_session::VortexSession,
+}
+
+/// Where a [`LocatedRun`]'s rows are.
+#[cfg(feature = "file-io")]
+enum RunRows {
+    /// The table's rows `run`, contiguous.
+    Table(std::ops::Range<u64>),
+    /// The quad-table rows a reference run lists, ascending: `rid`'s values
+    /// at `run`. `other` is the other reference's run, when it located the
+    /// code of a checked slot.
+    Reference {
+        rid: Chunks,
+        run: std::ops::Range<u64>,
+        other: Option<OtherReference>,
+    },
+}
+
+/// The other reference's run of a [`RunRows::Reference`], which lists the
+/// rows holding the code of the checked slot `slot`, in ascending order.
+#[cfg(feature = "file-io")]
+struct OtherReference {
+    slot: usize,
+    rid: Chunks,
+    run: std::ops::Range<u64>,
+}
+
+/// A block's rows of the table a [`LocatedRun`] reads: a contiguous run of
+/// it, or the ascending rows a reference run and the checks kept.
+#[cfg(feature = "file-io")]
+enum Rows {
+    Run(std::ops::Range<u64>),
+    Ids(Vec<u64>),
+}
+
+#[cfg(feature = "file-io")]
+impl Rows {
+    fn is_empty(&self) -> bool {
+        match self {
+            Rows::Run(run) => run.is_empty(),
+            Rows::Ids(ids) => ids.is_empty(),
+        }
+    }
+}
+
+#[cfg(feature = "file-io")]
+impl LocatedRun {
+    /// The run's rows, before their checks.
+    fn len(&self) -> u64 {
+        match &self.rows {
+            RunRows::Table(run) | RunRows::Reference { run, .. } => run.end - run.start,
+        }
+    }
+
+    /// The rows at positions `at` of the run (not empty, within its
+    /// [`len`](Self::len)) that the checks keep, in the run's order: with no
+    /// slot checked, a table run's own rows or the rows a reference run lists
+    /// there.
+    async fn block(&self, at: std::ops::Range<u64>) -> Result<Rows> {
+        crate::observe::observe!(LocatedBlock(at.end - at.start));
+        let (source, session) = (&self.source, &self.session);
+        match &self.rows {
+            RunRows::Table(run) => {
+                let rows = run.start + at.start..run.start + at.end;
+                let Some((&first, rest)) = self.checked.split_first() else {
+                    return Ok(Rows::Run(rows));
+                };
+                // The first check reads the block's rows, still contiguous.
+                let code = self.codes[first].expect("a checked slot is bound");
+                let values =
+                    read_codes(&self.columns[first], rows.clone(), source, session).await?;
+                let mut kept: Vec<u64> = rows
+                    .zip(values.iter())
+                    .filter(|&(_, &value)| value == code)
+                    .map(|(row, _)| row)
+                    .collect();
+                for &slot in rest {
+                    if kept.is_empty() {
+                        break;
+                    }
+                    kept = self.holding(slot, kept).await?;
+                }
+                Ok(Rows::Ids(kept))
+            }
+            RunRows::Reference { rid, run, other } => {
+                let rows = run.start + at.start..run.start + at.end;
+                let mut kept = read_codes(rid, rows, source, session).await?.to_vec();
+                for &slot in &self.checked {
+                    if kept.is_empty() {
+                        break;
+                    }
+                    // A slot with a located reference run keeps the rows that
+                    // run lists too: both lists ascend, so each row is
+                    // searched in what is left of the other's `rid`s, which
+                    // sit together in one index. Reading the quad table costs
+                    // a leaf for each leaf the rows reach, searching the other
+                    // run a search per row: rows spread one or two to a leaf
+                    // (a large file) are searched, rows bunched in few leaves
+                    // read, as are rows whose search a leaf declines.
+                    if let Some(other) = other.as_ref().filter(|other| other.slot == slot)
+                        && kept.len()
+                            < SEARCHES_PER_LEAF * leaves_holding(&self.columns[slot], &kept)
+                        && let Some(listed) =
+                            listed_in(&kept, &other.rid, other.run.clone(), source, session).await?
+                    {
+                        kept = listed;
+                        continue;
+                    }
+                    kept = self.holding(slot, kept).await?;
+                }
+                Ok(Rows::Ids(kept))
+            }
+        }
+    }
+
+    /// Of `rows` (ascending), those holding the checked `slot`'s code, read
+    /// at them.
+    async fn holding(&self, slot: usize, rows: Vec<u64>) -> Result<Vec<u64>> {
+        let code = self.codes[slot].expect("a checked slot is bound");
+        let values = take_codes(&self.columns[slot], &rows, &self.source, &self.session).await?;
+        Ok(rows
+            .into_iter()
+            .zip(values.iter())
+            .filter(|&(_, &value)| value == code)
+            .map(|(row, _)| row)
+            .collect())
+    }
+
+    /// The `(s, p, o, g)` code columns of a block's `rows`: a bound slot is
+    /// its code repeated, a free one read from its chunk leaves
+    /// ([`read_codes`], [`take_codes`]).
+    async fn columns(&self, rows: &Rows) -> Result<[Buffer<TermCode>; 4]> {
+        let len = match rows {
+            Rows::Run(run) => (run.end - run.start) as usize,
+            Rows::Ids(ids) => ids.len(),
+        };
+        let (source, session) = (&self.source, &self.session);
+        let mut out: [Buffer<TermCode>; 4] = Default::default();
+        for (slot, column) in out.iter_mut().enumerate() {
+            *column = match (self.codes[slot], rows) {
+                (Some(code), _) => vortex_buffer::BufferMut::full(code, len).freeze(),
+                (None, Rows::Run(run)) => {
+                    read_codes(&self.columns[slot], run.clone(), source, session).await?
+                }
+                (None, Rows::Ids(ids)) => {
+                    take_codes(&self.columns[slot], ids, source, session).await?
+                }
+            };
+        }
+        Ok(out)
+    }
+
+    /// The window `offset..offset + limit` (`None`: to the last) of the
+    /// run's matches, beside their number: with no slot checked the run's
+    /// length, and only the window's rows read; otherwise every row of the
+    /// run is checked, a block at a time, to count the rows kept, and only
+    /// those in the window are held.
+    async fn window(&self, offset: usize, limit: Option<usize>) -> Result<LocatedCodes> {
+        let (total, rows) = self.window_of_matches(offset, limit, true).await?;
+        let columns = self.columns(&rows).await?;
+        Ok(LocatedCodes { total, columns })
+    }
+
+    /// The `(s, p, o, g)` code columns of [`window`](Self::window)'s rows,
+    /// without its count: the run checked from its start only as far as the
+    /// window's last row.
+    async fn window_rows(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        let (_, rows) = self.window_of_matches(offset, limit, false).await?;
+        self.columns(&rows).await
+    }
+
+    /// The rows of the window `offset..offset + limit` of the run's matches,
+    /// beside the number of matches the reads counted: all of them, with no
+    /// slot checked or with `whole`; otherwise those up to the window's last
+    /// row, where the checks stop. A checked run is read a block at a time,
+    /// [`FIRST_GAP_BLOCK`] rows first and each next block twice as many, up
+    /// to [`GAP_BLOCK`]: a window near the run's start reads little of it.
+    async fn window_of_matches(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+        whole: bool,
+    ) -> Result<(u64, Rows)> {
+        let len = self.len();
+        if self.checked.is_empty() {
+            let w = window_of(len, offset, limit);
+            let rows = match w.is_empty() {
+                // A count's window, or one past the end, reads nothing.
+                true => Rows::Ids(Vec::new()),
+                false => self.block(w).await?,
+            };
+            return Ok((len, rows));
+        }
+        let from = offset as u64;
+        let to = limit.map(|limit| from.saturating_add(limit as u64));
+        let (mut total, mut window) = (0u64, Vec::new());
+        let (mut at, mut block) = (0, FIRST_GAP_BLOCK);
+        while at < len {
+            if !whole && to.is_some_and(|to| total >= to) {
+                break;
+            }
+            let next = at.saturating_add(block).min(len);
+            let kept = match self.block(at..next).await? {
+                Rows::Ids(kept) => kept,
+                Rows::Run(rows) => rows.collect(),
+            };
+            // The kept rows' positions among the matches start at `total`.
+            let n = kept.len() as u64;
+            let lo = from.saturating_sub(total).min(n);
+            let hi = to.map_or(n, |to| to.saturating_sub(total).min(n));
+            if lo < hi {
+                window.extend_from_slice(&kept[lo as usize..hi as usize]);
+            }
+            total += n;
+            at = next;
+            block = (block * 2).min(GAP_BLOCK);
+        }
+        Ok((total, Rows::Ids(window)))
+    }
+
+    /// The run's matches as chunks of their four code columns, a block of
+    /// `batch_rows` rows of the run read per chunk (blocks keeping no row
+    /// skipped), so a chunk holds at most `batch_rows` rows and every row of
+    /// the run is read once; the stream holds the run and its position in it.
+    fn chunks(self, batch_rows: usize) -> crate::CodeChunkStream {
+        use futures::StreamExt as _;
+
+        let batch = batch_rows as u64;
+        futures::stream::try_unfold((self, 0u64), move |(run, mut at)| async move {
+            let len = run.len();
+            while at < len {
+                let next = at.saturating_add(batch).min(len);
+                let rows = run.block(at..next).await?;
+                at = next;
+                if rows.is_empty() {
+                    continue;
+                }
+                let columns = run.columns(&rows).await?;
+                return Ok(Some((Vec::from(columns), (run, at))));
+            }
+            Ok(None)
+        })
+        .boxed()
+    }
+}
+
 /// The reference indexes, each `(val, rid)` sorted by `val` then `rid`: a
 /// run of one code's `val` lists, ascending, the quad-table rows holding it
 /// at the `(s, p, o, g)` position given here.
 #[cfg(feature = "file-io")]
 const REFERENCES: [(&str, usize); 2] = [("index:ref-p", 1), ("index:ref-o", 2)];
 
-/// Rows of a reference or subject run up to which the pattern's other bound
-/// slots are checked at the run's quad-table rows for every window; a longer
-/// subject run declines, for the caller's generic path, and a longer
-/// reference run (up to [`GAP_ROWS`]) is checked once, its kept rows
-/// memoized for the windows after.
+/// Rows of a bound subject's run of a subject-sorted quad table up to which
+/// a lookup through a reference index checks the other bound slots at the
+/// subject's rows, when they are no more than the reference run's; a longer
+/// subject run declines, for the caller's generic path.
 #[cfg(feature = "file-io")]
 const CHECKED_ROWS: u64 = 16_384;
 
@@ -369,25 +701,23 @@ const CHECKED_ROWS: u64 = 16_384;
 #[cfg(feature = "file-io")]
 const SEARCHES_PER_LEAF: usize = 16;
 
-/// [`locate_codes`](VortexRdfStore::locate_codes) through a reference index:
+/// [`located_run`](VortexRdfStore::located_run) through a reference index:
 /// the shortest run among those whose slot is bound gives the quad-table rows
-/// in order. With no other slot bound, its length is the total and only the
-/// window's rows are read; otherwise all its rows are checked against the
-/// other bound slots, within [`CHECKED_ROWS`] (block by block and memoized
-/// past it, within [`GAP_ROWS`]): against the other reference's
-/// run for `p` or `o`, by reading the quad table for `s` or `g`. A bound
-/// subject's run of a subject-sorted (`quads_sorted`) quad table is checked
-/// instead when it is no longer than the shortest reference run.
+/// in order, all of them, or, with other slots bound, those that hold them,
+/// checked within [`GAP_ROWS`]: against the other reference's run for `p` or
+/// `o`, by reading the quad table for `s` or `g`. A bound subject's run of a
+/// subject-sorted (`quads_sorted`) quad table is checked instead when it is
+/// no longer than the shortest reference run, within [`CHECKED_ROWS`].
+/// Answers the table the rows are read from (the quad table), where they
+/// are, and the slots checked.
 #[cfg(feature = "file-io")]
 async fn by_reference(
     codes: [Option<TermCode>; 4],
     tables: &crate::store::persist::native_file::LocatedTables,
     quads_sorted: bool,
-    offset: usize,
-    limit: Option<usize>,
-    source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
+    source: &Source,
     session: &vortex_session::VortexSession,
-) -> Result<Option<LocatedCodes>> {
+) -> Result<Option<(Columns, RunRows, Vec<usize>)>> {
     let Some(quads) = &tables.sorted[0] else {
         return Ok(None);
     };
@@ -427,189 +757,76 @@ async fn by_reference(
     let checked: Vec<usize> = (0..4)
         .filter(|&slot| slot != key && codes[slot].is_some())
         .collect();
-    let (total, rows) = if checked.is_empty() {
-        let total = run.end - run.start;
-        let w = window_of(total, offset, limit);
-        let rows = read_codes(rid, run.start + w.start..run.start + w.end, source, session).await?;
-        (total, rows)
-    } else {
-        // A reference run longer than CHECKED_ROWS is checked block by block,
-        // the rows it keeps memoized as a gap's are.
-        let long = subject.is_none() && run.end - run.start > CHECKED_ROWS;
-        let rows = match subject {
-            Some(subject) if subject.end - subject.start <= CHECKED_ROWS => {
-                let Some(rows) = check_rows(
-                    subject.collect(),
-                    true,
-                    &checked,
-                    &codes,
-                    &runs,
-                    tables,
-                    quads,
-                    source,
-                    session,
-                )
-                .await?
-                else {
-                    return Ok(None);
+    let rows = match subject {
+        Some(subject) if subject.end - subject.start <= CHECKED_ROWS => RunRows::Table(subject),
+        Some(_) => return Ok(None),
+        None if checked.is_empty() || run.end - run.start <= GAP_ROWS => {
+            let other = (0..2).filter(|&i| i != index).find_map(|i| {
+                let slot = REFERENCES[i].1;
+                let (Some(run), Some([_, rid])) = (&runs[i], &tables.references[i]) else {
+                    return None;
                 };
-                rows.into()
+                checked.contains(&slot).then(|| OtherReference {
+                    slot,
+                    rid: rid.clone(),
+                    run: run.clone(),
+                })
+            });
+            RunRows::Reference {
+                rid: rid.clone(),
+                run,
+                other,
             }
-            None if run.end - run.start <= GAP_ROWS => {
-                match long.then(|| memoized(&tables.long_runs, &codes)).flatten() {
-                    Some(rows) => rows,
-                    None => {
-                        let mut kept = Vec::new();
-                        let mut from = run.start;
-                        while from < run.end {
-                            let to = (from + GAP_BLOCK).min(run.end);
-                            let block = read_codes(rid, from..to, source, session).await?.to_vec();
-                            let Some(block) = check_rows(
-                                block, false, &checked, &codes, &runs, tables, quads, source,
-                                session,
-                            )
-                            .await?
-                            else {
-                                return Ok(None);
-                            };
-                            kept.extend_from_slice(&block);
-                            from = to;
-                        }
-                        let rows: std::sync::Arc<[u64]> = kept.into();
-                        if long {
-                            memoize(&tables.long_runs, codes, &rows);
-                        }
-                        rows
-                    }
-                }
-            }
-            _ => return Ok(None),
-        };
-        let total = rows.len() as u64;
-        let w = window_of(total, offset, limit);
-        (
-            total,
-            Buffer::copy_from(&rows[w.start as usize..w.end as usize]),
-        )
+        }
+        None => return Ok(None),
     };
-    let columns = window_columns(&codes, quads, WindowRows::Ids(&rows), source, session).await?;
-    Ok(Some(LocatedCodes { total, columns }))
+    Ok(Some((quads.clone(), rows, checked)))
 }
 
-/// The quad-table `rows` (ascending) of a reference or subject run that hold
-/// the `checked` slots' codes: against the other reference's run for `p` or
-/// `o`, by reading the quad table for `s` or `g`, or for a subject's rows
-/// (`by_subject`). `None` when a leaf declines its probe.
+/// Of `rows` (ascending, not empty), those that `rid`'s values at `run`
+/// (ascending) list too: the run walked one leaf at a time, each leaf's
+/// probe found once for all the rows that fall in it, and the leaves holding
+/// no row skipped by a search for the next row's bound: the rows of a short
+/// run sit far apart in a long one, and walking to them read every leaf
+/// between. `None` when a leaf declines its probe.
 #[cfg(feature = "file-io")]
-#[allow(clippy::too_many_arguments)]
-async fn check_rows(
-    mut rows: Vec<u64>,
-    by_subject: bool,
-    checked: &[usize],
-    codes: &[Option<TermCode>; 4],
-    runs: &[Option<std::ops::Range<u64>>; 2],
-    tables: &crate::store::persist::native_file::LocatedTables,
-    quads: &[std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>; 4],
-    source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
+async fn listed_in(
+    rows: &[u64],
+    rid: &vortex_rdf_encoded_search::ColumnChunks,
+    run: std::ops::Range<u64>,
+    source: &Source,
     session: &vortex_session::VortexSession,
 ) -> Result<Option<Vec<u64>>> {
-    {
-        for &slot in checked {
-            if rows.is_empty() {
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut pending = rows;
+    let Some(mut from) = seek(rid, run.clone(), rows[0], source, session).await? else {
+        return Ok(None);
+    };
+    while from < run.end && !pending.is_empty() {
+        let to = rid.leaf_end(from).min(run.end);
+        let Some(leaf) = rid.leaf_rows(from..to, source, session).await? else {
+            return Ok(None);
+        };
+        while let Some((&row, rest)) = pending.split_first() {
+            let hit = leaf.bounds(row);
+            if hit.start == to {
                 break;
             }
-            // A slot with a located reference run keeps the rows that run
-            // lists too: both lists ascend, so each row is searched in what
-            // is left of the other's `rid`s, which sit together in one index.
-            // Reading the quad table costs a leaf for each leaf the rows
-            // reach, searching the other run a search per row: rows spread
-            // one or two to a leaf (a large file) are searched, rows bunched
-            // in few leaves read. A subject's rows are contiguous, so read.
-            if !by_subject
-                && let Some(other) = REFERENCES.iter().position(|&(_, s)| s == slot)
-                && let (Some(other_run), Some([_, other_rid])) =
-                    (&runs[other], &tables.references[other])
-                && rows.len() < SEARCHES_PER_LEAF * leaves_holding(&quads[slot], &rows)
-            {
-                // The other run is walked one leaf at a time, each leaf's
-                // probe found once for all the rows that fall in it, and
-                // the leaves holding no row skipped by a search for the
-                // next row's bound: the rows of a short run sit far apart
-                // in a long one, and walking to them read every leaf between.
-                let mut kept = Vec::with_capacity(rows.len());
-                let mut pending = rows.as_slice();
-                let Some(mut from) =
-                    seek(other_rid, other_run.clone(), rows[0], source, session).await?
-                else {
-                    return Ok(None);
-                };
-                while from < other_run.end && !pending.is_empty() {
-                    let to = other_rid.leaf_end(from).min(other_run.end);
-                    let Some(leaf) = other_rid.leaf_rows(from..to, source, session).await? else {
-                        return Ok(None);
-                    };
-                    while let Some((&row, rest)) = pending.split_first() {
-                        let hit = leaf.bounds(row);
-                        if hit.start == to {
-                            break;
-                        }
-                        if !hit.is_empty() {
-                            kept.push(row);
-                        }
-                        pending = rest;
-                    }
-                    let Some(&next) = pending.first() else {
-                        break;
-                    };
-                    let Some(at) =
-                        seek(other_rid, to..other_run.end, next, source, session).await?
-                    else {
-                        return Ok(None);
-                    };
-                    from = at;
-                }
-                rows = kept;
-                continue;
+            if !hit.is_empty() {
+                kept.push(row);
             }
-            let values = take_codes(&quads[slot], &rows, source, session).await?;
-            let code = codes[slot].expect("a checked slot is bound");
-            rows = rows
-                .iter()
-                .zip(values.iter())
-                .filter(|&(_, &value)| value == code)
-                .map(|(&row, _)| row)
-                .collect();
+            pending = rest;
         }
+        let Some(&next) = pending.first() else {
+            break;
+        };
+        let Some(at) = seek(rid, to..run.end, next, source, session).await? else {
+            return Ok(None);
+        };
+        from = at;
     }
-    Ok(Some(rows))
+    Ok(Some(kept))
 }
-
-/// The rows memoized for the pattern of `codes`, if any.
-#[cfg(feature = "file-io")]
-fn memoized(memo: &LongRuns, codes: &[Option<TermCode>; 4]) -> Option<std::sync::Arc<[u64]>> {
-    let memo = memo
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    memo.iter()
-        .find(|(key, _)| key == codes)
-        .map(|(_, rows)| rows.clone())
-}
-
-/// Memoizes `rows` for the pattern of `codes`, dropping the oldest of
-/// [`LONG_RUN_MEMOS`].
-#[cfg(feature = "file-io")]
-fn memoize(memo: &LongRuns, codes: [Option<TermCode>; 4], rows: &std::sync::Arc<[u64]>) {
-    let mut memo = memo
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if memo.len() == LONG_RUN_MEMOS {
-        memo.remove(0);
-    }
-    memo.push((codes, rows.clone()));
-}
-
-#[cfg(feature = "file-io")]
-use crate::store::persist::native_file::LongRuns;
 
 /// The run of a sorted table's rows holding `codes` in the first `prefix`
 /// slots of its key `order` (`(s, p, o, g)` positions): the lead key's
@@ -617,11 +834,11 @@ use crate::store::persist::native_file::LongRuns;
 /// chunk declines its probe.
 #[cfg(feature = "file-io")]
 async fn locate_run(
-    columns: &[std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>; 4],
+    columns: &Columns,
     order: &[usize; 4],
     prefix: usize,
     codes: &[Option<TermCode>; 4],
-    source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
+    source: &Source,
     session: &vortex_session::VortexSession,
 ) -> Result<Option<std::ops::Range<u64>>> {
     let lead = order[0];
@@ -644,94 +861,20 @@ async fn locate_run(
     Ok(Some(run))
 }
 
-/// Rows of a located prefix run up to which [`gap_filtered`] checks the bound
-/// slots past it; a longer run declines, for the caller's other paths.
+/// Rows of a run whose rows are checked (a prefix run with bound slots past
+/// it, or a reference run with other slots bound) up to which it answers; a
+/// longer one declines, for the caller's other paths, as a window of it
+/// checks every row to count them.
 #[cfg(feature = "file-io")]
 const GAP_ROWS: u64 = 1 << 23;
 
-/// Rows of a prefix run read per block while checking it.
+/// Rows of a checked run a window reads in its first block.
+#[cfg(feature = "file-io")]
+const FIRST_GAP_BLOCK: u64 = 1 << 12;
+
+/// Rows of a checked run a window reads per block at most.
 #[cfg(feature = "file-io")]
 const GAP_BLOCK: u64 = 1 << 16;
-
-/// How many long checked runs keep their rows
-/// ([`LocatedTables::long_runs`](crate::store::persist::native_file::LocatedTables)).
-#[cfg(feature = "file-io")]
-const LONG_RUN_MEMOS: usize = 2;
-
-/// [`locate_codes`](VortexRdfStore::locate_codes) for bound slots that are no
-/// prefix of a sorted table's key order (a bound graph after a free slot,
-/// `(s p ? g)`, `(? p o g)`): the run of the table's longest bound `prefix`,
-/// its rows checked block by block against the other bound slots, in the
-/// table's order. The rows a run longer than [`CHECKED_ROWS`] keeps are
-/// memoized in `memo`, so paging through it reads each row once. `None` when
-/// the run is longer than [`GAP_ROWS`] or a chunk declines its probe.
-#[cfg(feature = "file-io")]
-#[allow(clippy::too_many_arguments)]
-async fn gap_filtered(
-    codes: [Option<TermCode>; 4],
-    columns: &[std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>; 4],
-    order: &[usize; 4],
-    prefix: usize,
-    memo: &LongRuns,
-    offset: usize,
-    limit: Option<usize>,
-    source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
-    session: &vortex_session::VortexSession,
-) -> Result<Option<LocatedCodes>> {
-    let Some(run) = locate_run(columns, order, prefix, &codes, source, session).await? else {
-        return Ok(None);
-    };
-    if run.end - run.start > GAP_ROWS {
-        return Ok(None);
-    }
-    let long = run.end - run.start > CHECKED_ROWS;
-    let rows = match long.then(|| memoized(memo, &codes)).flatten() {
-        Some(rows) => rows,
-        None => {
-            let checked: Vec<usize> = order[prefix..]
-                .iter()
-                .copied()
-                .filter(|&slot| codes[slot].is_some())
-                .collect();
-            let mut kept = Vec::new();
-            let mut from = run.start;
-            while from < run.end {
-                let to = (from + GAP_BLOCK).min(run.end);
-                let mut block: Vec<u64> = (from..to).collect();
-                for (i, &slot) in checked.iter().enumerate() {
-                    if block.is_empty() {
-                        break;
-                    }
-                    // The first check reads the block's rows, still contiguous.
-                    let values = if i == 0 {
-                        read_codes(&columns[slot], from..to, source, session).await?
-                    } else {
-                        take_codes(&columns[slot], &block, source, session).await?
-                    };
-                    let code = codes[slot].expect("a checked slot is bound");
-                    block = block
-                        .iter()
-                        .zip(values.iter())
-                        .filter(|&(_, &value)| value == code)
-                        .map(|(&row, _)| row)
-                        .collect();
-                }
-                kept.extend_from_slice(&block);
-                from = to;
-            }
-            let rows: std::sync::Arc<[u64]> = kept.into();
-            if long {
-                memoize(memo, codes, &rows);
-            }
-            rows
-        }
-    };
-    let total = rows.len() as u64;
-    let w = window_of(total, offset, limit);
-    let window = &rows[w.start as usize..w.end as usize];
-    let columns = window_columns(&codes, columns, WindowRows::Ids(window), source, session).await?;
-    Ok(Some(LocatedCodes { total, columns }))
-}
 
 /// The positions `offset..offset + limit` of `total` matches, clamped to
 /// them (`None`: to the last).
@@ -740,45 +883,6 @@ fn window_of(total: u64, offset: usize, limit: Option<usize>) -> std::ops::Range
     let from = (offset as u64).min(total);
     let to = limit.map_or(total, |limit| from.saturating_add(limit as u64).min(total));
     from..to
-}
-
-/// A window's quad-table rows: a contiguous run of a sorted table, or the
-/// ascending rows a reference run and its checks kept.
-#[cfg(feature = "file-io")]
-enum WindowRows<'a> {
-    Run(std::ops::Range<u64>),
-    Ids(&'a [u64]),
-}
-
-/// The `(s, p, o, g)` code columns of a window's `rows` of a table whose
-/// columns (in those positions) are `columns`: a bound slot is its code
-/// repeated, a free one read from its chunk leaves ([`read_codes`],
-/// [`take_codes`]).
-#[cfg(feature = "file-io")]
-async fn window_columns(
-    codes: &[Option<TermCode>; 4],
-    columns: &[std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>; 4],
-    rows: WindowRows<'_>,
-    source: &std::sync::Arc<dyn vortex_layout::segments::SegmentSource>,
-    session: &vortex_session::VortexSession,
-) -> Result<[Buffer<TermCode>; 4]> {
-    let len = match &rows {
-        WindowRows::Run(run) => (run.end - run.start) as usize,
-        WindowRows::Ids(ids) => ids.len(),
-    };
-    let mut out: [Buffer<TermCode>; 4] = Default::default();
-    for (slot, column) in out.iter_mut().enumerate() {
-        *column = match (codes[slot], &rows) {
-            (Some(code), _) => vortex_buffer::BufferMut::full(code, len).freeze(),
-            (None, WindowRows::Run(run)) => {
-                read_codes(&columns[slot], run.clone(), source, session).await?
-            }
-            (None, WindowRows::Ids(ids)) => {
-                take_codes(&columns[slot], ids, source, session).await?
-            }
-        };
-    }
-    Ok(out)
 }
 
 /// Rows up to which a column is read value by value through its leaves'

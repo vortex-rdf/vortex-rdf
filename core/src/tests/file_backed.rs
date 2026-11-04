@@ -628,7 +628,9 @@ async fn test_locate_codes_matches_the_term_path() {
     for fixture in file_stores().await {
         check_code_patterns(&fixture).await;
     }
-    // A store without a term dictionary has no code patterns.
+    // A store without a term dictionary has no code patterns, streamed or
+    // not; a stream whose chunks would hold no row (`batch_rows` 0) is
+    // refused, whatever its pattern.
     let (_dir, path) = write_store_file(fixture_quads(), LayoutStrategy::Default, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let error = store
@@ -636,12 +638,64 @@ async fn test_locate_codes_matches_the_term_path() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("no term dictionary"), "{error}");
+    let error = store
+        .match_code_chunks(crate::CodePattern::default(), 7)
+        .await
+        .err()
+        .expect("no code stream without a dictionary");
+    assert!(error.to_string().contains("no term dictionary"), "{error}");
+    let stores = file_stores().await;
+    let store = &stores[0].store;
+    let past = store.dict_reader().unwrap().len() as TermCode + 7;
+    let nothing = crate::CodePattern::new(Some(past), None, None, None);
+    for pattern in [crate::CodePattern::default(), nothing] {
+        let error = store.match_code_chunks(pattern, 0).await.err();
+        assert!(error.is_some(), "{pattern:?}: batch_rows 0");
+    }
+}
+
+/// The rows [`match_code_chunks`](VortexRdfStore::match_code_chunks) streams
+/// for `pattern` in chunks of `batch` rows or fewer (none empty), in the
+/// stream's order.
+async fn streamed_codes(
+    store: &VortexRdfStore,
+    pattern: crate::CodePattern,
+    batch: usize,
+) -> Vec<[TermCode; 4]> {
+    let chunks: Vec<Vec<vortex_buffer::Buffer<TermCode>>> = store
+        .match_code_chunks(pattern, batch)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for chunk in &chunks {
+        assert_eq!(chunk.len(), 4, "the four code columns");
+        assert!(
+            (1..=batch).contains(&chunk[0].len()),
+            "a chunk of {} rows",
+            chunk[0].len()
+        );
+        rows.extend(code_rows::<4>(chunk));
+    }
+    rows
+}
+
+/// The rows of each block of a located run that `rec` saw read, before the
+/// block's checks.
+fn located_blocks(rec: &Recorder) -> Vec<u64> {
+    rec.picked(|event| match event {
+        Event::LocatedBlock(rows) => Some(*rows),
+        _ => None,
+    })
 }
 
 /// `count_code_pattern` and `match_code_pattern` answer every shape of a
 /// store's own codes as the term path does, whether a located run answers it
-/// or the general match: the count is the match's size, and pages cover its
-/// rows once. A code in a position its term kind cannot take, or past the
+/// or the general match: the count is the match's size, pages cover its rows
+/// once, and `match_code_chunks` streams the unwindowed match's rows in its
+/// order. A code in a position its term kind cannot take, or past the
 /// dictionary, matches nothing.
 async fn check_code_patterns(fixture: &FixtureStore) {
     use crate::{CodePattern, Probe};
@@ -702,6 +756,13 @@ async fn check_code_patterns(fixture: &FixtureStore) {
         }
         seen.sort_unstable();
         assert_eq!(seen, want, "{tag}: pages of {page}");
+        // Streamed: the unwindowed match's rows, in its order.
+        let whole = store.match_code_pattern(pattern, 0, None).await.unwrap();
+        assert_eq!(
+            streamed_codes(store, pattern, page).await,
+            code_rows::<4>(&whole),
+            "{tag}: chunks of {page}"
+        );
     }
     let kinds = dict.kind_ranges().await.unwrap();
     let mut nothing = vec![CodePattern::new(
@@ -727,15 +788,20 @@ async fn check_code_patterns(fixture: &FixtureStore) {
         assert_eq!(store.count_code_pattern(pattern).await.unwrap(), 0, "{tag}");
         let got = store.match_code_pattern(pattern, 0, None).await.unwrap();
         assert!(got.iter().all(|column| column.is_empty()), "{tag}");
+        assert!(
+            streamed_codes(store, pattern, 7).await.is_empty(),
+            "{tag}: streamed"
+        );
     }
 }
 
-/// A bound graph after a free slot over a run longer than the rows checked
-/// unmemoized: `(? p o g)`, one `(p, o)` run of 40,000 quads alternating
-/// between two graphs, on the copy index (its `posg` run, checked) and the
-/// reference index (a long reference run, checked), read in pages and
-/// counted, more than once and interleaved with another such pattern, as the
-/// term path answers it.
+/// A bound graph after a free slot over a run longer than `CHECKED_ROWS`:
+/// `(? p o g)`, one `(p, o)` run of 40,000 quads alternating between two
+/// graphs, on the copy index (its `posg` run, checked) and the reference
+/// index (a long reference run, checked), read in pages and counted, more
+/// than once and interleaved with another such pattern, as the term path
+/// answers it; and streamed, each row of the run read once, in the pages'
+/// order.
 #[tokio::test]
 async fn test_locate_codes_long_graph_bound_run() {
     if !crate::store::query::located::locate_enabled() {
@@ -792,8 +858,44 @@ async fn check_long_graph_bound_run(index: IndexConfig) {
                 seen.extend(code_rows::<4>(&got.columns));
                 offset += 4096;
             }
+            let paged = seen.clone();
             seen.sort_unstable();
             assert_eq!(seen, want);
+            // A window without its count checks the run only as far as its
+            // own rows; a count checks the whole run.
+            let rec = Recorder::start();
+            let first = store
+                .match_code_pattern(pattern, 0, Some(64))
+                .await
+                .unwrap();
+            let read: u64 = located_blocks(&rec).iter().sum();
+            assert!(
+                read < 40_000,
+                "a first page of 64 read {read} rows of the run"
+            );
+            assert_eq!(code_rows::<4>(&first), paged[..64], "the first page");
+            drop(rec);
+            let rec = Recorder::start();
+            assert_eq!(store.count_code_pattern(pattern).await.unwrap(), 20_000);
+            assert_eq!(located_blocks(&rec).iter().sum::<u64>(), 40_000, "a count");
+            drop(rec);
+            // Streamed in chunks that do not divide the run, which is read
+            // once, its rows in the pages' order.
+            for batch in [4096, 999] {
+                let rec = Recorder::start();
+                let streamed = streamed_codes(&store, pattern, batch).await;
+                let blocks = located_blocks(&rec);
+                assert_eq!(
+                    blocks.iter().sum::<u64>(),
+                    40_000,
+                    "batch {batch}: the run, once"
+                );
+                assert!(
+                    blocks.iter().all(|&rows| rows <= batch as u64),
+                    "batch {batch}"
+                );
+                assert_eq!(streamed, paged, "batch {batch}");
+            }
         }
     }
 }
@@ -804,11 +906,27 @@ async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], s
     let dict = store.dict_reader().unwrap();
     let all = row_list(store).await;
     let mut answered = std::collections::BTreeSet::new();
-    for quad in all.iter().step_by(step) {
+    for (k, quad) in all.iter().step_by(step).enumerate() {
         for mask in 1..16u8 {
             let slot = |i: usize| (mask & (1 << i) != 0).then_some(quad[i]);
             let pattern = CodePattern::new(slot(0), slot(1), slot(2), slot(3));
-            let Some(full) = store.locate_codes(pattern, 0, None).await.unwrap() else {
+            let located = store.locate_codes(pattern, 0, None).await.unwrap();
+            // A stream reads from the located run exactly when a window does:
+            // checked for a declined pattern where a run can answer, a mapped
+            // file, on its first eight quads, as the general match's stream
+            // costs a scan.
+            if located.is_none() && (!fixture.mapped() || k >= 8) {
+                continue;
+            }
+            let rec = Recorder::start();
+            let streamed = streamed_codes(store, pattern, 64).await;
+            let blocks = located_blocks(&rec);
+            drop(rec);
+            let Some(full) = located else {
+                assert!(
+                    blocks.is_empty(),
+                    "{tag} {pattern:?}: declined, yet streamed from a located run"
+                );
                 continue;
             };
             answered.insert(mask);
@@ -842,6 +960,27 @@ async fn check_locate_codes(tag: &str, fixture: &FixtureStore, quads: &[Quad], s
             let mut located: Vec<[TermCode; 4]> = code_rows(&full.columns);
             located.sort_unstable();
             assert_eq!(located, want, "{tag}: rows");
+            // Streamed from the run: the lookup's rows in its order, in
+            // chunks of 64, and of one and of three on a small match (a block
+            // a row is a read a row).
+            assert!(
+                !blocks.is_empty(),
+                "{tag}: not streamed from the located run"
+            );
+            assert_eq!(
+                streamed,
+                code_rows::<4>(&full.columns),
+                "{tag}: chunks of 64"
+            );
+            if full.total <= 64 {
+                for batch in [1usize, 3] {
+                    assert_eq!(
+                        streamed_codes(store, pattern, batch).await,
+                        code_rows::<4>(&full.columns),
+                        "{tag}: chunks of {batch}"
+                    );
+                }
+            }
             for page in [1usize, 3, 64] {
                 let mut seen = Vec::new();
                 let mut offset = 0;
