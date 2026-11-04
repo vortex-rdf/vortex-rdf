@@ -88,8 +88,8 @@ After the timed runs, each suite makes `BENCH_MEMORY_RUNS` memory runs per adapt
 1. checks its counters: it holds an 8 MiB block and requires each counter to see it, so a counter that misses memory fails the run instead of reporting 0. Java's native counter must see at least 7 MiB of the block, since the JVM's own threads allocate natively during the check; every other counter sees all 8 MiB. A run that fails the check exits non-zero, naming the counter;
 2. takes a baseline before the store exists;
 3. obtains the store the way the timed queries use it, which the entry's `obtained` records: `mapped` (memory-mapped from its file), `loaded` (read from a file into memory), `built` (from the triples) or `opened` (an on-disk database);
-4. reads every probe pattern the adapter answers, and the full scan where the suite reads one, once;
-5. reads its figures, disposes the store, and reads them again.
+4. reads every probe pattern the adapter answers, the full scan included, once;
+5. reads its figures, disposes the store (the JS suite says "frees"), and reads them again.
 
 The figures are in MiB to one decimal, clamped at 0, and `null` where one does not apply:
 
