@@ -247,13 +247,33 @@ class WorkerTest {
 	}
 
 	/**
-	 * A store kept in the heap holds what it keeps there, so its figure does not follow the heap limit as a peak
-	 * does. That includes data its library leaves reachable from the querying thread after the store is gone, as
-	 * Jena's in-memory dataset does through a thread-local it never clears.
+	 * Store is read on a store no read has touched: what the reads cache in the store, and what the adapter keeps
+	 * from its first open and from every read after the dispose, are not in it.
 	 */
 	@Test
-	void theStoreFigureIncludesHeapDataPinnedToTheQueryingThread() throws Exception {
-		long store = figure(memoryRun(ListAdapter.inMemory("pinned").holding(64 << 20, 0).pinnedToTheQueryingThread()),
+	void theStoreFigureLeavesOutWhatTheReadsAndTheFirstOpenLeaveBehind() throws Exception {
+		Map<String, Object> r = memoryRun(
+				ListAdapter.inMemory("reads").holding(32 << 20, 0).cachingOnRead(2 << 20).leaking(8 << 20, 1 << 20));
+
+		assertTrue(Math.abs(figure(r, "storeBytes") - (32L << 20)) < 2L << 20, r.toString());
+	}
+
+	/** A store that locks its files opens a second time only after the first is disposed. */
+	@Test
+	void aMemoryRunOfAStoreThatLocksItsFilesSucceeds() throws Exception {
+		Map<String, Object> r = memoryRun(ListAdapter.exclusive("locked"));
+
+		assertEquals(Fixture.MATCHES, r.get("counts"));
+	}
+
+	/**
+	 * A store kept in the heap holds what it keeps there, so its figure does not follow the heap limit as a peak
+	 * does. That includes data its library leaves reachable from the thread that opened it after the store is gone,
+	 * as Jena's in-memory dataset does through a thread-local it never clears.
+	 */
+	@Test
+	void theStoreFigureIncludesHeapDataPinnedToTheThreadThatOpenedIt() throws Exception {
+		long store = figure(memoryRun(ListAdapter.inMemory("pinned").holding(64 << 20, 0).pinnedToItsThreads()),
 				"storeBytes");
 
 		assertTrue(store >= 64L << 20 && store < 80L << 20, "store " + store);

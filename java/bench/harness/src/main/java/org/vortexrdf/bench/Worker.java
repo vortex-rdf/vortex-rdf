@@ -68,11 +68,12 @@ public final class Worker {
 	}
 
 	/**
-	 * The memory role: what one store holds, measured in a JVM of its own. It opens the store the query role built,
-	 * reads every pattern once, then disposes the store, and reports the counts it read and three figures in bytes:
-	 * {@code storeBytes}, the heap and native memory ({@link Footprint}) that disposing the store released, read after
-	 * the reads and again after the dispose; and {@code peakAnonBytes} and {@code peakFileBytes}, the highest
-	 * {@link Rss} sample during the reads, above a baseline read before the open. It first checks that both counters
+	 * The memory role: what one store holds, measured in a JVM of its own. It opens the store the query role built and
+	 * disposes it before any read, then opens it again, reads every pattern once and disposes it, and reports the
+	 * counts it read and three figures in bytes: {@code storeBytes}, the live bytes right after the store is obtained
+	 * minus those after its dispose ({@link Footprint}), on a store no read has touched, so it leaves out the caches
+	 * reads fill; and {@code peakAnonBytes} and {@code peakFileBytes}, the highest {@link Rss} sample during the
+	 * reads, above a baseline read before the first open. It first checks that both counters
 	 * see a block held ({@link #selfCheck}). Any error is thrown, so the JVM exits non-zero.
 	 */
 	public static Map<String, Object> memory(Adapter<?, ?> a, WorkerFiles f, Path workdir) throws Exception {
@@ -360,8 +361,8 @@ public final class Worker {
 	}
 
 	/**
-	 * The memory role ({@link #memory}). The store lives its whole life on a thread of its own, as the query role's
-	 * warm handle does, so a thread-local its library leaves holding the store's data dies with the thread, and what
+	 * The memory role ({@link #memory}). Each of the two stores lives its whole life on a thread of its own, as the query
+	 * role's warm handle does, so a thread-local its library leaves holding the store's data dies with the thread, and what
 	 * it held counts as the store's.
 	 */
 	private static final class Memory<H, Q> {
@@ -393,9 +394,14 @@ public final class Worker {
 			// Sampled for its collection: the baseline holds no garbage.
 			Footprint.sample();
 			Rss base = Rss.read();
-			Footprint held = onItsOwnThread(() -> read(prepared));
-			// The store and its thread are gone: what they held is what this sample no longer finds.
-			Footprint store = held.minus(Footprint.sample());
+			// The first store is opened and disposed before any read: it holds nothing a read left behind. Its thread is
+			// gone: what it held is what this sample no longer finds.
+			Footprint opened = onItsOwnThread(this::opened);
+			Footprint store = opened.minus(Footprint.sample());
+			onItsOwnThread(() -> {
+				read(prepared);
+				return null;
+			});
 
 			Map<String, Object> out = new LinkedHashMap<>();
 			out.put("slug", a.slug());
@@ -411,12 +417,30 @@ public final class Worker {
 		}
 
 		/**
-		 * Open the store, read every pattern once under a {@link Rss.Sampler}, and sample what the process holds with
-		 * the store still open; then dispose it.
+		 * Open the store, sample what the process holds with it open, and dispose it, before any read. The sample's
+		 * collection drops the build's garbage, so its reading is the store as opened.
 		 */
-		private Footprint read(Map<String, Q> prepared) throws Exception {
+		private Footprint opened() throws Exception {
 			H handle = a.open(src, location);
-			Footprint held;
+			Footprint opened;
+			try {
+				opened = Footprint.sample();
+			} catch (Throwable t) {
+				// The sample's error is the run's: one the dispose adds after it rides along, rather than hiding it.
+				try {
+					a.dispose(handle);
+				} catch (Throwable suppressed) {
+					t.addSuppressed(suppressed);
+				}
+				throw t;
+			}
+			a.dispose(handle);
+			return opened;
+		}
+
+		/** Open the store again, read every pattern once under a {@link Rss.Sampler}, and dispose it. */
+		private void read(Map<String, Q> prepared) throws Exception {
+			H handle = a.open(src, location);
 			try {
 				// Sampled for its collection: an open that builds its store leaves the build's garbage behind.
 				Footprint.sample();
@@ -427,7 +451,6 @@ public final class Worker {
 					}
 				}
 				peak = sampler.peak();
-				held = Footprint.sample();
 			} catch (Throwable t) {
 				// The read's error is the run's: one the dispose adds after it rides along, rather than hiding it.
 				try {
@@ -438,7 +461,6 @@ public final class Worker {
 				throw t;
 			}
 			a.dispose(handle);
-			return held;
 		}
 	}
 

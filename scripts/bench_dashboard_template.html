@@ -842,14 +842,13 @@
       The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
       (3 by default) fresh JVMs per adapter, each on that adapter's own <em>classpath</em>, after the timed
       runs.
-      Each run opens the store, reads every pattern once as the timed cells do, and disposes it.
-      <em>Store</em> is the live memory that disposing the store released, read after the reads, so it includes the caches they filled. For Java, Store is the heap used after a full collection, plus glibc's bytes in use, minus the JVM's own allocations as Native Memory Tracking reports them. A store held in the heap has a process-memory peak that follows the heap limit (the provenance line lists it) and the collector, so Store is the figure to compare. The two Peak columns are <span class="mono">RssAnon</span> (process memory) and <span class="mono">RssFile</span>
+      Each run first opens the store and disposes it before any read: <em>Store</em> is the live memory that dispose released, so it leaves out the caches reads fill. The run then opens the store again, the same way, and reads every pattern once as the timed cells do. For Java, Store is the heap used after a full collection, plus glibc's bytes in use, minus the JVM's own allocations as Native Memory Tracking reports them. A store held in the heap has a process-memory peak that follows the heap limit (the provenance line lists it) and the collector, so Store is the figure to compare. The two Peak columns are <span class="mono">RssAnon</span> (process memory) and <span class="mono">RssFile</span>
       (mapped pages) at the highest 2 ms sample during the reads, above the baseline taken before
-      the open. HDT, LMDB and TDB2 files count as mapped pages. A store held in memory shows only the program's own code pages that the open and reads first touched, which also count as mapped pages: a few MB to a
+      the first open. HDT, LMDB and TDB2 files count as mapped pages. A store held in memory shows only the program's own code pages that the open and reads first touched, which also count as mapped pages: a few MB to a
       few tens of MB depending on the library, the same for a library's file and in-memory rows, so
       a pair's gap is the file's own pages. Jena TIM and RDF4J's MemoryStore rebuild from the
       N-Quads file inside each memory process, so their peaks include memory the JVM kept from the
-      build. The query runs' peak RSS is no longer shown, but stays
+      builds. The query runs' peak RSS is no longer shown, but stays
       in the results file and still drives the memory-pressure warning. On-disk size is the artifact
       the build left, counted in allocated blocks, listed only for the stores that write one. Lower
       is better in both tables.
