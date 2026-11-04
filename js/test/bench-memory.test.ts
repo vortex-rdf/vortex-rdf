@@ -5,11 +5,11 @@ import { SELF_CHECK_BYTES, checkCounter, memoryRunFigures, settleRounds, wasmCou
 const MiB = 1048576;
 
 describe('memoryRunFigures', () => {
-    test('memoryRunFigures takes each store as held after the reads minus disposed, and the peak above the baseline', () => {
+    test('memoryRunFigures takes each store as opened minus disposed, and the peak above the baseline', () => {
         expect(memoryRunFigures({
             baseline: 100 * MiB,
-            built: { held: 123.25 * MiB, disposed: 100 * MiB },
-            loaded: { held: 117 * MiB, disposed: 100.5 * MiB },
+            built: { opened: 123.25 * MiB, disposed: 100 * MiB },
+            loaded: { opened: 117 * MiB, disposed: 100.5 * MiB },
             probeTotals: [110 * MiB, 131 * MiB, 125 * MiB],
         })).toEqual({ storeBuiltMb: 23.3, storeLoadedMb: 16.5, peakLiveMb: 31 });
     });
@@ -18,16 +18,16 @@ describe('memoryRunFigures', () => {
         expect(memoryRunFigures({
             baseline: 100 * MiB,
             built: null,
-            loaded: { held: 117 * MiB, disposed: 100.5 * MiB },
+            loaded: { opened: 117 * MiB, disposed: 100.5 * MiB },
             probeTotals: [],
         })).toEqual({ storeBuiltMb: null, storeLoadedMb: 16.5, peakLiveMb: null });
     });
 
-    test('memoryRunFigures clamps a store held below its disposed reading, and a peak below the baseline, at 0', () => {
+    test('memoryRunFigures clamps a store opened below its disposed reading, and a peak below the baseline, at 0', () => {
         expect(memoryRunFigures({
             baseline: 100 * MiB,
-            built: { held: 99 * MiB, disposed: 100 * MiB },
-            loaded: { held: 100 * MiB, disposed: 100.25 * MiB },
+            built: { opened: 99 * MiB, disposed: 100 * MiB },
+            loaded: { opened: 100 * MiB, disposed: 100.25 * MiB },
             probeTotals: [90 * MiB, 99.5 * MiB],
         })).toEqual({ storeBuiltMb: 0, storeLoadedMb: 0, peakLiveMb: 0 });
     });

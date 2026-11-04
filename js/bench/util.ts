@@ -438,9 +438,10 @@ export async function settleRounds(round: () => Promise<void>, live: () => numbe
     }
 }
 
-/** One store's two live-byte readings, each taken after settling: `held`
- *  after the reads, before the dispose, and `disposed` after it. */
-export interface StoreReadings { held: number; disposed: number }
+/** One store's two live-byte readings, each taken after settling: `opened`
+ *  right after the store was obtained, before any read, and `disposed` after
+ *  its free. */
+export interface StoreReadings { opened: number; disposed: number }
 
 /** One memory run's figures, in MiB: the store built from the triples, the
  *  store loaded from a file, and the read peak, each null where the run did
@@ -448,7 +449,7 @@ export interface StoreReadings { held: number; disposed: number }
 export interface JsMemoryRun { storeBuiltMb: number | null; storeLoadedMb: number | null; peakLiveMb: number | null }
 
 /** A memory run's figures from its readings, in live bytes: each store is
- *  what its dispose released after the reads, and the peak is the highest
+ *  what its free released on a store no read had touched, and the peak is the highest
  *  probe total above the baseline. A missing input gives null, and every
  *  figure is clamped at 0, since allocator noise can make a difference
  *  negative. */
@@ -456,7 +457,7 @@ export function memoryRunFigures(r: {
     baseline: number; built: StoreReadings | null; loaded: StoreReadings | null; probeTotals: number[];
 }): JsMemoryRun {
     const mb = (bytes: number) => mib1(Math.max(0, bytes));
-    const store = (s: StoreReadings | null) => (s ? mb(s.held - s.disposed) : null);
+    const store = (s: StoreReadings | null) => (s ? mb(s.opened - s.disposed) : null);
     return {
         storeBuiltMb: store(r.built),
         storeLoadedMb: store(r.loaded),

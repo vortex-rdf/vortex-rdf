@@ -358,19 +358,22 @@ let held: unknown = null;
  * `heapUsed` after a collection; rdf-stores has no wasm module, so the JS heap
  * alone. Both counters must first see an 8 MiB block held, or the run throws
  * and the worker exits 1. The store is obtained as `a.obtained` says (built
- * from the flattened dataset, which is then dropped, or hdt's file loaded),
- * read once per probe and full scan, the counts recorded, then disposed. Each
- * reading is taken after `settle(live)`, whose rounds of collection and an
- * event-loop turn repeat until one frees less than 1 MiB, so the finalizers a
- * dispose or a read left behind have run. A built store with a persistent
- * form (Vortex) is then measured again as `fromBytes` loads it, from the bytes
- * `toBytes()` gave before the built store was freed, after the same reads,
- * whose counts must be the built store's. A failed dispose, or a loaded store
- * that counts other rows, throws as a failed self-check does.
+ * from the flattened dataset, which is passed inline so nothing keeps it
+ * alive, or hdt's file loaded), measured and freed before any read; a second
+ * store obtained the same way is then read once per probe and full scan, the
+ * counts recorded, and freed. Each reading is taken after `settle(live)`,
+ * whose rounds of collection and an event-loop turn repeat until one frees
+ * less than 1 MiB, so the finalizers a free or a read left behind have run. A
+ * built store with a persistent form (Vortex) is also measured as `fromBytes`
+ * loads it, from the bytes `toBytes()` gave before the second store was
+ * freed, then loaded again and given the same reads, whose counts must be the
+ * built store's. A failed free, or a loaded store that counts other rows,
+ * throws as a failed self-check does.
  *
- * - Store: live bytes after the reads minus live bytes after the dispose, so
- *   it includes the caches the reads filled (Vortex's term cache, and a built
- *   Vortex store's decoded code columns).
+ * - Store: live bytes right after the store is obtained minus those after its
+ *   free, on a store no read has touched, so it leaves out the caches reads
+ *   fill (Vortex's term cache, and a built Vortex store's decoded code
+ *   columns).
  * - Peak: per probe, the counter's peak reset, the read, a collection, then
  *   the counter's peak plus `heapUsed`; the highest above the baseline. A
  *   collected result (oxigraph) is held until that reading; a streaming
@@ -385,9 +388,18 @@ async function runMemory(a: StoreAdapter): Promise<JsMemoryRun> {
     const live = () => heapUsedBytes() + (counter?.stats().liveBytes ?? 0);
     await settle(live);
     const baseline = live();
-    let input: Quad[] | null = inputFor(a);
-    let h: unknown = await a.build(input); // built, or hdt's file loaded
-    input = null;
+    // Store: a store of its own, obtained and freed before any read, so it
+    // holds no cache a read fills. Not through `reclaim`, which swallows a
+    // failed free(): that would leave Store at about 0, so it fails the run.
+    let h: unknown = await a.build(inputFor(a)); // built, or hdt's file loaded
+    await settle(live);
+    const opened = live();
+    a.dispose?.(h);
+    h = null;
+    await settle(live);
+    const first: StoreReadings = { opened, disposed: live() };
+    // The reads, on a second store obtained the same way.
+    h = await a.build(inputFor(a));
     await settle(live);
     const probeTotals: number[] = [];
     for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) {
@@ -400,20 +412,24 @@ async function runMemory(a: StoreAdapter): Promise<JsMemoryRun> {
         held = null;
     }
     await settle(live);
-    const afterReads = live(); // the store, read after the reads
     const loads = a.obtained === 'built' && !!a.snapshot && !!a.open; // Vortex
     let bytes: unknown = loads ? await a.snapshot!(h) : null; // before the free
-    // Not through `reclaim`, which swallows a failed free(): that would leave
-    // Store at about 0, so it fails the run instead.
     a.dispose?.(h);
     h = null;
     await settle(live);
-    const first: StoreReadings = { held: afterReads, disposed: live() };
     let loaded: StoreReadings | null = a.obtained === 'loaded' ? first : null;
     if (loads) {
+        // The loaded store as `fromBytes` gives it, measured before any read.
         let l: unknown = await a.open!(bytes);
+        await settle(live);
+        const lOpened = live();
+        a.dispose?.(l);
+        l = null;
+        await settle(live);
+        loaded = { opened: lOpened, disposed: live() };
+        // Then the same reads, which must count the built store's rows.
+        l = await a.open!(bytes);
         bytes = null;
-        // The same reads, which must count the built store's rows.
         for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) {
             const rows = await a.countMatch(l, p);
             if (rows !== matched[p.name]) {
@@ -422,12 +438,7 @@ async function runMemory(a: StoreAdapter): Promise<JsMemoryRun> {
                     + `the built store ${matched[p.name]}`);
             }
         }
-        await settle(live);
-        const lHeld = live();
         a.dispose?.(l);
-        l = null;
-        await settle(live);
-        loaded = { held: lHeld, disposed: live() };
     }
     return memoryRunFigures({ baseline, built: a.obtained === 'built' ? first : null, loaded, probeTotals });
 }

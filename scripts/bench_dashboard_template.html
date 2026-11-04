@@ -567,9 +567,10 @@
     </div>
     <p class="group-desc">
       The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
-      (3 by default) fresh processes per adapter, after the timed runs. Each run opens the store,
-      reads every pattern once as the timed cells do, and disposes it. <em>Store</em> is the live
-      memory that disposing the store released, read after the reads, so it includes the caches they filled.
+      (3 by default) fresh processes per adapter, after the timed runs. Each run first builds or loads the store
+      and frees it before any read: <em>Store</em> is the live memory that free released, so it leaves out
+      the caches reads fill. The run then builds or loads the store again, the same way, and reads every
+      pattern once as the timed cells do.
       There is one Store column per method, so each compares like with like: built (Vortex,
       oxigraph, rdf-stores) and loaded (Vortex <span class="mono">fromBytes</span>, hdt). The Peak column counts live bytes, not RSS, because wasm memory never shrinks: the module's counter (compiled into the benchmark's builds only) plus the JS heap after GC. It is measured after each pattern's read, on the store the timed cells use, and leaves out a streaming read's current chunk. oxigraph's binding has
       no streaming read (<span class="mono">match()</span> returns an array), so its peak holds a
