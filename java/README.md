@@ -112,11 +112,11 @@ if (name != VortexRdfStore.NONE) {                            // the store holds
 
 `matchCodes` fills a reusable, writable direct buffer with `(s, p, o, g)` codes, four longs per row, from its start.
 
-- A long match is read in windows by passing the offset. Every window of one pattern comes in the same row order.
-- `matchCodeChunks` reads a whole match into the same kind of buffer, the next rows each call, with no offset to keep; close it, or drain it, when done.
+- A match can be read in windows by passing the offset. Every window of one pattern comes in the same row order, but each call finds its window anew.
+- `matchCodeChunks` reads a whole match into the same kind of buffer, the next rows each call, with no offset to keep, and reads each row once; close it, or drain it, when done. Read a long match this way rather than in windows.
 - A pattern that cannot match gives no rows, not an error: a code past the dictionary, or a literal in the subject position.
 
-When a file store can locate the pattern's rows by binary search (a prefix of the quad table's `(s, p, o, g)` order, or with `secondary-by-copy` the predicate- and object-led orders), a code lookup is one located run with no dictionary search; it takes the general path otherwise, and returns the same rows.
+When a file store can locate the pattern's rows by binary search (a prefix of the quad table's `(s, p, o, g)` order, or with `secondary-by-copy` the predicate- and object-led orders), a code lookup is one located run with no dictionary search; it takes the general path otherwise, and returns the same rows. A pattern with a bound slot past the located prefix (a bound graph after a free position) checks the run's rows against it: every `matchCodes` window checks the run again from its start as far as its own rows, while `matchCodeChunks` checks each row once, as it reads it.
 
 For measurements, two switches are read once when the native library loads: `VORTEX_RDF_LOCATE=0` makes every code lookup take the general path, and `VORTEX_RDF_COUNTERS=1` makes `VortexRdfStore.engineCounters()` count the encoded-search work (leaves searched encoded or decoded, probes, gathers, equality scans; all zero without it).
 
