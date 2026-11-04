@@ -35,6 +35,7 @@
 //! file-backed store reads that plus its file's touched pages. Every figure is
 //! clamped at 0. A query entry's `peakRssMb` stays the timed process's `VmHWM`,
 //! which still drives the memory-pressure warning.
+//! `BENCH_MEMORY_RUNS=0` runs no memory children and writes no memory entries.
 //!
 //! # Libraries
 //!
@@ -1794,6 +1795,7 @@ fn main() {
     let mut memory: Vec<serde_json::Value> = Vec::new();
     let mut counts_by_slug: BTreeMap<String, serde_json::Value> = Default::default();
     let mut warnings: Vec<String> = Vec::new();
+    let memory_on = memory_runs() >= 1;
 
     for a in adapters() {
         eprintln!("\n== {} ==", a.label());
@@ -1808,10 +1810,12 @@ fn main() {
             // Carry on: a partial tab beats no tab, and the missing rows are
             // visible as absent cells rather than as silently wrong ones.
             eprintln!("!! {} failed ({}), skipping", a.label(), out.status);
-            // The adapter keeps its memory row, reading "—": every adapter has an
-            // entry. No memory child runs, with no query counts to compare against
-            // and an artifact that may be missing.
-            memory.push(memory_entry(a.slug(), a.label(), a.obtained(), Vec::new()));
+            // With memory runs on, the adapter keeps its memory row, reading "—":
+            // every adapter has an entry. No memory child runs, with no query
+            // counts to compare against and an artifact that may be missing.
+            if memory_on {
+                memory.push(memory_entry(a.slug(), a.label(), a.obtained(), Vec::new()));
+            }
             continue;
         }
         let parsed: serde_json::Value =
@@ -1828,10 +1832,13 @@ fn main() {
             "peakRssMb": parsed["peak_rss_mb"],
         }));
         counts_by_slug.insert(a.slug().to_string(), parsed["counts"].clone());
-        // Even with no run to show, the entry stays: the page then reads "—"
-        // for the adapter rather than dropping its row.
-        let runs = run_memory_children(&exe, a.as_ref(), n, &parsed["counts"], &mut warnings);
-        memory.push(memory_entry(a.slug(), a.label(), a.obtained(), runs));
+        // With memory runs on, the entry stays even with no run to show: the page
+        // reads "—" for the adapter rather than dropping its row. With
+        // BENCH_MEMORY_RUNS=0 there are none, so the page keeps the query-peak table.
+        if memory_on {
+            let runs = run_memory_children(&exe, a.as_ref(), n, &parsed["counts"], &mut warnings);
+            memory.push(memory_entry(a.slug(), a.label(), a.obtained(), runs));
+        }
     }
 
     // Every adapter queried the same dataset with the same probes, so their counts
