@@ -1486,10 +1486,15 @@ datatype, a lexical form its numeric datatype's grammar rejects) is a type
 error, so it fails; `=` and `!=` leave such a literal undecided. A value an
 engine may hold apart from the spec is undecided under every operator: one
 outside its integer type's range, an integer past 64 bits, a decimal past 18
-fractional digits, `INF`, `NaN` and the other spellings of a special float,
-an integer from 2^53 on against a float or a double, and a decimal of more
-than 15 significant digits against one. A definite verdict is also the one
-Oxigraph gives. The other kinds follow rdflib 7.6 where it reads a term in its
+fractional digits or of magnitude about 1.7 × 10^20 or more (Oxigraph's
+limits), `INF`, `NaN` and the other spellings of a special float, and a float
+lexical form past its type's range. So is an integer (or a decimal without a
+fraction) from 2^53 on against a float or a double, a decimal with a fraction
+and more than 15 significant digits against one, and a decimal against a
+float where rounding it once (as the spec does) and through a double (as
+Oxigraph does) give different verdicts; a constant past 64 bits or 18
+fractional digits leaves every number undecided. A definite verdict is also
+the one Oxigraph gives. The other kinds follow rdflib 7.6 where it reads a term in its
 own way. The rules are in the
 [`predicates`](../core/src/store/layouts/dictionary/predicates/mod.rs) module,
 its [`numeric.rs`](../core/src/store/layouts/dictionary/predicates/numeric.rs)

@@ -273,11 +273,12 @@ impl Num {
         }
     }
 
-    /// Whether every engine holds this value as the spec does: an integer
+    /// Whether Oxigraph holds this value as the spec does: an integer
     /// within 64 bits, a decimal of at most 18 fractional digits whose
-    /// multiple of 10^-18 is within `i128`, or a float. These are
-    /// Oxigraph's own models: past them it raises an error, and XSD lets an
-    /// engine support no more (its minimum is 16 digits).
+    /// multiple of 10^-18 is within `i128` (a magnitude below about
+    /// 1.7 × 10^20), or a float. These are Oxigraph's own models: past them
+    /// it raises an error, and XSD lets an engine support no more (its
+    /// minimum is 16 digits).
     fn decided(self) -> bool {
         match self {
             Num::Int(i) => i64::try_from(i).is_ok(),
@@ -343,8 +344,8 @@ fn compare_exact(a: Num, b: Num) -> Option<Ordering> {
     Some(xa.cmp(&xb))
 }
 
-/// The double an integer or a decimal promotes to, where every engine
-/// computes the same one: an integer below 2^53, an exact double, or a
+/// The double an integer or a decimal promotes to, where the spec and
+/// Oxigraph compute the same one: an integer below 2^53, an exact double, or a
 /// decimal of at most 15 significant digits, whose mantissa and power of
 /// ten are exact doubles, so that dividing one by the other rounds their
 /// quotient once, to the nearest double, as the spec does. Oxigraph
@@ -394,7 +395,8 @@ fn halfway_between_floats(x: f64) -> bool {
 
 /// What a literal is to a numeric comparison.
 enum Operand {
-    /// A number of the model, in the range every engine decides alike.
+    /// A number of the model, in the range the spec and Oxigraph decide
+    /// alike.
     Number(Num),
     /// No numeric value: a literal of a non-numeric datatype (a string, a
     /// language-tagged literal, a boolean, a datatype outside XSD), or one
@@ -488,10 +490,12 @@ impl Number {
                 Some([p, q]) if op.apply(p) == op.apply(q) => op.apply(p),
                 _ => Verdict::Unknown,
             },
-            // `=` and `!=` fall back to term equality, which the spec makes
-            // a type error between two literals that are not the same term;
-            // Oxigraph, knowing both datatypes, answers that the terms
-            // differ instead. The engine decides.
+            // `=` and `!=` fall back to RDF term equality, which the spec
+            // makes a type error between two literals that are not the same
+            // term, and which an extended engine may answer instead (§17.3.1
+            // lets it replace a type error with a value). Oxigraph does for
+            // datatypes it knows: the terms differ, so `!=` holds there. The
+            // engine decides.
             Operand::NoValue if op.is_equality() => Verdict::Unknown,
             // No operator orders a number against a non-number: a type
             // error.

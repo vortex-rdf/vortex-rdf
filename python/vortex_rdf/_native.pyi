@@ -135,14 +135,22 @@ class TermDict:
         another datatype, or a lexical form its numeric datatype's grammar
         rejects) is a type error, so it fails; ``num_eq`` and ``num_ne``
         leave such a literal undecided. A non-literal fails every numeric
-        kind but ``num_ne``, which it passes. A value an engine may hold
-        apart from the spec is undecided under every numeric kind: one
-        outside its integer type's range, an integer past 64 bits, a decimal
-        past 18 fractional digits, a special float (``INF``, ``NaN``, and
-        spellings such as ``inf``), an integer from 2**53 on against a float
-        or a double, and a decimal of more than 15 significant digits
-        against one; a constant past those ranges leaves every number
-        undecided. Every definite verdict is the one Oxigraph gives.
+        kind but ``num_ne``, which it passes.
+
+        A value an engine may hold apart from the spec is undecided under
+        every numeric kind: one outside its integer type's range, an integer
+        past 64 bits, a decimal past 18 fractional digits or of magnitude
+        about 1.7e20 or more (Oxigraph's limits), a special float (``INF``,
+        ``NaN``, and spellings such as ``inf``), and a float lexical form
+        past its type's range. So is an integer (or a decimal without a
+        fraction) from 2**53 on against a float or a double, a decimal with
+        a fraction and more than 15 significant digits against one, and a
+        decimal against a float where rounding it once (as the spec does)
+        and through a double (as Oxigraph does) give different verdicts. A
+        constant past 64 bits or 18 fractional digits leaves every number
+        undecided; one past 128 bits, or no value of its datatype (such as
+        ``"300"^^xsd:byte`` or ``"INF"^^xsd:double``), raises ``ValueError``.
+        Every definite verdict is the one Oxigraph gives.
 
         Other kinds: ``is_literal``, ``is_iri``, ``is_blank``, ``datatype``,
         ``lang``, ``lang_matches``. ``lang_matches`` is BCP 47 basic
