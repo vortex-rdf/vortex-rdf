@@ -80,6 +80,7 @@ fn memory_run_clamps_negative_differences_to_zero() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "reads /proc/self/status")]
 fn sampler_sees_a_block_held_when_it_finishes() {
     let base = read_rss();
     let sampler = Sampler::start();

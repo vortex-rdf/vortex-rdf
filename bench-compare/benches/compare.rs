@@ -21,14 +21,18 @@
 //!
 //! After an adapter's query child, the parent runs `BENCH_MEMORY_RUNS` (default 3,
 //! `0` for none) memory children of that adapter, each a process of its own
-//! (`--adapter <slug> --role memory`) over the artifact the query child built. A
-//! child opens the store as `Adapter::obtained` says (mapped, loaded, built or
-//! opened), reads every probe once with the consuming read under a sampler of
-//! `/proc/self/status` every 2 ms, then disposes of the store. Store is the live
+//! (`--adapter <slug> --role memory`). A child opens its store the way
+//! `Adapter::obtained` says (mapped, loaded, built or opened), from the artifact or
+//! source the query child used, reads each probe the adapter answers once with the
+//! consuming read under a sampler of `/proc/self/status` every 2 ms, then
+//! disposes of the store. Store is the live
 //! bytes (the counting allocator, plus glibc's `mallinfo2` for C and C++
 //! allocations) after the reads minus those after the dispose, so it includes the
 //! caches the reads filled. The two peaks are the sample with the highest
-//! `RssAnon + RssFile`, less the baseline taken before the open. Every figure is
+//! `RssAnon + RssFile`, less the baseline taken before the open. Mapped pages
+//! include the program's own code pages that the open and the reads first touch, a
+//! few MB on every row: an in-memory store reads a few MB of file peak, and a
+//! file-backed store reads that plus its file's touched pages. Every figure is
 //! clamped at 0. A query entry's `peakRssMb` stays the timed process's `VmHWM`,
 //! which still drives the memory-pressure warning.
 //!
@@ -1632,10 +1636,17 @@ fn self_check() {
     use std::alloc::{GlobalAlloc, Layout, System};
     let layout = Layout::from_size_align(64 << 10, 16).unwrap();
     let before = glibc_live_bytes();
-    // SAFETY: the layout is non-zero-sized; each block is freed with the same layout.
+    // SAFETY: the layout is non-zero-sized; a null result is checked before use,
+    // and each block is freed with the same layout.
     let blocks = std::hint::black_box(
         (0..128)
-            .map(|_| unsafe { System.alloc(layout) })
+            .map(|_| {
+                let b = unsafe { System.alloc(layout) };
+                if b.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                b
+            })
             .collect::<Vec<_>>(),
     );
     check("mallinfo2 uordblks + hblkhd", glibc_live_bytes() - before);
@@ -1717,8 +1728,16 @@ fn run_memory_children(
             );
             break;
         }
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&out.stdout).expect("memory child emitted invalid JSON");
+        let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "!! {} memory run {k} failed (unreadable output: {e}), stopping its memory runs",
+                    a.label()
+                );
+                break;
+            }
+        };
         if parsed["counts"] != *query_counts {
             warnings.push(format!(
                 "{}: memory run {k} matched {}, its query run {query_counts}",
