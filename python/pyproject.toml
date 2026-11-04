@@ -39,6 +39,7 @@ Issues = "https://github.com/vortex-rdf/vortex-rdf/issues"
 # Python package as the private module `vortex_rdf._native`.
 module-name = "vortex_rdf._native"
 python-source = "."
+features = ["arrow"]
 
 [tool.uv]
 # The extension must be rebuilt when the Rust sources change — the binding
