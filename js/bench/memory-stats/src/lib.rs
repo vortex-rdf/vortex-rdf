@@ -205,7 +205,9 @@ mod tests {
             assert_eq!(live_bytes(), start + MIB as i64);
             let b = a.realloc(b, at(MIB), 3 * MIB);
             assert_eq!(live_bytes(), start + 3 * MIB as i64);
-            a.dealloc(b, at(3 * MIB));
+            let b = a.realloc(b, at(3 * MIB), MIB);
+            assert_eq!(live_bytes(), start + MIB as i64);
+            a.dealloc(b, at(MIB));
             let z = a.alloc_zeroed(at(MIB));
             assert_eq!(*z, 0);
             a.dealloc(z, at(MIB));
@@ -214,8 +216,34 @@ mod tests {
             (live_bytes(), peak_live_bytes()),
             (start, start + 3 * MIB as i64)
         );
+
+        // A failed allocation or reallocation changes nothing.
+        let failing = CountingAlloc(Failing);
+        unsafe {
+            assert!(failing.alloc(at(MIB)).is_null());
+            assert_eq!(live_bytes(), start);
+            // `Failing::realloc` never dereferences the pointer, so a dangling one is fine.
+            let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr();
+            assert!(failing.realloc(dangling, at(MIB), 2 * MIB).is_null());
+            assert_eq!(live_bytes(), start);
+        }
         reset_peak();
         assert_eq!(peak_live_bytes(), start);
         set_counting(false);
+    }
+
+    /// An allocator whose every allocation fails.
+    struct Failing;
+
+    unsafe impl GlobalAlloc for Failing {
+        unsafe fn alloc(&self, _: Layout) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+        unsafe fn dealloc(&self, _: *mut u8, _: Layout) {
+            unreachable!()
+        }
+        unsafe fn realloc(&self, _: *mut u8, _: Layout, _: usize) -> *mut u8 {
+            std::ptr::null_mut()
+        }
     }
 }

@@ -18,8 +18,8 @@ crate-type = ["cdylib", "rlib"]
 wasm-opt = ['-O1']
 
 [features]
-# Bench builds only (js/pkg/bench, the oxigraph comparison build): installs the
-# counting global allocator. Never enabled for the published package.
+# Bench builds only (js/pkg/bench): installs the counting global allocator.
+# Never enabled for the published package.
 memory-stats = ["dep:bench-memory-stats"]
 
 [dependencies]
