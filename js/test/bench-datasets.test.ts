@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { datasetProbes, moduli, objectTerm, quadAt } from '../bench/datasets.js';
+import { datasetProbes, flattenTerms, moduli, objectTerm, quadAt } from '../bench/datasets.js';
 
 // Golden values of the benchmark dataset generator, computed once and pinned
 // with identical literals in python/tests/test_bench_datasets.py and
@@ -52,5 +52,20 @@ describe('bench dataset parity', () => {
         expect(named[0].g?.termType).toBe('NamedNode');
         expect(named[0].g?.value).toBe(`${BASE}/graph/2026/named/000000`);
         expect(datasetProbes(32768, { graphs: 1 }).quads).toEqual([]);
+    });
+});
+
+describe('flattenTerms', () => {
+    test("flattenTerms reads each term value and each literal's datatype value", () => {
+        const reads: string[] = [];
+        const term = (tag: string, extra: object = {}) => ({ termType: 'NamedNode', get value() { reads.push(tag); return tag; }, ...extra });
+        const literal = {
+            termType: 'Literal',
+            get value() { reads.push('o'); return 'o'; },
+            datatype: { get value() { reads.push('dt'); return 'dt'; } },
+        };
+        const q = { subject: term('s'), predicate: term('p'), object: literal, graph: term('g') };
+        flattenTerms([q as never]);
+        expect(reads).toEqual(['s', 'p', 'o', 'dt', 'g']);
     });
 });

@@ -56,8 +56,6 @@ interface MemoryRow {
     /** Whole-process high-water mark: the only figure comparable across a wasm
      *  store and a pure-JS one. This is the headline memory number. */
     peakRssMb: number | null;
-    /** See `WorkerOutput.storeFootprint` in shared.ts. */
-    storeFootprint?: WorkerOutput['storeFootprint'];
 }
 
 type Role = 'query' | 'querycold' | 'fullscan' | 'mutate';
@@ -135,14 +133,10 @@ async function main(): Promise<void> {
     runRole(ADAPTERS, 'query', (a, out) => {
         memory.push({
             slug: a.slug, label: a.label, role: 'query',
-            peakRssMb: out.peakRssMb, storeFootprint: out.storeFootprint,
+            peakRssMb: out.peakRssMb,
         });
         mergeMatched(a.label, out);
-        console.log(
-            `[${a.label}] peak RSS: ${out.peakRssMb ?? 'unknown'} MB` +
-            `, store: ${out.storeFootprint?.rssMb ?? '?'} MB RSS` +
-            ` / ${out.storeFootprint?.wasmHeapMb ?? '-'} MB wasm`,
-        );
+        console.log(`[${a.label}] peak RSS: ${out.peakRssMb ?? 'unknown'} MB`);
     });
 
     // The cold regime gets its own process per adapter: every iteration adopts a

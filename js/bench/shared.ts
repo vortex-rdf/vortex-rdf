@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
-import { fmtNs, consumeQuads, consumeStrings } from './util.js';
+import { fmtNs, consumeQuads, consumeStream, consumeStrings } from './util.js';
 import { df, moduli, type Pat } from './datasets.js';
 import {
     RdfStore,
@@ -63,7 +63,7 @@ export interface StoreAdapter<H = unknown> {
     addAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad add loop
     addBatch?(h: H, quads: Quad[]): Promise<void> | void; // optional batch add (Vortex)
     deleteAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad delete loop
-    countMatch(h: H, p: Pat): Promise<number> | number; // count by consuming — every result term is read (consumeQuads)
+    countMatch(h: H, p: Pat): Promise<number> | number; // count by consuming — every result term is read (consumeStream, consumeQuads)
     /** Resolve the pattern and return only the match count — no term value is
      *  read. Each store's cheapest correct count path (a count API where one
      *  exists, the result set's length otherwise): the COUNT/ASK shape. */
@@ -129,8 +129,8 @@ export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptio
     { slug: 'vortex_default_bycopy', label: 'Vortex Default+ByCopy', options: { layout: 'default', indexes: ['secondary-by-copy'] } },
 ];
 
-// Result sets are counted by consuming them — `consumeQuads` / `consumeStrings`
-// in util.ts read every term value, so materialization is measured work on
+// Result sets are counted by consuming them — `consumeStream` / `consumeQuads` /
+// `consumeStrings` in util.ts read every term value, so materialization is measured work on
 // every store.
 
 export function vortexAdapter(variant: { slug: string; label: string; options: BuildOptions }): StoreAdapter<VortexRdfStore> {
@@ -142,7 +142,7 @@ export function vortexAdapter(variant: { slug: string; label: string; options: B
         addAll: async (h, quads) => { for (const q of quads) await h.addQuad(q); },
         addBatch: (h, quads) => h.addQuads(quads),
         deleteAll: async (h, quads) => { for (const q of quads) await h.deleteQuad(q); },
-        countMatch: async (h, p) => consumeQuads(await h.getQuads(p.s, p.p, p.o, p.g)),
+        countMatch: (h, p) => consumeStream(h.match(p.s, p.p, p.o, p.g)),
         countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
         snapshot: (h) => h.toBytes(),
         open: (bytes) => VortexRdfStore.fromBytes(bytes as Uint8Array),
@@ -175,7 +175,7 @@ export function rdfStoresAdapter(kind: 'default' | 'single', label: string): Sto
         newEmpty: () => newRdfStore(kind),
         addAll: (h, quads) => { for (const q of quads) h.addQuad(q); },
         deleteAll: (h, quads) => { for (const q of quads) h.removeQuad(q); },
-        countMatch: (h, p) => consumeQuads(h.getQuads(p.s, p.p, p.o, p.g)), // synchronous array
+        countMatch: (h, p) => consumeStream(h.match(p.s, p.p, p.o, p.g)),
         countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
     };
 }
@@ -349,9 +349,6 @@ export interface Row {
 export interface WorkerOutput {
     rows: Row[];
     peakRssMb: number | null;
-    /** What building the store cost over and above the shared input `Quad[]`.
-     *  `wasmHeapMb` is Vortex-only and null for the other adapters. */
-    storeFootprint: Record<string, number | null>;
     /** Rows each probe matched, by pattern name. */
     matched: Record<string, number>;
     failures: { phase: string; error: string }[];

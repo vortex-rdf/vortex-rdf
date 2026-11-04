@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { Quad } from '@rdfjs/types';
+import type { Quad, Stream } from '@rdfjs/types';
 import type { Fn, FnOptions } from 'tinybench';
 
 /** The quad shape every consume helper reads: the three mandatory term slots
@@ -72,6 +72,27 @@ export function making<H>(
     ];
 }
 
+/** Time every `make`, then keep the last handle: `beforeEach` disposes the
+ *  previous one, so only one handle lives at a time, and the final one is left
+ *  for `last()` to hand back, undisposed, once the bench has run. */
+export function makingLast<H>(
+    make: () => Promise<H> | H, dispose: (h: H) => void,
+): { task: [Fn, FnOptions]; last(): H | undefined } {
+    let h: H | undefined;
+    return {
+        task: [
+            async () => { h = await make(); },
+            {
+                beforeEach: () => {
+                    if (h !== undefined) dispose(h);
+                    h = undefined;
+                },
+            },
+        ],
+        last: () => h,
+    };
+}
+
 /** Time `run` on a handle `make` builds for each iteration in `beforeEach`;
  *  `dispose` gets it in `afterEach`. */
 export function onFresh<H>(
@@ -115,10 +136,12 @@ let consumeSink = 0;
 /** Thrown when a consume loop exceeds [`CONSUME_BUDGET_MS`]. The message is what
  *  lands in the run's `failures` list, so it says how far the loop got. */
 class ConsumeBudgetExceeded extends Error {
-    constructor(done: number, total: number, ms: number) {
+    constructor(done: number, total: number | null, ms: number) {
         super(
             `consume budget exceeded after ${(ms / 1000).toFixed(0)}s ` +
-            `(${done.toLocaleString()} of ${total.toLocaleString()} quads; ` +
+            (total === null
+                ? `(${done.toLocaleString()} quads read; `
+                : `(${done.toLocaleString()} of ${total.toLocaleString()} quads; `) +
             `raise CONSUME_BUDGET_MS to wait longer)`,
         );
         this.name = 'ConsumeBudgetExceeded';
@@ -151,6 +174,49 @@ export function consumeQuads(quads: ArrayLike<TermQuad>): number {
     }
     consumeSink += acc;
     return quads.length;
+}
+
+/** [`consumeQuads`]'s contract for a quad stream (RDF/JS `match()`): read every
+ *  term of every quad as it arrives, resolve to the count at `end`.
+ *
+ *  `end` and `error` are attached before `data`, because attaching `data` can
+ *  start the flow at once. The budget is checked every [`CONSUME_WINDOW`]
+ *  quads; past it the stream is destroyed (if it can be) and the promise
+ *  rejects. Events after the promise settles are ignored. */
+export function consumeStream(
+    stream: Pick<Stream, 'on'>, budgetMs: number = CONSUME_BUDGET_MS,
+): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+        let n = 0;
+        let acc = 0;
+        let settled = false;
+        const t0 = budgetMs > 0 ? performance.now() : 0;
+        stream.on('end', () => {
+            if (settled) return;
+            settled = true;
+            consumeSink += acc;
+            resolve(n);
+        });
+        stream.on('error', (e: unknown) => {
+            if (settled) return;
+            settled = true;
+            reject(e);
+        });
+        stream.on('data', (q: TermQuad) => {
+            if (settled) return;
+            if (budgetMs > 0 && n > 0 && n % CONSUME_WINDOW === 0) {
+                const ms = performance.now() - t0;
+                if (ms > budgetMs) {
+                    settled = true;
+                    (stream as { destroy?: () => unknown }).destroy?.();
+                    reject(new ConsumeBudgetExceeded(n, null, ms));
+                    return;
+                }
+            }
+            acc += readTerms([q], 0, 1);
+            n++;
+        });
+    });
 }
 
 /** [`consumeQuads`]'s contract for a store whose results are term strings

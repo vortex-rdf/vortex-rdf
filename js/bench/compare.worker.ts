@@ -6,14 +6,16 @@
 import { Bench, type BenchOptions, type Fn, type FnOptions } from 'tinybench';
 import { writeFileSync } from 'node:fs';
 
+import type { Quad } from '@rdfjs/types';
+
 import {
     ADAPTERS, MUT_ADAPTERS, N_TRIPLES, GRAPHS, MUT_BATCH,
-    genDataset, genFresh, genDatasetPrefix, datasetProbes, moduli,
+    genDataset, flattenTerms, genFresh, genDatasetPrefix, datasetProbes, moduli,
     FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
-    reclaim, collect, timeoutRow, unsupportedRow, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
+    reclaim, collect, timeoutRow, unsupportedRow, peakRssMb,
     type Row, type Pat, type StoreAdapter, type WorkerOutput,
 } from './shared.js';
-import { fmtNs, making, onFresh } from './util.js';
+import { fmtNs, making, makingLast, onFresh } from './util.js';
 
 const [, , slug, role, outFile] = process.argv;
 if (!slug || !role || !outFile) {
@@ -121,20 +123,6 @@ function coldAccess(a: StoreAdapter, snap: unknown): Access {
     };
 }
 
-/** What building the store cost, over and above the input `Quad[]`. */
-const storeFootprint: Record<string, number | null> = {};
-
-/** `wasm` is Vortex's linear memory specifically — oxigraph has its own module
- *  this cannot see, and rdf-stores has none — so it is only read for Vortex
- *  adapters and reported as null elsewhere (a 0 would misreport it). */
-async function memSnapshot(isVortex: boolean): Promise<{ rss: number | null; js: number; wasm: number | null }> {
-    // jsHeapMb forces a collection first, so the RSS read after it is post-GC too.
-    const js = jsHeapMb();
-    return { rss: rssMb(), js, wasm: isVortex ? await wasmHeapMb() : null };
-}
-
-const delta = (a: number | null, b: number | null) => (a === null || b === null ? null : a - b);
-
 /**
  * Measure `pats` through `access`: probe every pattern once, then benchmark
  * each cell that came in under the time limit with `opts`, a benchmark of its
@@ -207,40 +195,39 @@ function graphProbesUnsupported(slug: string, reason: string, regime: 'warm' | '
         [`${slug}::${p.name}`, `${slug}::${p.name}::count`].map((id) => ({ ...unsupportedRow(id, reason), regime })));
 }
 
+/** The dataset for `a`, its strings flattened once so that no timed build pays
+ *  V8's rope flattening. */
+function inputFor(a: StoreAdapter): Quad[] {
+    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    flattenTerms(triples);
+    return triples;
+}
+
 async function runQuery(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     const pats = probesFor(a);
 
     console.log(`[${a.label}] query…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
-    // Measure across the build only. The input array is ~a gigabyte of JS objects
-    // and is identical for every adapter, so a delta isolates the store's own
-    // footprint far better than any absolute reading — and unlike dropping the
-    // array it does not force us to regenerate it for the ingest phase.
-    const isVortex = a.slug.startsWith('vortex');
-    const before = await memSnapshot(isVortex);
-    let th: unknown = await a.build(triples);
-    const after = await memSnapshot(isVortex);
-    Object.assign(storeFootprint, {
-        rssMb: delta(after.rss, before.rss),
-        jsHeapMb: after.js - before.js,
-        wasmHeapMb: delta(after.wasm, before.wasm),
-    });
+    const triples = inputFor(a);
+    let th: unknown;
+    if (a.ingestUnsupported) {
+        rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
+        th = await a.build(triples); // hdt opens its file, untimed
+    } else {
+        // Three timed builds; the last one is the store the probes query.
+        console.log(`[${a.label}] ingest…`);
+        const builds = makingLast(() => a.build(triples), (h) => reclaim(a, h));
+        await bench('ingest', rows, HEAVY_OPTS, (b) => {
+            b.add(`ingest::${a.slug}`, ...builds.task);
+        });
+        th = builds.last() ?? await a.build(triples);
+    }
 
     await measure(a, pats, warmAccess(th), QUERY_OPTS, rows);
     reclaim(a, th);
     th = null;
 
     if (a.quadsUnsupported) rows.push(...graphProbesUnsupported(a.slug, a.quadsUnsupported, 'warm'));
-
-    if (a.ingestUnsupported) {
-        rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
-    } else {
-        console.log(`[${a.label}] ingest…`);
-        await bench('ingest', rows, HEAVY_OPTS, (b) => {
-            b.add(`ingest::${a.slug}`, ...making(() => a.build(triples), (h) => reclaim(a, h)));
-        });
-    }
 
     return rows;
 }
@@ -279,7 +266,7 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     const dispose = (h: unknown) => a.dispose?.(h);
 
     console.log(`[${a.label}] query cold…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    const triples = inputFor(a);
     const pats = probesFor(a);
     let th: unknown = await a.build(triples);
     const tSnap = await a.snapshot(th);
@@ -319,7 +306,7 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
 async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     console.log(`[${a.label}] full scan…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    const triples = inputFor(a);
     let h: unknown = await a.build(triples);
     // Its probes record what the scan matches, as the pattern probes do — the
     // strongest cross-adapter check there is: every store must return the
@@ -370,7 +357,6 @@ async function main(): Promise<void> {
     const out: WorkerOutput = {
         rows,
         peakRssMb: peakRssMb(),
-        storeFootprint,
         matched,
         failures,
         cardinality: role === 'query' ? moduli(N_TRIPLES, { graphs: GRAPHS }) : undefined,
