@@ -30,9 +30,13 @@ import {
     TermDictionaryQuotedIndexed,
     TermDictionaryNumberRecordFullTerms,
 } from 'rdf-stores';
-import { Store as OxiStore } from 'oxigraph';
+import type { Store as OxiStore } from './oxigraph-pkg/web.js';
 
 export * from './datasets.js';
+
+/** js/bench, beside which the bench's own wasm builds sit (oxigraph-pkg,
+ *  hdt-pkg). */
+const here = dirname(fileURLToPath(import.meta.url));
 
 // ─── Config (env-tunable) ────────────────────────────────────────────────────
 //
@@ -58,6 +62,9 @@ export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete 
 export interface StoreAdapter<H = unknown> {
     slug: string; // dashboard id segment
     label: string; // display name
+    /** Load the library's wasm module, untimed; the worker calls it before
+     *  any phase, so no timed build pays its compile. */
+    init?(): Promise<void>;
     build(quads: Quad[]): Promise<H> | H; // ingest (idiomatic bulk API per lib)
     newEmpty(): Promise<H> | H; // empty store (add phase)
     addAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad add loop
@@ -87,7 +94,8 @@ export interface StoreAdapter<H = unknown> {
     ingestUnsupported?: string;
     quadsUnsupported?: string;
     mutationUnsupported?: string;
-    // Both Vortex and oxigraph are wasm-bindgen: `.free()` deterministically drops
+    // Both Vortex and oxigraph (the bench's own build of its JS binding,
+    // bench/oxigraph-pkg) are wasm-bindgen: `.free()` deterministically drops
     // the WASM-side allocation. The generated FinalizationRegistry is a fallback
     // only — V8 has no visibility into WASM linear-memory pressure, so it can defer
     // running finalizers arbitrarily long, letting dozens of multi-million-quad
@@ -180,19 +188,57 @@ export function rdfStoresAdapter(kind: 'default' | 'single', label: string): Sto
     };
 }
 
+// ─── oxigraph (wasm) ─────────────────────────────────────────────────────────
+//
+// oxigraph's official JS binding, though not its npm package, which has no
+// counter: the bench's own build of the binding, from oxigraph's GitHub source
+// at the version the Rust comparison pins (bench-compare/Cargo.lock), with the
+// bench's live-byte counter patched in. `npm run build:oxigraph-wasm` →
+// bench/oxigraph-pkg (see bench/oxigraph-wasm/build.sh); compare.bench.ts
+// checks the build's version against the pin before anything runs.
+
+type Oxigraph = {
+    mod: typeof import('./oxigraph-pkg/web.js');
+    wasm: import('./oxigraph-pkg/web.js').InitOutput;
+};
+let oxigraphLoad: Promise<Oxigraph> | undefined;
+/** The module once loaded, which the adapter's constructors read. */
+let oxigraph: Oxigraph | undefined;
+
+/** oxigraph's module and the exports of its wasm instance, loaded once, the
+ *  way hdtMod loads hdt's. */
+export function loadOxigraph(): Promise<Oxigraph> {
+    oxigraphLoad ??= (async () => {
+        const mod = await import('./oxigraph-pkg/web.js');
+        const wasm = await mod.default({ module_or_path: readFileSync(resolve(here, 'oxigraph-pkg/web_bg.wasm')) });
+        oxigraph = { mod, wasm };
+        return oxigraph;
+    })();
+    return oxigraphLoad;
+}
+
+/** A Store from the loaded module, built from `quads` if given. Synchronous,
+ *  so the adapter's timed build and newEmpty stay a bare constructor call. */
+function newOxiStore(quads?: Quad[]): OxiStore {
+    if (!oxigraph) throw new Error("oxigraph is not loaded: call the adapter's init() first");
+    return new oxigraph.mod.Store(quads as unknown as Iterable<never> | undefined);
+}
+
 export function oxigraphAdapter(): StoreAdapter<OxiStore> {
     return {
         slug: 'oxigraph',
         label: 'oxigraph',
-        build: (quads) => new OxiStore(quads as unknown as Iterable<never>), // bulk via constructor
-        newEmpty: () => new OxiStore(),
+        init: async () => { await loadOxigraph(); },
+        build: (quads) => newOxiStore(quads), // bulk via constructor
+        newEmpty: () => newOxiStore(),
         addAll: (h, quads) => { for (const q of quads) h.add(q as never); },
         deleteAll: (h, quads) => { for (const q of quads) h.delete(q as never); },
         countMatch: (h, p) => consumeQuads(h.match(p.s as never, p.p as never, p.o as never, p.g as never)),
         // No count API: match() materializes its result array either way, so
         // walking its length is this store's floor for a count.
         countOnly: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
-        // oxigraph's shipped `.d.ts` does not declare the wasm-bindgen `free()`.
+        // Our build's `web.d.ts` declares Store from oxigraph's own TypeScript
+        // section, which leaves out the wasm-bindgen `free()`.
         dispose: (h) => (h as unknown as { free(): void }).free(),
     };
 }
@@ -207,7 +253,6 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
 // override. The wasm module itself is the bench's own build of the crate's
 // bindings: `npm run build:hdt-wasm` → bench/hdt-pkg (see bench/hdt-wasm).
 
-const here = dirname(fileURLToPath(import.meta.url));
 export const HDT_FILE = process.env.HDT_FILE
     ?? resolve(here, '../../target/bench_js/data.hdt');
 

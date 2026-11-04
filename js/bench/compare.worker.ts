@@ -349,6 +349,8 @@ async function main(): Promise<void> {
         console.error(`unknown adapter slug '${slug}' for role '${role}'`);
         process.exit(1);
     }
+    // Untimed, before any phase: no timed build pays the module's compile.
+    await a.init?.();
 
     const rows = role === 'query' ? await runQuery(a)
         : role === 'querycold' ? await runQueryCold(a)

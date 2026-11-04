@@ -10,7 +10,7 @@
 // live here.
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -279,4 +279,51 @@ export function runWorkerProcess<T>(workerPath: string, args: string[], label: s
     } finally {
         rmSync(outFile, { force: true });
     }
+}
+
+// ─── The oxigraph build's version ────────────────────────────────────────────
+//
+// The suite runs oxigraph from the bench's own build of its JS binding
+// (bench/oxigraph-wasm/build.sh), at the version the Rust comparison pins, so
+// the two tabs measure one oxigraph release. compare.bench.ts checks the build
+// against that pin before it runs anything.
+
+/** The Rust comparison's lock file, whose `oxigraph` entry is the pin. */
+export const BENCH_COMPARE_LOCK = resolve(here, '../../bench-compare/Cargo.lock');
+/** Where `npm run build:oxigraph-wasm` writes the build. */
+export const OXIGRAPH_PKG_DIR = resolve(here, 'oxigraph-pkg');
+
+/** The version `lock`, a Cargo.lock's text, pins for `crate`. Each
+ *  `[[package]]` block is read for its own `name` and `version` lines, so a
+ *  neighbouring block's version is never taken for it. Throws unless exactly
+ *  one block names `crate`. */
+export function lockedVersion(lock: string, crate: string): string {
+    const versions = lock.split('[[package]]').flatMap((block) => {
+        const name = /^name = "(.*)"$/m.exec(block)?.[1];
+        const version = /^version = "(.*)"$/m.exec(block)?.[1];
+        return name === crate && version !== undefined ? [version] : [];
+    });
+    if (versions.length === 0) throw new Error(`the lock pins no ${crate}`);
+    if (versions.length > 1) throw new Error(`the lock pins ${versions.length} versions of ${crate}`);
+    return versions[0];
+}
+
+/** Check that the oxigraph build in `pkgDir` is the version `lockPath` pins,
+ *  and return that version. Throws when there is no build to check, and when
+ *  the build is another version, naming both. */
+export function checkOxigraphVersion(lockPath: string, pkgDir: string): string {
+    const pinned = lockedVersion(readFileSync(lockPath, 'utf8'), 'oxigraph');
+    const manifest = join(pkgDir, 'package.json');
+    if (!existsSync(manifest)) {
+        throw new Error(
+            `no oxigraph build at ${pkgDir} — run \`npm run build:oxigraph-wasm\` `
+            + '(scripts/refresh.sh --only js builds it)');
+    }
+    const built = (JSON.parse(readFileSync(manifest, 'utf8')) as { version?: string }).version;
+    if (built !== pinned) {
+        throw new Error(
+            `${pkgDir} holds oxigraph ${built} but ${lockPath} pins ${pinned} — `
+            + 'rebuild it: npm run build:oxigraph-wasm');
+    }
+    return pinned;
 }

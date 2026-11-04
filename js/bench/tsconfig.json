@@ -1,9 +1,10 @@
 {
     "extends": "../tsconfig.json",
     "compilerOptions": {
-        // oxigraph's shipped node.d.ts does not pass strict checking
-        // (UInt8Array, undeclared top-level members); our own .d.ts files
-        // are checked by the root tsconfig.
+        // bench/oxigraph-pkg/web.d.ts, which our build generates from
+        // oxigraph's sources, does not pass strict checking (UInt8Array,
+        // undeclared top-level members); our own .d.ts files are checked by
+        // the root tsconfig.
         "skipLibCheck": true
     },
     "include": [

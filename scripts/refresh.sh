@@ -166,6 +166,13 @@ if has js; then
       bench/hdt-wasm/src bench/hdt-wasm/Cargo.toml bench/hdt-wasm/Cargo.lock \
       bench/memory-stats/src bench/memory-stats/Cargo.toml \
       ../.cargo/config.toml
+    # oxigraph's official JS binding, built from its GitHub source at the
+    # version bench-compare pins, with the bench's counter patched in (see
+    # bench/oxigraph-wasm/build.sh). The version is part of the command, so a
+    # new pin invalidates the stamp.
+    oxigraph_version=$(bash bench/oxigraph-wasm/build.sh --print-version)
+    build "npm run build:oxigraph-wasm -- $oxigraph_version" bench/oxigraph-pkg/web_bg.wasm \
+      bench/oxigraph-wasm bench/memory-stats/src bench/memory-stats/Cargo.toml
     npm run bench
   )
 fi

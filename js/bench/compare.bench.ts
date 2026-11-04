@@ -39,7 +39,7 @@ import {
     QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, unsupportedRow,
     type Row, type WorkerOutput,
 } from './shared.js';
-import { runWorkerProcess } from './util.js';
+import { BENCH_COMPARE_LOCK, OXIGRAPH_PKG_DIR, checkOxigraphVersion, runWorkerProcess } from './util.js';
 
 /** The run's dataset shape: term cardinality per role, from which every
  *  probe's selectivity follows. */
@@ -69,6 +69,10 @@ function runWorker(slug: string, role: Role): WorkerOutput | null {
 }
 
 async function main(): Promise<void> {
+    // oxigraph runs from the bench's own build (bench/oxigraph-wasm), which
+    // must be the version the Rust comparison pins: a missing or stale build
+    // stops the run here, before any worker starts.
+    const oxigraphVersion = checkOxigraphVersion(BENCH_COMPARE_LOCK, OXIGRAPH_PKG_DIR);
     console.log(
         `Dataset shape: ${N_TRIPLES.toLocaleString()} quads over ${SHAPE.nGraph} named graphs ` +
         `(${SHAPE.terms.toLocaleString()} distinct terms)…`);
@@ -182,7 +186,7 @@ async function main(): Promise<void> {
     };
 
     mkdirSync(dirname(OUT), { recursive: true });
-    writeFileSync(OUT, JSON.stringify({ provenance: provenance(), results, memory, config, failures }, null, 2));
+    writeFileSync(OUT, JSON.stringify({ provenance: provenance(oxigraphVersion), results, memory, config, failures }, null, 2));
     console.log(`\nWrote ${results.length} benchmark rows, ${memory.length} memory readings`
         + `${failures.length ? `, ${failures.length} unmeasurable phase(s)` : ''} → ${OUT}`);
     for (const f of failures) console.log(`  missing: ${f.label} / ${f.role} / ${f.phase}`);
@@ -198,7 +202,7 @@ function depVersion(pkg: string): string {
     } catch { return '?'; }
 }
 
-function provenance(): string {
+function provenance(oxigraphVersion: string): string {
     // UTC, to the minute — the format every dashboard tab dates itself in
     // (`scripts/render_bench_dashboard.py`, `python/bench/run.py`), so one page
     // never shows three formats or three timezones for one run.
@@ -209,7 +213,7 @@ function provenance(): string {
         `${N_TRIPLES.toLocaleString()} quads over ${SHAPE.nGraph} named graphs ` +
         `(${SHAPE.terms.toLocaleString()} terms; hdt reads their triples projection), ` +
         `MUT_BATCH=${MUT_BATCH.toLocaleString()} · tinybench ${depVersion('tinybench')}, wall-clock · ` +
-        `vortex-rdf-store ${require('../package.json').version}, rdf-stores ${depVersion('rdf-stores')}, oxigraph ${depVersion('oxigraph')}, hdt 0.7 (wasm, read-only) · ` +
+        `vortex-rdf-store ${require('../package.json').version}, rdf-stores ${depVersion('rdf-stores')}, oxigraph ${oxigraphVersion} (built from source), hdt 0.7 (wasm, read-only) · ` +
         `one adapter per process, isolated`
     );
 }
