@@ -1,8 +1,9 @@
 // match() read a chunk at a time: its stream yields the quads getQuads
 // returns, in getQuads' order, pulling them from a QuadChunks handle 8,192
 // rows at a time and only once the last chunk's quads are taken. The handle is
-// freed at the end, on an early exit and when freeing the store fails the
-// stream, and the stream reads the store as it was when match was called.
+// freed at the end, on an early exit, when a data listener throws and when
+// freeing the store fails the stream, and the stream reads the store as it was
+// when match was called.
 import { afterEach, describe, expect, test, vi, type MockInstance } from 'vitest';
 import type { Quad, Stream } from '@rdfjs/types';
 import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
@@ -229,6 +230,40 @@ describe('the stream rules', () => {
         expect(next).toHaveBeenCalledTimes(1);
         expect(free).toHaveBeenCalledTimes(1);
         expect(midway._store).toBeUndefined();
+        expect(ends).toEqual([]);
+    });
+
+    test('a data listener that throws destroys the stream, and its error propagates', async () => {
+        const next = vi.spyOn(QuadChunks.prototype, 'next');
+        const free = vi.spyOn(QuadChunks.prototype, 'free');
+        const store = await chunkedStore();
+        const stream = store.match() as MatchStream;
+        const thrown = new Error('a data listener threw');
+        const ends: string[] = [];
+        let data = 0;
+        stream.on('data', () => {
+            if (++data === 1) throw thrown;
+        });
+        stream.on('end', () => ends.push('end')).on('error', () => ends.push('error'));
+        // The error leaves the stream's start, a microtask, as an uncaught
+        // exception. Vitest reports one as an unhandled error, failing the run,
+        // unless a listener besides its own is registered, as this one is.
+        const uncaught: unknown[] = [];
+        const onUncaught = (error: unknown) => uncaught.push(error);
+        process.on('uncaughtException', onUncaught);
+        try {
+            await microtasks();
+        } finally {
+            process.off('uncaughtException', onUncaught);
+        }
+        expect(uncaught).toEqual([thrown]);
+        expect(free).toHaveBeenCalledTimes(1);
+        expect(stream._store).toBeUndefined();
+        // Nothing follows: no other quad, chunk, end or error.
+        expect(stream.read()).toBeNull();
+        await microtasks();
+        expect(data).toBe(1);
+        expect(next).toHaveBeenCalledTimes(1);
         expect(ends).toEqual([]);
     });
 

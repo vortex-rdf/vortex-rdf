@@ -257,7 +257,10 @@ class QuadStream {
         if (this._listeners.data.length > 0) this._drain();
     }
     // Emit the quads as `data`, a chunk pulled each time the buffer empties,
-    // until the stream is done; a call made while one drains returns.
+    // until the stream is done; a call made while one drains returns. A
+    // listener that throws destroys the stream, so the handle is freed now
+    // rather than at finalization, and its error propagates, as it would
+    // from Node's EventEmitter.
     _drain() {
         if (this._draining) return;
         this._draining = true;
@@ -267,6 +270,9 @@ class QuadStream {
                 if (this._pos < this._buffer.length) this._emit('data', this._buffer[this._pos++]);
                 else this._pull();
             }
+        } catch (error) {
+            this.destroy();
+            throw error;
         } finally {
             this._draining = false;
         }

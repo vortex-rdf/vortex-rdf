@@ -75,7 +75,7 @@ for await (const quad of store.match(null, myPredicate, null, null)) {
 }
 ```
 
-The stream is incremental: it reads the match 8,192 rows at a time, in `getQuads`' order, and reads the next chunk only once the last one's quads are taken (by `data` events, `read()` or `for await`). It reads the store as it was when `match` was called, so a mutation made while the stream is consumed does not change the quads it yields. A read that fails later is the stream's `error` event, and so is freeing the store before the stream ends; leaving a `for await` early releases the stream.
+The stream is incremental: it reads the match 8,192 rows at a time, in `getQuads`' order, and reads the next chunk only once the last one's quads are taken (by `data` events, `read()` or `for await`). It reads the store as it was when `match` was called, so a mutation made while the stream is consumed does not change the quads it yields. A read that fails later is the stream's `error` event, and so is freeing the store before the stream ends; leaving a `for await` early releases the stream. `end` arrives once the quads are consumed, through `data` events, `read()` or `for await`, so a stream nobody reads never ends. A stream holds its match, the store as it was when `match` was called, until it is consumed, `destroy()`ed or garbage-collected; `destroy()` is a method of the returned stream object, though `@rdfjs/types`' `Stream` type does not declare it.
 
 `getQuads` is the array-returning counterpart (synchronous — no read path performs I/O, so there is nothing to await), and `countQuads` answers from the match's row selection without materializing a quad:
 

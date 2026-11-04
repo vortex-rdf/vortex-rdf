@@ -210,10 +210,15 @@ export class VortexRdfStore {
      * `data` events, `read()` or `for await`), from the store as it was when
      * `match` was called. A read that fails later is the stream's `error`
      * event, and so is freeing the store before the stream ends; leaving a
-     * `for await` early releases the stream. The stream also implements
-     * `Symbol.asyncIterator`, so it can be consumed with `for await` (cast to
-     * `AsyncIterable<Quad>` in typed code). An invalid pattern term throws
-     * synchronously.
+     * `for await` early releases the stream. `end` arrives once the quads are
+     * consumed, through `data` events, `read()` or `for await`, so a stream
+     * nobody reads never ends. A stream holds its match, the store as it was
+     * when `match` was called, until it is consumed, `destroy()`ed or
+     * garbage-collected; `destroy()` is a method of the returned stream
+     * object, though `@rdfjs/types`' `Stream` type does not declare it. The
+     * stream also implements `Symbol.asyncIterator`, so it can be consumed
+     * with `for await` (cast to `AsyncIterable<Quad>` in typed code). An
+     * invalid pattern term throws synchronously.
      */
     match(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): Stream<Quad>;
     /**
