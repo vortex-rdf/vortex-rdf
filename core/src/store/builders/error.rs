@@ -1,3 +1,5 @@
+
+#[cfg(feature = "arrow")]
 use arrow_schema::ArrowError;
 use thiserror::Error;
 
@@ -10,6 +12,7 @@ pub enum BuilderError {
     ArrowBuilder(#[from] ArrowError),
 }
 
+#[cfg(feature = "arrow")]
 impl From<ArrowError> for VortexRdfError {
     fn from(value: ArrowError) -> Self {
         VortexRdfError::Building(BuilderError::ArrowBuilder(value))
