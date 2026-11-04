@@ -2,6 +2,7 @@
 //! `quads_vec`, their shared-term twins and the N-Triples/N-Quads export's
 //! stream, one pipeline for every row representation ([`ChunkDecode`]).
 
+#[cfg(feature = "file-io")]
 use futures::future;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, stream};
@@ -12,7 +13,6 @@ use crate::error::Result;
 use crate::store::layouts::ChunkDecode;
 use crate::store::{Backend, MemoryBase, SharedQuad, Tail, VortexRdfStore};
 
-#[cfg(feature = "file-io")]
 use super::deferred;
 #[cfg(feature = "file-io")]
 use super::file_plan::{CollectedPlan, FileReadScope, StreamedPlan};
@@ -51,8 +51,9 @@ use vortex_mask::Mask;
 type Chunks<T> = BoxStream<'static, Vec<Result<T>>>;
 
 /// How a file read takes a view's rows, a served view's off its serve plan
-/// in its index's order either way. In memory every read is the view's one
-/// chunk, so only a file read tells the two apart.
+/// in its index's order either way. In memory a stream takes 65,536 rows a
+/// chunk and a collected read decodes one chunk without a stream, so only a
+/// file read tells the two apart.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
 enum QuadRead {
@@ -70,7 +71,9 @@ impl VortexRdfStore {
     /// Stream every quad this view covers, one at a time: the base's rows (in
     /// the serving index's order for a served view, else in base row order),
     /// then the tail's live rows. Nothing is read until the first poll, and a
-    /// failure to set the read up arrives as the stream's first item.
+    /// failure to set the read up arrives as the stream's first item. An
+    /// in-memory view is read and decoded 65,536 rows at a time, as the
+    /// stream is pulled.
     pub fn quads(&self) -> Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_> {
         Box::new(
             self.chunk_stream::<Quad>(QuadRead::Streamed)
@@ -96,10 +99,10 @@ impl VortexRdfStore {
 
     /// The chunk stream of [`SharedQuad`]s behind
     /// [`shared_quads_vec`](Self::shared_quads_vec): each item is one decoded
-    /// chunk (a scan split, a read by id, a file view's tail, or a whole
-    /// in-memory view), for a consumer that converts whole batches without
-    /// per-quad stream overhead. A chunk's error, or a failure to set the
-    /// read up, arrives as a one-element `vec![Err(..)]`.
+    /// chunk (a scan split, a read by id, a file view's tail, or at most
+    /// 65,536 rows of an in-memory view), for a consumer that converts whole
+    /// batches without per-quad stream overhead. A chunk's error, or a
+    /// failure to set the read up, arrives as a one-element `vec![Err(..)]`.
     pub fn shared_quad_chunks(
         &self,
     ) -> Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_> {
@@ -139,23 +142,74 @@ impl VortexRdfStore {
     }
 
     /// The one chunk stream behind every read above, built on the first poll,
-    /// a build failure as one error chunk: in memory the view's one chunk
-    /// ([`in_memory_chunk`](Self::in_memory_chunk)), decoded without
-    /// suspending; on file the chunks of `file_chunks`, read as `mode` asks.
+    /// a build failure as one error chunk: in memory chunks of at most
+    /// [`IN_MEMORY_CHUNK_ROWS`] rows
+    /// ([`in_memory_chunks`](Self::in_memory_chunks)), each decoded when
+    /// pulled, without suspending; on file the chunks of `file_chunks`, read
+    /// as `mode` asks.
     fn chunk_stream<T: ChunkDecode>(
         &self,
         #[cfg_attr(not(feature = "file-io"), allow(unused_variables))] mode: QuadRead,
     ) -> BoxStream<'_, Vec<Result<T>>> {
         observe!(ChunkStream);
         match &self.quads.backend {
-            Backend::InMemory(memory) => {
-                stream::once(future::lazy(move |_| self.in_memory_chunk::<T>(memory)))
-                    .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(e)]))
-                    .boxed()
-            }
+            Backend::InMemory(memory) => deferred(
+                self.in_memory_chunks::<T>(memory, in_memory_chunk_rows()),
+                |e| vec![Err(e)],
+            ),
             #[cfg(feature = "file-io")]
             Backend::File(base) => deferred(self.file_chunks::<T>(base, mode), |e| vec![Err(e)]),
         }
+    }
+
+    /// An in-memory view's rows as decoded chunks of at most `chunk_rows`
+    /// rows, `memory` its base, in [`quads`](Self::quads)' order, each read
+    /// and decoded when it is pulled, without suspending: the rows are in
+    /// memory and an in-memory store's dictionary is resident. A served
+    /// view's chunks are windows of its plan's run
+    /// ([`decode_windows`](crate::store::indexes::InMemoryServePlan::decode_windows)),
+    /// any other view's are its base rows as
+    /// [`row_chunks`](Self::row_chunks) cuts them (a contiguous selection
+    /// without tombstones sliced, any other gathered a window of live ids a
+    /// pull); the tail's live rows follow, in chunks of their own.
+    async fn in_memory_chunks<'a, T: ChunkDecode>(
+        &'a self,
+        memory: &'a MemoryBase,
+        chunk_rows: usize,
+    ) -> Result<BoxStream<'a, Vec<Result<T>>>> {
+        let base = match &memory.serve {
+            // A served view decodes the matched quads from the index
+            // component's run a window at a time; tombstones apply through
+            // the run's rid column, and the selection may stay pending (the
+            // plan never needs it).
+            Some(plan) => {
+                stream::iter(plan.decode_windows::<T>(self.quads.deleted.as_ref(), chunk_rows))
+                    .left_stream()
+            }
+            None => {
+                let layout = &self.layout;
+                self.base_chunks(layout.strategy().primary_column_names(), chunk_rows)
+                    .await?
+                    .map(move |rows| match rows {
+                        Ok(rows) => {
+                            observe!(InMemoryChunk(rows.len()));
+                            T::decode(layout, &rows)
+                        }
+                        Err(e) => vec![Err(e)],
+                    })
+                    .right_stream()
+            }
+        };
+        // Tail rows are in memory and few: they follow the base's.
+        let layout = Tail::layout_for(&self.layout);
+        let tail = self.tail_chunks(chunk_rows)?.map(move |rows| match rows {
+            Ok(rows) => {
+                observe!(InMemoryChunk(rows.len()));
+                T::from_strings(layout, &rows)
+            }
+            Err(e) => vec![Err(e)],
+        });
+        Ok(base.chain(stream::iter(tail)).boxed())
     }
 
     /// An in-memory view's rows as one decoded chunk, `memory` its base, the
@@ -408,6 +462,22 @@ fn flattened<T>(total: usize, chunks: impl IntoIterator<Item = Vec<Result<T>>>) 
         }
     }
     Ok(rows)
+}
+
+/// The most rows a chunk of an in-memory view's chunk stream holds (`quads`,
+/// `shared_quad_chunks`, the N-Triples/N-Quads export): a stream holds one
+/// chunk's decoded rows, not the view's.
+const IN_MEMORY_CHUNK_ROWS: usize = 65_536;
+
+/// The rows [`chunk_stream`](VortexRdfStore::chunk_stream) cuts an in-memory
+/// view's chunks to: [`IN_MEMORY_CHUNK_ROWS`], or what a test forced on this
+/// thread.
+fn in_memory_chunk_rows() -> usize {
+    #[cfg(test)]
+    if let Some(rows) = crate::store::test_hooks::forced_chunk_rows() {
+        return rows;
+    }
+    IN_MEMORY_CHUNK_ROWS
 }
 
 /// `chunks` followed by the tail's one chunk.
