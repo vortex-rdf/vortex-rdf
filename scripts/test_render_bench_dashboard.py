@@ -110,10 +110,12 @@ class PanelParser(HTMLParser):
         classes = (a.get("class") or "").split()
         self._stack.append((tag, classes))
         if tag == "div" and "panel" in classes:
-            self._panel = {"title": "", "head": [], "rows": {}}
+            self._panel = {"title": "", "note": "", "head": [], "rows": {}}
             self.panels.append(self._panel)
         elif self._panel is None:
             return
+        elif tag == "p" and "note" in classes:
+            self._text = ("note", [])
         elif tag in ("h3", "th"):
             self._text = (tag, [])
         elif tag == "tr":
@@ -139,6 +141,9 @@ class PanelParser(HTMLParser):
         if tag == "h3" and self._text and self._text[0] == "h3":
             self._panel["title"] = "".join(self._text[1])
             self._text = None
+        elif tag == "p" and self._text and self._text[0] == "note":
+            self._panel["note"] = "".join(self._text[1])
+            self._text = None
         elif tag == "th" and self._text and self._text[0] == "th":
             self._panel["head"].append("".join(self._text[1]))
             self._text = None
@@ -162,9 +167,7 @@ class PanelParser(HTMLParser):
             self._row = None
 
     def handle_data(self, data):
-        if self._text is not None and self._text[0] != "ratio":
-            self._text[1].append(data)
-        elif self._text is not None:
+        if self._text is not None:
             self._text[1].append(data)
         elif self._cell is not None and self._cell["span"] == 0:
             self._cell["text"].append(data)
@@ -274,3 +277,8 @@ def test_every_tab_leads_its_footprint_with_the_store_panel(new_panels):
         assert new_panels[host][0]["head"][1:] == ["Store", "Peak: process memory", "Peak: mapped pages"]  # no Retained
     rocksdb = new_panels["compare-footprint-panels"][0]["rows"]["oxigraph (rocksdb)"][0]
     assert rocksdb["title"].endswith("; store opened from an on-disk database")
+
+
+def test_the_note_marks_the_spread_sign_only_where_a_pair_exists(new_panels):
+    assert "≈ marks a file / in-memory pair" in panel(new_panels["py-footprint-panels"], "Store memory")["note"]
+    assert "≈" not in panel(new_panels["js-memory-panels"], "Store memory")["note"]

@@ -415,14 +415,11 @@
       The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
       (3 by default) fresh processes per library, after the timed runs. Each run opens the store,
       reads every pattern once as the timed cells do, and disposes it. <em>Store</em> is the live
-      memory the dispose released, read after the reads, so it includes the caches they filled. The
-      peaks are <span class="mono">RssAnon</span> (process memory) and <span class="mono">RssFile</span>
+      memory that disposing the store released, read after the reads, so it includes the caches they filled. The two Peak columns are <span class="mono">RssAnon</span> (process memory) and <span class="mono">RssFile</span>
       (mapped pages) at the highest 2 ms sample during the reads, above the baseline taken before
-      the open. A file-backed store's pages show under mapped pages. A store held in memory reads
-      only the program's own code pages there, the ones the open and reads first touched: a few MB
+      the open. A file-backed store's pages show under mapped pages. A store held in memory reads only the program's own code pages under mapped pages, the ones the open and reads first touched: a few MB
       to a few tens of MB depending on the library, the same for a library's file and in-memory
-      rows, so a pair's gap is the file's own pages. Live memory is a counting allocator around
-      mimalloc, plus glibc's <span class="mono">mallinfo2</span> for C/C++ allocations such as
+      rows, so a pair's gap is the file's own pages. Live memory is counted by a counting allocator around mimalloc, plus glibc's <span class="mono">mallinfo2</span> for C/C++ allocations such as
       RocksDB's. oxigraph (memory) and sophia rebuild from the N-Quads file inside each memory
       process, so their peaks include memory the allocator kept from the build. The query runs'
       peak RSS is no longer shown, but stays in the results file. On-disk size is the artifact the
@@ -573,12 +570,9 @@
       The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
       (3 by default) fresh processes per adapter, after the timed runs. Each run opens the store,
       reads every pattern once as the timed cells do, and disposes it. <em>Store</em> is the live
-      memory the dispose released, read after the reads, so it includes the caches they filled.
+      memory that disposing the store released, read after the reads, so it includes the caches they filled.
       There is one Store column per method, so each compares like with like: built (Vortex,
-      oxigraph, rdf-stores) and loaded (Vortex <span class="mono">fromBytes</span>, hdt). The peak
-      is live bytes, not RSS, because wasm memory never shrinks: the module's counter (in the
-      dashboard's builds only) plus the JS heap after GC. It is measured per probe on the store
-      the timed cells use, and leaves out a streaming read's current chunk. oxigraph's binding has
+      oxigraph, rdf-stores) and loaded (Vortex <span class="mono">fromBytes</span>, hdt). Peak: live memory is live bytes, not RSS, because wasm memory never shrinks: the module's counter (compiled into the benchmark's builds only) plus the JS heap after GC. It is measured after each pattern's read, on the store the timed cells use, and leaves out a streaming read's current chunk. oxigraph's binding has
       no streaming read (<span class="mono">match()</span> returns an array), so its peak holds a
       whole result. There is no mapped-pages column, because no JS store maps a file. The query
       runs' peak RSS is no longer shown, but stays in the results file. Lower is better.
@@ -699,13 +693,13 @@
     </div>
     <p class="group-desc">
       The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
-      (3 by default) fresh processes per adapter <em>and its own virtualenv</em>, after the timed
-      runs. Each run opens the store, reads every pattern once as the timed cells do, and disposes
-      it. <em>Store</em> is the live memory the dispose released, read after the reads, so it
-      includes the caches they filled. The peaks are <span class="mono">RssAnon</span> (process
+      (3 by default) fresh processes per adapter, each in that adapter's own <em>virtualenv</em>, after the
+      timed runs. Each run opens the store, reads every pattern once as the timed cells do, and disposes
+      it. <em>Store</em> is the live memory that disposing the store released, read after the reads, so it
+      includes the caches they filled. The two Peak columns are <span class="mono">RssAnon</span> (process
       memory) and <span class="mono">RssFile</span> (mapped pages) at the highest 2 ms sample
       during the reads, above the baseline taken before the open. A file-backed store's pages show
-      under mapped pages. A store held in memory reads only the program's own code pages there,
+      under mapped pages. A store held in memory reads only the program's own code pages under mapped pages,
       the ones the open and reads first touched: a few MB to a few tens of MB depending on the
       library, the same for a library's file and in-memory rows, so a pair's gap is the file's own
       pages. The memory processes run with <span class="mono">PYTHONMALLOC=malloc</span> and read
@@ -842,16 +836,12 @@
     </div>
     <p class="group-desc">
       The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
-      (3 by default) fresh JVMs per adapter <em>on its own classpath</em>, after the timed runs.
+      (3 by default) fresh JVMs per adapter, each on that adapter's own <em>classpath</em>, after the timed
+      runs.
       Each run opens the store, reads every pattern once as the timed cells do, and disposes it.
-      <em>Store</em> is the live memory the dispose released, read after the reads, so it includes
-      the caches they filled: the heap used after a full collection, plus glibc's bytes in use minus
-      the JVM's own allocations as NMT reports them. A store held in the heap has a process-memory
-      peak that follows the heap limit and the collector, so Store is the figure to compare. The
-      peaks are <span class="mono">RssAnon</span> (process memory) and <span class="mono">RssFile</span>
+      <em>Store</em> is the live memory that disposing the store released, read after the reads, so it includes the caches they filled. For Java, Store is the heap used after a full collection, plus glibc's bytes in use, minus the JVM's own allocations as Native Memory Tracking reports them. A store held in the heap has a process-memory peak that follows the heap limit (the provenance line lists it) and the collector, so Store is the figure to compare. The two Peak columns are <span class="mono">RssAnon</span> (process memory) and <span class="mono">RssFile</span>
       (mapped pages) at the highest 2 ms sample during the reads, above the baseline taken before
-      the open. HDT, LMDB and TDB2 files count as mapped pages. A store held in memory reads only
-      the program's own code pages there, the ones the open and reads first touched: a few MB to a
+      the open. HDT, LMDB and TDB2 files count as mapped pages. A store held in memory reads only the program's own code pages under mapped pages, the ones the open and reads first touched: a few MB to a
       few tens of MB depending on the library, the same for a library's file and in-memory rows, so
       a pair's gap is the file's own pages. The query runs' peak RSS is no longer shown, but stays
       in the results file and still drives the memory-pressure warning. On-disk size is the artifact
