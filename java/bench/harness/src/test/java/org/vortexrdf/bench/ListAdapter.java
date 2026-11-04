@@ -144,6 +144,12 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 		return persistent;
 	}
 
+	/** A persistent store reads its copy into a list; one kept only in memory re-parses its source. */
+	@Override
+	public Obtained obtained() {
+		return persistent ? Obtained.LOADED : Obtained.BUILT;
+	}
+
 	@Override
 	public Store build(Path src, Path location) throws Exception {
 		lock();

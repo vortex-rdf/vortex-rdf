@@ -2,6 +2,8 @@ package org.vortexrdf.bench;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.foreign.Arena;
+import java.lang.ref.Reference;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,12 +25,23 @@ import java.util.stream.Stream;
  * timings.
  *
  * <p>The result goes to the {@code --out} file as one JSON object, never to stdout, which the libraries' own
- * logging may write to. A phase that throws becomes a failure naming the cells it leaves empty, and the worker
- * carries on with the next phase.
+ * logging may write to. In the query and mutate roles, a phase that throws becomes a failure naming the cells it
+ * leaves empty, and the worker carries on with the next phase. The memory role has no partial result: an error ends
+ * the JVM, non-zero, with the error on stderr.
  */
 public final class Worker {
 	static final String OPEN_UNSUPPORTED = "no artifact to reopen: a fresh process re-parses the source, which is the Build column";
 	static final String NO_GRAPHS = "this library's model has no graphs -- it reads the triples projection";
+	/** What the self-check holds, in the heap and outside it, and the least the heap counter must rise by. */
+	private static final int SELF_CHECK_BYTES = 8 << 20;
+	/** The native block's parts, each under glibc's 128 KiB mmap threshold. */
+	private static final int SELF_CHECK_PART = 64 << 10;
+	/**
+	 * The least the native counter must rise by while the self-check holds its 8 MiB block. The JVM's own threads, the
+	 * JIT's and the collector's, allocate natively during the check: measured, that moved the rise by up to 446 KB in a
+	 * fresh JVM and by about 5 KB in a warm one, while a counter that misses the block misses it by about 8 MiB.
+	 */
+	private static final int SELF_CHECK_NATIVE_BAR = 7 << 20;
 
 	private Worker() {
 	}
@@ -54,6 +67,18 @@ public final class Worker {
 		}
 	}
 
+	/**
+	 * The memory role: what one store holds, measured in a JVM of its own. It opens the store the query role built,
+	 * reads every pattern once, then disposes the store, and reports the counts it read and three figures in bytes:
+	 * {@code storeBytes}, the heap and native memory ({@link Footprint}) that disposing the store released, read after
+	 * the reads and again after the dispose; and {@code peakAnonBytes} and {@code peakFileBytes}, the highest
+	 * {@link Rss} sample during the reads, above a baseline read before the open. It first checks that both counters
+	 * see a block held ({@link #selfCheck}). Any error is thrown, so the JVM exits non-zero.
+	 */
+	public static Map<String, Object> memory(Adapter<?, ?> a, WorkerFiles f, Path workdir) throws Exception {
+		return new Memory<>(a, f, workdir).run();
+	}
+
 	/** What an empty worker JVM reports: which JDK it ran on, with no library loaded. */
 	public static Map<String, Object> baseline() {
 		Map<String, Object> out = new LinkedHashMap<>();
@@ -62,7 +87,10 @@ public final class Worker {
 		return out;
 	}
 
-	/** {@code --slug S --role query|mutate|baseline --quads --triples --probes --fresh --prefix --empty --workdir --out}. */
+	/**
+	 * {@code --slug S --role query|mutate|memory|baseline --quads --triples --probes --fresh --prefix --empty
+	 * --workdir --out}.
+	 */
 	public static void main(String[] args) throws Exception {
 		Map<String, String> opt = new HashMap<>();
 		for (int i = 0; i + 1 < args.length; i += 2) {
@@ -84,16 +112,14 @@ public final class Worker {
 			result = switch (role) {
 			case "query" -> query(adapter, files, workdir, knobs);
 			case "mutate" -> mutate(adapter, files, workdir, knobs);
+			case "memory" -> memory(adapter, files, workdir);
 			default -> throw new IllegalArgumentException("unknown role " + role);
 			};
 		}
 		Files.writeString(path(opt, "out"), Json.write(result), StandardCharsets.UTF_8);
 	}
 
-	/**
-	 * The query role: build, open, then every pattern warm, cold, and the full scan, and what the open store retains:
-	 * the memory, in the heap and outside it, that disposing the warm handle releases.
-	 */
+	/** The query role: build, open, then every pattern warm, cold, and the full scan. */
 	private static final class Query<H, Q> {
 		private final Adapter<H, Q> a;
 		private final WorkerFiles f;
@@ -106,7 +132,6 @@ public final class Worker {
 		private final List<Map<String, Object>> rows = new ArrayList<>();
 		private final Map<String, Object> counts = new LinkedHashMap<>();
 		private final List<Map<String, Object>> failures = new ArrayList<>();
-		private Footprint retained;
 
 		Query(Adapter<H, Q> a, WorkerFiles f, Path workdir, Knobs k) {
 			this.a = a;
@@ -127,9 +152,7 @@ public final class Worker {
 			} catch (IOException e) {
 				throw new UncheckedIOException(e);
 			}
-			// One pattern set: the triple patterns, plus the graph-bound ones when the library has graphs.
-			List<Pattern> patterns = probes.stream().filter(p -> p.kind() == Pattern.Kind.TRIPLES
-					|| (p.kind() == Pattern.Kind.QUADS && a.supportsQuads())).toList();
+			List<Pattern> patterns = patterns(a, probes);
 			Pattern full = probes.stream().filter(p -> p.kind() == Pattern.Kind.FULL).findFirst().orElseThrow();
 
 			try {
@@ -181,15 +204,12 @@ public final class Worker {
 			// Term parsing happens once per pattern, outside every timed region.
 			Map<String, Q> prepared = new LinkedHashMap<>();
 			Set<String> failed = new HashSet<>();
-			// The warm handle lives its whole life on a thread of its own, so what its library keeps per thread ends
-			// with it: Jena's in-memory dataset leaves its data reachable from the thread that queried it, through a
-			// thread-local it never clears.
-			Footprint held = onItsOwnThread(() -> warm(patterns, full, prepared, failed));
-			if (held == null) {
+			// The warm handle lives its whole life on a thread of its own, so what its library keeps per thread is gone
+			// with it before the cold readings: a library may leave a store's data reachable from the thread that
+			// queried it, as Jena's in-memory dataset does through a thread-local it never clears.
+			if (!onItsOwnThread(() -> warm(patterns, full, prepared, failed))) {
 				return queryResult(artifact());
 			}
-			// The store is unreachable now, so what it held is what this sample no longer finds.
-			retained = held.minus(Footprint.sample());
 			// A cold reading opens a store of its own, so it starts only once the warm handle is gone: a store that
 			// locks its files refuses a second handle, and one that hands every open the same connection would shut
 			// the warm handle down under it.
@@ -199,18 +219,16 @@ public final class Worker {
 			return queryResult(artifact());
 		}
 
-		/** The role's result, with what the open store retained when the role got that far. */
+		/** The role's result; {@code artifact} is the store it built, or null. */
 		private Map<String, Object> queryResult(String artifact) {
-			Map<String, Object> out = result(a, "query", rows, counts, failures, false, k, artifact);
-			out.put("retained", retained == null ? null : retained.toJson());
-			return out;
+			return result(a, "query", rows, counts, failures, false, k, artifact);
 		}
 
 		/**
-		 * Open the warm handle, take every pattern's counts and warm readings on it, sample what the process holds
-		 * with it open, then dispose it. Null when the store does not open.
+		 * Open the warm handle, take every pattern's counts and warm readings on it, then dispose it. False when the
+		 * store does not open.
 		 */
-		private Footprint warm(List<Pattern> patterns, Pattern full, Map<String, Q> prepared, Set<String> failed) {
+		private boolean warm(List<Pattern> patterns, Pattern full, Map<String, Q> prepared, Set<String> failed) {
 			H handle;
 			try {
 				handle = a.open(src, location);
@@ -221,11 +239,11 @@ public final class Worker {
 				}
 				lost.addAll(keys(full.name()));
 				failures.add(failure("open", lost, e));
-				return null;
+				return false;
 			}
 			try {
 				measureWarm(handle, patterns, full, prepared, failed);
-				return Footprint.sample();
+				return true;
 			} finally {
 				try {
 					a.dispose(handle);
@@ -341,6 +359,119 @@ public final class Worker {
 		}
 	}
 
+	/**
+	 * The memory role ({@link #memory}). The store lives its whole life on a thread of its own, as the query role's
+	 * warm handle does, so a thread-local its library leaves holding the store's data dies with the thread, and what
+	 * it held counts as the store's.
+	 */
+	private static final class Memory<H, Q> {
+		private final Adapter<H, Q> a;
+		private final WorkerFiles f;
+		private final Path src;
+		private final Path location;
+		private final Map<String, Object> counts = new LinkedHashMap<>();
+		private Rss peak;
+
+		Memory(Adapter<H, Q> a, WorkerFiles f, Path workdir) {
+			this.a = a;
+			this.f = f;
+			this.src = a.supportsQuads() ? f.quads() : f.triples();
+			this.location = workdir.resolve("store");
+		}
+
+		Map<String, Object> run() throws Exception {
+			List<Pattern> probes = Inputs.probes(f.probes());
+			Pattern full = probes.stream().filter(p -> p.kind() == Pattern.Kind.FULL).findFirst().orElseThrow();
+			Map<String, Q> prepared = new LinkedHashMap<>();
+			for (Pattern p : Stream.concat(patterns(a, probes).stream(), Stream.of(full)).toList()) {
+				prepared.put(p.name(), a.prepare(p));
+			}
+			// Thrown away: a JVM's first sample resolves the mallinfo2 downcall between reading the tracking and
+			// reading mallinfo2, which throws that sample off by a few hundred KB.
+			Footprint.sample();
+			selfCheck(Footprint::sample);
+			// Sampled for its collection: the baseline holds no garbage.
+			Footprint.sample();
+			Rss base = Rss.read();
+			Footprint held = onItsOwnThread(() -> read(prepared));
+			// The store and its thread are gone: what they held is what this sample no longer finds.
+			Footprint store = held.minus(Footprint.sample());
+
+			Map<String, Object> out = new LinkedHashMap<>();
+			out.put("slug", a.slug());
+			out.put("label", a.label());
+			out.put("role", "memory");
+			out.put("obtained", a.obtained().json());
+			out.put("counts", counts);
+			out.put("storeBytes", store.heapBytes() + store.nativeBytes());
+			out.put("peakAnonBytes", peak.anonBytes() - base.anonBytes());
+			out.put("peakFileBytes", peak.fileBytes() - base.fileBytes());
+			out.put("jdk", jdk());
+			return out;
+		}
+
+		/**
+		 * Open the store, read every pattern once under a {@link Rss.Sampler}, and sample what the process holds with
+		 * the store still open; then dispose it.
+		 */
+		private Footprint read(Map<String, Q> prepared) throws Exception {
+			H handle = a.open(src, location);
+			try {
+				// Sampled for its collection: an open that builds its store leaves the build's garbage behind.
+				Footprint.sample();
+				Rss.Sampler sampler = Rss.Sampler.start();
+				try (sampler) {
+					for (Map.Entry<String, Q> p : prepared.entrySet()) {
+						counts.put(p.getKey(), a.count(handle, p.getValue()));
+					}
+				}
+				peak = sampler.peak();
+				return Footprint.sample();
+			} finally {
+				a.dispose(handle);
+			}
+		}
+	}
+
+	/**
+	 * Throw, naming the counter, unless both of {@code sample}'s counters see the 8 MiB the check holds: an array in
+	 * the heap, whose counter must rise by all of it, and 128 blocks of 64 KiB from one arena outside it, whose counter
+	 * must rise by at least {@link #SELF_CHECK_NATIVE_BAR}. No block is large enough for glibc to mmap, so freeing them
+	 * leaves its dynamic mmap threshold, and with it how the store's allocations are served, as it was.
+	 */
+	static void selfCheck(Supplier<Footprint> sample) {
+		Footprint before = sample.get();
+		byte[] array = new byte[SELF_CHECK_BYTES];
+		Footprint held;
+		try (Arena arena = Arena.ofConfined()) {
+			for (int i = 0; i < SELF_CHECK_BYTES / SELF_CHECK_PART; i++) {
+				arena.allocate(SELF_CHECK_PART);
+			}
+			held = sample.get();
+			// Nothing reads the array, so without this the sample's collection could free it.
+			Reference.reachabilityFence(array);
+		}
+		long heapRise = held.heapBytes() - before.heapBytes(), nativeRise = held.nativeBytes() - before.nativeBytes();
+		if (heapRise < SELF_CHECK_BYTES) {
+			throw new IllegalStateException("self-check failed: the heap counter (used heap after a full GC) rose by "
+					+ heapRise + " bytes while the worker held an 8 MiB array");
+		}
+		if (nativeRise < SELF_CHECK_NATIVE_BAR) {
+			throw new IllegalStateException("self-check failed: the native counter (mallinfo2 less the JVM's own "
+					+ "malloc) rose by " + nativeRise + " bytes while the worker held 8 MiB of native memory (want at "
+					+ "least " + (SELF_CHECK_NATIVE_BAR >> 20) + " MiB)");
+		}
+	}
+
+	/**
+	 * The patterns the query and memory roles read: the triple patterns, plus the graph-bound ones when the library
+	 * has graphs.
+	 */
+	static List<Pattern> patterns(Adapter<?, ?> a, List<Pattern> probes) {
+		return probes.stream().filter(p -> p.kind() == Pattern.Kind.TRIPLES
+				|| (p.kind() == Pattern.Kind.QUADS && a.supportsQuads())).toList();
+	}
+
 	private static <H, Q> Map<String, Object> runMutate(Adapter<H, Q> a, WorkerFiles f, Path workdir, Knobs k,
 			List<Map<String, Object>> rows, List<Map<String, Object>> failures) {
 		String slug = a.slug();
@@ -411,11 +542,14 @@ public final class Worker {
 		return out;
 	}
 
-	/** {@code body}'s result, computed on a thread that has ended by the time this returns; what it throws, thrown. */
-	static <T> T onItsOwnThread(Supplier<T> body) {
+	/**
+	 * {@code body}'s result, computed on a thread that has ended by the time this returns; what it throws, thrown, a
+	 * checked exception wrapped in an {@link IllegalStateException}.
+	 */
+	static <T> T onItsOwnThread(Measure.ThrowingSupplier<T> body) {
 		List<T> result = new ArrayList<>(1);
 		Throwable[] thrown = new Throwable[1];
-		Thread thread = Thread.ofPlatform().name("warm-handle").start(() -> {
+		Thread thread = Thread.ofPlatform().name("store-handle").start(() -> {
 			try {
 				result.add(body.get());
 			} catch (Throwable t) {
@@ -426,7 +560,7 @@ public final class Worker {
 			thread.join();
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
-			throw new IllegalStateException("interrupted waiting for the warm handle's thread", e);
+			throw new IllegalStateException("interrupted waiting for the store handle's thread", e);
 		}
 		if (thrown[0] instanceof Error e) {
 			throw e;

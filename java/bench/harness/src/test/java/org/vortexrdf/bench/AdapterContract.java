@@ -6,7 +6,10 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.TestFactory;
@@ -15,7 +18,8 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * What every adapter must do on the fixture, whichever library it drives: answer every probe it supports with the
  * fixture's row count through both of its count paths, answer the same after a reopen, move the full count by
- * exactly the batch it adds or deletes, and read the terms it materializes. Each library module's test extends it.
+ * exactly the batch it adds or deletes, read the terms it materializes, and count the same in a memory run. Each
+ * library module's test extends it.
  */
 public abstract class AdapterContract {
 	@TempDir
@@ -52,6 +56,12 @@ public abstract class AdapterContract {
 		WorkerFiles f = Fixture.extract(tmp.resolve("fixture"));
 		Pattern s = Inputs.probes(f.probes()).get(0);
 		return adapters().stream().map(a -> dynamicTest(a.slug(), () -> termsAreRead(a, f, s)));
+	}
+
+	@TestFactory
+	Stream<DynamicTest> aMemoryRunReadsWhatTheFixtureHolds() throws Exception {
+		WorkerFiles f = Fixture.extract(tmp.resolve("fixture"));
+		return adapters().stream().map(a -> dynamicTest(a.slug(), () -> memoryRunCountsMatch(a, f)));
 	}
 
 	private <H, Q> void countsMatch(Adapter<H, Q> a, WorkerFiles f, List<Pattern> probes) throws Exception {
@@ -111,6 +121,17 @@ public abstract class AdapterContract {
 		} finally {
 			a.dispose(h);
 		}
+	}
+
+	/** A memory run on the store a build left in {@code <slug>/memory/store}, as the query role leaves one. */
+	private <H, Q> void memoryRunCountsMatch(Adapter<H, Q> a, WorkerFiles f) throws Exception {
+		Path work = location(a, "memory");
+		a.dispose(a.build(source(a, f), Files.createDirectories(work.resolve("store"))));
+		Map<String, Long> want = new HashMap<>(Fixture.MATCHES);
+		if (!a.supportsQuads()) {
+			want.keySet().removeAll(Set.of("G", "SPOG"));
+		}
+		assertEquals(want, Worker.memory(a, f, work).get("counts"), a.slug());
 	}
 
 	private static Path source(Adapter<?, ?> a, WorkerFiles f) {

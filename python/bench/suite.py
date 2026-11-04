@@ -196,7 +196,6 @@ def run_roles(
 
     `run_worker(slug, role)` returns the worker's result, or None when the
     worker failed: one library failing must not discard the rest of the run.
-    A query result's `memory_extra` joins that phase's memory row.
 
     Each adapter's memory role runs up to `memory_runs` times, and only when
     its query role reported counts (otherwise its artifact is missing or
@@ -220,8 +219,7 @@ def run_roles(
         run.iters = run.iters or res.get("iters") or {}
         if res.get("peak_rss_mb") is not None:
             run.memory.append(
-                {"slug": slug, "label": res["label"], "role": "query", "peakRssMb": res["peak_rss_mb"],
-                 **res.get("memory_extra", {})}
+                {"slug": slug, "label": res["label"], "role": "query", "peakRssMb": res["peak_rss_mb"]}
             )
         run.sizes.append({"slug": slug, "label": res["label"], "bytes": res.get("artifact_bytes")})
         run.failures.extend(res.get("failures", []))
