@@ -148,6 +148,8 @@ pub(crate) enum Event {
     /// A located run's rows read at a checked column to check them, this
     /// many rows.
     CheckRead(u64),
+    /// A column's zone map read from its file, for a located run's checks.
+    ZoneMapRead,
     /// A row scan run (`read_all_rows`, `stream_rows`).
     RowScan,
     /// A restricted file scan built with a filter pushed down.

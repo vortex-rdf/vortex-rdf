@@ -404,3 +404,111 @@ async fn zoned_runs_skip_settled_zones() {
         }
     }
 }
+
+/// Zone maps `rec` saw read from a file.
+fn zone_maps_read(rec: &Recorder) -> usize {
+    rec.count(&Event::ZoneMapRead)
+}
+
+/// The footer settles a checked slot for the whole file before any zone map
+/// is read: on a one-graph store a graph check needs no reading at all, and a
+/// graph code no row holds (here the `type` predicate's) matches nothing,
+/// still from the located run's table.
+#[tokio::test]
+async fn footer_settles_a_whole_file() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    let _on = ForcedZones::set(true);
+    for fixture in zone_stores().await {
+        let store = &fixture.store;
+        let patterns = zone_patterns(store, 1).await;
+        let located = match fixture.index {
+            IndexConfig::Copy => patterns[0],
+            _ => patterns[1],
+        };
+        let ty = code_of(store, "<http://example.org/type>").await;
+        let held_by_none = CodePattern {
+            graph: Some(ty),
+            ..located
+        };
+        let rec = Recorder::start();
+        assert_eq!(
+            store.count_code_pattern(held_by_none).await.unwrap(),
+            0,
+            "{}",
+            fixture.tag
+        );
+        let answered = store.locate_codes(held_by_none, 0, Some(0)).await.unwrap();
+        assert_eq!(
+            answered.map(|l| l.total),
+            Some(0),
+            "{}: still located",
+            fixture.tag
+        );
+        if !fixture.tag.ends_with("leaves") {
+            assert_eq!(
+                zone_maps_read(&rec),
+                0,
+                "{}: the footer settles it",
+                fixture.tag
+            );
+            assert_eq!(zone_work(&rec), (0, 0), "{}", fixture.tag);
+        }
+        drop(rec);
+        if fixture.graphs == Graphs::One {
+            let rec = Recorder::start();
+            assert_eq!(store.count_code_pattern(located).await.unwrap(), RUN as u64);
+            assert_eq!(zone_maps_read(&rec), 0, "{}: one graph", fixture.tag);
+            assert_eq!(zone_work(&rec), (0, 0), "{}: one graph", fixture.tag);
+            assert_eq!(rec.count_where(|e| matches!(e, Event::LocatedBlock(_))), 0);
+        }
+    }
+}
+
+/// `GAP_ROWS` caps only a run whose checks zones cannot decide: with the cap
+/// forced below the run, the copy index's run is still located with zones,
+/// and declines without them, as does a run whose column has no zone map.
+/// Counts answer alike either way.
+#[tokio::test]
+async fn gap_cap_only_where_zones_cannot_decide() {
+    use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
+
+    let _cap = ForcedGapRows::set(1_000);
+    for fixture in zone_stores().await {
+        let store = &fixture.store;
+        let patterns = zone_patterns(store, 1).await;
+        let (pattern, zoned) = match (
+            fixture.graphs,
+            fixture.index,
+            fixture.tag.ends_with("leaves"),
+        ) {
+            (Graphs::Alternating, IndexConfig::Copy, _) => (patterns[0], true),
+            (_, _, true) => (patterns[1], false),
+            _ => continue,
+        };
+        let want = term_rows(store, pattern).await.len() as u64;
+        {
+            let _on = ForcedZones::set(true);
+            let located = store.locate_codes(pattern, 0, Some(0)).await.unwrap();
+            assert_eq!(
+                located.is_some(),
+                zoned,
+                "{}: located with zones",
+                fixture.tag
+            );
+            assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
+        }
+        let _off = ForcedZones::set(false);
+        assert!(
+            store
+                .locate_codes(pattern, 0, Some(0))
+                .await
+                .unwrap()
+                .is_none(),
+            "{}",
+            fixture.tag
+        );
+        assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
+    }
+}
