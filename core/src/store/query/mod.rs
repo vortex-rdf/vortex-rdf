@@ -8,3 +8,5 @@ pub(crate) mod matching;
 pub(crate) mod partitions;
 pub(crate) mod served;
 pub(crate) mod window;
+#[cfg(feature = "file-io")]
+pub(crate) mod zone_decider;

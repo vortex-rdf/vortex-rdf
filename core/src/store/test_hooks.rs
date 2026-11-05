@@ -87,6 +87,32 @@ thread_local! {
     static CUTS_BEFORE_FAILURE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
+thread_local! {
+    /// Whether this thread's located runs decide zone by zone, while a
+    /// [`ForcedZones`] guard is live.
+    static ZONES: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The zone switch a [`ForcedZones`] forced on this thread.
+pub(crate) fn forced_zones() -> Option<bool> {
+    ZONES.get()
+}
+
+/// While alive, this thread's located runs decide their checked rows zone by
+/// zone (`true`) or row by row (`false`), whatever `VORTEX_RDF_ZONES` says.
+pub(crate) struct ForcedZones {
+    _guard: Override<bool>,
+}
+
+impl ForcedZones {
+    /// Force the zone switch to `on` until the guard drops.
+    pub(crate) fn set(on: bool) -> Self {
+        Self {
+            _guard: Override::set(&ZONES, on),
+        }
+    }
+}
+
 /// The split limit a [`ForcedLimit`] forced on this thread's row scans.
 pub(crate) fn forced_split_limit() -> Option<usize> {
     SPLIT_LIMIT.get()
