@@ -421,38 +421,35 @@ public final class Worker {
 		 * collection drops the build's garbage, so its reading is the store as opened.
 		 */
 		private Footprint opened() throws Exception {
-			H handle = a.open(src, location);
-			Footprint opened;
-			try {
-				opened = Footprint.sample();
-			} catch (Throwable t) {
-				// The sample's error is the run's: one the dispose adds after it rides along, rather than hiding it.
-				try {
-					a.dispose(handle);
-				} catch (Throwable suppressed) {
-					t.addSuppressed(suppressed);
-				}
-				throw t;
-			}
-			a.dispose(handle);
-			return opened;
+			return onAStore(h -> Footprint.sample());
 		}
 
 		/** Open the store again, read every pattern once under a {@link Rss.Sampler}, and dispose it. */
 		private void read(Map<String, Q> prepared) throws Exception {
-			H handle = a.open(src, location);
-			try {
+			onAStore(h -> {
 				// Sampled for its collection: an open that builds its store leaves the build's garbage behind.
 				Footprint.sample();
 				Rss.Sampler sampler = Rss.Sampler.start();
 				try (sampler) {
 					for (Map.Entry<String, Q> p : prepared.entrySet()) {
-						counts.put(p.getKey(), a.count(handle, p.getValue()));
+						counts.put(p.getKey(), a.count(h, p.getValue()));
 					}
 				}
 				peak = sampler.peak();
+				return null;
+			});
+		}
+
+		/**
+		 * Open the store, run {@code body} on it, and dispose it, whether the body returns or throws. The body's error is
+		 * the run's: one the dispose adds after it rides along as suppressed, rather than hiding it.
+		 */
+		private <T> T onAStore(Measure.ThrowingFunction<H, T> body) throws Exception {
+			H handle = a.open(src, location);
+			T result;
+			try {
+				result = body.apply(handle);
 			} catch (Throwable t) {
-				// The read's error is the run's: one the dispose adds after it rides along, rather than hiding it.
 				try {
 					a.dispose(handle);
 				} catch (Throwable suppressed) {
@@ -461,6 +458,7 @@ public final class Worker {
 				throw t;
 			}
 			a.dispose(handle);
+			return result;
 		}
 	}
 
