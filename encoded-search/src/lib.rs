@@ -254,7 +254,16 @@ impl<'a> SortedProbe<'a> {
     /// Whether the resolved tree's root is a dictionary: codes into a values
     /// array.
     pub fn is_dictionary(&self) -> bool {
-        matches!(self.root, node::Node::Dict { .. })
+        self.dictionary_len().is_some()
+    }
+
+    /// How many values the resolved tree's root dictionary holds; `None`
+    /// when its root is no dictionary.
+    pub fn dictionary_len(&self) -> Option<usize> {
+        match &self.root {
+            node::Node::Dict { values, .. } => Some(values.len()),
+            _ => None,
+        }
     }
 
     /// Pre-order encoding kinds of the resolved tree, for tests and

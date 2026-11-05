@@ -13,13 +13,13 @@ use std::sync::LazyLock;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
-use vortex_array::arrays::{BoolArray, PrimitiveArray};
+use vortex_array::arrays::{BoolArray, DictArray, PrimitiveArray};
 use vortex_array::expr::{BoundExpression, eq, lit, root};
 use vortex_array::scalar::Scalar;
 use vortex_array::search_sorted::{SearchSorted, SearchSortedArray, SearchSortedSide};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
-use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme};
+use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme, SchemeExt as _};
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 
 const N: usize = 2_097_152;
@@ -194,11 +194,70 @@ fn value_at(bencher: Bencher, shape: &str) {
 /// Values per window the equality counts take: a zone of a store's zone maps.
 const COUNT_WINDOW: usize = 8_192;
 
+/// The count benches' fixtures: dictionaries shaped like a store's graph
+/// column (a layout dictionary of a few values, its codes compressed: run
+/// ends for graphs in stretches, bit-packed for graphs row by row), one of
+/// 256 values, and the probe benches' run-end and 2,048-value dictionary.
+const COUNT_SHAPES: [&str; 5] = [
+    "graphs_stretch_2m",
+    "graphs_alternating_2m",
+    "dict256_alternating_2m",
+    "runend_2m",
+    "dict_2m",
+];
+
+/// A dictionary fixture: its name, its number of values, and the code of
+/// row `i`.
+type DictShape = (&'static str, usize, fn(usize) -> usize);
+
+static DICT_FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
+    let session = common::session();
+    let mut ctx = session.create_execution_ctx();
+    let codes_compressor = BtrBlocksCompressorBuilder::from_session(&session)
+        .exclude_schemes([integer::IntDictScheme.id()])
+        .build();
+    let shapes: [DictShape; 3] = [
+        ("graphs_stretch_2m", 4, |i| (i / 1000) % 4),
+        ("graphs_alternating_2m", 4, |i| i % 4),
+        ("dict256_alternating_2m", 256, |i| i % 256),
+    ];
+    shapes
+        .into_iter()
+        .map(|(name, distinct, code)| {
+            let codes: Vec<u8> = (0..N).map(|i| code(i) as u8).collect();
+            let values: Vec<u32> = (0..distinct as u32).map(|v| 1_000 + 7 * v).collect();
+            let data: Vec<u32> = codes.iter().map(|&c| values[c as usize]).collect();
+            let codes = codes_compressor
+                .compress(&PrimitiveArray::from_iter(codes).into_array(), &mut ctx)
+                .unwrap();
+            let encoded = DictArray::try_new(codes, PrimitiveArray::from_iter(values).into_array())
+                .unwrap()
+                .into_array();
+            let probe = SortedProbe::resolve(&encoded)
+                .unwrap_or_else(|| panic!("{name}: resolve declined ({})", encoded.encoding_id()));
+            assert!(probe.is_dictionary(), "{name}: {:?}", probe.node_kinds());
+            Fixture {
+                name,
+                data,
+                encoded,
+            }
+        })
+        .collect()
+});
+
+fn count_fixture(shape: &str) -> &'static Fixture {
+    DICT_FIXTURES
+        .iter()
+        .chain(FIXTURES.iter())
+        .find(|f| f.name == shape)
+        .unwrap()
+}
+
 /// Equality counts through the probe (`SortedProbe::count_eq`): 20 needles,
 /// each counted in every `COUNT_WINDOW`-value window of the fixture.
-#[divan::bench(args = SHAPES)]
+#[divan::bench(args = COUNT_SHAPES)]
 fn count_eq_probe(bencher: Bencher, shape: &str) {
-    let fixture = fixture(shape);
+    let fixture = count_fixture(shape);
     let probe = SortedProbe::resolve(&fixture.encoded).unwrap();
     let needles: Vec<u32> = needles(&fixture.data).into_iter().take(20).collect();
     let windows = fixture.data.len() / COUNT_WINDOW;
@@ -217,9 +276,9 @@ fn count_eq_probe(bencher: Bencher, shape: &str) {
 
 /// The same counts through Vortex's own kernels: each window sliced, compared
 /// to the needle (`eq(root(), lit(needle))`) and its true values counted.
-#[divan::bench(args = SHAPES)]
+#[divan::bench(args = COUNT_SHAPES)]
 fn count_eq_vortex(bencher: Bencher, shape: &str) {
-    let fixture = fixture(shape);
+    let fixture = count_fixture(shape);
     let session = common::session();
     let needles: Vec<BoundExpression> = needles(&fixture.data)
         .into_iter()

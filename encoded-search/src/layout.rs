@@ -552,9 +552,9 @@ impl ColumnChunks {
     /// How many of the values at `rows` (absolute) equal `needle`: each leaf
     /// the rows reach fetched (and cached) once and counted through its probe
     /// on the encoding where it allows ([`SortedProbe::count_eq`]), a
-    /// dictionary's codes leaf through Vortex's own compare, which is faster
-    /// there, and a leaf whose encoding declines the probe decoded and
-    /// counted.
+    /// dictionary leaf of many values through Vortex's own compare, which is
+    /// faster there ([`COMPARE_DICT_VALUES`]), and a leaf whose encoding
+    /// declines the probe decoded and counted.
     ///
     /// # Panics
     /// Panics if `rows` ends past `self.row_count()`.
@@ -579,11 +579,18 @@ impl ColumnChunks {
             let local = (at - leaf.row_offset) as usize..(to - leaf.row_offset) as usize;
             let fetched = self.chunk_leaf(idx, source, session).await?;
             count += match fetched.probe() {
-                // A dictionary's codes count faster through Vortex's own
-                // compare, which compares its values once; every other
-                // encoding counts faster on the probe (the probe bench's
-                // `count_eq_probe` against `count_eq_vortex`).
-                Some(probe) if probe.probe().is_dictionary() => {
+                // A large dictionary counts faster through Vortex's own
+                // compare, which compares its values once; the probe scans
+                // them on every count. Every other leaf counts faster on the
+                // probe, a store's few-valued graph dictionaries most of all
+                // (the probe bench's `count_eq_probe` against
+                // `count_eq_vortex`).
+                Some(probe)
+                    if probe
+                        .probe()
+                        .dictionary_len()
+                        .is_some_and(|values| values > COMPARE_DICT_VALUES) =>
+                {
                     count_eq_by_compare(fetched.array(), local, needle, session)?
                 }
                 Some(probe) => probe.probe().count_eq(local.start, local.len(), needle) as u64,
@@ -846,6 +853,14 @@ pub async fn fetch_flat(
     let row_count = usize::try_from(flat.row_count())?;
     parts.decode(flat.dtype(), row_count, flat.array_ctx(), session)
 }
+
+/// The most values a dictionary leaf holds for [`ColumnChunks::count_eq`] to
+/// count it on its probe; a larger one counts through Vortex's compare.
+/// Measured per 8,192-value window (the probe bench's count benches): with 4
+/// values the probe is 1.5x (bit-packed codes) to 450x (run-end codes)
+/// faster, with 256 values 4.5x, while with 2,048 values Vortex is 1.7x
+/// faster.
+const COMPARE_DICT_VALUES: usize = 1_024;
 
 /// How many of `array`'s values at `rows` equal `needle`, through Vortex's
 /// own kernels: `eq(root(), lit(needle))` over the slice, its true values
