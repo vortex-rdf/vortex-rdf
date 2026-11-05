@@ -62,7 +62,9 @@ It answers: per zone, none / all / mixed; per zone, a count (from the zone size,
 
 Through `StatsSession::register_rewrite` on `VORTEX_SESSION`, Vortex's extension point for statistics proofs:
 - **P1: a satisfier for `x = c`:** `min(x) = c AND max(x) = c`. Vortex 0.90 has none; vortex-rdf registers it and proposes it upstream (§12), then drops its own once Vortex ships one.
-- **P2: proofs over the recorded graph counts (§5)**, for `g = c`: falsified when the zone recorded its graphs and `c` is not among them; satisfied when `c` is the only one. With the falsifier registered, Vortex's own pruning (every filtered scan, `pruning_evaluation`) drops mixed graph zones that don't hold `c`, on every read path, with no vortex-rdf code in the scan. It needs the proof to be written with Vortex's built-in scalar functions over the statistic's stored state (for instance `list_contains` over a list of the zone's graphs); P2's plan checks this first, and changes the state's type if needed. If a proof can't be written that way, P2 keeps the counts for the ladder only.
+- **P2: a falsifier over the recorded graph counts (§5)**, for `g = c`: false for every row of a zone that recorded its graphs without `c`. Written with Vortex's built-in scalar functions only: `not(list_contains(get_item("values", stat(g, value_counts)), c))`. With it registered, Vortex's own pruning (every filtered scan, `pruning_evaluation`) drops graph zones that don't hold `c` although `c` lies within their bounds, on every read path, with no vortex-rdf code in the scan. "`c` is the only graph" needs no rule of its own: such a zone has `min = max = c` (P1's satisfier).
+  - **Settled by a probe (2026-11-05).** On a file whose zones alternate graphs 1 and 3, a filter on graph 2 (inside every zone's bounds) kept only the zones holding graph 2. The zoned reader's `pruning_evaluation` applied the falsifier, combined with the built-in min/max one by `falsify`'s `or`. A zone past `K` (a null state) stayed undecided.
+  - **The state's type follows from it:** a struct of `values` and `counts` lists. The first spike's opaque binary state can't be read by built-in functions.
 
 ## 4. Read paths
 
@@ -113,7 +115,7 @@ Cost: about 16 bytes per 8,192 rows per id column, held only by in-memory stores
 
 Written into every store from the new edition on (phase P2); there is no option to leave it out.
 
-- **What:** a custom aggregate function `vortexrdf.value_counts` (name open) with an `AggregateFnVTable`. For a zone holding at most `K` distinct values (`K` = 16, an option serialized with the aggregate), it records each value with its row count, as a list of `(value u64, count u32)`. Past `K` it records null, so the table stays small.
+- **What:** a custom aggregate function `vortexrdf.value_counts` (name open) with an `AggregateFnVTable`. For a zone holding at most `K` distinct values (`K` = 16, an option serialized with the aggregate), it records each value with its row count, as a struct of two lists: `values` (u64, ascending) and their `counts` (u32), so Vortex's built-in `list_contains` can test whether a zone holds a value (§3.1). Past `K` it records null, so the table stays small.
 - **Where:** in the zone maps of the graph columns of every table: the quad table, `index:posg`, `index:ospg`, and the reference indexes' new `g` column (§4.3). It's listed with the default aggregates in `ZonedLayoutOptions::aggregate_fns` for those columns in `id_column_strategy`. In memory it's computed with `Accumulator`.
 - **Read:** the column's recorded counts, decoded once per open file from the zoned layout's auxiliary child and kept with the file's other metadata. That memory is bounded by the file's layout (about 12 bytes per graph per zone), like the zone maps Vortex's readers keep, and holds no query result. A zone table is written as one segment, so reading it on every call would decode every zone each time (about 40 µs on a 4M-row table in the spike, growing with the table). With it, a mixed zone's count of `c` needs no data read; only zones with a null entry fall back to §3 level 4. Counts and offset windows then cost one lookup per zone wherever zones record their graphs.
 - **Registration and format:**
@@ -261,9 +263,9 @@ All modes returned identical rows.
 
 | Phase | Content |
 |---|---|
-| P1 | The ladder (file backend), footer statistics level, the encoded count, file located table runs (§4.1), counters and switch. From §13: the `x = c` satisfier rule (S3) and `VortexFile::can_prune` at level 1 (S4). Plan: `docs/superpowers/plans/2026-11-05-zone-reads-p1.md` |
+| P1 | The ladder (file backend), footer statistics level, the encoded count, file located table runs (§4.1), counters and switch. From §13: the `x = c` satisfier rule (S3) and `VortexFile::can_prune` at level 1 (S4) |
 | S | Done: the spikes (§10) settled §6 (no memo) and added the reference indexes' graph column (§4.3) |
-| P2 | The per-zone graph-count statistic and its edition (§5): aggregate, writer, file reads through the ladder. From §13: its proofs registered as rules, so Vortex's own pruning uses it (S9), if they can be written with built-in functions |
+| P2 | The per-zone graph-count statistic and its edition (§5): aggregate, writer, file reads through the ladder. From §13: its falsifier registered as a rule, so Vortex's own pruning uses it (S9) |
 | P3 | The reference indexes' graph column (§4.3): format under P2's edition, both builders, by-reference graph checks from it |
 | P4 | Whole-store filters: file general-match counts (§4.4); in-memory residual stage on Vortex `ZoneMap` with the recorded graph counts, array-statistics level. From §13: `CodeZones`, `ZoneBuilder`, `ZoneTable` and `runs_holding` replaced (S1), quad columns' zone tables read as `ZoneMap`s (S2), min and max stamped as array statistics (S10) |
 | P5 | In-memory index components with zone maps (and the reference graph column); their runs checked as contiguous runs (§4.2, §4.3). From §13: Vortex's compressor in place of the hand-picked encodings, if measurements allow (S11) |
@@ -304,7 +306,7 @@ An audit of what vortex-rdf built that Vortex 0.90 already offers, checked again
 | S6 | `BoundExprMemo` (one bound filter tree per shape) and the `ReaderTree` retired when it clears | None: Vortex's reader caches are keyed by the bound tree's identity and never evicted, so vortex-rdf pins identities and retires readers to bound them | Keep | — |
 | S7 | The quad table's `splits` kept once per file | `VortexFile::splits()` recomputes on every call | Keep | — |
 | S8 | Per-zone graph counts decoded by vortex-rdf (§5) | No public accessor for a reader's `ZoneMap` or a `ZoneMap`'s values | Keep (decoded once per file) | P2 |
-| S9 | Graph zones that don't hold `c` pruned only by vortex-rdf's ladder | Rules over the recorded graph counts (§3.1) make Vortex's own pruning exact for graph zones, in every scan | Replace (new rule), if a proof can be written with built-in scalar functions | P2 |
+| S9 | Graph zones that don't hold `c` pruned only by vortex-rdf's ladder | A falsifier over the recorded graph counts (§3.1) makes Vortex's own pruning exact for graph zones, in every scan | Replace (new rule; the 2026-11-05 probe shows it can be written with built-in functions) | P2 |
 | S10 | Min and max computed while compressing in-memory columns, then dropped (`resident.rs`) | Stamped as exact `Stat::Min`/`Stat::Max` on the array, so its statistics answer level 1 in memory | Replace | P4 |
 | S11 | In-memory columns' encoding chosen by hand: constant, run-end or bit-packed (`compress_int_column`) | `BtrBlocksCompressorBuilder::empty()` with the schemes the encoded-search probe reads. Today's pass also yields the zone bounds; a compressor needs a second pass for them | Measure first | P5 |
 | S12 | `IsSorted` stamped on sorted columns | Already Vortex's `Stat::IsSorted` | Keep (already Vortex) | — |
