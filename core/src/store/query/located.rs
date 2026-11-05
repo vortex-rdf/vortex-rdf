@@ -271,25 +271,27 @@ impl VortexRdfStore {
             (Some("index:posg"), [1, 2, 0, 3]),
             (Some("index:ospg"), [2, 0, 1, 3]),
         ];
-        let tables = file.located_tables(|| LocatedTables {
-            sorted: TABLES.map(|(component, _)| {
-                let handle = |column: &str| match component {
-                    None => file.column_chunks(column),
-                    Some(name) => file.component_column_chunks(name, column),
-                };
-                Some([
-                    handle(PRIMARY_COLUMNS[0])?,
-                    handle(PRIMARY_COLUMNS[1])?,
-                    handle(PRIMARY_COLUMNS[2])?,
-                    handle(PRIMARY_COLUMNS[3])?,
-                ])
-            }),
-            references: REFERENCES.map(|(name, _)| {
-                Some([
-                    file.component_column_chunks(name, "val")?,
-                    file.component_column_chunks(name, "rid")?,
-                ])
-            }),
+        let tables = file.located_tables(|| {
+            LocatedTables::new(
+                TABLES.map(|(component, _)| {
+                    let handle = |column: &str| match component {
+                        None => file.column_chunks(column),
+                        Some(name) => file.component_column_chunks(name, column),
+                    };
+                    Some([
+                        handle(PRIMARY_COLUMNS[0])?,
+                        handle(PRIMARY_COLUMNS[1])?,
+                        handle(PRIMARY_COLUMNS[2])?,
+                        handle(PRIMARY_COLUMNS[3])?,
+                    ])
+                }),
+                REFERENCES.map(|(name, _)| {
+                    Some([
+                        file.component_column_chunks(name, "val")?,
+                        file.component_column_chunks(name, "rid")?,
+                    ])
+                }),
+            )
         });
         let run = |columns: Columns, rows, checked| LocatedRun {
             codes,

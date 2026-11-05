@@ -135,6 +135,25 @@ pub(crate) struct LocatedTables {
     pub(crate) sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
     /// Per reference index (`index:ref-p`, `index:ref-o`), its `(val, rid)`.
     pub(crate) references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
+    /// Per sorted table and `(s, p, o, g)` column, its zone map, read on
+    /// first use; `None` for a column without exact zone bounds. Two `u64`
+    /// per zone of a column read, bounded by the file's layout.
+    #[expect(dead_code, reason = "read by located runs from P1 task 6")]
+    pub(crate) zones: [[OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 3],
+}
+
+impl LocatedTables {
+    /// The tables' handles, none of their zone maps read yet.
+    pub(crate) fn new(
+        sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
+        references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
+    ) -> Self {
+        Self {
+            sorted,
+            references,
+            zones: Default::default(),
+        }
+    }
 }
 
 /// What the tests count of how reads reached a file
@@ -429,6 +448,31 @@ impl NativeStoreFile {
             return self.roster.dict;
         }
         self.index_child(name).map(|child| child.slot)
+    }
+
+    /// The layout of column `column` of the quad table (`component` `None`)
+    /// or of index component `component`; `None` when either is missing.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by located runs from P1 task 6")
+    )]
+    pub(crate) fn table_column_layout(
+        &self,
+        component: Option<&str>,
+        column: &str,
+    ) -> Option<LayoutRef> {
+        use vortex_layout::LayoutChildType;
+
+        let table = match component {
+            None => self.quad_layout().ok()?,
+            Some(name) => self.slot_layout(self.slot_of(name)?).ok()?,
+        };
+        (0..table.nslots()).find_map(|i| match table.slot_type(i) {
+            Some(LayoutChildType::Field(name)) if name.as_ref() == column => {
+                table.slot(i).ok().flatten()
+            }
+            _ => None,
+        })
     }
 
     /// The quad child's layout (the root's transparent child): the struct of
