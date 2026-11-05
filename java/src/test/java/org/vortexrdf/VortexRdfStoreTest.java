@@ -208,8 +208,9 @@ class VortexRdfStoreTest {
 	@Test
 	void engineCountersNameEveryValueAndStayZeroWhenOff() {
 		Map<String, Long> counters = VortexRdfStore.engineCounters();
-		assertEquals(18, counters.size());
+		assertEquals(28, counters.size());
 		assertTrue(counters.containsKey("leaf_decoded") && counters.containsKey("typed_eq_probe_values"));
+		assertTrue(counters.containsKey("zone_counted") && counters.containsKey("check_read_values"));
 		if (!"1".equals(System.getenv("VORTEX_RDF_COUNTERS"))) {
 			assertTrue(counters.values().stream().allMatch(v -> v == 0), "nothing counts without the switch");
 		}
