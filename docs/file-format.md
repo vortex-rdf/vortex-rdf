@@ -538,7 +538,7 @@ Vortex's scan stream spawns, or, over such a filter, inside the split reads
 that evaluate its masks a split at a time. Under a file-backed dictionary a
 scan's chunks leave their split tasks undecoded, as their code columns, and
 decode as the stream reaches them, each decode spawned onto the runtime,
-[`STREAM_DECODE_AHEAD`](../core/src/store/read/quads.rs#L508) (2) of them in
+[`STREAM_DECODE_AHEAD`](../core/src/store/read/quads.rs#L511) (2) of them in
 flight ahead of the consumer. Vortex runs up to four splits per core ahead of
 the consumer, and those hold codes, so a scan holds at most two chunks of
 decoded terms beyond the one the consumer holds, whatever the core count.

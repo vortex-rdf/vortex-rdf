@@ -407,15 +407,18 @@ impl VortexRdfStore {
     }
 
     /// `scan`'s chunks decoded through `decoder`, then the tail's chunk; a
-    /// chunk's read error is one error chunk. Without a file-backed
-    /// dictionary the decode runs inside the scan's split tasks (its map
+    /// chunk's read error is one error chunk. A file scan needs a tokio
+    /// runtime: vortex spawns its splits onto the current one
+    /// (`Handle::current()`) as the stream is polled. Without a file-backed
+    /// dictionary the decode runs inside those split tasks (the scan's map
     /// function), concurrently across the runtime's workers. Under a
     /// file-backed dictionary every chunk passes on undecoded, its compact
-    /// code columns, and decodes as the stream reaches it: spawned onto the
-    /// runtime, [`STREAM_DECODE_AHEAD`] decodes in flight ahead of the
-    /// consumer, or on the stream itself where no runtime is current. The
-    /// splits the scan runs ahead of the consumer hold codes, and at most
-    /// [`STREAM_DECODE_AHEAD`] chunks beyond the consumer's are decoded.
+    /// code columns, and decodes as the stream reaches it, spawned onto the
+    /// same runtime with [`STREAM_DECODE_AHEAD`] decodes in flight ahead of
+    /// the consumer: the splits the scan runs ahead of the consumer hold
+    /// codes, and at most [`STREAM_DECODE_AHEAD`] chunks beyond the
+    /// consumer's are decoded. The stream spawns only where a runtime is
+    /// current, as the other file reads do ([`ScanDriver::for_row_scan`]).
     #[cfg(feature = "file-io")]
     fn scan_chunks<T: ChunkDecode>(
         &self,
@@ -503,7 +506,7 @@ const TASK_DECODE_MIN_ROWS: usize = 1024;
 /// The decodes a file-backed Dictionary scan keeps in flight ahead of its
 /// consumer ([`scan_chunks`](VortexRdfStore::scan_chunks)): with the chunk
 /// the consumer holds, at most this many plus one chunks are decoded at once,
-/// whatever the core count, and up to this many decode in parallel.
+/// whatever the core count, and up to this many decode concurrently.
 #[cfg(feature = "file-io")]
 const STREAM_DECODE_AHEAD: usize = 2;
 
@@ -735,8 +738,10 @@ mod tests {
     /// A file scan decodes at most [`STREAM_DECODE_AHEAD`] chunks beyond
     /// those its consumer has pulled, however far the scan's splits run
     /// ahead: a file-backed Dictionary store of eight chunks, its chunk
-    /// stream pulled a chunk at a time, has after each pull decoded no more
-    /// chunks than that, and by its end every chunk once.
+    /// stream polled a chunk at a time, has after each poll decoded no more
+    /// chunks than that, and by its end every chunk once. The polls that
+    /// wait count too: the decodes ahead peak while the consumer waits for
+    /// its next chunk, and are one fewer once it has it.
     #[tokio::test]
     async fn a_file_scan_decodes_at_most_its_decode_ahead_beyond_the_consumer() {
         const CHUNKS: usize = 8;
@@ -751,14 +756,21 @@ mod tests {
         let decoded_so_far = || rec.count_where(|e| matches!(e, Event::StreamDecode(_)));
         let mut chunks = store.shared_quad_chunks();
         let (mut pulled, mut rows) = (0, 0);
-        while let Some(chunk) = chunks.next().await {
-            pulled += 1;
-            rows += chunk.into_iter().map(Result::unwrap).count();
+        loop {
+            let polled = futures::poll!(chunks.next());
             let decoded = decoded_so_far();
             assert!(
                 decoded <= pulled + STREAM_DECODE_AHEAD,
                 "{decoded} chunks decoded with {pulled} pulled"
             );
+            match polled {
+                std::task::Poll::Pending => tokio::task::yield_now().await,
+                std::task::Poll::Ready(Some(chunk)) => {
+                    pulled += 1;
+                    rows += chunk.into_iter().map(Result::unwrap).count();
+                }
+                std::task::Poll::Ready(None) => break,
+            }
         }
         assert_eq!(decoded_so_far(), CHUNKS, "every chunk decoded once");
         // The base's chunks, then the tail's, empty.
