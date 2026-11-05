@@ -58,6 +58,13 @@ jobs:
           run: cargo codspeed run --bench benchmark
         env:
           DIVAN_SAMPLE_COUNT: 10
+          # codspeed 6 runs every case in a fresh process unless this is false:
+          # each case then starts cold under valgrind and rebuilds the stores
+          # core/benches/support/mod.rs caches for the process, and this step
+          # took over an hour instead of 9 minutes. A shared process, as under
+          # codspeed 5, lets the allocator state one case leaves behind reach
+          # the next.
+          CODSPEED_PROCESS_ISOLATION: "false"
 
   js-benchmarks:
     name: Run JS benchmarks
