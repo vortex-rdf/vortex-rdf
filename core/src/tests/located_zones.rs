@@ -62,6 +62,63 @@ async fn column_zones_absent_without_zone_maps() {
     );
 }
 
+/// A store file's graph column read with its recorded values: on the
+/// 1,000-row stretches' `index:posg`, each zone's count of each graph is its
+/// rows' count, and a code no row holds (the `type` predicate's) counts
+/// none. A file written without the statistic, as before it, records no
+/// zone's.
+#[tokio::test]
+async fn column_zones_read_recorded_counts() {
+    use crate::io::zone_map::ZONE_ROWS;
+    use crate::store::test_hooks::ForcedValueCounts;
+
+    for recorded in [true, false] {
+        let (_dir, path) = {
+            let _statistic = ForcedValueCounts::set(recorded);
+            write_store_file(
+                zone_quads(Graphs::Stretches),
+                LayoutStrategy::Dictionary,
+                IndexConfig::Copy.types(),
+            )
+            .await
+        };
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let native = open_mapped(&path).await;
+        let column = native
+            .table_column_layout(Some("index:posg"), "g")
+            .expect("index:posg has a g column");
+        let zones = ColumnZones::read(&column, &native.segment_source())
+            .await
+            .unwrap()
+            .expect("a written code column is zoned with exact bounds");
+        // index:posg holds the quad table's rows in (p, o, s, g) order.
+        let mut rows = row_list(&store).await;
+        rows.sort_unstable_by_key(|row| (row[1], row[2], row[0], row[3]));
+        assert_eq!(zones.zones(), rows.len().div_ceil(ZONE_ROWS) as u64);
+        let mut graphs = Vec::new();
+        for g in 1..=Graphs::Stretches.last() {
+            graphs.push(code_of(&store, &format!("<http://example.org/g{g}>")).await);
+        }
+        let held_by_none = code_of(&store, "<http://example.org/type>").await;
+        for (zone, rows) in rows.chunks(ZONE_ROWS).enumerate() {
+            let zone = zone as u64;
+            for &g in &graphs {
+                let want = rows.iter().filter(|row| row[3] == g).count() as u64;
+                assert_eq!(
+                    zones.recorded_count(zone, g),
+                    recorded.then_some(want),
+                    "recorded {recorded}: zone {zone}, graph {g}"
+                );
+            }
+            assert_eq!(
+                zones.recorded_count(zone, held_by_none),
+                recorded.then_some(0),
+                "recorded {recorded}: zone {zone}, a code no row holds"
+            );
+        }
+    }
+}
+
 /// Rows of each run of a [`zone_quads`] store.
 const RUN: usize = 40_000;
 
@@ -76,6 +133,10 @@ enum Graphs {
     Stretches,
     /// Four graphs in turn, row by row.
     Alternating,
+    /// Graph 1 on even rows and graph 3 on odd ones, but graph 2 on rows
+    /// 20,000..21,000: every zone's bounds hold graph 2's code, one zone
+    /// holds its rows.
+    Gapped,
 }
 
 impl Graphs {
@@ -93,6 +154,8 @@ impl Graphs {
             Graphs::Long => 1 + i / (RUN / 2),
             Graphs::Stretches => 1 + (i / 1000) % 4,
             Graphs::Alternating => 1 + i % 4,
+            Graphs::Gapped if (20_000..21_000).contains(&i) => 2,
+            Graphs::Gapped => 1 + 2 * (i % 2),
         }
     }
 
@@ -101,6 +164,7 @@ impl Graphs {
         match self {
             Graphs::One => 1,
             Graphs::Long => 2,
+            Graphs::Gapped => 3,
             Graphs::Stretches | Graphs::Alternating => 4,
         }
     }
@@ -420,6 +484,54 @@ async fn zoned_runs_skip_settled_zones() {
             }
             _ => {}
         }
+    }
+}
+
+/// A graph whose rows lie in one zone of a run, among zones of two graphs
+/// that bracket its code ([`Graphs::Gapped`]): every zone's bounds hold graph
+/// 2, so only the recorded values leave out the zones without it. Its count
+/// reads no checked rows and counts graph 2's zone alone on its encoding,
+/// and zones and rows answer alike. A file written without the statistic,
+/// as before it, counts as P1 did: every zone of the run on its encoding
+/// (Review Focus 4).
+#[tokio::test]
+async fn recorded_graphs_settle_zones_without_the_code() {
+    use crate::io::zone_map::ZONE_ROWS;
+    use crate::store::test_hooks::{ForcedValueCounts, ForcedZones};
+
+    for recorded in [true, false] {
+        let (_dir, path) = {
+            let _statistic = ForcedValueCounts::set(recorded);
+            write_store_file(
+                zone_quads(Graphs::Gapped),
+                LayoutStrategy::Dictionary,
+                IndexConfig::Copy.types(),
+            )
+            .await
+        };
+        let store = &VortexRdfStore::from_file(&path).await.unwrap();
+        let taxa = zone_patterns(store, 2).await[0];
+        let want = term_rows(store, taxa).await.len() as u64;
+        assert_eq!(want, 1_000, "graph 2's rows");
+        let rows = {
+            let _off = ForcedZones::set(false);
+            answers(store, taxa).await
+        };
+        let _on = ForcedZones::set(true);
+        let rec = Recorder::start();
+        assert_eq!(store.count_code_pattern(taxa).await.unwrap(), want);
+        // Graph 2's rows lie in one zone, whole within the run.
+        let counted = if recorded { ZONE_ROWS } else { RUN };
+        assert_eq!(
+            zone_work(&rec),
+            (counted as u64, 0),
+            "recorded {recorded}: rows counted on zones, and read"
+        );
+        drop(rec);
+        assert!(
+            answers(store, taxa).await == rows,
+            "recorded {recorded}: zones and rows answer alike"
+        );
     }
 }
 
