@@ -23,7 +23,7 @@ import { dirname, resolve } from 'node:path';
 
 import { VortexRdfStore, vortexCounter, vortexWasm, type BuildOptions } from './vortex.js';
 import {
-    fmtNs, consumeQuads, consumeStream, consumeStrings, settleRounds, wasmCounter,
+    fmtNs, consumeQuads, consumeStream, consumeStrings, errorText, settleRounds, wasmCounter,
     type JsMemoryRun, type WasmCounter,
 } from './util.js';
 import { df, moduli, type Pat } from './datasets.js';
@@ -141,7 +141,7 @@ export function reclaim(a: StoreAdapter, h: unknown): void {
     try {
         a.dispose?.(h);
     } catch (e) {
-        console.error(`  !! ${a.label}: dispose failed (${e instanceof Error ? e.message : e})`);
+        console.error(`  !! ${a.label}: dispose failed (${errorText(e)})`);
     }
     global.gc?.();
 }

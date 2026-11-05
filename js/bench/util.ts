@@ -449,8 +449,8 @@ export interface StoreReadings { opened: number; disposed: number }
 export interface JsMemoryRun { storeBuiltMb: number | null; storeLoadedMb: number | null; peakLiveMb: number | null }
 
 /** A memory run's figures from its readings, in live bytes: each store is
- *  what its free released on a store no read had touched, and the peak is the highest
- *  probe total above the baseline. A missing input gives null, and every
+ *  what its free released on a store no read had touched, and the peak is the
+ *  highest probe total above the baseline. A missing input gives null, and every
  *  figure is clamped at 0, since allocator noise can make a difference
  *  negative. */
 export function memoryRunFigures(r: {
