@@ -33,7 +33,8 @@ benchmark  fastest │ slowest │ median │ mean │ samples │ iters
 #dataset {"quads":64,"subjects":6,"predicates":35,"objects":37,"graphs":11,"terms":89,"matched":{"S":6}}
 """
 
-HOSTS = ("compare-footprint-panels", "js-memory-panels", "py-footprint-panels", "java-footprint-panels")
+HOSTS = ("compare-footprint-panels", "js-memory-panels", "py-footprint-panels", "java-footprint-panels",
+         "js-query-panels", "js-ingest-panels", "js-failures")
 
 PAGE_RUNNER = r"""
 const vm = require("vm");
@@ -74,18 +75,20 @@ console.log(JSON.stringify(out));
 """ % json.dumps(list(HOSTS))
 
 
-def render_page(out_dir: Path, **memory: list) -> str:
-    """Render a page whose four tabs carry the given memory entries."""
+def render_page(out_dir: Path, failures: dict | None = None, **memory: list) -> str:
+    """Render a page whose four tabs carry the given memory entries and, per suite, `failures`."""
+    failures = failures or {}
     rust = out_dir / "rust.txt"
     rust.write_text(RUST_LOG, encoding="utf-8")
     flags = []
     for kw, name in (("rust_compare", "rust-compare"), ("js", "js"), ("python", "python"), ("java", "java")):
-        if kw not in memory:
+        if kw not in memory and kw not in failures:
             continue
         path = out_dir / f"{name}.json"
         path.write_text(json.dumps({
             "results": [{"id": "ingest::vortex_dict", "median": "1 ms", "median_ns": 1e6}],
-            "memory": memory[kw],
+            "memory": memory.get(kw, []),
+            "failures": failures.get(kw, []),
         }), encoding="utf-8")
         flags += [f"--{name}", str(path)]
     index = out_dir / "index.html"
@@ -125,7 +128,7 @@ class PanelParser(HTMLParser):
                 self._text = ("rowh", [])
             else:
                 self._cell = {"text": [], "best": "best" in classes, "ratio": None, "spread": None,
-                              "title": a.get("title"), "span": 0}
+                              "title": a.get("title"), "span": 0, "failed": "failed" in classes}
         elif tag == "span" and self._cell is not None:
             self._cell["span"] += 1
             if "spread" in classes:
@@ -153,7 +156,7 @@ class PanelParser(HTMLParser):
         elif tag == "td" and self._cell is not None:
             c = self._cell
             self._row["cells"].append({"text": "".join(c["text"]), "best": c["best"], "ratio": c["ratio"],
-                                       "spread": c["spread"], "title": c["title"]})
+                                       "spread": c["spread"], "title": c["title"], "failed": c["failed"]})
             self._cell = None
         elif tag == "span" and self._text and self._text[0] == "ratio":
             self._cell["ratio"] = "".join(self._text[1])
@@ -182,6 +185,13 @@ def footprint_panels(page: str) -> dict[str, list[dict]]:
         parser.feed(html)
         panels[host] = parser.panels
     return panels
+
+
+def failures_text(page: str) -> str:
+    """The text of the `js-failures` line, tags stripped."""
+    scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
+    run = subprocess.run(["node", "-e", PAGE_RUNNER], input=scripts[-1], capture_output=True, text=True, check=True)
+    return re.sub(r"<[^>]+>", "", json.loads(run.stdout)["js-failures"])
 
 
 def panel(panels, title):
@@ -307,3 +317,23 @@ def test_the_syntax_check_rejects_a_script_that_does_not_parse(tmp_path):
     out = tmp_path / "index.html"
     assert rbd.check_script_syntax("<script>const ok = 1;</script>", out) is True
     assert rbd.check_script_syntax("<script>const broken = ;</script>", out) is False  # fails if node is missing
+
+
+JS_FAILS = [
+    {"slug": "oxigraph", "label": "oxigraph", "role": "fullscan", "phase": "full::count", "error": "unreachable"},
+    {"slug": "rdfstores_single", "label": "rdf-stores (1 index)", "role": "query", "phase": "ingest", "error": "boom"},
+]
+
+
+def test_a_js_phase_that_could_not_complete_reads_failed_and_is_listed(tmp_path):
+    page = render_page(tmp_path, failures={"js": JS_FAILS})
+    panels = footprint_panels(page)
+    match = panel(panels["js-query-panels"], "Cross-library match, by routing shape and cache regime")
+    cells = match["rows"]["oxigraph"]
+    assert [i for i, c in enumerate(cells) if c["failed"]] == [34]      # full, warm, count-only
+    assert cells[34]["text"] == "failed" and "unreachable" in cells[34]["title"]
+    build = panel(panels["js-ingest-panels"], "Build and open")["rows"]["rdf-stores (1 index)"][0]
+    assert build["failed"] and build["text"] == "failed" and "boom" in build["title"]
+    line = failures_text(page)
+    assert "oxigraph · fullscan · full::count: unreachable" in line
+    assert "rdf-stores (1 index) · query · ingest: boom" in line

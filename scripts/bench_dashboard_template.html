@@ -15,6 +15,7 @@
     --border-strong: rgba(11,11,11,0.18);
     --accent:      #2a78d6;
     --good:        #0ca30c;
+    --bad:         #c62828;
     --c1: #2a78d6;
     --c2: #008300;
     --c3: #e87ba4;
@@ -36,6 +37,7 @@
       --border-strong: rgba(255,255,255,0.18);
       --accent:      #3987e5;
       --good:        #0ca30c;
+      --bad:         #ef6461;
       --c1: #3987e5;
       --c2: #008300;
       --c3: #d55181;
@@ -57,6 +59,7 @@
     --border-strong: rgba(255,255,255,0.18);
     --accent:      #3987e5;
     --good:        #0ca30c;
+    --bad:         #ef6461;
     --c1: #3987e5;
     --c2: #008300;
     --c3: #d55181;
@@ -69,7 +72,7 @@
     --ink:#0b0b0b; --ink-2:#52514e; --ink-muted:#898781;
     --grid:#e1e0d9; --baseline:#c3c2b7; --border:rgba(11,11,11,0.10);
     --border-strong: rgba(11,11,11,0.18);
-    --accent:#2a78d6; --good:#0ca30c;
+    --accent:#2a78d6; --good:#0ca30c; --bad:#c62828;
     --c1:#2a78d6; --c2:#008300; --c3:#e87ba4; --c4:#eda100;
     --focus:#2a78d6;
   }
@@ -222,6 +225,13 @@
     color:var(--ink-muted); font-style:italic; font-size:11px;
     font-family:inherit; font-variant-numeric:normal;
   }
+  /* A phase the store attempted and could not complete: a result, in the
+     failure colour, never styled like the absence of one. */
+  .matrix-table td.num.failed {
+    color:var(--bad); font-weight:600; font-size:11px;
+    font-family:inherit; font-variant-numeric:normal;
+  }
+  .lede .failed { color:var(--bad); font-weight:600; }
   .matrix-table tbody tr.group-break td { border-top:1px solid var(--border-strong); }
   /* Two-level header (pattern spanning its cold/warm leaves). The pattern name
      is centred over its own leaves and each group is fenced on the left, so a
@@ -515,10 +525,12 @@
       A query (a match or count, the full scan included) whose first run takes longer
       than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
       tooltip.
+      A phase the store could not complete reads <span class="mono">failed</span>, with its error as the tooltip, and is listed under the count check.
     </p>
     <div class="kpi-row" id="js-kpi-row"></div>
     <p class="lede mono" id="js-matched-rows"></p>
     <p class="lede" id="js-count-warnings"></p>
+    <p class="lede" id="js-failures"></p>
   </section>
 
   <section id="js-ingest" class="group">
@@ -921,10 +933,12 @@ const jsById = new Map(JS_DATA.map(d => [byKey(d), d]));
   // tooltip. Without this, a store trapping mid-phase would look like a
   // benchmark nobody ran.
   for (const f of JS_FAILURES ?? []){
-    const id = `${f.slug}::${f.phase}`;
-    if (!jsById.has(id))
-      jsById.set(id, { median:"failed", median_ns:null, unsupported:true,
-        reason:`could not complete this phase: ${f.error}` });
+    // A pattern's cell is `<slug>::<phase>`; an operation's is `<phase>::<slug>`.
+    for (const id of [`${f.slug}::${f.phase}`, `${f.phase}::${f.slug}`]){
+      if (!jsById.has(id))
+        jsById.set(id, { median:"failed", median_ns:null, unsupported:true, failed:true,
+          reason:`could not complete this phase: ${f.error}` });
+    }
   }
 function fmtBytes(n){
   if (n < 1024) return `${n} B`;
@@ -1178,7 +1192,7 @@ function renderMatrixPanel(container, cfg, map){
         // out which kind of blank this is.
         if (rec.unsupported || rec.median_ns == null) {
           const why = (rec.reason || "not supported by this library").replace(/"/g, "&quot;");
-          return `<td class="num unsup${sep}" title="${why}">${rec.median ?? "unsupported"}</td>`;
+          return `<td class="num ${rec.failed ? "failed" : "unsup"}${sep}" title="${why}">${rec.median ?? "unsupported"}</td>`;
         }
         const isBest = rec.median_ns === best[i];
         const mult = rec.median_ns / best[i];
@@ -1662,6 +1676,13 @@ function renderJs(){
         " — timings for those patterns are not comparable across libraries."
       : `<span class="mono">✓ All libraries returned identical row counts for every pattern.</span>`;
   }
+  const jsFailHost = document.getElementById("js-failures");
+  if (jsFailHost && JS_FAILURES.length){
+    const esc = x => String(x).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    jsFailHost.innerHTML = `<strong>⚠ ${JS_FAILURES.length} phase(s) could not complete:</strong> ` +
+      JS_FAILURES.map(f => `<span class="mono">${esc(f.label)} · ${esc(f.role)} · ${esc(f.phase)}: ${esc(f.error)}</span>`).join("; ") +
+      ` — each one's cell reads <span class="failed">failed</span>, with the error as its tooltip; a worker that did not finish leaves its cells empty.`;
+  }
   makeTable(JS_DATA, "#js-data-table", "#js-table-filter", "#js-table-count");
   // Iteration counts are run metadata rather than a headline, so they ride the
   // provenance line here, as they already do under the cross-library panels.
@@ -1683,7 +1704,7 @@ function renderBindingsTab(t){
   for (const f of t.failures){
     for (const id of f.keys ?? []){
       if (!byId.has(id))
-        byId.set(id, { median:"failed", median_ns:null, unsupported:true,
+        byId.set(id, { median:"failed", median_ns:null, unsupported:true, failed:true,
           reason:`could not complete this phase: ${f.error}` });
     }
   }
