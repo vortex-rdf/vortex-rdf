@@ -451,9 +451,12 @@ flowchart TD
   BtrBlocks-style compressor, and write flat leaf layouts. Each id column —
   a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid` —
   is handed, through the builder's per-field override, to
-  [`id_column_strategy`](../core/src/io/container/sources.rs#L213): the same
+  [`id_column_strategy`](../core/src/io/container/sources.rs#L224): the same
   per-column pipeline rebuilt step for step from Vortex's layout strategies,
-  with the coalescing target split in two. A column that does not
+  with the coalescing target split in two. The graph column `g` also records
+  each block's graphs with their rows in its zone statistics
+  ([`graph_column_aggregates`](../core/src/io/container/sources.rs#L300):
+  `vortexrdf.value_counts`, at most 16 graphs, null past). A column that does not
   dictionary-encode coalesces toward ~2 MiB, 262,144 rows per leaf for a
   plain `u64` id column; a dictionary's codes, as narrow as its cardinality
   needs, stay at ~1 MiB. A test pins the
@@ -465,7 +468,7 @@ flowchart TD
   plain table write produces: plain code columns and `rid` (row ids are
   unique, so never dictionary-encoded) at ~2 MiB, dictionary codes at ~1 MiB,
   term strings under the string layouts at ~1 MiB.
-- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L290):
+- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L334):
   its chunks are already FSST-compressed windows, so they are written verbatim
   as one flat leaf each under a chunked node — no sampling, no re-encoding —
   zoned one zone per window with the window's exact first and last term when

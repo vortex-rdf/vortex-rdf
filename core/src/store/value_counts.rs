@@ -5,9 +5,6 @@
 //! can test whether a zone holds a value (the store's falsifier of `g = c`).
 //! The store writes it into the zone maps of its graph columns.
 
-// Read by the writer from the next commit on.
-#![cfg_attr(not(test), expect(dead_code))]
-
 use std::fmt::{self, Display, Formatter};
 
 use vortex_array::aggregate_fn::{

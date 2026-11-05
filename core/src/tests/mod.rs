@@ -45,6 +45,7 @@ mod serialization;
 mod streaming;
 mod tail_keys;
 mod unique_quads;
+mod value_counts;
 mod wide_codes;
 mod wide_row_ids;
 mod zone_bounds;

@@ -79,11 +79,18 @@ and a layout names its segments by id, so a read fetches exactly the segments
 of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
-The writer is limited to two editions: Vortex's frozen `core` edition
-`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L68)) — every
-encoding, layout, extension dtype and zone-map aggregate a store file may hold
-— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L79)), whose
-one member is the root layout. A frozen edition never changes, so a Vortex
+The writer is limited to three editions:
+
+- Vortex's frozen `core` edition `CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L74)): every encoding, layout, extension dtype and Vortex zone-map aggregate a store file may hold;
+- the store edition `vortexrdf2026.10.0` ([`STORE_EDITION`](../core/src/session.rs#L85)), whose one member is the root layout;
+- the value-counts edition `vortexrdf2026.11.0` ([`VALUE_COUNTS_EDITION`](../core/src/session.rs#L91)), whose one member is the graph columns' zone aggregate `vortexrdf.value_counts` (§3).
+
+A file of the value-counts edition needs a reader that registers the
+aggregate: vortex-rdf 0.14 and earlier refuse it, naming
+`vortexrdf.value_counts`. Files written before it keep reading; their graph
+columns lack the statistic, and readers skip what it would decide.
+
+A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
 per-chunk frame-of-reference (`fastlanes.for.v2`) or bit-packing with a width
 per block (`fastlanes.bitpacked.v2`), is never written. Files from earlier
@@ -210,7 +217,9 @@ written by Vortex's default write strategy, so each column becomes:
 column
  └─ Zoned                 one statistics row per 8,192-row block
      ├─ stats table       min / max (strings: truncated to 64 bytes),
-     │                    null count, NaN count
+     │                    null count, NaN count; on a graph column (`g`),
+     │                    also the block's graphs with their rows
+     │                    (`vortexrdf.value_counts`: at most 16, null past)
      └─ data
          └─ Chunked       row ranges coalesced toward ~1 MiB of data
              ├─ Flat      one compressed array = one segment
@@ -277,7 +286,7 @@ the dtype alone decides the layout ([§4](#4-the-quad-table)).
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L37))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L290)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L334)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates
