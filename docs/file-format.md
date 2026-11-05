@@ -516,8 +516,8 @@ takes from their leaves for sparse ids
 ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
 A row scan — the reads that
 materialize a view's rows: serialization and the `from_file_in_memory` load, a
-compaction's gather, and the one-shot reads (`code_columns_gathered`,
-`quads_vec`, `shared_quads_vec`) the reads by id decline — filters and decodes
+compaction's gather, and `code_columns_gathered` where the reads by id
+decline — filters and decodes
 per split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scans.rs#L65)
 (42) splits runs inline, a larger one is spawned across the runtime's workers.
 Without a Tokio runtime these scans run inline. A one-shot read under a
@@ -533,14 +533,19 @@ an uncapped count of a filtered view, the rows a delete tombstones, a
 `keep`'s pass over a column — spawns its splits from two up: each split's
 evaluation decodes and compares its rows, work that outlasts waking a
 worker.
-Streaming reads (`quads()` and its twins) decode inside the per-split tasks
-Vortex's scan stream spawns, or, over such a filter, inside the split reads
-that evaluate its masks a split at a time. Under a file-backed dictionary a
-scan's chunks leave their split tasks undecoded, as their code columns, and
-decode as the stream reaches them, each decode spawned onto the runtime,
-[`STREAM_DECODE_AHEAD`](../core/src/store/read/quads.rs#L511) (2) of them in
-flight ahead of the consumer. Vortex runs up to four splits per core ahead of
-the consumer, and those hold codes, so a scan holds at most two chunks of
+The reads that decode quads (`quads_vec`, `shared_quads_vec`, and the
+streaming reads: `quads()` and its twins, the N-Triples/N-Quads export) drive
+a scan's splits themselves: every split is spawned across the runtime's
+workers whatever their count, up to four per core ahead of the consumer, and
+polled inline without a Tokio runtime; over a pending filter of code
+equalities, the split reads that evaluate its masks a split at a time read
+the rows they keep. A split's
+task decodes its chunk, except under a file-backed dictionary: there a scan's
+chunks leave their split tasks undecoded, as their code columns, and decode
+as the stream reaches them, each decode spawned onto the runtime,
+[`STREAM_DECODE_AHEAD`](../core/src/store/read/quads.rs#L520) (2) of them in
+flight ahead of the consumer, or on the stream itself without a runtime. The
+splits ahead of the consumer hold codes, so a scan holds at most two chunks of
 decoded terms beyond the one the consumer holds, whatever the core count.
 The split reads that evaluate a filter's masks await the dictionary's reads
 inside the read; there a file-backed chunk of fewer than 1,024 rows decodes
