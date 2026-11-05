@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from adapters import VORTEX_SLUGS, build_adapter, split_term
+from adapters import ALL_SLUGS, VORTEX_SLUGS, build_adapter, split_term
 from conftest import NAME
 from datasets import FULL_SCAN_PATTERN, Pat
 
@@ -70,3 +70,35 @@ def test_split_term(term, parts):
 def test_split_term_rejects_garbage(garbage):
     with pytest.raises(ValueError):
         split_term(garbage)
+
+
+class Recorder:
+    """A store whose attribute lookups are recorded."""
+
+    def __init__(self, store):
+        self.store, self.names = store, []
+
+    def __getattr__(self, name):
+        self.names.append(name)
+        return getattr(self.store, name)
+
+
+def test_vortex_count_streams_through_iter_quads(fixture_nt_path, tmp_path):
+    adapter, src = build_adapter("vortex_dict"), str(fixture_nt_path)
+    store = Recorder(adapter.build(src, adapter.artifact_path(str(tmp_path), src)))
+    assert adapter.count(store, adapter.prepare(FULL_SCAN_PATTERN)) == 5
+    assert store.names == ["iter_quads"]
+
+
+def test_every_adapter_says_how_its_store_is_obtained():
+    assert {slug: build_adapter(slug).obtained for slug in ALL_SLUGS} == {
+        "vortex_dict": "mapped",
+        "vortex_dict_mem": "loaded",
+        "vortex_dict_bycopy": "mapped",
+        "vortex_dict_bycopy_mem": "loaded",
+        "vortex_dict_byref": "mapped",
+        "vortex_dict_byref_mem": "loaded",
+        "pyoxigraph": "built",
+        "pycottas": "opened",
+        "rdflib": "built",
+    }

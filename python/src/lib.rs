@@ -163,6 +163,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::VortexRdfStore>()?;
     m.add_class::<iterators::ProbeAnswers>()?;
     m.add_class::<iterators::CodeChunks>()?;
+    m.add_class::<iterators::QuadIterator>()?;
     m.add_class::<CancelToken>()?;
     m.add_class::<dict::TermDict>()?;
     m.add_class::<kernels::U64Column>()?;

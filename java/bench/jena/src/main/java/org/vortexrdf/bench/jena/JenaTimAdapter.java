@@ -5,6 +5,7 @@ import org.apache.jena.riot.RDFDataMgr;
 import org.apache.jena.sparql.core.DatasetGraph;
 import org.apache.jena.sparql.core.DatasetGraphFactory;
 import org.apache.jena.system.Txn;
+import org.vortexrdf.bench.Obtained;
 
 /**
  * Jena's transactional in-memory dataset (TIM, {@link DatasetGraphFactory#createTxnMem}), the in-memory choice
@@ -24,6 +25,11 @@ final class JenaTimAdapter extends JenaDatasetAdapter {
 	@Override
 	public boolean persistent() {
 		return false;
+	}
+
+	@Override
+	public Obtained obtained() {
+		return Obtained.BUILT;
 	}
 
 	@Override

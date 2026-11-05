@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["core", "encoded-search", "js", "cli", "python", "java"]
+# js/bench/memory-stats is a member, so `cargo test --workspace` runs its host tests.
+members = ["core", "encoded-search", "js", "js/bench/memory-stats", "cli", "python", "java"]
 # The comparative benchmark harness is a workspace of its own (see
 # bench-compare/Cargo.toml), kept out of this one's build and test surface.
 exclude = ["bench-compare"]
 # The python crate is a PyO3 extension module built by maturin; keep it out of
 # the default cargo build/test surface.
-default-members = ["core", "encoded-search", "js", "cli", "java"]
+default-members = ["core", "encoded-search", "js", "js/bench/memory-stats", "cli", "java"]
 
 [workspace.package]
 version = "0.14.0"

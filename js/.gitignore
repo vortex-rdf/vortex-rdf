@@ -8,3 +8,7 @@
 # checkout that never runs that build — CI among them.
 /bench/hdt-pkg/*
 !/bench/hdt-pkg/hdt_wasm_bench.d.ts
+# Built by `npm run build:oxigraph-wasm` (see bench/oxigraph-wasm). Only the
+# type declaration is committed, for the same reason as hdt-pkg's.
+/bench/oxigraph-pkg/*
+!/bench/oxigraph-pkg/web.d.ts

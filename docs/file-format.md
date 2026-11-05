@@ -534,18 +534,22 @@ an uncapped count of a filtered view, the rows a delete tombstones, a
 evaluation decodes and compares its rows, work that outlasts waking a
 worker.
 The reads that decode quads (`quads_vec`, `shared_quads_vec`, and the
-streaming reads: `quads()` and its twins, the N-Triples/N-Quads export) decode
-each chunk inside the task that reads its split. Over a scan, every split is
-spawned across the runtime's workers whatever their count, so the chunks
-decode in parallel, and the splits are polled inline without a Tokio runtime;
-over such a filter, the split reads of the rows its masks keep decode them.
-Under a file-backed dictionary the
-decode may await the dictionary's own reads, which a scan's split task cannot
-do: there a chunk decodes in its task only when its window reads complete at
-once, as over a mapping they always do, and at the stream's consumer
-otherwise. A file-backed chunk of fewer than 1,024 rows decodes at the
-consumer too, against the windows its core has in cache, where a worker would
-gain it no parallelism.
+streaming reads: `quads()` and its twins, the N-Triples/N-Quads export) drive
+a scan's splits themselves: every split is spawned across the runtime's
+workers whatever their count, up to four per core ahead of the consumer, and
+polled inline without a Tokio runtime; over such a filter, the split reads
+that evaluate its masks a split at a time read the rows they keep. A split's
+task decodes its chunk, except under a file-backed dictionary: there a scan's
+chunks leave their split tasks undecoded, as their code columns, and decode
+as the stream reaches them, each decode spawned onto the runtime,
+[`STREAM_DECODE_AHEAD`](../core/src/store/read/quads.rs#L518) (2) of them in
+flight ahead of the consumer, or on the stream itself without a runtime. The
+splits ahead of the consumer hold codes, so a scan holds at most two chunks of
+decoded terms beyond the one the consumer holds, whatever the core count.
+The split reads that evaluate a filter's masks await the dictionary's reads
+inside the read; there a file-backed chunk of fewer than 1,024 rows decodes
+at the consumer, against the windows its core has in cache, where a worker
+would gain it no parallelism.
 
 **Kernels.** The store's Vortex session adds fused executions of its own for
 cases Vortex 0.90 runs the slow way, registered before the default encodings

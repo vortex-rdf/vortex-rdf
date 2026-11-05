@@ -6,14 +6,17 @@ use std::sync::{Arc, LazyLock};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
+use vortex_buffer::Buffer;
+use vortex_rdf_core::{
+    DictReader, SharedQuad, TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore,
+};
 
 use crate::batch::Batch;
 use crate::cancel::Token;
 use crate::dict::{TermDict, decode_slice};
 use crate::iterators::{
-    Answers, CodeChunks, CodeColumns, ProbeAnswers, ProbeColumns, chunk_columns, code_columns,
-    every_column,
+    Answers, CodeChunks, CodeColumns, ProbeAnswers, ProbeColumns, QuadIterator, chunk_columns,
+    code_columns, every_column,
 };
 use crate::probes::{narrowed_probe, parse_probes};
 use crate::{CancelToken, RUNTIME, VortexRdfError, cancelled, detached, py_err, raced, settled};
@@ -60,7 +63,7 @@ fn token_of(cancel: Option<&Bound<'_, CancelToken>>) -> PyResult<Option<Token>> 
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
 /// Held as `Py<PyString>` so a term repeated down a column is one Python object
 /// shared by every row that uses it.
-type PyQuad = (Py<PyString>, Py<PyString>, Py<PyString>, Py<PyString>);
+pub(crate) type PyQuad = (Py<PyString>, Py<PyString>, Py<PyString>, Py<PyString>);
 
 /// `(subjects, predicates, objects, graphs)` as returned by
 /// [`VortexRdfStore::match_columns`].
@@ -101,6 +104,57 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
     };
     let [s, p, o, g] = columns;
     Ok([resolved(s)?, resolved(p)?, resolved(o)?, resolved(g)?])
+}
+
+/// A chunk of matched code columns decoded through `reader` into Python
+/// strings, a column each; a code outside the dictionary, or columns of
+/// unequal length, raise (see [`resolve_columns`]).
+pub(crate) fn decoded_columns(
+    py: Python<'_>,
+    reader: &DictReader,
+    codes: &[Buffer<TermCode>; 4],
+) -> PyResult<[Vec<Py<PyString>>; 4]> {
+    resolve_columns([
+        decode_slice(py, reader, &codes[0])?,
+        decode_slice(py, reader, &codes[1])?,
+        decode_slice(py, reader, &codes[2])?,
+        decode_slice(py, reader, &codes[3])?,
+    ])
+}
+
+/// Shared-string rows as Python strings, a column each, one Python string
+/// for every row that shares a term.
+pub(crate) fn shared_columns(py: Python<'_>, rows: &[SharedQuad]) -> [Vec<Py<PyString>>; 4] {
+    // Intern by `Arc` address: `rows` holds every `Arc` for the whole
+    // loop, so an address identifies one term. A strong count of one means
+    // no other row shares the term, so it skips the map.
+    let mut interned: HashMap<usize, Py<PyString>> = HashMap::new();
+    let mut out: [Vec<Py<PyString>>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows.len()));
+    for row in rows {
+        for (column, term) in out.iter_mut().zip([&row.s, &row.p, &row.o, &row.g]) {
+            if Arc::strong_count(term) == 1 {
+                column.push(PyString::new(py, term).unbind());
+                continue;
+            }
+            let key = Arc::as_ptr(term) as *const u8 as usize;
+            let py_term = interned
+                .entry(key)
+                .or_insert_with(|| PyString::new(py, term).unbind())
+                .clone_ref(py);
+            column.push(py_term);
+        }
+    }
+    out
+}
+
+/// `batch_rows` as a chunk's most rows; zero raises `ValueError`.
+fn check_batch_rows(batch_rows: usize) -> PyResult<()> {
+    if batch_rows == 0 {
+        return Err(PyValueError::new_err(
+            "batch_rows must be at least 1: the most rows a chunk holds",
+        ));
+    }
+    Ok(())
 }
 
 /// A read-only Vortex-RDF store opened from a `.vortex` file or from
@@ -149,12 +203,7 @@ impl VortexRdfStore {
             && let Some([subjects, predicates, objects, graphs]) =
                 detached(py, || probe_codes(&self.store, &probe))?
         {
-            return resolve_columns([
-                decode_slice(py, &reader, &subjects)?,
-                decode_slice(py, &reader, &predicates)?,
-                decode_slice(py, &reader, &objects)?,
-                decode_slice(py, &reader, &graphs)?,
-            ]);
+            return decoded_columns(py, &reader, &[subjects, predicates, objects, graphs]);
         }
 
         // The matched quads with shared-string terms: each distinct term of a
@@ -162,27 +211,7 @@ impl VortexRdfStore {
         let rows = detached(py, || async {
             self.store.run_probe(&probe).await?.shared_quads_vec().await
         })?;
-        // Intern by `Arc` address: `rows` holds every `Arc` for the whole
-        // loop, so an address identifies one term. A strong count of one means
-        // no other row shares the term, so it skips the map.
-        let mut interned: HashMap<usize, Py<PyString>> = HashMap::new();
-        let mut out: [Vec<Py<PyString>>; 4] =
-            std::array::from_fn(|_| Vec::with_capacity(rows.len()));
-        for row in &rows {
-            for (column, term) in out.iter_mut().zip([&row.s, &row.p, &row.o, &row.g]) {
-                if Arc::strong_count(term) == 1 {
-                    column.push(PyString::new(py, term).unbind());
-                    continue;
-                }
-                let key = Arc::as_ptr(term) as *const u8 as usize;
-                let py_term = interned
-                    .entry(key)
-                    .or_insert_with(|| PyString::new(py, term).unbind())
-                    .clone_ref(py);
-                column.push(py_term);
-            }
-        }
-        Ok(out)
+        Ok(shared_columns(py, &rows))
     }
 }
 
@@ -297,6 +326,37 @@ impl VortexRdfStore {
             .zip(graphs)
             .map(|(((s, p), o), g)| (s, p, o, g))
             .collect())
+    }
+
+    /// [`Self::get_quads`] as an iterator ([`QuadIterator`]): the same rows,
+    /// order and spelling, read `batch_rows` rows at a time, so it holds
+    /// about one chunk's terms. This call matches the pattern; each chunk is
+    /// read when the iteration reaches it. A Dictionary store's chunks are
+    /// code columns decoded through its dictionary, any other store's rows
+    /// decoded to terms. With a `cancel` token this call and every chunk
+    /// pull race it. `batch_rows=0` or a malformed term raises `ValueError`.
+    // The parameters are the Python signature: a pattern and the chunk shape.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, batch_rows=65536, cancel=None))]
+    fn iter_quads(
+        &self,
+        py: Python<'_>,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+        batch_rows: usize,
+        cancel: Option<&Bound<'_, CancelToken>>,
+    ) -> PyResult<QuadIterator> {
+        let probe = Probe::parse(s, p, o, g).map_err(py_err)?;
+        check_batch_rows(batch_rows)?;
+        let token = token_of(cancel)?;
+        let store = self.store.clone();
+        let dict = store.dict_reader();
+        let pulls = token.clone();
+        raced(py, token.as_ref(), async move {
+            QuadIterator::open(store.run_probe(&probe).await?, dict, batch_rows, pulls)
+        })
     }
 
     /// Number of quads matching a pattern, counted from the match's row
@@ -487,11 +547,7 @@ impl VortexRdfStore {
     ) -> PyResult<Option<CodeChunks>> {
         let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
         let columns = chunk_columns(&columns)?;
-        if batch_rows == 0 {
-            return Err(PyValueError::new_err(
-                "batch_rows must be at least 1: the most rows a chunk holds",
-            ));
-        }
+        check_batch_rows(batch_rows)?;
         let token = token_of(cancel)?;
         if self.store.dict_reader().is_none() {
             return Ok(None);

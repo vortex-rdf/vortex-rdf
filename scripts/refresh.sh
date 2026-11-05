@@ -34,8 +34,11 @@ cd "$(git rev-parse --show-toplevel)"
 # (all of them read BENCH_SIZE): 2^20 rows, one dataset. MUT_BATCH is the
 # comparative suites' add/delete batch; the internals suite keeps its own
 # (see the rust stage). Same numbers .github/workflows/bench-dashboard.yml pins.
+# BENCH_MEMORY_RUNS is how many memory runs every comparative suite makes per
+# adapter, each in a fresh process.
 export BENCH_SIZE="${BENCH_SIZE:-1048576}"
 export MUT_BATCH="${MUT_BATCH:-10000}"
+export BENCH_MEMORY_RUNS="${BENCH_MEMORY_RUNS:-3}"
 OUT=target/bench
 
 ONLY="rust,compare,js,python,java,render"
@@ -150,6 +153,8 @@ if has compare; then
   # built, then bench it.
   cargo fmt --manifest-path bench-compare/Cargo.toml --check
   cargo clippy --manifest-path bench-compare/Cargo.toml --all-targets --locked -- -D warnings
+  # The memory helpers' tests, in release to share the bench's dependency build.
+  cargo test --manifest-path bench-compare/Cargo.toml --release --locked
   cargo bench --manifest-path bench-compare/Cargo.toml
 fi
 
@@ -159,10 +164,23 @@ if has js; then
   (
     cd js
     [ -d node_modules ] || npm ci
-    build "npm run build" pkg/web/vortex_rdf_bg.wasm "${BINDING_DEPS[@]}"
+    # The bench's own copy of the bindings, built with the js crate's
+    # memory-stats feature into pkg/bench. The published build (pkg/web,
+    # `npm run build`) never carries the counter, and the suite loads only
+    # this copy. js-snippets is compiled in too, but BINDING_DEPS lacks it.
+    build "npm run build:bench-wasm" pkg/bench/vortex_rdf_bg.wasm "${BINDING_DEPS[@]}" js-snippets \
+      bench/memory-stats/src bench/memory-stats/Cargo.toml
     build "npm run build:hdt-wasm" bench/hdt-pkg/hdt_wasm_bench_bg.wasm \
       bench/hdt-wasm/src bench/hdt-wasm/Cargo.toml bench/hdt-wasm/Cargo.lock \
+      bench/memory-stats/src bench/memory-stats/Cargo.toml \
       ../.cargo/config.toml
+    # oxigraph's official JS binding, built from its GitHub source at the
+    # version bench-compare pins, with the bench's counter patched in (see
+    # bench/oxigraph-wasm/build.sh). The version is part of the command, so a
+    # new pin invalidates the stamp.
+    oxigraph_version=$(bash bench/oxigraph-wasm/build.sh --print-version)
+    build "npm run build:oxigraph-wasm -- $oxigraph_version" bench/oxigraph-pkg/web_bg.wasm \
+      bench/oxigraph-wasm bench/memory-stats/src bench/memory-stats/Cargo.toml
     npm run bench
   )
 fi

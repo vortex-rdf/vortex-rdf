@@ -1,14 +1,17 @@
 package org.vortexrdf.bench;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -61,6 +64,7 @@ class WorkerTest {
 		assertEquals(false, result.get("skippedRole"));
 		assertEquals(true, result.get("supportsQuads"));
 		assertNotNull(result.get("jdk"));
+		assertFalse(result.containsKey("retained"));
 	}
 
 	@Test
@@ -115,14 +119,19 @@ class WorkerTest {
 		assertFalse(keys(result).contains("list::O"));
 	}
 
+	/** The worker's arguments for {@code role} on the test classpath's {@code list_stdout}, in {@code tmp/work}. */
+	private String[] cli(String role, Path out) {
+		return new String[] { "--slug", "list_stdout", "--role", role, "--quads", files.quads().toString(),
+				"--triples", files.triples().toString(), "--probes", files.probes().toString(), "--fresh",
+				files.fresh().toString(), "--prefix", files.prefix().toString(), "--empty", files.empty().toString(),
+				"--workdir", tmp.resolve("work").toString(), "--out", out.toString() };
+	}
+
 	@Test
 	void stdoutFromAnAdapterLeavesTheResultIntact() throws Exception {
 		Path out = tmp.resolve("out.json");
 
-		Worker.main(new String[] { "--slug", "list_stdout", "--role", "query", "--quads", files.quads().toString(),
-				"--triples", files.triples().toString(), "--probes", files.probes().toString(), "--fresh",
-				files.fresh().toString(), "--prefix", files.prefix().toString(), "--empty", files.empty().toString(),
-				"--workdir", tmp.resolve("work").toString(), "--out", out.toString() });
+		Worker.main(cli("query", out));
 
 		String json = Files.readString(out);
 		assertTrue(json.startsWith("{\"slug\":\"list_stdout\",\"label\":\"List list_stdout\",\"role\":\"query\""),
@@ -199,35 +208,120 @@ class WorkerTest {
 		assertTrue(a.calls("S") >= 100, "S was materialized " + a.calls("S") + " times");
 	}
 
-	@SuppressWarnings("unchecked")
-	private long retained(ListAdapter a, String part) {
-		Map<String, Object> r = (Map<String, Object>) Worker.query(a, files, tmp.resolve("work"), QUICK).get("retained");
-		assertNotNull(r, "the query result has no retained figure");
-		return ((Number) r.get(part)).longValue();
+	/** A memory run of {@code a} on the store its build left in {@code tmp/work/store}. */
+	private Map<String, Object> memoryRun(ListAdapter a) throws Exception {
+		Path work = tmp.resolve("work");
+		a.dispose(a.build(files.quads(), Files.createDirectories(work.resolve("store"))));
+		return Worker.memory(a, files, work);
+	}
+
+	private static long figure(Map<String, Object> r, String key) {
+		return ((Number) r.get(key)).longValue();
+	}
+
+	@Test
+	void aMemoryRunReadsEveryProbeOnce() throws Exception {
+		ListAdapter a = ListAdapter.persistent("list");
+
+		Map<String, Object> r = memoryRun(a);
+
+		assertEquals(List.of("slug", "label", "role", "obtained", "counts", "storeBytes", "peakAnonBytes",
+				"peakFileBytes", "jdk"), List.copyOf(r.keySet()));
+		assertEquals(List.of("memory", "loaded"), List.of(r.get("role"), r.get("obtained")));
+		assertEquals(Fixture.MATCHES, r.get("counts"));
+		for (String name : NAMES) {
+			assertEquals(1, a.calls(name), name);
+		}
 	}
 
 	/**
-	 * What an open store retains outside the heap is the native memory that disposing it releases, to within the
-	 * JVM's own bookkeeping: the per-allocation overhead its tracking does not count moves by about a megabyte.
+	 * What a store holds outside the heap is the native memory that disposing it releases, to within the JVM's own
+	 * bookkeeping: the per-allocation overhead its tracking does not count moves by about a megabyte.
 	 */
 	@Test
-	void theRetainedFigureCountsTheNativeMemoryTheStoreHolds() {
-		long offHeap = retained(ListAdapter.inMemory("native").holding(0, 32L << 20), "nativeBytes");
+	void theStoreFigureIsTheNativeMemoryDisposingReleases() throws Exception {
+		Map<String, Object> r = memoryRun(ListAdapter.inMemory("native").holding(0, 32L << 20));
 
-		assertTrue(Math.abs(offHeap - (32L << 20)) < 2L << 20, "native " + offHeap);
+		assertTrue(Math.abs(figure(r, "storeBytes") - (32L << 20)) < 2L << 20, r.toString());
+		assertTrue(figure(r, "peakAnonBytes") >= 30L << 20, r.toString()); // zeroed at the open, so resident
 	}
 
 	/**
-	 * A store kept in the heap retains what it holds there, so its figure does not follow the heap limit as its peak
-	 * does. That includes data its library leaves reachable from the querying thread after the store is gone, as
-	 * Jena's in-memory dataset does through a thread-local it never clears.
+	 * Store is read on a store no read has touched: what the reads cache in the store, and what the adapter keeps
+	 * from its first open and from every read after the dispose, are not in it.
 	 */
 	@Test
-	void heapDataPinnedToTheQueryingThreadStillCountsAsTheStores() {
-		long heap = retained(ListAdapter.inMemory("pinned").holding(64 << 20, 0).pinnedToTheQueryingThread(),
-				"heapBytes");
+	void theStoreFigureLeavesOutWhatTheReadsAndTheFirstOpenLeaveBehind() throws Exception {
+		Map<String, Object> r = memoryRun(
+				ListAdapter.inMemory("reads").holding(32 << 20, 0).cachingOnRead(2 << 20).leaking(8 << 20, 1 << 20));
 
-		assertTrue(heap >= 64L << 20 && heap < 80L << 20, "heap " + heap);
+		assertTrue(Math.abs(figure(r, "storeBytes") - (32L << 20)) < 2L << 20, r.toString());
+	}
+
+	/** A store that locks its files opens a second time only after the first is disposed. */
+	@Test
+	void aMemoryRunOfAStoreThatLocksItsFilesSucceeds() throws Exception {
+		Map<String, Object> r = memoryRun(ListAdapter.exclusive("locked"));
+
+		assertEquals(Fixture.MATCHES, r.get("counts"));
+	}
+
+	/**
+	 * A store kept in the heap holds what it keeps there, so its figure does not follow the heap limit as a peak
+	 * does. That includes data its library leaves reachable from the thread that opened it after the store is gone,
+	 * as Jena's in-memory dataset does through a thread-local it never clears.
+	 */
+	@Test
+	void theStoreFigureIncludesHeapDataPinnedToTheThreadThatOpenedIt() throws Exception {
+		long store = figure(memoryRun(ListAdapter.inMemory("pinned").holding(64 << 20, 0).pinnedToItsThreads()),
+				"storeBytes");
+
+		assertTrue(store >= 64L << 20 && store < 80L << 20, "store " + store);
+	}
+
+	@Test
+	void aCounterThatMissesTheBlockFailsTheSelfCheck() {
+		// Thrown away, as the memory role does: a JVM's first sample is off by a few hundred KB.
+		Footprint.sample();
+		assertDoesNotThrow(() -> Worker.selfCheck(Footprint::sample));
+		assertTrue(assertThrows(IllegalStateException.class, () -> Worker.selfCheck(() -> new Footprint(0, 0)))
+				.getMessage().contains("heap"));
+		Iterator<Footprint> seen = List.of(new Footprint(0, 0), new Footprint(16L << 20, 0)).iterator();
+		assertTrue(assertThrows(IllegalStateException.class, () -> Worker.selfCheck(seen::next)).getMessage()
+				.contains("mallinfo2"));
+	}
+
+	/** The self-check on two samples: one before its block is held, and one while it is. */
+	private static void selfCheckSeeing(Footprint before, Footprint held) {
+		Iterator<Footprint> samples = List.of(before, held).iterator();
+		Worker.selfCheck(samples::next);
+	}
+
+	/**
+	 * The heap counter must see the whole 8 MiB array, and the native one 7 MiB of the 8 MiB block, since the JVM's own
+	 * threads allocate natively while the check runs.
+	 */
+	@Test
+	void theSelfCheckWantsTheWholeHeapBlockAndSevenMiBOfTheNativeOne() {
+		Footprint none = new Footprint(0, 0);
+
+		assertDoesNotThrow(() -> selfCheckSeeing(none, new Footprint(8L << 20, 7L << 20)));
+		String nativeShort = assertThrows(IllegalStateException.class,
+				() -> selfCheckSeeing(none, new Footprint(8L << 20, (7L << 20) - 1))).getMessage();
+		assertTrue(nativeShort.contains("mallinfo2") && nativeShort.contains("want at least 7 MiB"), nativeShort);
+		assertTrue(assertThrows(IllegalStateException.class,
+				() -> selfCheckSeeing(none, new Footprint((8L << 20) - 1, 7L << 20))).getMessage().contains("heap"));
+	}
+
+	@Test
+	void theWorkerRunsTheMemoryRole() throws Exception {
+		ListAdapter.persistent("x").build(files.quads(), Files.createDirectories(tmp.resolve("work/store")));
+		Path out = tmp.resolve("memory.json");
+
+		Worker.main(cli("memory", out));
+
+		assertTrue(Files.readString(out).startsWith(
+				"{\"slug\":\"list_stdout\",\"label\":\"List list_stdout\",\"role\":\"memory\",\"obtained\":\"loaded\""));
 	}
 
 	@Test

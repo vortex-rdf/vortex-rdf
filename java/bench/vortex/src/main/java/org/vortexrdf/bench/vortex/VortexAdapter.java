@@ -5,8 +5,10 @@ import java.lang.ProcessBuilder.Redirect;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import org.vortexrdf.QuadIterator;
 import org.vortexrdf.VortexRdfStore;
 import org.vortexrdf.bench.Adapter;
+import org.vortexrdf.bench.Obtained;
 import org.vortexrdf.bench.Pattern;
 import org.vortexrdf.bench.Sink;
 
@@ -57,6 +59,11 @@ public final class VortexAdapter implements Adapter<VortexRdfStore, Pattern> {
 	}
 
 	@Override
+	public Obtained obtained() {
+		return inMemory ? Obtained.LOADED : Obtained.MAPPED;
+	}
+
+	@Override
 	public VortexRdfStore build(Path src, Path location) throws Exception {
 		List<String> cmd = new ArrayList<>(List.of(cli(), "serialize", "--layout", "dictionary"));
 		for (String index : indexes) {
@@ -85,16 +92,19 @@ public final class VortexAdapter implements Adapter<VortexRdfStore, Pattern> {
 
 	@Override
 	public long count(VortexRdfStore store, Pattern p) {
-		// quads() is the bindings' term read: four N-Triples spellings per row, built in one native call.
-		List<String[]> rows = store.quads(p.s(), p.p(), p.o(), p.g());
-		long acc = 0;
-		for (String[] row : rows) {
-			for (String term : row) {
-				acc += term.length();
+		// iterateQuads is the bindings' streaming term read: four N-Triples spellings per row, at most 65,536 rows a
+		// chunk, so the read never holds the whole match.
+		long acc = 0, n = 0;
+		try (QuadIterator rows = store.iterateQuads(p.s(), p.p(), p.o(), p.g())) {
+			while (rows.hasNext()) {
+				for (String term : rows.next()) {
+					acc += term.length();
+				}
+				n++;
 			}
 		}
 		Sink.fold(acc);
-		return rows.size();
+		return n;
 	}
 
 	@Override

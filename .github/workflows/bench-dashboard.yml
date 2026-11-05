@@ -26,9 +26,12 @@ concurrency:
 # instrumented runs measure instructions and a bigger dataset only multiplies
 # valgrind cost. MUT_BATCH is the comparative suites' add/delete batch;
 # refresh.sh keeps it from the internals suite, which uses its own.
+# BENCH_MEMORY_RUNS is how many memory runs each comparative suite makes per
+# adapter; the Store memory panels take their medians and ranges over them.
 env:
   BENCH_SIZE: 1048576
   MUT_BATCH: 10000
+  BENCH_MEMORY_RUNS: 3
 
 # The suites measure at once, each on a runner of its own: run one after
 # another, as scripts/refresh.sh runs them locally, they took over an hour and
@@ -101,7 +104,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           # Restored, never saved here: ci.yml's js-tests keeps this entry,
-          # and builds the same wasm32 release (`npm run build`).
+          # and builds the same wasm32 release (`npm run build`; this job's
+          # build adds the js crate's memory-stats feature).
           shared-key: wasm
           save-if: false
 
@@ -112,17 +116,31 @@ jobs:
           cache: npm
           cache-dependency-path: js/package-lock.json
 
-      - name: Cache wasm bindings
+      - name: Cache the bench's wasm bindings
         uses: actions/cache@v6
         with:
-          path: js/pkg/web
-          key: wasm-pkg-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'js/src/**', 'js/Cargo.toml', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
+          path: js/pkg/bench
+          key: wasm-bench-pkg-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'js/src/**', 'js/Cargo.toml', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml', 'js/js-snippets/**', 'js/bench/memory-stats/src/**', 'js/bench/memory-stats/Cargo.toml') }}
 
       - name: Cache hdt wasm wrapper
         uses: actions/cache@v6
         with:
           path: js/bench/hdt-pkg
-          key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
+          key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock', 'js/bench/memory-stats/**', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
+
+      # oxigraph's JS binding, built from source by refresh.sh on a miss (it
+      # fetches the release tag from GitHub). Keyed on the version
+      # bench-compare pins, the build script and its patch, the counter crate
+      # the patch links, refresh.sh (the build command) and the setup-rust pin.
+      - name: Read the oxigraph version
+        id: oxigraph
+        run: echo "version=$(bash js/bench/oxigraph-wasm/build.sh --print-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache oxigraph wasm build
+        uses: actions/cache@v6
+        with:
+          path: js/bench/oxigraph-pkg
+          key: oxigraph-pkg-${{ steps.oxigraph.outputs.version }}-${{ hashFiles('js/bench/oxigraph-wasm/**', 'js/bench/memory-stats/src/**', 'js/bench/memory-stats/Cargo.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
 
       # The hdt crate's CLI, which builds the hdt adapter's HDT file (see
       # hdt_artifact in refresh.sh, which pins its version): a cargo install

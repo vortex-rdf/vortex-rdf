@@ -20,6 +20,7 @@ import org.eclipse.rdf4j.sail.lmdb.LmdbStore;
 import org.eclipse.rdf4j.sail.lmdb.config.LmdbStoreConfig;
 import org.eclipse.rdf4j.sail.memory.MemoryStore;
 import org.vortexrdf.bench.Adapter;
+import org.vortexrdf.bench.Obtained;
 import org.vortexrdf.bench.Pattern;
 import org.vortexrdf.bench.Quad;
 import org.vortexrdf.bench.Sink;
@@ -76,6 +77,11 @@ public final class Rdf4jAdapter implements Adapter<Rdf4jAdapter.Handle, Rdf4jAda
 	@Override
 	public boolean persistent() {
 		return store != Store.MEMORY;
+	}
+
+	@Override
+	public Obtained obtained() {
+		return store == Store.MEMORY ? Obtained.BUILT : Obtained.OPENED;
 	}
 
 	@Override

@@ -29,8 +29,8 @@ import type { Quad } from '@rdfjs/types';
 import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
 // Only the pure bench modules are importable here — ./util.js and
 // ./datasets.js, the two with no store library behind them (see their purity
-// contracts); shared.ts loads oxigraph and rdf-stores at module scope, which
-// this instrumented process must never do.
+// contracts); shared.ts loads rdf-stores and the bench's own Vortex build at
+// module scope, which this instrumented process must never do.
 import { decodeAll, fmtNs, making, onFresh } from './util.js';
 import {
     FULL_SCAN_PATTERN, genDataset, genFresh, genLiteralTriples, genQuads,
