@@ -503,7 +503,7 @@ pub(super) fn projected(base: &ArrayRef, columns: &[&'static str]) -> Result<Arr
 
 /// The [`InvalidInput`](VortexRdfError::InvalidInput) error for a zero batch
 /// size.
-fn check_batch(batch_rows: usize) -> Result<()> {
+pub(crate) fn check_batch(batch_rows: usize) -> Result<()> {
     if batch_rows == 0 {
         return Err(VortexRdfError::InvalidInput(
             "a chunk stream needs batch_rows > 0".to_string(),

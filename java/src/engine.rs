@@ -169,18 +169,17 @@ impl Store {
         RUNTIME.block_on(encode_lookup(self.dict()?, codes, limits))
     }
 
-    /// The quads matching a code pattern as a stream of their codes, in the match's order (a
-    /// `secondary-by-copy` index's for a pattern it serves, else base row order), read in chunks of at most
-    /// `batch_rows` rows ([`CodeStream`]); empty for a pattern no quad can match (a code past the dictionary, or
-    /// one in a position its term's kind cannot take).
+    /// The quads matching a code pattern as a stream of their codes, the rows of [`match_codes`](Self::match_codes)
+    /// in its order (a `secondary-by-copy` index's for a pattern it serves, else base row order), read in chunks of
+    /// at most `batch_rows` rows ([`CodeStream`], from core's `match_code_chunks`): a located run's rows are read
+    /// once, a block at a time, where each `match_codes` window checks a run with other bound slots again from its
+    /// start.
+    /// Empty for a pattern no quad can match (a code past the dictionary, or one in a position its term's kind
+    /// cannot take).
     pub fn code_stream(&self, pattern: CodePattern, batch_rows: usize) -> Result<CodeStream> {
         check_batch_rows(batch_rows)?;
-        match RUNTIME.block_on(self.store.code_probe(pattern))? {
-            None => Ok(CodeStream::empty()),
-            Some(probe) => {
-                CodeStream::open(&RUNTIME.block_on(self.store.run_probe(&probe))?, batch_rows)
-            }
-        }
+        let chunks = RUNTIME.block_on(self.store.match_code_chunks(pattern, batch_rows))?;
+        Ok(CodeStream::pulling(chunks))
     }
 
     /// The number of quads matching a code pattern, exact and without reading rows.

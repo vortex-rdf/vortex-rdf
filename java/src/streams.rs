@@ -4,7 +4,9 @@
 
 use futures::stream::{BoxStream, StreamExt};
 use vortex_buffer::Buffer;
-use vortex_rdf_core::{DictReader, QuadColumn, Result, SharedQuad, TermCode, VortexRdfStore};
+use vortex_rdf_core::{
+    CodeChunkStream, DictReader, QuadColumn, Result, SharedQuad, TermCode, VortexRdfStore,
+};
 
 use crate::RUNTIME;
 use crate::payload::{Limits, Pace, Payload, ROW_BYTES, encode_codes, encode_shared, write_rows};
@@ -129,7 +131,9 @@ impl TermStream {
         let terms = match dict {
             Some(dict) => Terms::Codes {
                 dict,
-                codes: Cursor::pulling(code_chunks(&view, batch_rows)?),
+                codes: Cursor::pulling(four_columns(
+                    view.code_chunks(&QuadColumn::ALL, batch_rows)?,
+                )),
             },
             None => {
                 let chunks = view.row_chunks(batch_rows)?;
@@ -184,14 +188,9 @@ impl TermStream {
 pub struct CodeStream(Cursor<Codes>);
 
 impl CodeStream {
-    /// A stream of `view`'s codes in chunks of at most `batch_rows` (at least 1).
-    pub(crate) fn open(view: &VortexRdfStore, batch_rows: usize) -> Result<Self> {
-        Ok(CodeStream(Cursor::pulling(code_chunks(view, batch_rows)?)))
-    }
-
-    /// The stream of a pattern no quad can match.
-    pub(crate) fn empty() -> Self {
-        CodeStream(Cursor::spent())
+    /// A stream of the code chunks `chunks` yields, each of all four columns.
+    pub(crate) fn pulling(chunks: CodeChunkStream) -> Self {
+        CodeStream(Cursor::pulling(four_columns(chunks)))
     }
 
     /// Writes up to `out.len()` rows, each its `(s, p, o, g)` codes, eight native-endian bytes apiece; returns
@@ -208,14 +207,10 @@ impl CodeStream {
     }
 }
 
-/// `view`'s rows as chunks of all four code columns, at most `batch_rows` rows each, as
-/// `code_chunks(&QuadColumn::ALL, ..)` yields them.
-fn code_chunks(
-    view: &VortexRdfStore,
-    batch_rows: usize,
-) -> Result<BoxStream<'static, Result<Codes>>> {
-    let chunks = view.code_chunks(&QuadColumn::ALL, batch_rows)?;
-    Ok(chunks
+/// Chunks of all four code columns, as `code_chunks(&QuadColumn::ALL, ..)` and `match_code_chunks` yield them, each
+/// as its four columns.
+fn four_columns(chunks: CodeChunkStream) -> BoxStream<'static, Result<Codes>> {
+    chunks
         .map(|columns| {
             columns.map(|columns| {
                 columns.try_into().unwrap_or_else(|columns: Vec<_>| {
@@ -223,5 +218,5 @@ fn code_chunks(
                 })
             })
         })
-        .boxed())
+        .boxed()
 }
