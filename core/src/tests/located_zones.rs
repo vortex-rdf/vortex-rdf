@@ -512,3 +512,27 @@ async fn gap_cap_only_where_zones_cannot_decide() {
         assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
     }
 }
+
+/// With `VORTEX_RDF_COUNTERS=1`, a zoned count is counted where it settles
+/// zones and counts mixed ones (a no-op without the variable).
+#[tokio::test]
+async fn zone_counters_count_decisions() {
+    use crate::store::test_hooks::ForcedZones;
+    use vortex_rdf_encoded_search::counters::{ZONE_ALL, ZONE_COUNTED, ZONE_NONE, on, snapshot};
+
+    if !on() {
+        return;
+    }
+    let _on = ForcedZones::set(true);
+    let quads = zone_quads(Graphs::Long);
+    let (_dir, path) =
+        write_store_file(quads, LayoutStrategy::Dictionary, IndexConfig::Copy.types()).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let taxa = zone_patterns(&store, 1).await[0];
+    let before = snapshot();
+    assert_eq!(store.count_code_pattern(taxa).await.unwrap(), 20_000);
+    let after = snapshot();
+    for site in [ZONE_ALL, ZONE_NONE, ZONE_COUNTED] {
+        assert!(after[site] > before[site], "site {site}");
+    }
+}

@@ -241,6 +241,10 @@ without reading the column, and only the zones holding it among other codes
 are read. A count counts such a zone on the column's encoding, so it reads
 no rows; a window finds its first zone from those counts and reads from
 there. `VORTEX_RDF_ZONES=0` (read once) checks every row instead, as before.
+With `VORTEX_RDF_COUNTERS=1` the engine counters count these decisions: the
+slots the footer settles (`zone_column`), the zones settled none and all
+(`zone_none`, `zone_all`), the mixed zones counted on their encoding
+(`zone_counted`) and the rows read to check (`check_read`), each with its rows.
 
 `locate_codes(CodePattern, offset, limit)` is the located run alone: it
 answers only a whole file-backed Dictionary store (no tail, tombstones or

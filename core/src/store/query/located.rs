@@ -356,11 +356,14 @@ impl VortexRdfStore {
                         let code = codes[slot].expect("a checked slot is bound");
                         match footer_decision(file, slot, code)? {
                             FooterDecision::Nothing => {
+                                note(counters::ZONE_COLUMN, rows.end - rows.start);
                                 rows = rows.start..rows.start;
                                 unsettled.clear();
                                 break;
                             }
-                            FooterDecision::Everything => {}
+                            FooterDecision::Everything => {
+                                note(counters::ZONE_COLUMN, rows.end - rows.start);
+                            }
                             FooterDecision::Unknown => unsettled.push(slot),
                         }
                     }
@@ -442,6 +445,15 @@ fn holds(kinds: &KindRanges, slot: usize, code: TermCode) -> bool {
 
 #[cfg(feature = "file-io")]
 use crate::store::query::zone_decider::ZoneClass;
+#[cfg(feature = "file-io")]
+use vortex_rdf_encoded_search::counters;
+
+/// One located run's zone decision of `rows` rows at counter site `site`
+/// (`VORTEX_RDF_COUNTERS=1`).
+#[cfg(feature = "file-io")]
+fn note(site: usize, rows: u64) {
+    counters::note(site, rows as usize);
+}
 
 /// A column's chunk-probe handle.
 #[cfg(feature = "file-io")]
@@ -580,8 +592,11 @@ impl LocatedRun {
                     let zone = at / zones.zone_len;
                     let end = ((zone + 1) * zones.zone_len).min(rows.end);
                     match zones.class(zone) {
-                        ZoneClass::None => {}
-                        ZoneClass::All => kept.extend(at..end),
+                        ZoneClass::None => note(counters::ZONE_NONE, end - at),
+                        ZoneClass::All => {
+                            note(counters::ZONE_ALL, end - at);
+                            kept.extend(at..end);
+                        }
                         ZoneClass::Mixed { unsettled } => {
                             kept.extend(self.checked_rows(at..end, unsettled).await?);
                         }
@@ -635,6 +650,7 @@ impl LocatedRun {
             return Ok(rows.collect());
         };
         crate::observe::observe!(CheckRead(rows.end - rows.start));
+        note(counters::CHECK_READ, rows.end - rows.start);
         let code = self.codes[first].expect("a checked slot is bound");
         let values = read_codes(
             &self.columns[first],
@@ -670,12 +686,19 @@ impl LocatedRun {
         let rows =
             (zone * zones.zone_len).max(run.start)..((zone + 1) * zones.zone_len).min(run.end);
         Ok(match zones.class(zone) {
-            ZoneClass::None => 0,
-            ZoneClass::All => rows.end - rows.start,
+            ZoneClass::None => {
+                note(counters::ZONE_NONE, rows.end - rows.start);
+                0
+            }
+            ZoneClass::All => {
+                note(counters::ZONE_ALL, rows.end - rows.start);
+                rows.end - rows.start
+            }
             ZoneClass::Mixed { unsettled } if unsettled.count_ones() == 1 => {
                 let slot = unsettled.trailing_zeros() as usize;
                 let code = self.codes[slot].expect("a checked slot is bound");
                 crate::observe::observe!(ZoneCounted(rows.end - rows.start));
+                note(counters::ZONE_COUNTED, rows.end - rows.start);
                 self.columns[slot]
                     .count_eq(rows, code, &self.source, &self.session)
                     .await?

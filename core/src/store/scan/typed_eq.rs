@@ -481,7 +481,9 @@ mod tests {
         if !on() {
             return;
         }
-        let bound = |c: [u64; 18]| c[TYPED_EQ_PRIMITIVE] + c[TYPED_EQ_PROBE];
+        let bound = |c: [u64; vortex_rdf_encoded_search::counters::LEN]| {
+            c[TYPED_EQ_PRIMITIVE] + c[TYPED_EQ_PROBE]
+        };
         let before = bound(snapshot());
         let sa = wrapped_struct(1000);
         typed_residual_ids(&sa, &RowSelection::All, 1000, &eqs(&[("p", 3)]), None).unwrap();
