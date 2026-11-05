@@ -464,3 +464,11 @@ export function memoryRunFigures(r: {
         peakLiveMb: r.probeTotals.length > 0 ? mb(Math.max(...r.probeTotals) - r.baseline) : null,
     };
 }
+
+/** A failure's error text: the message alone for a plain `Error`, and the name before it for
+ *  a subclass (a wasm trap is `RuntimeError: unreachable`), so a reader can tell a crash
+ *  from a refusal; anything else as `String(e)`. */
+export function errorText(e: unknown): string {
+    if (!(e instanceof Error)) return String(e);
+    return e.name === 'Error' ? e.message : `${e.name}: ${e.message}`;
+}

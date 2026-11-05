@@ -4,7 +4,7 @@ import { Bench } from 'tinybench';
 import { VortexRdfStore } from '@vortex-rdf/vortex-rdf-store';
 
 import { genDataset, predicateTerm } from '../bench/datasets.js';
-import { consumeStream, makingLast } from '../bench/util.js';
+import { consumeStream, errorText, makingLast } from '../bench/util.js';
 
 function spyQuad(reads: string[]) {
     const term = (tag: string) => ({ get value() { reads.push(tag); return tag; } });
@@ -66,5 +66,15 @@ describe('makingLast', () => {
         await bench.run();
         expect(log).toEqual(['make 1', 'dispose 1', 'make 2', 'dispose 2', 'make 3']);
         expect(kept.last()).toBe(3);
+    });
+});
+
+describe('errorText', () => {
+    test('errorText names a subclass, keeps a plain Error\'s message, and strings anything else', () => {
+        expect(errorText(new Error('boom'))).toBe('boom');
+        expect(errorText(new WebAssembly.RuntimeError('unreachable'))).toBe('RuntimeError: unreachable');
+        expect(errorText(new TypeError('x is not a function'))).toBe('TypeError: x is not a function');
+        expect(errorText('plain string')).toBe('plain string');
+        expect(errorText(42)).toBe('42');
     });
 });

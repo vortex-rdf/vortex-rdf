@@ -17,7 +17,7 @@ import {
     type Row, type Pat, type StoreAdapter, type WorkerOutput,
 } from './shared.js';
 import {
-    checkCounter, fmtNs, making, makingLast, memoryRunFigures, onFresh,
+    checkCounter, errorText, fmtNs, making, makingLast, memoryRunFigures, onFresh,
     type JsMemoryRun, type StoreReadings,
 } from './util.js';
 
@@ -49,7 +49,7 @@ async function bench(
         await b.run();
         collect(b, rows, regime);
     } catch (e) {
-        const error = e instanceof Error ? e.message : String(e);
+        const error = errorText(e);
         console.error(`  !! phase '${phase}' failed: ${error}`);
         failures.push({ phase, error });
     }
@@ -165,7 +165,7 @@ async function measure(a: StoreAdapter, pats: Pat[], access: Access, opts: Bench
             else cells.push({ name: p.name, run: (h) => a.countMatch(h, p) });
             cells.push({ name: `${p.name}::count`, run: (h) => a.countOnly(h, p) });
         } catch (e) {
-            const error = e instanceof Error ? e.message : String(e);
+            const error = errorText(e);
             console.error(`  !! probe '${p.name}' failed: ${error}`);
             failures.push({ phase: key(p.name), error });
         }
