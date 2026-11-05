@@ -128,7 +128,12 @@ Every read is lazy, and a stream's first poll decides how it runs:
   ([`ScanDriver`](../core/src/store/scan/file_scans.rs#L29)) onto the tokio
   runtime it is polled in, and vortex looks that runtime up
   (`Handle::current()`) at every spawn, so every later poll of the stream
-  must run inside a tokio runtime too. A filtered file view's capped count,
+  must run inside a tokio runtime too. The reads that decode quads from a
+  scan — `quads()` and its twins, `quads_vec`, `shared_quads_vec` and the
+  N-Triples/N-Quads export — spawn every split, however few, and under a
+  file-backed dictionary every chunk's decode, whenever that first poll
+  finds a runtime, and run inline without one
+  ([file-format.md §8](file-format.md#8-reading-a-file)). A filtered file view's capped count,
   window and one-shot reads evaluate the filter split by split under the
   same rule. Its uncapped count, a delete's search for the rows it
   tombstones and a `keep`'s pass spawn their splits, as `quads_vec` and

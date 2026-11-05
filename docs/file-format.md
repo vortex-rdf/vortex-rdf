@@ -537,12 +537,13 @@ The reads that decode quads (`quads_vec`, `shared_quads_vec`, and the
 streaming reads: `quads()` and its twins, the N-Triples/N-Quads export) drive
 a scan's splits themselves: every split is spawned across the runtime's
 workers whatever their count, up to four per core ahead of the consumer, and
-polled inline without a Tokio runtime; over such a filter, the split reads
-that evaluate its masks a split at a time read the rows they keep. A split's
+polled inline without a Tokio runtime; over a pending filter of code
+equalities, the split reads that evaluate its masks a split at a time read
+the rows they keep. A split's
 task decodes its chunk, except under a file-backed dictionary: there a scan's
 chunks leave their split tasks undecoded, as their code columns, and decode
 as the stream reaches them, each decode spawned onto the runtime,
-[`STREAM_DECODE_AHEAD`](../core/src/store/read/quads.rs#L518) (2) of them in
+[`STREAM_DECODE_AHEAD`](../core/src/store/read/quads.rs#L520) (2) of them in
 flight ahead of the consumer, or on the stream itself without a runtime. The
 splits ahead of the consumer hold codes, so a scan holds at most two chunks of
 decoded terms beyond the one the consumer holds, whatever the core count.

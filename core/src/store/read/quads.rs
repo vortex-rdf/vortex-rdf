@@ -407,7 +407,9 @@ impl VortexRdfStore {
     }
 
     /// `scan`'s chunks decoded through `decoder`, then the tail's chunk; a
-    /// chunk's read error is one error chunk. The scan's split futures are
+    /// split's read error is one error chunk, which the later chunks still
+    /// follow, and an error preparing the scan is the stream's only item, as
+    /// the masks-first split reads do. The scan's split futures are
     /// driven here ([`ScanBuilder::build`]): where a tokio runtime is
     /// current, every split is spawned onto it ([`spawned_splits`]), up to
     /// the window Vortex's own scan stream keeps, its concurrency per core;
@@ -743,20 +745,24 @@ mod tests {
     }
 
     /// The reads that scan a file, with no tokio runtime: a bare executor on
-    /// a plain thread reads a store's every row (the restricted scan) and an
-    /// index's run too wide to read point by point (its serve plan's scan),
-    /// each whole, shared and exported. They run inline, spawning nothing,
-    /// and read the rows of the store loaded in memory, as they do inside a
-    /// runtime.
+    /// a plain thread reads every row of a Dictionary store (the restricted
+    /// scan), over a mapped file and over dictionary reads that wait, every
+    /// row of a Default store, and an index's run too wide to read point by
+    /// point (its serve plan's scan), each whole, shared and exported. They
+    /// run inline, spawning nothing, decode on the stream the same chunks
+    /// they decode there inside a runtime (where their splits are spawned),
+    /// and read the rows of the store loaded in memory.
     #[tokio::test]
     async fn scanned_reads_read_a_file_outside_a_tokio_runtime() {
         let quads = crate::tests::modular_quads(4000, 3, 50);
         let (_dir, path) = crate::tests::write_store_file(
-            quads,
+            quads.clone(),
             LayoutStrategy::Dictionary,
             vec![crate::IndexType::SecondaryByCopy],
         )
         .await;
+        let (_default_dir, default_path) =
+            crate::tests::write_store_file(quads, LayoutStrategy::Default, vec![]).await;
         let p = oxrdf::NamedNode::new("http://example.org/p1").unwrap();
         let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
         let mapped = VortexRdfStore::from_file(&path).await.unwrap();
@@ -772,18 +778,57 @@ mod tests {
             .match_pattern(None, Some(&p), None, None)
             .await
             .unwrap();
-        for (label, view, want) in [
-            ("every row", mapped, read_whole(&loaded).await.0),
-            ("served run", served, read_whole(&loaded_served).await.0),
-        ] {
-            let (got, _) = read_whole(&view).await;
-            assert!(got == want, "{label}: rows inside a runtime");
+        let native = crate::tests::open_mapped(&path).await;
+        let waiting_dict = FileBackedDict::open_with_waiting_reads(&native)
+            .await
+            .unwrap()
+            .expect("the written dictionary child must be window-searchable");
+        let mut waiting = mapped.clone();
+        waiting.layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(waiting_dict));
+        let default_loaded = VortexRdfStore::from_file_in_memory(&default_path)
+            .await
+            .unwrap();
+        let default_mapped = VortexRdfStore::from_file(&default_path).await.unwrap();
 
-            let (got, spawned) = std::thread::spawn(move || {
+        let every_row = read_whole(&loaded).await.0;
+        // The label, the view, its rows, and whether its chunks decode on the
+        // stream (a file-backed dictionary's do; a Default store's decode in
+        // their split futures).
+        for (label, view, want, decodes_on_stream) in [
+            ("every row", mapped, every_row.clone(), true),
+            ("every row, waiting reads", waiting, every_row, true),
+            (
+                "every row, Default layout",
+                default_mapped,
+                read_whole(&default_loaded).await.0,
+                false,
+            ),
+            (
+                "served run",
+                served,
+                read_whole(&loaded_served).await.0,
+                true,
+            ),
+        ] {
+            let rec = Recorder::start();
+            let (got, left_inside) = read_whole(&view).await;
+            assert!(
+                rec.count(&Event::SplitSpawned) > 0,
+                "{label}: inside a runtime the splits are spawned"
+            );
+            drop(rec);
+            assert!(got == want, "{label}: rows inside a runtime");
+            assert_eq!(
+                !left_inside.is_empty(),
+                decodes_on_stream,
+                "{label}: chunks decoded on the stream inside a runtime: {left_inside:?}"
+            );
+
+            let (got, left, spawned) = std::thread::spawn(move || {
                 futures::executor::block_on(async {
                     let rec = Recorder::start();
-                    let (got, _) = read_whole(&view).await;
-                    (got, rec.count(&Event::SplitSpawned))
+                    let (got, left) = read_whole(&view).await;
+                    (got, left, rec.count(&Event::SplitSpawned))
                 })
             })
             .join()
@@ -793,6 +838,10 @@ mod tests {
                 "{label}: no runtime to spawn onto, so nothing spawned"
             );
             assert!(got == want, "{label}: rows outside a runtime");
+            assert_eq!(
+                left, left_inside,
+                "{label}: the same chunks decoded on the stream outside a runtime"
+            );
         }
     }
 
