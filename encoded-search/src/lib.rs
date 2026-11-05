@@ -227,6 +227,12 @@ impl<'a> SortedProbe<'a> {
         }
     }
 
+    /// Whether the resolved tree's root is a dictionary: codes into a values
+    /// array.
+    pub fn is_dictionary(&self) -> bool {
+        matches!(self.root, node::Node::Dict { .. })
+    }
+
     /// Pre-order encoding kinds of the resolved tree, for tests and
     /// diagnostics.
     pub fn node_kinds(&self) -> Vec<NodeKind> {

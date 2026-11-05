@@ -783,6 +783,22 @@ async fn column_chunks_probe_run_of_dictionaries() {
         ColumnChunks::from_struct_layout(&root, "s").expect("a run of dictionaries resolves");
     assert_eq!(column.row_count(), 20_000);
 
+    // Equality counts over the dictionaries' codes leaves: the whole column,
+    // across an input chunk (and dictionary) boundary, and one row.
+    for rows in [0..20_000u64, 4_990..5_010, 12_345..12_346] {
+        for needle in (0..=40u64).chain([100, u64::MAX]) {
+            let got = column
+                .count_eq(rows.clone(), needle, &source, &session)
+                .await
+                .unwrap();
+            let want = data[rows.start as usize..rows.end as usize]
+                .iter()
+                .filter(|&&v| u64::from(v) == needle)
+                .count() as u64;
+            assert_eq!(got, want, "count_eq({rows:?}, {needle})");
+        }
+    }
+
     for needle in (0..=40u64).chain([100, u64::MAX]) {
         let got = column
             .bounds(needle, &source, &session)

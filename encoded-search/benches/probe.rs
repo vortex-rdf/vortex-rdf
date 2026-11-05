@@ -13,7 +13,8 @@ use std::sync::LazyLock;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
-use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::{BoolArray, PrimitiveArray};
+use vortex_array::expr::{BoundExpression, eq, lit, root};
 use vortex_array::scalar::Scalar;
 use vortex_array::search_sorted::{SearchSorted, SearchSortedArray, SearchSortedSide};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
@@ -188,4 +189,64 @@ fn value_at(bencher: Bencher, shape: &str) {
     bencher
         .counter(ItemsCount::new(indices.len()))
         .bench(|| indices.iter().map(|&i| probe.value_at(i)).sum::<u64>());
+}
+
+/// Values per window the equality counts take: a zone of a store's zone maps.
+const COUNT_WINDOW: usize = 8_192;
+
+/// Equality counts through the probe (`SortedProbe::count_eq`): 20 needles,
+/// each counted in every `COUNT_WINDOW`-value window of the fixture.
+#[divan::bench(args = SHAPES)]
+fn count_eq_probe(bencher: Bencher, shape: &str) {
+    let fixture = fixture(shape);
+    let probe = SortedProbe::resolve(&fixture.encoded).unwrap();
+    let needles: Vec<u32> = needles(&fixture.data).into_iter().take(20).collect();
+    let windows = fixture.data.len() / COUNT_WINDOW;
+    bencher
+        .counter(ItemsCount::new(needles.len() * windows))
+        .bench(|| {
+            let mut total = 0;
+            for &needle in &needles {
+                for w in 0..windows {
+                    total += probe.count_eq(w * COUNT_WINDOW, COUNT_WINDOW, u64::from(needle));
+                }
+            }
+            total
+        });
+}
+
+/// The same counts through Vortex's own kernels: each window sliced, compared
+/// to the needle (`eq(root(), lit(needle))`) and its true values counted.
+#[divan::bench(args = SHAPES)]
+fn count_eq_vortex(bencher: Bencher, shape: &str) {
+    let fixture = fixture(shape);
+    let session = common::session();
+    let needles: Vec<BoundExpression> = needles(&fixture.data)
+        .into_iter()
+        .take(20)
+        .map(|c| eq(root(), lit(c)).bind(fixture.encoded.dtype()).unwrap())
+        .collect();
+    let windows = fixture.data.len() / COUNT_WINDOW;
+    bencher
+        .counter(ItemsCount::new(needles.len() * windows))
+        .bench(|| {
+            let mut ctx = session.create_execution_ctx();
+            let mut total = 0;
+            for needle in &needles {
+                for w in 0..windows {
+                    let window = fixture
+                        .encoded
+                        .slice(w * COUNT_WINDOW..(w + 1) * COUNT_WINDOW)
+                        .unwrap();
+                    total += window
+                        .apply_bound(needle)
+                        .unwrap()
+                        .execute::<BoolArray>(&mut ctx)
+                        .unwrap()
+                        .into_bit_buffer()
+                        .true_count();
+                }
+            }
+            total
+        });
 }
