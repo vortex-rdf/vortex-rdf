@@ -249,6 +249,28 @@ pub fn assert_bulk_reads<T: Copy + Into<u64>>(
             assert_eq!(out, want, "read_into({start}..+{width})");
         }
     }
+    // count_eq against a plain count, over windows of every width the reads
+    // take and needles drawn from the data, and one past it.
+    let needles: Vec<u64> = (0..data.len())
+        .step_by((data.len() / 5).max(1))
+        .map(at)
+        .chain([u64::MAX])
+        .collect();
+    for width in [1, 7, 1023, 1024, 1025, 3000, data.len()] {
+        let Some(last) = data.len().checked_sub(width) else {
+            continue;
+        };
+        for start in (0..=last).step_by((last / 5).max(1)) {
+            for &needle in &needles {
+                let want = (start..start + width).filter(|&i| at(i) == needle).count();
+                assert_eq!(
+                    probe.count_eq(start, width, needle),
+                    want,
+                    "count_eq({start}..+{width}, {needle})"
+                );
+            }
+        }
+    }
     let lists: [Vec<usize>; 3] = [
         (0..data.len()).filter(|i| i % 5 < 3).collect(),
         (0..data.len()).step_by(2).collect(),

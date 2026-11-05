@@ -222,6 +222,23 @@ async fn column_chunks_match_canonical() {
         .collect();
     assert_eq!(got, want, "values_at");
 
+    // Equality counts over the whole column, across a leaf boundary, inside
+    // a leaf and across the second input-chunk boundary, for needles inside
+    // and past the data.
+    for rows in [0..600_000u64, 199_990..200_010, 5..9, 399_999..400_001] {
+        for needle in [0, max / 2, max, max + 1] {
+            let got = column
+                .count_eq(rows.clone(), needle, &source, &session)
+                .await
+                .unwrap();
+            let want = data[rows.start as usize..rows.end as usize]
+                .iter()
+                .filter(|&&v| u64::from(v) == needle)
+                .count() as u64;
+            assert_eq!(got, want, "count_eq({rows:?}, {needle})");
+        }
+    }
+
     // Windowed bounds: search inside sub-ranges (including ones spanning a
     // chunk boundary) and compare against the canonical floor of the window.
     for window in [0u64..50_000, 150_000..250_000, 380_000..420_000, 5..6, 9..9] {

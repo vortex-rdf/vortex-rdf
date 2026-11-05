@@ -549,6 +549,59 @@ impl ColumnChunks {
         })
     }
 
+    /// How many of the values at `rows` (absolute) equal `needle`: each leaf
+    /// the rows reach fetched (and cached) once and counted through its probe
+    /// on the encoding where it allows ([`SortedProbe::count_eq`]), a leaf
+    /// whose encoding declines the probe decoded and counted.
+    ///
+    /// # Panics
+    /// Panics if `rows` ends past `self.row_count()`.
+    pub async fn count_eq(
+        &self,
+        rows: Range<u64>,
+        needle: u64,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<u64> {
+        use vortex_array::arrays::PrimitiveArray;
+
+        assert!(rows.end <= self.row_count, "rows {rows:?} out of bounds");
+        let mut count = 0;
+        let mut at = rows.start;
+        while at < rows.end {
+            let idx = self.leaf_holding(at);
+            let leaf = &self.chunks[idx];
+            let to = rows.end.min(leaf.end());
+            // Local rows are below the leaf's row count, which its fetch
+            // checked fits a `usize`.
+            let local = (at - leaf.row_offset) as usize..(to - leaf.row_offset) as usize;
+            let fetched = self.chunk_leaf(idx, source, session).await?;
+            count += match fetched.probe() {
+                Some(probe) => probe.probe().count_eq(local.start, local.len(), needle) as u64,
+                None => {
+                    let mut ctx = session.create_execution_ctx();
+                    let values = fetched
+                        .array()
+                        .slice(local)?
+                        .execute::<PrimitiveArray>(&mut ctx)?;
+                    // A needle wider than the leaf's values matches none of them.
+                    vortex_array::match_each_unsigned_integer_ptype!(values.ptype(), |T| {
+                        match T::try_from(needle) {
+                            Ok(needle) => values
+                                .as_slice::<T>()
+                                .iter()
+                                .filter(|&&v| v == needle)
+                                .count() as u64,
+                            Err(_) => 0,
+                        }
+                    })
+                }
+            };
+            at = to;
+        }
+        Ok(count)
+    }
+
     /// The chunk's resolved probe, fetched through `source` and resolved on
     /// first use; `None` when its encoding declines.
     async fn chunk_probe(

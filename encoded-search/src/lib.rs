@@ -191,6 +191,21 @@ impl<'a> SortedProbe<'a> {
         self.root.read_into(start, out);
     }
 
+    /// How many of the values at `start..start + len` equal `needle`, counted
+    /// on the encoding where it allows (a constant at once, run ends by their
+    /// runs, a dictionary by its codes, bit-packed values a chunk at a time)
+    /// and read otherwise. Needs no sortedness.
+    ///
+    /// # Panics
+    /// Panics if `start + len > self.len()`.
+    pub fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
+        assert!(
+            start.checked_add(len).is_some_and(|end| end <= self.len()),
+            "{len} values from {start} out of bounds"
+        );
+        self.root.count_eq(start, len, needle)
+    }
+
     /// The exact values at `indices`, in their order, into `out`: each run of
     /// consecutive indices read in one pass ([`Self::read_into`]), a lone
     /// index point-read.

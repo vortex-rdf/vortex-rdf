@@ -13,6 +13,10 @@ use crate::search::{partition, search_ascending, search_ascending_capped};
 /// of a run-length array's value offsets.
 const FL_CHUNK: usize = vortex_fastlanes::FL_CHUNK_SIZE;
 
+/// Values a dictionary may hold for [`Node::count_eq`] to scan them for a
+/// needle's codes; a larger one is counted by reading.
+const DICT_SCAN: usize = 4_096;
+
 /// Typed borrow of a canonical primitive buffer, one variant per unsigned width.
 pub(crate) enum Words<'a> {
     U8(&'a [u8]),
@@ -53,6 +57,23 @@ impl Words<'_> {
             Words::U16(s) => widen(&s[start..end], out),
             Words::U32(s) => widen(&s[start..end], out),
             Words::U64(s) => out.copy_from_slice(&s[start..end]),
+        }
+    }
+
+    /// How many of the words at `start..start + len` equal `needle`.
+    fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
+        fn count<T: Copy + PartialEq + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
+            match T::try_from(needle) {
+                Ok(n) => s.iter().filter(|&&v| v == n).count(),
+                Err(_) => 0,
+            }
+        }
+        let end = start + len;
+        match self {
+            Words::U8(s) => count(&s[start..end], needle),
+            Words::U16(s) => count(&s[start..end], needle),
+            Words::U32(s) => count(&s[start..end], needle),
+            Words::U64(s) => count(&s[start..end], needle),
         }
     }
 
@@ -193,6 +214,59 @@ impl PackedNode<'_> {
         }
         if let Some(patches) = &self.patches {
             patches.overwrite(start, out);
+        }
+    }
+
+    /// How many of the values at `start..start + len` equal `needle`, the
+    /// packed words unpacked a 1024-value FastLanes chunk at a time. Requires
+    /// no patches.
+    fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
+        fn count<T>(
+            node: &PackedNode<'_>,
+            packed: &[T],
+            start: usize,
+            len: usize,
+            needle: u64,
+        ) -> usize
+        where
+            T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
+        {
+            // A chunk of 1024 values packs into `width` bits apiece.
+            let words = 128 * node.bit_width / std::mem::size_of::<T>();
+            let (first, last) = (node.offset + start, node.offset + start + len);
+            let mut chunk = [T::default(); FL_CHUNK];
+            let mut count = 0;
+            let mut c = first / FL_CHUNK;
+            while c * FL_CHUNK < last {
+                let lo = first.max(c * FL_CHUNK) - c * FL_CHUNK;
+                let hi = last.min((c + 1) * FL_CHUNK) - c * FL_CHUNK;
+                // SAFETY: the packed buffer holds `words` words for every
+                // chunk up to `(len + offset).div_ceil(1024)`, and `c` is
+                // below it as `c * 1024 < offset + len`.
+                unsafe {
+                    T::unchecked_unpack(
+                        node.bit_width,
+                        &packed[c * words..(c + 1) * words],
+                        &mut chunk,
+                    );
+                }
+                count += chunk[lo..hi]
+                    .iter()
+                    .filter(|&&v| v.into() == needle)
+                    .count();
+                c += 1;
+            }
+            count
+        }
+        debug_assert!(self.patches.is_none(), "a patched node counts by reading");
+        if self.bit_width == 0 {
+            return if needle == 0 { len } else { 0 };
+        }
+        match &self.packed {
+            Words::U8(s) => count(self, s, start, len, needle),
+            Words::U16(s) => count(self, s, start, len, needle),
+            Words::U32(s) => count(self, s, start, len, needle),
+            Words::U64(s) => count(self, s, start, len, needle),
         }
     }
 
@@ -447,6 +521,97 @@ impl Node<'_> {
                 for (k, o) in out.iter_mut().enumerate() {
                     *o = self.value_at(start + k);
                 }
+            }
+        }
+    }
+
+    /// How many of the values at `start..start + len` equal `needle`, counted
+    /// on the encoding where it allows: a constant at once, a sequence by
+    /// arithmetic, run ends by their runs, a frame of reference against the
+    /// shifted needle, a small dictionary's codes against the needle's codes,
+    /// unpatched bit-packed values a 1024-value chunk at a time, words as
+    /// they are; any other encoding read a 1024-value block at a time.
+    /// Requires `start + len <= self.len()` but no sortedness.
+    pub(crate) fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        match self {
+            Node::Primitive(w) => w.count_eq(start, len, needle),
+            Node::Constant { value, .. } => {
+                if *value == needle {
+                    len
+                } else {
+                    0
+                }
+            }
+            Node::Sequence {
+                base, multiplier, ..
+            } => {
+                let Some(step) = needle.checked_sub(*base) else {
+                    return 0;
+                };
+                let at = step / multiplier;
+                usize::from(
+                    step % multiplier == 0 && (start as u64..(start + len) as u64).contains(&at),
+                )
+            }
+            Node::RunEnd {
+                ends,
+                values,
+                offset,
+                ..
+            } => {
+                let (first, last) = ((start + offset) as u64, (start + offset + len) as u64);
+                let mut run = partition(ends.len(), |r| ends.value_at(r) <= first);
+                let (mut at, mut count) = (first, 0);
+                while at < last {
+                    let end = ends.value_at(run).min(last);
+                    if values.value_at(run) == needle {
+                        count += end - at;
+                    }
+                    at = end;
+                    run += 1;
+                }
+                count as usize
+            }
+            Node::FoR { reference, child } => match needle.checked_sub(*reference) {
+                Some(shifted) => child.count_eq(start, len, shifted),
+                None => 0,
+            },
+            Node::Slice {
+                child, start: at, ..
+            } => child.count_eq(at + start, len, needle),
+            Node::Chunked { chunks, .. } => {
+                let mut c = partition(chunks.len(), |c| chunks[c].start <= start) - 1;
+                let (mut done, mut count) = (0, 0);
+                while done < len {
+                    let chunk = &chunks[c];
+                    let from = start + done - chunk.start;
+                    let take = (chunk.node.len() - from).min(len - done);
+                    count += chunk.node.count_eq(from, take, needle);
+                    done += take;
+                    c += 1;
+                }
+                count
+            }
+            // A dictionary small enough to scan maps the needle to its codes
+            // once, then counts those in its codes.
+            Node::Dict { codes, values } if values.len() <= DICT_SCAN => (0..values.len())
+                .filter(|&code| values.value_at(code) == needle)
+                .map(|code| codes.count_eq(start, len, code as u64))
+                .sum(),
+            Node::BitPacked(p) if p.patches.is_none() => p.count_eq(start, len, needle),
+            _ => {
+                let mut block = [0u64; FL_CHUNK];
+                let (mut at, end, mut count) = (start, start + len, 0);
+                while at < end {
+                    let n = (end - at).min(FL_CHUNK);
+                    self.read_into(at, &mut block[..n]);
+                    count += block[..n].iter().filter(|&&v| v == needle).count();
+                    at += n;
+                }
+                count
             }
         }
     }
