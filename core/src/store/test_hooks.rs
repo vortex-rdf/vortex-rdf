@@ -643,6 +643,28 @@ impl VortexRdfStore {
         }
     }
 
+    /// The zone-map row range a bound graph prunes to on a file view, as the
+    /// general match computes it: `Some(0..0)` when the layout or the
+    /// statistics prove it absent, `None` off-file or when the statistics
+    /// exclude nothing.
+    pub(crate) async fn debug_graph_pruning_envelope(
+        &self,
+        graph: &oxrdf::GraphName,
+    ) -> Result<Option<Range<u64>>> {
+        use crate::store::scan::{file_exprs, file_filter};
+        let Some(FileBase { file, .. }) = self.quads.file() else {
+            return Ok(None);
+        };
+        let pattern = QuadPattern::new(None, None, None, Some(graph));
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
+            return Ok(Some(0..0));
+        };
+        match file_exprs::build_file_filter(pattern, &mut codes)? {
+            Some(filter) => file_filter::row_range_from_pruning(file, &filter).await,
+            None => Ok(None),
+        }
+    }
+
     /// The exact row range the encoded chunk-probe fast path computes for a
     /// bound subject; `None` when the fast path would not engage (off-file,
     /// unsorted file, unsupported layout, unknown term).

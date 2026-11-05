@@ -655,6 +655,17 @@ memoized on the shared file handle, keyed by the filter expression.
 Results: `Some(0..0)` when nothing can match, `None` when statistics exclude
 nothing.
 
+**Graph conjuncts.** A graph column's zones also record their graphs, each
+with its rows (`vortexrdf.value_counts`, at most 16 per zone:
+[file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)). The
+store registers a falsifier of `g = c` over them,
+[`ValueCountsFalsifier`](../core/src/stats_rules.rs#L70), which Vortex's
+pruning applies beside the bounds. A zone whose bounds contain `c` but whose
+recorded graphs don't is excluded too. So graphs spread across the zones (many
+graphs, each zone holding a few, their codes interleaved) prune as well as
+graphs sorted by zone. A zone holding more than 16 graphs records none and is
+kept, as its bounds say.
+
 **Example.** `(? a ? ?)` on the Dictionary file without indexes pushes
 `p = 4` down. The four-row file is one zone whose `p` statistics span `4..7`,
 so nothing is excluded: the result is `None`, the selection stays `All`, and
@@ -965,6 +976,7 @@ and the object of a `TypedObject` store expands into 2–4 residual equalities.
 | `S???` | subject chunk probe → exact `Range`, no filter | same | same |
 | `?P??` | POSG located run → eager ids (≤ 256) or lazy ids **+ serve plan** | ref-p located run → lazy ids, materialized unless only counted or windowed; filter empty | filter `p = code` → pruning envelope |
 | `??O?` | OSPG located run → same as above | ref-o located run → same as above | filter `o = code` → pruning envelope |
+| `???G` | filter `g = code` → pruning envelope, from the zones' bounds and their recorded graphs (§7.2) | same | same |
 | `?PO?` | POSG `(p, o)` windowed location → both resolved, **serve plan** | ref-o located run → ids; `p` read at them by point reads when they are sparse in their splits, else the filter keeps `p` | filter `p ∧ o` → pruning envelope |
 | `?POG` | as above; plan carries `g` too, but its `row_range` is dropped | ref-o ids; `p ∧ g` read at them as above, else the filter keeps them | filter `p ∧ o ∧ g` |
 | `SP??` … `SPOG` | subject chunk probe, then the prefix behind it → exact `Range`, nothing residual; index routing skipped when the range is < 4096 rows | same | same |

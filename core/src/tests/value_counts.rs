@@ -147,3 +147,230 @@ async fn forced_off_writes_no_value_counts() {
         assert!(!records_value_counts(&layout), "{component:?}");
     }
 }
+
+/// The probe's graph of row `i`: zone 4 holds graph 2 alone; zone 6 holds 20
+/// graphs around graph 2's code (1, 3 and 40 to 57, past the limit of 16);
+/// the other zones alternate graphs 1 and 3, so graph 2 lies within their
+/// bounds without being in them.
+fn probe_graph(i: usize) -> usize {
+    match i / ZONE_ROWS {
+        4 => 2,
+        6 => [1, 3].into_iter().chain(40..58).nth(i % 20).unwrap(),
+        _ if i.is_multiple_of(2) => 1,
+        _ => 3,
+    }
+}
+
+/// A quad per row of `zones` zones, row `i` in graph `graph_of(i)`.
+fn zoned_graph_quads(zones: usize, graph_of: impl Fn(usize) -> usize) -> Vec<Quad> {
+    (0..zones * ZONE_ROWS)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{i:06}"),
+                "http://example.org/p",
+                "o",
+                numbered_graph(graph_of(i)),
+            )
+        })
+        .collect()
+}
+
+/// The code of graph `n` (`numbered_graph`'s IRI) in `store`'s dictionary.
+async fn graph_code(store: &VortexRdfStore, n: usize) -> TermCode {
+    store
+        .dict_reader()
+        .unwrap()
+        .encode(&format!("<http://example.org/g{n}>"))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Each zone's graph codes, from the store's rows in table order.
+async fn zone_graphs(store: &VortexRdfStore) -> Vec<std::collections::BTreeSet<u64>> {
+    let rows = row_list(store).await;
+    rows.chunks(ZONE_ROWS)
+        .map(|zone| zone.iter().map(|row| row[3]).collect())
+        .collect()
+}
+
+/// For `code`: the zones a reader of the recorded graphs keeps (its bounds
+/// hold `code`, and the zone holds it or recorded too many graphs to say),
+/// and the zones the bounds alone keep.
+fn expected_zones(
+    zones: &[std::collections::BTreeSet<u64>],
+    code: u64,
+) -> (Vec<usize>, Vec<usize>) {
+    let in_bounds = |zone: &std::collections::BTreeSet<u64>| {
+        zone.first().is_some_and(|&min| min <= code) && zone.last().is_some_and(|&max| code <= max)
+    };
+    let bounds: Vec<usize> = (0..zones.len()).filter(|&z| in_bounds(&zones[z])).collect();
+    let kept = bounds
+        .iter()
+        .copied()
+        .filter(|&z| zones[z].len() > 16 || zones[z].contains(&code))
+        .collect();
+    (kept, bounds)
+}
+
+/// The zones of the quad table that Vortex's pruning of `g = code` keeps.
+async fn kept_zones(store: &VortexRdfStore, code: u64) -> Vec<usize> {
+    use vortex_array::expr::{eq, get_item, lit, root};
+    let file = store.debug_native_file().unwrap();
+    let reader = file.layout_reader().unwrap();
+    let rows = file.row_count();
+    let expr = eq(get_item("g", root()), lit(code))
+        .bind(reader.dtype())
+        .unwrap();
+    let mask = reader
+        .pruning_evaluation(
+            &(0..rows),
+            &expr,
+            vortex_mask::Mask::new_true(rows as usize),
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    let rows = rows as usize;
+    (0..rows.div_ceil(ZONE_ROWS))
+        .filter(|z| {
+            mask.slice(z * ZONE_ROWS..((z + 1) * ZONE_ROWS).min(rows))
+                .true_count()
+                > 0
+        })
+        .collect()
+}
+
+/// Vortex's own pruning of `g = c` keeps exactly the zones that hold `c`,
+/// and the zones that recorded too many graphs to say: graph 2, inside every
+/// zone's bounds, keeps two of eight.
+#[tokio::test]
+async fn vortex_pruning_drops_zones_without_the_graph() {
+    let (_dir, path) = write_store_file(
+        zoned_graph_quads(8, probe_graph),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let zones = zone_graphs(&store).await;
+    let g2 = graph_code(&store, 2).await;
+    assert_eq!(expected_zones(&zones, g2).1, (0..8).collect::<Vec<_>>());
+    let (mut by_counts, mut null_kept) = (false, false);
+    for graph in [2, 1, 45] {
+        let code = graph_code(&store, graph).await;
+        let (want, bounds) = expected_zones(&zones, code);
+        by_counts |= want != bounds;
+        null_kept |= want
+            .iter()
+            .any(|&z| zones[z].len() > 16 && !zones[z].contains(&code));
+        assert_eq!(kept_zones(&store, code).await, want, "g{graph}");
+    }
+    assert!(
+        by_counts && null_kept,
+        "a zone pruned by its counts; a null zone kept"
+    );
+}
+
+/// The general match of a bound graph answers its rows, and its zone-map
+/// envelope is narrowed to the zones the recorded graphs keep.
+#[tokio::test]
+async fn graph_bound_general_match_prunes_zones() {
+    let (_dir, path) = write_store_file(
+        zoned_graph_quads(8, probe_graph),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let graph = numbered_graph(2);
+    let code = graph_code(&store, 2).await;
+    let mut want: Vec<[TermCode; 4]> = row_list(&store)
+        .await
+        .into_iter()
+        .filter(|row| row[3] == code)
+        .collect();
+    let view = store
+        .match_pattern(None, None, None, Some(&graph))
+        .await
+        .unwrap();
+    let mut got = row_list(&view).await;
+    want.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(got, want);
+    let zone = ZONE_ROWS as u64;
+    assert_eq!(
+        store.debug_graph_pruning_envelope(&graph).await.unwrap(),
+        Some(4 * zone..7 * zone)
+    );
+}
+
+/// The default graph is recorded like any other: zones alternating it and
+/// graph 3 are pruned for graph 2 by their counts, and kept for the default
+/// graph.
+#[tokio::test]
+async fn default_graph_zones_prune() {
+    let graph_of = |i: usize| match i / ZONE_ROWS {
+        4 => 2,
+        _ if i.is_multiple_of(2) => 0,
+        _ => 3,
+    };
+    let (_dir, path) = write_store_file(
+        zoned_graph_quads(8, graph_of),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let zones = zone_graphs(&store).await;
+    let default = row_list(&store).await[0][3];
+    let g2 = graph_code(&store, 2).await;
+    let (want, bounds) = expected_zones(&zones, g2);
+    assert_eq!(want, vec![4]);
+    assert_ne!(
+        want, bounds,
+        "graph 2 lies within the default graph's zones' bounds"
+    );
+    assert_eq!(kept_zones(&store, g2).await, want);
+    let (want, _) = expected_zones(&zones, default);
+    assert_eq!(want, (0..8).filter(|&z| z != 4).collect::<Vec<_>>());
+    assert_eq!(kept_zones(&store, default).await, want);
+}
+
+/// An in-memory store's bytes record the statistic, and a store adopted from
+/// them answers a graph-bound match as the file does.
+#[tokio::test]
+async fn bytes_carry_the_statistic() {
+    let memory = built_store(
+        zoned_graph_quads(8, probe_graph),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let bytes = memory.to_bytes().await.unwrap();
+    let (_dir, path) = temp_store_file(&bytes);
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let column = file
+        .debug_native_file()
+        .unwrap()
+        .table_column_layout(None, "g")
+        .unwrap();
+    assert!(records_value_counts(&column));
+    let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    let graph = numbered_graph(2);
+    assert_eq!(
+        graph_rows(&adopted, &graph).await,
+        graph_rows(&file, &graph).await
+    );
+}
+
+/// The rows of `store` in `graph`, sorted.
+async fn graph_rows(store: &VortexRdfStore, graph: &GraphName) -> Vec<[TermCode; 4]> {
+    let view = store
+        .match_pattern(None, None, None, Some(graph))
+        .await
+        .unwrap();
+    let mut rows = row_list(&view).await;
+    rows.sort_unstable();
+    rows
+}

@@ -58,10 +58,70 @@ impl vortex_array::stats::rewrite::StatsRewriteRule for EqSatisfier {
     }
 }
 
+/// `x = c` is false for every row of a zone whose recorded values
+/// (`vortexrdf.value_counts`, written for the graph columns) lack `c`:
+/// `not(list_contains(get_item("values", stat(x, value_counts)), c))`, built-in
+/// functions only, so Vortex's own pruning applies it in every filtered scan.
+/// A zone past the aggregate's limit records null, and a column without the
+/// statistic has none in scope: both leave the proof undecided. Given only
+/// for a non-nullable `u64` column (the aggregate's input) and a non-null
+/// `u64` literal, and not while `VORTEX_RDF_ZONES=0` ([`zones_switch`]).
+#[derive(Debug)]
+pub(crate) struct ValueCountsFalsifier;
+
+impl vortex_array::stats::rewrite::StatsRewriteRule for ValueCountsFalsifier {
+    fn scalar_fn_id(&self) -> ScalarFnId {
+        use vortex_array::scalar_fn::ScalarFnVTable as _;
+        vortex_array::scalar_fn::fns::binary::Binary.id()
+    }
+
+    fn falsify(
+        &self,
+        expr: &BoundExpression,
+        _session: &VortexSession,
+    ) -> VortexResult<Option<BoundExpression>> {
+        use vortex_array::dtype::{DType, Nullability, PType};
+        use vortex_array::expr::bound::{get_item, list_contains, not};
+        use vortex_array::scalar_fn::fns::binary::Binary;
+        use vortex_array::scalar_fn::fns::literal::Literal;
+        use vortex_array::scalar_fn::fns::operators::Operator;
+        use vortex_array::stats::expr::bound::stat;
+
+        if !zones_switch() || !matches!(expr.as_::<Binary>(), Operator::Eq) {
+            return Ok(None);
+        }
+        let (lhs, rhs) = (expr.child(0), expr.child(1));
+        let (column, literal) = match (lhs.is::<Literal>(), rhs.is::<Literal>()) {
+            (false, true) => (lhs, rhs),
+            (true, false) => (rhs, lhs),
+            _ => return Ok(None),
+        };
+        let u64 = DType::Primitive(PType::U64, Nullability::NonNullable);
+        if column.dtype() != &u64 || literal.dtype() != &u64 || literal.as_::<Literal>().is_null() {
+            return Ok(None);
+        }
+        let recorded = stat(column.clone(), crate::store::value_counts::value_counts());
+        Ok(Some(not(list_contains(
+            get_item("values", recorded),
+            literal.clone(),
+        ))))
+    }
+}
+
+/// Whether zone decisions are on: `VORTEX_RDF_ZONES=0` (an ablation switch,
+/// read once) turns them off, the [`ValueCountsFalsifier`] with them. The
+/// process switch alone: Vortex may evaluate a rule on its own threads,
+/// where a test's per-thread override doesn't reach.
+pub(crate) fn zones_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VORTEX_RDF_ZONES").as_deref() != Ok("0"))
+}
+
 /// Register the store's rules in `session`.
 pub(crate) fn register(session: &VortexSession) {
     use vortex_array::stats::session::StatsSessionExt as _;
     session.stats().register_rewrite(EqSatisfier);
+    session.stats().register_rewrite(ValueCountsFalsifier);
 }
 
 /// The two proofs of `x = code` over a column of `column` dtype, as Vortex

@@ -107,8 +107,7 @@ pub(crate) fn zones_enabled() -> bool {
     if let Some(on) = crate::store::test_hooks::forced_zones() {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VORTEX_RDF_ZONES").as_deref() != Ok("0"))
+    crate::stats_rules::zones_switch()
 }
 
 #[cfg(test)]
