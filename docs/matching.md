@@ -664,7 +664,8 @@ pruning applies beside the bounds. A zone whose bounds contain `c` but whose
 recorded graphs don't is excluded too. So graphs spread across the zones (many
 graphs, each zone holding a few, their codes interleaved) prune as well as
 graphs sorted by zone. A zone holding more than 16 graphs records none and is
-kept, as its bounds say.
+kept, as its bounds say. `VORTEX_RDF_ZONES=0` (an ablation switch, read once)
+turns the falsifier off, and the bounds alone prune.
 
 **Example.** `(? a ? ?)` on the Dictionary file without indexes pushes
 `p = 4` down. The four-row file is one zone whose `p` statistics span `4..7`,

@@ -234,10 +234,10 @@ same order. A code in a position its term kind cannot take matches nothing.
 Bound slots that are no such prefix, a bound graph after a free slot
 (`(? p o g)` on `index:posg`, `(s p ? g)` on the quad table), are the run of
 the table's longest bound prefix, its rows checked against the slots past
-it. Those checks are decided a zone at a time from the checked columns'
-zone maps, with Vortex's own proofs of `x = c`: a zone where no row can hold
-the checked code (by its bounds, or for the graph by the graphs it records)
-is skipped, a zone where every row holds it is taken whole without reading
+it. Those checks are decided a zone at a time: by Vortex's own proofs of
+`x = c` on the checked columns' zone-map bounds and, for the graph, by the
+graphs each zone records. A zone where no row can hold the checked code is
+skipped, a zone where every row holds it is taken whole without reading
 the column, and only the zones holding it among other codes are read. A
 count takes such a zone's count from the graphs it records when the graph is
 the one checked slot left in it and the zone lies whole within the run,
@@ -252,7 +252,8 @@ a row or two is answered faster that way. A longer run asks the statistics
 only when a read needs them: a first window that the run's first 4,096 rows
 fill, such as a 64-row first page, is read from those rows without them.
 `VORTEX_RDF_ZONES=0` (read once)
-checks every row instead, as before.
+checks every row instead, as before, and leaves the general match's zone
+pruning to the bounds, without the recorded graphs.
 With `VORTEX_RDF_COUNTERS=1` the engine counters count these decisions: the
 slots the footer settles (`zone_column`), the zones settled none and all
 (`zone_none`, `zone_all`), the mixed zones counted from their recorded graphs

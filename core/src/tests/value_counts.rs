@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::io::zone_map::{ExactZoneMap, ZONE_ROWS};
+use crate::stats_rules::zones_switch;
 use crate::store::test_hooks::ForcedValueCounts;
 use crate::store::value_counts::{decode_state, value_counts};
 
@@ -243,7 +244,8 @@ async fn kept_zones(store: &VortexRdfStore, code: u64) -> Vec<usize> {
 
 /// Vortex's own pruning of `g = c` keeps exactly the zones that hold `c`,
 /// and the zones that recorded too many graphs to say: graph 2, inside every
-/// zone's bounds, keeps two of eight.
+/// zone's bounds, keeps two of eight. `VORTEX_RDF_ZONES=0` turns the
+/// falsifier off, leaving the bounds alone.
 #[tokio::test]
 async fn vortex_pruning_drops_zones_without_the_graph() {
     let (_dir, path) = write_store_file(
@@ -264,7 +266,8 @@ async fn vortex_pruning_drops_zones_without_the_graph() {
         null_kept |= want
             .iter()
             .any(|&z| zones[z].len() > 16 && !zones[z].contains(&code));
-        assert_eq!(kept_zones(&store, code).await, want, "g{graph}");
+        let kept = if zones_switch() { want } else { bounds };
+        assert_eq!(kept_zones(&store, code).await, kept, "g{graph}");
     }
     assert!(
         by_counts && null_kept,
@@ -273,7 +276,9 @@ async fn vortex_pruning_drops_zones_without_the_graph() {
 }
 
 /// The general match of a bound graph answers its rows, and its zone-map
-/// envelope is narrowed to the zones the recorded graphs keep.
+/// envelope is narrowed to the zones the recorded graphs keep; with
+/// `VORTEX_RDF_ZONES=0` the bounds, which hold graph 2 in every zone, narrow
+/// nothing.
 #[tokio::test]
 async fn graph_bound_general_match_prunes_zones() {
     let (_dir, path) = write_store_file(
@@ -301,13 +306,13 @@ async fn graph_bound_general_match_prunes_zones() {
     let zone = ZONE_ROWS as u64;
     assert_eq!(
         store.debug_graph_pruning_envelope(&graph).await.unwrap(),
-        Some(4 * zone..7 * zone)
+        zones_switch().then_some(4 * zone..7 * zone)
     );
 }
 
 /// The default graph is recorded like any other: zones alternating it and
 /// graph 3 are pruned for graph 2 by their counts, and kept for the default
-/// graph.
+/// graph. `VORTEX_RDF_ZONES=0` leaves the bounds alone.
 #[tokio::test]
 async fn default_graph_zones_prune() {
     let graph_of = |i: usize| match i / ZONE_ROWS {
@@ -331,10 +336,12 @@ async fn default_graph_zones_prune() {
         want, bounds,
         "graph 2 lies within the default graph's zones' bounds"
     );
-    assert_eq!(kept_zones(&store, g2).await, want);
-    let (want, _) = expected_zones(&zones, default);
+    let kept = if zones_switch() { want } else { bounds };
+    assert_eq!(kept_zones(&store, g2).await, kept);
+    let (want, bounds) = expected_zones(&zones, default);
     assert_eq!(want, (0..8).filter(|&z| z != 4).collect::<Vec<_>>());
-    assert_eq!(kept_zones(&store, default).await, want);
+    let kept = if zones_switch() { want } else { bounds };
+    assert_eq!(kept_zones(&store, default).await, kept);
 }
 
 /// An in-memory store's bytes record the statistic, and a store adopted from
