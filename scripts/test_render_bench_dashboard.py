@@ -75,9 +75,10 @@ console.log(JSON.stringify(out));
 """ % json.dumps(list(HOSTS))
 
 
-def render_page(out_dir: Path, failures: dict | None = None, **memory: list) -> str:
+def render_page(out_dir: Path, failures: dict | None = None, extra_results: dict | None = None, **memory: list) -> str:
     """Render a page whose four tabs carry the given memory entries and, per suite, `failures`."""
     failures = failures or {}
+    extra_results = extra_results or {}
     rust = out_dir / "rust.txt"
     rust.write_text(RUST_LOG, encoding="utf-8")
     flags = []
@@ -86,7 +87,7 @@ def render_page(out_dir: Path, failures: dict | None = None, **memory: list) -> 
             continue
         path = out_dir / f"{name}.json"
         path.write_text(json.dumps({
-            "results": [{"id": "ingest::vortex_dict", "median": "1 ms", "median_ns": 1e6}],
+            "results": [{"id": "ingest::vortex_dict", "median": "1 ms", "median_ns": 1e6}, *extra_results.get(kw, [])],
             "memory": memory.get(kw, []),
             "failures": failures.get(kw, []),
         }), encoding="utf-8")
@@ -330,7 +331,8 @@ JS_FAILS = [
 
 
 def test_a_js_phase_that_could_not_complete_reads_failed_and_is_listed(tmp_path):
-    page = render_page(tmp_path, failures={"js": JS_FAILS})
+    page = render_page(tmp_path, failures={"js": JS_FAILS},
+                       extra_results={"js": [{"id": "hdt::S", "median": "1 ms", "median_ns": 1e6}]})
     hosts = rendered_hosts(page)
     panels = footprint_panels(page, hosts)
     match = panel(panels["js-query-panels"], "Cross-library match, by routing shape and cache regime")
@@ -343,4 +345,6 @@ def test_a_js_phase_that_could_not_complete_reads_failed_and_is_listed(tmp_path)
     assert "oxigraph · fullscan · full::count: unreachable" in line
     assert "rdf-stores (1 index) · query · ingest: boom" in line
     assert "hdt · memory · worker: the memory worker wrote no memory run" in line
-    assert not any(c["failed"] for c in match["rows"].get("hdt", []))
+    hdt = match["rows"]["hdt"]
+    assert hdt and not any(c["failed"] for c in hdt)
+    assert hdt[3]["text"] == "1 ms"                                     # S, warm, materialized: the row is real
