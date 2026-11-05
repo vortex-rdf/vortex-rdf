@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::io::zone_map::ColumnZones;
-use crate::stats_rules::{EqProofs, eq_proofs};
-use crate::store::schema::TermCode;
+use crate::stats_rules::EqProofs;
+#[cfg(test)]
+use crate::stats_rules::eq_proofs;
 
 /// How a zone stands against a run's checked slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,12 +25,13 @@ pub(crate) enum ZoneClass {
     Mixed { unsettled: u8 },
 }
 
-/// A checked slot of a run: its code, and its column's zone map in the
-/// run's table.
+/// A checked slot of a run: its column's zone map in the run's table, and
+/// Vortex's proofs of `x = code` for the slot's code
+/// ([`eq_proofs`](crate::stats_rules::eq_proofs)).
 pub(crate) struct CheckedColumn {
     pub(crate) slot: usize,
-    pub(crate) code: TermCode,
     pub(crate) zones: Arc<ColumnZones>,
+    pub(crate) proofs: EqProofs,
 }
 
 /// The classes of a table's zones against a run's checked slots, each
@@ -61,23 +63,20 @@ impl ZoneDecider {
     /// column's satisfier does, [`ZoneClass::Mixed`] otherwise, naming the
     /// columns neither proof settles.
     pub(crate) fn classify(&self, zones: Range<u64>) -> Result<Vec<ZoneClass>> {
-        use vortex_array::dtype::{DType, Nullability, PType};
-
         let n = (zones.end - zones.start) as usize;
         let (mut none, mut all, mut unsettled) = (vec![false; n], vec![true; n], vec![0u8; n]);
-        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
         for column in &self.columns {
             let EqProofs {
                 none: falsifier,
                 all: satisfier,
-            } = eq_proofs(&dtype, column.code)?;
-            let holds = |proof: &Option<_>| -> Result<Option<vortex_mask::Mask>> {
+            } = &column.proofs;
+            let holds = |proof: &Option<vortex_array::expr::BoundExpression>| -> Result<Option<vortex_mask::Mask>> {
                 proof
                     .as_ref()
                     .map(|proof| column.zones.prune(zones.clone(), proof))
                     .transpose()
             };
-            let (no_row, every_row) = (holds(&falsifier)?, holds(&satisfier)?);
+            let (no_row, every_row) = (holds(falsifier)?, holds(satisfier)?);
             for z in 0..n {
                 let zone_none = no_row.as_ref().is_some_and(|mask| mask.value(z));
                 let zone_all = every_row.as_ref().is_some_and(|mask| mask.value(z));
@@ -115,9 +114,14 @@ pub(crate) fn zones_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::schema::TermCode;
     use crate::store::test_hooks::ForcedZones;
 
     const Z: u64 = 8_192;
+    const U64: vortex_array::dtype::DType = vortex_array::dtype::DType::Primitive(
+        vortex_array::dtype::PType::U64,
+        vortex_array::dtype::Nullability::NonNullable,
+    );
 
     /// A column at `slot`, checked for `code`, with zones of these bounds.
     fn checked(slot: usize, code: TermCode, bounds: &[(u64, u64)]) -> CheckedColumn {
@@ -130,8 +134,8 @@ mod tests {
         .unwrap();
         CheckedColumn {
             slot,
-            code,
             zones: Arc::new(zones),
+            proofs: eq_proofs(&U64, code).unwrap(),
         }
     }
 
@@ -205,8 +209,8 @@ mod tests {
         .unwrap();
         let other = CheckedColumn {
             slot: 2,
-            code: 5,
             zones: Arc::new(other),
+            proofs: eq_proofs(&U64, 5).unwrap(),
         };
         assert!(ZoneDecider::new(vec![checked(3, 5, &graph_bounds()), other]).is_none());
     }

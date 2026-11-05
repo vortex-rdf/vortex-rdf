@@ -536,3 +536,49 @@ async fn zone_counters_count_decisions() {
         assert!(after[site] > before[site], "site {site}");
     }
 }
+
+/// A gap run shorter than a zone checks its few rows directly: asking the
+/// footer and the zone maps would cost a short probe (a join's per-binding
+/// lookup) more than the rows. It reads no zone map, answers as without
+/// zones, and its rows are checked.
+#[tokio::test]
+async fn short_runs_check_rows_without_statistics() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
+        let (_dir, path) = write_store_file(
+            zone_quads(Graphs::Long),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let ty = code_of(&store, "<http://example.org/type>").await;
+        let g1 = code_of(&store, "<http://example.org/g1>").await;
+        for (i, want) in [(5, 1), (30_000, 0)] {
+            let s = code_of(&store, &format!("<http://example.org/s{i:05}>")).await;
+            let pattern = CodePattern::new(Some(s), Some(ty), None, Some(g1));
+            let rows = {
+                let _off = ForcedZones::set(false);
+                code_rows::<4>(&store.match_code_pattern(pattern, 0, None).await.unwrap())
+            };
+            let _on = ForcedZones::set(true);
+            let rec = Recorder::start();
+            assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
+            let got = code_rows::<4>(&store.match_code_pattern(pattern, 0, None).await.unwrap());
+            assert_eq!(got, rows, "{} s{i}", index.name());
+            assert_eq!(
+                zone_maps_read(&rec),
+                0,
+                "{} s{i}: no zone map",
+                index.name()
+            );
+            assert!(
+                zone_work(&rec).1 > 0,
+                "{} s{i}: its rows checked",
+                index.name()
+            );
+        }
+    }
+}

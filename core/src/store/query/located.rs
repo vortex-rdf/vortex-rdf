@@ -340,39 +340,29 @@ impl VortexRdfStore {
             if let Some(found) =
                 locate_run(columns, order, prefix, &codes, &source, session).await?
             {
-                let mut checked: Vec<usize> = order[prefix..]
+                let checked: Vec<usize> = order[prefix..]
                     .iter()
                     .copied()
                     .filter(|&slot| codes[slot].is_some())
                     .collect();
-                let zoned = crate::store::query::zone_decider::zones_enabled();
-                let mut rows = found;
-                if zoned {
-                    // The footer first: a checked code no row of the file
-                    // holds matches nothing, one every row holds needs no
-                    // check.
-                    let mut unsettled = Vec::with_capacity(checked.len());
-                    for &slot in &checked {
-                        let code = codes[slot].expect("a checked slot is bound");
-                        match footer_decision(file, slot, code)? {
-                            FooterDecision::Nothing => {
-                                note(counters::ZONE_COLUMN, rows.end - rows.start);
-                                rows = rows.start..rows.start;
-                                unsettled.clear();
-                                break;
-                            }
-                            FooterDecision::Everything => {
-                                note(counters::ZONE_COLUMN, rows.end - rows.start);
-                            }
-                            FooterDecision::Unknown => unsettled.push(slot),
-                        }
-                    }
-                    checked = unsettled;
-                }
-                let mut located = run(columns.clone(), RunRows::Table(rows), checked);
-                if zoned && !located.checked.is_empty() {
-                    located.zones =
-                        run_zones(file, tables, table, TABLES[table].0, &located, &source).await?;
+                let mut located = run(columns.clone(), RunRows::Table(found), checked);
+                // A run of a zone or more asks the file's statistics; a
+                // shorter one reads its few rows faster than they answer
+                // (a join's one-row probe: 1 against 45 µs).
+                if crate::store::query::zone_decider::zones_enabled()
+                    && located.len() >= STATISTICS_ROWS
+                {
+                    // Boxed: its state would otherwise enlarge every
+                    // lookup's future.
+                    Box::pin(decide_by_statistics(
+                        file,
+                        tables,
+                        table,
+                        TABLES[table].0,
+                        &mut located,
+                        &source,
+                    ))
+                    .await?;
                 }
                 // A run still checked row by row is capped, as without zones.
                 if located.checked.is_empty()
@@ -1088,6 +1078,54 @@ async fn locate_run(
 /// it, or a reference run with other slots bound) up to which it answers; a
 /// longer one declines, for the caller's other paths, as a window of it
 /// checks every row to count them.
+/// The statistics' decisions on `run`, a gap run of sorted table `table`
+/// (`component` names it, `None` the quad table), in ladder order (spec §3):
+/// the footer settles each checked slot for the whole file, leaving the run
+/// empty where no row holds a slot's code and dropping a slot every row
+/// holds; the zone maps then class the run's zones against the slots left
+/// ([`run_zones`]). Each slot's proofs of `x = code` are built once, for
+/// both.
+#[cfg(feature = "file-io")]
+async fn decide_by_statistics(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    tables: &crate::store::persist::native_file::LocatedTables,
+    table: usize,
+    component: Option<&str>,
+    run: &mut LocatedRun,
+    source: &Source,
+) -> Result<()> {
+    use vortex_array::dtype::{DType, Nullability, PType};
+
+    let RunRows::Table(rows) = &run.rows else {
+        return Ok(());
+    };
+    let rows = rows.clone();
+    let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+    let (mut unsettled, mut proofs) = (Vec::new(), Vec::new());
+    for &slot in &run.checked {
+        let code = run.codes[slot].expect("a checked slot is bound");
+        let slot_proofs = crate::stats_rules::eq_proofs(&dtype, code)?;
+        match footer_decision(file, slot, code, &slot_proofs)? {
+            FooterDecision::Nothing => {
+                note(counters::ZONE_COLUMN, rows.end - rows.start);
+                run.rows = RunRows::Table(rows.start..rows.start);
+                run.checked.clear();
+                return Ok(());
+            }
+            FooterDecision::Everything => note(counters::ZONE_COLUMN, rows.end - rows.start),
+            FooterDecision::Unknown => {
+                unsettled.push(slot);
+                proofs.push(slot_proofs);
+            }
+        }
+    }
+    run.checked = unsettled;
+    if !run.checked.is_empty() {
+        run.zones = run_zones(file, tables, table, component, run, proofs, source).await?;
+    }
+    Ok(())
+}
+
 /// The zones of `run`, a run of sorted table `table` (`component` names
 /// it, `None` the quad table), classed against its checked slots by their
 /// columns' zone maps ([`ZoneDecider`]); `None` when a checked column has
@@ -1101,6 +1139,7 @@ async fn run_zones(
     table: usize,
     component: Option<&str>,
     run: &LocatedRun,
+    proofs: Vec<crate::stats_rules::EqProofs>,
     source: &Source,
 ) -> Result<Option<RunZones>> {
     use crate::store::query::zone_decider::{CheckedColumn, ZoneDecider};
@@ -1109,12 +1148,15 @@ async fn run_zones(
         return Ok(None);
     };
     let mut columns = Vec::with_capacity(run.checked.len());
-    for &slot in &run.checked {
+    for (&slot, proofs) in run.checked.iter().zip(proofs) {
         let Some(zones) = column_zones(file, tables, table, component, slot, source).await? else {
             return Ok(None);
         };
-        let code = run.codes[slot].expect("a checked slot is bound");
-        columns.push(CheckedColumn { slot, code, zones });
+        columns.push(CheckedColumn {
+            slot,
+            zones,
+            proofs,
+        });
     }
     let Some(decider) = ZoneDecider::new(columns) else {
         return Ok(None);
@@ -1183,6 +1225,7 @@ fn footer_decision(
     file: &crate::store::persist::native_file::NativeStoreFile,
     slot: usize,
     code: TermCode,
+    proofs: &crate::stats_rules::EqProofs,
 ) -> Result<FooterDecision> {
     use crate::store::schema::PRIMARY_COLUMNS;
     use vortex_array::expr::{eq, get_item, lit, root};
@@ -1192,7 +1235,11 @@ fn footer_decision(
         return Ok(FooterDecision::Nothing);
     }
     Ok(
-        match bounds_settle_every_row(footer_bounds(file, column), code, file.row_count())? {
+        match bounds_settle_every_row(
+            footer_bounds(file, column),
+            proofs.all.as_ref(),
+            file.row_count(),
+        )? {
             true => FooterDecision::Everything,
             false => FooterDecision::Unknown,
         },
@@ -1220,36 +1267,32 @@ fn footer_bounds(
 }
 
 /// Whether bounds `(min, max)` of a column of `row_count` rows prove every
-/// row holds `code`: Vortex's satisfier of `x = code` ([`eq_proofs`]) on a
-/// one-zone map of those bounds. `false` without bounds.
+/// row holds a code: `all`, Vortex's satisfier of `x = code`
+/// ([`eq_proofs`]), on a one-zone map of those bounds. `false` without
+/// bounds or a satisfier.
 ///
 /// [`eq_proofs`]: crate::stats_rules::eq_proofs
 #[cfg(feature = "file-io")]
 fn bounds_settle_every_row(
     bounds: Option<(u64, u64)>,
-    code: TermCode,
+    all: Option<&vortex_array::expr::BoundExpression>,
     row_count: u64,
 ) -> Result<bool> {
     use crate::io::zone_map::ColumnZones;
-    use vortex_array::dtype::{DType, Nullability, PType};
 
-    let Some((min, max)) = bounds else {
+    let (Some((min, max)), Some(all)) = (bounds, all) else {
         return Ok(false);
     };
     if row_count == 0 {
         return Ok(false);
     }
-    let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-    let Some(all) = crate::stats_rules::eq_proofs(&dtype, code)?.all else {
-        return Ok(false);
-    };
     let zones = ColumnZones::from_bounds(
         vortex_buffer::buffer![min],
         vortex_buffer::buffer![max],
         row_count,
         row_count,
     )?;
-    Ok(zones.prune(0..1, &all)?.value(0))
+    Ok(zones.prune(0..1, all)?.value(0))
 }
 
 /// The longest gap run checked row by row: [`GAP_ROWS`], or what a test
@@ -1265,6 +1308,12 @@ fn gap_rows() -> u64 {
 
 #[cfg(feature = "file-io")]
 const GAP_ROWS: u64 = 1 << 23;
+
+/// The fewest rows of a gap run for it to ask the file's statistics before
+/// its rows (a zone's): a shorter run reads its rows faster than the footer
+/// and the zone maps decide them, about 1 against 45 µs for a one-row probe.
+#[cfg(feature = "file-io")]
+const STATISTICS_ROWS: u64 = crate::io::zone_map::ZONE_ROWS as u64;
 
 /// Rows of a checked run a window reads in its first block.
 #[cfg(feature = "file-io")]
@@ -1407,9 +1456,16 @@ mod tests {
     /// without them settles nothing.
     #[test]
     fn footer_bounds_decide_every_row() {
-        assert!(!bounds_settle_every_row(None, 5, 100).unwrap());
-        assert!(!bounds_settle_every_row(Some((4, 5)), 5, 100).unwrap());
-        assert!(bounds_settle_every_row(Some((5, 5)), 5, 100).unwrap());
-        assert!(bounds_settle_every_row(Some((u64::MAX, u64::MAX)), u64::MAX, 100).unwrap());
+        use vortex_array::dtype::{DType, Nullability, PType};
+
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let all = |code| crate::stats_rules::eq_proofs(&dtype, code).unwrap().all;
+        let (five, top) = (all(5), all(u64::MAX));
+        assert!(!bounds_settle_every_row(None, five.as_ref(), 100).unwrap());
+        assert!(!bounds_settle_every_row(Some((4, 5)), five.as_ref(), 100).unwrap());
+        assert!(bounds_settle_every_row(Some((5, 5)), five.as_ref(), 100).unwrap());
+        assert!(!bounds_settle_every_row(Some((5, 5)), None, 100).unwrap());
+        let max = (u64::MAX, u64::MAX);
+        assert!(bounds_settle_every_row(Some(max), top.as_ref(), 100).unwrap());
     }
 }
