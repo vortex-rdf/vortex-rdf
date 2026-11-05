@@ -146,14 +146,27 @@ def test_artifact_size_comes_from_the_store_location(driver, tmp_path, monkeypat
     assert isinstance(res["peak_rss_mb"], int) and res["peak_rss_mb"] > 0
 
 
-def test_the_retained_figure_joins_the_memory_row_in_megabytes(driver, monkeypatch):
-    def worker(retained):
-        monkeypatch.setattr(driver, "worker_command", lambda slug, role, out, files: stub(out, result(retained=retained)))
-        return driver.run_java_worker("x", "query").get("memory_extra")
+MEMORY = {"slug": "x", "label": "X", "role": "memory", "obtained": "mapped", "counts": {"S": 1},
+          "storeBytes": 17_196_646, "peakAnonBytes": 42_152_755, "peakFileBytes": 0, "jdk": "25.0.4.1 (Ubuntu)"}
 
-    assert worker({"heapBytes": 3 << 20, "nativeBytes": 3 << 19}) == {"retainedHeapMb": 3.0, "retainedNativeMb": 1.5}
-    # A role that ended before its store was open has nothing to report.
-    assert worker(None) == {}
+
+def test_a_memory_run_returns_the_workers_own_readings(driver, monkeypatch):
+    monkeypatch.setattr(driver, "worker_command", lambda slug, role, out, files: stub(out, MEMORY))
+
+    assert driver.run_java_worker("x", "memory") == MEMORY  # no wait4 peak, size or failures added
+
+
+def test_memory_runs_join_the_suite_as_one_entry_per_adapter(driver, monkeypatch):
+    monkeypatch.setattr(driver, "worker_command", lambda slug, role, out, files:
+                        stub(out, MEMORY if role == "memory" else result(role=role)))
+
+    from suite import run_roles
+
+    outcome = run_roles(["x"], driver.run_java_worker, memory_runs=2)
+
+    assert set(outcome.memory[0]) == {"slug", "label", "role", "peakRssMb"}  # no retained figure
+    assert outcome.memory[-1] == {"slug": "x", "label": "X", "role": "memory", "obtained": "mapped",
+                                  "runs": [{"storeMb": 16.4, "peakAnonMb": 40.2, "peakFileMb": 0.0}] * 2}
 
 
 def test_worker_failures_carry_their_slug_label_and_role(driver, monkeypatch):
@@ -173,7 +186,7 @@ def test_a_worker_runs_on_its_own_library_classpath(driver, tmp_path):
     cmd = driver.worker_command("jena_tdb2", "query", tmp_path / "out.json", files)
 
     assert cmd[cmd.index("-cp") + 1] == driver.classpath("jena")
-    # The retained figure reads the JVM's own native allocations from its tracking.
+    # The Store figure reads the JVM's own native allocations from its tracking.
     assert "-XX:NativeMemoryTracking=summary" in cmd
     assert cmd[cmd.index("--slug") + 1] == "jena_tdb2"
     assert cmd[cmd.index("--workdir") + 1] == str(tmp_path / "data" / "work" / "jena_tdb2")

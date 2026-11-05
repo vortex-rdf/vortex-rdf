@@ -80,6 +80,7 @@ def _runtime_methods(cls):
         "CodeGroups",
         "ProbeAnswers",
         "CodeChunks",
+        "QuadIterator",
         "CancelToken",
     ],
 )

@@ -535,13 +535,17 @@ evaluation decodes and compares its rows, work that outlasts waking a
 worker.
 Streaming reads (`quads()` and its twins) decode inside the per-split tasks
 Vortex's scan stream spawns, or, over such a filter, inside the split reads
-that evaluate its masks a split at a time. Under a file-backed dictionary the
-decode may await the dictionary's own reads, which a scan's split task cannot
-do: there a chunk decodes in its task only when its window reads complete at
-once, as over a mapping they always do, and at the stream's consumer
-otherwise. A file-backed chunk of fewer than 1,024 rows decodes at the
-consumer too, against the windows its core has in cache, where a worker would
-gain it no parallelism.
+that evaluate its masks a split at a time. Under a file-backed dictionary a
+scan's chunks leave their split tasks undecoded, as their code columns, and
+decode as the stream reaches them, each decode spawned onto the runtime,
+[`STREAM_DECODE_AHEAD`](../core/src/store/read/quads.rs#L511) (2) of them in
+flight ahead of the consumer. Vortex runs up to four splits per core ahead of
+the consumer, and those hold codes, so a scan holds at most two chunks of
+decoded terms beyond the one the consumer holds, whatever the core count.
+The split reads that evaluate a filter's masks await the dictionary's reads
+inside the read; there a file-backed chunk of fewer than 1,024 rows decodes
+at the consumer, against the windows its core has in cache, where a worker
+would gain it no parallelism.
 
 **Kernels.** The store's Vortex session adds fused executions of its own for
 cases Vortex 0.90 runs the slow way, registered before the default encodings

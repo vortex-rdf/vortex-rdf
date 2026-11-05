@@ -1,20 +1,27 @@
 //! The iterators of the code path, each `__next__` one pull on the bindings'
 //! runtime, GIL-released and raced with the call's cancel token if it passed
 //! one: a match's term-code columns in chunks from core's chunk stream
-//! ([`CodeChunks`]), and a batch's answers in input order ([`ProbeAnswers`]).
+//! ([`CodeChunks`]), a match's quads as terms, a chunk decoded at a time
+//! ([`QuadIterator`]), and a batch's answers in input order
+//! ([`ProbeAnswers`]).
 
 use std::sync::{Mutex, PoisonError};
 
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyString, PyTuple};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::VortexRdfError as CoreError;
-use vortex_rdf_core::{CodeChunkStream, QuadColumn, TermCode};
+use vortex_rdf_core::{
+    CodeChunkStream, DictReader, QuadColumn, SharedQuad, TermCode, VortexRdfStore as CoreStore,
+};
 
 use crate::batch::Batch;
 use crate::cancel::{Pulled, Token, pull_next};
 use crate::kernels::U64Column;
+use crate::store::{PyQuad, decoded_columns, shared_columns};
 use crate::{RUNTIME, settled};
 
 /// A match's term-code columns in chunks of at most `batch_rows` rows, in
@@ -86,6 +93,116 @@ impl CodeChunks {
     #[getter]
     fn batch_rows(&self) -> usize {
         self.batch_rows
+    }
+}
+
+/// One chunk of a match, as the stream of a [`QuadIterator`] yields it.
+pub(crate) enum QuadChunk {
+    /// A Dictionary store's chunk: its four code columns.
+    Codes([Buffer<TermCode>; 4]),
+    /// Any other store's chunk, its rows decoded to terms.
+    Shared(Vec<SharedQuad>),
+}
+
+type QuadChunkStream = BoxStream<'static, Result<QuadChunk, CoreError>>;
+
+/// A match's quads as `(s, p, o, g)` strings, in `get_quads`' order and
+/// spelling, read a chunk of at most `batch_rows` rows at a time
+/// (`VortexRdfStore.iter_quads`). A `__next__` that has used up its chunk
+/// pulls the next on the bindings' runtime, GIL-released and raced with the
+/// call's cancel token if it passed one. The end of the match, an error or
+/// a cancel drops the stream, and every later `__next__` stops the
+/// iteration.
+#[pyclass(module = "vortex_rdf._native")] // not frozen: `__next__` takes `&mut self`
+pub struct QuadIterator {
+    /// The chunk stream; `None` once it has ended, failed or been
+    /// cancelled. The `Mutex` only makes it `Sync`; it is read with
+    /// `get_mut`.
+    chunks: Mutex<Option<QuadChunkStream>>,
+    /// The current chunk's rows not yet yielded, a column each.
+    rows: [std::vec::IntoIter<Py<PyString>>; 4],
+    /// The store's dictionary: `Some` exactly when the chunks are codes.
+    dict: Option<DictReader>,
+    /// The token every pull races, when the call passed one.
+    token: Option<Token>,
+}
+
+impl QuadIterator {
+    /// The quads of `view`, pulled in chunks of at most `batch_rows` (at
+    /// least 1): code chunks decoded through `dict` when it is the store's
+    /// dictionary, rows decoded to terms otherwise.
+    pub(crate) fn open(
+        view: CoreStore,
+        dict: Option<DictReader>,
+        batch_rows: usize,
+        token: Option<Token>,
+    ) -> Result<Self, CoreError> {
+        let chunks: QuadChunkStream = if dict.is_some() {
+            view.code_chunks(&QuadColumn::ALL, batch_rows)?
+                .map(|columns| {
+                    columns.map(|columns| {
+                        QuadChunk::Codes(columns.try_into().unwrap_or_else(|columns: Vec<_>| {
+                            panic!("{} code columns, not four", columns.len())
+                        }))
+                    })
+                })
+                .boxed()
+        } else {
+            let chunks = view.row_chunks(batch_rows)?;
+            // The view decodes its own chunks, so the stream holds it.
+            chunks
+                .map(move |chunk| view.decode_row_chunk(&chunk?).map(QuadChunk::Shared))
+                .boxed()
+        };
+        Ok(QuadIterator {
+            chunks: Mutex::new(Some(chunks)),
+            rows: std::array::from_fn(|_| Vec::new().into_iter()),
+            dict,
+            token,
+        })
+    }
+}
+
+#[pymethods]
+impl QuadIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyQuad>> {
+        loop {
+            if let [Some(s), Some(p), Some(o), Some(g)] = self.rows.each_mut().map(Iterator::next) {
+                return Ok(Some((s, p, o, g)));
+            }
+            // A chunk's columns have equal lengths, so a short column is
+            // the chunk's end.
+            let chunks = self
+                .chunks
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner);
+            let pulled = py.detach(|| pull_next(&RUNTIME, self.token.as_ref(), chunks));
+            if !matches!(pulled, Pulled::Done(Some(Ok(_)))) {
+                *chunks = None;
+            }
+            let Some(chunk) = settled(pulled.map(Option::transpose))? else {
+                return Ok(None);
+            };
+            let columns = match (chunk, &self.dict) {
+                (QuadChunk::Codes(codes), Some(dict)) => decoded_columns(py, dict, &codes),
+                (QuadChunk::Shared(rows), _) => Ok(shared_columns(py, &rows)),
+                (QuadChunk::Codes(_), None) => unreachable!("code chunks come with a dictionary"),
+            };
+            match columns {
+                Ok(columns) => self.rows = columns.map(Vec::into_iter),
+                Err(err) => {
+                    *self
+                        .chunks
+                        .get_mut()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
+                    return Err(err);
+                }
+            }
+        }
     }
 }
 

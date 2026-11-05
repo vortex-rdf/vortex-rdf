@@ -125,9 +125,15 @@ pub(crate) enum Event {
     // ── Reading ──────────────────────────────────────────────────────────
     /// A chunk stream built.
     ChunkStream,
-    /// A chunk decoded on its stream, its split task having left it, of this
-    /// many rows.
+    /// A chunk its split task left undecoded, handed by its stream to its
+    /// decode (awaited on the stream, or spawned ahead of the consumer), of
+    /// this many rows.
     StreamDecode(usize),
+    /// A chunk of an in-memory view's decoded stream (`quads`,
+    /// `shared_quad_chunks`, the export) read and decoded as it was pulled,
+    /// of this many rows: base rows (a served view's covered rows,
+    /// tombstoned ones among them) or tail rows.
+    InMemoryChunk(usize),
     /// An in-memory gather of a window of ids: `width`, the columns of a row
     /// gather; `None` for a code gather.
     Gather { width: Option<usize> },

@@ -1,11 +1,11 @@
 //! The `VortexRdfStore` and `TermDict` wasm bindings, and the columnar
-//! payload construction behind `match`/`getQuads` (`match_payload`).
+//! payload construction behind `getQuads` (`match_payload`).
 //!
 //! Every `pub` method here is exported to JS under its `js_name`, or under
 //! its own name without one. api.d.ts, the published type surface, documents
 //! what each does; the docs here say only what the Rust side adds. The reads
 //! are synchronous although core's are `async`: no wasm read path performs
-//! I/O (see `resolve_now`), and only `match` defers its read, into a promise.
+//! I/O (see `resolve_now`), and only `match` defers its read, to its stream.
 
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -15,14 +15,14 @@ use futures::{FutureExt, Stream, StreamExt, stream};
 use js_sys::{Array, Object, Reflect};
 use vortex_rdf_core::common::{formats::format_from_name, terms::parse_quads_from_reader};
 use vortex_rdf_core::{
-    DictSnapshot, LayoutStrategy, Probe, QuadColumn, RawQuad, Result as CoreResult,
+    DictSnapshot, LayoutStrategy, Probe, RawQuad, Result as CoreResult,
     VortexRdfStore as CoreStore, export_rdf,
 };
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::future_to_promise;
 
 use crate::chunks::{
-    CodeChunks, ProbeAnswers, code_columns, finished_iterable, handle_iterable, probe_codes,
+    CodeChunks, ProbeAnswers, QuadChunks, TermColumns, code_columns, finished_iterable,
+    handle_iterable, probe_codes,
 };
 use crate::codes::{code_from_js, code_to_js};
 use crate::error::{js_err, js_err_ctx};
@@ -45,10 +45,10 @@ extern "C" {
     #[wasm_bindgen(js_name = buildLazyQuads)]
     fn build_lazy_quads(payload: &JsValue) -> js_sys::Array;
 
-    /// Build a `Stream<LazyQuad>` from a `Promise<payload>` — so `match` returns
-    /// synchronously while resolving its rows lazily.
+    /// Build a `Stream<LazyQuad>` over a `QuadChunks` handle, which it pulls a
+    /// chunk at a time as its quads are taken — for `match`.
     #[wasm_bindgen(js_name = makeLazyQuadStream)]
-    fn make_lazy_quad_stream(payload_promise: &JsValue) -> JsValue;
+    fn make_lazy_quad_stream(chunks: QuadChunks) -> JsValue;
 
 }
 
@@ -62,8 +62,8 @@ pub struct VortexRdfStore {
     // (their `.equals` fast path keys on its identity). Not exposed to JS.
     dict_view: RefCell<Option<JsValue>>,
     // Dropped with this handle when it is freed: the iterators the store
-    // hands out (`CodeChunks`, `ProbeAnswers`) hold a `Weak` of it and refuse
-    // to pull once it is gone.
+    // hands out (`CodeChunks`, `ProbeAnswers`, `QuadChunks`) hold a `Weak` of
+    // it and refuse to pull once it is gone.
     alive: Rc<()>,
 }
 
@@ -291,9 +291,9 @@ impl VortexRdfStore {
         self.mutate(async |s| s.delete_quad(&quad).await).await
     }
 
-    /// The pattern resolves in a promise of its columnar payload
-    /// (`match_payload`), which lazy-rdf.js's `makeLazyQuadStream` serves as
-    /// the RDF/JS stream.
+    /// The pattern is parsed now; the match is read by the pulls of a
+    /// [`QuadChunks`] handle, which lazy-rdf.js's `makeLazyQuadStream` serves
+    /// as the RDF/JS stream.
     #[wasm_bindgen(js_name = match)]
     pub fn match_pattern(
         &self,
@@ -302,22 +302,23 @@ impl VortexRdfStore {
         object: JsValue,
         graph: JsValue,
     ) -> Result<JsValue, JsValue> {
-        // Parse the pattern eagerly (cheap, synchronous) so only owned oxrdf
-        // terms — not JsValues — are moved into the resolving future.
+        // Parsed now, so that an invalid pattern throws from this call; a
+        // read that fails later is the stream's 'error' event.
         let probe = pattern_probe(subject, predicate, object, graph)?;
-        // Ensure the shared dictionary view synchronously (Dictionary layout);
-        // it is not dependent on the matched rows and must be built off `self`.
-        let dict = self.lazy_dict();
-        let inner = self.inner.clone();
-        // The read is synchronous like every other, but runs in the promise's
-        // task, after `match` has returned: a failure is the stream's 'error'
-        // event, not a throw.
-        let promise = future_to_promise(async move { match_payload(&inner, dict, &probe) });
-        Ok(make_lazy_quad_stream(&promise.into()))
+        // The store's rows and its `LazyDict` as they are now: the snapshot
+        // the stream reads, which a later mutation leaves alone.
+        let chunks = QuadChunks::new(
+            self.inner.clone(),
+            probe,
+            self.lazy_dict(),
+            Rc::downgrade(&self.alive),
+        );
+        Ok(make_lazy_quad_stream(chunks))
     }
 
-    /// The payload [`match`](Self::match_pattern) resolves (`match_payload`),
-    /// built now and made lazy quads by lazy-rdf.js's `buildLazyQuads`.
+    /// The match's payload (`match_payload`), built now and made lazy quads
+    /// by lazy-rdf.js's `buildLazyQuads`; [`match`](Self::match_pattern)
+    /// streams the same quads in the same order, a chunk at a time.
     #[wasm_bindgen(js_name = getQuads)]
     pub fn get_quads(
         &self,
@@ -433,7 +434,8 @@ impl VortexRdfStore {
 }
 
 /// Resolve a pattern and pack the matched rows into the columnar payload the JS
-/// lazy read model consumes. Shared by `match` and `getQuads`.
+/// lazy read model consumes: `getQuads`' payload, in the shape each chunk of
+/// `match`'s stream takes ([`QuadChunks`]).
 ///
 /// With the store's `LazyDict` (`dict` is `Some`), the payload is the matched
 /// rows' code columns as `matchCodes` answers them ([`code_columns`]) plus
@@ -454,45 +456,16 @@ fn match_payload(
     term_payload(&matched)
 }
 
-/// A matched view's rows as packed N-Triples term columns: `{ offsets, bytes }`
-/// under `s`, `p`, `o` and `g`, plus `length`. The always-correct path, taken
-/// whenever the rows cannot be described as codes against the store's cached
-/// dictionary. The shared decode hands each term over in its N-Triples
-/// spelling already (the default graph as the empty string, this payload's
-/// vocabulary for it), so the bytes go straight into the column — no parse
-/// into oxrdf terms, no re-render.
+/// A matched view's rows as packed N-Triples term columns ([`TermColumns`]).
+/// The always-correct path, taken whenever the rows cannot be described as
+/// codes against the store's cached dictionary.
 fn term_payload(matched: &CoreStore) -> Result<JsValue, JsValue> {
-    // (offsets seeded with a leading 0, bytes) per column.
-    let mut columns: [(Vec<u32>, Vec<u8>); 4] = std::array::from_fn(|_| (vec![0], Vec::new()));
+    let mut columns = TermColumns::new();
     let mut chunks = matched.shared_quad_chunks();
     while let Some(chunk) = resolve_now(chunks.next().map(Ok))? {
         for row in chunk {
-            let row = row.map_err(js_err)?;
-            let terms = [&row.s, &row.p, &row.o, &row.g];
-            for ((offsets, bytes), term) in columns.iter_mut().zip(terms) {
-                bytes.extend_from_slice(term.as_bytes());
-                offsets.push(bytes.len() as u32);
-            }
+            columns.push(&row.map_err(js_err)?);
         }
     }
-    let payload = Object::new();
-    for (column, (offsets, bytes)) in QuadColumn::ALL.iter().zip(&columns) {
-        let packed = term_column(offsets, bytes)?;
-        Reflect::set(&payload, &column.name().into(), &packed)?;
-    }
-    let rows = columns[0].0.len() - 1;
-    Reflect::set(&payload, &"length".into(), &JsValue::from_f64(rows as f64))?;
-    Ok(payload.into())
-}
-
-/// Pack one term column's offsets/bytes into a `{offsets, bytes}` JS object.
-fn term_column(offsets: &[u32], bytes: &[u8]) -> Result<JsValue, JsValue> {
-    let offs = js_sys::Uint32Array::new_with_length(offsets.len() as u32);
-    offs.copy_from(offsets);
-    let bys = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-    bys.copy_from(bytes);
-    let column = Object::new();
-    Reflect::set(&column, &"offsets".into(), &offs)?;
-    Reflect::set(&column, &"bytes".into(), &bys)?;
-    Ok(column.into())
+    columns.into_payload()
 }

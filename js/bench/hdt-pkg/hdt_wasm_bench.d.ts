@@ -9,8 +9,8 @@ export class Hdt {
      * Returns string triples as a flat array of strings [s1, p1, o1, s2, p2, o2, ...].
      * WASM memory is limited, several million triple IDs may lead to OOM crashes reported as "RuntimeError: unreachable executed"
      */
-    ids_to_strings(ids: Uint32Array): string[];
-    constructor(data: Uint8Array);
+    ids_to_strings(ids: Uint32Array | number[]): string[];
+    constructor(data: Uint8Array | number[]);
     /**
      * Returns a flat Int32Array of IDs [s1, p1, o1, s2, p2, o2, ...].
      * There is some duplication with constants in triple patterns but as we only return 32 bit integers this should only be a few MB even for millions of results.
@@ -20,6 +20,12 @@ export class Hdt {
     triple_ids_with_pattern(sp?: string | null, pp?: string | null, op?: string | null): Uint32Array;
 }
 
+export function memoryStats(): { liveBytes: number, peakLiveBytes: number, heapBytes: number };
+
+export function resetMemoryPeak(): void;
+
+export function setMemoryCounting(on: boolean): void;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -28,10 +34,15 @@ export interface InitOutput {
     readonly hdt_ids_to_strings: (a: number, b: number, c: number) => [number, number, number, number];
     readonly hdt_new: (a: number, b: number) => [number, number, number];
     readonly hdt_triple_ids_with_pattern: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
+    readonly memoryStats: () => [number, number, number];
+    readonly resetMemoryPeak: () => void;
+    readonly setMemoryCounting: (a: number) => void;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __externref_table_alloc: () => number;
+    readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __externref_table_dealloc: (a: number) => void;
     readonly __externref_drop_slice: (a: number, b: number) => void;
     readonly __wbindgen_start: () => void;
