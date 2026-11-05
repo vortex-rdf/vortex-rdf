@@ -92,10 +92,6 @@ impl ExactZoneMap {
 /// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
 /// [`ZoneMap::prune`]: vortex_layout::layouts::zoned::zone_map::ZoneMap::prune
 #[cfg(feature = "file-io")]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by located runs from P1 task 6")
-)]
 pub(crate) struct ColumnZones {
     /// The zone table: `max`, then `min`, each a nullable `u64` column.
     table: StructArray,
@@ -106,10 +102,6 @@ pub(crate) struct ColumnZones {
 }
 
 #[cfg(feature = "file-io")]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by located runs from P1 task 6")
-)]
 impl ColumnZones {
     /// The zone map of a column whose zone `z` holds codes `mins[z]..=maxes[z]`,
     /// `zone_len` rows each but the last, `row_count` rows in all.

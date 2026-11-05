@@ -20,7 +20,7 @@ tests pin each interface
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L151), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
-| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L78) ([§6](#6-a-store-file-through-vortexs-reader)) |
+| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L79) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
 
@@ -231,6 +231,17 @@ general match of the codes' terms. Which of the two answers depends on the
 store and the pattern alone, so every window of one pattern comes in the
 same order. A code in a position its term kind cannot take matches nothing.
 
+Bound slots that are no such prefix, a bound graph after a free slot
+(`(? p o g)` on `index:posg`, `(s p ? g)` on the quad table), are the run of
+the table's longest bound prefix, its rows checked against the slots past
+it. Those checks are decided a zone at a time from the checked columns'
+zone maps, with Vortex's own proofs of `x = c`: a zone where no row can hold
+the checked code is skipped, a zone where every row holds it is taken whole
+without reading the column, and only the zones holding it among other codes
+are read. A count counts such a zone on the column's encoding, so it reads
+no rows; a window finds its first zone from those counts and reads from
+there. `VORTEX_RDF_ZONES=0` (read once) checks every row instead, as before.
+
 `locate_codes(CodePattern, offset, limit)` is the located run alone: it
 answers only a whole file-backed Dictionary store (no tail, tombstones or
 narrowing) and returns `None` otherwise.
@@ -272,7 +283,7 @@ valid.
 
 ## 6. A store file through vortex's reader
 
-[`vortex_session`](../core/src/lib.rs#L78) holds this crate's store layout,
+[`vortex_session`](../core/src/lib.rs#L79) holds this crate's store layout,
 encodings and write editions. vortex's own reader opens a store file through
 it, and the file scans as the quad table: the root hands its dtype, row
 count and scan to child 0

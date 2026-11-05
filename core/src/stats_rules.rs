@@ -69,10 +69,6 @@ pub(crate) fn register(session: &VortexSession) {
 /// equal `code` (the falsifier), `all` where every row does (the
 /// satisfier); either is `None` where no rule proves it.
 #[cfg(feature = "file-io")]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the zone decider from P1 task 5")
-)]
 pub(crate) struct EqProofs {
     pub(crate) none: Option<BoundExpression>,
     pub(crate) all: Option<BoundExpression>,
@@ -81,10 +77,6 @@ pub(crate) struct EqProofs {
 /// [`EqProofs`] of `x = code`, `x` a column of `column` dtype (the root of a
 /// zone map's stats).
 #[cfg(feature = "file-io")]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the zone decider from P1 task 5")
-)]
 pub(crate) fn eq_proofs(
     column: &vortex_array::dtype::DType,
     code: u64,

@@ -61,3 +61,346 @@ async fn column_zones_absent_without_zone_maps() {
             .is_none()
     );
 }
+
+/// Rows of each run of a [`zone_quads`] store.
+const RUN: usize = 40_000;
+
+/// How a run's rows fall into graphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Graphs {
+    /// One graph only.
+    One,
+    /// Two graphs, each a half of the run.
+    Long,
+    /// Four graphs in turn, 1,000 rows each time.
+    Stretches,
+    /// Four graphs in turn, row by row.
+    Alternating,
+}
+
+impl Graphs {
+    const ALL: [Graphs; 4] = [
+        Graphs::One,
+        Graphs::Long,
+        Graphs::Stretches,
+        Graphs::Alternating,
+    ];
+
+    /// The graph number of row `i` of a run.
+    fn of(self, i: usize) -> usize {
+        match self {
+            Graphs::One => 1,
+            Graphs::Long => 1 + i / (RUN / 2),
+            Graphs::Stretches => 1 + (i / 1000) % 4,
+            Graphs::Alternating => 1 + i % 4,
+        }
+    }
+
+    /// The last graph number a run holds.
+    fn last(self) -> usize {
+        match self {
+            Graphs::One => 1,
+            Graphs::Long => 2,
+            Graphs::Stretches | Graphs::Alternating => 4,
+        }
+    }
+}
+
+/// [`RUN`] quads `(s{i}, type, "Taxon", g(i))`, an `index:posg` run, and
+/// [`RUN`] quads `(hub, link, "o{i}", g(i))`, a quad-table run of `hub`.
+fn zone_quads(graphs: Graphs) -> Vec<Quad> {
+    let taxa = (0..RUN).map(|i| {
+        make_quad(
+            &format!("http://example.org/s{i:05}"),
+            "http://example.org/type",
+            "Taxon",
+            numbered_graph(graphs.of(i)),
+        )
+    });
+    let links = (0..RUN).map(|i| {
+        make_quad(
+            "http://example.org/hub",
+            "http://example.org/link",
+            &format!("o{i:05}"),
+            numbered_graph(graphs.of(i)),
+        )
+    });
+    taxa.chain(links).collect()
+}
+
+/// A store under test, its tag and its file's guard.
+struct ZoneStore {
+    tag: String,
+    graphs: Graphs,
+    index: IndexConfig,
+    store: VortexRdfStore,
+    _dir: tempfile::TempDir,
+}
+
+/// Each [`Graphs`] layout written without indexes and with the copy index,
+/// and the 1,000-row stretches in seven-row leaves, which have no zone maps.
+async fn zone_stores() -> Vec<ZoneStore> {
+    let mut stores = Vec::new();
+    for graphs in Graphs::ALL {
+        for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
+            let (dir, path) = write_store_file(
+                zone_quads(graphs),
+                LayoutStrategy::Dictionary,
+                index.types(),
+            )
+            .await;
+            stores.push(ZoneStore {
+                tag: format!("{graphs:?}/{}", index.name()),
+                graphs,
+                index,
+                store: VortexRdfStore::from_file(&path).await.unwrap(),
+                _dir: dir,
+            });
+        }
+    }
+    let (dir, path) = write_chunked_store_file(&zone_quads(Graphs::Stretches), 7).await;
+    stores.push(ZoneStore {
+        tag: "Stretches/seven-row-leaves".to_string(),
+        graphs: Graphs::Stretches,
+        index: IndexConfig::NoIndex,
+        store: VortexRdfStore::from_file(&path).await.unwrap(),
+        _dir: dir,
+    });
+    stores
+}
+
+/// The code of `term` (its N-Triples spelling) in `store`'s dictionary.
+async fn code_of(store: &VortexRdfStore, term: &str) -> TermCode {
+    store
+        .dict_reader()
+        .unwrap()
+        .encode(term)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("{term} is in the dictionary"))
+}
+
+/// The patterns checked on `store` for graph `g`: the `index:posg` run, the
+/// quad table's `(hub, link)` run, and `hub`'s run checked at two slots.
+async fn zone_patterns(store: &VortexRdfStore, g: usize) -> Vec<crate::CodePattern> {
+    use crate::CodePattern;
+    let graph = code_of(store, &format!("<http://example.org/g{g}>")).await;
+    let ty = code_of(store, "<http://example.org/type>").await;
+    let taxon = code_of(store, "\"Taxon\"").await;
+    let hub = code_of(store, "<http://example.org/hub>").await;
+    let link = code_of(store, "<http://example.org/link>").await;
+    let mut patterns = vec![
+        CodePattern::new(None, Some(ty), Some(taxon), Some(graph)),
+        CodePattern::new(Some(hub), Some(link), None, Some(graph)),
+    ];
+    for i in [0, RUN / 2] {
+        let o = code_of(store, &format!("\"o{i:05}\"")).await;
+        patterns.push(CodePattern::new(Some(hub), None, Some(o), Some(graph)));
+    }
+    patterns
+}
+
+/// The rows `pattern` streams in chunks of `batch` rows, in order.
+async fn streamed(
+    store: &VortexRdfStore,
+    pattern: crate::CodePattern,
+    batch: usize,
+) -> Vec<[TermCode; 4]> {
+    let chunks: Vec<Vec<vortex_buffer::Buffer<TermCode>>> = store
+        .match_code_chunks(pattern, batch)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    chunks
+        .iter()
+        .flat_map(|chunk| code_rows::<4>(chunk))
+        .collect()
+}
+
+/// What `pattern` answers on `store`: its count, its windows (pages of 1,
+/// 3 and 64 at the run's ends and middle, and 32 one-row reads spread over
+/// it) and its streams (chunks of 999 and 4,096 rows).
+async fn answers(
+    store: &VortexRdfStore,
+    pattern: crate::CodePattern,
+) -> (u64, Vec<Vec<[TermCode; 4]>>, Vec<Vec<[TermCode; 4]>>) {
+    let total = store.count_code_pattern(pattern).await.unwrap();
+    if let Some(located) = store.locate_codes(pattern, 0, Some(0)).await.unwrap() {
+        assert_eq!(located.total, total, "{pattern:?}: the located count");
+    }
+    let t = total as usize;
+    let mut reads: Vec<(usize, usize)> = Vec::new();
+    for limit in [1, 3, 64] {
+        for offset in [0, 1, t / 2, t.saturating_sub(1), t] {
+            reads.push((offset, limit));
+        }
+    }
+    reads.extend((0..32).map(|k| (k * t / 32, 1)));
+    let mut windows = Vec::new();
+    for (offset, limit) in reads {
+        let columns = store
+            .match_code_pattern(pattern, offset, Some(limit))
+            .await
+            .unwrap();
+        windows.push(code_rows::<4>(&columns));
+    }
+    let mut streams = Vec::new();
+    for batch in [999, 4096] {
+        streams.push(streamed(store, pattern, batch).await);
+    }
+    (total, windows, streams)
+}
+
+/// The term path's rows of `pattern`: its codes spelled out and matched.
+async fn term_rows(store: &VortexRdfStore, pattern: crate::CodePattern) -> Vec<[TermCode; 4]> {
+    let dict = store.dict_reader().unwrap();
+    let mut spelled: [Option<String>; 4] = Default::default();
+    let slots = [
+        pattern.subject,
+        pattern.predicate,
+        pattern.object,
+        pattern.graph,
+    ];
+    for (spelling, code) in spelled.iter_mut().zip(slots) {
+        if let Some(code) = code {
+            *spelling = dict.decode(code).await.unwrap();
+        }
+    }
+    let probe = crate::Probe::parse(
+        spelled[0].as_deref(),
+        spelled[1].as_deref(),
+        spelled[2].as_deref(),
+        spelled[3].as_deref(),
+    )
+    .unwrap();
+    sorted_rows(&store.run_probe(&probe).await.unwrap()).await
+}
+
+/// Every pattern of every store answers the same with zones and without:
+/// counts, windows and streams, row for row and in order, and as the term
+/// path does.
+#[tokio::test]
+async fn zoned_runs_answer_as_rows_do() {
+    use crate::store::test_hooks::ForcedZones;
+
+    for fixture in zone_stores().await {
+        let store = &fixture.store;
+        let mut graphs = vec![1, fixture.graphs.last()];
+        graphs.dedup();
+        for g in graphs {
+            for pattern in zone_patterns(store, g).await {
+                // Zones decide located runs only; the general match answers
+                // the rest as it always has.
+                if store
+                    .locate_codes(pattern, 0, Some(0))
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    continue;
+                }
+                let label = format!("{} g{g} {pattern:?}", fixture.tag);
+                let zoned = {
+                    let _on = ForcedZones::set(true);
+                    answers(store, pattern).await
+                };
+                let rows = {
+                    let _off = ForcedZones::set(false);
+                    answers(store, pattern).await
+                };
+                assert!(zoned == rows, "{label}: zones and rows answer alike");
+                let want = term_rows(store, pattern).await;
+                assert_eq!(zoned.0, want.len() as u64, "{label}: the count");
+                let unwindowed =
+                    code_rows::<4>(&store.match_code_pattern(pattern, 0, None).await.unwrap());
+                let mut sorted = unwindowed.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, want, "{label}: the rows");
+                for stream in &zoned.2 {
+                    assert_eq!(stream, &unwindowed, "{label}: a stream");
+                }
+            }
+        }
+    }
+}
+
+/// Rows `rec` saw counted on a mixed zone's encoding, and read to check.
+fn zone_work(rec: &Recorder) -> (u64, u64) {
+    let counted = rec.picked(|e| match e {
+        Event::ZoneCounted(rows) => Some(*rows),
+        _ => None,
+    });
+    let read = rec.picked(|e| match e {
+        Event::CheckRead(rows) => Some(*rows),
+        _ => None,
+    });
+    (counted.iter().sum(), read.iter().sum())
+}
+
+/// With zones, a count reads no checked rows: a zone of the graph alone
+/// counts its size, a zone without it nothing, and a mixed one is counted on
+/// its encoding; a stream reads the mixed zones only. A store without zone
+/// maps reads its run as before.
+#[tokio::test]
+async fn zoned_runs_skip_settled_zones() {
+    use crate::store::test_hooks::ForcedZones;
+
+    let _on = ForcedZones::set(true);
+    for fixture in zone_stores().await {
+        let store = &fixture.store;
+        let patterns = zone_patterns(store, 1).await;
+        let (taxa, links) = (patterns[0], patterns[1]);
+        match (
+            fixture.graphs,
+            fixture.index,
+            fixture.tag.ends_with("leaves"),
+        ) {
+            (Graphs::Long, IndexConfig::Copy, _) => {
+                let rec = Recorder::start();
+                assert_eq!(store.count_code_pattern(taxa).await.unwrap(), 20_000);
+                let (counted, read) = zone_work(&rec);
+                assert_eq!(read, 0, "{}: a count reads no checked rows", fixture.tag);
+                assert!(
+                    counted < RUN as u64,
+                    "{}: {counted} rows counted",
+                    fixture.tag
+                );
+                drop(rec);
+                let rec = Recorder::start();
+                assert_eq!(streamed(store, taxa, 4096).await.len(), 20_000);
+                let (_, read) = zone_work(&rec);
+                assert!(
+                    read < RUN as u64,
+                    "{}: a stream read {read} rows",
+                    fixture.tag
+                );
+            }
+            (Graphs::Alternating, IndexConfig::Copy, _) => {
+                let rec = Recorder::start();
+                assert_eq!(store.count_code_pattern(taxa).await.unwrap(), 10_000);
+                assert_eq!(zone_work(&rec), (RUN as u64, 0), "{}", fixture.tag);
+            }
+            (_, _, true) => {
+                let rec = Recorder::start();
+                assert_eq!(store.count_code_pattern(links).await.unwrap(), 10_000);
+                let blocks: u64 = rec
+                    .picked(|e| match e {
+                        Event::LocatedBlock(rows) => Some(*rows),
+                        _ => None,
+                    })
+                    .iter()
+                    .sum();
+                assert_eq!(blocks, RUN as u64, "{}: the run read", fixture.tag);
+                assert_eq!(
+                    zone_work(&rec).0,
+                    0,
+                    "{}: nothing counted on zones",
+                    fixture.tag
+                );
+            }
+            _ => {}
+        }
+    }
+}

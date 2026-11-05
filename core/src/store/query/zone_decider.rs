@@ -13,10 +13,6 @@ use crate::stats_rules::{EqProofs, eq_proofs};
 use crate::store::schema::TermCode;
 
 /// How a zone stands against a run's checked slots.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by located runs from P1 task 6")
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ZoneClass {
     /// No row of the zone holds every checked code.
@@ -30,10 +26,6 @@ pub(crate) enum ZoneClass {
 
 /// A checked slot of a run: its code, and its column's zone map in the
 /// run's table.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by located runs from P1 task 6")
-)]
 pub(crate) struct CheckedColumn {
     pub(crate) slot: usize,
     pub(crate) code: TermCode,
@@ -43,18 +35,10 @@ pub(crate) struct CheckedColumn {
 /// The classes of a table's zones against a run's checked slots, each
 /// column's zones pruned once per [`classify`](Self::classify) with
 /// Vortex's proofs of `x = code`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by located runs from P1 task 6")
-)]
 pub(crate) struct ZoneDecider {
     columns: Vec<CheckedColumn>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by located runs from P1 task 6")
-)]
 impl ZoneDecider {
     /// The decider of `columns`; `None` without columns, or for columns of
     /// different zones (lengths or counts).
@@ -119,10 +103,6 @@ impl ZoneDecider {
 /// Whether located runs decide their checked rows zone by zone:
 /// `VORTEX_RDF_ZONES=0` (an ablation switch, read once) puts every run on
 /// its row-by-row route, as before zones were asked. Unset is on.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by located runs from P1 task 6")
-)]
 pub(crate) fn zones_enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = crate::store::test_hooks::forced_zones() {

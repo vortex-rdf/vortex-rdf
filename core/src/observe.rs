@@ -142,6 +142,12 @@ pub(crate) enum Event {
     /// A block of a located run's rows read, for a lookup's window or a
     /// stream's chunk: this many rows of the run, before its checks.
     LocatedBlock(u64),
+    /// A located run's rows of a mixed zone counted on the checked column's
+    /// encoding, this many rows.
+    ZoneCounted(u64),
+    /// A located run's rows read at a checked column to check them, this
+    /// many rows.
+    CheckRead(u64),
     /// A row scan run (`read_all_rows`, `stream_rows`).
     RowScan,
     /// A restricted file scan built with a filter pushed down.

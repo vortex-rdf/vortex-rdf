@@ -300,6 +300,7 @@ impl VortexRdfStore {
             checked,
             source: source.clone(),
             session: session.clone(),
+            zones: None,
         };
         // The table whose key order starts with the most bound slots, when
         // none starts with all of them: a bound graph after a free slot.
@@ -343,7 +344,12 @@ impl VortexRdfStore {
                     .copied()
                     .filter(|&slot| codes[slot].is_some())
                     .collect();
-                return Ok(Some(run(columns.clone(), RunRows::Table(found), checked)));
+                let mut located = run(columns.clone(), RunRows::Table(found), checked);
+                if crate::store::query::zone_decider::zones_enabled() {
+                    located.zones =
+                        run_zones(file, tables, table, TABLES[table].0, &located, &source).await?;
+                }
+                return Ok(Some(located));
             }
         }
         // Boxed: its state would otherwise enlarge every lookup's future,
@@ -406,6 +412,9 @@ fn holds(kinds: &KindRanges, slot: usize, code: TermCode) -> bool {
     }
 }
 
+#[cfg(feature = "file-io")]
+use crate::store::query::zone_decider::ZoneClass;
+
 /// A column's chunk-probe handle.
 #[cfg(feature = "file-io")]
 type Chunks = std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>;
@@ -435,6 +444,33 @@ struct LocatedRun {
     checked: Vec<usize>,
     source: Source,
     session: vortex_session::VortexSession,
+    /// The classes of the run's table zones against its checked slots, when
+    /// zone maps decide them ([`run_zones`]); `None` checks every row.
+    zones: Option<RunZones>,
+}
+
+/// The classes of the zones a table run's rows fall in, against the run's
+/// checked slots (the ladder's zone level, spec §3): zones `first..first +
+/// classes.len()` of the table, `zone_len` rows each. They live with the
+/// run, so a call or a stream holds them, never the store.
+#[cfg(feature = "file-io")]
+struct RunZones {
+    zone_len: u64,
+    first: u64,
+    classes: Vec<crate::store::query::zone_decider::ZoneClass>,
+}
+
+#[cfg(feature = "file-io")]
+impl RunZones {
+    /// The class of table zone `zone`, one of the run's.
+    fn class(&self, zone: u64) -> crate::store::query::zone_decider::ZoneClass {
+        self.classes[(zone - self.first) as usize]
+    }
+
+    /// The zones past the run's last.
+    fn past(&self) -> u64 {
+        self.first + self.classes.len() as u64
+    }
 }
 
 /// Where a [`LocatedRun`]'s rows are.
@@ -498,23 +534,31 @@ impl LocatedRun {
         match &self.rows {
             RunRows::Table(run) => {
                 let rows = run.start + at.start..run.start + at.end;
-                let Some((&first, rest)) = self.checked.split_first() else {
+                if self.checked.is_empty() {
                     return Ok(Rows::Run(rows));
+                }
+                let Some(zones) = &self.zones else {
+                    let every = self
+                        .checked
+                        .iter()
+                        .fold(0u8, |bits, &slot| bits | 1 << slot);
+                    return Ok(Rows::Ids(self.checked_rows(rows, every).await?));
                 };
-                // The first check reads the block's rows, still contiguous.
-                let code = self.codes[first].expect("a checked slot is bound");
-                let values =
-                    read_codes(&self.columns[first], rows.clone(), source, session).await?;
-                let mut kept: Vec<u64> = rows
-                    .zip(values.iter())
-                    .filter(|&(_, &value)| value == code)
-                    .map(|(row, _)| row)
-                    .collect();
-                for &slot in rest {
-                    if kept.is_empty() {
-                        break;
+                // Zone by zone: none keeps nothing, all keeps every row
+                // unread, a mixed zone checks the slots it leaves unsettled.
+                let mut kept = Vec::new();
+                let mut at = rows.start;
+                while at < rows.end {
+                    let zone = at / zones.zone_len;
+                    let end = ((zone + 1) * zones.zone_len).min(rows.end);
+                    match zones.class(zone) {
+                        ZoneClass::None => {}
+                        ZoneClass::All => kept.extend(at..end),
+                        ZoneClass::Mixed { unsettled } => {
+                            kept.extend(self.checked_rows(at..end, unsettled).await?);
+                        }
                     }
-                    kept = self.holding(slot, kept).await?;
+                    at = end;
                 }
                 Ok(Rows::Ids(kept))
             }
@@ -547,6 +591,129 @@ impl LocatedRun {
                 Ok(Rows::Ids(kept))
             }
         }
+    }
+
+    /// The table rows `rows` (contiguous) holding the code of every checked
+    /// slot in `slots` (bits `1 << slot`), checked in [`checked`](Self::checked)
+    /// order: the first slot read over the rows, still contiguous, each
+    /// other one at the rows the slots before it kept.
+    async fn checked_rows(&self, rows: std::ops::Range<u64>, slots: u8) -> Result<Vec<u64>> {
+        let mut order = self
+            .checked
+            .iter()
+            .copied()
+            .filter(|&slot| slots & 1 << slot != 0);
+        let Some(first) = order.next() else {
+            return Ok(rows.collect());
+        };
+        crate::observe::observe!(CheckRead(rows.end - rows.start));
+        let code = self.codes[first].expect("a checked slot is bound");
+        let values = read_codes(
+            &self.columns[first],
+            rows.clone(),
+            &self.source,
+            &self.session,
+        )
+        .await?;
+        let mut kept: Vec<u64> = rows
+            .zip(values.iter())
+            .filter(|&(_, &value)| value == code)
+            .map(|(row, _)| row)
+            .collect();
+        for slot in order {
+            if kept.is_empty() {
+                break;
+            }
+            kept = self.holding(slot, kept).await?;
+        }
+        Ok(kept)
+    }
+
+    /// The matches of the run's rows in table zone `zone` (one of `zones`):
+    /// none for a zone of class none, its rows for one of class all, and for
+    /// a mixed zone its rows counted on the column's encoding when one slot
+    /// is unsettled there ([`ColumnChunks::count_eq`]), checked otherwise.
+    ///
+    /// [`ColumnChunks::count_eq`]: vortex_rdf_encoded_search::ColumnChunks::count_eq
+    async fn zone_count(&self, zones: &RunZones, zone: u64) -> Result<u64> {
+        let RunRows::Table(run) = &self.rows else {
+            unreachable!("only a table run is decided by zones");
+        };
+        let rows =
+            (zone * zones.zone_len).max(run.start)..((zone + 1) * zones.zone_len).min(run.end);
+        Ok(match zones.class(zone) {
+            ZoneClass::None => 0,
+            ZoneClass::All => rows.end - rows.start,
+            ZoneClass::Mixed { unsettled } if unsettled.count_ones() == 1 => {
+                let slot = unsettled.trailing_zeros() as usize;
+                let code = self.codes[slot].expect("a checked slot is bound");
+                crate::observe::observe!(ZoneCounted(rows.end - rows.start));
+                self.columns[slot]
+                    .count_eq(rows, code, &self.source, &self.session)
+                    .await?
+            }
+            ZoneClass::Mixed { unsettled } => {
+                self.checked_rows(rows, unsettled).await?.len() as u64
+            }
+        })
+    }
+
+    /// [`window_of_matches`](Self::window_of_matches) of a run decided by
+    /// zones: the zone holding the window's first match found by the zones'
+    /// counts ([`zone_count`](Self::zone_count)), the window read from there
+    /// a zone at a time, and the count, when `whole`, finished by the
+    /// counts of the zones past it.
+    async fn zoned_window(
+        &self,
+        zones: &RunZones,
+        offset: usize,
+        limit: Option<usize>,
+        whole: bool,
+    ) -> Result<(u64, Rows)> {
+        let RunRows::Table(run) = &self.rows else {
+            unreachable!("only a table run is decided by zones");
+        };
+        let (from, past) = (offset as u64, zones.past());
+        let to = limit.map(|limit| from.saturating_add(limit as u64));
+        let (mut zone, mut before) = (zones.first, 0);
+        if to != Some(from) {
+            while zone < past {
+                let n = self.zone_count(zones, zone).await?;
+                if before + n > from {
+                    break;
+                }
+                before += n;
+                zone += 1;
+            }
+        }
+        let (mut seen, mut window) = (before, Vec::new());
+        while zone < past && to.is_none_or(|to| seen < to) {
+            let rows =
+                (zone * zones.zone_len).max(run.start)..((zone + 1) * zones.zone_len).min(run.end);
+            let kept = match self
+                .block(rows.start - run.start..rows.end - run.start)
+                .await?
+            {
+                Rows::Ids(kept) => kept,
+                Rows::Run(rows) => rows.collect(),
+            };
+            let n = kept.len() as u64;
+            let lo = from.saturating_sub(seen).min(n);
+            let hi = to.map_or(n, |to| to.saturating_sub(seen).min(n));
+            if lo < hi {
+                window.extend_from_slice(&kept[lo as usize..hi as usize]);
+            }
+            seen += n;
+            zone += 1;
+        }
+        let mut total = seen;
+        if whole {
+            while zone < past {
+                total += self.zone_count(zones, zone).await?;
+                zone += 1;
+            }
+        }
+        Ok((total, Rows::Ids(window)))
     }
 
     /// Of `rows` (ascending), those holding the checked `slot`'s code, read
@@ -621,6 +788,9 @@ impl LocatedRun {
         limit: Option<usize>,
         whole: bool,
     ) -> Result<(u64, Rows)> {
+        if let Some(zones) = &self.zones {
+            return self.zoned_window(zones, offset, limit, whole).await;
+        }
         let len = self.len();
         if self.checked.is_empty() {
             let w = window_of(len, offset, limit);
@@ -867,6 +1037,74 @@ async fn locate_run(
 /// it, or a reference run with other slots bound) up to which it answers; a
 /// longer one declines, for the caller's other paths, as a window of it
 /// checks every row to count them.
+/// The zones of `run`, a run of sorted table `table` (`component` names
+/// it, `None` the quad table), classed against its checked slots by their
+/// columns' zone maps ([`ZoneDecider`]); `None` when a checked column has
+/// none, for the run to check every row.
+///
+/// [`ZoneDecider`]: crate::store::query::zone_decider::ZoneDecider
+#[cfg(feature = "file-io")]
+async fn run_zones(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    tables: &crate::store::persist::native_file::LocatedTables,
+    table: usize,
+    component: Option<&str>,
+    run: &LocatedRun,
+    source: &Source,
+) -> Result<Option<RunZones>> {
+    use crate::store::query::zone_decider::{CheckedColumn, ZoneDecider};
+
+    let RunRows::Table(rows) = &run.rows else {
+        return Ok(None);
+    };
+    let mut columns = Vec::with_capacity(run.checked.len());
+    for &slot in &run.checked {
+        let Some(zones) = column_zones(file, tables, table, component, slot, source).await? else {
+            return Ok(None);
+        };
+        let code = run.codes[slot].expect("a checked slot is bound");
+        columns.push(CheckedColumn { slot, code, zones });
+    }
+    let Some(decider) = ZoneDecider::new(columns) else {
+        return Ok(None);
+    };
+    let zone_len = decider.zone_len();
+    let (first, past) = (rows.start / zone_len, rows.end.div_ceil(zone_len));
+    Ok(Some(RunZones {
+        zone_len,
+        first,
+        classes: decider.classify(first..past)?,
+    }))
+}
+
+/// The zone map of column `slot` of sorted table `table` (`component` names
+/// it, `None` the quad table), read on first use and kept with the file's
+/// located tables; `None` for a column without exact zone bounds.
+#[cfg(feature = "file-io")]
+async fn column_zones(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    tables: &crate::store::persist::native_file::LocatedTables,
+    table: usize,
+    component: Option<&str>,
+    slot: usize,
+    source: &Source,
+) -> Result<Option<std::sync::Arc<crate::io::zone_map::ColumnZones>>> {
+    use crate::io::zone_map::ColumnZones;
+    use crate::store::schema::PRIMARY_COLUMNS;
+
+    let cell = &tables.zones[table][slot];
+    if let Some(zones) = cell.get() {
+        return Ok(zones.clone());
+    }
+    let zones = match file.table_column_layout(component, PRIMARY_COLUMNS[slot]) {
+        Some(column) => ColumnZones::read(&column, source)
+            .await?
+            .map(std::sync::Arc::new),
+        None => None,
+    };
+    Ok(cell.get_or_init(|| zones).clone())
+}
+
 #[cfg(feature = "file-io")]
 const GAP_ROWS: u64 = 1 << 23;
 

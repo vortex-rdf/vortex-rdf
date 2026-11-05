@@ -138,7 +138,6 @@ pub(crate) struct LocatedTables {
     /// Per sorted table and `(s, p, o, g)` column, its zone map, read on
     /// first use; `None` for a column without exact zone bounds. Two `u64`
     /// per zone of a column read, bounded by the file's layout.
-    #[expect(dead_code, reason = "read by located runs from P1 task 6")]
     pub(crate) zones: [[OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 3],
 }
 
@@ -452,10 +451,6 @@ impl NativeStoreFile {
 
     /// The layout of column `column` of the quad table (`component` `None`)
     /// or of index component `component`; `None` when either is missing.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by located runs from P1 task 6")
-    )]
     pub(crate) fn table_column_layout(
         &self,
         component: Option<&str>,
