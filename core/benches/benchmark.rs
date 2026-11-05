@@ -67,9 +67,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use futures::{StreamExt, stream};
-use oxrdf::{NamedNode, NamedOrBlankNode};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad};
 
-use vortex_rdf_core::{LayoutStrategy, Probe, QuadColumn, VortexRdfError, VortexRdfStore, io};
+use vortex_rdf_core::{
+    CodePattern, DictReader, LayoutStrategy, Probe, QuadColumn, RawQuad, TermCode, VortexRdfError,
+    VortexRdfStore, io,
+};
 
 // The module is shared with `match_lazy.rs` and compiled per-target; items
 // only the other target uses are dead here by design.
@@ -1380,6 +1383,261 @@ served_reads!(
     served_reused_file(File, Reused, SERVED_REUSED_READS),
     served_reused_mem(InMemory, Reused, SERVED_REUSED_READS),
 );
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4f — CHECKED RUNS (the located code reads)
+//
+// The code reads the Java binding makes, `countCodes`, `matchCodes` and
+// `matchCodeChunks` (core's `count_code_pattern`, `match_code_pattern` and
+// `match_code_chunks`), of a pattern that binds the graph after a free slot.
+// A located run answers it: the run of the pattern's longest bound prefix in
+// a sorted table, its rows checked against the graph. No other group reaches
+// that path: every other read goes through `match_pattern` or `run_probe`,
+// the general match.
+//
+// One by-copy Dictionary file, written as the CLI writes one, holds a run of
+// `CHECKED_RUN_ROWS` rows (8 zones of 8,192) for each of two shapes:
+//
+// * `(? p o g)`: one `(p, o)` of `index:posg`, a row per subject;
+// * `(s ? ? g)`: one subject of the quad table, a row per object. It is
+//   located the same way with or without an index.
+//
+// Along each run the graph cycles over four graphs row by row in the first
+// half; the second half is a stretch of the bound graph, then a stretch of
+// another. Each cell times one read of a store opened before timing, as an
+// engine paging through a match does: the count, the first page, a page from
+// the middle of the matches, and every match streamed a page at a time.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Rows of each checked run: 8 zones of 8,192 rows.
+const CHECKED_RUN_ROWS: usize = 65_536;
+
+/// The graph (0 to 3) a checked-run pattern binds.
+const CHECKED_BOUND_GRAPH: usize = 1;
+
+/// The rows of a checked run its bound graph matches: a quarter of the
+/// interleaved first half, and the stretch after it.
+const CHECKED_RUN_MATCHES: usize = CHECKED_RUN_ROWS / 8 + CHECKED_RUN_ROWS / 4;
+
+/// The first page qEndpoint reads of a match.
+const FIRST_PAGE_ROWS: usize = 64;
+
+/// A page qEndpoint reads of a match after the first, and the chunk a stream
+/// of one yields.
+const PAGE_ROWS: usize = 4_096;
+
+/// The graph (0 to 3) of a checked run's row `row`: the four in turn, row by
+/// row, through the first half; then the bound graph for a quarter of the run;
+/// then the graph after it.
+fn checked_run_graph(row: usize) -> usize {
+    if row < CHECKED_RUN_ROWS / 2 {
+        row % 4
+    } else if row < CHECKED_RUN_ROWS / 4 * 3 {
+        CHECKED_BOUND_GRAPH
+    } else {
+        CHECKED_BOUND_GRAPH + 1
+    }
+}
+
+/// The checked-run file's IRI named `name`.
+fn checked_iri(name: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("http://example.org/checked/{name}"))
+}
+
+/// The checked-run file's quads: the run of subject `hub`, then the run of
+/// `(type, Taxon)`, each of [`CHECKED_RUN_ROWS`] rows in its table's order,
+/// its graphs laid out by [`checked_run_graph`].
+fn checked_run_quads() -> Vec<RawQuad> {
+    let graph = |row| GraphName::NamedNode(checked_iri(&format!("g{}", checked_run_graph(row))));
+    let subject_run = (0..CHECKED_RUN_ROWS).map(|row| {
+        let object = checked_iri(&format!("o{row:05}"));
+        Quad::new(checked_iri("hub"), checked_iri("link"), object, graph(row))
+    });
+    let pair_run = (0..CHECKED_RUN_ROWS).map(|row| {
+        let subject = checked_iri(&format!("s{row:05}"));
+        Quad::new(
+            subject,
+            checked_iri("type"),
+            checked_iri("Taxon"),
+            graph(row),
+        )
+    });
+    subject_run
+        .chain(pair_run)
+        .map(|quad| RawQuad::from_quad(&quad))
+        .collect()
+}
+
+/// The checked-run file, written once per process under
+/// `target/bench_vortex_files` by the writer the CLI and the bindings use.
+fn checked_run_file() -> PathBuf {
+    static FILE: OnceLock<PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let dir = PathBuf::from("target/bench_vortex_files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("checked_runs.vortex");
+        let quads = stream::iter(checked_run_quads().into_iter().map(Ok));
+        rt().block_on(async {
+            io::quads_stream_to_vortex_file(
+                quads,
+                &path,
+                LayoutStrategy::Dictionary,
+                Index::ByCopy.types(),
+            )
+            .await
+            .expect("write the checked-run file");
+        });
+        path
+    })
+    .clone()
+}
+
+/// The code of the checked-run file's IRI named `name`.
+async fn checked_code(dict: &DictReader, name: &str) -> TermCode {
+    let iri = checked_iri(name);
+    dict.encode(&format!("<{}>", iri.as_str()))
+        .await
+        .expect("encode")
+        .unwrap_or_else(|| panic!("{iri} is not in the checked-run file"))
+}
+
+/// The pattern shape of a checked run.
+#[derive(Copy, Clone)]
+enum CheckedShape {
+    /// `(? p o g)`: the `(type, Taxon)` run of `index:posg`.
+    Pog,
+    /// `(s ? ? g)`: the quad table's run of subject `hub`.
+    Sg,
+}
+
+impl CheckedShape {
+    /// This shape's pattern in `store`'s codes, bound to [`CHECKED_BOUND_GRAPH`].
+    async fn pattern(self, store: &VortexRdfStore) -> CodePattern {
+        let dict = store.dict_reader().expect("a Dictionary store");
+        let graph = checked_code(&dict, &format!("g{CHECKED_BOUND_GRAPH}")).await;
+        match self {
+            Self::Pog => {
+                let predicate = checked_code(&dict, "type").await;
+                let object = checked_code(&dict, "Taxon").await;
+                CodePattern::new(None, Some(predicate), Some(object), Some(graph))
+            }
+            Self::Sg => {
+                let subject = checked_code(&dict, "hub").await;
+                CodePattern::new(Some(subject), None, None, Some(graph))
+            }
+        }
+    }
+}
+
+/// One read of a checked run, as the Java binding makes it.
+#[derive(Copy, Clone)]
+enum CheckedRead {
+    /// `count_code_pattern` (`countCodes`).
+    Count,
+    /// `match_code_pattern` of the first [`FIRST_PAGE_ROWS`] matches
+    /// (`matchCodes`).
+    FirstPage,
+    /// `match_code_pattern` of [`PAGE_ROWS`] matches from the middle of the
+    /// matches.
+    MiddlePage,
+    /// Every chunk of `match_code_chunks`, [`PAGE_ROWS`] rows a chunk
+    /// (`matchCodeChunks`).
+    Stream,
+}
+
+impl fmt::Debug for CheckedRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Count => "count",
+            Self::FirstPage => "first_page",
+            Self::MiddlePage => "middle_page",
+            Self::Stream => "stream",
+        })
+    }
+}
+
+/// The reads timed on each checked run.
+const CHECKED_READS: &[CheckedRead] = &[
+    CheckedRead::Count,
+    CheckedRead::FirstPage,
+    CheckedRead::MiddlePage,
+    CheckedRead::Stream,
+];
+
+impl CheckedRead {
+    /// This read of `pattern` on `store`, as the rows it returns (a count, its
+    /// value).
+    async fn rows(self, store: &VortexRdfStore, pattern: CodePattern) -> usize {
+        match self {
+            Self::Count => {
+                let count = store.count_code_pattern(pattern).await.expect("count");
+                usize::try_from(count).expect("a count fits usize")
+            }
+            Self::FirstPage => {
+                let columns = store.match_code_pattern(pattern, 0, Some(FIRST_PAGE_ROWS));
+                columns.await.expect("window")[0].len()
+            }
+            Self::MiddlePage => {
+                let offset = CHECKED_RUN_MATCHES / 2;
+                let columns = store.match_code_pattern(pattern, offset, Some(PAGE_ROWS));
+                columns.await.expect("window")[0].len()
+            }
+            Self::Stream => {
+                let chunks = store.match_code_chunks(pattern, PAGE_ROWS).await;
+                let mut chunks = chunks.expect("stream");
+                let mut rows = 0;
+                while let Some(chunk) = chunks.next().await {
+                    rows += chunk.expect("chunk")[0].len();
+                }
+                rows
+            }
+        }
+    }
+
+    /// The rows this read returns of a checked run.
+    fn expected_rows(self) -> usize {
+        match self {
+            Self::Count | Self::Stream => CHECKED_RUN_MATCHES,
+            Self::FirstPage => FIRST_PAGE_ROWS,
+            Self::MiddlePage => PAGE_ROWS,
+        }
+    }
+}
+
+/// One checked-run cell: `read` of `shape`'s run in the checked-run file,
+/// opened before timing. The setup panics, naming `cell` and the read, unless
+/// a located run answers the pattern and the read returns the rows it should.
+fn checked_run(bencher: divan::Bencher, cell: &str, shape: CheckedShape, read: CheckedRead) {
+    let path = checked_run_file();
+    let store = rt().block_on(async {
+        VortexRdfStore::from_file(path)
+            .await
+            .expect("open the checked-run file")
+    });
+    let pattern = rt().block_on(shape.pattern(&store));
+    let located = rt().block_on(store.locate_codes(pattern, 0, Some(0)));
+    assert!(
+        located.expect("locate").is_some(),
+        "{cell}/{read:?}: no located run answers the pattern"
+    );
+    let rows = rt().block_on(read.rows(&store, pattern));
+    assert_eq!(
+        rows,
+        read.expected_rows(),
+        "{cell}/{read:?}: wrong row count"
+    );
+    bencher.bench(|| black_box(rt().block_on(read.rows(&store, pattern))));
+}
+
+#[divan::bench(args = CHECKED_READS, sample_count = QUERY_SAMPLES)]
+fn checked_run_pog(bencher: divan::Bencher, read: &CheckedRead) {
+    checked_run(bencher, "checked_run_pog", CheckedShape::Pog, *read);
+}
+
+#[divan::bench(args = CHECKED_READS, sample_count = QUERY_SAMPLES)]
+fn checked_run_sg(bencher: divan::Bencher, read: &CheckedRead) {
+    checked_run(bencher, "checked_run_sg", CheckedShape::Sg, *read);
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // Group 5 — MUTATE (append / delete / compact)
