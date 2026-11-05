@@ -469,13 +469,15 @@ impl FileServePlan {
     /// this call rather than the read; rows read point by point bind nothing
     /// of the plan's.
     ///
-    /// The scan spawns one task per split and the consumer decodes each
-    /// chunk inside its task, so the split count is the decode's
-    /// parallelism. The child's natural splits are its leaf chunks, which
-    /// cluster a run into one split however wide it is; splitting the range
-    /// by row count spreads the run's decode over the workers instead. No
-    /// filter rides along a located run: its range is exactly the
-    /// constrained rows (the same fact `size` and the point reads rely on).
+    /// The scan spawns one task per split. The child's natural splits are
+    /// its leaf chunks, which cluster a run into one split however wide it
+    /// is; splitting the range by row count spreads the run's reads over the
+    /// workers instead, and its decode with them, which runs inside each
+    /// split's task under every layout but a file-backed dictionary's: there
+    /// the chunks leave their tasks as codes and decode two at a time ahead
+    /// of the consumer (`scan_chunks`). No filter rides along a located run:
+    /// its range is exactly the constrained rows (the same fact `size` and
+    /// the point reads rely on).
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     pub(crate) fn read<'a>(
