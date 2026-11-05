@@ -34,7 +34,7 @@ pub mod counters {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// How many counters there are: a pair per site.
-    pub const LEN: usize = 28;
+    pub const LEN: usize = 30;
 
     /// Names in [`snapshot`] order.
     pub const NAMES: [&str; LEN] = [
@@ -66,6 +66,8 @@ pub mod counters {
         "zone_counted_values",
         "check_read",
         "check_read_values",
+        "zone_recorded",
+        "zone_recorded_values",
     ];
     /// A chunk leaf loaded and resolved as it is encoded.
     pub const LEAF_ENCODED: usize = 0;
@@ -96,6 +98,9 @@ pub mod counters {
     pub const ZONE_COUNTED: usize = 24;
     /// A located run's rows read at checked columns to check them.
     pub const CHECK_READ: usize = 26;
+    /// A located run's mixed zone counted from the checked column's recorded
+    /// values (`vortexrdf.value_counts`), unread.
+    pub const ZONE_RECORDED: usize = 28;
 
     static C: [AtomicU64; LEN] = [const { AtomicU64::new(0) }; LEN];
 

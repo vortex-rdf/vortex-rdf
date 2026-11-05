@@ -145,6 +145,9 @@ pub(crate) enum Event {
     /// A located run's rows of a mixed zone counted on the checked column's
     /// encoding, this many rows.
     ZoneCounted(u64),
+    /// A located run's mixed zone of this many rows counted from the checked
+    /// column's recorded values, unread.
+    ZoneRecorded(u64),
     /// A located run's rows read at a checked column to check them, this
     /// many rows.
     CheckRead(u64),

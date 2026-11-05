@@ -248,11 +248,16 @@ impl ColumnZones {
         self.table.len() as u64
     }
 
+    /// The column's rows in zone `zone`: [`zone_len`](Self::zone_len) of
+    /// them from its first, or to the column's end.
+    pub(crate) fn zone_rows(&self, zone: u64) -> std::ops::Range<u64> {
+        zone * self.zone_len..((zone + 1) * self.zone_len).min(self.row_count)
+    }
+
     /// The rows of zone `zone` holding `code`, as the zone recorded them:
     /// `Some(0)` for a recorded zone without `code`; `None` for a zone that
     /// held more values than the statistic records, and for every zone of a
     /// column without it.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn recorded_count(&self, zone: u64, code: u64) -> Option<u64> {
         let zone = usize::try_from(zone).ok()?;
         let pairs = self.recorded.as_ref()?.get(zone)?.as_deref()?;

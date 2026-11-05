@@ -218,9 +218,10 @@ impl VortexRdfStore {
     /// `pattern` alone, never on the window, so every window of one pattern
     /// comes from the same table, in the same order. A run whose rows are
     /// checked is counted whole: zone by zone where the statistics decide it
-    /// (zones they settle by their size, the rest on the column's encoding
-    /// or by their rows), a block at a time otherwise, and only the window's
-    /// rows are kept; nothing is kept between calls. With the
+    /// (zones they settle by their size, a mixed zone lying whole within the
+    /// run by the values its graph column recorded, the rest on the column's
+    /// encoding or by their rows), a block at a time otherwise, and only the
+    /// window's rows are kept; nothing is kept between calls. With the
     /// ablation switch `VORTEX_RDF_LOCATE=0` ([`locate_enabled`]) it declines
     /// every pattern.
     ///
@@ -498,6 +499,11 @@ struct RunZones {
     zone_len: u64,
     first: u64,
     classes: Vec<crate::store::query::zone_decider::ZoneClass>,
+    /// Beside each class, the zone's matches as the values its column
+    /// recorded count them (the ladder's third level): for a mixed zone
+    /// lying whole within the run, whose one unsettled slot's column records
+    /// the zone's values; `None` for every other zone.
+    recorded: Vec<Option<u64>>,
 }
 
 #[cfg(feature = "file-io")]
@@ -505,6 +511,12 @@ impl RunZones {
     /// The class of table zone `zone`, one of the run's.
     fn class(&self, zone: u64) -> crate::store::query::zone_decider::ZoneClass {
         self.classes[(zone - self.first) as usize]
+    }
+
+    /// Table zone `zone`'s matches as its recorded values count them, `None`
+    /// where they don't.
+    fn recorded(&self, zone: u64) -> Option<u64> {
+        self.recorded[(zone - self.first) as usize]
     }
 
     /// The zones past the run's last.
@@ -708,8 +720,10 @@ impl LocatedRun {
 
     /// The matches of the run's rows in table zone `zone` (one of `zones`):
     /// none for a zone of class none, its rows for one of class all, and for
-    /// a mixed zone its rows counted on the column's encoding when one slot
-    /// is unsettled there ([`ColumnChunks::count_eq`]), checked otherwise.
+    /// a mixed zone with one slot unsettled there its recorded count of the
+    /// slot's code ([`RunZones::recorded`]), else its rows counted on the
+    /// column's encoding ([`ColumnChunks::count_eq`]); a mixed zone with
+    /// more slots unsettled is checked.
     ///
     /// [`ColumnChunks::count_eq`]: vortex_rdf_encoded_search::ColumnChunks::count_eq
     async fn zone_count(&self, zones: &RunZones, zone: u64) -> Result<u64> {
@@ -728,6 +742,11 @@ impl LocatedRun {
                 rows.end - rows.start
             }
             ZoneClass::Mixed { unsettled } if unsettled.count_ones() == 1 => {
+                if let Some(matches) = zones.recorded(zone) {
+                    crate::observe::observe!(ZoneRecorded(rows.end - rows.start));
+                    note(counters::ZONE_RECORDED, rows.end - rows.start);
+                    return Ok(matches);
+                }
                 let slot = unsettled.trailing_zeros() as usize;
                 let code = self.codes[slot].expect("a checked slot is bound");
                 crate::observe::observe!(ZoneCounted(rows.end - rows.start));
@@ -882,7 +901,9 @@ impl LocatedRun {
     /// beside the number of matches the reads counted: all of them, with no
     /// slot checked or with `whole`; otherwise those up to the window's last
     /// row, where the checks stop. A run the statistics decide goes zone by
-    /// zone ([`zoned_window`](Self::zoned_window)); any other checked run is
+    /// zone ([`zoned_window`](Self::zoned_window)), skipping the zones before
+    /// the window by their counts, from their classes and recorded values,
+    /// unread; any other checked run is
     /// read a block at a time, [`FIRST_GAP_BLOCK`] rows first and each next
     /// block twice as many, up to [`GAP_BLOCK`]: a window near the run's
     /// start reads little of it.
@@ -1215,6 +1236,7 @@ async fn run_zones(
         };
         columns.push(CheckedColumn {
             slot,
+            code: run.codes[slot].expect("a checked slot is bound"),
             zones,
             proofs,
         });
@@ -1224,10 +1246,27 @@ async fn run_zones(
     };
     let zone_len = decider.zone_len();
     let (first, past) = (rows.start / zone_len, rows.end.div_ceil(zone_len));
+    let classes = decider.classify(first..past)?;
+    // The ladder's third level: a mixed zone with one slot unsettled counts
+    // from its column's record, when the zone lies whole within the run (a
+    // partial zone's record counts rows outside it).
+    let recorded = (first..past)
+        .zip(&classes)
+        .map(|(zone, &class)| match class {
+            ZoneClass::Mixed { unsettled } if unsettled.count_ones() == 1 => {
+                let whole = decider.zone_rows(zone);
+                (rows.start <= whole.start && whole.end <= rows.end)
+                    .then(|| decider.recorded_count(unsettled.trailing_zeros() as usize, zone))
+                    .flatten()
+            }
+            _ => None,
+        })
+        .collect();
     Ok(Some(RunZones {
         zone_len,
         first,
-        classes: decider.classify(first..past)?,
+        classes,
+        recorded,
     }))
 }
 

@@ -876,21 +876,25 @@ async fn check_long_graph_bound_run(index: IndexConfig) {
             assert_eq!(code_rows::<4>(&first), paged[..64], "the first page");
             drop(rec);
             // A count of the copy index's run decides its zones, every one
-            // mixed here and counted on its encoding; a reference run's
-            // rows are read and checked.
+            // mixed here and, lying whole within the run, counted from the
+            // graphs it records; a reference run's rows are read and checked.
             let rec = Recorder::start();
             assert_eq!(store.count_code_pattern(pattern).await.unwrap(), 20_000);
             if matches!(index, IndexConfig::Copy)
                 && crate::store::query::zone_decider::zones_enabled()
             {
-                let counted: u64 = rec
-                    .picked(|e| match e {
-                        Event::ZoneCounted(rows) => Some(*rows),
+                let rows = |counted_from_records: bool| -> u64 {
+                    rec.picked(|e| match (e, counted_from_records) {
+                        (Event::ZoneRecorded(rows), true) | (Event::ZoneCounted(rows), false) => {
+                            Some(*rows)
+                        }
                         _ => None,
                     })
                     .iter()
-                    .sum();
-                assert_eq!(counted, 40_000, "a count, zone by zone");
+                    .sum()
+                };
+                assert_eq!(rows(true), 40_000, "a count, zone by zone, from records");
+                assert_eq!(rows(false), 0, "nothing counted on the encoding");
                 assert_eq!(located_blocks(&rec).iter().sum::<u64>(), 0, "a count");
             } else {
                 assert_eq!(located_blocks(&rec).iter().sum::<u64>(), 40_000, "a count");

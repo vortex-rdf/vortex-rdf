@@ -25,11 +25,12 @@ pub(crate) enum ZoneClass {
     Mixed { unsettled: u8 },
 }
 
-/// A checked slot of a run: its column's zone map in the run's table, and
-/// Vortex's proofs of `x = code` for the slot's code
+/// A checked slot of a run: the code it is checked for, its column's zone
+/// map in the run's table, and Vortex's proofs of `x = code`
 /// ([`eq_proofs`](crate::stats_rules::eq_proofs)).
 pub(crate) struct CheckedColumn {
     pub(crate) slot: usize,
+    pub(crate) code: u64,
     pub(crate) zones: Arc<ColumnZones>,
     pub(crate) proofs: EqProofs,
 }
@@ -56,6 +57,20 @@ impl ZoneDecider {
     /// Rows per zone, the last zone's excepted.
     pub(crate) fn zone_len(&self) -> u64 {
         self.columns[0].zones.zone_len()
+    }
+
+    /// The table's rows in zone `zone`.
+    pub(crate) fn zone_rows(&self, zone: u64) -> Range<u64> {
+        self.columns[0].zones.zone_rows(zone)
+    }
+
+    /// The rows of zone `zone` holding the code of checked slot `slot`, as
+    /// the slot's column recorded them
+    /// ([`ColumnZones::recorded_count`]): `None` where the column records
+    /// none for the zone, or `slot` is not checked.
+    pub(crate) fn recorded_count(&self, slot: usize, zone: u64) -> Option<u64> {
+        let column = self.columns.iter().find(|column| column.slot == slot)?;
+        column.zones.recorded_count(zone, column.code)
     }
 
     /// The class of each zone of `zones`, in order: [`ZoneClass::None`]
@@ -133,6 +148,7 @@ mod tests {
         .unwrap();
         CheckedColumn {
             slot,
+            code,
             zones: Arc::new(zones),
             proofs: eq_proofs(&U64, code).unwrap(),
         }
@@ -208,6 +224,7 @@ mod tests {
         .unwrap();
         let other = CheckedColumn {
             slot: 2,
+            code: 5,
             zones: Arc::new(other),
             proofs: eq_proofs(&U64, 5).unwrap(),
         };
