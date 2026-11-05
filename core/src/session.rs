@@ -24,6 +24,7 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     // Ahead of the default encodings' kernels, so that the store's are tried
     // first.
     crate::kernels::register(&session);
+    crate::stats_rules::register(&session);
     vortex_file::register_default_encodings(&session);
     crate::io::container::register(&session);
     enable_write_editions(&session);

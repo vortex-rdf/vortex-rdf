@@ -102,10 +102,13 @@ impl VortexRdfStore {
     /// ([`locate_codes`](Self::locate_codes)), the general match's rows in its
     /// own order otherwise. Which of the two answers depends on the store and
     /// `pattern` alone, so every window of one pattern comes in the same order.
-    /// Each window is found anew: a run whose rows are checked is checked
-    /// from its start as far as the window's last row (no further, as no
-    /// count is asked), so a caller reading a long match through
-    /// [`match_code_chunks`](Self::match_code_chunks) reads it once.
+    /// Each window is found anew: a run whose rows are checked finds the
+    /// window's first zone by its zones' counts where the statistics decide
+    /// it, and is otherwise checked from its start as far as the window's
+    /// last row (no further, as no count is asked), so a caller reading a
+    /// long match through [`match_code_chunks`](Self::match_code_chunks)
+    /// reads it once. A first window that the run's first 4,096 rows fill
+    /// is read from them before any statistics are asked.
     /// Matches nothing and fails as
     /// [`count_code_pattern`](Self::count_code_pattern) does.
     pub async fn match_code_pattern(
@@ -116,7 +119,7 @@ impl VortexRdfStore {
     ) -> Result<[Buffer<TermCode>; 4]> {
         let dict = self.code_dictionary()?;
         #[cfg(feature = "file-io")]
-        if let Some(run) = self.located_run(pattern).await? {
+        if let Some(mut run) = self.located_run(pattern).await? {
             return run.window_rows(offset, limit).await;
         }
         let Some(probe) = probe_of_codes(&dict, pattern).await? else {
@@ -202,8 +205,10 @@ impl VortexRdfStore {
     /// secondary-by-copy children `index:posg`'s `(p, o, s, g)` and
     /// `index:ospg`'s `(o, s, p, g)`. Rows come in that table's order. Bound
     /// slots that are no such prefix (a bound graph after a free slot) are the
-    /// run of the longest bound prefix, its rows checked against the others,
-    /// when it is no longer than [`GAP_ROWS`]. Failing that, a bound `p` or
+    /// run of the longest bound prefix, its rows checked against the others:
+    /// first by the file's footer statistics, which settle a slot for every
+    /// row; then zone by zone where the checked columns have zone maps; row
+    /// by row otherwise, when the run is no longer than [`GAP_ROWS`]. Failing that, a bound `p` or
     /// `o` is located in the reference index (`index:ref-p`, `index:ref-o`)
     /// and its rows read from the quad table in its order, the other bound
     /// slots checked at them when its run is short enough; a bound subject's
@@ -212,8 +217,10 @@ impl VortexRdfStore {
     /// holds, matches nothing. Whether it answers depends on the store and
     /// `pattern` alone, never on the window, so every window of one pattern
     /// comes from the same table, in the same order. A run whose rows are
-    /// checked is checked whole, a block at a time, to count them, and only
-    /// the window's rows are kept; nothing is kept between calls. With the
+    /// checked is counted whole: zone by zone where the statistics decide it
+    /// (zones they settle by their size, the rest on the column's encoding
+    /// or by their rows), a block at a time otherwise, and only the window's
+    /// rows are kept; nothing is kept between calls. With the
     /// ablation switch `VORTEX_RDF_LOCATE=0` ([`locate_enabled`]) it declines
     /// every pattern.
     ///
@@ -228,7 +235,7 @@ impl VortexRdfStore {
         #[cfg(feature = "file-io")]
         {
             match self.located_run(pattern).await? {
-                Some(run) => run.window(offset, limit).await.map(Some),
+                Some(mut run) => run.window(offset, limit).await.map(Some),
                 None => Ok(None),
             }
         }
@@ -271,25 +278,27 @@ impl VortexRdfStore {
             (Some("index:posg"), [1, 2, 0, 3]),
             (Some("index:ospg"), [2, 0, 1, 3]),
         ];
-        let tables = file.located_tables(|| LocatedTables {
-            sorted: TABLES.map(|(component, _)| {
-                let handle = |column: &str| match component {
-                    None => file.column_chunks(column),
-                    Some(name) => file.component_column_chunks(name, column),
-                };
-                Some([
-                    handle(PRIMARY_COLUMNS[0])?,
-                    handle(PRIMARY_COLUMNS[1])?,
-                    handle(PRIMARY_COLUMNS[2])?,
-                    handle(PRIMARY_COLUMNS[3])?,
-                ])
-            }),
-            references: REFERENCES.map(|(name, _)| {
-                Some([
-                    file.component_column_chunks(name, "val")?,
-                    file.component_column_chunks(name, "rid")?,
-                ])
-            }),
+        let tables = file.located_tables(|| {
+            LocatedTables::new(
+                TABLES.map(|(component, _)| {
+                    let handle = |column: &str| match component {
+                        None => file.column_chunks(column),
+                        Some(name) => file.component_column_chunks(name, column),
+                    };
+                    Some([
+                        handle(PRIMARY_COLUMNS[0])?,
+                        handle(PRIMARY_COLUMNS[1])?,
+                        handle(PRIMARY_COLUMNS[2])?,
+                        handle(PRIMARY_COLUMNS[3])?,
+                    ])
+                }),
+                REFERENCES.map(|(name, _)| {
+                    Some([
+                        file.component_column_chunks(name, "val")?,
+                        file.component_column_chunks(name, "rid")?,
+                    ])
+                }),
+            )
         });
         let run = |columns: Columns, rows, checked| LocatedRun {
             codes,
@@ -298,6 +307,8 @@ impl VortexRdfStore {
             checked,
             source: source.clone(),
             session: session.clone(),
+            zones: None,
+            pending: None,
         };
         // The table whose key order starts with the most bound slots, when
         // none starts with all of them: a bound graph after a free slot.
@@ -334,14 +345,38 @@ impl VortexRdfStore {
             let order = &TABLES[table].1;
             if let Some(found) =
                 locate_run(columns, order, prefix, &codes, &source, session).await?
-                && found.end - found.start <= GAP_ROWS
             {
-                let checked = order[prefix..]
+                let checked: Vec<usize> = order[prefix..]
                     .iter()
                     .copied()
                     .filter(|&slot| codes[slot].is_some())
                     .collect();
-                return Ok(Some(run(columns.clone(), RunRows::Table(found), checked)));
+                let mut located = run(columns.clone(), RunRows::Table(found), checked);
+                // A run of a zone or more asks the file's statistics; a
+                // shorter one reads its few rows faster than they answer
+                // (a join's one-row probe: 1 against 45 µs). A run within
+                // the cap asks them when a read needs them, so a first page
+                // its first block fills asks none; a longer one asks now,
+                // as whether it is capped depends on what they decide.
+                if crate::store::query::zone_decider::zones_enabled()
+                    && located.len() >= STATISTICS_ROWS
+                {
+                    located.pending = Some(PendingStatistics {
+                        file: std::sync::Arc::clone(file),
+                        table,
+                        component: TABLES[table].0,
+                    });
+                    if located.len() > gap_rows() {
+                        located.ask_statistics().await?;
+                    }
+                }
+                // A run still checked row by row is capped, as without zones.
+                if located.checked.is_empty()
+                    || located.zones.is_some()
+                    || located.len() <= gap_rows()
+                {
+                    return Ok(Some(located));
+                }
             }
         }
         // Boxed: its state would otherwise enlarge every lookup's future,
@@ -404,6 +439,18 @@ fn holds(kinds: &KindRanges, slot: usize, code: TermCode) -> bool {
     }
 }
 
+#[cfg(feature = "file-io")]
+use crate::store::query::zone_decider::ZoneClass;
+#[cfg(feature = "file-io")]
+use vortex_rdf_encoded_search::counters;
+
+/// One located run's zone decision of `rows` rows at counter site `site`
+/// (`VORTEX_RDF_COUNTERS=1`).
+#[cfg(feature = "file-io")]
+fn note(site: usize, rows: u64) {
+    counters::note(site, rows as usize);
+}
+
 /// A column's chunk-probe handle.
 #[cfg(feature = "file-io")]
 type Chunks = std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>;
@@ -433,6 +480,47 @@ struct LocatedRun {
     checked: Vec<usize>,
     source: Source,
     session: vortex_session::VortexSession,
+    /// The classes of the run's table zones against its checked slots, when
+    /// zone maps decide them ([`run_zones`]); `None` checks every row.
+    zones: Option<RunZones>,
+    /// The file statistics still to ask for the run's checked slots, until a
+    /// read needs them ([`ask_statistics`](Self::ask_statistics)); `None`
+    /// once asked, or when the run asks none.
+    pending: Option<PendingStatistics>,
+}
+
+/// The classes of the zones a table run's rows fall in, against the run's
+/// checked slots (the ladder's zone level, spec §3): zones `first..first +
+/// classes.len()` of the table, `zone_len` rows each. They live with the
+/// run, so a call or a stream holds them, never the store.
+#[cfg(feature = "file-io")]
+struct RunZones {
+    zone_len: u64,
+    first: u64,
+    classes: Vec<crate::store::query::zone_decider::ZoneClass>,
+}
+
+#[cfg(feature = "file-io")]
+impl RunZones {
+    /// The class of table zone `zone`, one of the run's.
+    fn class(&self, zone: u64) -> crate::store::query::zone_decider::ZoneClass {
+        self.classes[(zone - self.first) as usize]
+    }
+
+    /// The zones past the run's last.
+    fn past(&self) -> u64 {
+        self.first + self.classes.len() as u64
+    }
+}
+
+/// Where a table run asks its file's statistics when a read needs them
+/// ([`LocatedRun::ask_statistics`]): the file, and its sorted table `table`
+/// (`component` names it, `None` the quad table).
+#[cfg(feature = "file-io")]
+struct PendingStatistics {
+    file: std::sync::Arc<crate::store::persist::native_file::NativeStoreFile>,
+    table: usize,
+    component: Option<&'static str>,
 }
 
 /// Where a [`LocatedRun`]'s rows are.
@@ -479,6 +567,29 @@ impl Rows {
 
 #[cfg(feature = "file-io")]
 impl LocatedRun {
+    /// Asks the file's statistics for the run's checked slots
+    /// ([`decide_by_statistics`]) if they are still to ask; once asked, or
+    /// with none to ask, it does nothing.
+    async fn ask_statistics(&mut self) -> Result<()> {
+        let Some(PendingStatistics {
+            file,
+            table,
+            component,
+        }) = self.pending.take()
+        else {
+            return Ok(());
+        };
+        let tables = file
+            .built_located_tables()
+            .expect("a located run's file built its located tables");
+        let source = self.source.clone();
+        // Boxed: its state would otherwise enlarge every read's future.
+        Box::pin(decide_by_statistics(
+            &file, tables, table, component, self, &source,
+        ))
+        .await
+    }
+
     /// The run's rows, before their checks.
     fn len(&self) -> u64 {
         match &self.rows {
@@ -496,23 +607,34 @@ impl LocatedRun {
         match &self.rows {
             RunRows::Table(run) => {
                 let rows = run.start + at.start..run.start + at.end;
-                let Some((&first, rest)) = self.checked.split_first() else {
+                if self.checked.is_empty() {
                     return Ok(Rows::Run(rows));
+                }
+                let Some(zones) = &self.zones else {
+                    let every = self
+                        .checked
+                        .iter()
+                        .fold(0u8, |bits, &slot| bits | 1 << slot);
+                    return Ok(Rows::Ids(self.checked_rows(rows, every).await?));
                 };
-                // The first check reads the block's rows, still contiguous.
-                let code = self.codes[first].expect("a checked slot is bound");
-                let values =
-                    read_codes(&self.columns[first], rows.clone(), source, session).await?;
-                let mut kept: Vec<u64> = rows
-                    .zip(values.iter())
-                    .filter(|&(_, &value)| value == code)
-                    .map(|(row, _)| row)
-                    .collect();
-                for &slot in rest {
-                    if kept.is_empty() {
-                        break;
+                // Zone by zone: none keeps nothing, all keeps every row
+                // unread, a mixed zone checks the slots it leaves unsettled.
+                let mut kept = Vec::new();
+                let mut at = rows.start;
+                while at < rows.end {
+                    let zone = at / zones.zone_len;
+                    let end = ((zone + 1) * zones.zone_len).min(rows.end);
+                    match zones.class(zone) {
+                        ZoneClass::None => note(counters::ZONE_NONE, end - at),
+                        ZoneClass::All => {
+                            note(counters::ZONE_ALL, end - at);
+                            kept.extend(at..end);
+                        }
+                        ZoneClass::Mixed { unsettled } => {
+                            kept.extend(self.checked_rows(at..end, unsettled).await?);
+                        }
                     }
-                    kept = self.holding(slot, kept).await?;
+                    at = end;
                 }
                 Ok(Rows::Ids(kept))
             }
@@ -545,6 +667,137 @@ impl LocatedRun {
                 Ok(Rows::Ids(kept))
             }
         }
+    }
+
+    /// The table rows `rows` (contiguous) holding the code of every checked
+    /// slot in `slots` (bits `1 << slot`), checked in [`checked`](Self::checked)
+    /// order: the first slot read over the rows, still contiguous, each
+    /// other one at the rows the slots before it kept.
+    async fn checked_rows(&self, rows: std::ops::Range<u64>, slots: u8) -> Result<Vec<u64>> {
+        let mut order = self
+            .checked
+            .iter()
+            .copied()
+            .filter(|&slot| slots & 1 << slot != 0);
+        let Some(first) = order.next() else {
+            return Ok(rows.collect());
+        };
+        crate::observe::observe!(CheckRead(rows.end - rows.start));
+        note(counters::CHECK_READ, rows.end - rows.start);
+        let code = self.codes[first].expect("a checked slot is bound");
+        let values = read_codes(
+            &self.columns[first],
+            rows.clone(),
+            &self.source,
+            &self.session,
+        )
+        .await?;
+        let mut kept: Vec<u64> = rows
+            .zip(values.iter())
+            .filter(|&(_, &value)| value == code)
+            .map(|(row, _)| row)
+            .collect();
+        for slot in order {
+            if kept.is_empty() {
+                break;
+            }
+            kept = self.holding(slot, kept).await?;
+        }
+        Ok(kept)
+    }
+
+    /// The matches of the run's rows in table zone `zone` (one of `zones`):
+    /// none for a zone of class none, its rows for one of class all, and for
+    /// a mixed zone its rows counted on the column's encoding when one slot
+    /// is unsettled there ([`ColumnChunks::count_eq`]), checked otherwise.
+    ///
+    /// [`ColumnChunks::count_eq`]: vortex_rdf_encoded_search::ColumnChunks::count_eq
+    async fn zone_count(&self, zones: &RunZones, zone: u64) -> Result<u64> {
+        let RunRows::Table(run) = &self.rows else {
+            unreachable!("only a table run is decided by zones");
+        };
+        let rows =
+            (zone * zones.zone_len).max(run.start)..((zone + 1) * zones.zone_len).min(run.end);
+        Ok(match zones.class(zone) {
+            ZoneClass::None => {
+                note(counters::ZONE_NONE, rows.end - rows.start);
+                0
+            }
+            ZoneClass::All => {
+                note(counters::ZONE_ALL, rows.end - rows.start);
+                rows.end - rows.start
+            }
+            ZoneClass::Mixed { unsettled } if unsettled.count_ones() == 1 => {
+                let slot = unsettled.trailing_zeros() as usize;
+                let code = self.codes[slot].expect("a checked slot is bound");
+                crate::observe::observe!(ZoneCounted(rows.end - rows.start));
+                note(counters::ZONE_COUNTED, rows.end - rows.start);
+                self.columns[slot]
+                    .count_eq(rows, code, &self.source, &self.session)
+                    .await?
+            }
+            ZoneClass::Mixed { unsettled } => {
+                self.checked_rows(rows, unsettled).await?.len() as u64
+            }
+        })
+    }
+
+    /// [`window_of_matches`](Self::window_of_matches) of a run decided by
+    /// zones: the zone holding the window's first match found by the zones'
+    /// counts ([`zone_count`](Self::zone_count)), the window read from there
+    /// a zone at a time, and the count, when `whole`, finished by the
+    /// counts of the zones past it.
+    async fn zoned_window(
+        &self,
+        zones: &RunZones,
+        offset: usize,
+        limit: Option<usize>,
+        whole: bool,
+    ) -> Result<(u64, Rows)> {
+        let RunRows::Table(run) = &self.rows else {
+            unreachable!("only a table run is decided by zones");
+        };
+        let (from, past) = (offset as u64, zones.past());
+        let to = limit.map(|limit| from.saturating_add(limit as u64));
+        let (mut zone, mut before) = (zones.first, 0);
+        if to != Some(from) {
+            while zone < past {
+                let n = self.zone_count(zones, zone).await?;
+                if before + n > from {
+                    break;
+                }
+                before += n;
+                zone += 1;
+            }
+        }
+        let (mut seen, mut window) = (before, Vec::new());
+        while zone < past && to.is_none_or(|to| seen < to) {
+            let rows =
+                (zone * zones.zone_len).max(run.start)..((zone + 1) * zones.zone_len).min(run.end);
+            let kept = match self
+                .block(rows.start - run.start..rows.end - run.start)
+                .await?
+            {
+                Rows::Ids(kept) => kept,
+                Rows::Run(rows) => rows.collect(),
+            };
+            let n = kept.len() as u64;
+            let lo = from.saturating_sub(seen).min(n);
+            let hi = to.map_or(n, |to| to.saturating_sub(seen).min(n));
+            if lo < hi {
+                window.extend_from_slice(&kept[lo as usize..hi as usize]);
+            }
+            seen += n;
+            zone += 1;
+        }
+        let mut total = seen;
+        if whole {
+            while zone < past {
+                total += self.zone_count(zones, zone).await?;
+                zone += 1;
+            }
+        }
+        Ok((total, Rows::Ids(window)))
     }
 
     /// Of `rows` (ascending), those holding the checked `slot`'s code, read
@@ -586,10 +839,11 @@ impl LocatedRun {
 
     /// The window `offset..offset + limit` (`None`: to the last) of the
     /// run's matches, beside their number: with no slot checked the run's
-    /// length, and only the window's rows read; otherwise every row of the
-    /// run is checked, a block at a time, to count the rows kept, and only
-    /// those in the window are held.
-    async fn window(&self, offset: usize, limit: Option<usize>) -> Result<LocatedCodes> {
+    /// length, and only the window's rows read; otherwise the whole run is
+    /// counted, zone by zone where the statistics decide it and a block at a
+    /// time where they do not, and only the rows in the window are held.
+    async fn window(&mut self, offset: usize, limit: Option<usize>) -> Result<LocatedCodes> {
+        self.ask_statistics().await?;
         let (total, rows) = self.window_of_matches(offset, limit, true).await?;
         let columns = self.columns(&rows).await?;
         Ok(LocatedCodes { total, columns })
@@ -597,12 +851,29 @@ impl LocatedRun {
 
     /// The `(s, p, o, g)` code columns of [`window`](Self::window)'s rows,
     /// without its count: the run checked from its start only as far as the
-    /// window's last row.
+    /// window's last row. A first window that the run's first block
+    /// ([`FIRST_GAP_BLOCK`] rows) fills is read from that block, row by row,
+    /// before the file's statistics are asked, which cost more than the
+    /// block (70 against 15 µs); a window the block leaves short asks them.
     async fn window_rows(
-        &self,
+        &mut self,
         offset: usize,
         limit: Option<usize>,
     ) -> Result<[Buffer<TermCode>; 4]> {
+        if self.pending.is_some()
+            && offset == 0
+            && let Some(limit) = limit.filter(|&limit| limit as u64 <= FIRST_GAP_BLOCK)
+        {
+            let mut kept = match self.block(0..FIRST_GAP_BLOCK.min(self.len())).await? {
+                Rows::Ids(kept) => kept,
+                Rows::Run(rows) => rows.collect(),
+            };
+            if kept.len() >= limit {
+                kept.truncate(limit);
+                return self.columns(&Rows::Ids(kept)).await;
+            }
+        }
+        self.ask_statistics().await?;
         let (_, rows) = self.window_of_matches(offset, limit, false).await?;
         self.columns(&rows).await
     }
@@ -610,15 +881,20 @@ impl LocatedRun {
     /// The rows of the window `offset..offset + limit` of the run's matches,
     /// beside the number of matches the reads counted: all of them, with no
     /// slot checked or with `whole`; otherwise those up to the window's last
-    /// row, where the checks stop. A checked run is read a block at a time,
-    /// [`FIRST_GAP_BLOCK`] rows first and each next block twice as many, up
-    /// to [`GAP_BLOCK`]: a window near the run's start reads little of it.
+    /// row, where the checks stop. A run the statistics decide goes zone by
+    /// zone ([`zoned_window`](Self::zoned_window)); any other checked run is
+    /// read a block at a time, [`FIRST_GAP_BLOCK`] rows first and each next
+    /// block twice as many, up to [`GAP_BLOCK`]: a window near the run's
+    /// start reads little of it.
     async fn window_of_matches(
         &self,
         offset: usize,
         limit: Option<usize>,
         whole: bool,
     ) -> Result<(u64, Rows)> {
+        if let Some(zones) = &self.zones {
+            return self.zoned_window(zones, offset, limit, whole).await;
+        }
         let len = self.len();
         if self.checked.is_empty() {
             let w = window_of(len, offset, limit);
@@ -664,7 +940,8 @@ impl LocatedRun {
         use futures::StreamExt as _;
 
         let batch = batch_rows as u64;
-        futures::stream::try_unfold((self, 0u64), move |(run, mut at)| async move {
+        futures::stream::try_unfold((self, 0u64), move |(mut run, mut at)| async move {
+            run.ask_statistics().await?;
             let len = run.len();
             while at < len {
                 let next = at.saturating_add(batch).min(len);
@@ -861,12 +1138,248 @@ async fn locate_run(
     Ok(Some(run))
 }
 
-/// Rows of a run whose rows are checked (a prefix run with bound slots past
-/// it, or a reference run with other slots bound) up to which it answers; a
-/// longer one declines, for the caller's other paths, as a window of it
-/// checks every row to count them.
+/// The statistics' decisions on `run`, a gap run of sorted table `table`
+/// (`component` names it, `None` the quad table), in ladder order (spec §3):
+/// the footer settles each checked slot for the whole file, leaving the run
+/// empty where no row holds a slot's code and dropping a slot every row
+/// holds; the zone maps then class the run's zones against the slots left
+/// ([`run_zones`]). Each slot's proofs of `x = code` are built once, for
+/// both.
+#[cfg(feature = "file-io")]
+async fn decide_by_statistics(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    tables: &crate::store::persist::native_file::LocatedTables,
+    table: usize,
+    component: Option<&str>,
+    run: &mut LocatedRun,
+    source: &Source,
+) -> Result<()> {
+    use vortex_array::dtype::{DType, Nullability, PType};
+
+    let RunRows::Table(rows) = &run.rows else {
+        return Ok(());
+    };
+    crate::observe::observe!(StatisticsAsked);
+    let rows = rows.clone();
+    let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+    let (mut unsettled, mut proofs) = (Vec::new(), Vec::new());
+    for &slot in &run.checked {
+        let code = run.codes[slot].expect("a checked slot is bound");
+        let slot_proofs = crate::stats_rules::eq_proofs(&dtype, code)?;
+        match footer_decision(file, slot, code, &slot_proofs)? {
+            FooterDecision::Nothing => {
+                note(counters::ZONE_COLUMN, rows.end - rows.start);
+                run.rows = RunRows::Table(rows.start..rows.start);
+                run.checked.clear();
+                return Ok(());
+            }
+            FooterDecision::Everything => note(counters::ZONE_COLUMN, rows.end - rows.start),
+            FooterDecision::Unknown => {
+                unsettled.push(slot);
+                proofs.push(slot_proofs);
+            }
+        }
+    }
+    run.checked = unsettled;
+    if !run.checked.is_empty() {
+        run.zones = run_zones(file, tables, table, component, run, proofs, source).await?;
+    }
+    Ok(())
+}
+
+/// The zones of `run`, a run of sorted table `table` (`component` names
+/// it, `None` the quad table), classed against its checked slots by their
+/// columns' zone maps ([`ZoneDecider`]); `None` when a checked column has
+/// none, for the run to check every row.
+///
+/// [`ZoneDecider`]: crate::store::query::zone_decider::ZoneDecider
+#[cfg(feature = "file-io")]
+async fn run_zones(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    tables: &crate::store::persist::native_file::LocatedTables,
+    table: usize,
+    component: Option<&str>,
+    run: &LocatedRun,
+    proofs: Vec<crate::stats_rules::EqProofs>,
+    source: &Source,
+) -> Result<Option<RunZones>> {
+    use crate::store::query::zone_decider::{CheckedColumn, ZoneDecider};
+
+    let RunRows::Table(rows) = &run.rows else {
+        return Ok(None);
+    };
+    let mut columns = Vec::with_capacity(run.checked.len());
+    for (&slot, proofs) in run.checked.iter().zip(proofs) {
+        let Some(zones) = column_zones(file, tables, table, component, slot, source).await? else {
+            return Ok(None);
+        };
+        columns.push(CheckedColumn {
+            slot,
+            zones,
+            proofs,
+        });
+    }
+    let Some(decider) = ZoneDecider::new(columns) else {
+        return Ok(None);
+    };
+    let zone_len = decider.zone_len();
+    let (first, past) = (rows.start / zone_len, rows.end.div_ceil(zone_len));
+    Ok(Some(RunZones {
+        zone_len,
+        first,
+        classes: decider.classify(first..past)?,
+    }))
+}
+
+/// The zone map of column `slot` of sorted table `table` (`component` names
+/// it, `None` the quad table), read on first use and kept with the file's
+/// located tables; `None` for a column without exact zone bounds.
+#[cfg(feature = "file-io")]
+async fn column_zones(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    tables: &crate::store::persist::native_file::LocatedTables,
+    table: usize,
+    component: Option<&str>,
+    slot: usize,
+    source: &Source,
+) -> Result<Option<std::sync::Arc<crate::io::zone_map::ColumnZones>>> {
+    use crate::io::zone_map::ColumnZones;
+    use crate::store::schema::PRIMARY_COLUMNS;
+
+    let cell = &tables.zones[table][slot];
+    if let Some(zones) = cell.get() {
+        return Ok(zones.clone());
+    }
+    crate::observe::observe!(ZoneMapRead);
+    let zones = match file.table_column_layout(component, PRIMARY_COLUMNS[slot]) {
+        Some(column) => ColumnZones::read(&column, source)
+            .await?
+            .map(std::sync::Arc::new),
+        None => None,
+    };
+    Ok(cell.get_or_init(|| zones).clone())
+}
+
+/// What a file's footer statistics say of a checked slot's code, for the
+/// whole file (the ladder's first level, spec §3).
+#[cfg(feature = "file-io")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FooterDecision {
+    /// No row of the file holds the code.
+    Nothing,
+    /// Every row of the file holds it.
+    Everything,
+    /// The footer settles neither.
+    Unknown,
+}
+
+/// The footer's decision on `slot` holding `code`: [`Nothing`] where
+/// Vortex's file-level pruning refutes it (`VortexFile::can_prune`),
+/// [`Everything`] where the footer's exact bounds of the column are both the
+/// code ([`bounds_settle_every_row`]). A by-copy index holds the quad
+/// table's values, so the quad table's footer speaks for its columns too.
+///
+/// [`Nothing`]: FooterDecision::Nothing
+/// [`Everything`]: FooterDecision::Everything
+#[cfg(feature = "file-io")]
+fn footer_decision(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    slot: usize,
+    code: TermCode,
+    proofs: &crate::stats_rules::EqProofs,
+) -> Result<FooterDecision> {
+    use crate::store::schema::PRIMARY_COLUMNS;
+    use vortex_array::expr::{eq, get_item, lit, root};
+
+    let column = PRIMARY_COLUMNS[slot];
+    if file.can_prune(&eq(get_item(column, root()), lit(code)))? {
+        return Ok(FooterDecision::Nothing);
+    }
+    Ok(
+        match bounds_settle_every_row(
+            footer_bounds(file, column),
+            proofs.all.as_ref(),
+            file.row_count(),
+        )? {
+            true => FooterDecision::Everything,
+            false => FooterDecision::Unknown,
+        },
+    )
+}
+
+/// The footer's exact `(min, max)` of the file's top-level `u64` column
+/// `column`; `None` when the file keeps no exact bounds for it.
+#[cfg(feature = "file-io")]
+fn footer_bounds(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    column: &str,
+) -> Option<(u64, u64)> {
+    use vortex_array::expr::stats::Stat;
+
+    let stats = file.file_stats()?;
+    let index = file.dtype().as_struct_fields_opt()?.find(column)?;
+    let (set, dtype) = stats.get(index);
+    if !dtype.is_unsigned_int() {
+        return None;
+    }
+    let min = set.get_as::<u64>(Stat::Min, dtype).as_exact()?;
+    let max = set.get_as::<u64>(Stat::Max, dtype).as_exact()?;
+    Some((min, max))
+}
+
+/// Whether bounds `(min, max)` of a column of `row_count` rows prove every
+/// row holds a code: `all`, Vortex's satisfier of `x = code`
+/// ([`eq_proofs`]), on a one-zone map of those bounds. `false` without
+/// bounds or a satisfier.
+///
+/// [`eq_proofs`]: crate::stats_rules::eq_proofs
+#[cfg(feature = "file-io")]
+fn bounds_settle_every_row(
+    bounds: Option<(u64, u64)>,
+    all: Option<&vortex_array::expr::BoundExpression>,
+    row_count: u64,
+) -> Result<bool> {
+    use crate::io::zone_map::ColumnZones;
+
+    let (Some((min, max)), Some(all)) = (bounds, all) else {
+        return Ok(false);
+    };
+    if row_count == 0 {
+        return Ok(false);
+    }
+    let zones = ColumnZones::from_bounds(
+        vortex_buffer::buffer![min],
+        vortex_buffer::buffer![max],
+        row_count,
+        row_count,
+    )?;
+    Ok(zones.prune(0..1, all)?.value(0))
+}
+
+/// The longest gap run checked row by row: [`GAP_ROWS`], or what a test
+/// forced on this thread.
+#[cfg(feature = "file-io")]
+fn gap_rows() -> u64 {
+    #[cfg(test)]
+    if let Some(rows) = crate::store::test_hooks::forced_gap_rows() {
+        return rows;
+    }
+    GAP_ROWS
+}
+
+/// Rows of a run whose rows are checked row by row (a prefix run with bound
+/// slots past it that the statistics do not decide, or a reference run with
+/// other slots bound) up to which it answers; a longer one declines, for the
+/// caller's other paths, as a window of it checks every row to count them.
+/// A run the zone maps decide is not capped.
 #[cfg(feature = "file-io")]
 const GAP_ROWS: u64 = 1 << 23;
+
+/// The fewest rows of a gap run for it to ask the file's statistics before
+/// its rows (a zone's): a shorter run reads its rows faster than the footer
+/// and the zone maps decide them, about 1 against 45 µs for a one-row probe.
+#[cfg(feature = "file-io")]
+const STATISTICS_ROWS: u64 = crate::io::zone_map::ZONE_ROWS as u64;
 
 /// Rows of a checked run a window reads in its first block.
 #[cfg(feature = "file-io")]
@@ -999,4 +1512,26 @@ fn leaves_holding(column: &vortex_rdf_encoded_search::ColumnChunks, rows: &[u64]
         leaves += 1;
     }
     leaves
+}
+
+#[cfg(all(test, feature = "file-io"))]
+mod tests {
+    use super::*;
+
+    /// Footer bounds settle every row only where both are the code; a file
+    /// without them settles nothing.
+    #[test]
+    fn footer_bounds_decide_every_row() {
+        use vortex_array::dtype::{DType, Nullability, PType};
+
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let all = |code| crate::stats_rules::eq_proofs(&dtype, code).unwrap().all;
+        let (five, top) = (all(5), all(u64::MAX));
+        assert!(!bounds_settle_every_row(None, five.as_ref(), 100).unwrap());
+        assert!(!bounds_settle_every_row(Some((4, 5)), five.as_ref(), 100).unwrap());
+        assert!(bounds_settle_every_row(Some((5, 5)), five.as_ref(), 100).unwrap());
+        assert!(!bounds_settle_every_row(Some((5, 5)), None, 100).unwrap());
+        let max = (u64::MAX, u64::MAX);
+        assert!(bounds_settle_every_row(Some(max), top.as_ref(), 100).unwrap());
+    }
 }

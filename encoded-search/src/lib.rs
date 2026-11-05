@@ -33,8 +33,11 @@ pub mod counters {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// How many counters there are: a pair per site.
+    pub const LEN: usize = 28;
+
     /// Names in [`snapshot`] order.
-    pub const NAMES: [&str; 18] = [
+    pub const NAMES: [&str; LEN] = [
         "leaf_encoded",
         "leaf_encoded_values",
         "leaf_decoded",
@@ -53,6 +56,16 @@ pub mod counters {
         "typed_eq_probe_values",
         "typed_eq_primitive",
         "typed_eq_primitive_values",
+        "zone_column",
+        "zone_column_values",
+        "zone_none",
+        "zone_none_values",
+        "zone_all",
+        "zone_all_values",
+        "zone_counted",
+        "zone_counted_values",
+        "check_read",
+        "check_read_values",
     ];
     /// A chunk leaf loaded and resolved as it is encoded.
     pub const LEAF_ENCODED: usize = 0;
@@ -72,8 +85,19 @@ pub mod counters {
     pub const TYPED_EQ_PROBE: usize = 14;
     /// An equality scan bound to a primitive (decoded) column.
     pub const TYPED_EQ_PRIMITIVE: usize = 16;
+    /// A located run's checked slot settled for the whole file by its footer
+    /// statistics (values: the run's rows).
+    pub const ZONE_COLUMN: usize = 18;
+    /// A located run's zone (its rows of it) settled as holding no match.
+    pub const ZONE_NONE: usize = 20;
+    /// A located run's zone (its rows of it) settled as all matches, unread.
+    pub const ZONE_ALL: usize = 22;
+    /// A located run's mixed zone counted on the checked column's encoding.
+    pub const ZONE_COUNTED: usize = 24;
+    /// A located run's rows read at checked columns to check them.
+    pub const CHECK_READ: usize = 26;
 
-    static C: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+    static C: [AtomicU64; LEN] = [const { AtomicU64::new(0) }; LEN];
 
     /// Whether the counters are on.
     pub fn on() -> bool {
@@ -90,7 +114,7 @@ pub mod counters {
     }
 
     /// The counters, in [`NAMES`] order.
-    pub fn snapshot() -> [u64; 18] {
+    pub fn snapshot() -> [u64; LEN] {
         std::array::from_fn(|i| C[i].load(Ordering::Relaxed))
     }
 }
@@ -191,6 +215,21 @@ impl<'a> SortedProbe<'a> {
         self.root.read_into(start, out);
     }
 
+    /// How many of the values at `start..start + len` equal `needle`, counted
+    /// on the encoding where it allows (a constant at once, run ends by their
+    /// runs, a dictionary by its codes, bit-packed values a chunk at a time)
+    /// and read otherwise. Needs no sortedness.
+    ///
+    /// # Panics
+    /// Panics if `start + len > self.len()`.
+    pub fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
+        assert!(
+            start.checked_add(len).is_some_and(|end| end <= self.len()),
+            "{len} values from {start} out of bounds"
+        );
+        self.root.count_eq(start, len, needle)
+    }
+
     /// The exact values at `indices`, in their order, into `out`: each run of
     /// consecutive indices read in one pass ([`Self::read_into`]), a lone
     /// index point-read.
@@ -209,6 +248,21 @@ impl<'a> SortedProbe<'a> {
                 self.read_into(indices[i], &mut out[i..i + run]);
             }
             i += run;
+        }
+    }
+
+    /// Whether the resolved tree's root is a dictionary: codes into a values
+    /// array.
+    pub fn is_dictionary(&self) -> bool {
+        self.dictionary_len().is_some()
+    }
+
+    /// How many values the resolved tree's root dictionary holds; `None`
+    /// when its root is no dictionary.
+    pub fn dictionary_len(&self) -> Option<usize> {
+        match &self.root {
+            node::Node::Dict { values, .. } => Some(values.len()),
+            _ => None,
         }
     }
 

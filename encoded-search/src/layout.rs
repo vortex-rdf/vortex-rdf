@@ -549,6 +549,75 @@ impl ColumnChunks {
         })
     }
 
+    /// How many of the values at `rows` (absolute) equal `needle`: each leaf
+    /// the rows reach fetched (and cached) once and counted through its probe
+    /// on the encoding where it allows ([`SortedProbe::count_eq`]), a
+    /// dictionary leaf of many values through Vortex's own compare, which is
+    /// faster there ([`COMPARE_DICT_VALUES`]), and a leaf whose encoding
+    /// declines the probe decoded and counted.
+    ///
+    /// # Panics
+    /// Panics if `rows` ends past `self.row_count()`.
+    pub async fn count_eq(
+        &self,
+        rows: Range<u64>,
+        needle: u64,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<u64> {
+        use vortex_array::arrays::PrimitiveArray;
+
+        assert!(rows.end <= self.row_count, "rows {rows:?} out of bounds");
+        let mut count = 0;
+        let mut at = rows.start;
+        while at < rows.end {
+            let idx = self.leaf_holding(at);
+            let leaf = &self.chunks[idx];
+            let to = rows.end.min(leaf.end());
+            // Local rows are below the leaf's row count, which its fetch
+            // checked fits a `usize`.
+            let local = (at - leaf.row_offset) as usize..(to - leaf.row_offset) as usize;
+            let fetched = self.chunk_leaf(idx, source, session).await?;
+            count += match fetched.probe() {
+                // A large dictionary counts faster through Vortex's own
+                // compare, which compares its values once; the probe scans
+                // them on every count. Every other leaf counts faster on the
+                // probe, a store's few-valued graph dictionaries most of all
+                // (the probe bench's `count_eq_probe` against
+                // `count_eq_vortex`).
+                Some(probe)
+                    if probe
+                        .probe()
+                        .dictionary_len()
+                        .is_some_and(|values| values > COMPARE_DICT_VALUES) =>
+                {
+                    count_eq_by_compare(fetched.array(), local, needle, session)?
+                }
+                Some(probe) => probe.probe().count_eq(local.start, local.len(), needle) as u64,
+                None => {
+                    let mut ctx = session.create_execution_ctx();
+                    let values = fetched
+                        .array()
+                        .slice(local)?
+                        .execute::<PrimitiveArray>(&mut ctx)?;
+                    // A needle wider than the leaf's values matches none of them.
+                    vortex_array::match_each_unsigned_integer_ptype!(values.ptype(), |T| {
+                        match T::try_from(needle) {
+                            Ok(needle) => values
+                                .as_slice::<T>()
+                                .iter()
+                                .filter(|&&v| v == needle)
+                                .count() as u64,
+                            Err(_) => 0,
+                        }
+                    })
+                }
+            };
+            at = to;
+        }
+        Ok(count)
+    }
+
     /// The chunk's resolved probe, fetched through `source` and resolved on
     /// first use; `None` when its encoding declines.
     async fn chunk_probe(
@@ -783,6 +852,43 @@ pub async fn fetch_flat(
     };
     let row_count = usize::try_from(flat.row_count())?;
     parts.decode(flat.dtype(), row_count, flat.array_ctx(), session)
+}
+
+/// The most values a dictionary leaf holds for [`ColumnChunks::count_eq`] to
+/// count it on its probe; a larger one counts through Vortex's compare.
+/// Measured per 8,192-value window (the probe bench's count benches): with 4
+/// values the probe is 1.5x (bit-packed codes) to 450x (run-end codes)
+/// faster, with 256 values 4.5x, while with 2,048 values Vortex is 1.7x
+/// faster.
+const COMPARE_DICT_VALUES: usize = 1_024;
+
+/// How many of `array`'s values at `rows` equal `needle`, through Vortex's
+/// own kernels: `eq(root(), lit(needle))` over the slice, its true values
+/// counted; 0 when `needle` is wider than the array's values.
+fn count_eq_by_compare(
+    array: &ArrayRef,
+    rows: Range<usize>,
+    needle: u64,
+    session: &VortexSession,
+) -> VortexResult<u64> {
+    use vortex_array::arrays::BoolArray;
+    use vortex_array::expr::{eq, lit, root};
+
+    let literal =
+        vortex_array::match_each_unsigned_integer_ptype!(PType::try_from(array.dtype())?, |T| {
+            match T::try_from(needle) {
+                Ok(needle) => lit(needle),
+                Err(_) => return Ok(0),
+            }
+        });
+    let bound = eq(root(), literal).bind(array.dtype())?;
+    let mut ctx = session.create_execution_ctx();
+    Ok(array
+        .slice(rows)?
+        .apply_bound(&bound)?
+        .execute::<BoolArray>(&mut ctx)?
+        .into_bit_buffer()
+        .true_count() as u64)
 }
 
 /// Descend through zoned wrappers to their data child (child 0).

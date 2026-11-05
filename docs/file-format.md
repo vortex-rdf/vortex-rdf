@@ -80,9 +80,9 @@ of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
 The writer is limited to two editions: Vortex's frozen `core` edition
-`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L67)) — every
+`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L68)) — every
 encoding, layout, extension dtype and zone-map aggregate a store file may hold
-— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L78)), whose
+— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L79)), whose
 one member is the root layout. A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
 per-chunk frame-of-reference (`fastlanes.for.v2`) or bit-packing with a width
@@ -499,6 +499,7 @@ keep:
 | the reader tree (the quad table's reader and one reader per component), the quad table's split ranges | the file's layout; the reader tree is replaced whenever the bound filter trees below are cleared |
 | per-column chunk-probe handles with the probes of the leaves they fetched, so a repeated location skips the layout walk and the leaf rebuilds | one handle per column; per fetched leaf, a probe over mapped bytes |
 | pruning envelopes per filter shape | 512 entries, cleared wholesale at the cap |
+| the zone maps of the columns located runs check (each zone's `max` and `min`), read on first use | two `u64` per 8,192-row zone of each column read |
 | bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap; a clear retires the reader tree, and the caches go with its readers once no view holds one |
 | the dictionary child's reader, the window leaf layouts, the dictionary's window bounds ([§5](#5-the-dictionary-child)) and its kind ranges | two terms per 65,536-term window and a handful of codes |
 | the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) (4 MiB) per opened file, charging each window its code offsets at 4 bytes each plus [`WINDOW_ENTRY_OVERHEAD`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) (4 KiB); least recently used evicted; an FSST window of 65,536 terms is charged about 260 KiB, so about 15 fit. For a memory-mapped file store, which every `from_file` store is, the code bytes are slices of the map, so the charge bounds the heap the cache holds |

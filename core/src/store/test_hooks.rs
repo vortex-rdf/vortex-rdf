@@ -87,6 +87,58 @@ thread_local! {
     static CUTS_BEFORE_FAILURE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
+thread_local! {
+    /// Whether this thread's located runs decide zone by zone, while a
+    /// [`ForcedZones`] guard is live.
+    static ZONES: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+thread_local! {
+    /// The longest gap run this thread's located runs check row by row,
+    /// while a [`ForcedGapRows`] guard is live.
+    static GAP_ROWS: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// The gap-run cap a [`ForcedGapRows`] forced on this thread.
+pub(crate) fn forced_gap_rows() -> Option<u64> {
+    GAP_ROWS.get()
+}
+
+/// While alive, this thread's located runs check a gap run row by row only
+/// when it holds at most `rows` rows, in place of `GAP_ROWS`.
+pub(crate) struct ForcedGapRows {
+    _guard: Override<u64>,
+}
+
+impl ForcedGapRows {
+    /// Force the gap-run cap to `rows` until the guard drops.
+    pub(crate) fn set(rows: u64) -> Self {
+        Self {
+            _guard: Override::set(&GAP_ROWS, rows),
+        }
+    }
+}
+
+/// The zone switch a [`ForcedZones`] forced on this thread.
+pub(crate) fn forced_zones() -> Option<bool> {
+    ZONES.get()
+}
+
+/// While alive, this thread's located runs decide their checked rows zone by
+/// zone (`true`) or row by row (`false`), whatever `VORTEX_RDF_ZONES` says.
+pub(crate) struct ForcedZones {
+    _guard: Override<bool>,
+}
+
+impl ForcedZones {
+    /// Force the zone switch to `on` until the guard drops.
+    pub(crate) fn set(on: bool) -> Self {
+        Self {
+            _guard: Override::set(&ZONES, on),
+        }
+    }
+}
+
 /// The split limit a [`ForcedLimit`] forced on this thread's row scans.
 pub(crate) fn forced_split_limit() -> Option<usize> {
     SPLIT_LIMIT.get()
