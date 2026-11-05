@@ -347,6 +347,12 @@ impl NativeStoreFile {
         self.located.get_or_init(build)
     }
 
+    /// The located-run tables' handles, once [`located_tables`](Self::located_tables)
+    /// has built them.
+    pub(crate) fn built_located_tables(&self) -> Option<&LocatedTables> {
+        self.located.get()
+    }
+
     /// The quad table's natural splits, memoized. Shadows the inner file's
     /// `splits()` (which recomputes from the layout tree per call).
     pub(crate) fn splits(&self) -> VortexResult<Arc<[Range<u64>]>> {

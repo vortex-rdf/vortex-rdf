@@ -600,3 +600,72 @@ async fn short_runs_check_rows_without_statistics() {
         }
     }
 }
+
+/// Statistics `rec` saw a located run ask of its file.
+fn statistics_asked(rec: &Recorder) -> usize {
+    rec.count(&Event::StatisticsAsked)
+}
+
+/// A first page that a long checked run's first block fills is read from
+/// that block, row by row, before the file's statistics are asked, which
+/// cost more than the block: on interleaved graphs a 64-row page reads
+/// 4,096 rows and asks nothing. A first page the block leaves short (its
+/// graph starts half-way), a later page and a count ask them. Every page
+/// is the rows' own.
+#[tokio::test]
+async fn first_page_reads_the_first_block_before_statistics() {
+    use crate::store::test_hooks::ForcedZones;
+
+    for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
+        for (graphs, g, fills) in [(Graphs::Alternating, 1, true), (Graphs::Long, 2, false)] {
+            let (_dir, path) = write_store_file(
+                zone_quads(graphs),
+                LayoutStrategy::Dictionary,
+                index.types(),
+            )
+            .await;
+            let store = &VortexRdfStore::from_file(&path).await.unwrap();
+            let patterns = zone_patterns(store, g).await;
+            // The quad table's (hub, link) run, and on a copy store the
+            // index:posg run.
+            let patterns = match index {
+                IndexConfig::Copy => &patterns[..2],
+                _ => &patterns[1..2],
+            };
+            for (i, &pattern) in patterns.iter().enumerate() {
+                let tag = format!("{graphs:?}/{} g{g} pattern {i}", index.name());
+                let page = |offset| async move {
+                    code_rows::<4>(
+                        &store
+                            .match_code_pattern(pattern, offset, Some(64))
+                            .await
+                            .unwrap(),
+                    )
+                };
+                let want = {
+                    let _off = ForcedZones::set(false);
+                    (page(0).await, page(64).await)
+                };
+                let _on = ForcedZones::set(true);
+                let rec = Recorder::start();
+                let first = page(0).await;
+                assert_eq!(first.len(), 64, "{tag}");
+                assert_eq!(first, want.0, "{tag}: the first page");
+                if fills {
+                    assert_eq!(statistics_asked(&rec), 0, "{tag}: none asked");
+                    assert_eq!(zone_work(&rec), (0, 4096), "{tag}: the first block");
+                } else {
+                    assert_eq!(statistics_asked(&rec), 1, "{tag}: the block fell short");
+                }
+                drop(rec);
+                let rec = Recorder::start();
+                assert_eq!(page(64).await, want.1, "{tag}: the second page");
+                assert_eq!(statistics_asked(&rec), 1, "{tag}: a later page asks");
+                drop(rec);
+                let rec = Recorder::start();
+                store.count_code_pattern(pattern).await.unwrap();
+                assert_eq!(statistics_asked(&rec), 1, "{tag}: a count asks");
+            }
+        }
+    }
+}

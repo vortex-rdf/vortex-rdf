@@ -107,7 +107,8 @@ impl VortexRdfStore {
     /// it, and is otherwise checked from its start as far as the window's
     /// last row (no further, as no count is asked), so a caller reading a
     /// long match through [`match_code_chunks`](Self::match_code_chunks)
-    /// reads it once.
+    /// reads it once. A first window that the run's first 4,096 rows fill
+    /// is read from them before any statistics are asked.
     /// Matches nothing and fails as
     /// [`count_code_pattern`](Self::count_code_pattern) does.
     pub async fn match_code_pattern(
@@ -118,7 +119,7 @@ impl VortexRdfStore {
     ) -> Result<[Buffer<TermCode>; 4]> {
         let dict = self.code_dictionary()?;
         #[cfg(feature = "file-io")]
-        if let Some(run) = self.located_run(pattern).await? {
+        if let Some(mut run) = self.located_run(pattern).await? {
             return run.window_rows(offset, limit).await;
         }
         let Some(probe) = probe_of_codes(&dict, pattern).await? else {
@@ -234,7 +235,7 @@ impl VortexRdfStore {
         #[cfg(feature = "file-io")]
         {
             match self.located_run(pattern).await? {
-                Some(run) => run.window(offset, limit).await.map(Some),
+                Some(mut run) => run.window(offset, limit).await.map(Some),
                 None => Ok(None),
             }
         }
@@ -307,6 +308,7 @@ impl VortexRdfStore {
             source: source.clone(),
             session: session.clone(),
             zones: None,
+            pending: None,
         };
         // The table whose key order starts with the most bound slots, when
         // none starts with all of them: a bound graph after a free slot.
@@ -352,21 +354,21 @@ impl VortexRdfStore {
                 let mut located = run(columns.clone(), RunRows::Table(found), checked);
                 // A run of a zone or more asks the file's statistics; a
                 // shorter one reads its few rows faster than they answer
-                // (a join's one-row probe: 1 against 45 µs).
+                // (a join's one-row probe: 1 against 45 µs). A run within
+                // the cap asks them when a read needs them, so a first page
+                // its first block fills asks none; a longer one asks now,
+                // as whether it is capped depends on what they decide.
                 if crate::store::query::zone_decider::zones_enabled()
                     && located.len() >= STATISTICS_ROWS
                 {
-                    // Boxed: its state would otherwise enlarge every
-                    // lookup's future.
-                    Box::pin(decide_by_statistics(
-                        file,
-                        tables,
+                    located.pending = Some(PendingStatistics {
+                        file: std::sync::Arc::clone(file),
                         table,
-                        TABLES[table].0,
-                        &mut located,
-                        &source,
-                    ))
-                    .await?;
+                        component: TABLES[table].0,
+                    });
+                    if located.len() > gap_rows() {
+                        located.ask_statistics().await?;
+                    }
                 }
                 // A run still checked row by row is capped, as without zones.
                 if located.checked.is_empty()
@@ -481,6 +483,10 @@ struct LocatedRun {
     /// The classes of the run's table zones against its checked slots, when
     /// zone maps decide them ([`run_zones`]); `None` checks every row.
     zones: Option<RunZones>,
+    /// The file statistics still to ask for the run's checked slots, until a
+    /// read needs them ([`ask_statistics`](Self::ask_statistics)); `None`
+    /// once asked, or when the run asks none.
+    pending: Option<PendingStatistics>,
 }
 
 /// The classes of the zones a table run's rows fall in, against the run's
@@ -505,6 +511,16 @@ impl RunZones {
     fn past(&self) -> u64 {
         self.first + self.classes.len() as u64
     }
+}
+
+/// Where a table run asks its file's statistics when a read needs them
+/// ([`LocatedRun::ask_statistics`]): the file, and its sorted table `table`
+/// (`component` names it, `None` the quad table).
+#[cfg(feature = "file-io")]
+struct PendingStatistics {
+    file: std::sync::Arc<crate::store::persist::native_file::NativeStoreFile>,
+    table: usize,
+    component: Option<&'static str>,
 }
 
 /// Where a [`LocatedRun`]'s rows are.
@@ -551,6 +567,29 @@ impl Rows {
 
 #[cfg(feature = "file-io")]
 impl LocatedRun {
+    /// Asks the file's statistics for the run's checked slots
+    /// ([`decide_by_statistics`]) if they are still to ask; once asked, or
+    /// with none to ask, it does nothing.
+    async fn ask_statistics(&mut self) -> Result<()> {
+        let Some(PendingStatistics {
+            file,
+            table,
+            component,
+        }) = self.pending.take()
+        else {
+            return Ok(());
+        };
+        let tables = file
+            .built_located_tables()
+            .expect("a located run's file built its located tables");
+        let source = self.source.clone();
+        // Boxed: its state would otherwise enlarge every read's future.
+        Box::pin(decide_by_statistics(
+            &file, tables, table, component, self, &source,
+        ))
+        .await
+    }
+
     /// The run's rows, before their checks.
     fn len(&self) -> u64 {
         match &self.rows {
@@ -803,7 +842,8 @@ impl LocatedRun {
     /// length, and only the window's rows read; otherwise the whole run is
     /// counted, zone by zone where the statistics decide it and a block at a
     /// time where they do not, and only the rows in the window are held.
-    async fn window(&self, offset: usize, limit: Option<usize>) -> Result<LocatedCodes> {
+    async fn window(&mut self, offset: usize, limit: Option<usize>) -> Result<LocatedCodes> {
+        self.ask_statistics().await?;
         let (total, rows) = self.window_of_matches(offset, limit, true).await?;
         let columns = self.columns(&rows).await?;
         Ok(LocatedCodes { total, columns })
@@ -811,12 +851,29 @@ impl LocatedRun {
 
     /// The `(s, p, o, g)` code columns of [`window`](Self::window)'s rows,
     /// without its count: the run checked from its start only as far as the
-    /// window's last row.
+    /// window's last row. A first window that the run's first block
+    /// ([`FIRST_GAP_BLOCK`] rows) fills is read from that block, row by row,
+    /// before the file's statistics are asked, which cost more than the
+    /// block (70 against 15 µs); a window the block leaves short asks them.
     async fn window_rows(
-        &self,
+        &mut self,
         offset: usize,
         limit: Option<usize>,
     ) -> Result<[Buffer<TermCode>; 4]> {
+        if self.pending.is_some()
+            && offset == 0
+            && let Some(limit) = limit.filter(|&limit| limit as u64 <= FIRST_GAP_BLOCK)
+        {
+            let mut kept = match self.block(0..FIRST_GAP_BLOCK.min(self.len())).await? {
+                Rows::Ids(kept) => kept,
+                Rows::Run(rows) => rows.collect(),
+            };
+            if kept.len() >= limit {
+                kept.truncate(limit);
+                return self.columns(&Rows::Ids(kept)).await;
+            }
+        }
+        self.ask_statistics().await?;
         let (_, rows) = self.window_of_matches(offset, limit, false).await?;
         self.columns(&rows).await
     }
@@ -883,7 +940,8 @@ impl LocatedRun {
         use futures::StreamExt as _;
 
         let batch = batch_rows as u64;
-        futures::stream::try_unfold((self, 0u64), move |(run, mut at)| async move {
+        futures::stream::try_unfold((self, 0u64), move |(mut run, mut at)| async move {
+            run.ask_statistics().await?;
             let len = run.len();
             while at < len {
                 let next = at.saturating_add(batch).min(len);
@@ -1101,6 +1159,7 @@ async fn decide_by_statistics(
     let RunRows::Table(rows) = &run.rows else {
         return Ok(());
     };
+    crate::observe::observe!(StatisticsAsked);
     let rows = rows.clone();
     let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
     let (mut unsettled, mut proofs) = (Vec::new(), Vec::new());
