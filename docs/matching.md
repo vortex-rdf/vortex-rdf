@@ -659,7 +659,7 @@ nothing.
 with its rows (`vortexrdf.value_counts`, at most 16 per zone:
 [file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)). The
 store registers a falsifier of `g = c` over them,
-[`ValueCountsFalsifier`](../core/src/stats_rules.rs#L70), which Vortex's
+[`ValueCountsFalsifier`](../core/src/stats_rules.rs#L71), which Vortex's
 pruning applies beside the bounds. A zone whose bounds contain `c` but whose
 recorded graphs don't is excluded too. So graphs spread across the zones (many
 graphs, each zone holding a few, their codes interleaved) prune as well as

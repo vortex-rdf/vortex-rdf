@@ -66,6 +66,7 @@ impl vortex_array::stats::rewrite::StatsRewriteRule for EqSatisfier {
 /// statistic has none in scope: both leave the proof undecided. Given only
 /// for a non-nullable `u64` column (the aggregate's input) and a non-null
 /// `u64` literal, and not while `VORTEX_RDF_ZONES=0` ([`zones_switch`]).
+/// A located run applies the same records itself ([`BOUNDS_SESSION`]).
 #[derive(Debug)]
 pub(crate) struct ValueCountsFalsifier;
 
@@ -124,10 +125,27 @@ pub(crate) fn register(session: &VortexSession) {
     session.stats().register_rewrite(ValueCountsFalsifier);
 }
 
+/// The session a located run builds its proofs of `x = c` in
+/// ([`eq_proofs`]): Vortex's built-in rules and [`EqSatisfier`], without the
+/// [`ValueCountsFalsifier`]. A located run applies a zone's recorded values
+/// from the records it decodes once per file
+/// ([`ColumnZones::recorded_count`](crate::io::zone_map::ColumnZones::recorded_count)),
+/// a search per zone. Asked in a proof on every call, that falsifier cost a
+/// count about 30 µs: its list function evaluated over the zone table, and
+/// its term at the footer, which kept Vortex from folding the footer's proof
+/// to a constant.
+#[cfg(feature = "file-io")]
+static BOUNDS_SESSION: std::sync::LazyLock<VortexSession> = std::sync::LazyLock::new(|| {
+    use vortex_array::stats::session::StatsSessionExt as _;
+    let session = VortexSession::empty();
+    session.stats().register_rewrite(EqSatisfier);
+    session
+});
+
 /// The two proofs of `x = code` over a column of `column` dtype, as Vortex
-/// builds them from the store session's rules: `none` holds where no row can
-/// equal `code` (the falsifier), `all` where every row does (the
-/// satisfier); either is `None` where no rule proves it.
+/// builds them from the bounds' rules ([`BOUNDS_SESSION`]): `none` holds
+/// where no row can equal `code` (the falsifier), `all` where every row does
+/// (the satisfier); either is `None` where no rule proves it.
 #[cfg(feature = "file-io")]
 pub(crate) struct EqProofs {
     pub(crate) none: Option<BoundExpression>,
@@ -141,13 +159,12 @@ pub(crate) fn eq_proofs(
     column: &vortex_array::dtype::DType,
     code: u64,
 ) -> crate::error::Result<EqProofs> {
-    use crate::session::VORTEX_SESSION;
     use vortex_array::expr::{eq, lit, root};
 
     let expr = eq(root(), lit(code)).bind(column)?;
     Ok(EqProofs {
-        none: expr.falsify(&VORTEX_SESSION)?,
-        all: expr.satisfy(&VORTEX_SESSION)?,
+        none: expr.falsify(&BOUNDS_SESSION)?,
+        all: expr.satisfy(&BOUNDS_SESSION)?,
     })
 }
 
@@ -216,5 +233,32 @@ mod tests {
         assert!(satisfier.is_none(), "floats");
         let nullable = DType::Primitive(PType::U64, Nullability::Nullable);
         assert!(eq_proofs(&nullable, 5).unwrap().all.is_none(), "nullable");
+    }
+
+    /// A located run's proofs of `x = c` are the bounds' alone: it applies a
+    /// zone's recorded values from the records it decodes, a search per
+    /// zone, where Vortex would evaluate the recorded-values falsifier's list
+    /// function on every call. The store session's own falsifier, which
+    /// Vortex's scans prune with, still carries them.
+    #[test]
+    fn located_proofs_leave_recorded_values_to_the_records() {
+        use vortex_array::expr::{eq, lit, root};
+
+        let located = eq_proofs(&U64, 5).unwrap();
+        let none = located.none.expect("a falsifier from the bounds");
+        assert!(!none.to_string().contains("value_counts"), "{none}");
+        assert!(located.all.is_some(), "the satisfier stays");
+        if zones_switch() {
+            let scans = eq(root(), lit(5u64))
+                .bind(&U64)
+                .unwrap()
+                .falsify(&crate::session::VORTEX_SESSION)
+                .unwrap()
+                .expect("the store session's falsifier");
+            assert!(
+                scans.to_string().contains("vortexrdf.value_counts"),
+                "{scans}"
+            );
+        }
     }
 }

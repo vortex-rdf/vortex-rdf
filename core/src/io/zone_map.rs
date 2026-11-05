@@ -91,26 +91,20 @@ impl ExactZoneMap {
 
 /// A non-nullable `u64` column's zone map as Vortex's own [`ZoneMap`] takes
 /// it: the zone table's exact bounds ([`exact_bound_aggregates`], `max` then
-/// `min`), one row per zone, then the values each zone holds with their rows
-/// where the column records them (`vortexrdf.value_counts`, a graph column
-/// of a file written since the `vortexrdf 2026.11.0` edition). A stats proof
-/// (a falsifier or a satisfier) is evaluated over a range of its zones by
-/// [`prune`](Self::prune), Vortex's [`ZoneMap::prune`] on those zones' rows
-/// of the table; a zone's recorded rows of a code are
-/// [`recorded_count`](Self::recorded_count).
+/// `min`), one row per zone; and beside it, where the column records them
+/// (`vortexrdf.value_counts`, a graph column of a file written since the
+/// `vortexrdf 2026.11.0` edition), the values each zone holds with their
+/// rows, decoded once. A stats proof (a falsifier or a satisfier) is
+/// evaluated over a range of its zones by [`prune`](Self::prune), Vortex's
+/// [`ZoneMap::prune`] on those zones' rows of the table; a zone's recorded
+/// rows of a code are [`recorded_count`](Self::recorded_count).
 ///
 /// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
 /// [`ZoneMap::prune`]: vortex_layout::layouts::zoned::zone_map::ZoneMap::prune
 #[cfg(feature = "file-io")]
 pub(crate) struct ColumnZones {
-    /// The zone table: `max`, then `min`, each a nullable `u64` column, then
-    /// each zone's recorded values where the column records them.
+    /// The zone table: `max`, then `min`, each a nullable `u64` column.
     table: StructArray,
-    /// The aggregates of the table's columns, in order, as [`ZoneMap`]
-    /// takes them.
-    ///
-    /// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
-    aggregates: Arc<[AggregateFnRef]>,
     /// Each zone's recorded values, `None` for every zone of a column
     /// without the statistic.
     recorded: Option<RecordedZones>,
@@ -136,64 +130,48 @@ impl ColumnZones {
         zone_len: u64,
         row_count: u64,
     ) -> Result<Self> {
-        Self::new(mins, maxes, None, zone_len, row_count)
-    }
-
-    /// The zone map of [`from_bounds`](Self::from_bounds), recording the
-    /// values `states` holds for each zone (the zone table's
-    /// `vortexrdf.value_counts` column) where given.
-    fn new(
-        mins: vortex_buffer::Buffer<u64>,
-        maxes: vortex_buffer::Buffer<u64>,
-        states: Option<ArrayRef>,
-        zone_len: u64,
-        row_count: u64,
-    ) -> Result<Self> {
         use vortex_array::IntoArray as _;
         use vortex_array::arrays::PrimitiveArray;
         use vortex_array::validity::Validity;
 
         let zones = mins.len();
-        let recorded_zones = states.as_ref().map_or(zones, ArrayRef::len);
-        if maxes.len() != zones
-            || recorded_zones != zones
-            || zone_len == 0
-            || row_count.div_ceil(zone_len) != zones as u64
-        {
+        if maxes.len() != zones || zone_len == 0 || row_count.div_ceil(zone_len) != zones as u64 {
             return Err(crate::error::VortexRdfError::InvalidInput(format!(
-                "{zones} minimums, {} maximums and {recorded_zones} recorded zones for \
-                 {row_count} rows in zones of {zone_len}",
+                "{zones} minimums and {} maximums for {row_count} rows in zones of {zone_len}",
                 maxes.len()
             )));
         }
-        let mut aggregates = exact_bound_aggregates().to_vec();
-        let mut columns = vec![
-            PrimitiveArray::new(maxes, Validity::AllValid).into_array(),
-            PrimitiveArray::new(mins, Validity::AllValid).into_array(),
-        ];
-        let recorded = match states {
-            Some(states) => {
-                let (states, recorded) = decode_states(states)?;
-                aggregates.push(crate::store::value_counts::value_counts());
-                columns.push(states);
-                Some(recorded)
-            }
-            None => None,
-        };
-        let names: Vec<String> = aggregates.iter().map(ToString::to_string).collect();
+        let aggregates = exact_bound_aggregates();
+        let names: Vec<String> = aggregates.iter().map(|a| a.to_string()).collect();
         let table = StructArray::try_new(
             names.iter().map(String::as_str).collect::<Vec<_>>().into(),
-            columns,
+            vec![
+                PrimitiveArray::new(maxes, Validity::AllValid).into_array(),
+                PrimitiveArray::new(mins, Validity::AllValid).into_array(),
+            ],
             zones,
             Validity::NonNullable,
         )?;
         Ok(Self {
             table,
-            aggregates: aggregates.into(),
-            recorded,
+            recorded: None,
             zone_len,
             row_count,
         })
+    }
+
+    /// This zone map with the values `states` records for each zone (the
+    /// zone table's `vortexrdf.value_counts` column), decoded once.
+    fn with_recorded(mut self, states: ArrayRef) -> Result<Self> {
+        if states.len() as u64 != self.zones() {
+            return Err(crate::error::VortexRdfError::InvalidInput(format!(
+                "{} recorded zones for {} zone bounds",
+                states.len(),
+                self.zones()
+            )));
+        }
+        self.recorded = Some(decode_states(states)?);
+        Ok(self)
     }
 
     /// `column`'s zone map, read through `source`: `None` when `column` is
@@ -228,14 +206,16 @@ impl ColumnZones {
             .unmasked_field_by_name_opt(value_counts().to_string())
             .filter(|states| states.dtype() == &state_dtype())
             .cloned();
-        Self::new(
+        let zones = Self::from_bounds(
             mins.into_buffer::<u64>(),
             maxes.into_buffer::<u64>(),
-            states,
             map.zone_len as u64,
             column.row_count(),
-        )
-        .map(Some)
+        )?;
+        match states {
+            Some(states) => zones.with_recorded(states).map(Some),
+            None => Ok(Some(zones)),
+        }
     }
 
     /// Rows per zone, the last zone's excepted.
@@ -297,7 +277,7 @@ impl ColumnZones {
         let map = ZoneMap::try_new(
             DType::Primitive(PType::U64, Nullability::NonNullable),
             table,
-            Arc::clone(&self.aggregates),
+            exact_bound_aggregates(),
             self.zone_len,
             rows,
         )?;
@@ -314,11 +294,11 @@ fn bounds_of<A: Executable>(table: &StructArray, ctx: &mut ExecutionCtx) -> Resu
     Ok(max.zip(min))
 }
 
-/// A zone table's `vortexrdf.value_counts` column executed once to canonical
-/// arrays all through, and each zone's `(code, rows)` pairs decoded from it:
-/// `None` for a zone past the statistic's limit (a null state).
+/// Each zone's `(code, rows)` pairs, decoded from a zone table's
+/// `vortexrdf.value_counts` column executed once to canonical arrays all
+/// through: `None` for a zone past the statistic's limit (a null state).
 #[cfg(feature = "file-io")]
-fn decode_states(states: ArrayRef) -> Result<(ArrayRef, RecordedZones)> {
+fn decode_states(states: ArrayRef) -> Result<RecordedZones> {
     use crate::store::value_counts::decode_state;
     use vortex_array::{IntoArray as _, RecursiveCanonical};
 
@@ -327,12 +307,11 @@ fn decode_states(states: ArrayRef) -> Result<(ArrayRef, RecordedZones)> {
         .execute::<RecursiveCanonical>(&mut ctx)?
         .0
         .into_array();
-    let recorded = (0..states.len())
+    (0..states.len())
         .map(|zone| {
             Ok(decode_state(&states.execute_scalar(zone, &mut ctx)?).map(Vec::into_boxed_slice))
         })
-        .collect::<Result<_>>()?;
-    Ok((states, recorded))
+        .collect()
 }
 
 /// Column `name` of a zone table executed to `A`, `None` when the table lacks

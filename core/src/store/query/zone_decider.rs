@@ -1,8 +1,9 @@
 //! The zone level of the statistics ladder (spec §3, level 2): how each zone
 //! of a table stands against the bound slots a located run checks, decided
 //! by Vortex's own proofs of `x = c` ([`eq_proofs`]) on the checked columns'
-//! zone maps ([`ColumnZones`]): no row of the zone holds every checked code,
-//! every row does, or the zone is mixed.
+//! zone maps ([`ColumnZones`]) and by the values a graph column's zones
+//! record: no row of the zone holds every checked code, every row does, or
+//! the zone is mixed.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -74,9 +75,10 @@ impl ZoneDecider {
     }
 
     /// The class of each zone of `zones`, in order: [`ZoneClass::None`]
-    /// where any column's falsifier holds, [`ZoneClass::All`] where every
-    /// column's satisfier does, [`ZoneClass::Mixed`] otherwise, naming the
-    /// columns neither proof settles.
+    /// where any column's falsifier holds or the values its zone recorded
+    /// lack the column's code, [`ZoneClass::All`] where every column's
+    /// satisfier does, [`ZoneClass::Mixed`] otherwise, naming the columns
+    /// none of these settle.
     pub(crate) fn classify(&self, zones: Range<u64>) -> Result<Vec<ZoneClass>> {
         let n = (zones.end - zones.start) as usize;
         let (mut none, mut all, mut unsettled) = (vec![false; n], vec![true; n], vec![0u8; n]);
@@ -93,7 +95,9 @@ impl ZoneDecider {
             };
             let (no_row, every_row) = (holds(falsifier)?, holds(satisfier)?);
             for z in 0..n {
-                let zone_none = no_row.as_ref().is_some_and(|mask| mask.value(z));
+                let zone = zones.start + z as u64;
+                let zone_none = no_row.as_ref().is_some_and(|mask| mask.value(z))
+                    || column.zones.recorded_count(zone, column.code) == Some(0);
                 let zone_all = every_row.as_ref().is_some_and(|mask| mask.value(z));
                 none[z] |= zone_none;
                 all[z] &= zone_all;
