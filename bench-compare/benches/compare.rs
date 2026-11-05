@@ -31,7 +31,8 @@
 //! adapter answers is read once with the consuming read under a sampler of
 //! `/proc/self/status` every 2 ms, and the store is disposed of again. The two
 //! peaks are the sample with the highest `RssAnon + RssFile` during the reads,
-//! above the baseline taken before the first open. Mapped pages
+//! above the baseline taken before the first open. The reads run on the second
+//! store, so a peak can include memory the allocator kept from the first. Mapped pages
 //! include the program's own code pages that the open and the reads first touch,
 //! a few MB to a few tens of MB, depending on the library; the Vortex rows read
 //! about 7 to 8 MB of them. An in-memory store reads that much of file peak, and

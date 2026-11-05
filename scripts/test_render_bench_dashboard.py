@@ -176,22 +176,25 @@ class PanelParser(HTMLParser):
             self._cell["text"].append(data)
 
 
-def footprint_panels(page: str) -> dict[str, list[dict]]:
+def rendered_hosts(page: str) -> dict[str, str]:
+    """Each footprint host's HTML after the page's script has run, from one node run."""
     scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
     run = subprocess.run(["node", "-e", PAGE_RUNNER], input=scripts[-1], capture_output=True, text=True, check=True)
+    return json.loads(run.stdout)
+
+
+def footprint_panels(page: str, hosts: dict[str, str] | None = None) -> dict[str, list[dict]]:
     panels = {}
-    for host, html in json.loads(run.stdout).items():
+    for host, html in (hosts or rendered_hosts(page)).items():
         parser = PanelParser()
         parser.feed(html)
         panels[host] = parser.panels
     return panels
 
 
-def failures_text(page: str) -> str:
+def failures_text(hosts: dict[str, str]) -> str:
     """The text of the `js-failures` line, tags stripped."""
-    scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
-    run = subprocess.run(["node", "-e", PAGE_RUNNER], input=scripts[-1], capture_output=True, text=True, check=True)
-    return re.sub(r"<[^>]+>", "", json.loads(run.stdout)["js-failures"])
+    return re.sub(r"<[^>]+>", "", hosts["js-failures"])
 
 
 def panel(panels, title):
@@ -322,18 +325,22 @@ def test_the_syntax_check_rejects_a_script_that_does_not_parse(tmp_path):
 JS_FAILS = [
     {"slug": "oxigraph", "label": "oxigraph", "role": "fullscan", "phase": "full::count", "error": "unreachable"},
     {"slug": "rdfstores_single", "label": "rdf-stores (1 index)", "role": "query", "phase": "ingest", "error": "boom"},
+    {"slug": "hdt", "label": "hdt", "role": "memory", "phase": "worker", "error": "the memory worker wrote no memory run"},
 ]
 
 
 def test_a_js_phase_that_could_not_complete_reads_failed_and_is_listed(tmp_path):
     page = render_page(tmp_path, failures={"js": JS_FAILS})
-    panels = footprint_panels(page)
+    hosts = rendered_hosts(page)
+    panels = footprint_panels(page, hosts)
     match = panel(panels["js-query-panels"], "Cross-library match, by routing shape and cache regime")
     cells = match["rows"]["oxigraph"]
     assert [i for i, c in enumerate(cells) if c["failed"]] == [34]      # full, warm, count-only
     assert cells[34]["text"] == "failed" and "unreachable" in cells[34]["title"]
     build = panel(panels["js-ingest-panels"], "Build and open")["rows"]["rdf-stores (1 index)"][0]
     assert build["failed"] and build["text"] == "failed" and "boom" in build["title"]
-    line = failures_text(page)
+    line = failures_text(hosts)
     assert "oxigraph · fullscan · full::count: unreachable" in line
     assert "rdf-stores (1 index) · query · ingest: boom" in line
+    assert "hdt · memory · worker: the memory worker wrote no memory run" in line
+    assert not any(c["failed"] for c in match["rows"].get("hdt", []))
