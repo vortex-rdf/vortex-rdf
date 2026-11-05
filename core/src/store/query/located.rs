@@ -102,10 +102,12 @@ impl VortexRdfStore {
     /// ([`locate_codes`](Self::locate_codes)), the general match's rows in its
     /// own order otherwise. Which of the two answers depends on the store and
     /// `pattern` alone, so every window of one pattern comes in the same order.
-    /// Each window is found anew: a run whose rows are checked is checked
-    /// from its start as far as the window's last row (no further, as no
-    /// count is asked), so a caller reading a long match through
-    /// [`match_code_chunks`](Self::match_code_chunks) reads it once.
+    /// Each window is found anew: a run whose rows are checked finds the
+    /// window's first zone by its zones' counts where the statistics decide
+    /// it, and is otherwise checked from its start as far as the window's
+    /// last row (no further, as no count is asked), so a caller reading a
+    /// long match through [`match_code_chunks`](Self::match_code_chunks)
+    /// reads it once.
     /// Matches nothing and fails as
     /// [`count_code_pattern`](Self::count_code_pattern) does.
     pub async fn match_code_pattern(
@@ -214,8 +216,10 @@ impl VortexRdfStore {
     /// holds, matches nothing. Whether it answers depends on the store and
     /// `pattern` alone, never on the window, so every window of one pattern
     /// comes from the same table, in the same order. A run whose rows are
-    /// checked is checked whole, a block at a time, to count them, and only
-    /// the window's rows are kept; nothing is kept between calls. With the
+    /// checked is counted whole: zone by zone where the statistics decide it
+    /// (zones they settle by their size, the rest on the column's encoding
+    /// or by their rows), a block at a time otherwise, and only the window's
+    /// rows are kept; nothing is kept between calls. With the
     /// ablation switch `VORTEX_RDF_LOCATE=0` ([`locate_enabled`]) it declines
     /// every pattern.
     ///
@@ -796,9 +800,9 @@ impl LocatedRun {
 
     /// The window `offset..offset + limit` (`None`: to the last) of the
     /// run's matches, beside their number: with no slot checked the run's
-    /// length, and only the window's rows read; otherwise every row of the
-    /// run is checked, a block at a time, to count the rows kept, and only
-    /// those in the window are held.
+    /// length, and only the window's rows read; otherwise the whole run is
+    /// counted, zone by zone where the statistics decide it and a block at a
+    /// time where they do not, and only the rows in the window are held.
     async fn window(&self, offset: usize, limit: Option<usize>) -> Result<LocatedCodes> {
         let (total, rows) = self.window_of_matches(offset, limit, true).await?;
         let columns = self.columns(&rows).await?;
@@ -820,9 +824,11 @@ impl LocatedRun {
     /// The rows of the window `offset..offset + limit` of the run's matches,
     /// beside the number of matches the reads counted: all of them, with no
     /// slot checked or with `whole`; otherwise those up to the window's last
-    /// row, where the checks stop. A checked run is read a block at a time,
-    /// [`FIRST_GAP_BLOCK`] rows first and each next block twice as many, up
-    /// to [`GAP_BLOCK`]: a window near the run's start reads little of it.
+    /// row, where the checks stop. A run the statistics decide goes zone by
+    /// zone ([`zoned_window`](Self::zoned_window)); any other checked run is
+    /// read a block at a time, [`FIRST_GAP_BLOCK`] rows first and each next
+    /// block twice as many, up to [`GAP_BLOCK`]: a window near the run's
+    /// start reads little of it.
     async fn window_of_matches(
         &self,
         offset: usize,
@@ -1074,10 +1080,6 @@ async fn locate_run(
     Ok(Some(run))
 }
 
-/// Rows of a run whose rows are checked (a prefix run with bound slots past
-/// it, or a reference run with other slots bound) up to which it answers; a
-/// longer one declines, for the caller's other paths, as a window of it
-/// checks every row to count them.
 /// The statistics' decisions on `run`, a gap run of sorted table `table`
 /// (`component` names it, `None` the quad table), in ladder order (spec §3):
 /// the footer settles each checked slot for the whole file, leaving the run
@@ -1306,6 +1308,11 @@ fn gap_rows() -> u64 {
     GAP_ROWS
 }
 
+/// Rows of a run whose rows are checked row by row (a prefix run with bound
+/// slots past it that the statistics do not decide, or a reference run with
+/// other slots bound) up to which it answers; a longer one declines, for the
+/// caller's other paths, as a window of it checks every row to count them.
+/// A run the zone maps decide is not capped.
 #[cfg(feature = "file-io")]
 const GAP_ROWS: u64 = 1 << 23;
 

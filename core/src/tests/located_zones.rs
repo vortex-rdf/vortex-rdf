@@ -219,13 +219,20 @@ async fn streamed(
         .collect()
 }
 
+/// What a pattern answers: its count, its windows, its streams, and its
+/// located windows with their totals.
+type Answers = (
+    u64,
+    Vec<Vec<[TermCode; 4]>>,
+    Vec<Vec<[TermCode; 4]>>,
+    Vec<(u64, Vec<[TermCode; 4]>)>,
+);
+
 /// What `pattern` answers on `store`: its count, its windows (pages of 1,
 /// 3 and 64 at the run's ends and middle, and 32 one-row reads spread over
-/// it) and its streams (chunks of 999 and 4,096 rows).
-async fn answers(
-    store: &VortexRdfStore,
-    pattern: crate::CodePattern,
-) -> (u64, Vec<Vec<[TermCode; 4]>>, Vec<Vec<[TermCode; 4]>>) {
+/// it), its streams (chunks of 999 and 4,096 rows), and the pages again
+/// through `locate_codes`, each with the run's count beside it.
+async fn answers(store: &VortexRdfStore, pattern: crate::CodePattern) -> Answers {
     let total = store.count_code_pattern(pattern).await.unwrap();
     if let Some(located) = store.locate_codes(pattern, 0, Some(0)).await.unwrap() {
         assert_eq!(located.total, total, "{pattern:?}: the located count");
@@ -235,6 +242,17 @@ async fn answers(
     for limit in [1, 3, 64] {
         for offset in [0, 1, t / 2, t.saturating_sub(1), t] {
             reads.push((offset, limit));
+        }
+    }
+    let mut located = Vec::new();
+    for &(offset, limit) in &reads {
+        if let Some(found) = store
+            .locate_codes(pattern, offset, Some(limit))
+            .await
+            .unwrap()
+        {
+            assert_eq!(found.total, total, "{pattern:?}: a located page's count");
+            located.push((found.total, code_rows::<4>(&found.columns)));
         }
     }
     reads.extend((0..32).map(|k| (k * t / 32, 1)));
@@ -250,7 +268,7 @@ async fn answers(
     for batch in [999, 4096] {
         streams.push(streamed(store, pattern, batch).await);
     }
-    (total, windows, streams)
+    (total, windows, streams, located)
 }
 
 /// The term path's rows of `pattern`: its codes spelled out and matched.
