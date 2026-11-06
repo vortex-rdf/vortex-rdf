@@ -54,8 +54,19 @@ impl ExactZoneMap {
         let exact = exact_bound_aggregates()
             .iter()
             .all(|aggregate| present.contains(&aggregate.to_string()));
-        // A zoned layout's zone table is its second slot, after the data.
-        let table = exact.then(|| column.slot(1).ok().flatten()).flatten()?;
+        // A zoned layout's zone table is its `zones` auxiliary child.
+        let table = exact
+            .then(|| {
+                (0..column.nslots()).find_map(|slot| match column.slot_type(slot) {
+                    Some(vortex_layout::LayoutChildType::Auxiliary(name))
+                        if name.as_ref() == "zones" =>
+                    {
+                        column.slot(slot).ok().flatten()
+                    }
+                    _ => None,
+                })
+            })
+            .flatten()?;
         Some(Self {
             table,
             zone_len: zoned.zone_len(),

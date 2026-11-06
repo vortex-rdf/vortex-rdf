@@ -453,7 +453,7 @@ the compare; with none left the selection is the answer, compared nowhere
 ([`ask_statistics`](../core/src/store/scan/residual.rs#L66)). This is what
 Vortex's falsifier of `x = c` and the store's satisfier prove on exact
 bounds, read off the bounds directly
-([`eq_on_bounds`](../core/src/io/zone_map.rs#L353)): building and
+([`eq_on_bounds`](../core/src/io/zone_map.rs#L364)): building and
 evaluating the proofs for a residual cost tens of µs, more than many
 residuals' whole compare.
 On a one-graph store a graph equality settles this way. The view still counts
@@ -474,7 +474,7 @@ selection wider than a zone, the zones it touches are classed once against
 the equalities left, by the same rule on each bound column's zone bounds
 and the graphs `g`'s zones record
 ([`ResidualZones`](../core/src/store/scan/residual.rs#L133),
-[`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L198)): "none" where a
+[`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L209)): "none" where a
 code lies outside its zone's bounds or the zone's recorded graphs lack it,
 "all" where every bound column's zone bounds are its code, mixed otherwise
 (a test pins the rule to Vortex's proofs on each zone).
