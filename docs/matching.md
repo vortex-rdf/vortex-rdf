@@ -274,7 +274,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L276) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L459), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L808) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L810) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L167-L174 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -450,7 +450,7 @@ zone maps are taken (below; a loaded store's are its file's footer
 statistics). A constrained column's code outside its bounds leaves the
 selection no row, and bounds that are both the code drop the equality from
 the compare; with none left the selection is the answer, compared nowhere
-([`ask_statistics`](../core/src/store/scan/residual.rs#L66)). This is what
+([`ask_statistics`](../core/src/store/scan/residual.rs#L68)). This is what
 Vortex's falsifier of `x = c` and the store's satisfier prove on exact
 bounds, read off the bounds directly
 ([`eq_on_bounds`](../core/src/io/zone_map.rs#L369)): building and
@@ -464,7 +464,7 @@ the view's tail and indexes.
 Then the **zone classes** narrow the rows to compare. An in-memory base keeps
 a Vortex zone map of each code column's 8,192-row zones, their exact bounds,
 and for the graph column the graphs each zone records with their rows
-([`QuadZones`](../core/src/store/zones.rs#L30)), as a file store's located runs
+([`QuadZones`](../core/src/store/zones.rs#L33)), as a file store's located runs
 read them: taken in the pass that compresses a build's codes (the graphs with
 Vortex's accumulator of `vortexrdf.value_counts`), or read from the zone
 tables of the file a store is loaded from (`from_file_in_memory`,
@@ -473,7 +473,7 @@ columns of the Default and TypedObject layouts) skips this step. Over a
 selection wider than a zone, the zones it touches are classed once against
 the equalities left, by the same rule on each bound column's zone bounds
 and the graphs `g`'s zones record
-([`ResidualZones`](../core/src/store/scan/residual.rs#L133),
+([`ResidualZones`](../core/src/store/scan/residual.rs#L135),
 [`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L209)): "none" where a
 code lies outside its zone's bounds or the zone's recorded graphs lack it,
 "all" where every bound column's zone bounds are its code, mixed otherwise
@@ -482,7 +482,7 @@ The selection's rows in "none" zones are skipped, those in "all" zones are
 taken uncompared, and those in a mixed zone are compared on the columns it
 leaves unsettled only, adjacent zones of one treatment as one run, through
 the implementations below
-([`residual_rows`](../core/src/store/scan/residual.rs#L637)). Each run's
+([`residual_rows`](../core/src/store/scan/residual.rs#L639)). Each run's
 compare decides whether to decode its columns on the residual's whole
 selection, not the run's rows, so a residual over every row decodes them once
 for all its runs. When the runs to compare are several and hold more than
@@ -494,10 +494,10 @@ left pending (below) keeps its classes, and counts and windows by them.
 With zones off (`VORTEX_RDF_ZONES=0`) the residual keeps its route from before
 the classes, bounds only: the zones whose bounds leave a constrained
 column's code out are left out
-([`kept_runs`](../core/src/store/zones.rs#L122)), when what is left holds at
+([`kept_runs`](../core/src/store/zones.rs#L125)), when what is left holds at
 most half the base: a run of rows (every row, or a subject's range) is
 compared zone run by zone run, each a slice of the base through the mask
-scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L781)), and an
+scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L783)), and an
 id list keeps only its ids in those runs before the implementations below
 compare them. A code most zones may hold (a predicate or graph spread over
 every zone) leaves everything to compare.
@@ -545,17 +545,17 @@ windowed (`IdsNeed::CountOrWindow`: `count_probe` with a limit, and
 how many rows it needs, its window's offset and limit. When those are fewer
 than the rows the selection holds, and the selection holds more than one
 8,192-row piece, the compare is left pending
-([`PendingResidual`](../core/src/store/view/pending.rs#L37)) as the view's
+([`PendingResidual`](../core/src/store/view/pending.rs#L40)) as the view's
 selection (`ViewSelection::Residual`), as a deferred index run's ids are.
 With its zone classes, `size_capped` counts the zones in base order until
 the cap, and `window` counts the zones before the window, unread where they
 can be (below), then reads the matches from the zone holding its first to
-its last ([`zoned_window`](../core/src/store/scan/residual.rs#L435)). Without
+its last ([`zoned_window`](../core/src/store/scan/residual.rs#L437)). Without
 them (zones off, or no zone map for its columns), both compare the selection
 in pieces, in base row order, a zone's rows first and four times as many
 each piece after, each through the implementations above, and stop at the
 piece that brings the live rows they need to their count
-([`prefix`](../core/src/store/view/pending.rs#L208)); a selection no wider
+([`prefix`](../core/src/store/view/pending.rs#L215)); a selection no wider
 than that count is one piece, and a compare that runs to the end keeps its
 matches as the view's ids. Any other consumer compares the whole selection
 at once. A window that reaches every row, a probe with keeps and
@@ -566,7 +566,7 @@ above the typed residual's caps, so the mask scan compares it.
 A count without a limit (`IdsNeed::Count`: `size` through `count_probe` and
 `count_code_pattern`) leaves the compare pending too, and counts it zone by
 zone on its zone classes, with no match materialized
-([`zoned_count`](../core/src/store/scan/residual.rs#L332)): a "none" zone
+([`zoned_count`](../core/src/store/scan/residual.rs#L334)): a "none" zone
 counts nothing, an "all" zone its selected live rows, and a mixed zone with
 one column left to compare and no tombstone among its selected rows counts
 from the zone's recorded graphs when the selection holds the whole zone,

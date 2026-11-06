@@ -268,9 +268,10 @@ before it by their counts.
 `VORTEX_RDF_ZONES=0` (read once)
 checks every row instead, as before, and leaves the general match's zone
 pruning to the bounds, without the recorded graphs.
-With `VORTEX_RDF_COUNTERS=1` the engine counters count these decisions: the
-slots the footer settles (`zone_column`), the zones settled none and all
-(`zone_none`, `zone_all`), the mixed zones counted from their recorded graphs
+With `VORTEX_RDF_COUNTERS=1` the engine counters count a located run's
+decisions, not the general match's or the residual compare's: the slots the
+footer settles (`zone_column`), the zones settled none and all (`zone_none`,
+`zone_all`), the mixed zones counted from their recorded graphs
 (`zone_recorded`) or on their encoding (`zone_counted`) and the rows read to
 check (`check_read`), each with its rows.
 
