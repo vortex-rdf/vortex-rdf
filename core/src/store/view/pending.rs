@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::observe::observe;
 use crate::store::MemoryBase;
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
-use crate::store::scan::residual::residual_rows;
+use crate::store::scan::residual::{ResidualZones, residual_rows};
 use crate::store::schema::RowId;
 use crate::store::view::selection::{RowSelection, SelectedRows, window_rows};
 
@@ -38,6 +38,8 @@ pub(crate) struct PendingResidual {
     memory: MemoryBase,
     selection: RowSelection,
     eqs: Vec<(&'static str, Scalar)>,
+    /// The selection's zones classed against `eqs`, once, for every piece.
+    zones: Option<ResidualZones>,
     ids: OnceLock<Buffer<RowId>>,
 }
 
@@ -79,17 +81,20 @@ impl ResidualPrefix {
 
 impl PendingResidual {
     /// The compare of `eqs` over `selection`, of `memory`'s base, left
-    /// pending.
+    /// pending, with the selection's zones classed against them (`zones`,
+    /// [`ResidualZones`]), if any.
     pub(crate) fn new(
         memory: MemoryBase,
         selection: RowSelection,
         eqs: Vec<(&'static str, Scalar)>,
+        zones: Option<ResidualZones>,
     ) -> Self {
         observe!(ResidualDeferred);
         Self {
             memory,
             selection,
             eqs,
+            zones,
             ids: OnceLock::new(),
         }
     }
@@ -100,7 +105,13 @@ impl PendingResidual {
         if let Some(ids) = self.ids.get() {
             return Ok(ids.clone());
         }
-        let matched = residual_rows(&self.memory, self.selection.clone(), &self.eqs, None)?;
+        let matched = residual_rows(
+            &self.memory,
+            self.selection.clone(),
+            &self.eqs,
+            self.zones.as_ref(),
+            None,
+        )?;
         let ids = match matched.as_rows(self.memory.base.len()) {
             SelectedRows::Run(run) => (run.start as RowId..run.end as RowId).collect(),
             SelectedRows::Ids(ids) => ids.clone(),
@@ -186,8 +197,13 @@ impl PendingResidual {
             }
             let piece = piece.start as usize..piece.end as usize;
             observe!(ResidualPiece(piece.len()));
-            let matched =
-                residual_rows(&self.memory, rows_at(&rows, piece.clone()), &self.eqs, None)?;
+            let matched = residual_rows(
+                &self.memory,
+                rows_at(&rows, piece.clone()),
+                &self.eqs,
+                self.zones.as_ref(),
+                None,
+            )?;
             let found = ids.len();
             match matched.as_rows(base_len) {
                 SelectedRows::Run(run) => ids.extend(run.start as RowId..run.end as RowId),

@@ -69,6 +69,7 @@ impl ZoneDecider {
     /// the slot's column recorded them
     /// ([`ColumnZones::recorded_count`]): `None` where the column records
     /// none for the zone, or `slot` is not checked.
+    #[cfg_attr(not(feature = "file-io"), expect(dead_code))]
     pub(crate) fn recorded_count(&self, slot: usize, zone: u64) -> Option<u64> {
         let column = self.columns.iter().find(|column| column.slot == slot)?;
         column.zones.recorded_count(zone, column.code)
@@ -81,6 +82,7 @@ impl ZoneDecider {
     /// none of these settle.
     pub(crate) fn classify(&self, zones: Range<u64>) -> Result<Vec<ZoneClass>> {
         let n = (zones.end - zones.start) as usize;
+        crate::observe::observe!(ZonesClassed(n as u64));
         let (mut none, mut all, mut unsettled) = (vec![false; n], vec![true; n], vec![0u8; n]);
         for column in &self.columns {
             let EqProofs {

@@ -274,7 +274,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L448), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L222) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L185) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L444) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:152-159`](../core/src/store/query/matching/memory.rs#L152-L159 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -418,14 +418,14 @@ zone maps are taken (below; a loaded store's are its file's footer
 statistics). Vortex's falsifier of a constrained column's `x = c` holding on
 them leaves the selection no row, and its satisfier holding drops the
 equality from the compare; with none left the selection is the answer,
-compared nowhere ([`settled_by_statistics`](../core/src/store/scan/residual.rs#L57)).
+compared nowhere ([`ask_statistics`](../core/src/store/scan/residual.rs#L67)).
 On a one-graph store a graph equality settles this way. The view still counts
 as narrowed by the residual, so a serve plan is dropped as a compare drops it
 and its rows read in base order, and a selection the statistics empty keeps
 the view's tail and indexes.
 
-Then **zone maps** narrow the rows to compare. An in-memory base keeps a
-Vortex zone map of each code column's 8,192-row zones, their exact bounds,
+Then the **zone classes** narrow the rows to compare. An in-memory base keeps
+a Vortex zone map of each code column's 8,192-row zones, their exact bounds,
 and for the graph column the graphs each zone records with their rows
 ([`QuadZones`](../core/src/store/zones.rs#L30)), as a file store's located runs
 read them: taken in the pass that compresses a build's codes (the graphs with
@@ -433,16 +433,30 @@ Vortex's accumulator of `vortexrdf.value_counts`), or read from the zone
 tables of the file a store is loaded from (`from_file_in_memory`,
 `from_bytes`), so no query pays for them. A base without them (the string
 columns of the Default and TypedObject layouts) skips this step. Over a
-selection wider than a zone, the zones where Vortex's falsifier of a
-constrained column's `x = c` holds, or whose recorded graphs lack the code,
-are left out ([`kept_runs`](../core/src/store/zones.rs#L129)), when what is
-left holds at most half the base: a run of rows (every row, or a
-subject's range) is compared zone run by zone run, each a slice of the base
-through the mask scan below
-([`runs_matching`](../core/src/store/scan/residual.rs#L158)), and an id list keeps
-only its ids in those runs before the implementations below compare them. A
-code most zones may hold (a predicate or graph spread over every zone) leaves
-everything to compare.
+selection wider than a zone, the zones it touches are classed once against
+the equalities left, by the same proofs on each bound column's zone map
+([`ResidualZones`](../core/src/store/scan/residual.rs#L135), through the
+located runs' zone decider): "none" where a falsifier holds or the recorded
+graphs lack the code, "all" where every satisfier holds, mixed otherwise.
+The selection's rows in "none" zones are skipped, those in "all" zones are
+taken uncompared, and those in a mixed zone are compared on the columns it
+leaves unsettled only, adjacent zones of one treatment as one run, through
+the implementations below
+([`residual_rows`](../core/src/store/scan/residual.rs#L281)). A range starting
+mid-zone or an id list is classed on the zones it touches, each cut at the
+zone boundaries. A residual left pending (below) keeps its classes for every
+piece it compares.
+
+With zones off (`VORTEX_RDF_ZONES=0`) the residual keeps its route from before
+the classes, bounds only: the zones where Vortex's falsifier of a constrained
+column's `x = c` holds on the zone bounds are left out
+([`kept_runs`](../core/src/store/zones.rs#L131)), when what is left holds at
+most half the base: a run of rows (every row, or a subject's range) is
+compared zone run by zone run, each a slice of the base through the mask
+scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L417)), and an
+id list keeps only its ids in those runs before the implementations below
+compare them. A code most zones may hold (a predicate or graph spread over
+every zone) leaves everything to compare.
 
 Then two implementations, in order:
 
@@ -492,7 +506,7 @@ selection (`ViewSelection::Residual`), as a deferred index run's ids are. `size_
 selection in pieces, in base row order, a zone's rows first and four times as
 many each piece after, each through the zone bounds and the implementations
 above, and stop at the piece that brings the live rows they need to their
-count ([`prefix`](../core/src/store/view/pending.rs#L151)); a selection no
+count ([`prefix`](../core/src/store/view/pending.rs#L162)); a selection no
 wider than that count is one piece. A compare that runs to the end keeps its
 matches as the view's ids, and any other consumer compares the whole
 selection at once. A count without a limit, a window that reaches every row,

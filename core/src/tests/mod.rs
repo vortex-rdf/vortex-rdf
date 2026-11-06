@@ -40,6 +40,7 @@ mod pending_residual;
 mod predicates;
 mod rebuild;
 mod reference_graphs;
+mod residual_zones;
 mod roundtrip;
 mod row_limit;
 mod serialization;

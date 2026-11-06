@@ -280,37 +280,39 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
-        // The ladder's first level (spec §3), the base columns' array
-        // statistics, asked before the compare is deferred or run: an
-        // equality no row holds leaves the selection no row (the view keeps
-        // its tail and indexes), one every row holds leaves the compare, and
-        // with none left the selection is the answer. Either way the residual
-        // has narrowed the view, so a serve plan is dropped as a compare
-        // drops it, and the rows read in base order.
+        // The ladder's first levels (spec §3), asked once, before the
+        // compare is deferred or run. The base columns' array statistics:
+        // an equality no row holds leaves the selection no row (the view
+        // keeps its tail and indexes), one every row holds leaves the
+        // compare, and with none left the selection is the answer. Either way
+        // the residual has narrowed the view, so a serve plan is dropped as a
+        // compare drops it, and the rows read in base order. Then the zones
+        // the selection touches, classed against the equalities left.
         let rows = selection.len(memory.base.len());
-        let eqs = if residual::asks_statistics(rows) && crate::stats_rules::zones_enabled() {
-            match residual::settled_by_statistics(&memory.base, eqs)? {
-                residual::Settled::Nothing => {
+        let (eqs, zones) = if residual::asks_statistics(rows) && crate::stats_rules::zones_enabled()
+        {
+            match residual::ask_statistics(memory, &selection, eqs)? {
+                residual::Asked::Nothing => {
                     observe!(ResidualSettled { none: true });
                     debug::step!(t, "[match_pattern] In-memory residual settled: no row");
                     return Ok(Some(ViewSelection::Exact(RowSelection::empty())));
                 }
-                residual::Settled::Open(eqs) if eqs.is_empty() => {
+                residual::Asked::Everything => {
                     observe!(ResidualSettled { none: false });
                     debug::step!(t, "[match_pattern] In-memory residual settled: every row");
                     return Ok(Some(ViewSelection::Exact(selection)));
                 }
-                residual::Settled::Open(eqs) => eqs,
+                residual::Asked::Open { eqs, zones } => (eqs, zones),
             }
         } else {
-            eqs
+            (eqs, None)
         };
         if need.defers_residual(rows) {
             debug::step!(t, "[match_pattern] In-memory residual left pending");
-            let pending = PendingResidual::new(memory.clone(), selection, eqs);
+            let pending = PendingResidual::new(memory.clone(), selection, eqs, zones);
             return Ok(Some(ViewSelection::Residual(Arc::new(pending))));
         }
-        let narrowed = residual::residual_rows(memory, selection, &eqs, t)?;
+        let narrowed = residual::residual_rows(memory, selection, &eqs, zones.as_ref(), t)?;
         Ok(Some(ViewSelection::Exact(narrowed)))
     }
 }

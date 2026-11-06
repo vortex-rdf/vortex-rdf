@@ -265,7 +265,6 @@ impl ColumnZones {
         self.table.len() as u64
     }
 
-    #[cfg(feature = "file-io")]
     /// The column's rows in zone `zone`: [`zone_len`](Self::zone_len) of
     /// them from its first, or to the column's end.
     pub(crate) fn zone_rows(&self, zone: u64) -> std::ops::Range<u64> {

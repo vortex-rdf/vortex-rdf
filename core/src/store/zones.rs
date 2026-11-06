@@ -119,13 +119,15 @@ impl QuadZones {
         Ok(zones)
     }
 
-    /// The rows of the zones that may hold every code `eqs` binds, as
-    /// ascending runs over a base of `rows` rows, adjacent zones joined: a
-    /// zone is left out where Vortex's falsifier of a bound column's `x = c`
-    /// holds on its zone map, or where `g`'s records lack its code. `None`
-    /// when no bound column has zones, or when the zones left hold more than
-    /// half the base: comparing a whole column then costs less than
-    /// comparing its runs.
+    /// The rows of the zones whose bounds may hold every code `eqs` binds,
+    /// as ascending runs over a base of `rows` rows, adjacent zones joined:
+    /// a zone is left out where Vortex's falsifier of a bound column's
+    /// `x = c` holds on its zone map's bounds. `None` when no bound column
+    /// has zones, or when the zones left hold more than half the base:
+    /// comparing a whole column then costs less than comparing its runs.
+    /// The residual's route with zones off, bounds only; with zones on it
+    /// classes its zones once
+    /// ([`ResidualZones`](crate::store::scan::residual::ResidualZones)).
     pub(crate) fn kept_runs(
         &self,
         eqs: &[(&str, Scalar)],
@@ -143,9 +145,7 @@ impl QuadZones {
             };
             let keep = keep.get_or_insert_with(|| vec![true; zones.zones() as usize]);
             for (zone, kept) in keep.iter_mut().enumerate() {
-                let ruled_out = none.as_ref().is_some_and(|mask| mask.value(zone))
-                    || zones.recorded_count(zone as u64, code) == Some(0);
-                *kept &= !ruled_out;
+                *kept &= !none.as_ref().is_some_and(|mask| mask.value(zone));
             }
         }
         let Some(keep) = keep else {
