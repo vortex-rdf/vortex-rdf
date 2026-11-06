@@ -178,6 +178,9 @@ pub(crate) enum Event {
     ZoneRecorded(u64),
     /// A reference run read its child's own `g` at this many positions.
     ReferenceGraphRead(u64),
+    /// A located run searched the reference index of slot `slot` (`p` or
+    /// `o`) for its code's run.
+    ReferenceSearched { slot: usize },
     /// A located run read slot `slot` of the quad table at this many
     /// scattered rows, to check them.
     CheckTaken { slot: usize, rows: u64 },

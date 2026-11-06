@@ -210,9 +210,9 @@ impl VortexRdfStore {
     /// row; then zone by zone where the checked columns have zone maps; row
     /// by row otherwise, when the run is no longer than [`GAP_ROWS`]. That
     /// run gives way to a bound `p`'s or `o`'s run in its reference index
-    /// (`index:ref-p`, `index:ref-o`) strictly shorter than it, as a hub
-    /// subject's quads do to its rare object's (`s?o`); failing it too, the
-    /// shortest such run is read. A reference run's rows are read from the
+    /// (`index:ref-p`, `index:ref-o`) that is strictly shorter and answers,
+    /// as a hub subject's quads do to its rare object's (`s?o`); when the
+    /// run does not answer, the shortest such run is read. A reference run's rows are read from the
     /// quad table in its order, the other bound slots checked at them when
     /// it is no longer than [`GAP_ROWS`]; a bound graph is checked on the
     /// reference child's own `g` where it holds one, and when the graph is
@@ -344,24 +344,29 @@ impl VortexRdfStore {
                 Vec::new(),
             )));
         }
-        // The runs of the bound slots' codes in the reference indexes, found
-        // once: the gap step gives way to one strictly shorter than its own
-        // run, and the lookup through a reference index reads the shortest.
-        // Boxed: its state would otherwise enlarge every lookup's future,
-        // the sorted tables' too.
-        let runs = Box::pin(reference_runs(codes, tables, &source, session)).await?;
-        let shorter_reference = |found: &std::ops::Range<u64>| {
-            runs.iter()
-                .flatten()
-                .any(|run| run.end - run.start < found.end - found.start)
+        // The bound reference slots' runs, each searched once and only for a
+        // step that uses it: the gap step weighs the runs of the slots past
+        // its prefix (a slot in the prefix holds every row of the gap run,
+        // so its run is never shorter), and the lookup by reference, reached
+        // when the gap step does not answer, reads the rest too.
+        let past_prefix = |slot: usize| {
+            gap.is_none_or(|(table, prefix)| !TABLES[table].1[..prefix].contains(&slot))
         };
+        let mut runs = reference_runs(codes, tables, past_prefix, &source, session).await?;
         // The run of the longest bound prefix, its rows checked against the
         // bound slots past it, in the table's order, unless a reference run
-        // is strictly shorter: a hub subject's many quads against its rare
-        // object's few (`s?o`).
+        // answers in its place: one strictly shorter and within the cap on a
+        // run checked row by row, as a hub subject's many quads give way to
+        // its rare object's few (`s?o`).
         if let Some((table, prefix)) = gap {
             let columns = tables.sorted[table].as_ref().expect("a table with columns");
             let order = &TABLES[table].1;
+            let shorter_reference = |found: &std::ops::Range<u64>| {
+                runs.iter().flatten().any(|run| {
+                    let rows = run.end - run.start;
+                    rows < found.end - found.start && rows <= gap_rows()
+                })
+            };
             if let Some(found) = locate_run(columns, order, prefix, &codes, &source, session)
                 .await?
                 .filter(|found| !shorter_reference(found))
@@ -397,6 +402,11 @@ impl VortexRdfStore {
                 {
                     return Ok(Some(located));
                 }
+            }
+            // The prefix's slots' reference runs, for the lookup by reference.
+            let rest = reference_runs(codes, tables, |slot| !past_prefix(slot), &source, session);
+            for (run, found) in runs.iter_mut().zip(rest.await?) {
+                *run = run.take().or(found);
             }
         }
         let Some((columns, rows, checked, index)) = by_reference(codes, tables, runs) else {
@@ -1140,22 +1150,28 @@ const GRAPH_SLOT: usize = 3;
 #[cfg(feature = "file-io")]
 const SEARCHES_PER_LEAF: usize = 16;
 
-/// The run of each bound reference slot's code in its reference index's
-/// `val`, by [`REFERENCES`] index: `None` where the slot is free, the file
-/// holds no such index, or a leaf declines the search.
+/// The run of each bound reference slot's code that `wanted` names, in its
+/// reference index's `val`, by [`REFERENCES`] index: `None` where the slot
+/// is free or not wanted, the file holds no such index, or a leaf declines
+/// the search.
 #[cfg(feature = "file-io")]
 async fn reference_runs(
     codes: [Option<TermCode>; 4],
     tables: &crate::store::persist::native_file::LocatedTables,
+    wanted: impl Fn(usize) -> bool,
     source: &Source,
     session: &vortex_session::VortexSession,
 ) -> Result<[Option<std::ops::Range<u64>>; 2]> {
     let mut runs: [Option<std::ops::Range<u64>>; 2] = [None, None];
     for (i, &(_, slot)) in REFERENCES.iter().enumerate() {
-        let (Some(code), Some([val, _])) = (codes[slot], &tables.references[i]) else {
+        let (Some(code), Some([val, _]), true) = (codes[slot], &tables.references[i], wanted(slot))
+        else {
             continue;
         };
-        runs[i] = val.bounds(code, source, session).await?;
+        crate::observe::observe!(ReferenceSearched { slot });
+        // Boxed: a search's state would otherwise enlarge every lookup's
+        // future, the sorted tables' too.
+        runs[i] = Box::pin(val.bounds(code, source, session)).await?;
     }
     Ok(runs)
 }
@@ -1169,7 +1185,7 @@ async fn reference_runs(
 /// table), where they are, the slots checked, and the reference index; the
 /// caller caps a run its statistics leave checked row by row at
 /// [`GAP_ROWS`]. A bound subject's own run is the gap step's, which reads it
-/// when no reference run is shorter.
+/// unless a shorter reference run answers in its place.
 #[cfg(feature = "file-io")]
 fn by_reference(
     codes: [Option<TermCode>; 4],
