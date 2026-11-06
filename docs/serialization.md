@@ -265,7 +265,7 @@ same way, are unique because their row ids are: none equals the one before
 it.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
-([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229)):
+([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L232)):
 every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
 ([`build_code_chunk`](../core/src/store/layouts/dictionary/codec/mod.rs#L107)) or,

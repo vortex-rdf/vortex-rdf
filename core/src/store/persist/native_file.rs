@@ -99,7 +99,9 @@ pub(crate) struct NativeStoreFile {
 }
 
 /// The readers of one opened file: the quad table's root reader and one
-/// reader per component slot, each built on first use.
+/// reader per component slot, each built on first use by Vortex's
+/// [`LazyReaderChildren`](vortex_layout::LazyReaderChildren) over the root's
+/// children, named and typed as the inventory describes them.
 ///
 /// Vortex keeps caches inside a reader (zone-map pruning results,
 /// partitioned expressions, dictionary evaluations) keyed by the identity of
@@ -117,15 +119,32 @@ struct ReaderTree {
     /// The file with a reader cache of its own: it builds and holds the root
     /// reader.
     root: vortex_file::VortexFile,
-    components: Vec<OnceLock<LayoutReaderRef>>,
+    /// The root's children's readers: the quad source's, then each
+    /// component's.
+    children: vortex_layout::LazyReaderChildren,
 }
 
 impl ReaderTree {
-    fn new(file: &vortex_file::VortexFile, components: usize, generation: u64) -> Self {
+    fn new(file: &vortex_file::VortexFile, generation: u64) -> Self {
+        let layout = file.footer().layout().as_::<RdfStoreLayoutVTable>();
+        let components = &layout.data().components;
+        let dtypes = std::iter::once(layout.dtype().clone())
+            .chain(components.iter().map(|c| c.dtype.clone()))
+            .collect();
+        let names = std::iter::once(Arc::from(container::QUAD_SOURCE_NAME))
+            .chain(components.iter().map(|c| Arc::from(c.name.as_str())))
+            .collect();
         Self {
             generation,
             root: file.clone().with_caching(),
-            components: (0..components).map(|_| OnceLock::new()).collect(),
+            children: vortex_layout::LazyReaderChildren::new(
+                Arc::clone(layout.children()),
+                dtypes,
+                names,
+                file.segment_source(),
+                file.session().clone(),
+                Default::default(),
+            ),
         }
     }
 }
@@ -295,7 +314,7 @@ impl NativeStoreFile {
         let roster = ComponentRoster::of(&file)?;
         let data = file.footer().layout().as_::<RdfStoreLayoutVTable>().data();
         let quads_sorted = data.quads_sorted;
-        let readers = Mutex::new(Arc::new(ReaderTree::new(&file, data.components.len(), 0)));
+        let readers = Mutex::new(Arc::new(ReaderTree::new(&file, 0)));
         Ok(Self {
             file,
             roster,
@@ -561,13 +580,8 @@ impl NativeStoreFile {
     /// The reader of the component in `slot` of the inventory, from the
     /// current tree: built on its first use there.
     fn slot_reader(&self, slot: usize) -> VortexResult<LayoutReaderRef> {
-        let tree = self.readers();
-        let cell = &tree.components[slot];
-        if let Some(reader) = cell.get() {
-            return Ok(reader.clone());
-        }
-        let reader = container::component_reader(&self.file, slot)?;
-        Ok(cell.get_or_init(|| reader).clone())
+        let child = container::QUAD_SOURCE_CHILD + 1 + slot;
+        Ok(self.readers().children.get(child)?.clone())
     }
 
     /// The current reader tree: the one made for the bound tree memo's
@@ -581,11 +595,7 @@ impl NativeStoreFile {
         // took the lock must not put an older tree back.
         let generation = self.bound_exprs.clears();
         if current.generation != generation {
-            *current = Arc::new(ReaderTree::new(
-                &self.file,
-                self.root().data().components.len(),
-                generation,
-            ));
+            *current = Arc::new(ReaderTree::new(&self.file, generation));
         }
         Arc::clone(&current)
     }

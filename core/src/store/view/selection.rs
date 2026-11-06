@@ -6,9 +6,9 @@
 //! a count of a located run), and an in-memory residual compare a count or a
 //! window runs only as far as it reaches.
 //!
-//! A range and an id list are mutually exclusive: a file scan given both
-//! loses vortex's exact-range planning (`attempt_split_ranges` bails when a
-//! row range is also set).
+//! A range and an id list are mutually exclusive: a selection is one or the
+//! other, so a file scan gets a row range or row indices, never both (Vortex
+//! 0.90 would read their intersection).
 
 use std::ops::Range;
 use std::sync::Arc;

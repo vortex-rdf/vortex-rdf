@@ -132,7 +132,8 @@ pub(crate) fn stream_rows(
 }
 
 /// Split futures in flight per unit of available parallelism when a split
-/// loop's futures are spawned: a scan's default concurrency.
+/// loop's futures are spawned: Vortex's default scan concurrency, the value
+/// `ScanBuilder::new` sets, which Vortex does not export.
 const SPLITS_IN_FLIGHT_PER_CORE: usize = 4;
 
 /// How many split futures a split loop keeps in flight:
@@ -176,11 +177,10 @@ pub(crate) async fn read_index_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<Ar
 impl RowSelection {
     /// This selection and the `deleted` tombstones applied to a file scan.
     ///
-    /// A range sets the scan's row range and an id list its [`Selection`];
-    /// the variants are exclusive, as vortex's exact-range planning
-    /// (`attempt_split_ranges`) bails when a row range accompanies an
-    /// `IncludeByIndex` selection. `All` keeps the full row range (every file
-    /// row is a quad row).
+    /// A range sets the scan's row range and an id list its [`Selection`].
+    /// A `RowSelection` never holds both, though Vortex 0.90 would read their
+    /// intersection. `All` keeps the full row range (every file row is a quad
+    /// row).
     ///
     /// Tombstoned rows are dropped inside the scan, so this composes with a
     /// pushed-down filter, whose output carries no row ids to realign
@@ -420,6 +420,34 @@ mod tests {
             assert_eq!(driven.driver(), driver, "unordered, limit {limit}");
             assert_eq!(driven.rows, whole.rows, "unordered, {driver:?}");
         }
+    }
+
+    /// The scans this crate builds take Vortex's default concurrency, which
+    /// [`SPLITS_IN_FLIGHT_PER_CORE`] mirrors: Vortex exports no constant of it.
+    #[tokio::test]
+    async fn scans_take_vortex_default_concurrency() {
+        let (_dir, file) = crate::tests::mapped_file(8, vec![]).await;
+        assert_eq!(
+            file.scan().unwrap().concurrency(),
+            SPLITS_IN_FLIGHT_PER_CORE
+        );
+    }
+
+    /// Vortex 0.90 intersects a scan's row range with its row indices, the
+    /// pairing [`RowSelection::restrict_scan`] never builds: of the ids 5, 12,
+    /// 30 and 45, a scan of rows `10..40` reads 12 and 30.
+    #[tokio::test]
+    async fn a_row_range_and_row_indices_intersect() {
+        let (_dir, file) = crate::tests::mapped_file(64, vec![]).await;
+        let whole = quad_codes(read_all_rows(file.scan().unwrap()).await.unwrap());
+        let ids = StrictSortedBuffer::try_new(Buffer::from_iter([5u64, 12, 30, 45])).unwrap();
+        let scan = file
+            .scan()
+            .unwrap()
+            .with_row_range(10..40)
+            .with_row_indices(ids);
+        let rows = quad_codes(read_all_rows(scan).await.unwrap());
+        assert_eq!(rows[0], vec![whole[0][12], whole[0][30]]);
     }
 
     /// A scan of at most [`MAX_INLINE_SPLITS`] splits runs inline and one with

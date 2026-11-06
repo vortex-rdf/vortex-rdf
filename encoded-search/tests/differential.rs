@@ -243,6 +243,59 @@ fn probes_bitpacked_zero_width() {
     assert_probe(&packed, &data, &[NodeKind::BitPacked]);
 }
 
+/// Bit-packed columns of every stored word width, with values past the packed
+/// width carried as patches: every bulk read (`read_into`, `read_at`,
+/// `count_eq`, `eq_offsets`) answers as the values do, the patches written
+/// over the values unpacked around them, whole and sliced to start inside a
+/// chunk.
+#[test]
+fn bulk_reads_of_bitpacked_words_with_patches() {
+    use vortex_array::arrays::slice::SliceKernel;
+
+    fn check<T>(outliers: [u64; 3])
+    where
+        T: vortex_array::dtype::NativePType + Into<u64> + TryFrom<u64>,
+        <T as TryFrom<u64>>::Error: std::fmt::Debug,
+    {
+        let mut data: Vec<T> = (0..5000u64)
+            .map(|i| T::try_from(i % 100).unwrap())
+            .collect();
+        for (at, outlier) in [17, 1500, 4999].into_iter().zip(outliers) {
+            data[at] = T::try_from(outlier).unwrap();
+        }
+        let canonical = PrimitiveArray::from_iter(data.iter().copied());
+        let packed =
+            vortex_fastlanes::bitpack_compress::bitpack_encode(&canonical, 7, None, &mut ctx())
+                .unwrap()
+                .into_array();
+        let probe = SortedProbe::resolve(&packed).expect("a bit-packed column resolves");
+        assert!(
+            probe.node_kinds().contains(&NodeKind::Patches),
+            "{:?}: the outliers are patches",
+            T::PTYPE
+        );
+        common::assert_bulk_reads(&probe, &data);
+        // Sliced, the node reads from an offset into its first chunk: one
+        // inside the chunk, one across chunks into the patched tail, and a
+        // single patched row.
+        for range in [1..5000usize, 1000..4100, 3000..5000, 1500..1501] {
+            let sliced = <vortex_fastlanes::BitPacked as SliceKernel>::slice(
+                packed.as_::<vortex_fastlanes::BitPacked>(),
+                range.clone(),
+                &mut ctx(),
+            )
+            .unwrap()
+            .unwrap();
+            let probe = SortedProbe::resolve(&sliced).expect("a sliced bit-packed column resolves");
+            common::assert_bulk_reads(&probe, &data[range]);
+        }
+    }
+    check::<u8>([200, 255, 129]);
+    check::<u16>([40_000, 65_535, 1_000]);
+    check::<u32>([1 << 30, u32::MAX as u64, 5_000]);
+    check::<u64>([1 << 40, u64::MAX, 12_345]);
+}
+
 #[test]
 fn probes_bitpacked_with_patches() {
     use vortex_array::arrays::slice::SliceKernel;

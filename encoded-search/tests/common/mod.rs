@@ -238,11 +238,26 @@ pub fn assert_bulk_reads<T: Copy + Into<u64>>(
         (0..data.len()).map(at).collect::<Vec<_>>(),
         "read_into the whole array"
     );
-    for width in [1, 2, 7, 1023, 1024, 1025, 3000] {
+    // Widths on both sides of each bit-packed read's limits: six values read
+    // one by one, the chunk-unpack crossover (16, 32, 96 and 128 values for
+    // 1-, 2-, 4- and 8-byte words) and a whole chunk, from starts strided
+    // across the array and from starts that straddle the first FastLanes
+    // chunk boundary (row 1,024) with each side short.
+    let widths = [
+        1, 2, 3, 6, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 159, 160,
+        161, 255, 256, 257, 1023, 1024, 1025, 3000,
+    ];
+    for width in widths {
         let Some(last) = data.len().checked_sub(width) else {
             continue;
         };
-        for start in (0..=last).step_by((last / 7).max(1)) {
+        let straddling = [
+            1023,
+            1024usize.saturating_sub(width.div_ceil(2)),
+            1025usize.saturating_sub(width),
+        ];
+        let strided = (0..=last).step_by((last / 7).max(1));
+        for start in strided.chain(straddling.into_iter().filter(|&s| s <= last)) {
             let mut out = vec![0; width];
             probe.read_into(start, &mut out);
             let want: Vec<u64> = (start..start + width).map(at).collect();

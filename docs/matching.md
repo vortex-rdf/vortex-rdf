@@ -272,7 +272,7 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L276) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L459), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L808) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L167-L174 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
@@ -297,7 +297,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L270), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L276), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -453,7 +453,7 @@ the compare; with none left the selection is the answer, compared nowhere
 ([`ask_statistics`](../core/src/store/scan/residual.rs#L66)). This is what
 Vortex's falsifier of `x = c` and the store's satisfier prove on exact
 bounds, read off the bounds directly
-([`eq_on_bounds`](../core/src/io/zone_map.rs#L353)): building and
+([`eq_on_bounds`](../core/src/io/zone_map.rs#L364)): building and
 evaluating the proofs for a residual cost tens of µs, more than many
 residuals' whole compare.
 On a one-graph store a graph equality settles this way. The view still counts
@@ -474,7 +474,7 @@ selection wider than a zone, the zones it touches are classed once against
 the equalities left, by the same rule on each bound column's zone bounds
 and the graphs `g`'s zones record
 ([`ResidualZones`](../core/src/store/scan/residual.rs#L133),
-[`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L198)): "none" where a
+[`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L209)): "none" where a
 code lies outside its zone's bounds or the zone's recorded graphs lack it,
 "all" where every bound column's zone bounds are its code, mixed otherwise
 (a test pins the rule to Vortex's proofs on each zone).
@@ -767,7 +767,7 @@ of `col != c` applies. Each split reads it off the quad table's zone maps
 for its own zones
 ([`every_row_zones`](../core/src/store/scan/file_filter.rs#L223)): the maps
 the file reads once per column on first use, as located runs read them
-([`QuadZoneMaps`](../core/src/store/persist/native_file.rs#L198)), shared
+([`QuadZoneMaps`](../core/src/store/persist/native_file.rs#L217)), shared
 by the splits however many ask at once. The filter is then evaluated only
 over the split's other rows, after their own pruning. Counts and reads alike
 take them; a tombstoned row is not among them, as no split starts with it.
@@ -905,9 +905,11 @@ point-read now (`Eager`) while the plan still serves the quads.
 `1, 3, 0, 2` — where `o = 5` bounds `[2, 4)`, rids `0, 2`. On the 1M file
 `P`'s located run is 31,776 rows: over the point-read cap, so the ids become a
 deferred rid-only pushed-down scan and reads stream the run through the plan
-— a scan of exactly that row range, no filter, split by row count so that its
-decode runs on many of the runtime's workers rather than inside the single
-leaf-chunk split the child's own layout would make of the run.
+— a scan of exactly that row range, no filter, split by row count into about
+two splits per worker rather than the single leaf-chunk split the child's own
+layout would make of the run. A stream of the quads decodes each split on a
+task of its own; a code read polls up to 42 splits on its calling task and
+spawns them past that.
 
 **Cost.** Locating a run is a handful of binary searches on either backend,
 whatever its width. Reading through the plan is what differs: a copy serves
@@ -970,7 +972,7 @@ longer list for each of the shorter's instead of merging the two.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_rows`](../core/src/store/scan/file_reads.rs#L632) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::read`](../core/src/store/indexes/serve/file.rs#L481)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_rows`](../core/src/store/scan/file_reads.rs#L632) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::read`](../core/src/store/indexes/serve/file.rs#L494)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped at match time when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Kept by | a window, keep, partition or chained match of the served view, narrowed ([§6.4](#64-keeping-or-dropping-the-serve-plan)) | the same, its residual filter resolved |
@@ -1179,7 +1181,7 @@ a one-shot read, `StreamedPlan` for a stream):
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else a range scan of the located run (`FileServePlan::read`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries; on file, read it by id or scan it as `ExactRead` chooses (below) |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — under the Dictionary layout one `Arc<str>` per distinct term of a chunk, under the string layouts one per run of rows repeating a term, each read in place, handed to every row that holds it | the same gather or file read, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located run's width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/serve/file.rs#L533)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
+| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/serve/file.rs#L546)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
 | `row_chunks()` / `code_chunks()` | the plan's rows in the index's order, the ids never sorted: in memory gathered off the base at the run's ids, one window of ids per chunk, or, over a Dictionary base whose columns stay encoded (read off a file or adopted from bytes), read off the index component, a slice or a take of a window of the run's live rows per chunk; on file the index child's own chunks (the located range, the kept rows' positions, or the filtered scan) cut to the cap, except TypedObject's rows, taken from the base a window of ids at a time | the selection's rows in base row order: sliced or gathered in memory; on file read by id, by a pending filter's masks, or scanned |
 | `nquad_line_chunks()` (the N-Triples/N-Quads export) | as `quads()`, in the index's order, each chunk written as N-Quads lines | as `quads()`, in base row order, each chunk written as N-Quads lines: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
 
