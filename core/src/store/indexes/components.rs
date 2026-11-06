@@ -31,6 +31,7 @@ use crate::io::container::{
     INDEX_VERSION, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
     child_strategy,
 };
+use crate::io::zone_map::{ColumnZones, ZONE_ROWS};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{into_struct_array, make_string_array, named_struct};
@@ -105,6 +106,7 @@ pub(crate) fn adopt_component(
         }),
         sorted,
         probes: StructProbes::new(),
+        graph_zones: None,
     }
 }
 
@@ -141,6 +143,19 @@ pub(crate) struct IndexComponent {
     /// guard holds for the component's lifetime; [`rebuilt`](Self::rebuilt)
     /// takes a fresh cache.
     probes: Arc<StructProbes>,
+    /// The zone map of the component's graph column (`g`), with each zone's
+    /// recorded graphs, when that column is a code column zoned in
+    /// [`ZONE_ROWS`]-row zones covering the component's rows: taken while a
+    /// build compresses the component, or read from its child's zone table
+    /// at load. A run bound to a graph checks it inside the component, zone
+    /// by zone. `None` for a string column, a reference child written
+    /// without a graph column, and parts that carry none. Every rebuild of
+    /// the same rows keeps it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the in-memory resolver's graph check")
+    )]
+    graph_zones: Option<Arc<ColumnZones>>,
 }
 
 /// An [`IndexComponent`]'s rows: `cell` holds them as one struct in child
@@ -168,6 +183,7 @@ impl IndexComponent {
             }),
             sorted,
             probes: StructProbes::new(),
+            graph_zones: None,
         }
     }
 
@@ -282,10 +298,56 @@ impl IndexComponent {
     /// sorted probes bind the compressed columns directly.
     ///
     /// [`resident::with_compressed_int_children`]: crate::store::resident::with_compressed_int_children
+    ///
+    /// The pass that compresses the graph column takes its zone map, with
+    /// each zone's recorded graphs ([`graph_zones`](Self::graph_zones)).
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        self.rebuilt(|rows| {
-            crate::store::resident::with_compressed_int_children(rows, false).map(|(rows, _)| rows)
-        })
+        let mut graph = None;
+        let component = self.rebuilt(|rows| {
+            let (rows, zones) = crate::store::resident::with_compressed_int_children(rows, false)?;
+            graph = zones.of_column(crate::store::schema::COL_G).cloned();
+            Ok(rows)
+        })?;
+        Ok(component.with_graph_zones(graph))
+    }
+
+    /// The zone map of the component's graph column, with each zone's
+    /// recorded graphs, if it keeps one.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the in-memory resolver's graph check")
+    )]
+    pub(crate) fn graph_zones(&self) -> Option<&Arc<ColumnZones>> {
+        self.graph_zones.as_ref()
+    }
+
+    /// This component keeping `zones` as its graph column's zone map, or none
+    /// when they do not cover its rows in [`ZONE_ROWS`]-row zones: a map of
+    /// other zones or rows would not line up with them. Reads no row, a
+    /// deferred adoption's count coming from its reader.
+    pub(crate) fn with_graph_zones(self, zones: Option<Arc<ColumnZones>>) -> Self {
+        let rows = self.row_count();
+        let graph_zones = zones.filter(|zones| {
+            zones.zone_len() == ZONE_ROWS as u64
+                && zones.zones() == rows.div_ceil(ZONE_ROWS as u64)
+                && zones.row_count() == rows
+        });
+        Self {
+            graph_zones,
+            ..self
+        }
+    }
+
+    /// How many rows the component holds: its rows' length, or a deferred
+    /// adoption's reader's count, which materializes nothing.
+    fn row_count(&self) -> u64 {
+        match (self.rows.cell.get(), &self.rows.pending) {
+            (Some(rows), _) => rows.len() as u64,
+            (None, Some(reader)) => reader.row_count(),
+            (None, None) => {
+                unreachable!("a component without a pending adoption holds its built rows")
+            }
+        }
     }
 
     /// The cached encoded-search probe over the component's `column`, or

@@ -421,7 +421,7 @@ the compare; with none left the selection is the answer, compared nowhere
 ([`ask_statistics`](../core/src/store/scan/residual.rs#L66)). This is what
 Vortex's falsifier of `x = c` and the store's satisfier prove on exact
 bounds, read off the bounds directly
-([`eq_on_bounds`](../core/src/io/zone_map.rs#L348)): building and
+([`eq_on_bounds`](../core/src/io/zone_map.rs#L353)): building and
 evaluating the proofs for a residual cost tens of µs, more than many
 residuals' whole compare.
 On a one-graph store a graph equality settles this way. The view still counts
@@ -462,7 +462,7 @@ left pending (below) keeps its classes, and counts and windows by them.
 With zones off (`VORTEX_RDF_ZONES=0`) the residual keeps its route from before
 the classes, bounds only: the zones whose bounds leave a constrained
 column's code out are left out
-([`kept_runs`](../core/src/store/zones.rs#L131)), when what is left holds at
+([`kept_runs`](../core/src/store/zones.rs#L122)), when what is left holds at
 most half the base: a run of rows (every row, or a subject's range) is
 compared zone run by zone run, each a slice of the base through the mask
 scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L781)), and an

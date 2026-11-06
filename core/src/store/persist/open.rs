@@ -8,9 +8,9 @@ use crate::io::container;
 use crate::io::file::{FileAccess, open_vortex_file};
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
-use crate::store::indexes::{
-    ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
-};
+#[cfg(feature = "file-io")]
+use crate::store::indexes::IndexComponent;
+use crate::store::indexes::{ComponentIdentity, adopt_component, check_component_rows};
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{DictAccess, LayoutStrategy};
 #[cfg(feature = "file-io")]
@@ -28,8 +28,8 @@ use vortex_array::{IntoArray, VortexSessionExecute};
 use crate::store::VortexRdfStore;
 use crate::store::construct::resolved_layout;
 use crate::store::indexes::COL_RID;
-use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
-use crate::store::zones::QuadZones;
+use crate::store::schema::{CODE_PTYPE, COL_G, ROW_ID_PTYPE, is_code_column_name};
+use crate::store::zones::{QuadZones, read_graph_zones};
 
 /// Refuse a table whose id columns are integers of another width than this
 /// version reads: an integer `s`, `p`, `o`, `g` (the quad table and the copy
@@ -68,8 +68,8 @@ enum ComponentKind {
     /// The required `dictionary` child (the Dictionary layout's terms).
     Dict,
     /// A known index child: the registry row carrying the identity an
-    /// in-memory [`IndexComponent`] adopts and the index type it makes
-    /// queryable.
+    /// in-memory [`IndexComponent`](crate::store::indexes::IndexComponent)
+    /// adopts and the index type it makes queryable.
     Index(&'static ComponentIdentity),
     /// An optional component this version does not interpret: ignoring it
     /// cannot change query results.
@@ -207,6 +207,22 @@ impl ComponentRoster {
     }
 }
 
+/// The zone maps of a store file's index children's graph columns, by
+/// component name, as an in-memory component keeps them
+/// ([`read_graph_zones`]): read concurrently, each from its column's zone
+/// table through `source`.
+#[cfg(feature = "file-io")]
+async fn component_graph_zones(
+    file: &NativeStoreFile,
+    source: &Arc<dyn vortex_layout::segments::SegmentSource>,
+) -> Result<Vec<(&'static str, Option<Arc<crate::io::zone_map::ColumnZones>>)>> {
+    let reads = file.index_children().iter().map(|child| {
+        let column = file.table_column_layout(Some(child.identity.name), COL_G);
+        async move { Result::Ok((child.identity.name, read_graph_zones(column, source).await?)) }
+    });
+    futures::future::try_join_all(reads).await
+}
+
 /// Lift an unrefined file view's index children into in-memory components:
 /// each known child of the file's roster is scanned whole and executed to its
 /// rows (every consumer, a write or an in-memory open, reads them at once),
@@ -262,10 +278,23 @@ impl VortexRdfStore {
             .expect("a store opened from a file reads that file")
             .file;
         let (quads, source) = (file.quad_layout()?, file.segment_source());
-        let (parts, zones) = futures::try_join!(
+        let (mut parts, zones, graphs) = futures::try_join!(
             opened.to_serializable_parts(),
-            QuadZones::read(&quads, &source)
+            QuadZones::read(&quads, &source),
+            component_graph_zones(file, &source),
         )?;
+        // Each index component keeps its child's graph-column zone map.
+        parts.components = parts
+            .components
+            .into_iter()
+            .map(|component| {
+                let zones = graphs
+                    .iter()
+                    .find(|(name, _)| *name == component.identity.name)
+                    .and_then(|(_, zones)| zones.clone());
+                component.with_graph_zones(zones)
+            })
+            .collect();
         let store = Self::from_parts(parts, zones)?;
         // The footer's exact bounds of the quad table's code columns, the
         // base columns' array statistics (the whole column's level).
@@ -390,21 +419,21 @@ impl VortexRdfStore {
             ))),
             None => None,
         };
-        // Adopted by reader, nothing read: the child's scan and
-        // canonicalization wait for the component's first use (an index
-        // probe, serialization). Sound because each reader sits over the
-        // buffer the file was opened from (see `adopt_component`).
-        let components = roster
-            .index_children
-            .iter()
-            .map(|child| -> Result<IndexComponent> {
-                Ok(adopt_component(
-                    child.identity,
-                    reader(child.slot)?,
-                    child.sorted,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Adopted by reader, nothing read but the graph column's zone table:
+        // the child's scan and canonicalization wait for the component's
+        // first use (an index probe, serialization). Sound because each
+        // reader sits over the buffer the file was opened from (see
+        // `adopt_component`).
+        let source = file.segment_source();
+        let mut components = Vec::with_capacity(roster.index_children.len());
+        for child in &roster.index_children {
+            let graph = container::component_child(typed, child.slot)?;
+            let graph = read_graph_zones(container::struct_field(&graph, COL_G), &source).await?;
+            components.push(
+                adopt_component(child.identity, reader(child.slot)?, child.sorted)
+                    .with_graph_zones(graph),
+            );
+        }
         let layout = resolved_layout(dict, quads.dtype())?;
         // The footer's exact bounds of the quad table's code columns, the
         // base columns' array statistics (the whole column's level).

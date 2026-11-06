@@ -81,8 +81,13 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 ///   code-column payload path decodes the canonical primitive once into its
 ///   cache (`shared_code_primitive`) and is zero-copy on every later call.
 ///
-/// An index component's columns get neither: no read asks their statistics
-/// and no payload path reads them.
+/// An index component's graph column (`g`) takes its zone map with its
+/// recorded graphs, which a run bound to a graph checks inside the component
+/// ([`IndexComponent::graph_zones`]); its columns take no bounds stamp and no
+/// wrapper, as no read asks their array statistics and no payload path reads
+/// them.
+///
+/// [`IndexComponent::graph_zones`]: crate::store::indexes::components::IndexComponent::graph_zones
 pub(crate) fn with_compressed_int_children(
     rows: ArrayRef,
     primary: bool,
@@ -103,8 +108,8 @@ pub(crate) fn with_compressed_int_children(
         let slot = PRIMARY_COLUMNS
             .iter()
             .position(|column| *column == name.as_ref())
-            .filter(|_| primary);
-        let bounds = slot.and(zones_of.bounds(child.len()));
+            .filter(|&slot| primary || records_graphs(slot));
+        let bounds = slot.filter(|_| primary).and(zones_of.bounds(child.len()));
         if let Some(slot) = slot
             && let Some(mut column) = zones_of.finish(child.len())?
         {

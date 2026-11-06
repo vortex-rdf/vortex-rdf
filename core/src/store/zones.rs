@@ -94,16 +94,7 @@ impl QuadZones {
             let Some(column) = quads.slot(slot)? else {
                 continue;
             };
-            if column.dtype() != &CODE_DTYPE {
-                continue;
-            }
-            // A zone table of other zones than this base's would not line up
-            // with its rows: such a column has none.
-            let Some(map) = ExactZoneMap::of(&column) else {
-                continue;
-            };
-            let zones = column.row_count().div_ceil(ZONE_ROWS as u64);
-            if map.zone_len == ZONE_ROWS && map.table.row_count() == zones {
+            if zoned_code_column(&column) {
                 columns.push((quad_slot, column));
             }
         }
@@ -313,6 +304,34 @@ pub(crate) fn graph_records(
         records.push(decode_state(&acc.finish()?).map(Vec::into_boxed_slice));
     }
     Ok(records)
+}
+
+/// Whether `column` is a code column zoned in [`ZONE_ROWS`]-row zones with
+/// exact bounds, a zone per [`ZONE_ROWS`] of its rows: a zone table of other
+/// zones would not line up with an in-memory copy of its rows, so such a
+/// column has none.
+fn zoned_code_column(column: &vortex_layout::LayoutRef) -> bool {
+    column.dtype() == &CODE_DTYPE
+        && ExactZoneMap::of(column).is_some_and(|map| {
+            map.zone_len == ZONE_ROWS
+                && map.table.row_count() == column.row_count().div_ceil(ZONE_ROWS as u64)
+        })
+}
+
+/// The zone map an in-memory index component keeps of its child's graph
+/// column `column`, read from the column's zone table with each zone's
+/// recorded graphs ([`ColumnZones::read`]): `None` without the column, or
+/// when it is not a code column zoned as a base's are
+/// ([`QuadZones::read`]), as a string column or a child written without the
+/// zones.
+pub(crate) async fn read_graph_zones(
+    column: Option<vortex_layout::LayoutRef>,
+    source: &Arc<dyn vortex_layout::segments::SegmentSource>,
+) -> Result<Option<Arc<ColumnZones>>> {
+    match column.filter(zoned_code_column) {
+        Some(column) => Ok(ColumnZones::read(&column, source).await?.map(Arc::new)),
+        None => Ok(None),
+    }
 }
 
 /// Whether slot `slot` is the graph column, whose zones record their graphs.

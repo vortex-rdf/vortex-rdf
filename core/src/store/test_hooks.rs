@@ -471,6 +471,39 @@ impl VortexRdfStore {
             .find(|c| c.identity.name == name)
             .map(IndexComponent::probes_resolved)
     }
+
+    /// The named in-memory component's graph-column zone bounds, `(min,
+    /// max)` per zone ([`IndexComponent::graph_zones`]); `None` when this
+    /// store holds no such component or it keeps no zone map.
+    pub(crate) fn debug_component_zone_bounds(
+        &self,
+        name: &str,
+    ) -> Option<Vec<(TermCode, TermCode)>> {
+        self.in_memory_components()?
+            .iter()
+            .find(|c| c.identity.name == name)?
+            .graph_zones()
+            .map(|zones| zones.bounds())
+    }
+
+    /// The named in-memory component's graph-column recorded graphs, each
+    /// zone's `(code, rows)` pairs or `None` past what the statistic records;
+    /// `None` as for [`debug_component_zone_bounds`](Self::debug_component_zone_bounds),
+    /// or for a map without the statistic.
+    pub(crate) fn debug_component_zone_records(&self, name: &str) -> Option<ZoneRecords> {
+        let records = self
+            .in_memory_components()?
+            .iter()
+            .find(|c| c.identity.name == name)?
+            .graph_zones()?
+            .recorded()?;
+        Some(
+            records
+                .iter()
+                .map(|zone| zone.as_ref().map(|pairs| pairs.to_vec()))
+                .collect(),
+        )
+    }
 }
 
 #[cfg(feature = "file-io")]

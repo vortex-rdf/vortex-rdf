@@ -59,7 +59,7 @@ pub(crate) use layout::store_metadata_of_bytes;
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
     RdfStoreLayoutVTable, component_child, component_reader, is_native_file, newer_root_id,
-    register,
+    register, struct_field,
 };
 #[cfg(test)]
 pub(crate) use sources::default_child_strategy;
