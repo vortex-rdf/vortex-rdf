@@ -244,11 +244,11 @@ impl FileServePlan {
         LazyRowIds::from_located_run(Arc::clone(file), self.child.clone(), range, false)
     }
 
-    /// The child's `columns` at the child rows `positions` (ascending, not
-    /// empty), in that order: point by point through the child's cached
-    /// chunk probes, or, where a probe declines (a string column), by a scan
-    /// of those rows (Vortex's row-indices selection), which reads only the
-    /// child's chunks that hold them.
+    /// The child's `columns` at the child rows `positions` (strictly
+    /// ascending, not empty), in that order: point by point through the
+    /// child's cached chunk probes, or, where a probe declines (a string
+    /// column), by a scan of those rows (Vortex's row-indices selection),
+    /// which reads only the child's chunks that hold them.
     pub(crate) async fn columns_at(
         &self,
         file: &NativeStoreFile,
@@ -277,8 +277,8 @@ impl FileServePlan {
         .await
     }
 
-    /// The child's rows at `positions` (ascending, not empty), every child
-    /// column, in that order ([`columns_at`](Self::columns_at)).
+    /// The child's rows at `positions` (strictly ascending, not empty), every
+    /// child column, in that order ([`columns_at`](Self::columns_at)).
     pub(crate) async fn rows_at(
         &self,
         file: &NativeStoreFile,
@@ -480,13 +480,15 @@ impl FileServePlan {
     /// this call rather than the read; rows read point by point bind nothing
     /// of the plan's.
     ///
-    /// The range is split by row count, across the workers. Only a stream of
-    /// the view's quads (`quads()`, through Vortex's own scan stream) spawns
-    /// a task per split, so that the split count is its decode's
-    /// parallelism; a code read runs at most `MAX_INLINE_SPLITS` splits
-    /// inline on its calling task. No filter rides along a located run: its
-    /// range is exactly the constrained rows (the same fact `size` and the
-    /// point reads rely on).
+    /// The range is split by row count, about two splits per worker
+    /// (`run_split_rows`). A stream of the view's quads (`quads()`, through
+    /// Vortex's own scan stream) spawns a task per split, so the split count
+    /// is its decode's parallelism. A code read drives the splits as
+    /// `ScanDriver::for_row_scan` says: inline on its calling task up to
+    /// `MAX_INLINE_SPLITS`, spawned past that, as a wide run's are on 22 or
+    /// more workers. No filter rides along a located run: its range is
+    /// exactly the constrained rows (the same fact `size` and the point reads
+    /// rely on).
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     pub(crate) fn read<'a>(
