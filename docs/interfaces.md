@@ -234,17 +234,18 @@ each row's graph (`g`, in files written from this version on): as the run's
 only check, it is decided a zone at a time from those rows' zone maps and
 recorded graphs, as below, at any length. Otherwise, and in files written
 before, the run is checked row by row, for runs of at most 8,388,608 rows
-(`GAP_ROWS`). A bound subject's run of a subject-sorted quad table is
-checked instead when it is no longer, up to 16,384 rows, so `s?o` reads the
-subject's few rows, not a common object's many. Any other pattern goes through the
-general match of the codes' terms. Which of the two answers depends on the
+(`GAP_ROWS`). With a free predicate, a bound subject's run of a
+subject-sorted quad table (below) is read instead when no reference run is
+shorter, so `s?o` reads the subject's few rows rather than a common
+object's many, and a rare object's few rather than a hub subject's many.
+Any other pattern goes through the general match of the codes' terms. Which of the two answers depends on the
 store and the pattern alone, so every window of one pattern comes in the
 same order. A code in a position its term kind cannot take matches nothing.
 
-Bound slots that are no such prefix, a bound graph after a free slot
-(`(? p o g)` on `index:posg`, `(s p ? g)` on the quad table), are the run of
-the table's longest bound prefix, its rows checked against the slots past
-it. Those checks are decided a zone at a time: by Vortex's own proofs of
+Bound slots that are no such prefix, a bound slot after a free one
+(`(? p o g)` on `index:posg`, `(s p ? g)` or `(s ? o ?)` on the quad table),
+are the run of the table's longest bound prefix, its rows checked against
+the slots past it, unless a reference run is strictly shorter. Those checks are decided a zone at a time: by Vortex's own proofs of
 `x = c` on the checked columns' zone-map bounds and, for the graph, by the
 graphs each zone records. A zone where no row can hold the checked code is
 skipped, a zone where every row holds it is taken whole without reading

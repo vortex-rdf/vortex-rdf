@@ -537,6 +537,61 @@ fn hub_quads() -> Vec<Quad> {
     quads
 }
 
+/// Under the reference index, a bound subject and object read the shorter
+/// of the subject's run and the object's reference run: the hub's 60 rows
+/// give way to its object's one-row reference run, and a subject's few rows
+/// win over its object's long run.
+#[tokio::test]
+async fn subject_and_object_read_the_shorter_run() {
+    use super::located_zones::code_of;
+    use crate::CodePattern;
+
+    if !crate::store::query::located::locate_enabled() {
+        return; // VORTEX_RDF_LOCATE=0: no located run reads any block
+    }
+    let (_dir, path) = write_store_file(
+        hub_quads(),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let all = row_list(&store).await;
+    let rows_where =
+        |slot: usize, code: TermCode| all.iter().filter(|row| row[slot] == code).count();
+    let hub = code_of(&store, "<http://example.org/hub>").await;
+    let rare = code_of(&store, "\"rare7\"").await;
+    let s05 = code_of(&store, "<http://example.org/s05>").await;
+    let first = all.iter().find(|row| row[0] == s05).expect("s05's quads")[2];
+    assert_eq!((rows_where(0, hub), rows_where(2, rare)), (60, 1));
+    assert!(
+        rows_where(0, s05) < rows_where(2, first),
+        "s05's run is the shorter"
+    );
+    // Each pattern beside the rows its run reads: the object's one row for
+    // the hub, the subject's own for s05.
+    for (s, o, read) in [(hub, rare, 1), (s05, first, rows_where(0, s05))] {
+        let pattern = CodePattern::new(Some(s), None, Some(o), None);
+        let want: Vec<[TermCode; 4]> = all
+            .iter()
+            .filter(|row| row[0] == s && row[2] == o)
+            .copied()
+            .collect();
+        let rec = Recorder::start();
+        let count = store.count_code_pattern(pattern).await.unwrap();
+        let blocks = located_blocks(&rec);
+        drop(rec);
+        assert_eq!(count, want.len() as u64, "{pattern:?}: the count");
+        assert_eq!(
+            blocks.iter().sum::<u64>(),
+            read as u64,
+            "{pattern:?}: rows read"
+        );
+        let got = store.match_code_pattern(pattern, 0, None).await.unwrap();
+        assert_eq!(code_rows::<4>(&got), want, "{pattern:?}: the rows");
+    }
+}
+
 /// `locate_codes` answers exactly what the term path answers: for every bound
 /// subset of a store's own quads' codes, on every file open and index set
 /// (the suite's fixture, and [`multiplicity_quads`] and [`hub_quads`]
@@ -795,7 +850,7 @@ async fn check_code_patterns(fixture: &FixtureStore) {
     }
 }
 
-/// A bound graph after a free slot over a run longer than `CHECKED_ROWS`:
+/// A bound graph after a free slot over a long run:
 /// `(? p o g)`, one `(p, o)` run of 40,000 quads alternating between two
 /// graphs, on the copy index (its `posg` run, checked) and the reference
 /// index (a long reference run, checked), read in pages and counted, more
