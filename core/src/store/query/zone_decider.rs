@@ -87,6 +87,7 @@ impl ZoneDecider {
     /// none of these settle.
     pub(crate) fn classify(&self, zones: Range<u64>) -> Result<Vec<ZoneClass>> {
         let n = (zones.end - zones.start) as usize;
+        crate::observe::observe!(ZonesClassed(n as u64));
         let (mut none, mut all, mut unsettled) = (vec![false; n], vec![true; n], vec![0u8; n]);
         for column in &self.columns {
             let EqProofs {
@@ -124,22 +125,10 @@ impl ZoneDecider {
     }
 }
 
-/// Whether located runs decide their checked rows zone by zone:
-/// `VORTEX_RDF_ZONES=0` (an ablation switch, read once) puts every run on
-/// its row-by-row route, as before zones were asked. Unset is on.
-pub(crate) fn zones_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(on) = crate::store::test_hooks::forced_zones() {
-        return on;
-    }
-    crate::stats_rules::zones_switch()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::schema::TermCode;
-    use crate::store::test_hooks::ForcedZones;
 
     const Z: u64 = 8_192;
     const U64: vortex_array::dtype::DType = vortex_array::dtype::DType::Primitive(
@@ -239,18 +228,5 @@ mod tests {
             proofs: eq_proofs(&U64, 5).unwrap(),
         };
         assert!(ZoneDecider::new(vec![checked(3, 5, &graph_bounds()), other]).is_none());
-    }
-
-    /// A test forces the switch for its thread; the guard's drop restores it.
-    #[test]
-    fn forced_zones_override() {
-        let production = zones_enabled();
-        {
-            let _off = ForcedZones::set(false);
-            assert!(!zones_enabled());
-            let _on = ForcedZones::set(true);
-            assert!(zones_enabled());
-        }
-        assert_eq!(zones_enabled(), production);
     }
 }

@@ -33,6 +33,11 @@ impl VortexRdfStore {
         {
             return Ok(live);
         }
+        // A residual compare left pending counts its zones, never
+        // materializing its ids.
+        if let ViewSelection::Residual(residual) = &self.quads.selection {
+            return residual.count(self.quads.deleted.as_ref());
+        }
         let selection = self.quads.materialized_selection().await?;
         #[cfg(feature = "file-io")]
         if let Some((file, filter)) = self.quads.pending_filter() {

@@ -224,6 +224,20 @@ const TYPED_EQ_MAX_ROWS: usize = 4_096;
 /// which the mask scan gathers first.
 const TYPED_PROBE_MAX_ROWS: usize = 256;
 
+/// [`typed_residual_ids_reading`] of a residual that reads `selection`
+/// alone.
+#[cfg(test)]
+pub(crate) fn typed_residual_ids(
+    struct_arr: &StructArray,
+    selection: &RowSelection,
+    base_len: usize,
+    eqs: &[(&'static str, Scalar)],
+    probes: Option<(&ArrayRef, &StructProbes)>,
+) -> Option<vortex_buffer::Buffer<u64>> {
+    let work = selection.len(base_len);
+    typed_residual_ids_reading(struct_arr, selection, base_len, eqs, probes, work)
+}
+
 /// The typed residual filter over a store's base: when every residual
 /// equality binds a typed column (see [`TypedEq`]), the rows the selection
 /// covers are tested with direct loads and the surviving base row ids
@@ -236,12 +250,19 @@ const TYPED_PROBE_MAX_ROWS: usize = 256;
 /// avoids. A probe-read column reads through the store's probe in `probes`
 /// (the base `struct_arr` was taken from, with its probe cache) when it holds
 /// one. The base counterpart of [`typed_positions`].
-pub(crate) fn typed_residual_ids(
+///
+/// `selection` is one part of a residual that reads `work` rows in all (its
+/// zones compared apart): a payload wrapper's canonical form is
+/// materialized when the whole residual, not this part, reads at least as
+/// many values as the pass decodes, so a residual over every row decodes its
+/// columns once for all its parts.
+pub(crate) fn typed_residual_ids_reading(
     struct_arr: &StructArray,
     selection: &RowSelection,
     base_len: usize,
     eqs: &[(&'static str, Scalar)],
     probes: Option<(&ArrayRef, &StructProbes)>,
+    work: usize,
 ) -> Option<vortex_buffer::Buffer<u64>> {
     // A lone constraint has no conjunction to short-circuit per row, so over
     // a wide selection it goes to the mask scan; two or more slice-bound
@@ -257,7 +278,7 @@ pub(crate) fn typed_residual_ids(
     // it for every later view/clone of the base, and a narrow selection stays
     // on point reads so a store queried only through its fast paths never
     // holds a second copy of its columns.
-    let canonicalize = selected.saturating_mul(eqs.len()) >= base_len;
+    let canonicalize = work.max(selected).saturating_mul(eqs.len()) >= base_len;
     let cols = TypedEq::bind(struct_arr, eqs, &needles, canonicalize, probes)?;
     // A probe-bound column (no canonical form to reach for) is read per row,
     // so all but a narrow selection over one goes to the mask scan.

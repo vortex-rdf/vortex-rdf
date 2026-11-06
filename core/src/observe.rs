@@ -79,6 +79,19 @@ pub(crate) enum Event {
     ProbeBound { cached: bool },
     /// A residual narrowed by zone bounds.
     ZoneNarrowed,
+    /// An in-memory residual compared this many rows: a zone run its zone
+    /// maps kept, or the selection the typed loop or the mask scan read.
+    ResidualCompared(u64),
+    /// An in-memory residual took this many rows of its selection from
+    /// zones where every row holds its codes, uncompared.
+    ResidualZoneTaken(u64),
+    /// A zone decider classed this many zones (a located run's, or an
+    /// in-memory residual's once).
+    ZonesClassed(u64),
+    /// An in-memory residual settled by its columns' array statistics,
+    /// with no row compared: `none` when no row holds a code, else every
+    /// equality held on every row.
+    ResidualSettled { none: bool },
     /// A residual compare left pending.
     ResidualDeferred,
     /// A piece of a pending residual compared, of this many rows.
@@ -142,11 +155,11 @@ pub(crate) enum Event {
     /// A block of a located run's rows read, for a lookup's window or a
     /// stream's chunk: this many rows of the run, before its checks.
     LocatedBlock(u64),
-    /// A located run's rows of a mixed zone counted on the checked column's
-    /// encoding, this many rows.
+    /// A located run's or an in-memory residual's rows of a mixed zone
+    /// counted on the checked column's encoding, this many rows.
     ZoneCounted(u64),
-    /// A located run's mixed zone of this many rows counted from the checked
-    /// column's recorded values, unread.
+    /// A located run's or an in-memory residual's mixed zone of this many
+    /// rows counted from the checked column's recorded values, unread.
     ZoneRecorded(u64),
     /// A reference run read its child's own `g` at this many positions.
     ReferenceGraphRead(u64),
@@ -156,7 +169,8 @@ pub(crate) enum Event {
     /// A located run's rows read at a checked column to check them, this
     /// many rows.
     CheckRead(u64),
-    /// A column's zone map read from its file, for a located run's checks.
+    /// A column's zone map read from its file, for a located run's checks or
+    /// a file filter's every-row zones.
     ZoneMapRead,
     /// A located run's checked slots put to its file's statistics, footer
     /// and zone maps.
@@ -172,6 +186,12 @@ pub(crate) enum Event {
     MaskedRead(MaskedRead),
     /// A filter evaluated over one split.
     SplitEvaluated,
+    /// A split's rows a filter of code equalities took uncompared, from
+    /// zones where no row can differ from any of its codes.
+    SplitAllRows(u64),
+    /// A split's rows a filter's conjuncts were evaluated over, after its
+    /// zones were pruned.
+    SplitFilterRows(u64),
     /// A split's mask the in-order fold handed on, of this range.
     SplitConsumed(Range<u64>),
 }

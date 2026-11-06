@@ -29,7 +29,7 @@ use crate::store::VortexRdfStore;
 use crate::store::construct::resolved_layout;
 use crate::store::indexes::COL_RID;
 use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
-use crate::store::zones::ZoneTable;
+use crate::store::zones::QuadZones;
 
 /// Refuse a table whose id columns are integers of another width than this
 /// version reads: an integer `s`, `p`, `o`, `g` (the quad table and the copy
@@ -264,9 +264,17 @@ impl VortexRdfStore {
         let (quads, source) = (file.quad_layout()?, file.segment_source());
         let (parts, zones) = futures::try_join!(
             opened.to_serializable_parts(),
-            ZoneTable::read_from_file(&quads, &source)
+            QuadZones::read(&quads, &source)
         )?;
-        Self::from_parts(parts, zones)
+        let store = Self::from_parts(parts, zones)?;
+        // The footer's exact bounds of the quad table's code columns, the
+        // base columns' array statistics (the whole column's level).
+        if let crate::store::Backend::InMemory(memory) = &store.quads.backend {
+            crate::store::array::stamp_quad_bounds(&memory.base, |column| {
+                crate::io::zone_map::footer_bounds(file, column)
+            });
+        }
+        Ok(store)
     }
 
     /// The open behind both: footer, component roster and resolved layout,
@@ -366,8 +374,7 @@ impl VortexRdfStore {
         let typed = root.as_::<container::RdfStoreLayoutVTable>();
         // The base's zone bounds, from the quad child's zone maps.
         let zones =
-            ZoneTable::read_from_file(&container::quad_source(typed)?, &file.segment_source())
-                .await?;
+            QuadZones::read(&container::quad_source(typed)?, &file.segment_source()).await?;
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let quads = quads.execute::<StructArray>(&mut ctx)?.into_array();
         // Restore the subject stamp from the file's recorded provenance,
@@ -399,6 +406,11 @@ impl VortexRdfStore {
             })
             .collect::<Result<Vec<_>>>()?;
         let layout = resolved_layout(dict, quads.dtype())?;
+        // The footer's exact bounds of the quad table's code columns, the
+        // base columns' array statistics (the whole column's level).
+        crate::store::array::stamp_quad_bounds(&quads, |column| {
+            crate::io::zone_map::footer_bounds(&file, column)
+        });
         Self::assemble_resident(quads, components, layout, zones)
     }
 }

@@ -118,6 +118,21 @@ pub(crate) fn zones_switch() -> bool {
     *ON.get_or_init(|| std::env::var("VORTEX_RDF_ZONES").as_deref() != Ok("0"))
 }
 
+/// Whether reads decide their checked rows by the statistics: located runs
+/// zone by zone, and the in-memory residual by its columns' array
+/// statistics. `VORTEX_RDF_ZONES=0` ([`zones_switch`]) puts every read on
+/// its row-by-row route, as before the statistics were asked; a test may
+/// force it for its thread ([`ForcedZones`]).
+///
+/// [`ForcedZones`]: crate::store::test_hooks::ForcedZones
+pub(crate) fn zones_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = crate::store::test_hooks::forced_zones() {
+        return on;
+    }
+    zones_switch()
+}
+
 /// Register the store's rules in `session`.
 pub(crate) fn register(session: &VortexSession) {
     use vortex_array::stats::session::StatsSessionExt as _;
@@ -168,8 +183,30 @@ pub(crate) fn eq_proofs(
     })
 }
 
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A test forces the switch for its thread; the guard's drop restores it.
+    #[test]
+    fn forced_zones_override() {
+        use crate::store::test_hooks::ForcedZones;
+
+        let production = zones_enabled();
+        {
+            let _off = ForcedZones::set(false);
+            assert!(!zones_enabled());
+            let _on = ForcedZones::set(true);
+            assert!(zones_enabled());
+        }
+        assert_eq!(zones_enabled(), production);
+    }
+}
+
+/// The proofs of `x = c` on zone maps: file-only, as only file reads build
+/// them ([`eq_proofs`]).
+#[cfg(all(test, feature = "file-io"))]
+mod proofs {
     use super::*;
     use crate::io::zone_map::ColumnZones;
     use vortex_array::dtype::{DType, Nullability, PType};

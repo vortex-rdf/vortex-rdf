@@ -23,6 +23,7 @@ mod dictionary_handle;
 // shared escaped-literal case list.
 pub(crate) mod escaping;
 mod file_backed;
+mod file_counts;
 mod index_order;
 mod indexes;
 mod indexes_file;
@@ -40,6 +41,7 @@ mod pending_residual;
 mod predicates;
 mod rebuild;
 mod reference_graphs;
+mod residual_zones;
 mod roundtrip;
 mod row_limit;
 mod serialization;

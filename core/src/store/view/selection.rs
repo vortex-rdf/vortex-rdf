@@ -114,8 +114,11 @@ impl ViewSelection {
     /// file run's only once read. An in-memory
     /// run's ids are decoded and cached here, the one way this fails, and a
     /// pending residual's matches are known once every piece was compared,
-    /// and computed here under tombstones. Passed no tombstones, it counts the
+    /// and counted here under tombstones ([`PendingResidual::count`]: zone by
+    /// zone where its zones are classed). Passed no tombstones, it counts the
     /// selection's rows, a bound on its live ones.
+    ///
+    /// [`PendingResidual::count`]: crate::store::view::pending::PendingResidual::count
     pub(crate) fn len_if_known(
         &self,
         deleted: Option<&Mask>,
@@ -129,7 +132,7 @@ impl ViewSelection {
             }
             (ViewSelection::Residual(residual), None) => residual.len_if_known(),
             (ViewSelection::Residual(residual), Some(deleted)) => {
-                Some(RowSelection::Ids(residual.materialized()?).live_len(Some(deleted), base_len))
+                Some(residual.count(Some(deleted))?)
             }
         })
     }

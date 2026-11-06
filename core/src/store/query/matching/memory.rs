@@ -280,12 +280,39 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
-        if need.defers_residual(selection.len(memory.base.len())) {
+        // The statistics ladder's first levels, asked once, before the
+        // compare is deferred or run. The base columns' array statistics:
+        // an equality no row holds leaves the selection no row (the view
+        // keeps its tail and indexes), one every row holds leaves the
+        // compare, and with none left the selection is the answer. Either way
+        // the residual has narrowed the view, so a serve plan is dropped as a
+        // compare drops it, and the rows read in base order. Then the zones
+        // the selection touches, classed against the equalities left.
+        let rows = selection.len(memory.base.len());
+        let (eqs, zones) = if residual::asks_statistics(rows) && crate::stats_rules::zones_enabled()
+        {
+            match residual::ask_statistics(memory, &selection, eqs)? {
+                residual::Asked::Nothing => {
+                    observe!(ResidualSettled { none: true });
+                    debug::step!(t, "[match_pattern] In-memory residual settled: no row");
+                    return Ok(Some(ViewSelection::Exact(RowSelection::empty())));
+                }
+                residual::Asked::Everything => {
+                    observe!(ResidualSettled { none: false });
+                    debug::step!(t, "[match_pattern] In-memory residual settled: every row");
+                    return Ok(Some(ViewSelection::Exact(selection)));
+                }
+                residual::Asked::Open { eqs, zones } => (eqs, zones),
+            }
+        } else {
+            (eqs, None)
+        };
+        if need.defers_residual(rows) {
             debug::step!(t, "[match_pattern] In-memory residual left pending");
-            let pending = PendingResidual::new(memory.clone(), selection, eqs);
+            let pending = PendingResidual::new(memory.clone(), selection, eqs, zones);
             return Ok(Some(ViewSelection::Residual(Arc::new(pending))));
         }
-        let narrowed = residual::residual_rows(memory, selection, &eqs, t)?;
+        let narrowed = residual::residual_rows(memory, selection, &eqs, zones.as_ref(), t)?;
         Ok(Some(ViewSelection::Exact(narrowed)))
     }
 }
