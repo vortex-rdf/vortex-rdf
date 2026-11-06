@@ -1,5 +1,6 @@
-//! Probe mechanism benchmarks: resolve cost, bounds vs the generic vortex
-//! kernel and the canonical floor, windowed bounds, and point access.
+//! Probe mechanism benchmarks: resolve cost, bounds vs Vortex's own sorted
+//! search (typed and by `Scalar`) and the canonical floor, windowed bounds,
+//! and point access.
 //!
 //! Deliberately outside the CodSpeed surface: CI uploads only core's
 //! `benchmark` target, so these groups exist for local A/B runs. The
@@ -16,7 +17,9 @@ use divan::counter::ItemsCount;
 use vortex_array::arrays::{BoolArray, DictArray, PrimitiveArray};
 use vortex_array::expr::{BoundExpression, eq, lit, root};
 use vortex_array::scalar::Scalar;
-use vortex_array::search_sorted::{SearchSorted, SearchSortedArray, SearchSortedSide};
+use vortex_array::search_sorted::{
+    SearchSorted, SearchSortedArray, SearchSortedPrimitiveArray, SearchSortedSide,
+};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
 use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme, SchemeExt as _};
@@ -117,8 +120,38 @@ fn bounds_encoded(bencher: Bencher, shape: &str) {
     });
 }
 
+/// Vortex's typed sorted search over each fixture: one bisection of point
+/// reads, each read through the array's probe as a `Scalar` (a run-end array
+/// bisects its ends on every read), its comparisons typed.
 #[divan::bench(args = SHAPES)]
-fn bounds_generic_search_sorted(bencher: Bencher, shape: &str) {
+fn bounds_vortex_typed(bencher: Bencher, shape: &str) {
+    let fixture = fixture(shape);
+    let probes: Vec<u32> = needles(&fixture.data).into_iter().take(20).collect();
+    let session = common::session();
+    bencher.counter(ItemsCount::new(probes.len())).bench(|| {
+        let mut ctx = session.create_execution_ctx();
+        let sorted = SearchSortedPrimitiveArray::<u32>::new(&fixture.encoded, &mut ctx);
+        probes
+            .iter()
+            .map(|c| {
+                let lo = sorted
+                    .search_sorted(c, SearchSortedSide::Left)
+                    .unwrap()
+                    .to_index();
+                let hi = sorted
+                    .search_sorted(c, SearchSortedSide::Right)
+                    .unwrap()
+                    .to_index();
+                hi - lo
+            })
+            .sum::<usize>()
+    });
+}
+
+/// Vortex's sorted search by `Scalar` over each fixture: the same bisection,
+/// its comparisons between scalars.
+#[divan::bench(args = SHAPES)]
+fn bounds_vortex_scalar(bencher: Bencher, shape: &str) {
     let fixture = fixture(shape);
     let probes: Vec<u32> = needles(&fixture.data).into_iter().take(20).collect();
     let session = common::session();
