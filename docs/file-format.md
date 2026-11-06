@@ -81,14 +81,16 @@ self-describing.
 
 The writer is limited to three editions:
 
-- Vortex's frozen `core` edition `CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L74)): every encoding, layout, extension dtype and Vortex zone-map aggregate a store file may hold;
-- the store edition `vortexrdf2026.10.0` ([`STORE_EDITION`](../core/src/session.rs#L85)), whose one member is the root layout;
-- the value-counts edition `vortexrdf2026.11.0` ([`VALUE_COUNTS_EDITION`](../core/src/session.rs#L91)), whose one member is the graph columns' zone aggregate `vortexrdf.value_counts` (§3).
+- Vortex's frozen `core` edition `CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L75)): every encoding, layout, extension dtype and Vortex zone-map aggregate a store file may hold;
+- the store edition `vortexrdf2026.10.0` ([`STORE_EDITION`](../core/src/session.rs#L86)), whose one member is the root layout;
+- the value-counts edition `vortexrdf2026.11.0` ([`VALUE_COUNTS_EDITION`](../core/src/session.rs#L92)), whose one member is the graph columns' zone aggregate `vortexrdf.value_counts` (§3).
 
 A file of the value-counts edition needs a reader that registers the
 aggregate: vortex-rdf 0.14 and earlier refuse it, naming
 `vortexrdf.value_counts`. Files written before it keep reading; their graph
-columns lack the statistic, and readers skip what it would decide. The
+columns lack the statistic, and readers skip what it would decide. A store
+whose every graph zone holds more than 16 graphs records no value counts, so
+0.14 reads it too. The
 reference children's `g` column ([§6](#6-the-index-children)) needs no edition of its own: it is a
 plain code column with the graph columns' aggregates, and index children stay
 version 1.
@@ -291,7 +293,7 @@ the dtype alone decides the layout ([§4](#4-the-quad-table)).
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L37))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L334)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L335)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates

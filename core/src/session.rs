@@ -65,7 +65,8 @@ fn registries() -> VortexSession {
 
 /// The frozen Vortex `core` edition the store writes with: every array
 /// encoding, layout, extension dtype and zone-map aggregate a store file may
-/// hold, apart from the store's root layout. A frozen edition never changes,
+/// hold, apart from vortex-rdf's own: the store's root layout and the graph
+/// columns' `vortexrdf.value_counts` aggregate. A frozen edition never changes,
 /// so a Vortex upgrade cannot widen what the store writes: a wire form outside
 /// it, such as per-chunk frame-of-reference (`fastlanes.for.v2`), bit-packing
 /// with a width per block (`fastlanes.bitpacked.v2`) or the experimental
@@ -77,7 +78,7 @@ const CORE_EDITION: EditionId = vortex_edition::declarations::core::CORE_2026_08
 static STORE_FAMILY: EditionFamily = EditionFamily {
     name: "vortexrdf",
     origin: "vortex-rdf",
-    doc: "The components vortex-rdf adds to a Vortex file: the store's root layout.",
+    doc: "The components vortex-rdf adds to a Vortex file: the store's root layout and the graph columns' value-counts zone aggregate.",
 };
 
 /// The store edition: the `v2` root layout and nothing else. A released
@@ -160,7 +161,8 @@ mod tests {
     }
 
     /// Every component the session admits for writing is a member of the
-    /// pinned core edition or the store's root layout. A Vortex upgrade that
+    /// pinned core edition or one of vortex-rdf's own: the store's root
+    /// layout and the value-counts aggregate. A Vortex upgrade that
     /// enables more (a plugin enabling its own edition as it initializes, a
     /// default edition switched on) fails here before a store file carries a
     /// wire form the readers were never checked against.
@@ -309,5 +311,46 @@ mod tests {
                 .to_string(),
         };
         assert!(error.contains("vortexrdf.value_counts"), "{error}");
+    }
+
+    /// A store whose every graph zone holds more than 16 graphs records no
+    /// value counts: each zone's state is null, the zone maps carry no
+    /// `vortexrdf.value_counts` column, and a session that doesn't register
+    /// the aggregate (vortex-rdf 0.14's) reads the file.
+    #[tokio::test]
+    async fn a_store_of_wide_graph_zones_reads_without_value_counts() {
+        use oxrdf::{GraphName, NamedNode, Quad};
+        use vortex_file::OpenOptionsSessionExt as _;
+
+        let iri = |name: &str| NamedNode::new_unchecked(format!("http://example.org/{name}"));
+        let quads: Vec<crate::Result<crate::RawQuad>> = (0..100)
+            .map(|i| {
+                let quad = Quad::new(
+                    iri(&format!("s{i}")),
+                    iri("p"),
+                    iri("o"),
+                    GraphName::NamedNode(iri(&format!("g{}", i % 40))),
+                );
+                Ok(crate::RawQuad::from_quad(&quad))
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.vortex");
+        crate::io::quads_stream_to_vortex_file(
+            futures::stream::iter(quads),
+            &path,
+            crate::LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let session = registries();
+        vortex_file::register_default_encodings(&session);
+        crate::io::container::register(&session);
+        let file = session.open_options().open_path(&path).await.unwrap();
+        let rows = crate::io::read::scan_all_reader(file.layout_reader().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 100);
     }
 }
