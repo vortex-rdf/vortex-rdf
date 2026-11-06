@@ -274,7 +274,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L448), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L564) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L679) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:152-159`](../core/src/store/query/matching/memory.rs#L152-L159 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -442,7 +442,7 @@ The selection's rows in "none" zones are skipped, those in "all" zones are
 taken uncompared, and those in a mixed zone are compared on the columns it
 leaves unsettled only, adjacent zones of one treatment as one run, through
 the implementations below
-([`residual_rows`](../core/src/store/scan/residual.rs#L407)). A range starting
+([`residual_rows`](../core/src/store/scan/residual.rs#L522)). A range starting
 mid-zone or an id list is classed on the zones it touches, each cut at the
 zone boundaries. A residual left pending (below) keeps its classes for every
 piece it compares.
@@ -453,7 +453,7 @@ column's `x = c` holds on the zone bounds are left out
 ([`kept_runs`](../core/src/store/zones.rs#L131)), when what is left holds at
 most half the base: a run of rows (every row, or a subject's range) is
 compared zone run by zone run, each a slice of the base through the mask
-scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L537)), and an
+scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L652)), and an
 id list keeps only its ids in those runs before the implementations below
 compare them. A code most zones may hold (a predicate or graph spread over
 every zone) leaves everything to compare.
@@ -502,14 +502,19 @@ how many rows it needs, its window's offset and limit. When those are fewer
 than the rows the selection holds, and the selection holds more than one
 8,192-row piece, the compare is left pending
 ([`PendingResidual`](../core/src/store/view/pending.rs#L37)) as the view's
-selection (`ViewSelection::Residual`), as a deferred index run's ids are. `size_capped` and `window` then compare the
-selection in pieces, in base row order, a zone's rows first and four times as
-many each piece after, each through the zone bounds and the implementations
-above, and stop at the piece that brings the live rows they need to their
-count ([`prefix`](../core/src/store/view/pending.rs#L175)); a selection no
-wider than that count is one piece. A compare that runs to the end keeps its
-matches as the view's ids, and any other consumer compares the whole
-selection at once. A window that reaches every row, a probe with keeps and
+selection (`ViewSelection::Residual`), as a deferred index run's ids are.
+With its zone classes, `size_capped` counts the zones in base order until
+the cap, and `window` counts the zones before the window, unread where they
+can be (below), then reads the matches from the zone holding its first to
+its last ([`zoned_window`](../core/src/store/scan/residual.rs#L351)). Without
+them (zones off, or no zone map for its columns), both compare the selection
+in pieces, in base row order, a zone's rows first and four times as many
+each piece after, each through the implementations above, and stop at the
+piece that brings the live rows they need to their count
+([`prefix`](../core/src/store/view/pending.rs#L208)); a selection no wider
+than that count is one piece, and a compare that runs to the end keeps its
+matches as the view's ids. Any other consumer compares the whole selection
+at once. A window that reaches every row, a probe with keeps and
 `match_pattern` compare eagerly, as above. An ASK over a pattern every zone
 holds then compares the first piece, not the store, and the first piece is
 above the typed residual's caps, so the mask scan compares it.
@@ -517,7 +522,7 @@ above the typed residual's caps, so the mask scan compares it.
 A count without a limit (`IdsNeed::Count`: `size` through `count_probe` and
 `count_code_pattern`) leaves the compare pending too, and counts it zone by
 zone on its zone classes, with no match materialized
-([`zoned_count`](../core/src/store/scan/residual.rs#L259)): a "none" zone
+([`zoned_count`](../core/src/store/scan/residual.rs#L314)): a "none" zone
 counts nothing, an "all" zone its selected live rows, and a mixed zone with
 one column left to compare and no tombstone among its selected rows counts
 from the zone's recorded graphs when the selection holds the whole zone,

@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::observe::observe;
 use crate::store::MemoryBase;
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
-use crate::store::scan::residual::{ResidualZones, residual_rows, zoned_count};
+use crate::store::scan::residual::{ResidualZones, residual_rows, zoned_count, zoned_window};
 use crate::store::schema::RowId;
 use crate::store::view::selection::{RowSelection, SelectedRows, window_rows};
 
@@ -127,7 +127,14 @@ impl PendingResidual {
             return Ok(count_live(ids, deleted));
         }
         match &self.zones {
-            Some(zones) => zoned_count(&self.memory, &self.selection, &self.eqs, zones, deleted),
+            Some(zones) => zoned_count(
+                &self.memory,
+                &self.selection,
+                &self.eqs,
+                zones,
+                deleted,
+                usize::MAX,
+            ),
             None => Ok(count_live(&self.materialized()?, deleted)),
         }
     }
@@ -140,6 +147,19 @@ impl PendingResidual {
     /// `min(live matches, limit)`, `deleted` tombstoned, the pieces compared
     /// only until `limit` live rows are found.
     pub(crate) fn count_capped(&self, limit: usize, deleted: Option<&Mask>) -> Result<usize> {
+        if self.ids.get().is_none()
+            && let Some(zones) = &self.zones
+        {
+            let counted = zoned_count(
+                &self.memory,
+                &self.selection,
+                &self.eqs,
+                zones,
+                deleted,
+                limit,
+            )?;
+            return Ok(counted.min(limit));
+        }
         Ok(self.prefix(limit, deleted)?.live.min(limit))
     }
 
@@ -154,6 +174,19 @@ impl PendingResidual {
         limit: usize,
         deleted: Option<&Mask>,
     ) -> Result<(Buffer<RowId>, usize)> {
+        if self.ids.get().is_none()
+            && let Some(zones) = &self.zones
+        {
+            return zoned_window(
+                &self.memory,
+                &self.selection,
+                &self.eqs,
+                zones,
+                offset,
+                limit,
+                deleted,
+            );
+        }
         let prefix = self.prefix(offset.saturating_add(limit), deleted)?;
         let live = prefix.live_ids(deleted);
         let rows = window_rows(offset, limit, live.len() as u64)

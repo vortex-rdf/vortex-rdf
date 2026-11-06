@@ -1,15 +1,19 @@
 //! A residual compare left pending: an in-memory match that a count or a
 //! window may stop short of (`count_probe` with a limit, `run_probe` with a
-//! window) leaves its residual compare pending and compares the selection in
-//! pieces, a zone's rows first and four times as many each after, only until
-//! the count or the window has its live rows. Its answers are the eager
-//! compare's, over every kind of selection, under tombstones and with a tail;
-//! a count or a window that reaches every row, and every other use of a
+//! window) leaves its residual compare pending. With zones off (or no zone
+//! map for its columns) it compares the selection in pieces, a zone's rows
+//! first and four times as many each after, only until the count or the
+//! window has its live rows: the pins of those pieces run with zones off.
+//! With zones on it counts and windows by its zone classes
+//! (`tests::residual_zones`). Its answers are the eager compare's, over
+//! every kind of selection, under tombstones and with a tail, either way; a
+//! capped count or a window that reaches every row, and every other use of a
 //! match, compares eagerly.
 
 use super::*;
 use crate::io::zone_map::ZONE_ROWS;
 use crate::store::scan::pieces::FIRST_PIECE_ROWS;
+use crate::store::test_hooks::ForcedZones;
 
 /// The rows of each piece of a pending residual `rec` saw compared since its
 /// last take, in order.
@@ -61,6 +65,8 @@ fn probe(p: Option<&str>, o: Option<&str>) -> Probe {
 /// compare's.
 #[tokio::test]
 async fn a_count_compares_only_the_pieces_its_limit_needs() {
+    // The pieces' route: zones off.
+    let _zones = ForcedZones::set(false);
     let (_dir, stores) = residual_stores().await;
     // `p0` matches every third row: 2,731 in the first piece, 13,654 in the
     // first two.
@@ -114,6 +120,8 @@ async fn a_count_compares_only_the_pieces_its_limit_needs() {
 /// its rows the eager match's: a first page stops after the first piece.
 #[tokio::test]
 async fn a_window_compares_only_the_pieces_it_reaches() {
+    // The pieces' route: zones off.
+    let _zones = ForcedZones::set(false);
     let (_dir, stores) = residual_stores().await;
     let p0 = probe(Some("p0"), None);
     for (label, store) in &stores {
@@ -136,7 +144,8 @@ async fn a_window_compares_only_the_pieces_it_reaches() {
     }
 }
 
-/// Every count and window of a pending compare answers as the eager match:
+/// Every count and window of a pending compare answers as the eager match,
+/// zones off (by pieces) and on (by zone classes):
 /// patterns whose rows every piece holds (`p0`, `"o7"`, the default graph)
 /// and fewer (`p1` with `"o7"`), at windows that end in each piece, at the
 /// matches' end and past it, over the store, a window of it (a range from
@@ -166,7 +175,12 @@ async fn a_pending_compare_answers_as_the_eager_match() {
         probe(Some("p1"), Some("o7")),
         Probe::new(None, None, None, Some(GraphName::DefaultGraph)),
     ];
-    for (label, store) in &stores {
+    for ((label, store), on) in stores
+        .iter()
+        .flat_map(|store| [(store, false), (store, true)])
+    {
+        let _zones = ForcedZones::set(on);
+        let label = format!("{label} (zones {})", if on { "on" } else { "off" });
         let views = [
             ("plain", store.clone()),
             ("windowed", store.window(1_000, ROWS).await.unwrap()),
@@ -243,6 +257,8 @@ async fn a_pending_compare_answers_as_the_eager_match() {
 /// every piece and finds none, and a window takes nothing.
 #[tokio::test]
 async fn a_pending_compare_counts_only_live_rows() {
+    // The pieces' route: zones off.
+    let _zones = ForcedZones::set(false);
     let (_dir, stores) = residual_stores().await;
     let p0_o0 = probe(Some("p0"), Some("o0"));
     for (label, store) in &stores {
@@ -344,6 +360,8 @@ async fn a_count_or_window_reaching_every_row_compares_eagerly() {
 /// still count and take only the live rows.
 #[tokio::test]
 async fn a_pending_compare_run_to_the_end_keeps_its_matches() {
+    // The pieces' route: zones off.
+    let _zones = ForcedZones::set(false);
     use crate::store::IdsNeed;
 
     let (_dir, stores) = residual_stores().await;

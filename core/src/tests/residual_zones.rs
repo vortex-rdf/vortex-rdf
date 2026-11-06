@@ -227,8 +227,8 @@ async fn all_zones_are_taken_uncompared() {
     );
 }
 
-/// A window of a deferred residual, compared in several pieces, classes
-/// the residual's zones once.
+/// A window of a deferred residual, which counts the zones before it and
+/// reads the one holding it, classes the residual's zones once.
 #[tokio::test]
 async fn a_pending_residual_classes_once() {
     let store = built_store(zone_quads(Graphs::Long), LayoutStrategy::Dictionary, vec![]).await;
@@ -245,20 +245,24 @@ async fn a_pending_residual_classes_once() {
                     .await
                     .unwrap(),
             );
+            let (taken, recorded, counted, compared) = zone_rows_seen(&rec);
             (
                 rows,
                 rec.count_where(|e| matches!(e, Event::ZonesClassed(_))),
-                rec.count_where(|e| matches!(e, Event::ResidualPiece(_))),
+                taken + recorded + counted + compared,
                 rec.count(&Event::ResidualDeferred),
             )
         }
     };
-    let (on, classed, pieces, deferred) = window(true).await;
+    let (on, classed, zone_rows, deferred) = window(true).await;
     let (off, ..) = window(false).await;
     assert_eq!(on.len(), 64);
     assert_eq!(on, off, "the window, as with zones off");
     assert_eq!(deferred, 1, "a deferred residual");
-    assert!(pieces > 1, "compared in {pieces} pieces");
+    assert!(
+        zone_rows > 2 * ZONE_ROWS as u64,
+        "{zone_rows} rows of zones counted or read"
+    );
     assert_eq!(classed, 1, "its zones classed once");
 }
 
@@ -419,5 +423,49 @@ async fn residual_counts_respect_tombstones() {
         taken,
         all_zones * ZONE_ROWS as u64,
         "the all zones taken, their tombstone left out of the count"
+    );
+}
+
+/// A 64-row window from the middle of `(? ? ? g1)` on `Graphs::Alternating`
+/// in memory: every zone is mixed, so the window skips the zones before it
+/// by their recorded counts and compares at most the two zones it spans,
+/// its rows the zones-off window's.
+#[tokio::test]
+async fn residual_windows_jump_by_zone_counts() {
+    use super::located_zones::code_of;
+
+    let store = built_store(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let g1 = code_of(&store, "<http://example.org/g1>").await;
+    let pattern = crate::CodePattern::new(None, None, None, Some(g1));
+    let window = |on: bool| {
+        let store = &store;
+        async move {
+            let _zones = ForcedZones::set(on);
+            let rec = Recorder::start();
+            let rows = tuples(
+                &store
+                    .match_code_pattern(pattern, 10_000, Some(64))
+                    .await
+                    .unwrap(),
+            );
+            (rows, zone_rows_seen(&rec))
+        }
+    };
+    let (on, (_, recorded, _, compared)) = window(true).await;
+    let (off, _) = window(false).await;
+    assert_eq!(on.len(), 64);
+    assert_eq!(on, off, "the window, as with zones off");
+    assert!(
+        compared <= 2 * ZONE_ROWS as u64,
+        "{compared} rows compared, at most the two zones the window spans"
+    );
+    assert!(
+        recorded > 0,
+        "the zones before it counted from their records"
     );
 }

@@ -251,17 +251,73 @@ impl ResidualZones {
     }
 }
 
+/// What a zone's selected rows hold of a residual's matches, had as cheaply
+/// as they can be ([`zone_matches`]).
+enum ZoneMatches {
+    /// Their live matches, counted without reading them.
+    Counted(usize),
+    /// Their matches, compared (tombstoned rows among them).
+    Read(RowSelection),
+}
+
+/// The matches of zone `zone`'s selected rows `part`, by its treatment:
+/// none in a "none" zone, the live rows of an "all" zone, a mixed zone's
+/// counted unread where it can be ([`counted_unread`]), else compared.
+fn zone_matches(
+    memory: &MemoryBase,
+    zones: &ResidualZones,
+    zone: u64,
+    part: &RowSelection,
+    eqs: &[(&'static str, Scalar)],
+    treatment: Treatment,
+    deleted: Option<&Mask>,
+) -> Result<ZoneMatches> {
+    let base_len = memory.base.len();
+    Ok(match treatment {
+        Treatment::Skip => ZoneMatches::Counted(0),
+        Treatment::Take => {
+            observe!(ResidualZoneTaken(part.len(base_len) as u64));
+            ZoneMatches::Counted(live_rows(part, deleted, base_len))
+        }
+        Treatment::Compare(bits) => {
+            match counted_unread(memory, zones, zone, part, eqs, bits, deleted)? {
+                Some(matches) => ZoneMatches::Counted(matches),
+                None => {
+                    ZoneMatches::Read(compared(memory, part.clone(), &picked(eqs, bits), None)?)
+                }
+            }
+        }
+    })
+}
+
+/// The matches of a zone's selected rows `part` by its treatment, read:
+/// none, every row, or those the compare keeps (tombstoned rows among
+/// them).
+fn matched_rows(
+    memory: &MemoryBase,
+    part: RowSelection,
+    eqs: &[(&'static str, Scalar)],
+    treatment: Treatment,
+) -> Result<RowSelection> {
+    match treatment {
+        Treatment::Skip => Ok(RowSelection::empty()),
+        Treatment::Take => Ok(part),
+        Treatment::Compare(bits) => compared(memory, part, &picked(eqs, bits), None),
+    }
+}
+
 /// How many live rows of `selection` (of `memory`'s base, `deleted`
 /// tombstoned) match every equality of `eqs`, by the residual's zone
-/// classes, zone by zone and with no match materialized: none in a "none"
-/// zone, the selected live rows of an "all" zone, a mixed zone's counted
-/// unread where it can be ([`counted_unread`]), and the rest compared.
+/// classes, zone by zone in base order and with no match materialized
+/// ([`zone_matches`]), stopping once `cap` are counted: the count, or at
+/// least `cap`.
 pub(crate) fn zoned_count(
     memory: &MemoryBase,
     selection: &RowSelection,
     eqs: &[(&'static str, Scalar)],
     zones: &ResidualZones,
     deleted: Option<&Mask>,
+    cap: usize,
 ) -> Result<usize> {
     let base_len = memory.base.len();
     let rows = selection.as_rows(base_len);
@@ -270,30 +326,79 @@ pub(crate) fn zoned_count(
     };
     let mut count = 0;
     for (zone, run, treatment) in zones.zones_of(span) {
+        if count >= cap {
+            break;
+        }
         let part = part_of(&rows, run);
-        let selected = part.len(base_len);
-        if selected == 0 {
+        if part.is_empty(base_len) {
             continue;
         }
-        count += match treatment {
-            Treatment::Skip => 0,
-            Treatment::Take => {
-                observe!(ResidualZoneTaken(selected as u64));
-                live_rows(&part, deleted, base_len)
-            }
-            Treatment::Compare(bits) => {
-                match counted_unread(memory, zones, zone, &part, eqs, bits, deleted)? {
-                    Some(matches) => matches,
-                    None => {
-                        let unsettled = picked(eqs, bits);
-                        let matched = compared(memory, part, &unsettled, None)?;
-                        live_rows(&matched, deleted, base_len)
-                    }
-                }
-            }
+        count += match zone_matches(memory, zones, zone, &part, eqs, treatment, deleted)? {
+            ZoneMatches::Counted(matches) => matches,
+            ZoneMatches::Read(matched) => live_rows(&matched, deleted, base_len),
         };
     }
     Ok(count)
+}
+
+/// The live matches `offset..offset + limit` of `selection` (of `memory`'s
+/// base, `deleted` tombstoned) in base row order, by the residual's zone
+/// classes, beside the live matches as far as they are known: every one
+/// when the window reaches the last, else at least `offset + limit`. The
+/// zones before the window are counted ([`zone_matches`]), unread where
+/// they can be; the matches are read from the zone holding the window's
+/// first, a zone at a time, until the window's last.
+pub(crate) fn zoned_window(
+    memory: &MemoryBase,
+    selection: &RowSelection,
+    eqs: &[(&'static str, Scalar)],
+    zones: &ResidualZones,
+    offset: usize,
+    limit: usize,
+    deleted: Option<&Mask>,
+) -> Result<(vortex_buffer::Buffer<RowId>, usize)> {
+    let base_len = memory.base.len();
+    let rows = selection.as_rows(base_len);
+    let Some(span) = span(&rows) else {
+        return Ok((vortex_buffer::Buffer::empty(), 0));
+    };
+    let want = offset.saturating_add(limit);
+    // The live matches before the window's zone, and those read from it on.
+    let (mut before, mut found) = (0usize, Vec::<RowId>::new());
+    for (zone, run, treatment) in zones.zones_of(span) {
+        let part = part_of(&rows, run);
+        if part.is_empty(base_len) {
+            continue;
+        }
+        if found.is_empty() {
+            let matched = match zone_matches(memory, zones, zone, &part, eqs, treatment, deleted)? {
+                ZoneMatches::Counted(matches) if before + matches <= offset => {
+                    before += matches;
+                    continue;
+                }
+                ZoneMatches::Counted(_) => matched_rows(memory, part, eqs, treatment)?,
+                ZoneMatches::Read(matched) => matched,
+            };
+            let live = live_ids(&matched, deleted, base_len);
+            if before + live.len() <= offset {
+                before += live.len();
+                continue;
+            }
+            found = live;
+        } else {
+            let matched = matched_rows(memory, part, eqs, treatment)?;
+            found.extend(live_ids(&matched, deleted, base_len));
+        }
+        if before + found.len() >= want {
+            break;
+        }
+    }
+    let start = offset.saturating_sub(before).min(found.len());
+    let end = start.saturating_add(limit).min(found.len());
+    Ok((
+        vortex_buffer::Buffer::from_iter(found[start..end].iter().copied()),
+        before + found.len(),
+    ))
 }
 
 /// The matches of mixed zone `zone`'s selected rows `part`, counted unread
@@ -355,6 +460,16 @@ fn tombstoned(selection: &RowSelection, deleted: &Mask, base_len: usize) -> usiz
         SelectedRows::Run(run) => deleted.slice(run).true_count(),
         SelectedRows::Ids(ids) => ids.iter().filter(|&&id| deleted.value(id as usize)).count(),
     }
+}
+
+/// `selection`'s rows `deleted` leaves live, in order.
+fn live_ids(selection: &RowSelection, deleted: Option<&Mask>, base_len: usize) -> Vec<RowId> {
+    let mut ids = Vec::with_capacity(selection.len(base_len));
+    extend_rows(&mut ids, selection, base_len);
+    if let Some(deleted) = deleted {
+        ids.retain(|&id| !deleted.value(id as usize));
+    }
+    ids
 }
 
 /// How many of `selection`'s rows `deleted` leaves live.
