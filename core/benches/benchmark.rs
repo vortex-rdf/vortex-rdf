@@ -1836,6 +1836,186 @@ fn checked_ref_run_og(bencher: divan::Bencher, read: &CheckedRead) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// Group 4i — WHOLE-STORE COUNTS (general matches over zones of one graph)
+//
+// A pattern that no index serves goes through the general match: on file a
+// filtered scan whose zones Vortex prunes, in memory the residual compare
+// over the base. In the other groups' files every zone holds several graphs,
+// so no zone holds the bound graph alone. Here zones 0 to 3 hold graph A
+// alone, zones 4 and 5 graph B alone, zone 6 both in turn, and zone 7 graph
+// C: half the file is A's in whole zones, where every row matches.
+//
+// One Dictionary file without an index, written as the CLI writes one:
+// 65,536 quads `(s, type, Taxon, g)`. Each cell times one read of a store
+// opened before timing, on the file and loaded in memory from it: the count
+// of `(? ? ? A)`, the count of `(? type ? A)`, and a page of 4,096 rows from
+// the middle of `(? ? ? A)`'s matches.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Rows of the whole-counts file: 8 zones of 8,192 rows.
+const WHOLE_ROWS: usize = 8 * GRAPH_ZONE_ROWS;
+
+/// The rows graph A matches: zones 0 to 3 whole, and half of zone 6.
+const WHOLE_A_ROWS: usize = 4 * GRAPH_ZONE_ROWS + GRAPH_ZONE_ROWS / 2;
+
+/// Where the middle page of `(? ? ? A)`'s matches starts: inside zone 2.
+const WHOLE_PAGE_OFFSET: usize = 18_000;
+
+/// The whole-counts file's graph labelled `label`.
+fn whole_graph_named(label: &str) -> GraphName {
+    GraphName::NamedNode(zones_iri(&format!("whole/{label}")))
+}
+
+/// The graph of row `i`: A in zones 0 to 3, B in zones 4 and 5, A and B in
+/// turn in zone 6, C in zone 7.
+fn whole_graph(i: usize) -> GraphName {
+    whole_graph_named(match i / GRAPH_ZONE_ROWS {
+        0..=3 => "A",
+        4 | 5 => "B",
+        6 if i.is_multiple_of(2) => "A",
+        6 => "B",
+        _ => "C",
+    })
+}
+
+/// The whole-counts file, written once per process under
+/// `target/bench_vortex_files` by the writer the CLI and the bindings use.
+fn whole_file() -> PathBuf {
+    static FILE: OnceLock<PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let dir = PathBuf::from("target/bench_vortex_files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("whole_counts.vortex");
+        let quads: Vec<RawQuad> = (0..WHOLE_ROWS)
+            .map(|i| {
+                let subject = zones_iri(&format!("whole/s{i:05}"));
+                let quad = Quad::new(
+                    subject,
+                    zones_iri("type"),
+                    zones_iri("Taxon"),
+                    whole_graph(i),
+                );
+                RawQuad::from_quad(&quad)
+            })
+            .collect();
+        let quads = stream::iter(quads.into_iter().map(Ok));
+        rt().block_on(async {
+            io::quads_stream_to_vortex_file(
+                quads,
+                &path,
+                LayoutStrategy::Dictionary,
+                Index::None.types(),
+            )
+            .await
+            .expect("write the whole-counts file");
+        });
+        path
+    })
+    .clone()
+}
+
+/// One read of graph A's general match on the whole-counts file.
+#[derive(Copy, Clone)]
+enum WholeRead {
+    /// `(? ? ? A)`'s `size`.
+    CountG,
+    /// `(? type ? A)`'s `size`.
+    CountPg,
+    /// `match_code_pattern` of [`PAGE_ROWS`] of `(? ? ? A)`'s matches from
+    /// [`WHOLE_PAGE_OFFSET`].
+    MiddlePageG,
+}
+
+impl fmt::Debug for WholeRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CountG => "count_g",
+            Self::CountPg => "count_pg",
+            Self::MiddlePageG => "middle_page_g",
+        })
+    }
+}
+
+/// The reads timed on the whole-counts file.
+const WHOLE_READS: &[WholeRead] = &[
+    WholeRead::CountG,
+    WholeRead::CountPg,
+    WholeRead::MiddlePageG,
+];
+
+impl WholeRead {
+    /// This read on `store`, as the rows it returns (a count, its value).
+    async fn rows(self, store: &VortexRdfStore) -> usize {
+        let graph = whole_graph_named("A");
+        match self {
+            Self::CountG | Self::CountPg => {
+                let predicate = zones_iri("type");
+                let predicate = matches!(self, Self::CountPg).then_some(&predicate);
+                let view = store
+                    .match_pattern(None, predicate, None, Some(&graph))
+                    .await
+                    .expect("match");
+                view.size().await.expect("size")
+            }
+            Self::MiddlePageG => {
+                let dict = store.dict_reader().expect("a Dictionary store");
+                let code = dict
+                    .encode(&format!("<{}>", zones_iri("whole/A").as_str()))
+                    .await
+                    .expect("encode")
+                    .expect("graph A is in the file");
+                let pattern = CodePattern::new(None, None, None, Some(code));
+                let columns = store.match_code_pattern(pattern, WHOLE_PAGE_OFFSET, Some(PAGE_ROWS));
+                columns.await.expect("window")[0].len()
+            }
+        }
+    }
+
+    /// The rows this read returns.
+    fn expected_rows(self) -> usize {
+        match self {
+            Self::CountG | Self::CountPg => WHOLE_A_ROWS,
+            Self::MiddlePageG => PAGE_ROWS,
+        }
+    }
+}
+
+/// One whole-counts cell: `read` on the whole-counts file opened as
+/// `residency`, before timing. The setup panics, naming `cell`, unless the
+/// read returns its rows.
+fn whole_counts(bencher: divan::Bencher, cell: &str, residency: DictResidency, read: WholeRead) {
+    let path = whole_file();
+    let store = rt().block_on(residency.open(&path));
+    let rows = rt().block_on(read.rows(&store));
+    assert_eq!(
+        rows,
+        read.expected_rows(),
+        "{cell}/{read:?}: wrong row count"
+    );
+    bencher.bench(|| black_box(rt().block_on(read.rows(&store))));
+}
+
+#[divan::bench(args = WHOLE_READS, sample_count = QUERY_SAMPLES)]
+fn whole_counts_file(bencher: divan::Bencher, read: &WholeRead) {
+    whole_counts(
+        bencher,
+        "whole_counts_file",
+        DictResidency::FileBacked,
+        *read,
+    );
+}
+
+#[divan::bench(args = WHOLE_READS, sample_count = QUERY_SAMPLES)]
+fn whole_counts_resident(bencher: divan::Bencher, read: &WholeRead) {
+    whole_counts(
+        bencher,
+        "whole_counts_resident",
+        DictResidency::Resident,
+        *read,
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // Group 5 — MUTATE (append / delete / compact)
 //
 // Mutations are copy-on-write: appends accrete in an in-memory tail, deletes
