@@ -113,6 +113,10 @@ pub(crate) enum Event {
     /// buffers: the index child's columns read (those its terms do not pin,
     /// the row id only under tombstones).
     ServedCodesRead(Vec<&'static str>),
+    /// A served file view's child rows at its positions read by a scan
+    /// (where no probe reads the child's columns), bounded to these child
+    /// rows: the splits Vortex plans for it lie inside them.
+    ServedPositionsScanned(Range<u64>),
     /// A served in-memory view's chunk read off its index component (a slice
     /// of its run, or a take at its live rows), the base's code columns being
     /// encoded (a store read off a file), this many rows.

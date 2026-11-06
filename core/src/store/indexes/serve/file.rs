@@ -258,9 +258,23 @@ impl FileServePlan {
         if let Some(rows) = component_point_rows(file, self.child.name, columns, positions).await? {
             return Ok(rows);
         }
+        // The scan is bounded to the positions' span as well as selected at
+        // them: without a row range, Vortex plans the splits of dense
+        // positions over the whole child, every chunk of every column read.
+        let span = match (positions.first(), positions.last()) {
+            (Some(&first), Some(&last)) => first..last + 1,
+            _ => 0..0,
+        };
+        observe!(ServedPositionsScanned(span.clone()));
         let positions =
             vortex_scan::strict_sorted_buffer::StrictSortedBuffer::try_new(positions.clone())?;
-        read_all_rows(self.child.scan(columns)?.with_row_indices(positions)).await
+        read_all_rows(
+            self.child
+                .scan(columns)?
+                .with_row_range(span)
+                .with_row_indices(positions),
+        )
+        .await
     }
 
     /// The child's rows at `positions` (ascending, not empty), every child

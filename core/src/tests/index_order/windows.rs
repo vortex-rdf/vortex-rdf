@@ -495,3 +495,57 @@ async fn string_served_views_read_their_positions() {
         }
     }
 }
+
+/// A narrowed served view of a string-layout file reads its positions by a
+/// scan bounded to the rows they span, never to the whole index child: the
+/// scan's row range bounds the splits Vortex plans, which it would otherwise
+/// plan over every chunk of the child's columns on each read.
+#[tokio::test]
+async fn string_served_positions_scan_their_span() {
+    let (_dir, path) = write_store_file(
+        modular_quads(20_000, 7, 11),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    // A tombstone inside the run leaves the partitions' positions holes.
+    let store = VortexRdfStore::from_file(&path)
+        .await
+        .unwrap()
+        .delete_matching(
+            Some(&NamedOrBlankNode::from(iri("s9998"))),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let view = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    assert_eq!(served_component(&view), Some("index:posg"));
+    let n = view.size().await.unwrap();
+    let rec = Recorder::start();
+    for part in view
+        .partitions(std::num::NonZeroUsize::new(4).unwrap())
+        .await
+        .unwrap()
+    {
+        part.quads_vec().await.unwrap();
+    }
+    view.window(n / 2, 4)
+        .await
+        .unwrap()
+        .quads_vec()
+        .await
+        .unwrap();
+    let spans = rec.picked(|e| match e {
+        Event::ServedPositionsScanned(rows) => Some(rows.clone()),
+        _ => None,
+    });
+    assert!(!spans.is_empty(), "the reads scan their positions");
+    for rows in &spans {
+        assert!(
+            rows.end - rows.start <= n as u64,
+            "a positions scan spans at most the {n}-row view, not the child: {rows:?}"
+        );
+    }
+}
