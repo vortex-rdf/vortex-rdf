@@ -27,6 +27,12 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     crate::stats_rules::register(&session);
     vortex_file::register_default_encodings(&session);
     crate::io::container::register(&session);
+    {
+        use vortex_array::aggregate_fn::session::AggregateFnSessionExt as _;
+        session
+            .aggregate_fns()
+            .register(crate::store::value_counts::ValueCounts);
+    }
     enable_write_editions(&session);
     session
 });
@@ -78,6 +84,22 @@ static STORE_FAMILY: EditionFamily = EditionFamily {
 /// edition is frozen: a new member gets a new edition, not a changed one.
 const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 10, 0);
 
+/// The edition adding the graph columns' `vortexrdf.value_counts` zone
+/// aggregate: each zone's graphs with their rows, for Vortex's pruning of a
+/// bound graph and the store's counts. A file of this edition needs a reader
+/// that registers the aggregate.
+const VALUE_COUNTS_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 11, 0);
+
+static VALUE_COUNTS_DECLARATION: EditionDeclaration = EditionDeclaration {
+    edition: Edition {
+        id: VALUE_COUNTS_EDITION,
+        min_library_version: None,
+    },
+    added: &[EditionMember::aggregate(
+        &crate::store::value_counts::VALUE_COUNTS_ID,
+    )],
+};
+
 static STORE_DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: STORE_EDITION,
@@ -89,10 +111,11 @@ static STORE_DECLARATION: EditionDeclaration = EditionDeclaration {
 };
 
 /// Register Vortex's edition declarations and the store's, then enable
-/// [`CORE_EDITION`] and [`STORE_EDITION`] for writing. The file writer emits
+/// [`CORE_EDITION`], [`STORE_EDITION`] and [`VALUE_COUNTS_EDITION`] for
+/// writing. The file writer emits
 /// only components of an enabled edition (reading needs registration alone)
 /// and a compressor built from the session only the wire forms they allow, so
-/// the two editions are the allow-list of what a store file can contain.
+/// the three editions are the allow-list of what a store file can contain.
 fn enable_write_editions(session: &VortexSession) {
     use vortex_edition::EditionSessionExt as _;
     use vortex_error::{VortexExpect as _, vortex_err};
@@ -107,7 +130,11 @@ fn enable_write_editions(session: &VortexSession) {
         .register_edition(&STORE_DECLARATION)
         .map_err(|error| vortex_err!("{error}"))
         .vortex_expect("the store edition is valid");
-    for edition in [CORE_EDITION, STORE_EDITION] {
+    session
+        .register_edition(&VALUE_COUNTS_DECLARATION)
+        .map_err(|error| vortex_err!("{error}"))
+        .vortex_expect("the value-counts edition is valid");
+    for edition in [CORE_EDITION, STORE_EDITION, VALUE_COUNTS_EDITION] {
         session
             .enable_edition(edition)
             .map_err(|error| vortex_err!("{error}"))
@@ -155,7 +182,9 @@ mod tests {
                 .map(|inclusion| inclusion.component_id.to_string())
                 .collect();
             for id in ids(kind) {
-                let own = kind == ComponentKind::Layout && id == STORE_LAYOUT_ID;
+                let own = (kind == ComponentKind::Layout && id == STORE_LAYOUT_ID)
+                    || (kind == ComponentKind::Aggregate
+                        && id == crate::store::value_counts::VALUE_COUNTS_ID);
                 assert!(
                     own || pinned.contains(&id),
                     "{kind} {id} is admitted outside {CORE_EDITION}"
@@ -222,5 +251,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `vortexrdf` edition after the store edition adds one member, the
+    /// graph columns' `vortexrdf.value_counts` zone aggregate, and is enabled
+    /// for writing.
+    #[test]
+    fn the_value_counts_edition_adds_the_statistic() {
+        let edition = EditionId::new("vortexrdf", 2026, 11, 0);
+        let members: Vec<String> = VORTEX_SESSION
+            .editions()
+            .components_in(&edition, ComponentKind::Aggregate)
+            .iter()
+            .map(|inclusion| inclusion.component_id.to_string())
+            .collect();
+        assert_eq!(members, ["vortexrdf.value_counts"]);
+        assert!(ids(ComponentKind::Aggregate).contains(&"vortexrdf.value_counts".to_string()));
+    }
+
+    /// A session that doesn't register the aggregate (vortex-rdf 0.14's)
+    /// can't read a store file carrying it, and says which aggregate.
+    #[tokio::test]
+    async fn a_session_without_value_counts_refuses_a_new_file() {
+        use oxrdf::{GraphName, NamedNode, Quad};
+        use vortex_file::OpenOptionsSessionExt as _;
+
+        let iri = |name: &str| NamedNode::new_unchecked(format!("http://example.org/{name}"));
+        let quads: Vec<crate::Result<crate::RawQuad>> = (0..100)
+            .map(|i| {
+                let quad = Quad::new(
+                    iri(&format!("s{i}")),
+                    iri("p"),
+                    iri("o"),
+                    GraphName::NamedNode(iri(&format!("g{}", i % 3))),
+                );
+                Ok(crate::RawQuad::from_quad(&quad))
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.vortex");
+        crate::io::quads_stream_to_vortex_file(
+            futures::stream::iter(quads),
+            &path,
+            crate::LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let session = registries();
+        vortex_file::register_default_encodings(&session);
+        crate::io::container::register(&session);
+        let error = match session.open_options().open_path(&path).await {
+            Err(error) => error.to_string(),
+            Ok(file) => crate::io::read::scan_all_reader(file.layout_reader().unwrap())
+                .await
+                .expect_err("a session without the aggregate reads the file")
+                .to_string(),
+        };
+        assert!(error.contains("vortexrdf.value_counts"), "{error}");
     }
 }

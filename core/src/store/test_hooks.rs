@@ -94,6 +94,33 @@ thread_local! {
 }
 
 thread_local! {
+    /// Whether this thread's store writes record the graph columns'
+    /// `vortexrdf.value_counts`, while a [`ForcedValueCounts`] guard is live.
+    static VALUE_COUNTS: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The value-counts switch a [`ForcedValueCounts`] forced on this thread.
+pub(crate) fn forced_value_counts() -> Option<bool> {
+    VALUE_COUNTS.get()
+}
+
+/// While alive, this thread's store writes record the graph columns'
+/// `vortexrdf.value_counts` (`true`), or write them as earlier versions did
+/// (`false`), to stand for a file written before the statistic.
+pub(crate) struct ForcedValueCounts {
+    _guard: Override<bool>,
+}
+
+impl ForcedValueCounts {
+    /// Force the statistic on or off until the guard drops.
+    pub(crate) fn set(on: bool) -> Self {
+        Self {
+            _guard: Override::set(&VALUE_COUNTS, on),
+        }
+    }
+}
+
+thread_local! {
     /// The longest gap run this thread's located runs check row by row,
     /// while a [`ForcedGapRows`] guard is live.
     static GAP_ROWS: Cell<Option<u64>> = const { Cell::new(None) };
@@ -432,6 +459,15 @@ impl VortexRdfStore {
         self.quads.file().map(|base| base.file.is_mapped())
     }
 
+    /// The store's file handle; `None` off-file.
+    pub(crate) fn debug_native_file(
+        &self,
+    ) -> Option<std::sync::Arc<crate::store::persist::native_file::NativeStoreFile>> {
+        self.quads
+            .file()
+            .map(|base| std::sync::Arc::clone(&base.file))
+    }
+
     /// How many (scope, filter shape) trees the file handle has bound;
     /// `None` off-file.
     pub(crate) fn debug_bound_exprs(&self) -> Option<usize> {
@@ -598,6 +634,28 @@ impl VortexRdfStore {
             return Ok(None);
         };
         let pattern = QuadPattern::new(Some(subject), None, None, None);
+        let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
+            return Ok(Some(0..0));
+        };
+        match file_exprs::build_file_filter(pattern, &mut codes)? {
+            Some(filter) => file_filter::row_range_from_pruning(file, &filter).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The zone-map row range a bound graph prunes to on a file view, as the
+    /// general match computes it: `Some(0..0)` when the layout or the
+    /// statistics prove it absent, `None` off-file or when the statistics
+    /// exclude nothing.
+    pub(crate) async fn debug_graph_pruning_envelope(
+        &self,
+        graph: &oxrdf::GraphName,
+    ) -> Result<Option<Range<u64>>> {
+        use crate::store::scan::{file_exprs, file_filter};
+        let Some(FileBase { file, .. }) = self.quads.file() else {
+            return Ok(None);
+        };
+        let pattern = QuadPattern::new(None, None, None, Some(graph));
         let Prepared::Codes(mut codes) = self.layout.prepare_pattern(pattern).await? else {
             return Ok(Some(0..0));
         };

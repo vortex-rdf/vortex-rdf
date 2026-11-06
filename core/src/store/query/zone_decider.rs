@@ -1,8 +1,15 @@
-//! The zone level of the statistics ladder (spec §3, level 2): how each zone
-//! of a table stands against the bound slots a located run checks, decided
-//! by Vortex's own proofs of `x = c` ([`eq_proofs`]) on the checked columns'
-//! zone maps ([`ColumnZones`]): no row of the zone holds every checked code,
-//! every row does, or the zone is mixed.
+//! The zone level of the statistics ladder: how each zone of a table stands
+//! against the bound slots a located run checks, decided by Vortex's own
+//! proofs of `x = c` ([`eq_proofs`]) on the checked columns' zone maps
+//! ([`ColumnZones`]) and by the values a graph column's zones record: no row
+//! of the zone holds every checked code, every row does, or the zone is
+//! mixed.
+//!
+//! The ladder is the order a located run asks the statistics in, each level
+//! only for what the one before left open: the file's footer settles a
+//! checked slot for the whole file (level 1), the zone maps class each zone
+//! (level 2, this module), and a graph column's recorded values count a
+//! mixed zone without reading its rows (level 3).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -25,11 +32,12 @@ pub(crate) enum ZoneClass {
     Mixed { unsettled: u8 },
 }
 
-/// A checked slot of a run: its column's zone map in the run's table, and
-/// Vortex's proofs of `x = code` for the slot's code
+/// A checked slot of a run: the code it is checked for, its column's zone
+/// map in the run's table, and Vortex's proofs of `x = code`
 /// ([`eq_proofs`](crate::stats_rules::eq_proofs)).
 pub(crate) struct CheckedColumn {
     pub(crate) slot: usize,
+    pub(crate) code: u64,
     pub(crate) zones: Arc<ColumnZones>,
     pub(crate) proofs: EqProofs,
 }
@@ -58,10 +66,25 @@ impl ZoneDecider {
         self.columns[0].zones.zone_len()
     }
 
+    /// The table's rows in zone `zone`.
+    pub(crate) fn zone_rows(&self, zone: u64) -> Range<u64> {
+        self.columns[0].zones.zone_rows(zone)
+    }
+
+    /// The rows of zone `zone` holding the code of checked slot `slot`, as
+    /// the slot's column recorded them
+    /// ([`ColumnZones::recorded_count`]): `None` where the column records
+    /// none for the zone, or `slot` is not checked.
+    pub(crate) fn recorded_count(&self, slot: usize, zone: u64) -> Option<u64> {
+        let column = self.columns.iter().find(|column| column.slot == slot)?;
+        column.zones.recorded_count(zone, column.code)
+    }
+
     /// The class of each zone of `zones`, in order: [`ZoneClass::None`]
-    /// where any column's falsifier holds, [`ZoneClass::All`] where every
-    /// column's satisfier does, [`ZoneClass::Mixed`] otherwise, naming the
-    /// columns neither proof settles.
+    /// where any column's falsifier holds or the values its zone recorded
+    /// lack the column's code, [`ZoneClass::All`] where every column's
+    /// satisfier does, [`ZoneClass::Mixed`] otherwise, naming the columns
+    /// none of these settle.
     pub(crate) fn classify(&self, zones: Range<u64>) -> Result<Vec<ZoneClass>> {
         let n = (zones.end - zones.start) as usize;
         let (mut none, mut all, mut unsettled) = (vec![false; n], vec![true; n], vec![0u8; n]);
@@ -78,7 +101,9 @@ impl ZoneDecider {
             };
             let (no_row, every_row) = (holds(falsifier)?, holds(satisfier)?);
             for z in 0..n {
-                let zone_none = no_row.as_ref().is_some_and(|mask| mask.value(z));
+                let zone = zones.start + z as u64;
+                let zone_none = no_row.as_ref().is_some_and(|mask| mask.value(z))
+                    || column.zones.recorded_count(zone, column.code) == Some(0);
                 let zone_all = every_row.as_ref().is_some_and(|mask| mask.value(z));
                 none[z] |= zone_none;
                 all[z] &= zone_all;
@@ -107,8 +132,7 @@ pub(crate) fn zones_enabled() -> bool {
     if let Some(on) = crate::store::test_hooks::forced_zones() {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VORTEX_RDF_ZONES").as_deref() != Ok("0"))
+    crate::stats_rules::zones_switch()
 }
 
 #[cfg(test)]
@@ -134,6 +158,7 @@ mod tests {
         .unwrap();
         CheckedColumn {
             slot,
+            code,
             zones: Arc::new(zones),
             proofs: eq_proofs(&U64, code).unwrap(),
         }
@@ -209,6 +234,7 @@ mod tests {
         .unwrap();
         let other = CheckedColumn {
             slot: 2,
+            code: 5,
             zones: Arc::new(other),
             proofs: eq_proofs(&U64, 5).unwrap(),
         };

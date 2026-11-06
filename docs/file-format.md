@@ -79,11 +79,18 @@ and a layout names its segments by id, so a read fetches exactly the segments
 of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
-The writer is limited to two editions: Vortex's frozen `core` edition
-`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L68)) — every
-encoding, layout, extension dtype and zone-map aggregate a store file may hold
-— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L79)), whose
-one member is the root layout. A frozen edition never changes, so a Vortex
+The writer is limited to three editions:
+
+- Vortex's frozen `core` edition `CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L74)): every encoding, layout, extension dtype and Vortex zone-map aggregate a store file may hold;
+- the store edition `vortexrdf2026.10.0` ([`STORE_EDITION`](../core/src/session.rs#L85)), whose one member is the root layout;
+- the value-counts edition `vortexrdf2026.11.0` ([`VALUE_COUNTS_EDITION`](../core/src/session.rs#L91)), whose one member is the graph columns' zone aggregate `vortexrdf.value_counts` (§3).
+
+A file of the value-counts edition needs a reader that registers the
+aggregate: vortex-rdf 0.14 and earlier refuse it, naming
+`vortexrdf.value_counts`. Files written before it keep reading; their graph
+columns lack the statistic, and readers skip what it would decide.
+
+A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
 per-chunk frame-of-reference (`fastlanes.for.v2`) or bit-packing with a width
 per block (`fastlanes.bitpacked.v2`), is never written. Files from earlier
@@ -210,7 +217,9 @@ written by Vortex's default write strategy, so each column becomes:
 column
  └─ Zoned                 one statistics row per 8,192-row block
      ├─ stats table       min / max (strings: truncated to 64 bytes),
-     │                    null count, NaN count
+     │                    null count, NaN count; on a graph column (`g`),
+     │                    also the block's graphs with their rows
+     │                    (`vortexrdf.value_counts`: at most 16, null past)
      └─ data
          └─ Chunked       row ranges coalesced toward ~1 MiB of data
              ├─ Flat      one compressed array = one segment
@@ -277,7 +286,7 @@ the dtype alone decides the layout ([§4](#4-the-quad-table)).
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L37))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L290)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L334)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates
@@ -499,7 +508,7 @@ keep:
 | the reader tree (the quad table's reader and one reader per component), the quad table's split ranges | the file's layout; the reader tree is replaced whenever the bound filter trees below are cleared |
 | per-column chunk-probe handles with the probes of the leaves they fetched, so a repeated location skips the layout walk and the leaf rebuilds | one handle per column; per fetched leaf, a probe over mapped bytes |
 | pruning envelopes per filter shape | 512 entries, cleared wholesale at the cap |
-| the zone maps of the columns located runs check (each zone's `max` and `min`), read on first use | two `u64` per 8,192-row zone of each column read |
+| the zone maps of the columns located runs check (each zone's `max` and `min`) and, for a graph column, each zone's recorded graphs with their rows (`vortexrdf.value_counts`, decoded once), read on first use | two `u64` per 8,192-row zone of each column read; for a graph column, up to 16 `(code, rows)` pairs of 16 bytes per zone and a 16-byte slot per zone, about 270 bytes a zone at most |
 | bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap; a clear retires the reader tree, and the caches go with its readers once no view holds one |
 | the dictionary child's reader, the window leaf layouts, the dictionary's window bounds ([§5](#5-the-dictionary-child)) and its kind ranges | two terms per 65,536-term window and a handful of codes |
 | the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) (4 MiB) per opened file, charging each window its code offsets at 4 bytes each plus [`WINDOW_ENTRY_OVERHEAD`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) (4 KiB); least recently used evicted; an FSST window of 65,536 terms is charged about 260 KiB, so about 15 fit. For a memory-mapped file store, which every `from_file` store is, the code bytes are slices of the map, so the charge bounds the heap the cache holds |
@@ -655,7 +664,7 @@ open rather than being read around.
 |---|---|---|
 | `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L28) |
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L16) |
-| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ZONE_ROWS`](../core/src/io/zone_map.rs#L22) |
+| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ZONE_ROWS`](../core/src/io/zone_map.rs#L25) |
 | data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L112), [`child_strategy`](../core/src/io/container/sources.rs#L153) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs#L37) |
 | `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, and a chunk decode hold in place, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |

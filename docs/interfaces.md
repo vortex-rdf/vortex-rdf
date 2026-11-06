@@ -17,7 +17,7 @@ tests pin each interface
 |---|---|
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L85), [`code_chunks`](../core/src/store/read/chunks.rs#L121) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L162), [`index_components`](../core/src/store/read/metadata.rs#L234), [`partitions`](../core/src/store/query/partitions.rs#L29) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L195)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L151), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
 | A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L79) ([§6](#6-a-store-file-through-vortexs-reader)) |
@@ -234,23 +234,31 @@ same order. A code in a position its term kind cannot take matches nothing.
 Bound slots that are no such prefix, a bound graph after a free slot
 (`(? p o g)` on `index:posg`, `(s p ? g)` on the quad table), are the run of
 the table's longest bound prefix, its rows checked against the slots past
-it. Those checks are decided a zone at a time from the checked columns'
-zone maps, with Vortex's own proofs of `x = c`: a zone where no row can hold
-the checked code is skipped, a zone where every row holds it is taken whole
-without reading the column, and only the zones holding it among other codes
-are read. A count counts such a zone on the column's encoding when one
-checked slot is left in it, reading no rows, and checks its rows when two
-are; a window finds its first zone from those counts and reads from there.
+it. Those checks are decided a zone at a time: by Vortex's own proofs of
+`x = c` on the checked columns' zone-map bounds and, for the graph, by the
+graphs each zone records. A zone where no row can hold the checked code is
+skipped, a zone where every row holds it is taken whole without reading
+the column, and only the zones holding it among other codes are read. A
+count takes such a zone's count from the graphs it records when the graph is
+the one checked slot left in it and the zone lies whole within the run,
+counts it on the column's encoding otherwise when one checked slot is left,
+reading no rows either way, and checks its rows when two are; a window finds
+its first zone from those counts and reads from there. A graph column
+records each zone's graphs with their rows up to 16 of them (files written
+since the `vortexrdf 2026.11.0` edition); a zone of more, or a file written
+before, keeps its bounds alone.
 A run shorter than a zone checks its few rows directly, as a join's probe of
 a row or two is answered faster that way. A longer run asks the statistics
 only when a read needs them: a first window that the run's first 4,096 rows
 fill, such as a 64-row first page, is read from those rows without them.
 `VORTEX_RDF_ZONES=0` (read once)
-checks every row instead, as before.
+checks every row instead, as before, and leaves the general match's zone
+pruning to the bounds, without the recorded graphs.
 With `VORTEX_RDF_COUNTERS=1` the engine counters count these decisions: the
 slots the footer settles (`zone_column`), the zones settled none and all
-(`zone_none`, `zone_all`), the mixed zones counted on their encoding
-(`zone_counted`) and the rows read to check (`check_read`), each with its rows.
+(`zone_none`, `zone_all`), the mixed zones counted from their recorded graphs
+(`zone_recorded`) or on their encoding (`zone_counted`) and the rows read to
+check (`check_read`), each with its rows.
 
 `locate_codes(CodePattern, offset, limit)` is the located run alone: it
 answers only a whole file-backed Dictionary store (no tail, tombstones or

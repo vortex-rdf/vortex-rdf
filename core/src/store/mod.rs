@@ -15,6 +15,7 @@ pub(crate) mod scan;
 pub(crate) mod schema;
 #[cfg(test)]
 pub(crate) mod test_hooks;
+pub(crate) mod value_counts;
 pub(crate) mod view;
 pub(crate) mod write;
 pub(crate) mod zones;

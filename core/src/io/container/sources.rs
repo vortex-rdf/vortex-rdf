@@ -185,12 +185,23 @@ pub(crate) fn child_strategy_with(
     if id_fields.is_empty() {
         return default_child_strategy();
     }
-    let id = id_column_strategy(codes_target, fallback_target);
+    let id = id_column_strategy(codes_target, fallback_target, None);
+    let graph = records_value_counts().then(|| {
+        id_column_strategy(
+            codes_target,
+            fallback_target,
+            Some(graph_column_aggregates()),
+        )
+    });
     let mut builder =
         vortex_file::WriteStrategyBuilder::from_session(&crate::session::VORTEX_SESSION)
             .with_btrblocks_builder(store_compressor());
     for name in id_fields {
-        builder = builder.with_field_writer(FieldPath::from_name(name), Arc::clone(&id));
+        let strategy = match &graph {
+            Some(graph) if name.as_ref() == crate::store::schema::COL_G => Arc::clone(graph),
+            _ => Arc::clone(&id),
+        };
+        builder = builder.with_field_writer(FieldPath::from_name(name), strategy);
     }
     builder.build()
 }
@@ -213,6 +224,7 @@ pub(crate) fn child_strategy_with(
 fn id_column_strategy(
     codes_target: u64,
     fallback_target: u64,
+    aggregate_fns: Option<Arc<[vortex_array::aggregate_fn::AggregateFnRef]>>,
 ) -> Arc<dyn vortex_layout::LayoutStrategy> {
     use std::num::NonZeroUsize;
 
@@ -266,6 +278,7 @@ fn id_column_strategy(
         compress_then_flat,
         ZonedLayoutOptions {
             block_size: NonZeroUsize::new(ZONE_ROWS).expect("a zone is not empty"),
+            aggregate_fns,
             ..Default::default()
         },
     );
@@ -278,6 +291,37 @@ fn id_column_strategy(
             canonicalize: false,
         },
     ))
+}
+
+/// The zone aggregates of a graph column (`g`, a `u64` term code): the zoned
+/// writer's defaults for a `u64` column (exact `max` and `min`, then the NaN
+/// and null counts), and `vortexrdf.value_counts`, each zone's graphs with
+/// their rows ([`value_counts`](crate::store::value_counts::value_counts)).
+pub(crate) fn graph_column_aggregates() -> Arc<[vortex_array::aggregate_fn::AggregateFnRef]> {
+    use vortex_array::aggregate_fn::fns::{
+        max::Max, min::Min, nan_count::NanCount, null_count::NullCount,
+    };
+    use vortex_array::aggregate_fn::{
+        AggregateFnVTableExt as _, EmptyOptions, NumericalAggregateOpts,
+    };
+    Arc::from([
+        Max.bind(NumericalAggregateOpts::skip_nans()),
+        Min.bind(NumericalAggregateOpts::skip_nans()),
+        NanCount.bind(EmptyOptions),
+        NullCount.bind(EmptyOptions),
+        crate::store::value_counts::value_counts(),
+    ])
+}
+
+/// Whether graph columns are written with [`graph_column_aggregates`]:
+/// always, but for a test standing for a file written before them
+/// ([`ForcedValueCounts`](crate::store::test_hooks::ForcedValueCounts)).
+fn records_value_counts() -> bool {
+    #[cfg(test)]
+    if let Some(on) = crate::store::test_hooks::forced_value_counts() {
+        return on;
+    }
+    true
 }
 
 /// The dictionary child's strategy: every source chunk written verbatim as
