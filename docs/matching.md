@@ -990,7 +990,10 @@ scan that still supplies a serve plan.
 The code lookups (`count_code_pattern`, `match_code_pattern`, `locate_codes`;
 [interfaces.md §4](interfaces.md#4-narrowing-natively)) answer a bound graph
 after a free slot, `?POG` on `index:posg` or `SP?G` on the quad table, from
-the bound prefix's run on a Dictionary file, the graph checked a zone at a
+the bound prefix's run on a Dictionary file, and by reference `?P?G` or `??OG`
+from the reference child's run, its graph read from the child's own `g`
+column (a child written without one checks the quad table's `g` at the run's
+rows, row by row). The graph is checked a zone at a
 time: zones whose bounds or recorded graphs rule it out are skipped, zones of
 it alone taken whole, and a mixed zone lying whole within the run counted
 from its recorded graphs (`zone_recorded`), else on the graph column's

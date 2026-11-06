@@ -365,8 +365,10 @@ impl VortexRdfStore {
                 {
                     located.pending = Some(PendingStatistics {
                         file: std::sync::Arc::clone(file),
-                        table,
-                        component: TABLES[table].0,
+                        target: StatisticsTarget::Table {
+                            table,
+                            component: TABLES[table].0,
+                        },
                     });
                     if located.len() > gap_rows() {
                         located.ask_statistics().await?;
@@ -391,7 +393,36 @@ impl VortexRdfStore {
             session,
         ))
         .await?;
-        Ok(found.map(|(columns, rows, checked)| run(columns, rows, checked)))
+        let Some((columns, rows, checked, index)) = found else {
+            return Ok(None);
+        };
+        let mut located = run(columns, rows, checked);
+        // A run checked against the graph alone, its child holding each
+        // row's graph, asks the statistics as a table run does: its child's
+        // own `g` zones decide it.
+        if matches!(&located.rows, RunRows::Reference { graph: Some(_), .. })
+            && located.checked == [GRAPH_SLOT]
+            && crate::store::query::zone_decider::zones_enabled()
+            && located.len() >= STATISTICS_ROWS
+        {
+            located.pending = Some(PendingStatistics {
+                file: std::sync::Arc::clone(file),
+                target: StatisticsTarget::Reference { index },
+            });
+            if located.len() > gap_rows() {
+                located.ask_statistics().await?;
+            }
+        }
+        // A reference run still checked row by row is capped; a subject's
+        // run, short by construction, is not.
+        if matches!(located.rows, RunRows::Table(_))
+            || located.checked.is_empty()
+            || located.zones.is_some()
+            || located.len() <= gap_rows()
+        {
+            return Ok(Some(located));
+        }
+        Ok(None)
     }
 }
 
@@ -526,14 +557,27 @@ impl RunZones {
     }
 }
 
-/// Where a table run asks its file's statistics when a read needs them
-/// ([`LocatedRun::ask_statistics`]): the file, and its sorted table `table`
-/// (`component` names it, `None` the quad table).
+/// Where a run asks its file's statistics when a read needs them
+/// ([`LocatedRun::ask_statistics`]): the file, and the table whose zones
+/// class the run's positions.
 #[cfg(feature = "file-io")]
 struct PendingStatistics {
     file: std::sync::Arc<crate::store::persist::native_file::NativeStoreFile>,
-    table: usize,
-    component: Option<&'static str>,
+    target: StatisticsTarget,
+}
+
+/// The table whose zone maps decide a run's checks.
+#[cfg(feature = "file-io")]
+#[derive(Clone, Copy)]
+enum StatisticsTarget {
+    /// Sorted table `table` (`component` names it, `None` the quad table).
+    Table {
+        table: usize,
+        component: Option<&'static str>,
+    },
+    /// Reference index `index` of [`REFERENCES`]: its child's own `g`, the
+    /// one check of a run of it decided by zones.
+    Reference { index: usize },
 }
 
 /// Where a [`LocatedRun`]'s rows are.
@@ -588,12 +632,7 @@ impl LocatedRun {
     /// ([`decide_by_statistics`]) if they are still to ask; once asked, or
     /// with none to ask, it does nothing.
     async fn ask_statistics(&mut self) -> Result<()> {
-        let Some(PendingStatistics {
-            file,
-            table,
-            component,
-        }) = self.pending.take()
-        else {
+        let Some(PendingStatistics { file, target }) = self.pending.take() else {
             return Ok(());
         };
         let tables = file
@@ -601,10 +640,33 @@ impl LocatedRun {
             .expect("a located run's file built its located tables");
         let source = self.source.clone();
         // Boxed: its state would otherwise enlarge every read's future.
-        Box::pin(decide_by_statistics(
-            &file, tables, table, component, self, &source,
-        ))
-        .await
+        Box::pin(decide_by_statistics(&file, tables, target, self, &source)).await
+    }
+
+    /// The positions of the run's rows in the table it is located in: a
+    /// sorted table's rows, or a reference child's.
+    fn positions(&self) -> std::ops::Range<u64> {
+        match &self.rows {
+            RunRows::Table(run) | RunRows::Reference { run, .. } => run.clone(),
+        }
+    }
+
+    /// The run, emptied: no row of it matches.
+    fn clear_rows(&mut self) {
+        match &mut self.rows {
+            RunRows::Table(run) | RunRows::Reference { run, .. } => *run = run.start..run.start,
+        }
+    }
+
+    /// The column the check of `slot` reads at the run's positions: a
+    /// reference run's own `g` for the graph, else the table's.
+    fn checked_column(&self, slot: usize) -> &Chunks {
+        match &self.rows {
+            RunRows::Reference {
+                graph: Some(graph), ..
+            } if slot == GRAPH_SLOT => graph,
+            _ => &self.columns[slot],
+        }
     }
 
     /// The run's rows, before their checks.
@@ -662,27 +724,45 @@ impl LocatedRun {
                 graph,
             } => {
                 let rows = run.start + at.start..run.start + at.end;
-                let mut kept = read_codes(rid, rows.clone(), source, session)
-                    .await?
-                    .to_vec();
+                // A run checked against the graph alone, decided zone by
+                // zone over its child's positions: none keeps nothing, all
+                // keeps every row id unread, a mixed zone reads its graphs.
+                if let (Some(zones), Some(graph)) = (&self.zones, graph) {
+                    let mut kept = Vec::new();
+                    let mut at = rows.start;
+                    while at < rows.end {
+                        let zone = at / zones.zone_len;
+                        let end = ((zone + 1) * zones.zone_len).min(rows.end);
+                        match zones.class(zone) {
+                            ZoneClass::None => note(counters::ZONE_NONE, end - at),
+                            ZoneClass::All => {
+                                note(counters::ZONE_ALL, end - at);
+                                kept.extend(
+                                    read_codes(rid, at..end, source, session).await?.iter(),
+                                );
+                            }
+                            ZoneClass::Mixed { .. } => {
+                                kept.extend(self.graph_rows(rid, graph, at..end).await?);
+                            }
+                        }
+                        at = end;
+                    }
+                    return Ok(Rows::Ids(kept));
+                }
                 // The child's own graphs check the graph first, on the
                 // block's own contiguous rows.
-                let graph_code = self.codes[GRAPH_SLOT];
-                if let (Some(graph), Some(code)) = (graph, graph_code) {
-                    crate::observe::observe!(ReferenceGraphRead(rows.end - rows.start));
-                    let graphs = read_codes(graph, rows, source, session).await?;
-                    kept = kept
-                        .into_iter()
-                        .zip(graphs.iter())
-                        .filter(|&(_, &g)| g == code)
-                        .map(|(row, _)| row)
-                        .collect();
-                }
+                let own = graph
+                    .as_ref()
+                    .filter(|_| self.checked.contains(&GRAPH_SLOT));
+                let mut kept = match own {
+                    Some(graph) => self.graph_rows(rid, graph, rows).await?,
+                    None => read_codes(rid, rows, source, session).await?.to_vec(),
+                };
                 for &slot in &self.checked {
                     if kept.is_empty() {
                         break;
                     }
-                    if slot == GRAPH_SLOT && graph.is_some() {
+                    if slot == GRAPH_SLOT && own.is_some() {
                         continue;
                     }
                     // A slot with a located reference run keeps the rows that
@@ -755,9 +835,7 @@ impl LocatedRun {
     ///
     /// [`ColumnChunks::count_eq`]: vortex_rdf_encoded_search::ColumnChunks::count_eq
     async fn zone_count(&self, zones: &RunZones, zone: u64) -> Result<u64> {
-        let RunRows::Table(run) = &self.rows else {
-            unreachable!("only a table run is decided by zones");
-        };
+        let run = &self.positions();
         let rows =
             (zone * zones.zone_len).max(run.start)..((zone + 1) * zones.zone_len).min(run.end);
         Ok(match zones.class(zone) {
@@ -779,7 +857,7 @@ impl LocatedRun {
                 let code = self.codes[slot].expect("a checked slot is bound");
                 crate::observe::observe!(ZoneCounted(rows.end - rows.start));
                 note(counters::ZONE_COUNTED, rows.end - rows.start);
-                self.columns[slot]
+                self.checked_column(slot)
                     .count_eq(rows, code, &self.source, &self.session)
                     .await?
             }
@@ -801,9 +879,7 @@ impl LocatedRun {
         limit: Option<usize>,
         whole: bool,
     ) -> Result<(u64, Rows)> {
-        let RunRows::Table(run) = &self.rows else {
-            unreachable!("only a table run is decided by zones");
-        };
+        let run = &self.positions();
         let (from, past) = (offset as u64, zones.past());
         let to = limit.map(|limit| from.saturating_add(limit as u64));
         let (mut zone, mut before) = (zones.first, 0);
@@ -845,6 +921,27 @@ impl LocatedRun {
             }
         }
         Ok((total, Rows::Ids(window)))
+    }
+
+    /// The row ids `rid` lists at a reference child's positions `at` whose
+    /// graph, the child's own `g` there, is the run's graph code.
+    async fn graph_rows(
+        &self,
+        rid: &Chunks,
+        graph: &Chunks,
+        at: std::ops::Range<u64>,
+    ) -> Result<Vec<u64>> {
+        let (source, session) = (&self.source, &self.session);
+        let code = self.codes[GRAPH_SLOT].expect("a checked graph is bound");
+        crate::observe::observe!(ReferenceGraphRead(at.end - at.start));
+        let rids = read_codes(rid, at.clone(), source, session).await?;
+        let graphs = read_codes(graph, at, source, session).await?;
+        Ok(rids
+            .iter()
+            .zip(graphs.iter())
+            .filter(|&(_, &g)| g == code)
+            .map(|(&row, _)| row)
+            .collect())
     }
 
     /// Of `rows` (ascending), those holding the checked `slot`'s code, read
@@ -1038,12 +1135,14 @@ const SEARCHES_PER_LEAF: usize = 16;
 /// [`located_run`](VortexRdfStore::located_run) through a reference index:
 /// the shortest run among those whose slot is bound gives the quad-table rows
 /// in order, all of them, or, with other slots bound, those that hold them,
-/// checked within [`GAP_ROWS`]: against the other reference's run for `p` or
-/// `o`, by reading the quad table for `s` or `g`. A bound subject's run of a
-/// subject-sorted (`quads_sorted`) quad table is checked instead when it is
-/// no longer than the shortest reference run, within [`CHECKED_ROWS`].
-/// Answers the table the rows are read from (the quad table), where they
-/// are, and the slots checked.
+/// checked: against the other reference's run for `p` or `o`, by reading the
+/// quad table for `s`, and for `g` by the child's own `g` where it holds one,
+/// else the quad table's. A bound subject's run of a subject-sorted
+/// (`quads_sorted`) quad table is checked instead when it is no longer than
+/// the shortest reference run, within [`CHECKED_ROWS`]. Answers the table the
+/// rows are read from (the quad table), where they are, the slots checked,
+/// and the reference index; the caller caps a run its statistics leave
+/// checked row by row at [`GAP_ROWS`].
 #[cfg(feature = "file-io")]
 async fn by_reference(
     codes: [Option<TermCode>; 4],
@@ -1051,7 +1150,7 @@ async fn by_reference(
     quads_sorted: bool,
     source: &Source,
     session: &vortex_session::VortexSession,
-) -> Result<Option<(Columns, RunRows, Vec<usize>)>> {
+) -> Result<Option<(Columns, RunRows, Vec<usize>, usize)>> {
     let Some(quads) = &tables.sorted[0] else {
         return Ok(None);
     };
@@ -1094,7 +1193,7 @@ async fn by_reference(
     let rows = match subject {
         Some(subject) if subject.end - subject.start <= CHECKED_ROWS => RunRows::Table(subject),
         Some(_) => return Ok(None),
-        None if checked.is_empty() || run.end - run.start <= GAP_ROWS => {
+        None => {
             let other = (0..2).filter(|&i| i != index).find_map(|i| {
                 let slot = REFERENCES[i].1;
                 let (Some(run), Some([_, rid])) = (&runs[i], &tables.references[i]) else {
@@ -1113,9 +1212,8 @@ async fn by_reference(
                 graph: codes[GRAPH_SLOT].and(tables.reference_graphs[index].clone()),
             }
         }
-        None => return Ok(None),
     };
-    Ok(Some((quads.clone(), rows, checked)))
+    Ok(Some((quads.clone(), rows, checked, index)))
 }
 
 /// Of `rows` (ascending, not empty), those that `rid`'s values at `run`
@@ -1196,29 +1294,26 @@ async fn locate_run(
     Ok(Some(run))
 }
 
-/// The statistics' decisions on `run`, a gap run of sorted table `table`
-/// (`component` names it, `None` the quad table), in ladder order (spec §3):
-/// the footer settles each checked slot for the whole file, leaving the run
-/// empty where no row holds a slot's code and dropping a slot every row
-/// holds; the zone maps then class the run's zones against the slots left
-/// ([`run_zones`]). Each slot's proofs of `x = code` are built once, for
-/// both.
+/// The statistics' decisions on `run`, located in `target` (a sorted
+/// table's gap run, or a reference child's run checked against the graph),
+/// in ladder order (spec §3): the footer settles each checked slot for the
+/// whole file, leaving the run empty where no row holds a slot's code and
+/// dropping a slot every row holds; the zone maps then class the run's zones
+/// against the slots left ([`run_zones`]). Each slot's proofs of `x = code`
+/// are built once, for both. The quad table's footer speaks for an index
+/// child's columns, which hold its values.
 #[cfg(feature = "file-io")]
 async fn decide_by_statistics(
     file: &crate::store::persist::native_file::NativeStoreFile,
     tables: &crate::store::persist::native_file::LocatedTables,
-    table: usize,
-    component: Option<&str>,
+    target: StatisticsTarget,
     run: &mut LocatedRun,
     source: &Source,
 ) -> Result<()> {
     use vortex_array::dtype::{DType, Nullability, PType};
 
-    let RunRows::Table(rows) = &run.rows else {
-        return Ok(());
-    };
     crate::observe::observe!(StatisticsAsked);
-    let rows = rows.clone();
+    let rows = run.positions();
     let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
     let (mut unsettled, mut proofs) = (Vec::new(), Vec::new());
     for &slot in &run.checked {
@@ -1227,7 +1322,7 @@ async fn decide_by_statistics(
         match footer_decision(file, slot, &slot_proofs)? {
             FooterDecision::Nothing => {
                 note(counters::ZONE_COLUMN, rows.end - rows.start);
-                run.rows = RunRows::Table(rows.start..rows.start);
+                run.clear_rows();
                 run.checked.clear();
                 return Ok(());
             }
@@ -1240,35 +1335,41 @@ async fn decide_by_statistics(
     }
     run.checked = unsettled;
     if !run.checked.is_empty() {
-        run.zones = run_zones(file, tables, table, component, run, proofs, source).await?;
+        run.zones = run_zones(file, tables, target, run, proofs, source).await?;
     }
     Ok(())
 }
 
-/// The zones of `run`, a run of sorted table `table` (`component` names
-/// it, `None` the quad table), classed against its checked slots by their
-/// columns' zone maps ([`ZoneDecider`]); `None` when a checked column has
-/// none, for the run to check every row.
+/// The zones of `run`, located in `target`, classed against its checked
+/// slots by their columns' zone maps ([`ZoneDecider`]): a sorted table's
+/// checked columns, or a reference child's own `g`. `None` when a checked
+/// column has none, for the run to check every row.
 ///
 /// [`ZoneDecider`]: crate::store::query::zone_decider::ZoneDecider
 #[cfg(feature = "file-io")]
 async fn run_zones(
     file: &crate::store::persist::native_file::NativeStoreFile,
     tables: &crate::store::persist::native_file::LocatedTables,
-    table: usize,
-    component: Option<&str>,
+    target: StatisticsTarget,
     run: &LocatedRun,
     proofs: Vec<crate::stats_rules::EqProofs>,
     source: &Source,
 ) -> Result<Option<RunZones>> {
     use crate::store::query::zone_decider::{CheckedColumn, ZoneDecider};
 
-    let RunRows::Table(rows) = &run.rows else {
-        return Ok(None);
-    };
+    let rows = &run.positions();
     let mut columns = Vec::with_capacity(run.checked.len());
     for (&slot, proofs) in run.checked.iter().zip(proofs) {
-        let Some(zones) = column_zones(file, tables, table, component, slot, source).await? else {
+        let zones = match target {
+            StatisticsTarget::Table { table, component } => {
+                column_zones(file, tables, table, component, slot, source).await?
+            }
+            StatisticsTarget::Reference { index } if slot == GRAPH_SLOT => {
+                reference_zones(file, tables, index, source).await?
+            }
+            StatisticsTarget::Reference { .. } => None,
+        };
+        let Some(zones) = zones else {
             return Ok(None);
         };
         columns.push(CheckedColumn {
@@ -1305,6 +1406,32 @@ async fn run_zones(
         classes,
         recorded,
     }))
+}
+
+/// The zone map of reference index `index`'s child's own `g`, with its
+/// zones' recorded graphs, read on first use and kept with the file's
+/// located tables; `None` for a child without one.
+#[cfg(feature = "file-io")]
+async fn reference_zones(
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    tables: &crate::store::persist::native_file::LocatedTables,
+    index: usize,
+    source: &Source,
+) -> Result<Option<std::sync::Arc<crate::io::zone_map::ColumnZones>>> {
+    use crate::io::zone_map::ColumnZones;
+
+    let cell = &tables.reference_zones[index];
+    if let Some(zones) = cell.get() {
+        return Ok(zones.clone());
+    }
+    crate::observe::observe!(ZoneMapRead);
+    let zones = match file.table_column_layout(Some(REFERENCES[index].0), "g") {
+        Some(column) => ColumnZones::read(&column, source)
+            .await?
+            .map(std::sync::Arc::new),
+        None => None,
+    };
+    Ok(cell.get_or_init(|| zones).clone())
 }
 
 /// The zone map of column `slot` of sorted table `table` (`component` names

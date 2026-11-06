@@ -215,12 +215,17 @@ struct ZoneStore {
     _dir: tempfile::TempDir,
 }
 
-/// Each [`Graphs`] layout written without indexes and with the copy index,
-/// and the 1,000-row stretches in seven-row leaves, which have no zone maps.
+/// Each [`Graphs`] layout written without indexes, with the copy index and
+/// with the reference index, and the 1,000-row stretches in seven-row
+/// leaves, which have no zone maps.
 async fn zone_stores() -> Vec<ZoneStore> {
     let mut stores = Vec::new();
     for graphs in Graphs::ALL {
-        for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
+        for index in [
+            IndexConfig::NoIndex,
+            IndexConfig::Copy,
+            IndexConfig::Reference,
+        ] {
             let (dir, path) = write_store_file(
                 zone_quads(graphs),
                 LayoutStrategy::Dictionary,
@@ -259,7 +264,9 @@ async fn code_of(store: &VortexRdfStore, term: &str) -> TermCode {
 }
 
 /// The patterns checked on `store` for graph `g`: the `index:posg` run, the
-/// quad table's `(hub, link)` run, and `hub`'s run checked at two slots.
+/// quad table's `(hub, link)` run, `hub`'s run checked at two slots, and
+/// `(? type ? g)` and `(? ? Taxon g)`, by reference the runs of `index:ref-p`
+/// and `index:ref-o` checked against the graph alone.
 async fn zone_patterns(store: &VortexRdfStore, g: usize) -> Vec<crate::CodePattern> {
     use crate::CodePattern;
     let graph = code_of(store, &format!("<http://example.org/g{g}>")).await;
@@ -275,6 +282,8 @@ async fn zone_patterns(store: &VortexRdfStore, g: usize) -> Vec<crate::CodePatte
         let o = code_of(store, &format!("\"o{i:05}\"")).await;
         patterns.push(CodePattern::new(Some(hub), None, Some(o), Some(graph)));
     }
+    patterns.push(CodePattern::new(None, Some(ty), None, Some(graph)));
+    patterns.push(CodePattern::new(None, None, Some(taxon), Some(graph)));
     patterns
 }
 
@@ -808,6 +817,205 @@ async fn default_graph_counts_from_records() {
         counted < ZONE_ROWS as u64,
         "only a partial zone on its encoding: {counted} rows"
     );
+}
+
+/// The reads `rec` saw a reference run make of graphs: its child's own
+/// (`ReferenceGraphRead`), and the quad table's at its rows (`CheckTaken` of
+/// slot 3).
+fn reference_graph_reads(rec: &Recorder) -> (u64, u64) {
+    let own = rec.picked(|e| match e {
+        Event::ReferenceGraphRead(rows) => Some(*rows),
+        _ => None,
+    });
+    let taken = rec.picked(|e| match e {
+        Event::CheckTaken { slot: 3, rows } => Some(*rows),
+        _ => None,
+    });
+    (own.iter().sum(), taken.iter().sum())
+}
+
+/// A by-reference run checked against the graph alone is decided zone by
+/// zone from its child's own `g`, as a table run is: a count reads no graph
+/// (the child's or the quad table's) and no checked row. On long stretches
+/// the zones of graph 1 alone and those without it settle; on alternating
+/// graphs the whole zones count from their records, the child's short last
+/// zone among them (the run reaches the child's end), and the partial first
+/// zone on its encoding; zones past 16 graphs count on their encoding; the
+/// default graph counts from records like any other.
+#[tokio::test]
+async fn reference_runs_skip_settled_zones() {
+    use crate::CodePattern;
+    use crate::io::zone_map::ZONE_ROWS;
+    use crate::store::test_hooks::ForcedZones;
+
+    let _on = ForcedZones::set(true);
+    let zone = ZONE_ROWS as u64;
+    for graphs in [
+        Graphs::Long,
+        Graphs::Alternating,
+        Graphs::RecordedByTurns,
+        Graphs::DefaultAndThree,
+    ] {
+        let (_dir, path) = write_store_file(
+            zone_quads(graphs),
+            LayoutStrategy::Dictionary,
+            IndexConfig::Reference.types(),
+        )
+        .await;
+        let store = &VortexRdfStore::from_file(&path).await.unwrap();
+        let rows = row_list(store).await;
+        let ty = code_of(store, "<http://example.org/type>").await;
+        let link = code_of(store, "<http://example.org/link>").await;
+        let graph = match graphs {
+            Graphs::DefaultAndThree => code_of(store, "").await,
+            _ => code_of(store, "<http://example.org/g1>").await,
+        };
+        // RecordedByTurns lays its turns out along `link`'s run, which
+        // starts the child; the others read `type`'s, which ends it.
+        let predicate = match graphs {
+            Graphs::RecordedByTurns => link,
+            _ => ty,
+        };
+        let pattern = CodePattern::new(None, Some(predicate), None, Some(graph));
+        let want = rows
+            .iter()
+            .filter(|row| row[1] == predicate && row[3] == graph)
+            .count() as u64;
+        let tag = format!("{graphs:?}");
+        let rec = Recorder::start();
+        assert_eq!(
+            store.count_code_pattern(pattern).await.unwrap(),
+            want,
+            "{tag}"
+        );
+        assert_eq!(reference_graph_reads(&rec), (0, 0), "{tag}: no graph read");
+        let (counted, read) = zone_work(&rec);
+        let recorded: u64 = zone_recorded(&rec).iter().sum();
+        assert_eq!(read, 0, "{tag}: no checked row read");
+        match graphs {
+            Graphs::Long => assert!(counted < RUN as u64, "{tag}: {counted} counted"),
+            Graphs::Alternating => {
+                // The run is the child's last RUN positions.
+                let start = 2 * RUN as u64 - RUN as u64;
+                let partial = start.next_multiple_of(zone) - start;
+                assert_eq!(
+                    (counted, recorded),
+                    (partial, RUN as u64 - partial),
+                    "{tag}"
+                );
+                assert_eq!(
+                    zone_recorded(&rec).last(),
+                    Some(&(2 * RUN as u64 % zone)),
+                    "{tag}: the child's short last zone"
+                );
+            }
+            Graphs::RecordedByTurns => {
+                // Zones 0, 2 and 4 hold seventeen graphs; 1 and 3 recorded.
+                assert_eq!(recorded, 2 * zone, "{tag}: the recorded zones");
+                assert_eq!(counted, RUN as u64 - 2 * zone, "{tag}: the others");
+            }
+            _ => {
+                assert_eq!(recorded + counted, RUN as u64, "{tag}: every zone mixed");
+                assert!(counted < zone, "{tag}: a partial zone alone counted");
+            }
+        }
+    }
+}
+
+/// `GAP_ROWS` caps a by-reference run only where zones cannot decide it:
+/// with the cap forced below the run, `(? type ? g1)` is located when its
+/// child holds `g` and declines when it doesn't, as `(? type Taxon g1)`, two
+/// checks, declines. Counts equal the rows' either way.
+#[tokio::test]
+async fn reference_cap_only_where_zones_cannot_decide() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::{ForcedGapRows, ForcedReferenceGraphs, ForcedZones};
+
+    let _on = ForcedZones::set(true);
+    for graphs in [true, false] {
+        let (_dir, path) = {
+            let _hook = ForcedReferenceGraphs::set(graphs);
+            write_store_file(
+                zone_quads(Graphs::Alternating),
+                LayoutStrategy::Dictionary,
+                IndexConfig::Reference.types(),
+            )
+            .await
+        };
+        let store = &VortexRdfStore::from_file(&path).await.unwrap();
+        let rows = row_list(store).await;
+        let ty = code_of(store, "<http://example.org/type>").await;
+        let taxon = code_of(store, "\"Taxon\"").await;
+        let g1 = code_of(store, "<http://example.org/g1>").await;
+        let _cap = ForcedGapRows::set(1_000);
+        for (pattern, located) in [
+            (CodePattern::new(None, Some(ty), None, Some(g1)), graphs),
+            (
+                CodePattern::new(None, Some(ty), Some(taxon), Some(g1)),
+                false,
+            ),
+        ] {
+            let tag = format!("graphs {graphs} {pattern:?}");
+            let found = store.locate_codes(pattern, 0, Some(0)).await.unwrap();
+            assert_eq!(found.is_some(), located, "{tag}");
+            let want = rows
+                .iter()
+                .filter(|row| {
+                    row[1] == ty && row[3] == g1 && pattern.object.is_none_or(|o| row[2] == o)
+                })
+                .count() as u64;
+            assert_eq!(
+                store.count_code_pattern(pattern).await.unwrap(),
+                want,
+                "{tag}"
+            );
+        }
+    }
+}
+
+/// A by-reference run asks its file's statistics only when a read needs
+/// them: on alternating graphs a 64-row first page is read from the run's
+/// first block and asks none; a later page and a count ask them. Every page
+/// is the rows'.
+#[tokio::test]
+async fn reference_first_page_reads_the_first_block_before_statistics() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    let (_dir, path) = write_store_file(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let store = &VortexRdfStore::from_file(&path).await.unwrap();
+    let ty = code_of(store, "<http://example.org/type>").await;
+    let g1 = code_of(store, "<http://example.org/g1>").await;
+    let pattern = CodePattern::new(None, Some(ty), None, Some(g1));
+    let page = |offset| async move {
+        code_rows::<4>(
+            &store
+                .match_code_pattern(pattern, offset, Some(64))
+                .await
+                .unwrap(),
+        )
+    };
+    let want = {
+        let _off = ForcedZones::set(false);
+        (page(0).await, page(64).await)
+    };
+    let _on = ForcedZones::set(true);
+    let rec = Recorder::start();
+    assert_eq!(page(0).await, want.0, "the first page");
+    assert_eq!(statistics_asked(&rec), 0, "none asked");
+    drop(rec);
+    let rec = Recorder::start();
+    assert_eq!(page(64).await, want.1, "the second page");
+    assert_eq!(statistics_asked(&rec), 1, "a later page asks");
+    drop(rec);
+    let rec = Recorder::start();
+    store.count_code_pattern(pattern).await.unwrap();
+    assert_eq!(statistics_asked(&rec), 1, "a count asks");
 }
 
 /// Zone maps `rec` saw read from a file.

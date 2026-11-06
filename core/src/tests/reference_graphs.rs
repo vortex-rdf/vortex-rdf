@@ -272,13 +272,16 @@ async fn reads(
 /// A by-reference run checked against the graph reads its child's own `g`
 /// rows, contiguous, and never the quad table's `g` at its scattered rows:
 /// `(? type ? g1)`, `(? ? Taxon g1)` and `(? type Taxon g1)` on alternating
-/// graphs. A store written without the child `g`, as before it, reads the
-/// quad table's; both answer every read alike, as their rows say.
+/// graphs, read row by row (zones off; zones deciding these runs are pinned
+/// in `located_zones`). A store written without the child `g`, as before it,
+/// reads the quad table's; both answer every read alike, as their rows say.
 #[tokio::test]
 async fn reference_runs_read_their_own_graphs() {
     use super::located_zones::{Graphs, RUN, zone_quads};
     use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
 
+    let _rows = ForcedZones::set(false);
     let mut answers = Vec::new();
     for graphs in [true, false] {
         let (_dir, path) = {

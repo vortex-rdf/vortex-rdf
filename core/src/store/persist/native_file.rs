@@ -142,6 +142,9 @@ pub(crate) struct LocatedTables {
     /// first use; `None` for a column without exact zone bounds. Two `u64`
     /// per zone of a column read, bounded by the file's layout.
     pub(crate) zones: [[OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 3],
+    /// Per reference index, its child's `g` zone map with the zones'
+    /// recorded graphs, read on first use, bounded the same way.
+    pub(crate) reference_zones: [OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 2],
 }
 
 impl LocatedTables {
@@ -156,6 +159,7 @@ impl LocatedTables {
             references,
             reference_graphs,
             zones: Default::default(),
+            reference_zones: Default::default(),
         }
     }
 }

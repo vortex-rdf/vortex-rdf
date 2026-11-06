@@ -223,10 +223,15 @@ one located run answers the match's size and the window's code columns, with
 no dictionary search, view or gather, in that table's order. With the
 reference index, a bound `p` or `o` is a run of `index:ref-p` or
 `index:ref-o` listing quad-table rows: the shorter one answers, in
-quad-table order, and any other bound slot is checked at its rows (for runs
-of at most 16,384 rows). A bound subject's run of a subject-sorted quad
-table is checked instead when it is no longer, so `s?o` reads the subject's
-few rows, not a common object's many. Any other pattern goes through the
+quad-table order, and any other bound slot is checked at its rows. A bound
+graph is checked on the reference child's own rows, where the child holds
+each row's graph (`g`, in files written from this version on): as the run's
+only check, it is decided a zone at a time from those rows' zone maps and
+recorded graphs, as below, at any length. Otherwise, and in files written
+before, the run is checked row by row, for runs of at most 8,388,608 rows
+(`GAP_ROWS`). A bound subject's run of a subject-sorted quad table is
+checked instead when it is no longer, up to 16,384 rows, so `s?o` reads the
+subject's few rows, not a common object's many. Any other pattern goes through the
 general match of the codes' terms. Which of the two answers depends on the
 store and the pattern alone, so every window of one pattern comes in the
 same order. A code in a position its term kind cannot take matches nothing.

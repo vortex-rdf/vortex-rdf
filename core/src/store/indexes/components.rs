@@ -430,6 +430,9 @@ pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes 
 pub(crate) trait TermColumn: Clone + Default + Ord {
     /// Whether a reference child of this encoding holds each row's graph:
     /// the Dictionary layout's codes do, the string layouts' terms don't.
+    /// Read by the out-of-core builder, which wasm32-unknown-unknown builds
+    /// without.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), expect(dead_code))]
     const RECORDS_GRAPH: bool;
 
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
