@@ -140,6 +140,23 @@ export function genDataset(n: number, opts: DatasetOpts = {}): Quad[] {
     return out;
 }
 
+/** Flatten every string of `quads` in place, by encoding it once.
+ *
+ *  The generator's template strings are V8 ropes, and the first build to encode
+ *  them flattened them all. That cost +165 MB of live JS heap at 2^20 rows and
+ *  2.4x that build's time. Running the encoder here, the same call `packQuads`
+ *  makes, moves that cost out of every timed build. */
+export function flattenTerms(quads: readonly Quad[]): void {
+    const enc = new TextEncoder();
+    const scratch = new Uint8Array(4096);
+    for (const q of quads) {
+        for (const t of [q.subject, q.predicate, q.object, q.graph]) {
+            enc.encodeInto(t.value, scratch);
+            if (t.termType === 'Literal') enc.encodeInto(t.datatype.value, scratch);
+        }
+    }
+}
+
 /** The first `take` quads `genDataset(n, opts)` would produce, without building
  *  the full array — the mutation worker needs only a MUT_BATCH-sized slice for
  *  the delete phase, and `n` can be a couple of million. */

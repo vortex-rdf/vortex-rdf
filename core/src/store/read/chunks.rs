@@ -239,7 +239,7 @@ impl VortexRdfStore {
     /// gathered per pull; a file view's read is chosen once
     /// ([`file_base_chunks`](Self::file_base_chunks)); any other read is
     /// [`base_read`](Self::base_read)'s, cut to the cap.
-    async fn base_chunks(
+    pub(super) async fn base_chunks(
         &self,
         columns: &[&'static str],
         batch_rows: usize,
@@ -335,7 +335,7 @@ impl VortexRdfStore {
 
     /// The tail's live rows cut to `batch_rows`, each slice cut when it is
     /// reached; none without a tail.
-    fn tail_chunks(
+    pub(super) fn tail_chunks(
         &self,
         batch_rows: usize,
     ) -> Result<impl Iterator<Item = Result<ArrayRef>> + Send + 'static> {

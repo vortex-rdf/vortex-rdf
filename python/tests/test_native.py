@@ -196,7 +196,7 @@ def test_blank_node_round_trip(vortex_files):
 
 
 @pytest.mark.parametrize("layout", ["default", "dictionary"])
-@pytest.mark.parametrize("matcher", ["get_quads", "count_quads", "match_columns", "match_codes"])
+@pytest.mark.parametrize("matcher", ["get_quads", "iter_quads", "count_quads", "match_columns", "match_codes"])
 def test_bad_term_raises_value_error(vortex_files, layout, matcher):
     """All four pattern slots validate on every matcher: a malformed term
     raises ValueError, carrying core's invalid-input message and the slot

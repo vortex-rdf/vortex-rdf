@@ -14,8 +14,10 @@ The dataset generator and the orchestration are python/bench's (`datasets.py`
 and `suite.py`), so the Java tab measures the Python tab's data by the same
 rules. This file writes the files a Java worker reads besides the dataset (the
 query probes and the two mutation batches), runs one JVM per adapter and role
-on that library's own classpath, and reads each worker's peak memory as the
-kernel reports it when the worker exits.
+on that library's own classpath, and reads each query and mutate worker's peak
+memory as the kernel reports it when the worker exits. The memory role runs
+`BENCH_MEMORY_RUNS` more JVMs per adapter, each reporting its own figures: the
+Store figure, what disposing the store releases, and the peaks of its reads.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from datasets import DatasetOpts, dataset_prefix, dataset_probes, fresh_quads, w
 from suite import (  # noqa: E402
     Dataset,
     bench_graphs,
+    bench_memory_runs,
     bench_rows,
     check_count_agreement,
     cpu_model,
@@ -168,10 +171,10 @@ def java_executable() -> str:
 
 def jvm_flags() -> list[str]:
     """The flags every worker JVM gets, whichever library it runs: one heap
-    limit, the default collector, native memory tracking (the retained
-    figure leaves the JVM's own allocations out by it), native access for
-    the libraries that load native code, and a temporary directory on disk
-    rather than tmpfs."""
+    limit, the default collector, native memory tracking (the memory role's
+    Store figure leaves the JVM's own allocations out by it), native access
+    for the libraries that load native code, and a temporary directory on
+    disk rather than tmpfs."""
     return [
         f"-Xmx{os.environ.get('JAVA_BENCH_XMX') or '6g'}",
         "-XX:+UseG1GC",
@@ -239,17 +242,15 @@ def run_java_worker(slug: str, role: str, files: Optional[RunFiles] = None) -> O
         res = json.loads(out.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         return crashed(slug, role, f"worker wrote no readable result: {e}")
+    # A memory run's result is its own readings, in bytes: the JVM's whole
+    # peak is not one of them, and it builds no artifact and records no
+    # failures (any error ends it, non-zero).
+    if role == "memory":
+        return res
     # A role the library cannot perform did nothing but start a JVM; its peak
     # would be a bare-JVM figure posing as a measurement.
     res["peak_rss_mb"] = None if res.get("skippedRole") else peak_mb
     res["artifact_bytes"] = allocated_bytes(Path(res["artifact"])) if res.get("artifact") else None
-    # What the open store held, in the Java heap and outside it: what disposing
-    # its warm handle released, for the query phase's memory row.
-    retained = res.get("retained")
-    res["memory_extra"] = {
-        "retainedHeapMb": round(retained["heapBytes"] / 2**20, 1),
-        "retainedNativeMb": round(retained["nativeBytes"] / 2**20, 1),
-    } if retained else {}
     res["failures"] = [{**f, "slug": slug, "label": res["label"], "role": role} for f in res.get("failures", [])]
     return res
 
@@ -332,7 +333,7 @@ def main(argv: list[str]) -> int:
             supports_quads[slug] = res["supportsQuads"]
         return res
 
-    run = run_roles([slug for slug, _ in ADAPTERS], worker)
+    run = run_roles([slug for slug, _ in ADAPTERS], worker, memory_runs=bench_memory_runs())
     warnings = check_count_agreement(run.counts_by_slug)
     for w in warnings:
         log(f"!! count disagreement: {w}")

@@ -15,6 +15,7 @@ import com.the_qa_company.qendpoint.core.triples.TripleID;
 import com.the_qa_company.qendpoint.core.triples.TripleString;
 import java.nio.file.Path;
 import org.vortexrdf.bench.Adapter;
+import org.vortexrdf.bench.Obtained;
 import org.vortexrdf.bench.Pattern;
 import org.vortexrdf.bench.Sink;
 import org.vortexrdf.bench.Terms;
@@ -49,6 +50,11 @@ public final class QendpointAdapter implements Adapter<HDT, String[]> {
 	@Override
 	public boolean persistent() {
 		return true;
+	}
+
+	@Override
+	public Obtained obtained() {
+		return Obtained.MAPPED;
 	}
 
 	@Override

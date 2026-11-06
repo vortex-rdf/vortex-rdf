@@ -10,12 +10,12 @@
 // live here.
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { Quad } from '@rdfjs/types';
+import type { Quad, Stream } from '@rdfjs/types';
 import type { Fn, FnOptions } from 'tinybench';
 
 /** The quad shape every consume helper reads: the three mandatory term slots
@@ -72,6 +72,27 @@ export function making<H>(
     ];
 }
 
+/** Time every `make`, then keep the last handle: `beforeEach` disposes the
+ *  previous one, so only one handle lives at a time, and the final one is left
+ *  for `last()` to hand back, undisposed, once the bench has run. */
+export function makingLast<H>(
+    make: () => Promise<H> | H, dispose: (h: H) => void,
+): { task: [Fn, FnOptions]; last(): H | undefined } {
+    let h: H | undefined;
+    return {
+        task: [
+            async () => { h = await make(); },
+            {
+                beforeEach: () => {
+                    if (h !== undefined) dispose(h);
+                    h = undefined;
+                },
+            },
+        ],
+        last: () => h,
+    };
+}
+
 /** Time `run` on a handle `make` builds for each iteration in `beforeEach`;
  *  `dispose` gets it in `afterEach`. */
 export function onFresh<H>(
@@ -115,10 +136,12 @@ let consumeSink = 0;
 /** Thrown when a consume loop exceeds [`CONSUME_BUDGET_MS`]. The message is what
  *  lands in the run's `failures` list, so it says how far the loop got. */
 class ConsumeBudgetExceeded extends Error {
-    constructor(done: number, total: number, ms: number) {
+    constructor(done: number, total: number | null, ms: number) {
         super(
             `consume budget exceeded after ${(ms / 1000).toFixed(0)}s ` +
-            `(${done.toLocaleString()} of ${total.toLocaleString()} quads; ` +
+            (total === null
+                ? `(${done.toLocaleString()} quads read; `
+                : `(${done.toLocaleString()} of ${total.toLocaleString()} quads; `) +
             `raise CONSUME_BUDGET_MS to wait longer)`,
         );
         this.name = 'ConsumeBudgetExceeded';
@@ -151,6 +174,51 @@ export function consumeQuads(quads: ArrayLike<TermQuad>): number {
     }
     consumeSink += acc;
     return quads.length;
+}
+
+/** [`consumeQuads`]'s contract for a quad stream (RDF/JS `match()`): read every
+ *  term of every quad as it arrives, resolve to the count at `end`.
+ *
+ *  `end` and `error` are attached before `data`, because attaching `data` can
+ *  start the flow at once. The budget is checked every [`CONSUME_WINDOW`]
+ *  quads; past it the stream is destroyed (if it can be) and the promise
+ *  rejects. Events after the promise settles are ignored. */
+export function consumeStream(
+    stream: Pick<Stream, 'on'>, budgetMs: number = CONSUME_BUDGET_MS,
+): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+        let n = 0;
+        let acc = 0;
+        let settled = false;
+        const t0 = budgetMs > 0 ? performance.now() : 0;
+        stream.on('end', () => {
+            if (settled) return;
+            settled = true;
+            consumeSink += acc;
+            resolve(n);
+        });
+        stream.on('error', (e: unknown) => {
+            if (settled) return;
+            settled = true;
+            reject(e);
+        });
+        stream.on('data', (q: TermQuad) => {
+            if (settled) return;
+            if (budgetMs > 0 && n > 0 && n % CONSUME_WINDOW === 0) {
+                const ms = performance.now() - t0;
+                if (ms > budgetMs) {
+                    settled = true;
+                    (stream as { destroy?: () => unknown }).destroy?.();
+                    reject(new ConsumeBudgetExceeded(n, null, ms));
+                    return;
+                }
+            }
+            // readTerms' reads, inline: no array per quad in the timed read.
+            acc += q.subject.value.length + q.predicate.value.length
+                + q.object.value.length + (q.graph?.value.length ?? 0);
+            n++;
+        });
+    });
 }
 
 /** [`consumeQuads`]'s contract for a store whose results are term strings
@@ -213,4 +281,194 @@ export function runWorkerProcess<T>(workerPath: string, args: string[], label: s
     } finally {
         rmSync(outFile, { force: true });
     }
+}
+
+// ─── The oxigraph build's version ────────────────────────────────────────────
+//
+// The suite runs oxigraph from the bench's own build of its JS binding
+// (bench/oxigraph-wasm/build.sh), at the version the Rust comparison pins, so
+// the two tabs measure one oxigraph release. compare.bench.ts checks the build
+// against that pin before it runs anything.
+
+/** The Rust comparison's lock file, whose `oxigraph` entry is the pin. */
+export const BENCH_COMPARE_LOCK = resolve(here, '../../bench-compare/Cargo.lock');
+/** Where `npm run build:oxigraph-wasm` writes the build. */
+export const OXIGRAPH_PKG_DIR = resolve(here, 'oxigraph-pkg');
+
+/** The version `lock`, a Cargo.lock's text, pins for `crate`. Each
+ *  `[[package]]` block is read for its own `name` and `version` lines, so a
+ *  neighbouring block's version is never taken for it. Throws unless exactly
+ *  one block names `crate`. */
+export function lockedVersion(lock: string, crate: string): string {
+    const versions = lock.split('[[package]]').flatMap((block) => {
+        const name = /^name = "(.*)"$/m.exec(block)?.[1];
+        const version = /^version = "(.*)"$/m.exec(block)?.[1];
+        return name === crate && version !== undefined ? [version] : [];
+    });
+    if (versions.length === 0) throw new Error(`the lock pins no ${crate}`);
+    if (versions.length > 1) throw new Error(`the lock pins ${versions.length} versions of ${crate}`);
+    return versions[0];
+}
+
+/** Check that the oxigraph build in `pkgDir` is the version `lockPath` pins,
+ *  and return that version. Throws when there is no build to check, and when
+ *  the build is another version, naming both. */
+export function checkOxigraphVersion(lockPath: string, pkgDir: string): string {
+    const pinned = lockedVersion(readFileSync(lockPath, 'utf8'), 'oxigraph');
+    const manifest = join(pkgDir, 'package.json');
+    if (!existsSync(manifest)) {
+        throw new Error(
+            `no oxigraph build at ${pkgDir} — run \`npm run build:oxigraph-wasm\` `
+            + '(scripts/refresh.sh --only js builds it)');
+    }
+    const built = (JSON.parse(readFileSync(manifest, 'utf8')) as { version?: string }).version;
+    if (built !== pinned) {
+        throw new Error(
+            `${pkgDir} holds oxigraph ${built} but ${lockPath} pins ${pinned} — `
+            + 'rebuild it: npm run build:oxigraph-wasm');
+    }
+    return pinned;
+}
+
+// ─── Memory runs ─────────────────────────────────────────────────────────────
+//
+// compare.worker.ts's `memory` role measures one store in a process of its
+// own: the live bytes of the store's wasm module (the bench's counter, linked
+// into every module it loads) plus the JS heap, read around the store's reads
+// and its dispose. The pure parts of that run live here, so they are tested
+// without loading a store.
+
+/** The block each counter must see held at the start of a memory run. */
+export const SELF_CHECK_BYTES = 8 << 20;
+
+/** What the counter's `memoryStats()` returns: live and peak heap bytes since
+ *  counting was switched on (signed: a block allocated before and freed after
+ *  counts below 0), and the module's `memory.buffer.byteLength`. */
+export interface MemoryStats { liveBytes: number; peakLiveBytes: number; heapBytes: number }
+
+/** The counter's exports (`bench-memory-stats`), in a module built with it. */
+export interface MemoryStatsExports {
+    setMemoryCounting(on: boolean): void;
+    memoryStats(): MemoryStats;
+    resetMemoryPeak(): void;
+}
+
+/** One wasm module's counter. Every member is a closure over the module, with
+ *  no `this`, so each can be passed around bare. */
+export interface WasmCounter {
+    name: string;
+    setCounting(on: boolean): void;
+    stats(): MemoryStats;
+    /** `resetMemoryPeak()`: the peak becomes the current live bytes. */
+    resetPeak(): void;
+    /** Allocate `bytes` through the module's own allocator, which the counter
+     *  wraps; the returned function frees them. */
+    hold(bytes: number): () => void;
+}
+
+/** The counter of the wasm module `name`, from its JS exports and the exports
+ *  of its instance (`InitOutput`), whose allocator `hold` goes through.
+ *  Throws when the module was built without the counter. */
+export function wasmCounter(
+    name: string,
+    exports: object,
+    wasm: {
+        __wbindgen_malloc(size: number, align: number): number;
+        __wbindgen_free(ptr: number, size: number, align: number): void;
+    },
+): WasmCounter {
+    const m = exports as Partial<MemoryStatsExports>;
+    if (typeof m.setMemoryCounting !== 'function'
+        || typeof m.memoryStats !== 'function'
+        || typeof m.resetMemoryPeak !== 'function') {
+        throw new Error(`${name} has no memory-stats exports — rebuild it with the bench's counter (bench-memory-stats)`);
+    }
+    const { setMemoryCounting, memoryStats, resetMemoryPeak } = m as MemoryStatsExports;
+    return {
+        name,
+        setCounting: (on) => setMemoryCounting(on),
+        stats: () => memoryStats(),
+        resetPeak: () => resetMemoryPeak(),
+        hold: (bytes) => {
+            const ptr = wasm.__wbindgen_malloc(bytes, 8);
+            return () => wasm.__wbindgen_free(ptr, bytes, 8);
+        },
+    };
+}
+
+/** Bytes as MiB, to one decimal. */
+export function mib1(bytes: number): number {
+    return Math.round((bytes / 1048576) * 10) / 10;
+}
+
+/** The self-check every memory run starts with: `read` must rise by the whole
+ *  of a [`SELF_CHECK_BYTES`] block while `hold` holds it. Throws naming the
+ *  counter otherwise; the block is freed either way. */
+export function checkCounter(name: string, read: () => number, hold: (bytes: number) => () => void): void {
+    const before = read();
+    const release = hold(SELF_CHECK_BYTES);
+    try {
+        const rise = read() - before;
+        if (rise < SELF_CHECK_BYTES) {
+            throw new Error(
+                `memory self-check: the ${name} counter rose by ${mib1(rise).toFixed(1)} MiB `
+                + 'while an 8 MiB block was held (want at least 8)');
+        }
+    } finally {
+        release();
+    }
+}
+
+/** A settle ends at the first round that frees less than this. */
+export const SETTLE_STEP_BYTES = 1 << 20;
+/** The most rounds a settle runs. */
+export const SETTLE_MAX_ROUNDS = 10;
+
+/** Settle the live bytes `live` reads: run `round` until one frees less than
+ *  [`SETTLE_STEP_BYTES`], compared with the reading before it, and at most
+ *  [`SETTLE_MAX_ROUNDS`] times. Returns the rounds run; the first always
+ *  runs. */
+export async function settleRounds(round: () => Promise<void>, live: () => number): Promise<number> {
+    let before = live();
+    for (let rounds = 1; ; rounds++) {
+        await round();
+        const after = live();
+        if (before - after < SETTLE_STEP_BYTES || rounds >= SETTLE_MAX_ROUNDS) return rounds;
+        before = after;
+    }
+}
+
+/** One store's two live-byte readings, each taken after settling: `opened`
+ *  right after the store was obtained, before any read, and `disposed` after
+ *  its free. */
+export interface StoreReadings { opened: number; disposed: number }
+
+/** One memory run's figures, in MiB: the store built from the triples, the
+ *  store loaded from a file, and the read peak, each null where the run did
+ *  not measure it. */
+export interface JsMemoryRun { storeBuiltMb: number | null; storeLoadedMb: number | null; peakLiveMb: number | null }
+
+/** A memory run's figures from its readings, in live bytes: each store is
+ *  what its free released on a store no read had touched, and the peak is the
+ *  highest probe total above the baseline. A missing input gives null, and every
+ *  figure is clamped at 0, since allocator noise can make a difference
+ *  negative. */
+export function memoryRunFigures(r: {
+    baseline: number; built: StoreReadings | null; loaded: StoreReadings | null; probeTotals: number[];
+}): JsMemoryRun {
+    const mb = (bytes: number) => mib1(Math.max(0, bytes));
+    const store = (s: StoreReadings | null) => (s ? mb(s.opened - s.disposed) : null);
+    return {
+        storeBuiltMb: store(r.built),
+        storeLoadedMb: store(r.loaded),
+        peakLiveMb: r.probeTotals.length > 0 ? mb(Math.max(...r.probeTotals) - r.baseline) : null,
+    };
+}
+
+/** A failure's error text: the message alone for a plain `Error`, and the name before it for
+ *  a subclass (a wasm trap is `RuntimeError: unreachable`), so a reader can tell a crash
+ *  from a refusal; anything else as `String(e)`. */
+export function errorText(e: unknown): string {
+    if (!(e instanceof Error)) return String(e);
+    return e.name === 'Error' ? e.message : `${e.name}: ${e.message}`;
 }

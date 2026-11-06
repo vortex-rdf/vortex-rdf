@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from adapters import ALL_SLUGS, VENV_FOR  # noqa: E402
 from suite import (  # noqa: E402
     bench_graphs,
+    bench_memory_runs,
     bench_rows,
     check_count_agreement,
     cpu_model,
@@ -113,12 +114,8 @@ def installed_versions(python: Path, pkgs: list[str]) -> dict[str, str]:
     return out
 
 
-def run_worker(slug: str, role: str, triples: Path, quads: Path) -> dict | None:
-    venv_name = VENV_FOR[slug]
-    python = provision(venv_name)
-    workdir = DATA_DIR / "work" / slug
-    workdir.mkdir(parents=True, exist_ok=True)
-
+def worker_env(venv_name: str, role: str) -> dict[str, str]:
+    """The environment a worker of `role` runs in."""
     env = dict(os.environ)
     # Every worker needs this directory (datasets/adapters/worker); the Vortex
     # adapter additionally needs the bindings package.
@@ -126,6 +123,24 @@ def run_worker(slug: str, role: str, triples: Path, quads: Path) -> dict | None:
     if venv_name == "vortex":
         path_parts.append(str(REPO_ROOT / "python"))
     env["PYTHONPATH"] = os.pathsep.join(path_parts)
+    if role == "memory":
+        # glibc's malloc under Python's own allocator, so that `mallinfo2`
+        # counts Python objects too (see worker.py's memory role); no
+        # tracemalloc, whose traces would land in the store's bytes.
+        env["PYTHONMALLOC"] = "malloc"
+        env.pop("PYTHONTRACEMALLOC", None)
+    else:
+        # An exported value must not change the allocator the timings run under.
+        env.pop("PYTHONMALLOC", None)
+    return env
+
+
+def run_worker(slug: str, role: str, triples: Path, quads: Path) -> dict | None:
+    venv_name = VENV_FOR[slug]
+    python = provision(venv_name)
+    workdir = DATA_DIR / "work" / slug
+    workdir.mkdir(parents=True, exist_ok=True)
+    env = worker_env(venv_name, role)
 
     cmd = [
         str(python), str(BENCH_DIR / "worker.py"),
@@ -166,7 +181,11 @@ def main() -> int:
     mem = meminfo_mb()
 
     dataset = prepare_dataset(DATA_DIR, N_TRIPLES, GRAPHS)
-    run = run_roles(ALL_SLUGS, lambda slug, role: run_worker(slug, role, dataset.triples, dataset.quads))
+    run = run_roles(
+        ALL_SLUGS,
+        lambda slug, role: run_worker(slug, role, dataset.triples, dataset.quads),
+        memory_runs=bench_memory_runs(),
+    )
 
     warnings = check_count_agreement(run.counts_by_slug)
     for w in warnings:

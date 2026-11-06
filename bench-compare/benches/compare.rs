@@ -17,6 +17,30 @@
 //! of another library's scan, and peak RSS is only attributable to a library that
 //! had a process to itself. The parent merges the children's JSON.
 //!
+//! # Memory runs
+//!
+//! After an adapter's query child, the parent runs `BENCH_MEMORY_RUNS` (default 3,
+//! `0` for none) memory children of that adapter, each a process of its own
+//! (`--adapter <slug> --role memory`). A child opens its store the way
+//! `Adapter::obtained` says (mapped, loaded, built or opened), from the artifact or
+//! source the query child used, and disposes of it before any read.
+//! **Store:** the live bytes (the counting allocator, plus glibc's `mallinfo2` for
+//! C and C++ allocations) right after the store is obtained minus those after its
+//! dispose, on a store no read has touched, so it leaves out the caches reads fill.
+//! The reads then run on a second store, obtained the same way: each probe the
+//! adapter answers is read once with the consuming read under a sampler of
+//! `/proc/self/status` every 2 ms, and the store is disposed of again. The two
+//! peaks are the sample with the highest `RssAnon + RssFile` during the reads,
+//! above the baseline taken before the first open. The reads run on the second
+//! store, so a peak can include memory the allocator kept from the first. Mapped pages
+//! include the program's own code pages that the open and the reads first touch,
+//! a few MB to a few tens of MB, depending on the library; the Vortex rows read
+//! about 7 to 8 MB of them. An in-memory store reads that much of file peak, and
+//! a file-backed store reads that plus its file's touched pages. Every figure is
+//! clamped at 0. A query entry's `peakRssMb` stays the timed process's `VmHWM`,
+//! which still drives the memory-pressure warning.
+//! `BENCH_MEMORY_RUNS=0` runs no memory children and writes no memory entries.
+//!
 //! # Libraries
 //!
 //! oxigraph enters twice — its in-memory store and its RocksDB-backed one, the
@@ -32,6 +56,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use bench_memory_stats::CountingAlloc;
+use futures::StreamExt as _;
+use mimalloc::MiMalloc;
 use oxigraph::store::Store as OxigraphStore;
 use oxrdf::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term, TermRef};
 use sophia::api::MownStr;
@@ -40,9 +67,18 @@ use sophia::inmem::dataset::FastDataset;
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore};
 
+/// mimalloc, as the CLI uses, behind the counter a memory child reads. The timed
+/// children never switch counting on.
+#[global_allocator]
+static GLOBAL: CountingAlloc<MiMalloc> = CountingAlloc(MiMalloc);
+
 #[path = "../../core/benches/support/runtime.rs"]
 mod runtime;
 use runtime::rt;
+
+#[path = "support/memory.rs"]
+mod memory;
+use memory::{MemoryRun, Obtained, Sampler, memory_entry, mib, opened_store_bytes, read_rss};
 
 // ─── Scale ──────────────────────────────────────────────────────────────────
 
@@ -497,6 +533,9 @@ trait Adapter {
     fn build(&self, run: &Run);
     fn open(&self, run: &Run) -> Box<dyn Queryable>;
 
+    /// How `open` gets the store, which the memory panel names.
+    fn obtained(&self) -> Obtained;
+
     /// Whether the library's model has graphs at all.
     ///
     /// True (the default) means it builds from the quad dataset and answers
@@ -625,6 +664,14 @@ fn mut_batch() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000)
+}
+
+/// Memory runs per adapter (`BENCH_MEMORY_RUNS`); `0` runs none.
+fn memory_runs() -> usize {
+    std::env::var("BENCH_MEMORY_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
 }
 
 /// The primitives of a library that can mutate, which [`run_mutations`] times
@@ -762,6 +809,13 @@ impl Adapter for VortexAdapter {
         });
         Box::new(VortexStore(store))
     }
+    fn obtained(&self) -> Obtained {
+        if self.in_memory {
+            Obtained::Loaded
+        } else {
+            Obtained::Mapped
+        }
+    }
     /// One Vortex row runs the mutation phases: the add phase starts from an
     /// empty store, which no index or residency knob reaches.
     fn mutate(&self, run: &Run, rows: &mut Vec<Row>) {
@@ -820,15 +874,20 @@ impl Queryable for VortexStore {
                 .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
                 .await
                 .expect("match");
-            // Materialize, don't just read a row count: the view's `size`
-            // would answer a full scan from metadata in nanoseconds -- a number
-            // that compares nothing. `quads_vec` builds four terms per row, and
-            // the fold below reads them, which is what every other adapter here
-            // does too (see `Queryable::count`).
-            let quads = view.quads_vec().await.expect("materialize");
-            let bytes: usize = quads.iter().map(oxrdf_quad_bytes).sum();
+            // Read every term of every matched row, not just a row count: the
+            // view's `size` would answer a full scan from metadata in nanoseconds
+            // -- a number that compares nothing. `quads` decodes the match chunk
+            // by chunk and builds four terms per row, and this loop reads each
+            // row's as it arrives, so nothing collects the match. The other
+            // adapters' iterators decode a row at a time (see `Queryable::count`).
+            let mut quads = view.quads();
+            let (mut rows, mut bytes) = (0usize, 0usize);
+            while let Some(q) = quads.next().await {
+                bytes += oxrdf_quad_bytes(&q.expect("stream quads"));
+                rows += 1;
+            }
             std::hint::black_box(bytes);
-            quads.len()
+            rows
         })
     }
 
@@ -902,6 +961,12 @@ impl Adapter for OxigraphAdapter {
                 OxigraphStore::open_read_only(&run.artifact).expect("open rocksdb read-only")
             }
         }))
+    }
+    fn obtained(&self) -> Obtained {
+        match self {
+            Self::Memory => Obtained::Built,
+            Self::RocksDb => Obtained::Opened,
+        }
     }
     fn mutate(&self, run: &Run, rows: &mut Vec<Row>) {
         run_mutations(self, run, rows);
@@ -1052,6 +1117,9 @@ impl Adapter for SophiaAdapter {
     }
     fn open(&self, run: &Run) -> Box<dyn Queryable> {
         Box::new(SophiaDataset(load_sophia_dataset(&run.src)))
+    }
+    fn obtained(&self) -> Obtained {
+        Obtained::Built
     }
     fn mutate(&self, run: &Run, rows: &mut Vec<Row>) {
         run_mutations(self, run, rows);
@@ -1251,6 +1319,9 @@ impl Adapter for HdtAdapter {
         let hdt = hdt::Hdt::read(std::io::BufReader::new(f)).expect("read hdt");
         Box::new(HdtStore(hdt))
     }
+    fn obtained(&self) -> Obtained {
+        Obtained::Loaded
+    }
     fn mutate(&self, _run: &Run, rows: &mut Vec<Row>) {
         for phase in ["add", "add_batch", "delete"] {
             rows.push(unsupported_row(
@@ -1361,8 +1432,9 @@ struct WorkerOut {
     peak_rss_mb: Option<f64>,
 }
 
-fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
-    let slug = a.slug();
+/// The run's setup, shared by the query child and the memory child: the dataset
+/// the library reads, its workdir, and the artifact path inside it.
+fn adapter_run(a: &dyn Adapter, n: usize) -> Run {
     // One dataset for the whole run: the quads file for a library whose model
     // has graphs, its triples projection for one whose model does not.
     let src = if a.handles_graphs() {
@@ -1374,13 +1446,18 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
         .parent()
         .unwrap()
         .join("target/bench_compare")
-        .join(slug);
+        .join(a.slug());
     std::fs::create_dir_all(&workdir).expect("create workdir");
-    let run = Run {
+    Run {
         n,
         src,
         artifact: a.artifact(&workdir),
-    };
+    }
+}
+
+fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
+    let slug = a.slug();
+    let run = adapter_run(a, n);
     let log = |m: &str| eprintln!("  [{}] {}", a.label(), m);
 
     let mut rows: Vec<Row> = Vec::new();
@@ -1516,6 +1593,171 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
     }
 }
 
+// ─── Memory runs ────────────────────────────────────────────────────────────
+
+/// Bytes the C and C++ allocator holds live (RocksDB's), which the counting
+/// allocator cannot see: glibc's `uordblks` (heap) plus `hblkhd` (mmapped blocks).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn glibc_live_bytes() -> i64 {
+    // SAFETY: mallinfo2 has no preconditions; it only reads the allocator's state.
+    let info = unsafe { libc::mallinfo2() };
+    (info.uordblks + info.hblkhd) as i64
+}
+
+/// Without glibc there is no such counter; the self-check then fails the run.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn glibc_live_bytes() -> i64 {
+    0
+}
+
+/// Live bytes of the whole process: Rust allocations plus C and C++ ones.
+fn process_live_bytes() -> i64 {
+    bench_memory_stats::live_bytes() + glibc_live_bytes()
+}
+
+/// At the start of every memory run each counter must see an 8 MiB block held;
+/// otherwise the run's Store figure would be silently wrong. The failure line goes
+/// to stderr, which the parent inherits: its stdout is the child's JSON channel,
+/// discarded when the child exits non-zero.
+fn self_check() {
+    const HELD: i64 = 8 << 20;
+    let check = |name: &str, rose: i64| {
+        if rose < HELD {
+            eprintln!("memory self-check failed: {name} rose by {rose} bytes while 8 MiB was held");
+            std::process::exit(1);
+        }
+    };
+
+    let before = bench_memory_stats::live_bytes();
+    let block = std::hint::black_box(Vec::<u8>::with_capacity(8 << 20));
+    check(
+        "bench_memory_stats::live_bytes()",
+        bench_memory_stats::live_bytes() - before,
+    );
+    drop(block);
+
+    // 128 blocks of 64 KiB from the system allocator: glibc's malloc, under its
+    // 128 KiB mmap threshold, so freeing them does not raise the dynamic threshold.
+    use std::alloc::{GlobalAlloc, Layout, System};
+    let layout = Layout::from_size_align(64 << 10, 16).unwrap();
+    let before = glibc_live_bytes();
+    // SAFETY: the layout is non-zero-sized; a null result is checked before use,
+    // and each block is freed with the same layout.
+    let blocks = std::hint::black_box(
+        (0..128)
+            .map(|_| {
+                let b = unsafe { System.alloc(layout) };
+                if b.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                b
+            })
+            .collect::<Vec<_>>(),
+    );
+    check("mallinfo2 uordblks + hblkhd", glibc_live_bytes() - before);
+    for b in blocks {
+        unsafe { System.dealloc(b, layout) };
+    }
+}
+
+/// A memory child's stdout: its run, and the rows each probe matched, which the
+/// parent compares with the query child's.
+#[derive(serde::Serialize)]
+struct MemoryOut {
+    run: MemoryRun,
+    counts: BTreeMap<String, usize>,
+}
+
+fn run_memory(a: &dyn Adapter, n: usize) -> MemoryOut {
+    bench_memory_stats::set_counting(true);
+    self_check();
+    let run = adapter_run(a, n);
+    // Process-lifetime state, created before the baseline so no figure includes it.
+    rt();
+    vortex_rdf_core::vortex_session();
+
+    let base_live = process_live_bytes();
+    let base_rss = read_rss();
+    // Store: a store of its own, opened and disposed before any read.
+    let store_bytes = opened_store_bytes(|| a.open(&run), process_live_bytes);
+    // The reads run on a second open of the same store.
+    let handle = a.open(&run);
+    let sampler = Sampler::start();
+    let mut counts = BTreeMap::new();
+    for probe in probes()
+        .into_iter()
+        .filter(|p| a.handles_graphs() || !p.binds_graph())
+    {
+        counts.insert(probe.name.clone(), Read::Terms.run(&*handle, &probe));
+    }
+    let peak = sampler.finish();
+
+    drop(handle);
+    let after = process_live_bytes();
+    let run = MemoryRun::new(store_bytes, base_rss, peak);
+    eprintln!(
+        "  [{}] memory: store {} MB, peak +{} MB anon, +{} MB file, {} MB left live",
+        a.label(),
+        run.store_mb,
+        run.peak_anon_mb,
+        run.peak_file_mb,
+        mib(after - base_live)
+    );
+    MemoryOut { run, counts }
+}
+
+/// Runs the adapter's memory children, one process each, and returns the `run`
+/// objects of those that finished with the query child's counts. The runs stop
+/// at the first that fails or whose counts differ.
+fn run_memory_children(
+    exe: &Path,
+    a: &dyn Adapter,
+    n: usize,
+    query_counts: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) -> Vec<serde_json::Value> {
+    let mut runs = Vec::new();
+    for k in 1..=memory_runs() {
+        let out = std::process::Command::new(exe)
+            .arg("--adapter")
+            .arg(a.slug())
+            .arg("--role")
+            .arg("memory")
+            .env("BENCH_SIZE", n.to_string())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .expect("spawn memory child");
+        if !out.status.success() {
+            eprintln!(
+                "!! {} memory run {k} failed ({}), stopping its memory runs",
+                a.label(),
+                out.status
+            );
+            break;
+        }
+        let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "!! {} memory run {k} failed (unreadable output: {e}), stopping its memory runs",
+                    a.label()
+                );
+                break;
+            }
+        };
+        if parsed["counts"] != *query_counts {
+            warnings.push(format!(
+                "{}: memory run {k} matched {}, its query run {query_counts}",
+                a.slug(),
+                parsed["counts"]
+            ));
+            break;
+        }
+        runs.push(parsed["run"].clone());
+    }
+    runs
+}
+
 // ─── Driver ─────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -1531,8 +1773,16 @@ fn main() {
             .iter()
             .find(|a| a.slug() == slug)
             .unwrap_or_else(|| panic!("unknown adapter {slug}"));
-        let out = run_adapter(a.as_ref(), n);
-        println!("{}", serde_json::to_string(&out).unwrap());
+        let role = args
+            .iter()
+            .position(|a| a == "--role")
+            .map(|j| args.get(j + 1).expect("--role needs a value").as_str());
+        let line = match role {
+            None => serde_json::to_string(&run_adapter(a.as_ref(), n)),
+            Some("memory") => serde_json::to_string(&run_memory(a.as_ref(), n)),
+            Some(role) => panic!("unknown role {role}"),
+        };
+        println!("{}", line.unwrap());
         return;
     }
 
@@ -1550,6 +1800,8 @@ fn main() {
     let mut sizes: Vec<serde_json::Value> = Vec::new();
     let mut memory: Vec<serde_json::Value> = Vec::new();
     let mut counts_by_slug: BTreeMap<String, serde_json::Value> = Default::default();
+    let mut warnings: Vec<String> = Vec::new();
+    let memory_on = memory_runs() >= 1;
 
     for a in adapters() {
         eprintln!("\n== {} ==", a.label());
@@ -1564,6 +1816,13 @@ fn main() {
             // Carry on: a partial tab beats no tab, and the missing rows are
             // visible as absent cells rather than as silently wrong ones.
             eprintln!("!! {} failed ({}), skipping", a.label(), out.status);
+            // With memory runs on, the adapter keeps its memory row, reading "—",
+            // with `obtained` null: every adapter has an entry. No memory child
+            // runs, with no query counts to compare against and an artifact that
+            // may be missing.
+            if memory_on {
+                memory.push(memory_entry(a.slug(), a.label(), None, Vec::new()));
+            }
             continue;
         }
         let parsed: serde_json::Value =
@@ -1580,12 +1839,20 @@ fn main() {
             "peakRssMb": parsed["peak_rss_mb"],
         }));
         counts_by_slug.insert(a.slug().to_string(), parsed["counts"].clone());
+        // With memory runs on, the entry stays even with no run to show: the page
+        // reads "—" for the adapter rather than dropping its row. With
+        // BENCH_MEMORY_RUNS=0 there are none, so the page keeps the query-peak table.
+        if memory_on {
+            let runs = run_memory_children(&exe, a.as_ref(), n, &parsed["counts"], &mut warnings);
+            // How the kept runs got their store; null when none was kept.
+            let obtained = (!runs.is_empty()).then(|| a.obtained());
+            memory.push(memory_entry(a.slug(), a.label(), obtained, runs));
+        }
     }
 
     // Every adapter queried the same dataset with the same probes, so their counts
     // must agree; a disagreement means one was queried wrongly and its timings
     // measure the wrong work.
-    let mut warnings: Vec<String> = Vec::new();
     let mut merged: BTreeMap<String, u64> = Default::default();
     for (slug, counts) in &counts_by_slug {
         for (probe, v) in counts.as_object().into_iter().flatten() {

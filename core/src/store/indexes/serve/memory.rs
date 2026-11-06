@@ -17,7 +17,7 @@ use super::{LiveRows, ServeDecode, ServedRows, ServedSpan};
 use crate::error::Result;
 use crate::observe::observe;
 use crate::store::SortOrder;
-use crate::store::array::into_struct_array;
+use crate::store::array::{batch_ranges, into_struct_array};
 use crate::store::indexes::{COL_RID, ComponentRun};
 use crate::store::layouts::ChunkDecode;
 use crate::store::probes::StructProbes;
@@ -363,7 +363,7 @@ impl InMemoryServePlan {
         if let Some(columns) = self.live_point_columns(deleted) {
             return Ok(columns);
         }
-        let (rows, deleted) = self.covered_rows(deleted)?;
+        let (rows, deleted) = self.covered_rows(deleted, 0..self.span_len())?;
         self.decode.chunk_code_columns(&rows, deleted)
     }
 
@@ -377,24 +377,58 @@ impl InMemoryServePlan {
             Ok(None) => {}
             Err(e) => return vec![Err(e)],
         }
-        match self.covered_rows(deleted) {
+        match self.covered_rows(deleted, 0..self.span_len()) {
             Ok((rows, deleted)) => self.decode.decode_columns(&rows, deleted),
             Err(e) => vec![Err(e)],
         }
     }
 
-    /// The component's rows the view covers, in its order, beside the
-    /// tombstones its decode still drops: a slice of the range, under
-    /// `deleted`, or one take at the kept rows' positions, which are live.
-    fn covered_rows<'a>(&self, deleted: Option<&'a Mask>) -> Result<(ArrayRef, Option<&'a Mask>)> {
+    /// The matched rows decoded a chunk at a time, in the component's order,
+    /// each chunk read and decoded when the iterator reaches it: a view of
+    /// at most `chunk_rows` covered rows as one chunk, read as
+    /// [`decode`](Self::decode) reads it (a small run point by point); a
+    /// wider one a window of `chunk_rows` covered rows a chunk
+    /// ([`covered_rows`](Self::covered_rows)), the `deleted` tombstones among
+    /// them dropped as it decodes.
+    pub(crate) fn decode_windows<'a, T: ChunkDecode>(
+        &'a self,
+        deleted: Option<&'a Mask>,
+        chunk_rows: usize,
+    ) -> impl Iterator<Item = Vec<Result<T>>> + Send + 'a {
+        let fits = self.span_len() <= chunk_rows;
+        batch_ranges(self.span_len(), chunk_rows).map(move |window| {
+            observe!(InMemoryChunk(window.len()));
+            if fits {
+                return self.decode(deleted);
+            }
+            match self.covered_rows(deleted, window) {
+                Ok((rows, deleted)) => self.decode.decode_columns(&rows, deleted),
+                Err(e) => vec![Err(e)],
+            }
+        })
+    }
+
+    /// The component's rows `window` of those the view covers (positions in
+    /// its span), in its order, beside the tombstones its decode still
+    /// drops: a slice of the range, under `deleted`, or one take at those of
+    /// the kept rows' positions, which are live.
+    fn covered_rows<'a>(
+        &self,
+        deleted: Option<&'a Mask>,
+        window: Range<usize>,
+    ) -> Result<(ArrayRef, Option<&'a Mask>)> {
         Ok(match &self.span {
-            ServedSpan::Range(range) => (
-                self.array.slice(range.start as usize..range.end as usize)?,
-                deleted,
-            ),
+            ServedSpan::Range(range) => {
+                let start = range.start as usize;
+                (
+                    self.array.slice(start + window.start..start + window.end)?,
+                    deleted,
+                )
+            }
             ServedSpan::Kept(kept) => {
                 let indices =
-                    PrimitiveArray::new(kept.positions.clone(), Validity::NonNullable).into_array();
+                    PrimitiveArray::new(kept.positions.slice(window), Validity::NonNullable)
+                        .into_array();
                 (self.array.take(indices)?, None)
             }
         })

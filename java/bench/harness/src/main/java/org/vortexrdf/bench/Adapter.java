@@ -33,6 +33,12 @@ public interface Adapter<H, Q> {
 	/** Whether the build leaves an artifact at its location that a fresh process can reopen, and that is sized. */
 	boolean persistent();
 
+	/**
+	 * How {@link #open} obtains the store: mapped (a file it memory-maps), loaded (a file read into memory), built
+	 * (from the triples) or opened (an on-disk database).
+	 */
+	Obtained obtained();
+
 	/** Ingest {@code src} (an .nq or .nt file) into a queryable store; {@code location} is an empty directory. */
 	H build(Path src, Path location) throws Exception;
 

@@ -12,8 +12,6 @@ import java.lang.foreign.SegmentAllocator;
 import java.lang.foreign.StructLayout;
 import java.lang.invoke.MethodHandle;
 import java.lang.management.ManagementFactory;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import javax.management.JMException;
 import javax.management.ObjectName;
 
@@ -66,14 +64,6 @@ public record Footprint(long heapBytes, long nativeBytes) {
 	 */
 	public Footprint minus(Footprint later) {
 		return new Footprint(Math.max(0, heapBytes - later.heapBytes), Math.max(0, nativeBytes - later.nativeBytes));
-	}
-
-	/** The worker's JSON shape. */
-	public Map<String, Object> toJson() {
-		Map<String, Object> out = new LinkedHashMap<>();
-		out.put("heapBytes", heapBytes);
-		out.put("nativeBytes", nativeBytes);
-		return out;
 	}
 
 	/**

@@ -1,7 +1,9 @@
-//! Materialized and shared-term reads: `quads_vec` against the stream, and
-//! `shared_quads_vec` / `shared_quad_chunks` under every layout and view.
+//! Materialized and shared-term reads: `quads_vec` against the stream,
+//! `shared_quads_vec` / `shared_quad_chunks` under every layout and view,
+//! and an in-memory view's streams in chunks of bounded rows.
 
 use super::*;
+use crate::store::test_hooks::ForcedChunkRows;
 
 // ─── Materialized reads ────────────────────────────────────────────────
 
@@ -255,4 +257,201 @@ async fn test_shared_quads_survive_compaction() {
     );
     assert_eq!(compacted.size().await.unwrap(), 11);
     assert_eq!(shared_tuple_rows(&held), before);
+}
+
+// ─── Bounded in-memory streams ─────────────────────────────────────────
+
+/// The N-Quads bytes [`export_rdf`](crate::export_rdf) writes of `view`.
+async fn nquads_export(view: &VortexRdfStore) -> Vec<u8> {
+    let mut out = Vec::new();
+    crate::export_rdf(view.clone(), &mut out, oxrdfio::RdfFormat::NQuads)
+        .await
+        .unwrap();
+    out
+}
+
+/// Under [`ForcedChunkRows::set`]`(rows)` an in-memory `view` streams more
+/// than one chunk, none of more than `rows` rows, and its streams read the
+/// rows of its one-chunk reads: `shared_quad_chunks` concatenates to
+/// `shared_quads_vec`, `quads()` collects to `quads_vec`, and the N-Quads
+/// export writes the bytes it writes at the production cap.
+async fn assert_bounded_chunks(view: &VortexRdfStore, rows: usize, tag: &str) {
+    let (shared, quads) = (
+        view.shared_quads_vec().await.unwrap(),
+        view.quads_vec().await.unwrap(),
+    );
+    let lines = nquads_export(view).await;
+    let _forced = ForcedChunkRows::set(rows);
+    let chunks: Vec<Vec<_>> = view.shared_quad_chunks().collect().await;
+    let sizes: Vec<usize> = chunks.iter().map(Vec::len).collect();
+    assert!(
+        sizes.len() > 1 && sizes.iter().all(|&n| n <= rows),
+        "{tag}: {sizes:?}"
+    );
+    let chunked: Vec<crate::store::SharedQuad> =
+        chunks.into_iter().flatten().map(|r| r.unwrap()).collect();
+    assert_eq!(chunked, shared, "{tag}: shared_quad_chunks");
+    let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
+    assert_eq!(streamed, quads, "{tag}: quads()");
+    assert_eq!(nquads_export(view).await, lines, "{tag}: export");
+}
+
+/// Every shape of in-memory view streams chunks of at most the forced rows,
+/// which concatenate to its one-chunk reads, under every layout: the whole
+/// store and a window of it (a run, sliced), a match and a tombstoned store
+/// (live ids, gathered a window at a time) and a tail after the base's
+/// rows; and an index-served match, a window of it, its tombstones, its tail
+/// and (under the Dictionary layout) a keep of it, the served rows read off
+/// the index's run a window at a time.
+#[tokio::test]
+async fn test_in_memory_chunks_concatenate_to_the_whole_view() {
+    let quads = modular_quads(64, 3, 4);
+    let late: Vec<Quad> = (0..10)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/tail{i}"),
+                "http://example.org/p0",
+                "late",
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let p0 = iri("p0");
+    for layout in LAYOUTS {
+        let plain = built_store(quads.clone(), layout, vec![]).await;
+        let indexed = built_store(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
+        let served = matched_view(&indexed, None, Some(&p0), None, None).await;
+        let mut views = vec![
+            // A run of 64.
+            ("whole", plain.clone()),
+            // A run of 40.
+            ("window", plain.window(3, 40).await.unwrap()),
+            // 22 ids.
+            (
+                "matched",
+                matched_view(&plain, None, Some(&p0), None, None).await,
+            ),
+            // 59 live ids.
+            ("tombstoned", delete_all(&plain, &quads[..5]).await),
+            // 64 rows, then 10.
+            ("tailed", plain.add_quads(late.clone()).await.unwrap()),
+            // A run of 22.
+            ("served", served.clone()),
+            ("served window", served.window(3, 15).await.unwrap()),
+            (
+                "served tombstoned",
+                matched_view(
+                    &delete_all(&indexed, &quads[..1]).await,
+                    None,
+                    Some(&p0),
+                    None,
+                    None,
+                )
+                .await,
+            ),
+            (
+                "served tailed",
+                matched_view(
+                    &indexed.add_quads(late.clone()).await.unwrap(),
+                    None,
+                    Some(&p0),
+                    None,
+                    None,
+                )
+                .await,
+            ),
+        ];
+        if layout == LayoutStrategy::Dictionary {
+            // The kept rows: 11 of the 22.
+            let codes = indexed
+                .dict_reader()
+                .unwrap()
+                .encode_many(&["\"object 0\"", "\"object 2\""])
+                .await
+                .unwrap();
+            views.push((
+                "served keep",
+                served
+                    .keep(QuadColumn::O, &Keep::set(codes.into_iter().flatten()))
+                    .await
+                    .unwrap(),
+            ));
+        }
+        for (name, view) in &views {
+            let tag = format!("{layout:?} {name}");
+            assert_eq!(
+                served_component(view).is_some(),
+                name.starts_with("served"),
+                "{tag}"
+            );
+            assert_bounded_chunks(view, 7, &tag).await;
+        }
+    }
+}
+
+/// An in-memory chunk stream reads and decodes one chunk a pull, and no
+/// pull suspends, as the JS bindings poll it (`now_or_never`): nothing is
+/// read before the first poll, then each pull reads the chunk it yields, for
+/// the whole store's run (sliced) and for an index-served match's (read off
+/// the index's run).
+#[tokio::test]
+async fn test_in_memory_chunk_stream_decodes_a_chunk_a_pull() {
+    use futures::FutureExt as _;
+    let store = built_store(
+        modular_quads(64, 3, 4),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let served = matched_view(&store, None, Some(&iri("p0")), None, None).await;
+    let _forced = ForcedChunkRows::set(7);
+    let decoded = |rec: &Recorder| rec.count_where(|e| matches!(e, Event::InMemoryChunk(_)));
+    for (tag, view, want) in [
+        ("whole", &store, vec![7, 7, 7, 7, 7, 7, 7, 7, 7, 1]),
+        ("served", &served, vec![7, 7, 7, 1]),
+    ] {
+        let rec = Recorder::start();
+        let mut chunks = view.shared_quad_chunks();
+        assert_eq!(
+            decoded(&rec),
+            0,
+            "{tag}: nothing read before the first poll"
+        );
+        let mut sizes = Vec::new();
+        while let Some(chunk) = chunks
+            .next()
+            .now_or_never()
+            .expect("an in-memory pull never suspends")
+        {
+            sizes.push(chunk.len());
+            assert_eq!(decoded(&rec), sizes.len(), "{tag}: one chunk a pull");
+        }
+        assert_eq!(sizes, want, "{tag}");
+    }
+}
+
+/// At the production cap an in-memory view's chunks hold at most 65,536
+/// rows: a store of 160,000 rows streams two full chunks and the rest, a
+/// tail one more chunk after them, and the chunks concatenate to the view's
+/// one-chunk read.
+#[tokio::test]
+async fn test_in_memory_chunks_hold_at_most_65_536_rows() {
+    // 160,000 rows, the file's bytes written once per process.
+    let (_dir, path) = multi_window_dictionary_file().await;
+    let store = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let tailed = store.add_quads(appended_quads(3)).await.unwrap();
+    for (tag, view, want) in [
+        ("whole", &store, vec![65_536, 65_536, 28_928]),
+        ("tailed", &tailed, vec![65_536, 65_536, 28_928, 3]),
+    ] {
+        let chunks: Vec<Vec<_>> = view.shared_quad_chunks().collect().await;
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            want,
+            "{tag}"
+        );
+        let rows: Vec<crate::store::SharedQuad> =
+            chunks.into_iter().flatten().map(|r| r.unwrap()).collect();
+        assert_eq!(rows, view.shared_quads_vec().await.unwrap(), "{tag}");
+    }
 }

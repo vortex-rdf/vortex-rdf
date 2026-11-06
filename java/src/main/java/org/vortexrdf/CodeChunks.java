@@ -27,6 +27,7 @@ public final class CodeChunks implements AutoCloseable {
 	 *
 	 * @param out a writable direct buffer in native byte order of at least {@code maxRows * ROW_BYTES} bytes
 	 * @param maxRows at least 1
+	 * @return the number of rows written, 0 once every row was
 	 * @throws IllegalStateException if the store was closed before this stream ended
 	 */
 	public int next(ByteBuffer out, int maxRows) {

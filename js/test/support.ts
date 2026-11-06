@@ -1,10 +1,11 @@
 // Fixtures and helpers shared by the binding tests: the RDF/JS factory, the
-// N-Quads document most stores are built from, every build variant, and the
-// readers of match streams and code chunks. Not a test file itself: vitest
-// collects only *.test.ts.
+// N-Quads document most stores are built from, the larger one a match is read
+// from in several chunks, every build variant, and the readers of match
+// streams and code chunks. Not a test file itself: vitest collects only
+// *.test.ts.
 import { expect } from 'vitest';
 import { DataFactory } from 'rdf-data-factory';
-import type { Quad, Stream } from '@rdfjs/types';
+import type { Quad, Stream, Term } from '@rdfjs/types';
 import { VortexRdfStore, type BuildOptions, type CodeChunk, type CodeColumns } from '@vortex-rdf/vortex-rdf-store';
 
 export const df = new DataFactory();
@@ -56,11 +57,56 @@ export const VARIANTS: { name: string; options: BuildOptions }[] = [
     },
 ];
 
+/** The quads of `chunkedNquads()`: more than two of `match`'s 8,192-row chunks. */
+export const CHUNKED_ROWS = 20_000;
+
+/** The objects of `chunkedNquads()`, quad `i` taking `OBJECTS[i % 5]`. */
+const OBJECTS = [
+    '<http://example.org/o0>',
+    '"lit"',
+    '"hola"@es',
+    '"42"^^<http://www.w3.org/2001/XMLSchema#integer>',
+    '<http://example.org/o1>',
+];
+
+/** An N-Quads document of `CHUNKED_ROWS` quads: quad `i` has the subject
+ *  `s<i>`, the predicate `p<i % 2>` and the object `OBJECTS[i % 5]`, in the
+ *  graph `g1` when `i` is odd and in the default graph when it is even. */
+export function chunkedNquads(): string {
+    const lines: string[] = [];
+    for (let i = 0; i < CHUNKED_ROWS; i++) {
+        const graph = i % 2 === 1 ? ' <http://example.org/g1>' : '';
+        lines.push(`<http://example.org/s${i}> <http://example.org/p${i % 2}> ${OBJECTS[i % 5]}${graph} .`);
+    }
+    return lines.join('\n') + '\n';
+}
+
+/** Patterns over `chunkedNquads()`, each commented with the rows it matches. */
+export const CHUNKED_PATTERNS: [Term | null, Term | null, Term | null, Term | null][] = [
+    [null, null, null, null], // 20,000
+    [null, ex('p1'), null, null], // 10,000; a by-copy index serves it
+    [null, null, ex('o0'), null], // 4,000; a by-copy index serves it
+    [null, null, null, ex('g1')], // 10,000
+    [ex('s7'), null, null, null], // 1
+    [ex('nobody'), null, null, null], // 0
+];
+
 /** Drain the quads of a match() result (via its Symbol.asyncIterator) into an array. */
 export async function collect(stream: Stream<Quad>): Promise<Quad[]> {
     const out: Quad[] = [];
     for await (const quad of stream as unknown as AsyncIterable<Quad>) out.push(quad);
     return out;
+}
+
+/** A quad as one string, to compare reads by: every term's `termType` and
+ *  `value`, and a literal's `language` and `datatype.value`, joined. */
+export function quadKey(quad: Quad): string {
+    const parts: string[] = [];
+    for (const term of [quad.subject, quad.predicate, quad.object, quad.graph]) {
+        parts.push(term.termType, term.value);
+        if (term.termType === 'Literal') parts.push(term.language, term.datatype.value);
+    }
+    return parts.join(' ');
 }
 
 export type Position = 's' | 'p' | 'o' | 'g';

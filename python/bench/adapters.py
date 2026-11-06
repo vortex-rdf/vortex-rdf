@@ -114,6 +114,19 @@ class Adapter:
     #: source file every process start; those get no Open measurement, because
     #: the re-parse is what the Build column already reports.
     has_distinct_open: bool = True
+    #: How `open` gets the store, one of four words for the memory panel:
+    #: `mapped` (a memory-mapped file), `loaded` (a file read into memory),
+    #: `built` (built from the triples) or `opened` (an on-disk database).
+    obtained: str = ""
+    def unseen_live_bytes(self) -> int:
+        """Live bytes the library holds where `live_bytes` cannot see them, by
+        the library's own count. The base holds none."""
+        return 0
+
+    def import_library(self) -> None:
+        """Import the library under test, so its import-time allocations are
+        in a memory run's baseline and not in the store's reads. The base does
+        nothing."""
 
     def artifact_path(self, workdir: str, src: str) -> str:
         raise NotImplementedError
@@ -193,6 +206,10 @@ class VortexAdapter(Adapter):
         #: rdflib are in-memory stores, so the comparison is only interpretable
         #: with both Vortex modes on the page.
         self.in_memory = in_memory
+        self.obtained = "loaded" if in_memory else "mapped"
+
+    def import_library(self) -> None:
+        import vortex_rdf  # noqa: F401
 
     def artifact_path(self, workdir: str, src: str) -> str:
         # Keyed by source stem so the triples and quads artifacts never collide.
@@ -213,11 +230,11 @@ class VortexAdapter(Adapter):
         return VortexRdfStore(artifact, in_memory=self.in_memory)
 
     def count(self, handle: Any, pat: Pat) -> int:
-        # `get_quads` is the idiomatic read, and it materializes four terms per
+        # `iter_quads` streams the read a chunk at a time, still four terms a
         # row. On a triple pattern the libraries whose result is a triple build
         # three, so Vortex is doing strictly more work per row here, not less.
         acc = rows = 0
-        for s, p, o, g in handle.get_quads(pat.s, pat.p, pat.o, pat.g):
+        for s, p, o, g in handle.iter_quads(pat.s, pat.p, pat.o, pat.g):
             acc += len(s) + len(p) + len(o) + len(g)
             rows += 1
         consume(acc)
@@ -241,6 +258,10 @@ class PyoxigraphAdapter(Adapter):
 
     slug, label = "pyoxigraph", "pyoxigraph"
     has_distinct_open = False
+    obtained = "built"
+
+    def import_library(self) -> None:
+        import pyoxigraph  # noqa: F401
 
     def _term(self, t: Optional[str]):
         if t is None:
@@ -321,6 +342,22 @@ class PycottasAdapter(Adapter):
 
     slug, label = "pycottas", "pycottas"
     mutation_unsupported = "COTTASStore raises: 'The COTTAS store is read only!'"
+    # `opened`, not `mapped` or `loaded`: DuckDB reads the Parquet file per query.
+    obtained = "opened"
+
+    def unseen_live_bytes(self) -> int:
+        # DuckDB allocates through its own allocator, which mallinfo2 cannot
+        # see; its tracked memory is the part mallinfo2 misses. The
+        # module-level `duckdb.execute` runs on the default connection that
+        # pycottas queries through.
+        import duckdb
+
+        return duckdb.execute(
+            "SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()"
+        ).fetchone()[0]
+
+    def import_library(self) -> None:
+        import pycottas  # noqa: F401
 
     def artifact_path(self, workdir: str, src: str) -> str:
         stem = os.path.splitext(os.path.basename(src))[0]
@@ -372,6 +409,10 @@ class RdflibAdapter(Adapter):
 
     slug, label = "rdflib", "rdflib"
     has_distinct_open = False
+    obtained = "built"
+
+    def import_library(self) -> None:
+        import rdflib  # noqa: F401
 
     def artifact_path(self, workdir: str, src: str) -> str:
         return ""
