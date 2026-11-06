@@ -532,6 +532,16 @@ Keeps (`VALUES`, FILTER code sets) never become filter expressions, so the
 two memos only see a workload's pattern shapes. No count, decode or predicate
 result is cached.
 
+An in-memory store (`from_file_in_memory`, `from_bytes`, or a build) keeps
+the same statistics of its quad table beside its rows, built once: the zone
+map of each code column (`s`, `p`, `o`, `g`: each zone's `min` and `max`,
+two `u64` per 8,192-row zone), the graph column's recorded graphs per zone
+(up to 16 `(code, rows)` pairs), and each code column's exact smallest and
+largest code as its array statistics (`Stat::Min`, `Stat::Max`). A load reads
+them from the file's zone tables and footer, a build takes them in the pass
+that compresses its codes ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)). A
+query computes its residual's zone classes from them and keeps nothing.
+
 **Scans.** A scan read to completion into one array is driven by what its
 splits cost. An index child's row-id scan always runs inline on the calling
 task: zone maps prune almost every split, and a located run is sliced out of

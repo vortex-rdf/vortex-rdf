@@ -256,6 +256,15 @@ A run shorter than a zone checks its few rows directly, as a join's probe of
 a row or two is answered faster that way. A longer run asks the statistics
 only when a read needs them: a first window that the run's first 4,096 rows
 fill, such as a 64-row first page, is read from those rows without them.
+The general match, which no located run answers, uses the same statistics.
+On file, a filter of code equalities takes the zones where every row holds
+every code without evaluating itself, and prunes the rest by the zones'
+bounds and recorded graphs. In memory, the residual compare asks the
+columns' array statistics first, then classes the zones it touches once:
+it skips the zones that cannot hold its codes, takes the zones that hold
+only them, and compares the rest; a count takes a mixed zone from its
+recorded graphs or the column's encoding, and a window skips the zones
+before it by their counts.
 `VORTEX_RDF_ZONES=0` (read once)
 checks every row instead, as before, and leaves the general match's zone
 pruning to the bounds, without the recorded graphs.

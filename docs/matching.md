@@ -640,7 +640,7 @@ Each stage in the code, and where the details are below:
 | 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L224), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L473) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`file.rs:22-91`](../core/src/store/query/matching/file.rs#L22-L91 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L765) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`file.rs:171-186`](../core/src/store/query/matching/file.rs#L171-L186 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L205) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -689,7 +689,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L765) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -711,6 +711,18 @@ graphs, each zone holding a few, their codes interleaved) prune as well as
 graphs sorted by zone. A zone holding more than 16 graphs records none and is
 kept, as its bounds say. `VORTEX_RDF_ZONES=0` (an ablation switch, read once)
 turns the falsifier off, and the bounds alone prune.
+
+**Every-row zones.** A filter of code equalities (`col = c` alone, as the
+Dictionary layout pushes them) also takes the zones where every row holds
+every code without evaluating it. Each split prunes the negation of each
+equality, `col != c`, over the rows it starts with: a zone whose bounds are
+both `c` cannot hold a differing row, so its rows match as they are
+([`every_row_zones`](../core/src/store/scan/file_filter.rs#L189)), and the
+filter is evaluated only over the split's other rows, after their own
+pruning. Counts and reads alike take them; a tombstoned row is not among
+them, as no split starts with it. The negation, not `not(col = c)`: Vortex
+0.90 has no pruning rule for `not`. `VORTEX_RDF_ZONES=0` (decided once per
+evaluation, on the calling thread) leaves the step out.
 
 **Example.** `(? a ? ?)` on the Dictionary file without indexes pushes
 `p = 4` down. The four-row file is one zone whose `p` statistics span `4..7`,
@@ -1004,8 +1016,8 @@ indexes. `→` reads "then".
 | `?P??` | POSG lead probe → lazy ids **+ serve plan** | ref-p probe → lazy ids, materialized unless only counted or windowed | typed/mask scan of `p` over all rows |
 | `??O?` | OSPG lead probe → lazy ids **+ serve plan** | ref-o probe → same as above | typed/mask scan of `o` |
 | `?PO?` | POSG `(p, o)` prefix probe → both resolved, lazy ids **+ serve plan** | ref-o probe (object preferred) → ids → residual `p` scan | typed/mask scan of `p ∧ o` |
-| `???G` | indexes decline → typed/mask scan of `g` | same | same |
-| `?P?G` | POSG lead probe → residual `g` scan **drops the plan**, ids materialize | ref-p probe → residual `g` scan | typed/mask scan |
+| `???G` | indexes decline → residual `g`: the column's array statistics (a one-graph store settles here), then the zone classes, "none" zones skipped, "all" zones taken, mixed ones compared; a count takes mixed zones from their recorded graphs or the encoding (§6.3) | same | same |
+| `?P?G` | POSG lead probe → residual `g` over the ids, as above, **drops the plan**, ids materialize | ref-p probe → residual `g`, as above | residual `p ∧ g`, as above |
 | `SP??` / `SPO?` / `SPOG` (`contains`) | prefix probe → exact `Range`, nothing residual; indexes never consulted (nothing left bound) | same | same |
 | `S?O?` / `S??G` | prefix probe narrows by the subject; residual scan of `o` (or `g`) over the range — index routing skipped entirely if the range is < 4096 rows | same | same |
 
@@ -1022,7 +1034,7 @@ and the object of a `TypedObject` store expands into 2–4 residual equalities.
 | `S???` | subject chunk probe → exact `Range`, no filter | same | same |
 | `?P??` | POSG located run → eager ids (≤ 256) or lazy ids **+ serve plan** | ref-p located run → lazy ids, materialized unless only counted or windowed; filter empty | filter `p = code` → pruning envelope |
 | `??O?` | OSPG located run → same as above | ref-o located run → same as above | filter `o = code` → pruning envelope |
-| `???G` | filter `g = code` → pruning envelope, from the zones' bounds and their recorded graphs (§7.2) | same | same |
+| `???G` | filter `g = code` → pruning envelope, from the zones' bounds and their recorded graphs; per split, the zones of the graph alone taken unevaluated (§7.2) | same | same |
 | `?PO?` | POSG `(p, o)` windowed location → both resolved, **serve plan** | ref-o located run → ids; `p` read at them by point reads when they are sparse in their splits, else the filter keeps `p` | filter `p ∧ o` → pruning envelope |
 | `?POG` | as above; plan carries `g` too, but its `row_range` is dropped | ref-o ids; `p ∧ g` read at them as above, else the filter keeps them | filter `p ∧ o ∧ g` |
 | `SP??` … `SPOG` | subject chunk probe, then the prefix behind it → exact `Range`, nothing residual; index routing skipped when the range is < 4096 rows | same | same |

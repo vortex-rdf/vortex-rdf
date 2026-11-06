@@ -3,7 +3,7 @@
 //! no store state.
 
 use std::borrow::Borrow;
-use std::ops::{BitAnd, Range};
+use std::ops::{BitAnd, BitOr, Range};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::future::BoxFuture;
@@ -180,12 +180,61 @@ impl ConjunctOrder {
     }
 }
 
+/// The rows of `start` in zones where no row can differ from any code of a
+/// filter of code equalities: each of `negations` (`col != c`, one per
+/// equality) pruned there by the zone maps and footer statistics, so every
+/// row holds every code. Answers those rows, beside the rest of `start`
+/// for the filter to evaluate; with no negation (zones off, or a filter of
+/// another shape), none and `start`.
+async fn every_row_zones(
+    reader: &Arc<dyn LayoutReader>,
+    negations: &[BoundExpression],
+    range: &Range<u64>,
+    start: Mask,
+) -> Result<(Mask, Mask)> {
+    let mut all = start.clone();
+    if negations.is_empty() {
+        return Ok((Mask::new_false(start.len()), start));
+    }
+    for negation in negations {
+        if all.all_false() {
+            break;
+        }
+        let may_differ = reader
+            .pruning_evaluation(range, negation, all.clone())?
+            .await?;
+        all = all.bitand(&!&may_differ);
+    }
+    let taken = all.true_count();
+    if taken == 0 {
+        return Ok((all, start));
+    }
+    observe!(SplitAllRows(taken as u64));
+    let rest = start.bitand(&!&all);
+    Ok((all, rest))
+}
+
 /// A filter evaluated over one file split, a narrowing mask threaded through
-/// the layout reader's two phases: statistics-only pruning, then each
+/// the layout reader's phases: for a filter of code equalities, the zones
+/// where every row holds every code taken unevaluated ([`every_row_zones`],
+/// with the filter's `negations`); then statistics-only pruning, then each
 /// conjunct's evaluation over what survives, in the order `order` gives.
 /// Answers the split-relative mask of the rows that match, exactly; mirrors
 /// the filter phase of vortex's `split_exec`.
 async fn evaluate_filter_split(
+    reader: Arc<dyn LayoutReader>,
+    order: &ConjunctOrder,
+    negations: &[BoundExpression],
+    range: &Range<u64>,
+    start_mask: Mask,
+) -> Result<Mask> {
+    let (all, start_mask) = every_row_zones(&reader, negations, range, start_mask).await?;
+    let matched = evaluate_conjuncts(reader, order, range, start_mask).await?;
+    Ok(matched.bitor(&all))
+}
+
+/// [`evaluate_filter_split`]'s pruning and evaluation of the conjuncts.
+async fn evaluate_conjuncts(
     reader: Arc<dyn LayoutReader>,
     order: &ConjunctOrder,
     range: &Range<u64>,
@@ -198,6 +247,7 @@ async fn evaluate_filter_split(
     // awaits cannot be proven `Send`.
     let bound = (0..sequence.len()).map(|k| Ok(&order.conjuncts[sequence[k]]));
     let mut mask = prune_mask(&reader, bound, range, start_mask).await?;
+    observe!(SplitFilterRows(mask.true_count() as u64));
     // Phase 2: for whatever the stats couldn't rule out, read and evaluate each
     // conjunct for real, threading the narrowing mask so later conjuncts see
     // fewer rows, and report what each kept.
@@ -246,20 +296,53 @@ fn filter_split_tasks(
         filter,
         bound_conjuncts(file, reader.as_ref(), filter.expr()).collect::<Result<_>>()?,
     ));
+    let negations: Arc<[BoundExpression]> = negations(file, reader.as_ref(), filter)?.into();
     Ok(ranges
         .into_iter()
         .map(|range| {
             let reader = Arc::clone(&reader);
             let order = Arc::clone(&order);
+            let negations = Arc::clone(&negations);
             let start_mask = split_start_mask(mask_selection, deleted, &range);
             async move {
                 observe!(SplitEvaluated);
-                let mask = evaluate_filter_split(reader, &order, &range, start_mask).await?;
+                let mask =
+                    evaluate_filter_split(reader, &order, &negations, &range, start_mask).await?;
                 Ok::<_, VortexRdfError>((mask, range))
             }
             .boxed()
         })
         .collect())
+}
+
+/// The negation of each equality of a filter of code equalities, `col != c`,
+/// bound against `reader`'s dtype through the file's memo: what the splits
+/// prune to find the zones where every row holds every code
+/// ([`every_row_zones`]). None with zones off (`VORTEX_RDF_ZONES=0`, decided
+/// here, on the calling thread) or for a filter of any other shape. Vortex
+/// 0.90 has no pruning rule for `not`, so `not(col = c)` would prune
+/// nothing; `col != c` prunes where a zone's bounds are both `c`.
+fn negations(
+    file: &NativeStoreFile,
+    reader: &dyn LayoutReader,
+    filter: &PushedFilter,
+) -> Result<Vec<BoundExpression>> {
+    use vortex_array::expr::{lit, not_eq};
+
+    let Some(eqs) = filter.eqs() else {
+        return Ok(Vec::new());
+    };
+    if !crate::stats_rules::zones_enabled() {
+        return Ok(Vec::new());
+    }
+    eqs.iter()
+        .map(|(column, code)| {
+            let negation = not_eq(get_item(column.clone(), root()), lit(code));
+            Ok(file
+                .bound_exprs()
+                .bind(QUAD_SCOPE, &negation, reader.dtype())?)
+        })
+        .collect()
 }
 
 /// One split's filter evaluation, owning everything it reads: the surviving

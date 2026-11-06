@@ -185,6 +185,12 @@ pub(crate) enum Event {
     MaskedRead(MaskedRead),
     /// A filter evaluated over one split.
     SplitEvaluated,
+    /// A split's rows a filter of code equalities took uncompared, from
+    /// zones where no row can differ from any of its codes.
+    SplitAllRows(u64),
+    /// A split's rows a filter's conjuncts were evaluated over, after its
+    /// zones were pruned.
+    SplitFilterRows(u64),
     /// A split's mask the in-order fold handed on, of this range.
     SplitConsumed(Range<u64>),
 }
