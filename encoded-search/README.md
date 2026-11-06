@@ -144,10 +144,10 @@ its lower bound, which the leaves' last values pick, and `leaf_rows` hands
 back a window inside one leaf as a `LeafRows`, whose bounds searches and point
 reads go through that leaf's probe without finding the leaf again. `values_at`
 reads any list of rows, finding each leaf once for the rows that follow one
-another in it and reading each run of consecutive rows in one pass. Each fetched chunk is read by Vortex's own flat reader, its whole array
-projected unfiltered, and so reconstructed in its wire encoding (metadata over
-the segment buffers — nothing is decompressed), resolved into a probe once, and
-cached, so repeated queries against a hot file do no further I/O.
+another in it and reading each run of consecutive rows in one pass. Each fetched chunk is reconstructed in its wire encoding
+(`SerializedArray::decode` rebuilds metadata over the segment buffers — it does
+not decompress), resolved into a probe once, and cached, so repeated queries
+against a hot file do no further I/O.
 
 A column the writer dictionary-encoded at the layout level (a `vortex.dict`
 node — a values leaf beside a codes subtree, possibly one of a chunked run of
