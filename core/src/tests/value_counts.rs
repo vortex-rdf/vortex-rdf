@@ -9,7 +9,7 @@ use crate::store::test_hooks::ForcedValueCounts;
 use crate::store::value_counts::{decode_state, value_counts};
 
 /// Whether `column` is zoned with the statistic among its aggregates.
-fn records_value_counts(column: &vortex_layout::LayoutRef) -> bool {
+pub(super) fn records_value_counts(column: &vortex_layout::LayoutRef) -> bool {
     use vortex_layout::layouts::zoned::Zoned;
     column.as_opt::<Zoned>().is_some_and(|zoned| {
         zoned

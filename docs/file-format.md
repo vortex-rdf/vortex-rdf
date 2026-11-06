@@ -27,8 +27,8 @@ and `from_file` read one grammar.
 │   │ index:posg   {s, p, o, g, rid}   sorted (p, o, s, g)   │ │  only if built with
 │   │ index:ospg   {s, p, o, g, rid}   sorted (o, s, p, g)   │ │  secondary-by-copy
 │   ├────────────────────────────────────────────────────────┤ │
-│   │ index:ref-o  {val, rid}          sorted by val         │ │  only if built with
-│   │ index:ref-p  {val, rid}          sorted by val         │ │  secondary-by-reference
+│   │ index:ref-o  {val, rid, g}       sorted by val         │ │  only if built with
+│   │ index:ref-p  {val, rid, g}       sorted by val         │ │  secondary-by-reference
 │   ├────────────────────────────────────────────────────────┤ │
 │   │ dictionary   {_dict_term}  one FSST window per leaf    │ │  Dictionary layout only
 │   └────────────────────────────────────────────────────────┘ │
@@ -88,7 +88,10 @@ The writer is limited to three editions:
 A file of the value-counts edition needs a reader that registers the
 aggregate: vortex-rdf 0.14 and earlier refuse it, naming
 `vortexrdf.value_counts`. Files written before it keep reading; their graph
-columns lack the statistic, and readers skip what it would decide.
+columns lack the statistic, and readers skip what it would decide. The
+reference children's `g` column ([§6](#6-the-index-children)) needs no edition of its own: it is a
+plain code column with the graph columns' aggregates, and index children stay
+version 1.
 
 A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
@@ -353,8 +356,8 @@ slower) and `sorted: true`.
 |---|---|---|---|---|---|
 | `index:posg` | `secondary-by-copy` | `secondary-by-copy/posg` | `s`, `p`, `o`, `g`, `rid` | `(p, o, s, g)` | bound `p`; bound `p` **and** `o` in one prefix search |
 | `index:ospg` | `secondary-by-copy` | `secondary-by-copy/ospg` | `s`, `p`, `o`, `g`, `rid` | `(o, s, p, g)` | bound `o` |
-| `index:ref-o` | `secondary-by-reference` | `secondary-by-reference/o` | `val`, `rid` | `val`, then `rid` | bound `o` |
-| `index:ref-p` | `secondary-by-reference` | `secondary-by-reference/p` | `val`, `rid` | `val`, then `rid` | bound `p` |
+| `index:ref-o` | `secondary-by-reference` | `secondary-by-reference/o` | `val`, `rid`; `g` under `Dictionary` | `val`, then `rid` | bound `o` |
+| `index:ref-p` | `secondary-by-reference` | `secondary-by-reference/p` | `val`, `rid`; `g` under `Dictionary` | `val`, then `rid` | bound `p` |
 
 Shared rules:
 
@@ -378,12 +381,20 @@ Shared rules:
 - **One row per quad.** A child whose row count differs from the quad table's
   fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L76)).
 - **A bound graph is never a key an index is searched by** (it is the last
-  key of both copy orders, and a `{val, rid}` child holds none), and neither
+  key of both copy orders, and a reference child's `g` is no key), and neither
   index answers a bound-subject pattern — the sorted quad table is the better
   path there.
 - **A `{val, rid}` child is ordered by `(val, rid)`**: inside one value's run
   the row ids ascend, so a window over a located run reads only its own rows
   ([matching.md §16.2](matching.md#162-window-size_capped-exists)).
+- **Under `Dictionary`, a reference child also holds `g`**: the graph code of
+  the quad its `rid` names, the default graph's code included, zoned with the
+  recorded graphs (`vortexrdf.value_counts`) as every graph column is. A
+  by-reference run checked against a graph reads these contiguous rows
+  instead of the quad table's `g` at scattered row ids. Readers find the
+  column by name; a child written without it, before it existed, holds
+  `{val, rid}` and is read as before. The string layouts' children hold
+  `{val, rid}`.
 
 Both copy families keep the same column names; the child's *identity* says
 which order its rows are in. Inside a lead-column run the next key is itself
@@ -468,15 +479,17 @@ layouts):
 
 With `secondary-by-reference`:
 
-| `index:ref-o` | val | rid |   | `index:ref-p` | val | rid |
-|---|---|---|---|---|---|---|
-| | 1 | 1 | | | 4 | 0 |
-| | 2 | 3 | | | 4 | 2 |
-| | 5 | 0 | | | 6 | 3 |
-| | 5 | 2 | | | 7 | 1 |
+| `index:ref-o` | val | rid | g |   | `index:ref-p` | val | rid | g |
+|---|---|---|---|---|---|---|---|---|
+| | 1 | 1 | 0 | | | 4 | 0 | 0 |
+| | 2 | 3 | 0 | | | 4 | 2 | 0 |
+| | 5 | 0 | 0 | | | 6 | 3 | 0 |
+| | 5 | 2 | 0 | | | 7 | 1 | 0 |
 
 The pattern `(? ? ex:alice ?)` becomes: code of `<http://example.org/alice>`
 = 2 → binary search `index:ref-o`'s `val` for 2 → position 1 → `rid` 3 → row 3.
+Each `g` is the graph of the row its `rid` names, here the default graph's
+code, 0: a pattern that also binds the graph checks it at position 1 itself.
 
 ---
 

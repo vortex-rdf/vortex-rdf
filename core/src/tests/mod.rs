@@ -39,6 +39,7 @@ mod open_errors;
 mod pending_residual;
 mod predicates;
 mod rebuild;
+mod reference_graphs;
 mod roundtrip;
 mod row_limit;
 mod serialization;
