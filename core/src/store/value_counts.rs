@@ -55,7 +55,7 @@ impl Counts {
         match values.binary_search_by_key(&value, |&(v, _)| v) {
             Ok(at) => values[at].1 += n,
             Err(at) => {
-                if values.len() as u32 == max {
+                if values.len() >= max as usize {
                     *self = Counts::TooMany;
                 } else {
                     values.insert(at, (value, n));
@@ -104,7 +104,8 @@ pub(crate) fn value_counts() -> AggregateFnRef {
 }
 
 /// A recorded state's `(value, count)` pairs, ascending by value; `None` for
-/// a zone that held more than `max_values` values (a null state).
+/// a zone that held more than `max_values` values (a null state), and for a
+/// state the aggregate does not write ([`pairs`]).
 pub(crate) fn decode_state(state: &Scalar) -> Option<Vec<(u64, u32)>> {
     if state.is_null() {
         return None;
@@ -114,27 +115,57 @@ pub(crate) fn decode_state(state: &Scalar) -> Option<Vec<(u64, u32)>> {
         state
             .field(name)
             .and_then(|field| field.as_list().elements())
-            .unwrap_or_default()
     };
-    let (values, counts) = (list("values"), list("counts"));
-    Some(
-        values
-            .iter()
-            .zip(&counts)
-            .map(|(value, count)| {
-                (
-                    value
-                        .as_primitive()
-                        .typed_value::<u64>()
-                        .expect("a u64 value"),
-                    count
-                        .as_primitive()
-                        .typed_value::<u32>()
-                        .expect("a u32 count"),
-                )
-            })
-            .collect(),
+    let values: Vec<u64> = list("values")?
+        .iter()
+        .map(|value| {
+            value
+                .as_primitive()
+                .typed_value::<u64>()
+                .expect("a u64 value")
+        })
+        .collect();
+    let counts: Vec<u32> = list("counts")?
+        .iter()
+        .map(|count| {
+            count
+                .as_primitive()
+                .typed_value::<u32>()
+                .expect("a u32 count")
+        })
+        .collect();
+    pairs(&values, &counts)
+}
+
+/// The state recording `values` with their `counts`, as given.
+pub(crate) fn state_of(values: &[u64], counts: &[u32]) -> Scalar {
+    let values = values
+        .iter()
+        .map(|&value| Scalar::primitive(value, Nullability::NonNullable))
+        .collect();
+    let counts = counts
+        .iter()
+        .map(|&n| Scalar::primitive(n, Nullability::NonNullable))
+        .collect();
+    let list = |ptype, items| {
+        Scalar::list(
+            std::sync::Arc::new(element(ptype)),
+            items,
+            Nullability::NonNullable,
+        )
+    };
+    Scalar::struct_(
+        state_dtype(),
+        [list(PType::U64, values), list(PType::U32, counts)],
     )
+}
+
+/// A state's `values` paired with their `counts`, where the two make a state
+/// the aggregate writes: as many counts as values, the values strictly
+/// ascending. `None` otherwise, for a state another writer could leave.
+pub(crate) fn pairs(values: &[u64], counts: &[u32]) -> Option<Vec<(u64, u32)>> {
+    (values.len() == counts.len() && values.is_sorted_by(|a, b| a < b))
+        .then(|| values.iter().copied().zip(counts.iter().copied()).collect())
 }
 
 impl AggregateFnVTable for ValueCounts {
@@ -207,10 +238,10 @@ impl AggregateFnVTable for ValueCounts {
         first: Self::Partial,
         second: Self::Partial,
     ) -> VortexResult<Self::Partial> {
-        let (Counts::Values(mut merged), Counts::Values(second)) = (first, second) else {
+        let (Counts::Values(merged), Counts::Values(second)) = (first, second) else {
             return Ok(Counts::TooMany);
         };
-        let mut out = Counts::Values(std::mem::take(&mut merged));
+        let mut out = Counts::Values(merged);
         for (value, n) in second {
             out.add(value, n, args.options.max_values);
         }
@@ -222,30 +253,20 @@ impl AggregateFnVTable for ValueCounts {
         _args: AggregateArgs<'_, Self::Options>,
         partial: &Self::Partial,
     ) -> VortexResult<Scalar> {
-        Ok(match partial {
-            Counts::TooMany => Scalar::null(state_dtype()),
-            Counts::Values(values) => Scalar::struct_(
-                state_dtype(),
-                [
-                    Scalar::list(
-                        std::sync::Arc::new(element(PType::U64)),
-                        values
-                            .iter()
-                            .map(|&(value, _)| Scalar::primitive(value, Nullability::NonNullable))
-                            .collect(),
-                        Nullability::NonNullable,
-                    ),
-                    Scalar::list(
-                        std::sync::Arc::new(element(PType::U32)),
-                        values
-                            .iter()
-                            .map(|&(_, n)| Scalar::primitive(n as u32, Nullability::NonNullable))
-                            .collect(),
-                        Nullability::NonNullable,
-                    ),
-                ],
-            ),
-        })
+        let Counts::Values(recorded) = partial else {
+            return Ok(Scalar::null(state_dtype()));
+        };
+        // A count past a u32's range is more than a state holds: the zone
+        // records nothing, as one past `max_values` does.
+        let Ok(counts) = recorded
+            .iter()
+            .map(|&(_, n)| u32::try_from(n))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return Ok(Scalar::null(state_dtype()));
+        };
+        let values: Vec<u64> = recorded.iter().map(|&(value, _)| value).collect();
+        Ok(state_of(&values, &counts))
     }
 
     fn is_saturated(
@@ -265,11 +286,11 @@ impl AggregateFnVTable for ValueCounts {
     ) -> VortexResult<()> {
         let max = args.options.max_values;
         match batch {
-            Columnar::Constant(c) => {
-                if let Some(value) = c.scalar().as_primitive().typed_value::<u64>() {
-                    partial.add(value, c.len() as u64, max);
-                }
-            }
+            Columnar::Constant(c) => match c.scalar().as_primitive().typed_value::<u64>() {
+                Some(value) => partial.add(value, c.len() as u64, max),
+                // Rows without a value to count leave the zone unrecorded.
+                None => *partial = Counts::TooMany,
+            },
             Columnar::Canonical(Canonical::Primitive(p)) => {
                 let values = p.as_slice::<u64>();
                 // Runs of one value count once: graph columns come in runs.
@@ -391,6 +412,54 @@ mod tests {
             decode_state(&ValueCounts.to_scalar(args(), &saturated).unwrap()),
             None
         );
+    }
+
+    /// A count past a u32's range is more than a state holds: the zone
+    /// records nothing, not a count cut to 32 bits.
+    #[test]
+    fn a_count_past_u32_records_nothing() {
+        let rows = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let constant = ConstantArray::new(7u64, rows).into_array();
+        assert_eq!(recorded(&[constant]), None);
+    }
+
+    /// Rows without a value to count (a null constant, which a non-nullable
+    /// input never holds) leave the zone unrecorded, not recorded without
+    /// them.
+    #[test]
+    fn a_null_constant_records_nothing() {
+        use vortex_array::scalar::Scalar;
+
+        let opts = options();
+        let state = state_dtype();
+        let args = || AggregateArgs {
+            options: &opts,
+            dtype: &U64,
+            return_dtype: &state,
+            partial_dtype: &state,
+        };
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let mut partial = ValueCounts.empty_partial(args()).unwrap();
+        let null = Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable));
+        let batch = Columnar::Constant(ConstantArray::new(null, 4));
+        ValueCounts
+            .accumulate(args(), &mut partial, &batch, &mut ctx)
+            .unwrap();
+        let scalar = ValueCounts.to_scalar(args(), &partial).unwrap();
+        assert_eq!(decode_state(&scalar), None);
+    }
+
+    /// A state decodes to its pairs only as the aggregate writes it: as many
+    /// counts as values, the values strictly ascending.
+    #[test]
+    fn decodes_only_well_formed_states() {
+        let decoded = |values: &[u64], counts: &[u32]| decode_state(&state_of(values, counts));
+        assert_eq!(decoded(&[1, 3], &[2, 5]), Some(vec![(1, 2), (3, 5)]));
+        assert_eq!(decoded(&[], &[]), Some(vec![]));
+        assert_eq!(decoded(&[1, 3], &[2]), None, "fewer counts");
+        assert_eq!(decoded(&[1], &[2, 5]), None, "more counts");
+        assert_eq!(decoded(&[3, 1], &[2, 5]), None, "descending");
+        assert_eq!(decoded(&[3, 3], &[2, 5]), None, "repeated");
     }
 
     /// The field a zone table names the statistic by: the aggregate's id and

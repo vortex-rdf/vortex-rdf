@@ -256,6 +256,11 @@ What the store reads from this structure:
 - the **zone-map tables** for pruning: a pushed-down filter is evaluated
   against every block's statistics first, and the surviving blocks' envelope
   bounds the scan ([matching.md §7.2](matching.md#72-zone-map-pruning));
+- on a graph column, each block's **recorded graphs** for counts and zone
+  checks, taken only as the store writes them: as many counts as graphs, the
+  graphs strictly ascending, the counts summing to the block's rows. A block
+  whose record is otherwise is read as recording none
+  ([`decode_states`](../core/src/io/zone_map.rs#L441));
 - the **chunk leaves** of the `u64` code and row-id columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and

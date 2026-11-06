@@ -221,7 +221,8 @@ impl ColumnZones {
     }
 
     /// This zone map with the values `states` records for each zone (the
-    /// zone table's `vortexrdf.value_counts` column), decoded once.
+    /// zone table's `vortexrdf.value_counts` column), decoded once
+    /// ([`decode_states`]).
     fn with_recorded(mut self, states: ArrayRef) -> Result<Self> {
         if states.len() as u64 != self.zones() {
             return Err(crate::error::VortexRdfError::InvalidInput(format!(
@@ -230,7 +231,11 @@ impl ColumnZones {
                 self.zones()
             )));
         }
-        self.recorded = Some(decode_states(states)?);
+        let rows = |zone| {
+            let rows = self.zone_rows(zone);
+            rows.end - rows.start
+        };
+        self.recorded = Some(decode_states(states, rows)?);
         Ok(self)
     }
 
@@ -424,23 +429,62 @@ fn bounds_of<A: Executable>(table: &StructArray, ctx: &mut ExecutionCtx) -> Resu
     Ok(max.zip(min))
 }
 
-/// Each zone's `(code, rows)` pairs, decoded from a zone table's
-/// `vortexrdf.value_counts` column executed once to canonical arrays all
-/// through: `None` for a zone past the statistic's limit (a null state).
-fn decode_states(states: ArrayRef) -> Result<RecordedZones> {
-    use crate::store::value_counts::decode_state;
+/// Each zone's `(code, rows)` pairs, read from a zone table's
+/// `vortexrdf.value_counts` column (of the statistic's dtype) executed once
+/// to canonical arrays all through, straight from their buffers. `None` for
+/// a zone past the statistic's limit (a null state), and for a record no
+/// store writes, whose zone then stands on its bounds alone: lists of
+/// unequal lengths, codes not strictly ascending ([`pairs`]), or counts that
+/// do not sum to the zone's `zone_rows`.
+///
+/// [`pairs`]: crate::store::value_counts::pairs
+fn decode_states(states: ArrayRef, zone_rows: impl Fn(u64) -> u64) -> Result<RecordedZones> {
+    use crate::store::value_counts::pairs;
+    use vortex_array::arrays::listview::{ListViewArrayExt as _, ListViewArraySlotsExt as _};
+    use vortex_array::arrays::struct_::StructArrayExt as _;
+    use vortex_array::arrays::{ListViewArray, PrimitiveArray};
     use vortex_array::{IntoArray as _, RecursiveCanonical};
 
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let states = states
         .execute::<RecursiveCanonical>(&mut ctx)?
         .0
-        .into_array();
-    (0..states.len())
-        .map(|zone| {
-            Ok(decode_state(&states.execute_scalar(zone, &mut ctx)?).map(Vec::into_boxed_slice))
-        })
-        .collect()
+        .into_array()
+        .execute::<StructArray>(&mut ctx)?;
+    let recorded = states
+        .struct_validity()
+        .execute_mask(states.len(), &mut ctx)?;
+    let mut list = |name: &str| -> Result<(ListViewArray, PrimitiveArray)> {
+        let list = states
+            .unmasked_field_by_name(name)?
+            .clone()
+            .execute::<ListViewArray>(&mut ctx)?;
+        let elements = list
+            .elements()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        Ok((list, elements))
+    };
+    let (codes, code_items) = list("values")?;
+    let (counts, count_items) = list("counts")?;
+    let (code_items, count_items) = (code_items.as_slice::<u64>(), count_items.as_slice::<u32>());
+    let mut zones = Vec::with_capacity(states.len());
+    for zone in 0..states.len() {
+        let mut items = |list: &ListViewArray| {
+            let start = list.offset_at(zone, &mut ctx);
+            start..start.saturating_add(list.size_at(zone, &mut ctx))
+        };
+        let (codes, counts) = (items(&codes), items(&counts));
+        let record = recorded
+            .value(zone)
+            .then(|| pairs(code_items.get(codes)?, count_items.get(counts)?))
+            .flatten()
+            .filter(|pairs| {
+                pairs.iter().map(|&(_, n)| u64::from(n)).sum::<u64>() == zone_rows(zone as u64)
+            });
+        zones.push(record.map(Vec::into_boxed_slice));
+    }
+    Ok(zones)
 }
 
 /// Column `name` of a zone table executed to `A`, `None` when the table lacks
@@ -590,5 +634,65 @@ mod tests {
             );
         }
         assert!(!bounds_prove(None, none, 100).unwrap());
+    }
+
+    /// A zone table's recorded states as another writer of the statistic
+    /// could leave them: a zone whose lists differ in length, whose codes do
+    /// not ascend strictly, or whose counts do not sum to its rows reads as
+    /// unrecorded, as a zone past the limit does; well-formed zones read as
+    /// written, the last one by its own rows.
+    #[test]
+    fn malformed_records_read_as_unrecorded() {
+        use crate::store::value_counts::{state_dtype, state_of as state};
+        use vortex_array::builders::builder_with_capacity_in;
+        use vortex_array::memory::BufferAllocatorRef;
+        use vortex_array::scalar::Scalar;
+
+        let written = [
+            state(&[1, 3], &[5_000, 3_192]),
+            state(&[1, 3], &[8_192]),
+            state(&[3, 1], &[5_000, 3_192]),
+            state(&[2, 2], &[5_000, 3_192]),
+            state(&[1, 3], &[5_000, 3_000]),
+            Scalar::null(state_dtype()),
+            state(&[7], &[100]),
+        ];
+        let mut states = builder_with_capacity_in(
+            &state_dtype(),
+            written.len(),
+            BufferAllocatorRef::static_ref(),
+        );
+        for zone in &written {
+            states.append_scalar(zone).unwrap();
+        }
+        let zones = ColumnZones::from_bounds(
+            vortex_buffer::buffer![1u64, 1, 1, 2, 1, 0, 7],
+            vortex_buffer::buffer![3u64, 3, 3, 2, 3, 9, 7],
+            8_192,
+            6 * 8_192 + 100,
+        )
+        .unwrap()
+        .with_recorded(states.finish())
+        .unwrap();
+        let recorded: Vec<Option<Vec<(u64, u32)>>> = zones
+            .recorded()
+            .unwrap()
+            .iter()
+            .map(|zone| zone.as_deref().map(<[_]>::to_vec))
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                Some(vec![(1, 5_000), (3, 3_192)]),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vec![(7, 100)]),
+            ]
+        );
+        assert_eq!(zones.recorded_count(1, 3), None, "unequal lists");
+        assert_eq!(zones.eq_holds(2, 2), None, "codes out of order");
     }
 }

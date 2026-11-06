@@ -453,7 +453,7 @@ the compare; with none left the selection is the answer, compared nowhere
 ([`ask_statistics`](../core/src/store/scan/residual.rs#L66)). This is what
 Vortex's falsifier of `x = c` and the store's satisfier prove on exact
 bounds, read off the bounds directly
-([`eq_on_bounds`](../core/src/io/zone_map.rs#L364)): building and
+([`eq_on_bounds`](../core/src/io/zone_map.rs#L369)): building and
 evaluating the proofs for a residual cost tens of µs, more than many
 residuals' whole compare.
 On a one-graph store a graph equality settles this way. The view still counts
