@@ -1512,6 +1512,9 @@ enum CheckedShape {
     RefPg,
     /// `(? ? o g)`, by reference: the `Taxon` run of `index:ref-o`.
     RefOg,
+    /// `(? p ? g)`, by copy: the `type` run of `index:posg`, its graph left to
+    /// check.
+    Pg,
 }
 
 impl CheckedShape {
@@ -1529,7 +1532,7 @@ impl CheckedShape {
                 let subject = checked_code(&dict, "hub").await;
                 CodePattern::new(Some(subject), None, None, Some(graph))
             }
-            Self::RefPg => {
+            Self::RefPg | Self::Pg => {
                 let predicate = checked_code(&dict, "type").await;
                 CodePattern::new(None, Some(predicate), None, Some(graph))
             }
@@ -1544,7 +1547,7 @@ impl CheckedShape {
     /// ([`checked_ref_run_file`]).
     fn file(self) -> PathBuf {
         match self {
-            Self::Pog | Self::Sg => checked_run_file(),
+            Self::Pog | Self::Sg | Self::Pg => checked_run_file(),
             Self::RefPg | Self::RefOg => checked_ref_run_file(),
         }
     }
@@ -2011,6 +2014,70 @@ fn whole_counts_resident(bencher: divan::Bencher, read: &WholeRead) {
         bencher,
         "whole_counts_resident",
         DictResidency::Resident,
+        *read,
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4j — CHECKED RUNS IN MEMORY (index runs bound to a graph)
+//
+// Group 4f's and 4h's reads on their files loaded in memory
+// (`from_file_in_memory`), where no located run answers: the general match
+// takes the run of the bound predicate or object in an index component, and
+// compares the bound graph at the base rows the run lists, scattered over the
+// base. The runs are the `(type, Taxon)` run of `index:posg` for `(? p o g)`
+// and its `type` run for `(? p ? g)`, the graph left to check after the free
+// slot, and Group 4h's `type` run of `index:ref-p` and `Taxon` run of
+// `index:ref-o`, of `CHECKED_RUN_ROWS` rows each, their graphs laid out as
+// Group 4f's. The cells time Group 4f's four reads.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// One in-memory checked-run cell: `read` of `shape`'s run, its file loaded
+/// with `from_file_in_memory` before timing. The setup panics, naming `cell`
+/// and the read, unless the read returns the rows it should.
+fn checked_run_mem(bencher: divan::Bencher, cell: &str, shape: CheckedShape, read: CheckedRead) {
+    let path = shape.file();
+    let store = rt().block_on(async {
+        VortexRdfStore::from_file_in_memory(path)
+            .await
+            .expect("load the checked-run file")
+    });
+    let pattern = rt().block_on(shape.pattern(&store));
+    let rows = rt().block_on(read.rows(&store, pattern));
+    assert_eq!(
+        rows,
+        read.expected_rows(),
+        "{cell}/{read:?}: wrong row count"
+    );
+    bencher.bench(|| black_box(rt().block_on(read.rows(&store, pattern))));
+}
+
+#[divan::bench(args = CHECKED_READS, sample_count = QUERY_SAMPLES)]
+fn checked_run_mem_pog(bencher: divan::Bencher, read: &CheckedRead) {
+    checked_run_mem(bencher, "checked_run_mem_pog", CheckedShape::Pog, *read);
+}
+
+#[divan::bench(args = CHECKED_READS, sample_count = QUERY_SAMPLES)]
+fn checked_run_mem_pg(bencher: divan::Bencher, read: &CheckedRead) {
+    checked_run_mem(bencher, "checked_run_mem_pg", CheckedShape::Pg, *read);
+}
+
+#[divan::bench(args = CHECKED_READS, sample_count = QUERY_SAMPLES)]
+fn checked_ref_run_mem_pg(bencher: divan::Bencher, read: &CheckedRead) {
+    checked_run_mem(
+        bencher,
+        "checked_ref_run_mem_pg",
+        CheckedShape::RefPg,
+        *read,
+    );
+}
+
+#[divan::bench(args = CHECKED_READS, sample_count = QUERY_SAMPLES)]
+fn checked_ref_run_mem_og(bencher: divan::Bencher, read: &CheckedRead) {
+    checked_run_mem(
+        bencher,
+        "checked_ref_run_mem_og",
+        CheckedShape::RefOg,
         *read,
     );
 }
