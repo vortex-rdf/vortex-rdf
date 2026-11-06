@@ -491,8 +491,8 @@ struct LocatedRun {
 }
 
 /// The classes of the zones a table run's rows fall in, against the run's
-/// checked slots (the ladder's zone level, spec §3): zones `first..first +
-/// classes.len()` of the table, `zone_len` rows each. They live with the
+/// checked slots (the ladder's zone level, see `zone_decider`): zones
+/// `first..first + classes.len()` of the table, `zone_len` rows each. They live with the
 /// run, so a call or a stream holds them, never the store.
 #[cfg(feature = "file-io")]
 struct RunZones {
@@ -1160,7 +1160,7 @@ async fn locate_run(
 }
 
 /// The statistics' decisions on `run`, a gap run of sorted table `table`
-/// (`component` names it, `None` the quad table), in ladder order (spec §3):
+/// (`component` names it, `None` the quad table), in ladder order:
 /// the footer settles each checked slot for the whole file, leaving the run
 /// empty where no row holds a slot's code and dropping a slot every row
 /// holds; the zone maps then class the run's zones against the slots left
@@ -1300,7 +1300,7 @@ async fn column_zones(
 }
 
 /// What a file's footer statistics say of a checked slot's code, for the
-/// whole file (the ladder's first level, spec §3).
+/// whole file (the ladder's first level).
 #[cfg(feature = "file-io")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FooterDecision {

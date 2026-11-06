@@ -1,9 +1,15 @@
-//! The zone level of the statistics ladder (spec §3, level 2): how each zone
-//! of a table stands against the bound slots a located run checks, decided
-//! by Vortex's own proofs of `x = c` ([`eq_proofs`]) on the checked columns'
-//! zone maps ([`ColumnZones`]) and by the values a graph column's zones
-//! record: no row of the zone holds every checked code, every row does, or
-//! the zone is mixed.
+//! The zone level of the statistics ladder: how each zone of a table stands
+//! against the bound slots a located run checks, decided by Vortex's own
+//! proofs of `x = c` ([`eq_proofs`]) on the checked columns' zone maps
+//! ([`ColumnZones`]) and by the values a graph column's zones record: no row
+//! of the zone holds every checked code, every row does, or the zone is
+//! mixed.
+//!
+//! The ladder is the order a located run asks the statistics in, each level
+//! only for what the one before left open: the file's footer settles a
+//! checked slot for the whole file (level 1), the zone maps class each zone
+//! (level 2, this module), and a graph column's recorded values count a
+//! mixed zone without reading its rows (level 3).
 
 use std::ops::Range;
 use std::sync::Arc;
