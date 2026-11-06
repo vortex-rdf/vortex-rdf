@@ -376,23 +376,24 @@ pub(crate) fn eq_on_bounds(min: u64, max: u64, code: u64) -> Option<bool> {
     }
 }
 
-/// Whether `proof`, one of Vortex's proofs of `x = code` ([`eq_proofs`]),
-/// holds on bounds `(min, max)` of a column of `row_count` rows, a one-zone
-/// map of them: for the falsifier no row holds the code, for the satisfier
-/// every row does. `false` without bounds or a proof.
+/// What exact bounds `(min, max)` of a column of `row_count` rows decide of
+/// `x = code`, by Vortex's proofs of it (`proofs`, [`eq_proofs`]) on one
+/// one-zone map of them: `Some(false)` where the falsifier holds (no row
+/// holds the code), `Some(true)` where the satisfier does (every row does),
+/// `None` where neither does, and without bounds, rows or a proof.
 ///
 /// [`eq_proofs`]: crate::stats_rules::eq_proofs
 #[cfg(feature = "file-io")]
-pub(crate) fn bounds_prove(
+pub(crate) fn bounds_decide(
     bounds: Option<(u64, u64)>,
-    proof: Option<&vortex_array::expr::BoundExpression>,
+    proofs: &crate::stats_rules::EqProofs,
     row_count: u64,
-) -> Result<bool> {
-    let (Some((min, max)), Some(proof)) = (bounds, proof) else {
-        return Ok(false);
+) -> Result<Option<bool>> {
+    let Some((min, max)) = bounds else {
+        return Ok(None);
     };
     if row_count == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let zones = ColumnZones::from_bounds(
         vortex_buffer::buffer![min],
@@ -400,7 +401,19 @@ pub(crate) fn bounds_prove(
         row_count,
         row_count,
     )?;
-    Ok(zones.prune(0..1, proof)?.value(0))
+    let holds = |proof: &Option<vortex_array::expr::BoundExpression>| -> Result<bool> {
+        match proof {
+            Some(proof) => Ok(zones.prune(0..1, proof)?.value(0)),
+            None => Ok(false),
+        }
+    };
+    Ok(if holds(&proofs.none)? {
+        Some(false)
+    } else if holds(&proofs.all)? {
+        Some(true)
+    } else {
+        None
+    })
 }
 
 /// The footer's exact `(min, max)` of `file`'s top-level `u64` column
@@ -603,37 +616,43 @@ mod tests {
         assert_eq!(zones.prune(2..2, &none).unwrap().len(), 0);
     }
 
+    /// Bounds decide that every row holds a code only where both are the
+    /// code, and that none does where they leave it out, on one map for both
+    /// proofs; bounds of no rows, a file without bounds, or no proof decide
+    /// nothing.
     #[cfg(feature = "file-io")]
-    /// Bounds prove every row holds a code only where both are the
-    /// code, and no row does where they leave it out; a file without them
-    /// proves nothing.
     #[test]
-    fn bounds_prove_the_code() {
+    fn bounds_decide_the_code() {
+        use crate::stats_rules::{EqProofs, eq_proofs};
         use vortex_array::dtype::{DType, Nullability, PType};
 
         let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        let proofs = |code| crate::stats_rules::eq_proofs(&dtype, code).unwrap();
-        let (five, top) = (proofs(5), proofs(u64::MAX));
-        let (all, none) = (five.all.as_ref(), five.none.as_ref());
-        assert!(!bounds_prove(None, all, 100).unwrap());
-        assert!(!bounds_prove(Some((4, 5)), all, 100).unwrap());
-        assert!(bounds_prove(Some((5, 5)), all, 100).unwrap());
-        assert!(!bounds_prove(Some((5, 5)), None, 100).unwrap());
-        let max = (u64::MAX, u64::MAX);
-        assert!(bounds_prove(Some(max), top.all.as_ref(), 100).unwrap());
-        for (bounds, held_by_none) in [
-            ((6, 9), true),
-            ((1, 4), true),
-            ((4, 6), false),
-            ((5, 5), false),
+        let (five, top) = (
+            eq_proofs(&dtype, 5).unwrap(),
+            eq_proofs(&dtype, u64::MAX).unwrap(),
+        );
+        for (bounds, decided) in [
+            (Some((5, 5)), Some(true)),
+            (Some((4, 5)), None),
+            (Some((4, 6)), None),
+            (Some((6, 9)), Some(false)),
+            (Some((1, 4)), Some(false)),
+            (None, None),
         ] {
             assert_eq!(
-                bounds_prove(Some(bounds), none, 100).unwrap(),
-                held_by_none,
+                bounds_decide(bounds, &five, 100).unwrap(),
+                decided,
                 "{bounds:?}"
             );
         }
-        assert!(!bounds_prove(None, none, 100).unwrap());
+        let max = Some((u64::MAX, u64::MAX));
+        assert_eq!(bounds_decide(max, &top, 100).unwrap(), Some(true));
+        assert_eq!(bounds_decide(Some((5, 5)), &five, 0).unwrap(), None);
+        let unproved = EqProofs {
+            none: None,
+            all: None,
+        };
+        assert_eq!(bounds_decide(Some((6, 9)), &unproved, 100).unwrap(), None);
     }
 
     /// A zone table's recorded states as another writer of the statistic

@@ -1488,12 +1488,13 @@ enum FooterDecision {
 /// the footer's exact bounds of the slot's column
 /// ([`footer_bounds`](crate::io::zone_map::footer_bounds)):
 /// [`Nothing`] where Vortex's falsifier of `x = code` holds on them,
-/// [`Everything`] where its satisfier does ([`bounds_prove`]). A by-copy
+/// [`Everything`] where its satisfier does ([`bounds_decide`]). A by-copy
 /// index holds the quad table's values, so the quad table's footer speaks
 /// for its columns too.
 ///
 /// [`Nothing`]: FooterDecision::Nothing
 /// [`Everything`]: FooterDecision::Everything
+/// [`bounds_decide`]: crate::io::zone_map::bounds_decide
 #[cfg(feature = "file-io")]
 fn footer_decision(
     file: &crate::store::persist::native_file::NativeStoreFile,
@@ -1503,14 +1504,11 @@ fn footer_decision(
     use crate::store::schema::PRIMARY_COLUMNS;
 
     let bounds = crate::io::zone_map::footer_bounds(file, PRIMARY_COLUMNS[slot]);
-    let rows = file.row_count();
     Ok(
-        if crate::io::zone_map::bounds_prove(bounds, proofs.none.as_ref(), rows)? {
-            FooterDecision::Nothing
-        } else if crate::io::zone_map::bounds_prove(bounds, proofs.all.as_ref(), rows)? {
-            FooterDecision::Everything
-        } else {
-            FooterDecision::Unknown
+        match crate::io::zone_map::bounds_decide(bounds, proofs, file.row_count())? {
+            Some(false) => FooterDecision::Nothing,
+            Some(true) => FooterDecision::Everything,
+            None => FooterDecision::Unknown,
         },
     )
 }
