@@ -271,10 +271,11 @@ mod tests {
         assert!(ids(ComponentKind::Aggregate).contains(&"vortexrdf.value_counts".to_string()));
     }
 
-    /// A session that doesn't register the aggregate (vortex-rdf 0.14's)
-    /// can't read a store file carrying it, and says which aggregate.
-    #[tokio::test]
-    async fn a_session_without_value_counts_refuses_a_new_file() {
+    /// 100 quads over `graphs` graphs (`g{i % graphs}`), written to a store
+    /// file and read whole in a session that doesn't register the aggregate
+    /// (vortex-rdf 0.14's): the rows it read, or the error opening or reading
+    /// the file.
+    async fn read_without_value_counts(graphs: usize) -> std::result::Result<usize, String> {
         use oxrdf::{GraphName, NamedNode, Quad};
         use vortex_file::OpenOptionsSessionExt as _;
 
@@ -285,7 +286,7 @@ mod tests {
                     iri(&format!("s{i}")),
                     iri("p"),
                     iri("o"),
-                    GraphName::NamedNode(iri(&format!("g{}", i % 3))),
+                    GraphName::NamedNode(iri(&format!("g{}", i % graphs))),
                 );
                 Ok(crate::RawQuad::from_quad(&quad))
             })
@@ -303,13 +304,26 @@ mod tests {
         let session = registries();
         vortex_file::register_default_encodings(&session);
         crate::io::container::register(&session);
-        let error = match session.open_options().open_path(&path).await {
-            Err(error) => error.to_string(),
-            Ok(file) => crate::io::read::scan_all_reader(file.layout_reader().unwrap())
-                .await
-                .expect_err("a session without the aggregate reads the file")
-                .to_string(),
-        };
+        let error = |error: &dyn std::fmt::Display| error.to_string();
+        let file = session
+            .open_options()
+            .open_path(&path)
+            .await
+            .map_err(|e| error(&e))?;
+        let reader = file.layout_reader().map_err(|e| error(&e))?;
+        let rows = crate::io::read::scan_all_reader(reader)
+            .await
+            .map_err(|e| error(&e))?;
+        Ok(rows.len())
+    }
+
+    /// A session that doesn't register the aggregate (vortex-rdf 0.14's)
+    /// can't read a store file carrying it, and says which aggregate.
+    #[tokio::test]
+    async fn a_session_without_value_counts_refuses_a_new_file() {
+        let error = read_without_value_counts(3)
+            .await
+            .expect_err("a session without the aggregate reads the file");
         assert!(error.contains("vortexrdf.value_counts"), "{error}");
     }
 
@@ -319,38 +333,6 @@ mod tests {
     /// the aggregate (vortex-rdf 0.14's) reads the file.
     #[tokio::test]
     async fn a_store_of_wide_graph_zones_reads_without_value_counts() {
-        use oxrdf::{GraphName, NamedNode, Quad};
-        use vortex_file::OpenOptionsSessionExt as _;
-
-        let iri = |name: &str| NamedNode::new_unchecked(format!("http://example.org/{name}"));
-        let quads: Vec<crate::Result<crate::RawQuad>> = (0..100)
-            .map(|i| {
-                let quad = Quad::new(
-                    iri(&format!("s{i}")),
-                    iri("p"),
-                    iri("o"),
-                    GraphName::NamedNode(iri(&format!("g{}", i % 40))),
-                );
-                Ok(crate::RawQuad::from_quad(&quad))
-            })
-            .collect();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("store.vortex");
-        crate::io::quads_stream_to_vortex_file(
-            futures::stream::iter(quads),
-            &path,
-            crate::LayoutStrategy::Dictionary,
-            vec![],
-        )
-        .await
-        .unwrap();
-        let session = registries();
-        vortex_file::register_default_encodings(&session);
-        crate::io::container::register(&session);
-        let file = session.open_options().open_path(&path).await.unwrap();
-        let rows = crate::io::read::scan_all_reader(file.layout_reader().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 100);
+        assert_eq!(read_without_value_counts(40).await, Ok(100));
     }
 }
