@@ -1472,24 +1472,24 @@ fn checked_run_quads() -> Vec<RawQuad> {
 /// `target/bench_vortex_files` by the writer the CLI and the bindings use.
 fn checked_run_file() -> PathBuf {
     static FILE: OnceLock<PathBuf> = OnceLock::new();
-    FILE.get_or_init(|| {
-        let dir = PathBuf::from("target/bench_vortex_files");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("checked_runs.vortex");
-        let quads = stream::iter(checked_run_quads().into_iter().map(Ok));
-        rt().block_on(async {
-            io::quads_stream_to_vortex_file(
-                quads,
-                &path,
-                LayoutStrategy::Dictionary,
-                Index::ByCopy.types(),
-            )
+    FILE.get_or_init(|| write_checked_file("checked_runs.vortex", Index::ByCopy))
+        .clone()
+}
+
+/// The checked runs' quads as a file named `name` under
+/// `target/bench_vortex_files`, Dictionary layout with `index`, written as the
+/// CLI writes one.
+fn write_checked_file(name: &str, index: Index) -> PathBuf {
+    let dir = PathBuf::from("target/bench_vortex_files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    let quads = stream::iter(checked_run_quads().into_iter().map(Ok));
+    rt().block_on(async {
+        io::quads_stream_to_vortex_file(quads, &path, LayoutStrategy::Dictionary, index.types())
             .await
-            .expect("write the checked-run file");
-        });
-        path
-    })
-    .clone()
+            .unwrap_or_else(|e| panic!("write {name}: {e}"));
+    });
+    path
 }
 
 /// The code of the checked-run file's IRI named `name`.
@@ -1508,6 +1508,10 @@ enum CheckedShape {
     Pog,
     /// `(s ? ? g)`: the quad table's run of subject `hub`.
     Sg,
+    /// `(? p ? g)`, by reference: the `type` run of `index:ref-p`.
+    RefPg,
+    /// `(? ? o g)`, by reference: the `Taxon` run of `index:ref-o`.
+    RefOg,
 }
 
 impl CheckedShape {
@@ -1525,6 +1529,23 @@ impl CheckedShape {
                 let subject = checked_code(&dict, "hub").await;
                 CodePattern::new(Some(subject), None, None, Some(graph))
             }
+            Self::RefPg => {
+                let predicate = checked_code(&dict, "type").await;
+                CodePattern::new(None, Some(predicate), None, Some(graph))
+            }
+            Self::RefOg => {
+                let object = checked_code(&dict, "Taxon").await;
+                CodePattern::new(None, None, Some(object), Some(graph))
+            }
+        }
+    }
+
+    /// The file holding this shape's run: by copy, or by reference
+    /// ([`checked_ref_run_file`]).
+    fn file(self) -> PathBuf {
+        match self {
+            Self::Pog | Self::Sg => checked_run_file(),
+            Self::RefPg | Self::RefOg => checked_ref_run_file(),
         }
     }
 }
@@ -1608,7 +1629,7 @@ impl CheckedRead {
 /// opened before timing. The setup panics, naming `cell` and the read, unless
 /// a located run answers the pattern and the read returns the rows it should.
 fn checked_run(bencher: divan::Bencher, cell: &str, shape: CheckedShape, read: CheckedRead) {
-    let path = checked_run_file();
+    let path = shape.file();
     let store = rt().block_on(async {
         VortexRdfStore::from_file(path)
             .await
@@ -1781,6 +1802,37 @@ fn graph_zones(bencher: divan::Bencher, read: &GraphZonesRead) {
     let rows = rt().block_on(read.rows(&store));
     assert_eq!(rows, BOUND_ROWS, "graph_zones/{read:?}: wrong row count");
     bencher.bench(|| black_box(rt().block_on(read.rows(&store))));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4h — CHECKED REFERENCE RUNS (by-reference located code reads)
+//
+// Group 4f's reads on a by-reference file. A bound predicate or object is a
+// run of a reference index (`index:ref-p`, `index:ref-o`) listing quad-table
+// rows, and a bound graph is checked at those rows: each check reads the quad
+// table's graph at rows scattered over the file. The file holds Group 4f's
+// quads by reference; the runs are the `type` run of `index:ref-p`,
+// `(? p ? g)`, and the `Taxon` run of `index:ref-o`, `(? ? o g)`, of
+// `CHECKED_RUN_ROWS` rows each, their graphs laid out as Group 4f's. The cells
+// time Group 4f's four reads.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// The checked runs' file by reference, written once per process like
+/// [`checked_run_file`].
+fn checked_ref_run_file() -> PathBuf {
+    static FILE: OnceLock<PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| write_checked_file("checked_ref_runs.vortex", Index::ByReference))
+        .clone()
+}
+
+#[divan::bench(args = CHECKED_READS, sample_count = QUERY_SAMPLES)]
+fn checked_ref_run_pg(bencher: divan::Bencher, read: &CheckedRead) {
+    checked_run(bencher, "checked_ref_run_pg", CheckedShape::RefPg, *read);
+}
+
+#[divan::bench(args = CHECKED_READS, sample_count = QUERY_SAMPLES)]
+fn checked_ref_run_og(bencher: divan::Bencher, read: &CheckedRead) {
+    checked_run(bencher, "checked_ref_run_og", CheckedShape::RefOg, *read);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
