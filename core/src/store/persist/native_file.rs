@@ -135,10 +135,16 @@ pub(crate) struct LocatedTables {
     pub(crate) sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
     /// Per reference index (`index:ref-p`, `index:ref-o`), its `(val, rid)`.
     pub(crate) references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
+    /// Per reference index, its child's `g` (each row's graph), `None` for a
+    /// child written without it.
+    pub(crate) reference_graphs: [Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>; 2],
     /// Per sorted table and `(s, p, o, g)` column, its zone map, read on
     /// first use; `None` for a column without exact zone bounds. Two `u64`
     /// per zone of a column read, bounded by the file's layout.
     pub(crate) zones: [[OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 3],
+    /// Per reference index, its child's `g` zone map with the zones'
+    /// recorded graphs, read on first use, bounded the same way.
+    pub(crate) reference_zones: [OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 2],
 }
 
 impl LocatedTables {
@@ -146,11 +152,14 @@ impl LocatedTables {
     pub(crate) fn new(
         sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
         references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
+        reference_graphs: [Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>; 2],
     ) -> Self {
         Self {
             sorted,
             references,
+            reference_graphs,
             zones: Default::default(),
+            reference_zones: Default::default(),
         }
     }
 }

@@ -9,7 +9,9 @@
 //! one global sort: [`components`] for the in-memory builders, merged
 //! `(value, row id)` spill runs for the out-of-core one. Both hand the
 //! columns over as this index's two persisted children (`{val, rid}` per
-//! covered family), the value column stamped `IsSorted`.
+//! covered family), the value column stamped `IsSorted`. Under the
+//! Dictionary layout each child also holds `g`, the graph of the quad its
+//! row id names, so a by-reference run checks its own graph rows.
 //!
 //! Both backends need global sortedness to binary-search, and neither needs
 //! it to be correct: they differ in what a child declaring itself unsorted
@@ -31,12 +33,26 @@ use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::{QuadPattern, TermRef};
-use crate::store::schema::{RowId, TermCode};
+use crate::store::schema::{COL_G, RowId, TermCode};
 
 /// The value column of a reference component's persisted child; the row id
 /// beside it is the name every index child shares ([`COL_RID`]).
 pub(crate) const COL_VAL: &str = "val";
 const CHILD_COLUMNS: [&str; 2] = [COL_VAL, COL_RID];
+/// A Dictionary-layout child's columns: the value, the row id, and the graph
+/// code of the quad that row id names.
+pub(crate) const GRAPH_CHILD_COLUMNS: [&str; 3] = [COL_VAL, COL_RID, COL_G];
+
+/// Whether the builders give the Dictionary layout's children each row's
+/// graph: always, but where a test forced the column off, to stand for a
+/// file written before it.
+pub(crate) fn records_graphs() -> bool {
+    #[cfg(test)]
+    if let Some(on) = crate::store::test_hooks::forced_reference_graphs() {
+        return on;
+    }
+    true
+}
 
 /// This index's persisted-child identity table, one `{val, rid}` table per
 /// covered family in [`RefFamily`] order, for the hub's generic loops
@@ -126,22 +142,32 @@ pub(crate) mod out_of_core {
     use vortex_array::{ArrayRef, IntoArray};
 
     use super::super::components::TermColumn;
-    use super::CHILD_COLUMNS;
+    use super::{CHILD_COLUMNS, GRAPH_CHILD_COLUMNS};
     use crate::error::Result;
     use crate::store::array::named_struct;
     use crate::store::array::stamp_is_sorted;
     use crate::store::schema::RowId;
 
     /// One chunk of a reference component's persisted child from a window of its
-    /// merged `(value, row id)` pairs, value column stamped sorted. `V` is the
-    /// value encoding: `String`, or [`TermCode`]s under the Dictionary layout.
+    /// merged `(value, row id, graph)` rows, value column stamped sorted, and
+    /// with `graphs` the graph column beside them ([`GRAPH_CHILD_COLUMNS`]).
+    /// `V` is the value encoding: `String`, or [`TermCode`]s under the
+    /// Dictionary layout.
     ///
     /// [`TermCode`]: crate::store::TermCode
-    pub(crate) fn ref_child_chunk<V: TermColumn>(pairs: &[(V, RowId)]) -> Result<ArrayRef> {
-        let val = V::column(pairs.iter().map(|(v, _)| v));
+    pub(crate) fn ref_child_chunk<V: TermColumn>(
+        rows: &[(V, RowId, V)],
+        graphs: bool,
+    ) -> Result<ArrayRef> {
+        let val = V::column(rows.iter().map(|(v, _, _)| v));
         stamp_is_sorted(&val);
-        let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
-        named_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
+        let rid = PrimitiveArray::from_iter(rows.iter().map(|(_, rid, _)| *rid)).into_array();
+        if graphs {
+            let g = V::column(rows.iter().map(|(_, _, g)| g));
+            return named_struct(&GRAPH_CHILD_COLUMNS, vec![val, rid, g], rows.len())
+                .map(|a| a.into_array());
+        }
+        named_struct(&CHILD_COLUMNS, vec![val, rid], rows.len()).map(|a| a.into_array())
     }
 }
 
@@ -153,14 +179,15 @@ fn rid_column(perm: &[usize]) -> ArrayRef {
 
 /// This index's two persisted children over `input`, each a `{val, rid}`
 /// table over the whole dataset in [`IDENTITIES`] order, sorted by
-/// `(value, row id)` with the value column stamped sorted: the in-memory
-/// builders' emission. Row ids number the input's positions (the builder
+/// `(value, row id)` with the value column stamped sorted, and under the
+/// Dictionary layout a `g` column beside them ([`GRAPH_CHILD_COLUMNS`],
+/// [`records_graphs`]): the in-memory builders' emission. Row ids number the input's positions (the builder
 /// passes the dataset in final row order), so term strings sort as a
 /// permutation of positions, with no per-term string copies, whose ties
 /// break by position, which is row-id order; codes sort as `(code, row id)`
 /// pairs.
 pub(super) fn components(input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
-    let [(o_val, o_rid), (p_val, p_rid)] = match input {
+    let (columns, [mut o, mut p]): (&[&'static str], [Vec<ArrayRef>; 2]) = match input {
         IndexInput::Quads(quads) => {
             let perm_by = |term_of: fn(&RawQuad) -> &str| -> Vec<usize> {
                 let mut perm: Vec<usize> = (0..quads.len()).collect();
@@ -170,41 +197,54 @@ pub(super) fn components(input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
                 perm
             };
             let o_perm = perm_by(|q| &q.o);
-            let o = (
+            let o = vec![
                 make_string_array(o_perm.iter().map(|&i| quads[i].o.as_str())),
                 rid_column(&o_perm),
-            );
+            ];
             drop(o_perm);
             let p_perm = perm_by(|q| &q.p);
-            let p = (
+            let p = vec![
                 make_string_array(p_perm.iter().map(|&i| quads[i].p.as_str())),
                 rid_column(&p_perm),
-            );
-            [o, p]
+            ];
+            (&CHILD_COLUMNS, [o, p])
         }
         IndexInput::Codes(codes) => {
-            let sorted = |column: &[TermCode]| -> (ArrayRef, ArrayRef) {
+            let graphs = records_graphs();
+            let sorted = |column: &[TermCode]| -> Vec<ArrayRef> {
                 let mut pairs: Vec<(TermCode, RowId)> = column
                     .iter()
                     .enumerate()
                     .map(|(i, &code)| (code, super::row_id(i)))
                     .collect();
                 pairs.sort_unstable();
-                (
+                let mut columns = vec![
                     PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array(),
                     PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array(),
-                )
+                ];
+                if graphs {
+                    let graph =
+                        |&(_, rid): &(TermCode, RowId)| codes.g[super::base_row(rid) as usize];
+                    columns.push(PrimitiveArray::from_iter(pairs.iter().map(graph)).into_array());
+                }
+                columns
             };
-            [sorted(&codes.o), sorted(&codes.p)]
+            let columns: &[&'static str] = if graphs {
+                &GRAPH_CHILD_COLUMNS
+            } else {
+                &CHILD_COLUMNS
+            };
+            (columns, [sorted(&codes.o), sorted(&codes.p)])
         }
     };
-    stamp_is_sorted(&o_val);
-    stamp_is_sorted(&p_val);
+    stamp_is_sorted(&o[0]);
+    stamp_is_sorted(&p[0]);
+    let (o, p) = (std::mem::take(&mut o), std::mem::take(&mut p));
     components_from(
-        &CHILD_COLUMNS,
+        columns,
         [
-            (RefFamily::Object.identity(), vec![o_val, o_rid]),
-            (RefFamily::Predicate.identity(), vec![p_val, p_rid]),
+            (RefFamily::Object.identity(), o),
+            (RefFamily::Predicate.identity(), p),
         ],
     )
 }

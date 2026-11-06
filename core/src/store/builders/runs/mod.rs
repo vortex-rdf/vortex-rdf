@@ -39,8 +39,9 @@ use crate::store::schema::RowId;
 pub(crate) const QUAD_RECORD_BYTES: usize = 16;
 /// Bytes of an index run's header: its first row id, a `u64`.
 pub(crate) const RUN_HEADER_BYTES: usize = 8;
-/// Bytes of a reference-index record: a rank and a row offset.
-pub(crate) const REF_RECORD_BYTES: usize = 8;
+/// Bytes of a reference-index record: the value's rank, the graph's rank and
+/// a row offset.
+pub(crate) const REF_RECORD_BYTES: usize = 12;
 /// Bytes of a copy-index record: four ranks and a row offset.
 pub(crate) const COPY_RECORD_BYTES: usize = 20;
 
@@ -546,8 +547,11 @@ pub(crate) trait IndexEntry: Copy + Ord {
     fn from_parts(key: &[u8], row_id: RowId) -> Self;
 }
 
-/// A reference-index entry: the value's rank and its row id.
-pub(crate) type RefEntry = (u32, RowId);
+/// A reference-index entry: the value's rank, its row id, and the rank of
+/// the graph of that row's quad (the column a Dictionary child holds beside
+/// the row id). Entries order by value, then row id: a family's row ids are
+/// unique, so the graph never decides.
+pub(crate) type RefEntry = (u32, RowId, u32);
 
 /// A copy-index entry: the quad's four ranks in the family's key order and
 /// its row id.
@@ -562,10 +566,11 @@ impl IndexEntry for RefEntry {
 
     fn write_key(&self, out: &mut [u8]) {
         out[..4].copy_from_slice(&self.0.to_le_bytes());
+        out[4..8].copy_from_slice(&self.2.to_le_bytes());
     }
 
     fn from_parts(key: &[u8], row_id: RowId) -> Self {
-        (le_u32(key), row_id)
+        (le_u32(key), row_id, le_u32(&key[4..]))
     }
 }
 

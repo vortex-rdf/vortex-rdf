@@ -121,6 +121,34 @@ impl ForcedValueCounts {
 }
 
 thread_local! {
+    /// Whether this thread's builds give the reference children each row's
+    /// graph, while a [`ForcedReferenceGraphs`] guard is live.
+    static REFERENCE_GRAPHS: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The reference-graphs switch a [`ForcedReferenceGraphs`] forced on this
+/// thread.
+pub(crate) fn forced_reference_graphs() -> Option<bool> {
+    REFERENCE_GRAPHS.get()
+}
+
+/// While alive, this thread's builds give the Dictionary layout's reference
+/// children each row's graph (`true`), or write `{val, rid}` as earlier
+/// versions did (`false`), to stand for a file written before the column.
+pub(crate) struct ForcedReferenceGraphs {
+    _guard: Override<bool>,
+}
+
+impl ForcedReferenceGraphs {
+    /// Force the column on or off until the guard drops.
+    pub(crate) fn set(on: bool) -> Self {
+        Self {
+            _guard: Override::set(&REFERENCE_GRAPHS, on),
+        }
+    }
+}
+
+thread_local! {
     /// The longest gap run this thread's located runs check row by row,
     /// while a [`ForcedGapRows`] guard is live.
     static GAP_ROWS: Cell<Option<u64>> = const { Cell::new(None) };

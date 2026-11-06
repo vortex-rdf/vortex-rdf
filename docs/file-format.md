@@ -27,8 +27,8 @@ and `from_file` read one grammar.
 │   │ index:posg   {s, p, o, g, rid}   sorted (p, o, s, g)   │ │  only if built with
 │   │ index:ospg   {s, p, o, g, rid}   sorted (o, s, p, g)   │ │  secondary-by-copy
 │   ├────────────────────────────────────────────────────────┤ │
-│   │ index:ref-o  {val, rid}          sorted by val         │ │  only if built with
-│   │ index:ref-p  {val, rid}          sorted by val         │ │  secondary-by-reference
+│   │ index:ref-o  {val, rid, g}       sorted by val         │ │  only if built with
+│   │ index:ref-p  {val, rid, g}       g: Dictionary only    │ │  secondary-by-reference
 │   ├────────────────────────────────────────────────────────┤ │
 │   │ dictionary   {_dict_term}  one FSST window per leaf    │ │  Dictionary layout only
 │   └────────────────────────────────────────────────────────┘ │
@@ -88,7 +88,10 @@ The writer is limited to three editions:
 A file of the value-counts edition needs a reader that registers the
 aggregate: vortex-rdf 0.14 and earlier refuse it, naming
 `vortexrdf.value_counts`. Files written before it keep reading; their graph
-columns lack the statistic, and readers skip what it would decide.
+columns lack the statistic, and readers skip what it would decide. The
+reference children's `g` column ([§6](#6-the-index-children)) needs no edition of its own: it is a
+plain code column with the graph columns' aggregates, and index children stay
+version 1.
 
 A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
@@ -113,9 +116,11 @@ newer vortex-rdf and is refused as such, with an error saying to open it with a
 newer version; a dictionary or index component whose version is above the one
 this version reads ([`DICT_VERSION`](../core/src/io/container/mod.rs#L47),
 [`INDEX_VERSION`](../core/src/io/container/mod.rs#L51)) is refused the same
-way. Readers rely on two guarantees of the `v2` writers that nothing checks at
-open: each quad is stored once, and a reference index's children are in
-`(val, rid)` order ([§10](#10-what-a-file-must-satisfy)).
+way. Readers rely on three guarantees of the `v2` writers that nothing checks
+at open: each quad is stored once, a reference index's children are in
+`(val, rid)` order, and a reference child's `g`, where it has one, holds at
+each row the graph of the quad its `rid` names
+([§10](#10-what-a-file-must-satisfy)).
 
 ```mermaid
 flowchart TD
@@ -353,8 +358,8 @@ slower) and `sorted: true`.
 |---|---|---|---|---|---|
 | `index:posg` | `secondary-by-copy` | `secondary-by-copy/posg` | `s`, `p`, `o`, `g`, `rid` | `(p, o, s, g)` | bound `p`; bound `p` **and** `o` in one prefix search |
 | `index:ospg` | `secondary-by-copy` | `secondary-by-copy/ospg` | `s`, `p`, `o`, `g`, `rid` | `(o, s, p, g)` | bound `o` |
-| `index:ref-o` | `secondary-by-reference` | `secondary-by-reference/o` | `val`, `rid` | `val`, then `rid` | bound `o` |
-| `index:ref-p` | `secondary-by-reference` | `secondary-by-reference/p` | `val`, `rid` | `val`, then `rid` | bound `p` |
+| `index:ref-o` | `secondary-by-reference` | `secondary-by-reference/o` | `val`, `rid`; `g` under `Dictionary` | `val`, then `rid` | bound `o` |
+| `index:ref-p` | `secondary-by-reference` | `secondary-by-reference/p` | `val`, `rid`; `g` under `Dictionary` | `val`, then `rid` | bound `p` |
 
 Shared rules:
 
@@ -378,12 +383,20 @@ Shared rules:
 - **One row per quad.** A child whose row count differs from the quad table's
   fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L76)).
 - **A bound graph is never a key an index is searched by** (it is the last
-  key of both copy orders, and a `{val, rid}` child holds none), and neither
+  key of both copy orders, and a reference child's `g` is no key), and neither
   index answers a bound-subject pattern — the sorted quad table is the better
   path there.
 - **A `{val, rid}` child is ordered by `(val, rid)`**: inside one value's run
   the row ids ascend, so a window over a located run reads only its own rows
   ([matching.md §16.2](matching.md#162-window-size_capped-exists)).
+- **Under `Dictionary`, a reference child also holds `g`**: the graph code of
+  the quad its `rid` names, the default graph's code included, zoned with the
+  recorded graphs (`vortexrdf.value_counts`) as every graph column is. A
+  by-reference run checked against a graph reads these contiguous rows
+  instead of the quad table's `g` at scattered row ids. Readers find the
+  column by name; a child written without it, before it existed, holds
+  `{val, rid}` and is read as before. The string layouts' children hold
+  `{val, rid}`.
 
 Both copy families keep the same column names; the child's *identity* says
 which order its rows are in. Inside a lead-column run the next key is itself
@@ -468,15 +481,17 @@ layouts):
 
 With `secondary-by-reference`:
 
-| `index:ref-o` | val | rid |   | `index:ref-p` | val | rid |
-|---|---|---|---|---|---|---|
-| | 1 | 1 | | | 4 | 0 |
-| | 2 | 3 | | | 4 | 2 |
-| | 5 | 0 | | | 6 | 3 |
-| | 5 | 2 | | | 7 | 1 |
+| `index:ref-o` | val | rid | g |   | `index:ref-p` | val | rid | g |
+|---|---|---|---|---|---|---|---|---|
+| | 1 | 1 | 0 | | | 4 | 0 | 0 |
+| | 2 | 3 | 0 | | | 4 | 2 | 0 |
+| | 5 | 0 | 0 | | | 6 | 3 | 0 |
+| | 5 | 2 | 0 | | | 7 | 1 | 0 |
 
 The pattern `(? ? ex:alice ?)` becomes: code of `<http://example.org/alice>`
 = 2 → binary search `index:ref-o`'s `val` for 2 → position 1 → `rid` 3 → row 3.
+Each `g` is the graph of the row its `rid` names, here the default graph's
+code, 0: a pattern that also binds the graph checks it at position 1 itself.
 
 ---
 
@@ -508,7 +523,7 @@ keep:
 | the reader tree (the quad table's reader and one reader per component), the quad table's split ranges | the file's layout; the reader tree is replaced whenever the bound filter trees below are cleared |
 | per-column chunk-probe handles with the probes of the leaves they fetched, so a repeated location skips the layout walk and the leaf rebuilds | one handle per column; per fetched leaf, a probe over mapped bytes |
 | pruning envelopes per filter shape | 512 entries, cleared wholesale at the cap |
-| the zone maps of the columns located runs check (each zone's `max` and `min`) and, for a graph column, each zone's recorded graphs with their rows (`vortexrdf.value_counts`, decoded once), read on first use | two `u64` per 8,192-row zone of each column read; for a graph column, up to 16 `(code, rows)` pairs of 16 bytes per zone and a 16-byte slot per zone, about 270 bytes a zone at most |
+| the zone maps of the columns located runs check (each zone's `max` and `min`) and, for a graph column (a reference child's `g` among them), each zone's recorded graphs with their rows (`vortexrdf.value_counts`, decoded once), read on first use | two `u64` per 8,192-row zone of each column read; for a graph column, up to 16 `(code, rows)` pairs of 16 bytes per zone and a 16-byte slot per zone, about 270 bytes a zone at most |
 | bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap; a clear retires the reader tree, and the caches go with its readers once no view holds one |
 | the dictionary child's reader, the window leaf layouts, the dictionary's window bounds ([§5](#5-the-dictionary-child)) and its kind ranges | two terms per 65,536-term window and a handful of codes |
 | the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) (4 MiB) per opened file, charging each window its code offsets at 4 bytes each plus [`WINDOW_ENTRY_OVERHEAD`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) (4 KiB); least recently used evicted; an FSST window of 65,536 terms is charged about 260 KiB, so about 15 fit. For a memory-mapped file store, which every `from_file` store is, the code bytes are slices of the map, so the charge bounds the heap the cache holds |
@@ -630,9 +645,9 @@ checks:
 2. The inventory is JSON with `version: 1`; component names are unique and
    never `quad-source`; field kinds are `u32`, `u64` or `utf8`, all
    non-nullable. Under `Dictionary` every code column — `s`, `p`, `o`, `g`
-   of the quad table and of the copy children, `val` of the reference
-   children — is `u64`, and under every layout so is each index child's
-   `rid`.
+   of the quad table and of the copy children, `val` and `g` of the
+   reference children — is `u64`, and under every layout so is each index
+   child's `rid`.
 3. Terms are spelled in N-Triples form; the default graph is the empty string
    — in the quad columns, the dictionary and the index children alike.
 4. `quads_sorted: true` only when the rows are in global `(s, p, o, g)` order
@@ -647,7 +662,10 @@ checks:
 7. Index children hold exactly one row per quad, `rid` addressing quad-table
    rows; unknown index slugs must be `required: false`.
 8. The quad table holds each quad once, and a reference index's children are
-   in `(val, rid)` order. Readers count and window by them without checking.
+   in `(val, rid)` order. A reference child may omit `g`; where it holds one
+   (under `Dictionary`), its value at each row is the `g` of the quad-table
+   row its `rid` names. Readers count and window by these without checking:
+   a wrong `g` gives a graph-bound by-reference match wrong rows.
 9. Every `utf8` column holds valid UTF-8, and an FSST term chunk's 32-bit
    code offsets are non-negative: readers take stored terms as UTF-8 and those
    offsets as written, unchecked, so a store file is trusted input, and a
