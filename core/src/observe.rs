@@ -178,6 +178,9 @@ pub(crate) enum Event {
     ZoneRecorded(u64),
     /// A reference run read its child's own `g` at this many positions.
     ReferenceGraphRead(u64),
+    /// A located run searched the reference index of slot `slot` (`p` or
+    /// `o`) for its code's run.
+    ReferenceSearched { slot: usize },
     /// A located run read slot `slot` of the quad table at this many
     /// scattered rows, to check them.
     CheckTaken { slot: usize, rows: u64 },
@@ -187,9 +190,6 @@ pub(crate) enum Event {
     /// A column's zone map read from its file, for a located run's checks or
     /// a file filter's every-row zones.
     ZoneMapRead,
-    /// A Vortex `ZoneMap` built over some of a column's zones, which the
-    /// stats proofs asked of those zones prune (`ColumnZones::zone_map`).
-    ZoneMapBuilt,
     /// A located run's checked slots put to its file's statistics, footer
     /// and zone maps.
     StatisticsAsked,

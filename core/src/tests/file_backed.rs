@@ -537,6 +537,179 @@ fn hub_quads() -> Vec<Quad> {
     quads
 }
 
+/// Under the reference index, a bound subject and object read the shorter
+/// of the subject's run and the object's reference run: the hub's 60 rows
+/// give way to its object's one-row reference run, and a subject's few rows
+/// win over its object's long run.
+#[tokio::test]
+async fn subject_and_object_read_the_shorter_run() {
+    use super::located_zones::code_of;
+    use crate::CodePattern;
+
+    if !crate::store::query::located::locate_enabled() {
+        return; // VORTEX_RDF_LOCATE=0: no located run reads any block
+    }
+    let (_dir, path) = write_store_file(
+        hub_quads(),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let all = row_list(&store).await;
+    let rows_where =
+        |slot: usize, code: TermCode| all.iter().filter(|row| row[slot] == code).count();
+    let hub = code_of(&store, "<http://example.org/hub>").await;
+    let rare = code_of(&store, "\"rare7\"").await;
+    let s05 = code_of(&store, "<http://example.org/s05>").await;
+    let first = all.iter().find(|row| row[0] == s05).expect("s05's quads")[2];
+    assert_eq!((rows_where(0, hub), rows_where(2, rare)), (60, 1));
+    assert!(
+        rows_where(0, s05) < rows_where(2, first),
+        "s05's run is the shorter"
+    );
+    // Each pattern beside the rows its run reads: the object's one row for
+    // the hub, the subject's own for s05.
+    for (s, o, read) in [(hub, rare, 1), (s05, first, rows_where(0, s05))] {
+        let pattern = CodePattern::new(Some(s), None, Some(o), None);
+        let want: Vec<[TermCode; 4]> = all
+            .iter()
+            .filter(|row| row[0] == s && row[2] == o)
+            .copied()
+            .collect();
+        let rec = Recorder::start();
+        let count = store.count_code_pattern(pattern).await.unwrap();
+        let blocks = located_blocks(&rec);
+        drop(rec);
+        assert_eq!(count, want.len() as u64, "{pattern:?}: the count");
+        assert_eq!(
+            blocks.iter().sum::<u64>(),
+            read as u64,
+            "{pattern:?}: rows read"
+        );
+        let got = store.match_code_pattern(pattern, 0, None).await.unwrap();
+        assert_eq!(code_rows::<4>(&got), want, "{pattern:?}: the rows");
+    }
+}
+
+/// A gap run is weighed only against the reference runs that could be
+/// shorter than it, those of bound slots past its prefix: a slot in the
+/// prefix holds every row of the gap run. So on a by-reference file `(s p ?
+/// g)` searches no reference index and `(s ? o ?)` and `(s ? o g)` search
+/// `o`'s alone, and on a file with both index families no gap shape searches
+/// any, the copy tables' prefixes covering its `p` and `o`. Each answers
+/// the term path's rows.
+#[tokio::test]
+async fn gap_runs_search_only_the_reference_runs_that_could_be_shorter() {
+    use crate::CodePattern;
+    use crate::store::indexes::ALL_INDEX_TYPES;
+
+    if !crate::store::query::located::locate_enabled() {
+        return;
+    }
+    // Each index set beside the shapes checked on it (bit `i` binds slot
+    // `i` of `(s, p, o, g)`) and the reference indexes each searches.
+    let cases = [
+        (
+            IndexConfig::Reference.types(),
+            vec![(0b1011, 0), (0b0101, 1), (0b1101, 1)],
+        ),
+        (
+            ALL_INDEX_TYPES.to_vec(),
+            vec![
+                (0b1010, 0),
+                (0b1100, 0),
+                (0b1101, 0),
+                (0b1011, 0),
+                (0b1110, 0),
+            ],
+        ),
+    ];
+    for (indexes, shapes) in cases {
+        let (_dir, path) =
+            write_store_file(multiplicity_quads(), LayoutStrategy::Dictionary, indexes).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let all = row_list(&store).await;
+        let quad = all[all.len() / 3];
+        for (mask, searched) in shapes {
+            let slot = |i: usize| (mask & (1 << i) != 0).then_some(quad[i]);
+            let pattern = CodePattern::new(slot(0), slot(1), slot(2), slot(3));
+            let rec = Recorder::start();
+            let located = store.locate_codes(pattern, 0, None).await.unwrap();
+            let searches = rec.picked(|event| match event {
+                Event::ReferenceSearched { slot } => Some(*slot),
+                _ => None,
+            });
+            drop(rec);
+            let located = located.unwrap_or_else(|| panic!("{pattern:?}: located"));
+            assert_eq!(
+                searches.len(),
+                searched,
+                "{pattern:?}: searched {searches:?}"
+            );
+            let mut got = code_rows::<4>(&located.columns);
+            let mut want: Vec<[TermCode; 4]> = all
+                .iter()
+                .filter(|row| (0..4).all(|i| slot(i).is_none_or(|code| row[i] == code)))
+                .copied()
+                .collect();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want, "{pattern:?}: the rows");
+        }
+    }
+}
+
+/// A gap run gives way only to a shorter reference run that answers: with
+/// the row-by-row cap forced below both, `(big ? common)`'s subject run,
+/// which its zones decide, answers, where the object's shorter reference
+/// run, its subjects checked row by row, would be capped and decline.
+#[tokio::test]
+async fn a_capped_reference_run_leaves_the_gap_run_to_answer() {
+    use super::located_zones::code_of;
+    use crate::CodePattern;
+    use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
+
+    if !crate::store::query::located::locate_enabled() {
+        return;
+    }
+    let _zones = ForcedZones::set(true);
+    let quads: Vec<Quad> = (0..10_000)
+        .map(|k| {
+            let object = match k % 2 {
+                0 => "common".to_string(),
+                _ => format!("o{k}"),
+            };
+            make_quad(
+                "http://example.org/big",
+                &format!("http://example.org/p{k:05}"),
+                &object,
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let (_dir, path) = write_store_file(
+        quads,
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let big = code_of(&store, "<http://example.org/big>").await;
+    let common = code_of(&store, "\"common\"").await;
+    let pattern = CodePattern::new(Some(big), None, Some(common), None);
+    let _cap = ForcedGapRows::set(1_000);
+    assert!(
+        store
+            .locate_codes(pattern, 0, Some(0))
+            .await
+            .unwrap()
+            .is_some(),
+        "the subject's run, decided by its zones"
+    );
+    assert_eq!(store.count_code_pattern(pattern).await.unwrap(), 5_000);
+}
+
 /// `locate_codes` answers exactly what the term path answers: for every bound
 /// subset of a store's own quads' codes, on every file open and index set
 /// (the suite's fixture, and [`multiplicity_quads`] and [`hub_quads`]
@@ -795,7 +968,7 @@ async fn check_code_patterns(fixture: &FixtureStore) {
     }
 }
 
-/// A bound graph after a free slot over a run longer than `CHECKED_ROWS`:
+/// A bound graph after a free slot over a long run:
 /// `(? p o g)`, one `(p, o)` run of 40,000 quads alternating between two
 /// graphs, on the copy index (its `posg` run, checked) and the reference
 /// index (a long reference run, checked), read in pages and counted, more

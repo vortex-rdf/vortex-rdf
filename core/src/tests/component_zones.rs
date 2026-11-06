@@ -1,5 +1,5 @@
 //! In-memory index components' zone maps: a component's graph column keeps
-//! a Vortex zone map with its zones' recorded graphs, as a file's index child
+//! a zone map with its zones' recorded graphs, as a file's index child
 //! does, taken while a build compresses the component or read from the
 //! child's zone table at load.
 

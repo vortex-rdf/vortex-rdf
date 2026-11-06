@@ -204,19 +204,21 @@ impl VortexRdfStore {
     /// table's `(s, p, o, g)` (a `quads_sorted` file), and the
     /// secondary-by-copy children `index:posg`'s `(p, o, s, g)` and
     /// `index:ospg`'s `(o, s, p, g)`. Rows come in that table's order. Bound
-    /// slots that are no such prefix (a bound graph after a free slot) are the
+    /// slots that are no such prefix (a bound slot after a free one) are the
     /// run of the longest bound prefix, its rows checked against the others:
     /// first by the file's footer statistics, which settle a slot for every
     /// row; then zone by zone where the checked columns have zone maps; row
-    /// by row otherwise, when the run is no longer than [`GAP_ROWS`]. Failing that, a bound `p` or
-    /// `o` is located in the reference index (`index:ref-p`, `index:ref-o`)
-    /// and its rows read from the quad table in its order, the other bound
-    /// slots checked at them when its run is no longer than [`GAP_ROWS`]; a
-    /// bound graph is checked on the reference child's own `g` where it holds
-    /// one, and when the graph is the run's only check the child's zone maps
-    /// decide it, at any length. A bound subject's run of a `quads_sorted`
-    /// file is the rows checked instead when no longer. A code past the dictionary, or one in a position no quad
-    /// holds, matches nothing. Whether it answers depends on the store and
+    /// by row otherwise, when the run is no longer than [`GAP_ROWS`]. That
+    /// run gives way to a bound `p`'s or `o`'s run in its reference index
+    /// (`index:ref-p`, `index:ref-o`) that is strictly shorter and answers,
+    /// as a hub subject's quads do to its rare object's (`s?o`); when the
+    /// run does not answer, the shortest such run is read. A reference run's rows are read from the
+    /// quad table in its order, the other bound slots checked at them when
+    /// it is no longer than [`GAP_ROWS`]; a bound graph is checked on the
+    /// reference child's own `g` where it holds one, and when the graph is
+    /// the run's only check the child's zone maps decide it, at any length.
+    /// A code past the dictionary, or one in a position no quad holds,
+    /// matches nothing. Whether it answers depends on the store and
     /// `pattern` alone, never on the window, so every window of one pattern
     /// comes from the same table, in the same order. A run whose rows are
     /// checked is counted whole: zone by zone where the statistics decide it
@@ -342,13 +344,32 @@ impl VortexRdfStore {
                 Vec::new(),
             )));
         }
+        // The bound reference slots' runs, each searched once and only for a
+        // step that uses it: the gap step weighs the runs of the slots past
+        // its prefix (a slot in the prefix holds every row of the gap run,
+        // so its run is never shorter), and the lookup by reference, reached
+        // when the gap step does not answer, reads the rest too.
+        let past_prefix = |slot: usize| {
+            gap.is_none_or(|(table, prefix)| !TABLES[table].1[..prefix].contains(&slot))
+        };
+        let mut runs = reference_runs(codes, tables, past_prefix, &source, session).await?;
         // The run of the longest bound prefix, its rows checked against the
-        // bound slots past it, in the table's order.
+        // bound slots past it, in the table's order, unless a reference run
+        // answers in its place: one strictly shorter and within the cap on a
+        // run checked row by row, as a hub subject's many quads give way to
+        // its rare object's few (`s?o`).
         if let Some((table, prefix)) = gap {
             let columns = tables.sorted[table].as_ref().expect("a table with columns");
             let order = &TABLES[table].1;
-            if let Some(found) =
-                locate_run(columns, order, prefix, &codes, &source, session).await?
+            let shorter_reference = |found: &std::ops::Range<u64>| {
+                runs.iter().flatten().any(|run| {
+                    let rows = run.end - run.start;
+                    rows < found.end - found.start && rows <= gap_rows()
+                })
+            };
+            if let Some(found) = locate_run(columns, order, prefix, &codes, &source, session)
+                .await?
+                .filter(|found| !shorter_reference(found))
             {
                 let checked: Vec<usize> = order[prefix..]
                     .iter()
@@ -382,18 +403,13 @@ impl VortexRdfStore {
                     return Ok(Some(located));
                 }
             }
+            // The prefix's slots' reference runs, for the lookup by reference.
+            let rest = reference_runs(codes, tables, |slot| !past_prefix(slot), &source, session);
+            for (run, found) in runs.iter_mut().zip(rest.await?) {
+                *run = run.take().or(found);
+            }
         }
-        // Boxed: its state would otherwise enlarge every lookup's future,
-        // the sorted tables' too.
-        let found = Box::pin(by_reference(
-            codes,
-            tables,
-            file.quads_sorted(),
-            &source,
-            session,
-        ))
-        .await?;
-        let Some((columns, rows, checked, index)) = found else {
+        let Some((columns, rows, checked, index)) = by_reference(codes, tables, runs) else {
             return Ok(None);
         };
         let mut located = run(columns, rows, checked);
@@ -413,13 +429,8 @@ impl VortexRdfStore {
                 located.ask_statistics().await?;
             }
         }
-        // A reference run still checked row by row is capped; a subject's
-        // run, short by construction, is not.
-        if matches!(located.rows, RunRows::Table(_))
-            || located.checked.is_empty()
-            || located.zones.is_some()
-            || located.len() <= gap_rows()
-        {
+        // A reference run still checked row by row is capped.
+        if located.checked.is_empty() || located.zones.is_some() || located.len() <= gap_rows() {
             return Ok(Some(located));
         }
         Ok(None)
@@ -1133,101 +1144,84 @@ const REFERENCES: [(&str, usize); 2] = [("index:ref-p", 1), ("index:ref-o", 2)];
 #[cfg(feature = "file-io")]
 const GRAPH_SLOT: usize = 3;
 
-/// Rows of a bound subject's run of a subject-sorted quad table up to which
-/// a lookup through a reference index checks the other bound slots at the
-/// subject's rows, when they are no more than the reference run's; a longer
-/// subject run declines, for the caller's generic path.
-#[cfg(feature = "file-io")]
-const CHECKED_ROWS: u64 = 16_384;
-
 /// How many searches of a reference run's `rid`s cost about as much as
 /// reaching one more quad-table leaf to read a slot there (about 250 ns
 /// against 4 µs per leaf on WatDiv 100M's reference store, warm).
 #[cfg(feature = "file-io")]
 const SEARCHES_PER_LEAF: usize = 16;
 
-/// [`located_run`](VortexRdfStore::located_run) through a reference index:
-/// the shortest run among those whose slot is bound gives the quad-table rows
-/// in order, all of them, or, with other slots bound, those that hold them,
-/// checked: against the other reference's run for `p` or `o`, by reading the
-/// quad table for `s`, and for `g` by the child's own `g` where it holds one,
-/// else the quad table's. A bound subject's run of a subject-sorted
-/// (`quads_sorted`) quad table is checked instead when it is no longer than
-/// the shortest reference run, within [`CHECKED_ROWS`]. Answers the table the
-/// rows are read from (the quad table), where they are, the slots checked,
-/// and the reference index; the caller caps a run its statistics leave
-/// checked row by row at [`GAP_ROWS`].
+/// The run of each bound reference slot's code that `wanted` names, in its
+/// reference index's `val`, by [`REFERENCES`] index: `None` where the slot
+/// is free or not wanted, the file holds no such index, or a leaf declines
+/// the search.
 #[cfg(feature = "file-io")]
-async fn by_reference(
+async fn reference_runs(
     codes: [Option<TermCode>; 4],
     tables: &crate::store::persist::native_file::LocatedTables,
-    quads_sorted: bool,
+    wanted: impl Fn(usize) -> bool,
     source: &Source,
     session: &vortex_session::VortexSession,
-) -> Result<Option<(Columns, RunRows, Vec<usize>, usize)>> {
-    let Some(quads) = &tables.sorted[0] else {
-        return Ok(None);
-    };
+) -> Result<[Option<std::ops::Range<u64>>; 2]> {
     let mut runs: [Option<std::ops::Range<u64>>; 2] = [None, None];
     for (i, &(_, slot)) in REFERENCES.iter().enumerate() {
-        let (Some(code), Some([val, _])) = (codes[slot], &tables.references[i]) else {
+        let (Some(code), Some([val, _]), true) = (codes[slot], &tables.references[i], wanted(slot))
+        else {
             continue;
         };
-        runs[i] = val.bounds(code, source, session).await?;
+        crate::observe::observe!(ReferenceSearched { slot });
+        // Boxed: a search's state would otherwise enlarge every lookup's
+        // future, the sorted tables' too.
+        runs[i] = Box::pin(val.bounds(code, source, session)).await?;
     }
-    let Some(index) = (0..2)
+    Ok(runs)
+}
+
+/// [`located_run`](VortexRdfStore::located_run) through a reference index:
+/// the shortest of `runs` ([`reference_runs`]) gives the quad-table rows in
+/// order, all of them, or, with other slots bound, those that hold them,
+/// checked: against the other reference's run for `p` or `o`, by reading the
+/// quad table for `s`, and for `g` by the child's own `g` where it holds one,
+/// else the quad table's. Answers the table the rows are read from (the quad
+/// table), where they are, the slots checked, and the reference index; the
+/// caller caps a run its statistics leave checked row by row at
+/// [`GAP_ROWS`]. A bound subject's own run is the gap step's, which reads it
+/// unless a shorter reference run answers in its place.
+#[cfg(feature = "file-io")]
+fn by_reference(
+    codes: [Option<TermCode>; 4],
+    tables: &crate::store::persist::native_file::LocatedTables,
+    runs: [Option<std::ops::Range<u64>>; 2],
+) -> Option<(Columns, RunRows, Vec<usize>, usize)> {
+    let quads = tables.sorted[0].as_ref()?;
+    let index = (0..2)
         .filter(|&i| runs[i].is_some())
-        .min_by_key(|&i| runs[i].as_ref().map(|run| run.end - run.start))
-    else {
-        return Ok(None);
-    };
+        .min_by_key(|&i| runs[i].as_ref().map(|run| run.end - run.start))?;
     let run = runs[index].clone().expect("a located run");
     let [_, rid] = tables.references[index]
         .as_ref()
         .expect("a reference that located a run");
-    // A bound subject of a subject-sorted quad table is a run of it too,
-    // found by one search and its rows contiguous. It is the rows checked
-    // when no longer than the reference run: a subject's few quads, not the
-    // many of a common object (`s?o`), as the reference index's own probe
-    // leaves a bound subject to the subject column.
-    let subject = match codes[0] {
-        Some(code) if quads_sorted => quads[0]
-            .bounds(code, source, session)
-            .await?
-            .filter(|subject| subject.end - subject.start <= run.end - run.start),
-        _ => None,
-    };
-    let key = match subject {
-        Some(_) => 0,
-        None => REFERENCES[index].1,
-    };
+    let key = REFERENCES[index].1;
     let checked: Vec<usize> = (0..4)
         .filter(|&slot| slot != key && codes[slot].is_some())
         .collect();
-    let rows = match subject {
-        Some(subject) if subject.end - subject.start <= CHECKED_ROWS => RunRows::Table(subject),
-        Some(_) => return Ok(None),
-        None => {
-            let other = (0..2).filter(|&i| i != index).find_map(|i| {
-                let slot = REFERENCES[i].1;
-                let (Some(run), Some([_, rid])) = (&runs[i], &tables.references[i]) else {
-                    return None;
-                };
-                checked.contains(&slot).then(|| OtherReference {
-                    slot,
-                    rid: rid.clone(),
-                    run: run.clone(),
-                })
-            });
-            RunRows::Reference {
-                rid: rid.clone(),
-                run,
-                other,
-                graph: codes[GRAPH_SLOT].and(tables.reference_graphs[index].clone()),
-            }
-        }
+    let other = (0..2).filter(|&i| i != index).find_map(|i| {
+        let slot = REFERENCES[i].1;
+        let (Some(run), Some([_, rid])) = (&runs[i], &tables.references[i]) else {
+            return None;
+        };
+        checked.contains(&slot).then(|| OtherReference {
+            slot,
+            rid: rid.clone(),
+            run: run.clone(),
+        })
+    });
+    let rows = RunRows::Reference {
+        rid: rid.clone(),
+        run,
+        other,
+        graph: codes[GRAPH_SLOT].and(tables.reference_graphs[index].clone()),
     };
-    Ok(Some((quads.clone(), rows, checked, index)))
+    Some((quads.clone(), rows, checked, index))
 }
 
 /// Of `rows` (ascending, not empty), those that `rid`'s values at `run`
@@ -1310,12 +1304,14 @@ async fn locate_run(
 
 /// The statistics' decisions on `run`, located in `target` (a sorted
 /// table's gap run, or a reference child's run checked against the graph),
-/// in ladder order: the footer settles each checked slot for the
-/// whole file, leaving the run empty where no row holds a slot's code and
-/// dropping a slot every row holds; the zone maps then class the run's zones
-/// against the slots left ([`run_zones`]). Each slot's proofs of `x = code`
-/// are built once, for both. The quad table's footer speaks for an index
-/// child's columns, which hold its values.
+/// in ladder order: the footer's exact bounds of each checked slot's column
+/// settle it for the whole file ([`eq_on_bounds`]), leaving the run empty
+/// where no row holds the slot's code and dropping a slot every row holds;
+/// the zone maps then class the run's zones against the slots left
+/// ([`run_zones`]). The quad table's footer speaks for an index child's
+/// columns, which hold its values.
+///
+/// [`eq_on_bounds`]: crate::io::zone_map::eq_on_bounds
 #[cfg(feature = "file-io")]
 async fn decide_by_statistics(
     file: &crate::store::persist::native_file::NativeStoreFile,
@@ -1324,32 +1320,31 @@ async fn decide_by_statistics(
     run: &mut LocatedRun,
     source: &Source,
 ) -> Result<()> {
-    use vortex_array::dtype::{DType, Nullability, PType};
+    use crate::io::zone_map::{eq_on_bounds, footer_bounds};
+    use crate::store::schema::PRIMARY_COLUMNS;
 
     crate::observe::observe!(StatisticsAsked);
     let rows = run.positions();
-    let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-    let (mut unsettled, mut proofs) = (Vec::new(), Vec::new());
+    let mut unsettled = Vec::new();
     for &slot in &run.checked {
         let code = run.codes[slot].expect("a checked slot is bound");
-        let slot_proofs = crate::stats_rules::eq_proofs(&dtype, code)?;
-        match footer_decision(file, slot, &slot_proofs)? {
-            FooterDecision::Nothing => {
+        let footer = footer_bounds(file, PRIMARY_COLUMNS[slot])
+            .filter(|_| file.row_count() > 0)
+            .and_then(|(min, max)| eq_on_bounds(min, max, code));
+        match footer {
+            Some(false) => {
                 note(counters::ZONE_COLUMN, rows.end - rows.start);
                 run.clear_rows();
                 run.checked.clear();
                 return Ok(());
             }
-            FooterDecision::Everything => note(counters::ZONE_COLUMN, rows.end - rows.start),
-            FooterDecision::Unknown => {
-                unsettled.push(slot);
-                proofs.push(slot_proofs);
-            }
+            Some(true) => note(counters::ZONE_COLUMN, rows.end - rows.start),
+            None => unsettled.push(slot),
         }
     }
     run.checked = unsettled;
     if !run.checked.is_empty() {
-        run.zones = run_zones(file, tables, target, run, proofs, source).await?;
+        run.zones = run_zones(file, tables, target, run, source).await?;
     }
     Ok(())
 }
@@ -1366,14 +1361,13 @@ async fn run_zones(
     tables: &crate::store::persist::native_file::LocatedTables,
     target: StatisticsTarget,
     run: &LocatedRun,
-    proofs: Vec<crate::stats_rules::EqProofs>,
     source: &Source,
 ) -> Result<Option<RunZones>> {
     use crate::store::query::zone_decider::{CheckedColumn, ZoneDecider};
 
     let rows = &run.positions();
     let mut columns = Vec::with_capacity(run.checked.len());
-    for (&slot, proofs) in run.checked.iter().zip(proofs) {
+    for &slot in &run.checked {
         let zones = match target {
             StatisticsTarget::Table { table, component } => {
                 column_zones(file, tables, table, component, slot, source).await?
@@ -1390,7 +1384,6 @@ async fn run_zones(
             slot,
             code: run.codes[slot].expect("a checked slot is bound"),
             zones,
-            proofs,
         });
     }
     let Some(decider) = ZoneDecider::new(columns) else {
@@ -1398,7 +1391,7 @@ async fn run_zones(
     };
     let zone_len = decider.zone_len();
     let (first, past) = (rows.start / zone_len, rows.end.div_ceil(zone_len));
-    let classes = decider.classify(first..past)?;
+    let classes = decider.classify(first..past);
     // The ladder's third level: a mixed zone with one slot unsettled counts
     // from its column's record, when the zone lies whole within the run (a
     // partial zone's record counts rows outside it).
@@ -1484,48 +1477,6 @@ async fn kept_zones(
         None => None,
     };
     Ok(cell.get_or_init(|| zones).clone())
-}
-
-/// What a file's footer statistics say of a checked slot's code, for the
-/// whole file (the ladder's first level).
-#[cfg(feature = "file-io")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FooterDecision {
-    /// No row of the file holds the code.
-    Nothing,
-    /// Every row of the file holds it.
-    Everything,
-    /// The footer settles neither.
-    Unknown,
-}
-
-/// The footer's decision on `slot` holding the code `proofs` prove, from
-/// the footer's exact bounds of the slot's column
-/// ([`footer_bounds`](crate::io::zone_map::footer_bounds)):
-/// [`Nothing`] where Vortex's falsifier of `x = code` holds on them,
-/// [`Everything`] where its satisfier does ([`bounds_decide`]). A by-copy
-/// index holds the quad table's values, so the quad table's footer speaks
-/// for its columns too.
-///
-/// [`Nothing`]: FooterDecision::Nothing
-/// [`Everything`]: FooterDecision::Everything
-/// [`bounds_decide`]: crate::io::zone_map::bounds_decide
-#[cfg(feature = "file-io")]
-fn footer_decision(
-    file: &crate::store::persist::native_file::NativeStoreFile,
-    slot: usize,
-    proofs: &crate::stats_rules::EqProofs,
-) -> Result<FooterDecision> {
-    use crate::store::schema::PRIMARY_COLUMNS;
-
-    let bounds = crate::io::zone_map::footer_bounds(file, PRIMARY_COLUMNS[slot]);
-    Ok(
-        match crate::io::zone_map::bounds_decide(bounds, proofs, file.row_count())? {
-            Some(false) => FooterDecision::Nothing,
-            Some(true) => FooterDecision::Everything,
-            None => FooterDecision::Unknown,
-        },
-    )
 }
 
 /// The longest gap run checked row by row: [`GAP_ROWS`], or what a test

@@ -1,9 +1,8 @@
 //! The zone level of the statistics ladder: how each zone of a table stands
-//! against the bound slots a located run checks, decided by Vortex's own
-//! proofs of `x = c` ([`eq_proofs`]) on the checked columns' zone maps
-//! ([`ColumnZones`]) and by the values a graph column's zones record: no row
-//! of the zone holds every checked code, every row does, or the zone is
-//! mixed.
+//! against the bound slots a located run checks, decided by each zone's
+//! exact bounds and the values a graph column's zones record
+//! ([`ColumnZones::eq_holds`]): no row of the zone holds every checked code,
+//! every row does, or the zone is mixed.
 //!
 //! The ladder is the order a located run asks the statistics in, each level
 //! only for what the one before left open: the file's footer settles a
@@ -14,11 +13,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::error::Result;
 use crate::io::zone_map::ColumnZones;
-use crate::stats_rules::EqProofs;
-#[cfg(test)]
-use crate::stats_rules::eq_proofs;
 
 /// How a zone stands against a run's checked slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,19 +27,15 @@ pub(crate) enum ZoneClass {
     Mixed { unsettled: u8 },
 }
 
-/// A checked slot of a run: the code it is checked for, its column's zone
-/// map in the run's table, and Vortex's proofs of `x = code`
-/// ([`eq_proofs`](crate::stats_rules::eq_proofs)).
+/// A checked slot of a run: the code it is checked for and its column's
+/// zone map in the run's table.
 pub(crate) struct CheckedColumn {
     pub(crate) slot: usize,
     pub(crate) code: u64,
     pub(crate) zones: Arc<ColumnZones>,
-    pub(crate) proofs: EqProofs,
 }
 
-/// The classes of a table's zones against a run's checked slots, each
-/// column's zones pruned once per [`classify`](Self::classify) with
-/// Vortex's proofs of `x = code`, on one Vortex zone map of them.
+/// The classes of a table's zones against a run's checked slots.
 pub(crate) struct ZoneDecider {
     columns: Vec<CheckedColumn>,
 }
@@ -80,56 +71,29 @@ impl ZoneDecider {
         column.zones.recorded_count(zone, column.code)
     }
 
-    /// The class of each zone of `zones`, in order: [`ZoneClass::None`]
-    /// where any column's falsifier holds or the values its zone recorded
-    /// lack the column's code, [`ZoneClass::All`] where every column's
-    /// satisfier does, [`ZoneClass::Mixed`] otherwise, naming the columns
-    /// none of these settle.
-    pub(crate) fn classify(&self, zones: Range<u64>) -> Result<Vec<ZoneClass>> {
-        let n = (zones.end - zones.start) as usize;
-        crate::observe::observe!(ZonesClassed(n as u64));
-        let (mut none, mut all, mut unsettled) = (vec![false; n], vec![true; n], vec![0u8; n]);
-        for column in &self.columns {
-            let EqProofs {
-                none: falsifier,
-                all: satisfier,
-            } = &column.proofs;
-            // One Vortex zone map of the zones, which both proofs prune.
-            let map = match (falsifier, satisfier) {
-                (None, None) => None,
-                _ if zones.is_empty() => None,
-                _ => Some(column.zones.zone_map(zones.clone())?),
-            };
-            let holds = |proof: &Option<vortex_array::expr::BoundExpression>| -> Result<Option<vortex_mask::Mask>> {
-                match (proof, &map) {
-                    (Some(proof), Some(map)) => {
-                        Ok(Some(map.prune(proof, &crate::session::VORTEX_SESSION)?))
+    /// The class of each zone of `zones`, in order, by how each column's
+    /// zone stands against its code ([`ColumnZones::eq_holds`]):
+    /// [`ZoneClass::None`] where any column's zone holds it in no row,
+    /// [`ZoneClass::All`] where every column's holds it in every row,
+    /// [`ZoneClass::Mixed`] otherwise, naming the columns neither settles.
+    pub(crate) fn classify(&self, zones: Range<u64>) -> Vec<ZoneClass> {
+        crate::observe::observe!(ZonesClassed(zones.end - zones.start));
+        zones
+            .map(|zone| {
+                let mut unsettled = 0u8;
+                for column in &self.columns {
+                    match column.zones.eq_holds(zone, column.code) {
+                        Some(false) => return ZoneClass::None,
+                        Some(true) => {}
+                        None => unsettled |= 1 << column.slot,
                     }
-                    _ => Ok(None),
                 }
-            };
-            let (no_row, every_row) = (holds(falsifier)?, holds(satisfier)?);
-            for z in 0..n {
-                let zone = zones.start + z as u64;
-                let zone_none = no_row.as_ref().is_some_and(|mask| mask.value(z))
-                    || column.zones.recorded_count(zone, column.code) == Some(0);
-                let zone_all = every_row.as_ref().is_some_and(|mask| mask.value(z));
-                none[z] |= zone_none;
-                all[z] &= zone_all;
-                if !zone_none && !zone_all {
-                    unsettled[z] |= 1 << column.slot;
+                match unsettled {
+                    0 => ZoneClass::All,
+                    _ => ZoneClass::Mixed { unsettled },
                 }
-            }
-        }
-        Ok((0..n)
-            .map(|z| match (none[z], all[z]) {
-                (true, _) => ZoneClass::None,
-                (false, true) => ZoneClass::All,
-                (false, false) => ZoneClass::Mixed {
-                    unsettled: unsettled[z],
-                },
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -139,10 +103,6 @@ mod tests {
     use crate::store::schema::TermCode;
 
     const Z: u64 = 8_192;
-    const U64: vortex_array::dtype::DType = vortex_array::dtype::DType::Primitive(
-        vortex_array::dtype::PType::U64,
-        vortex_array::dtype::Nullability::NonNullable,
-    );
 
     /// A column at `slot`, checked for `code`, with zones of these bounds.
     fn checked(slot: usize, code: TermCode, bounds: &[(u64, u64)]) -> CheckedColumn {
@@ -157,7 +117,6 @@ mod tests {
             slot,
             code,
             zones: Arc::new(zones),
-            proofs: eq_proofs(&U64, code).unwrap(),
         }
     }
 
@@ -174,7 +133,7 @@ mod tests {
         assert_eq!(decider.zone_len(), Z);
         let mixed = ZoneClass::Mixed { unsettled: 1 << 3 };
         assert_eq!(
-            decider.classify(0..5).unwrap(),
+            decider.classify(0..5),
             [
                 ZoneClass::All,
                 ZoneClass::None,
@@ -185,20 +144,6 @@ mod tests {
         );
     }
 
-    /// Each checked column's zones are classed on one Vortex zone map, which
-    /// its falsifier and its satisfier both prune.
-    #[test]
-    fn each_column_classes_on_one_zone_map() {
-        use crate::observe::{Event, Recorder};
-
-        let o = checked(2, 7, &[(7, 7), (1, 9), (8, 9)]);
-        let g = checked(3, 5, &[(5, 5), (1, 4), (4, 6)]);
-        let decider = ZoneDecider::new(vec![o, g]).unwrap();
-        let rec = Recorder::start();
-        decider.classify(0..3).unwrap();
-        assert_eq!(rec.count(&Event::ZoneMapBuilt), 2, "one map per column");
-    }
-
     /// Two checked columns: none where either says none, all where both say
     /// all, and a mixed zone names the columns still unsettled in it.
     #[test]
@@ -207,7 +152,7 @@ mod tests {
         let g = checked(3, 5, &[(5, 5), (1, 4), (6, 9), (5, 6), (4, 6), (5, 6)]);
         let decider = ZoneDecider::new(vec![o, g]).unwrap();
         assert_eq!(
-            decider.classify(0..6).unwrap(),
+            decider.classify(0..6),
             [
                 ZoneClass::All,
                 ZoneClass::None,
@@ -221,15 +166,38 @@ mod tests {
         );
     }
 
+    /// Exact bounds settle a zone before its recorded values do: a zone
+    /// whose bounds are the code alone is all though its record lacks the
+    /// code (a record no store writes, contradicting the bounds), as
+    /// [`ColumnZones::eq_holds`] has it; a zone whose bounds hold the code
+    /// among others is none where its record lacks it.
+    #[test]
+    fn exact_bounds_settle_before_records() {
+        let mut column = checked(3, 5, &[(5, 5), (4, 6)]);
+        column.zones = Arc::new(
+            ColumnZones::from_bounds(
+                vortex_buffer::buffer![5u64, 4],
+                vortex_buffer::buffer![5u64, 6],
+                Z,
+                2 * Z,
+            )
+            .unwrap()
+            .with_records(vec![
+                Some(vec![(6, Z as u32)].into()),
+                Some(vec![(4, 8_000), (6, 192)].into()),
+            ])
+            .unwrap(),
+        );
+        let decider = ZoneDecider::new(vec![column]).unwrap();
+        assert_eq!(decider.classify(0..2), [ZoneClass::All, ZoneClass::None]);
+    }
+
     /// A range of zones is decided alone, and an empty one is nothing.
     #[test]
     fn partial_and_empty_ranges() {
         let decider = ZoneDecider::new(vec![checked(3, 5, &graph_bounds())]).unwrap();
-        assert_eq!(
-            decider.classify(1..3).unwrap(),
-            [ZoneClass::None, ZoneClass::None]
-        );
-        assert!(decider.classify(2..2).unwrap().is_empty());
+        assert_eq!(decider.classify(1..3), [ZoneClass::None, ZoneClass::None]);
+        assert!(decider.classify(2..2).is_empty());
     }
 
     /// No decider without columns, or over columns zoned differently.
@@ -247,7 +215,6 @@ mod tests {
             slot: 2,
             code: 5,
             zones: Arc::new(other),
-            proofs: eq_proofs(&U64, 5).unwrap(),
         };
         assert!(ZoneDecider::new(vec![checked(3, 5, &graph_bounds()), other]).is_none());
     }

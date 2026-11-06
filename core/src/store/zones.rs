@@ -1,19 +1,18 @@
 //! The zone maps of an in-memory base's code columns: P1's [`ColumnZones`]
-//! (a Vortex `ZoneMap` of each 8,192-row zone's exact bounds) per quad code
-//! column, `g`'s with the graphs each zone recorded (P2's
-//! `vortexrdf.value_counts`), as a file store's located runs read them. A
-//! residual equality over a base that no index serves classes the zones its
-//! selection touches against them once
-//! ([`ResidualZones`](crate::store::scan::residual::ResidualZones)): it
-//! skips the zones a bound column's bounds or `g`'s records rule out and
-//! compares only the rest, as the file path's zone-map pruning reads only
-//! the zones it leaves. With zones off it compares the runs of the zones the
-//! bounds alone leave ([`QuadZones::kept_runs`]). A build takes the bounds
-//! in the pass that picks each code column's compression, which reads every
-//! code anyway ([`ZoneBuilder`]), and `g`'s records with Vortex's
-//! accumulator; a store loaded from a file or from bytes reads both from the
-//! file's zone tables ([`QuadZones::read`]). A base with neither has none,
-//! and its residual compares every row.
+//! (each 8,192-row zone's exact bounds) per quad code column, `g`'s with the
+//! graphs each zone recorded (P2's `vortexrdf.value_counts`), as a file store's
+//! located runs read them. A residual equality over a base that no index serves
+//! classes the zones its selection touches against them once
+//! ([`ResidualZones`](crate::store::scan::residual::ResidualZones)): it skips
+//! the zones a bound column's bounds or `g`'s records rule out and compares
+//! only the rest, as the file path's zone-map pruning reads only the zones it
+//! leaves. With zones off it compares the runs of the zones the bounds alone
+//! leave ([`QuadZones::kept_runs`]). A build takes the bounds in the pass that
+//! picks each code column's compression, which reads every code anyway
+//! ([`ZoneBuilder`]), and `g`'s records with Vortex's accumulator; a store
+//! loaded from a file or from bytes reads both from the file's zone tables
+//! ([`QuadZones::read`]). A base with neither has none, and its residual
+//! compares every row.
 
 use std::ops::Range;
 use std::sync::Arc;
