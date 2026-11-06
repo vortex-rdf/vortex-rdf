@@ -1,7 +1,9 @@
-//! The residual compare over an in-memory base: the rows of a selection
-//! where every equality a pattern left after its fast paths holds
-//! ([`residual_rows`]: the zones whose code bounds cannot hold a code
-//! skipped, then the typed fast path or the mask scan over the rows left),
+//! The residual compare over an in-memory base: what the base columns'
+//! array statistics settle of a pattern's leftover equalities
+//! ([`settled_by_statistics`]), the rows of a selection where every
+//! equality left holds ([`residual_rows`]: the zones whose code bounds
+//! cannot hold a code skipped, then the typed fast path or the mask scan
+//! over the rows left),
 //! and the mask of an array's rows holding them ([`mask_for`]), which the
 //! tail's match compares with too. Functions of the base, with no store
 //! state: the match narrows a selection with them, and a residual compare
@@ -19,13 +21,65 @@ use web_time::Instant;
 
 use crate::debug;
 use crate::error::Result;
-use crate::io::zone_map::ZONE_ROWS;
+use crate::io::zone_map::{ZONE_ROWS, bounds_prove};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
+use crate::stats_rules::eq_proofs;
 use crate::store::MemoryBase;
-use crate::store::array::{bool_array_to_mask, into_struct_array};
+use crate::store::array::{bool_array_to_mask, into_struct_array, stamped_bounds, unsigned_value};
 use crate::store::scan::typed_eq::typed_residual_ids;
+use crate::store::schema::CODE_DTYPE;
 use crate::store::view::selection::RowSelection;
+
+/// Whether a residual over a selection of `rows` rows asks the statistics
+/// before it compares: past one zone's rows, as below them the compare
+/// costs less than the statistics' answer.
+pub(crate) fn asks_statistics(rows: usize) -> bool {
+    rows > ZONE_ROWS
+}
+
+/// What the array statistics of a residual's columns settle of its
+/// equalities: the ladder's first level, the base's whole column (spec §3).
+#[derive(Debug)]
+pub(crate) enum Settled {
+    /// No base row holds an equality's code.
+    Nothing,
+    /// The equalities the statistics leave to compare, in order: none when
+    /// every one holds on every base row.
+    Open(Vec<(&'static str, Scalar)>),
+}
+
+/// Each equality of `eqs` against its base column's exact bounds
+/// ([`stamped_bounds`]), by Vortex's proofs of `x = code` ([`eq_proofs`],
+/// [`bounds_prove`]): [`Settled::Nothing`] where a falsifier holds, else
+/// the equalities whose satisfier does not, those of a column without
+/// bounds among them.
+pub(crate) fn settled_by_statistics(
+    base: &ArrayRef,
+    eqs: Vec<(&'static str, Scalar)>,
+) -> Result<Settled> {
+    let struct_arr = into_struct_array(base.clone())?;
+    let rows = base.len() as u64;
+    let mut open = Vec::with_capacity(eqs.len());
+    for (field, value) in eqs {
+        let bounds = struct_arr
+            .unmasked_field_by_name(field)
+            .ok()
+            .and_then(stamped_bounds);
+        let (Some(bounds), Some(code)) = (bounds, unsigned_value(&value)) else {
+            open.push((field, value));
+            continue;
+        };
+        let proofs = eq_proofs(&CODE_DTYPE, code)?;
+        if bounds_prove(Some(bounds), proofs.none.as_ref(), rows)? {
+            return Ok(Settled::Nothing);
+        }
+        if !bounds_prove(Some(bounds), proofs.all.as_ref(), rows)? {
+            open.push((field, value));
+        }
+    }
+    Ok(Settled::Open(open))
+}
 
 /// The rows of `selection` (of `memory`'s base) where every equality of
 /// `eqs` holds: the zones whose code bounds cannot hold a constrained
@@ -50,7 +104,7 @@ pub(crate) fn residual_rows(
     // the base, with no id list of the rows left (those runs are many
     // where a code's zones scatter); an id list keeps only its ids in them.
     let mut selection = selection;
-    if selection.len(base.len()) > ZONE_ROWS
+    if asks_statistics(selection.len(base.len()))
         && let Some(runs) = zones.kept_runs(eqs, base.len())?
     {
         observe!(ZoneNarrowed);
@@ -80,6 +134,7 @@ pub(crate) fn residual_rows(
             Some((base, probes)),
         ) {
             Some(ids) => {
+                observe!(ResidualCompared(selection.len(base.len()) as u64));
                 debug::step!(
                     t,
                     "[match_pattern] In-memory narrowed by typed residual scan"
@@ -87,6 +142,7 @@ pub(crate) fn residual_rows(
                 RowSelection::Ids(ids)
             }
             None => {
+                observe!(ResidualCompared(selection.len(base.len()) as u64));
                 let mask = mask_for(&selection.apply(base)?, eqs)?;
                 let narrowed = selection.refine(&bool_array_to_mask(mask)?);
                 debug::step!(t, "[match_pattern] In-memory narrowed by mask scan");

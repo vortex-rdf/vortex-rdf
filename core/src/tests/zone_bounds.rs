@@ -332,3 +332,139 @@ async fn records_skip_zones_in_memory() {
         .sum();
     assert_eq!(compared, 2 * ZONE_ROWS as u64, "graph 2's two zones");
 }
+
+/// A one-graph store's graph column holds a single code, so its array
+/// statistics settle a graph residual with no zone and no row compared:
+/// `(? ? ? g1)` matches every row, counted and paged as the base's rows,
+/// and `(? ? ? type)`, whose code no row holds as a graph, matches none.
+#[tokio::test]
+async fn array_statistics_settle_a_whole_column() {
+    use super::located_zones::{Graphs, RUN, code_of, zone_quads};
+
+    let store = built_store(zone_quads(Graphs::One), LayoutStrategy::Dictionary, vec![]).await;
+    let rows = 2 * RUN;
+    let compared = |rec: &Recorder| rec.count_where(|e| matches!(e, Event::ResidualCompared(_)));
+    let g1 = code_of(&store, "<http://example.org/g1>").await;
+    let every = crate::CodePattern::new(None, None, None, Some(g1));
+
+    let rec = Recorder::start();
+    let view = store
+        .match_pattern(None, None, None, Some(&iri_graph("g1")))
+        .await
+        .unwrap();
+    assert_eq!(view.size().await.unwrap(), rows, "every row");
+    assert_eq!(store.count_code_pattern(every).await.unwrap(), rows as u64);
+    let page = store
+        .match_code_pattern(every, 18_000, Some(4_096))
+        .await
+        .unwrap();
+    let base = row_list(&store).await;
+    let page: Vec<[TermCode; 4]> = (0..page[0].len())
+        .map(|i| std::array::from_fn(|c| page[c][i]))
+        .collect();
+    assert_eq!(page, base[18_000..22_096], "the base's rows, in base order");
+    assert!(
+        rec.count(&Event::ResidualSettled { none: false }) >= 1,
+        "settled by the statistics"
+    );
+    assert_eq!(compared(&rec), 0, "no row compared");
+
+    let rec = Recorder::start();
+    let none = store
+        .match_pattern(None, None, None, Some(&iri_graph("type")))
+        .await
+        .unwrap();
+    assert_eq!(none.size().await.unwrap(), 0, "no row holds the graph");
+    assert_eq!(rec.count(&Event::ResidualSettled { none: true }), 1);
+    assert_eq!(compared(&rec), 0, "no row compared");
+}
+
+/// Every in-memory Dictionary store stamps its four code columns with
+/// their exact bounds, the same whether built from the quads, loaded from
+/// the file in memory, or adopted from its bytes, and the zone maps'
+/// smallest and largest codes; a Default-layout store, whose columns hold
+/// strings, stamps none.
+#[tokio::test]
+async fn built_and_loaded_stores_stamp_the_same_bounds() {
+    use super::located_zones::{Graphs, zone_quads};
+
+    let quads = zone_quads(Graphs::Stretches);
+    let built = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    for column in ["s", "p", "o", "g"] {
+        let zones = built.debug_zone_bounds(column).expect("built zones");
+        let folded = (
+            zones.iter().map(|z| z.0).min().unwrap(),
+            zones.iter().map(|z| z.1).max().unwrap(),
+        );
+        assert_eq!(
+            built.debug_column_bounds(column),
+            Some(folded),
+            "built {column}"
+        );
+        for (label, store) in [("loaded", &loaded), ("adopted", &adopted)] {
+            assert_eq!(
+                store.debug_column_bounds(column),
+                Some(folded),
+                "{label} {column}"
+            );
+        }
+    }
+    let strings = built_store(quads, LayoutStrategy::Default, vec![]).await;
+    for column in ["s", "p", "o", "g"] {
+        assert_eq!(
+            strings.debug_column_bounds(column),
+            None,
+            "Default {column}"
+        );
+    }
+}
+
+/// `(? type ? g1)` on a one-graph store with `index:posg`: the index
+/// resolves the predicate, and the statistics settle the graph left over.
+/// The view still answers in base row order, as with zones off (the
+/// index's serve plan dropped, as a residual drops it), and keeps the
+/// store's indexes.
+#[tokio::test]
+async fn settled_residuals_keep_base_order() {
+    use super::located_zones::{Graphs, RUN, zone_quads};
+    use crate::store::test_hooks::ForcedZones;
+
+    let store = built_store(
+        zone_quads(Graphs::One),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Copy.types(),
+    )
+    .await;
+    let (ty, g1) = (iri("type"), iri_graph("g1"));
+    let read = |on: bool| {
+        let (store, ty, g1) = (&store, &ty, &g1);
+        async move {
+            let _zones = ForcedZones::set(on);
+            let rec = Recorder::start();
+            let view = store
+                .match_pattern(None, Some(ty), None, Some(g1))
+                .await
+                .unwrap();
+            let rows = row_list(&view).await;
+            (
+                rows,
+                view.indexes().to_vec(),
+                rec.count(&Event::ResidualSettled { none: false }),
+            )
+        }
+    };
+    let (on, on_indexes, settled) = read(true).await;
+    let (off, off_indexes, unsettled) = read(false).await;
+    assert_eq!(on.len(), RUN, "every type row");
+    assert_eq!(on, off, "the rows and their order, as with zones off");
+    let mut sorted = on.clone();
+    sorted.sort_unstable();
+    assert_eq!(on, sorted, "base row order");
+    assert_eq!(on_indexes, store.indexes(), "the view keeps its indexes");
+    assert_eq!(off_indexes, store.indexes());
+    assert_eq!((settled, unsettled), (1, 0), "settled with zones on only");
+}

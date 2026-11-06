@@ -280,7 +280,32 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
-        if need.defers_residual(selection.len(memory.base.len())) {
+        // The ladder's first level (spec §3), the base columns' array
+        // statistics, asked before the compare is deferred or run: an
+        // equality no row holds leaves the selection no row (the view keeps
+        // its tail and indexes), one every row holds leaves the compare, and
+        // with none left the selection is the answer. Either way the residual
+        // has narrowed the view, so a serve plan is dropped as a compare
+        // drops it, and the rows read in base order.
+        let rows = selection.len(memory.base.len());
+        let eqs = if residual::asks_statistics(rows) && crate::stats_rules::zones_enabled() {
+            match residual::settled_by_statistics(&memory.base, eqs)? {
+                residual::Settled::Nothing => {
+                    observe!(ResidualSettled { none: true });
+                    debug::step!(t, "[match_pattern] In-memory residual settled: no row");
+                    return Ok(Some(ViewSelection::Exact(RowSelection::empty())));
+                }
+                residual::Settled::Open(eqs) if eqs.is_empty() => {
+                    observe!(ResidualSettled { none: false });
+                    debug::step!(t, "[match_pattern] In-memory residual settled: every row");
+                    return Ok(Some(ViewSelection::Exact(selection)));
+                }
+                residual::Settled::Open(eqs) => eqs,
+            }
+        } else {
+            eqs
+        };
+        if need.defers_residual(rows) {
             debug::step!(t, "[match_pattern] In-memory residual left pending");
             let pending = PendingResidual::new(memory.clone(), selection, eqs);
             return Ok(Some(ViewSelection::Residual(Arc::new(pending))));

@@ -253,7 +253,7 @@ async fn zone_stores() -> Vec<ZoneStore> {
 }
 
 /// The code of `term` (its N-Triples spelling) in `store`'s dictionary.
-async fn code_of(store: &VortexRdfStore, term: &str) -> TermCode {
+pub(super) async fn code_of(store: &VortexRdfStore, term: &str) -> TermCode {
     store
         .dict_reader()
         .unwrap()

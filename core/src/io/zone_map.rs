@@ -329,7 +329,6 @@ impl ColumnZones {
 /// every row does. `false` without bounds or a proof.
 ///
 /// [`eq_proofs`]: crate::stats_rules::eq_proofs
-#[cfg(feature = "file-io")]
 pub(crate) fn bounds_prove(
     bounds: Option<(u64, u64)>,
     proof: Option<&vortex_array::expr::BoundExpression>,
@@ -348,6 +347,23 @@ pub(crate) fn bounds_prove(
         row_count,
     )?;
     Ok(zones.prune(0..1, proof)?.value(0))
+}
+
+/// The footer's exact `(min, max)` of `file`'s top-level `u64` column
+/// `column` (a store file's quad table: its footer statistics); `None`
+/// when the file keeps no exact bounds for it.
+pub(crate) fn footer_bounds(file: &vortex_file::VortexFile, column: &str) -> Option<(u64, u64)> {
+    use vortex_array::expr::stats::Stat;
+
+    let stats = file.file_stats()?;
+    let index = file.dtype().as_struct_fields_opt()?.find(column)?;
+    let (set, dtype) = stats.get(index);
+    if !dtype.is_unsigned_int() {
+        return None;
+    }
+    let min = set.get_as::<u64>(Stat::Min, dtype).as_exact()?;
+    let max = set.get_as::<u64>(Stat::Max, dtype).as_exact()?;
+    Some((min, max))
 }
 
 /// A zone table's exact `(max, min)` columns executed to `A`: `None` when
@@ -433,7 +449,6 @@ mod tests {
         assert_eq!(zones.prune(2..2, &none).unwrap().len(), 0);
     }
 
-    #[cfg(feature = "file-io")]
     /// Bounds prove every row holds a code only where both are the
     /// code, and no row does where they leave it out; a file without them
     /// proves nothing.

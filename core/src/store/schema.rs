@@ -25,6 +25,10 @@ pub type TermCode = u64;
 /// file this crate never wrote and is refused at open.
 pub(crate) const CODE_PTYPE: PType = PType::U64;
 
+/// The dtype of a code column as this crate writes one: non-nullable
+/// [`CODE_PTYPE`].
+pub(crate) const CODE_DTYPE: DType = DType::Primitive(CODE_PTYPE, Nullability::NonNullable);
+
 /// A row id: a quad's position in the quad table, the value of every index
 /// child's `rid` column (how an index names the rows it matched) and the
 /// currency a match's row selection, tombstones and further matches share

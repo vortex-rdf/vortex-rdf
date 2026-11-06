@@ -362,9 +362,7 @@ impl VortexRdfStore {
                 // the cap asks them when a read needs them, so a first page
                 // its first block fills asks none; a longer one asks now,
                 // as whether it is capped depends on what they decide.
-                if crate::store::query::zone_decider::zones_enabled()
-                    && located.len() >= STATISTICS_ROWS
-                {
+                if crate::stats_rules::zones_enabled() && located.len() >= STATISTICS_ROWS {
                     located.pending = Some(PendingStatistics {
                         file: std::sync::Arc::clone(file),
                         target: StatisticsTarget::Table {
@@ -404,7 +402,7 @@ impl VortexRdfStore {
         // own `g` zones decide it.
         if matches!(&located.rows, RunRows::Reference { graph: Some(_), .. })
             && located.checked == [GRAPH_SLOT]
-            && crate::store::query::zone_decider::zones_enabled()
+            && crate::stats_rules::zones_enabled()
             && located.len() >= STATISTICS_ROWS
         {
             located.pending = Some(PendingStatistics {
@@ -1481,7 +1479,8 @@ enum FooterDecision {
 }
 
 /// The footer's decision on `slot` holding the code `proofs` prove, from
-/// the footer's exact bounds of the slot's column ([`footer_bounds`]):
+/// the footer's exact bounds of the slot's column
+/// ([`footer_bounds`](crate::io::zone_map::footer_bounds)):
 /// [`Nothing`] where Vortex's falsifier of `x = code` holds on them,
 /// [`Everything`] where its satisfier does ([`bounds_prove`]). A by-copy
 /// index holds the quad table's values, so the quad table's footer speaks
@@ -1497,7 +1496,7 @@ fn footer_decision(
 ) -> Result<FooterDecision> {
     use crate::store::schema::PRIMARY_COLUMNS;
 
-    let bounds = footer_bounds(file, PRIMARY_COLUMNS[slot]);
+    let bounds = crate::io::zone_map::footer_bounds(file, PRIMARY_COLUMNS[slot]);
     let rows = file.row_count();
     Ok(
         if crate::io::zone_map::bounds_prove(bounds, proofs.none.as_ref(), rows)? {
@@ -1508,26 +1507,6 @@ fn footer_decision(
             FooterDecision::Unknown
         },
     )
-}
-
-/// The footer's exact `(min, max)` of the file's top-level `u64` column
-/// `column`; `None` when the file keeps no exact bounds for it.
-#[cfg(feature = "file-io")]
-fn footer_bounds(
-    file: &crate::store::persist::native_file::NativeStoreFile,
-    column: &str,
-) -> Option<(u64, u64)> {
-    use vortex_array::expr::stats::Stat;
-
-    let stats = file.file_stats()?;
-    let index = file.dtype().as_struct_fields_opt()?.find(column)?;
-    let (set, dtype) = stats.get(index);
-    if !dtype.is_unsigned_int() {
-        return None;
-    }
-    let min = set.get_as::<u64>(Stat::Min, dtype).as_exact()?;
-    let max = set.get_as::<u64>(Stat::Max, dtype).as_exact()?;
-    Some((min, max))
 }
 
 /// The longest gap run checked row by row: [`GAP_ROWS`], or what a test

@@ -9,7 +9,7 @@
 use crate::error::Result;
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{column_is_sorted, stamp_is_sorted};
+use crate::store::array::{column_is_sorted, stamp_bounds, stamp_is_sorted};
 use crate::store::schema;
 use crate::store::schema::CODE_PTYPE;
 use crate::store::zones::{QuadZones, ZoneBuilder};
@@ -23,7 +23,8 @@ use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 /// Keep a base struct's integer children (the Dictionary layout's term codes,
 /// TypedObject's kind column) in their encoding wherever an encoded-search
 /// probe binds them, and decode the rest to canonical primitives once,
-/// keeping each child's `IsSorted` stamp.
+/// keeping each child's `IsSorted` stamp and its exact bounds
+/// ([`stamped_bounds`](crate::store::array::stamped_bounds)).
 ///
 /// The match fast paths ([`search_sorted_bounds`]' probes, the typed residual
 /// loops) bind canonical primitives and every encoding a probe resolves; any
@@ -49,6 +50,9 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
         if column_is_sorted(child) {
             stamp_is_sorted(&canonical);
         }
+        if let Some((min, max)) = crate::store::array::stamped_bounds(child) {
+            stamp_bounds(&canonical, min, max);
+        }
         Ok(Some(canonical))
     })
 }
@@ -65,20 +69,23 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// untouched. A chunked column is compressed chunk by chunk
 /// ([`compress_int_child`]).
 ///
-/// The pass that picks a column's encoding reads all its codes, and takes
-/// the column's zone bounds on the way ([`ZoneBuilder`]): they come back
-/// beside the struct ([`QuadZones`]), `g`'s with its recorded graphs, for
-/// the primary base, whose residual
-/// filter skips zones by them.
+/// `primary` marks the store's primary base, whose code columns the
+/// residual reads by their statistics and the payload path decodes:
+/// - The pass that picks a code column's encoding reads all its codes, and
+///   takes the column's zone bounds on the way ([`ZoneBuilder`]): they come
+///   back beside the struct ([`QuadZones`]), `g`'s with its recorded
+///   graphs, and the whole column's bounds are stamped on it as exact array
+///   statistics ([`stamp_bounds`]).
+/// - Each compressed column is wrapped in a `vortex.shared` wrapper: the
+///   match fast paths probe the compressed source through it, while the
+///   code-column payload path decodes the canonical primitive once into its
+///   cache (`shared_code_primitive`) and is zero-copy on every later call.
 ///
-/// `payload_lazy` wraps each compressed column in a `vortex.shared` wrapper:
-/// the match fast paths probe the compressed source through it, while the
-/// code-column payload path decodes the canonical primitive once into its
-/// cache (`shared_code_primitive`) and is zero-copy on every later call. Pass
-/// it for the primary base, the only array the payload path reads.
+/// An index component's columns get neither: no read asks their statistics
+/// and no payload path reads them.
 pub(crate) fn with_compressed_int_children(
     rows: ArrayRef,
-    payload_lazy: bool,
+    primary: bool,
 ) -> Result<(ArrayRef, QuadZones)> {
     use vortex_array::arrays::Primitive;
     use vortex_layout::arrays::shared::Shared;
@@ -89,14 +96,18 @@ pub(crate) fn with_compressed_int_children(
         use crate::store::zones::{graph_records, records_graphs};
 
         let sorted = column_is_sorted(child);
-        let mut bounds = ZoneBuilder::new();
-        let Some(mut encoded) = compress_int_child(child, sorted, &mut bounds, ctx)? else {
+        let mut zones_of = ZoneBuilder::new();
+        let Some(mut encoded) = compress_int_child(child, sorted, &mut zones_of, ctx)? else {
             return Ok(None);
         };
         let slot = PRIMARY_COLUMNS
             .iter()
-            .position(|column| *column == name.as_ref());
-        if let (Some(slot), Some(mut column)) = (slot, bounds.finish(child.len())?) {
+            .position(|column| *column == name.as_ref())
+            .filter(|_| primary);
+        let bounds = slot.and(zones_of.bounds(child.len()));
+        if let Some(slot) = slot
+            && let Some(mut column) = zones_of.finish(child.len())?
+        {
             if records_graphs(slot) {
                 let codes = child
                     .clone()
@@ -105,11 +116,14 @@ pub(crate) fn with_compressed_int_children(
             }
             zones.set(slot, column);
         }
-        if payload_lazy && !encoded.is::<Primitive>() {
+        if primary && !encoded.is::<Primitive>() {
             encoded = Shared::new(encoded).into_array();
         }
         if sorted {
             stamp_is_sorted(&encoded);
+        }
+        if let Some((min, max)) = bounds {
+            stamp_bounds(&encoded, min, max);
         }
         Ok(Some(encoded))
     })?;

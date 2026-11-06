@@ -569,6 +569,22 @@ impl VortexRdfStore {
         }
     }
 
+    /// Base column `name`'s exact `(min, max)` array statistics
+    /// ([`stamped_bounds`](crate::store::array::stamped_bounds)), of an
+    /// in-memory view; `None` for a column without them or any other view.
+    pub(crate) fn debug_column_bounds(&self, name: &str) -> Option<(TermCode, TermCode)> {
+        match &self.quads.backend {
+            crate::store::Backend::InMemory(memory) => {
+                use vortex_array::arrays::struct_::StructArrayExt as _;
+                let base = crate::store::array::into_struct_array(memory.base.clone()).ok()?;
+                let column = base.unmasked_field_by_name(name).ok()?;
+                crate::store::array::stamped_bounds(column)
+            }
+            #[cfg(feature = "file-io")]
+            crate::store::Backend::File(_) => None,
+        }
+    }
+
     /// The live base rows the filter masks a window kept on this view hold
     /// (see `FileFilter::Kept`); `None` on a view without them.
     pub(crate) fn debug_evaluated_len(&self) -> Option<usize> {

@@ -14,16 +14,12 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use vortex_array::dtype::{DType, Nullability, PType};
 use vortex_array::scalar::Scalar;
 
 use crate::error::Result;
 use crate::io::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS};
 use crate::store::array::unsigned_value;
-use crate::store::schema::{PRIMARY_COLUMNS, TermCode};
-
-/// The dtype of a code column that carries a zone map.
-const CODE_DTYPE: DType = DType::Primitive(PType::U64, Nullability::NonNullable);
+use crate::store::schema::{CODE_DTYPE, PRIMARY_COLUMNS, TermCode};
 
 /// The graph column's slot in `(s, p, o, g)`.
 const GRAPH_SLOT: usize = 3;
@@ -235,6 +231,29 @@ impl ZoneBuilder {
         self.mins.push(self.lo);
         self.maxes.push(self.hi);
         (self.lo, self.hi, self.filled) = (TermCode::MAX, TermCode::MIN, 0);
+    }
+
+    /// The column's exact `(min, max)`, if the runs folded in cover exactly
+    /// `rows` rows: the smallest and largest code of its zones, the one
+    /// being filled included.
+    pub(crate) fn bounds(&self, rows: usize) -> Option<(TermCode, TermCode)> {
+        if self.rows != rows || rows == 0 {
+            return None;
+        }
+        let open = self.filled > 0;
+        let min = self
+            .mins
+            .iter()
+            .copied()
+            .chain(open.then_some(self.lo))
+            .min()?;
+        let max = self
+            .maxes
+            .iter()
+            .copied()
+            .chain(open.then_some(self.hi))
+            .max()?;
+        Some((min, max))
     }
 
     /// The column's zone map, if the runs folded in cover exactly `rows`

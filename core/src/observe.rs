@@ -79,9 +79,13 @@ pub(crate) enum Event {
     ProbeBound { cached: bool },
     /// A residual narrowed by zone bounds.
     ZoneNarrowed,
-    /// An in-memory residual compared this many rows of a zone run its zone
-    /// maps kept.
+    /// An in-memory residual compared this many rows: a zone run its zone
+    /// maps kept, or the selection the typed loop or the mask scan read.
     ResidualCompared(u64),
+    /// An in-memory residual settled by its columns' array statistics,
+    /// with no row compared: `none` when no row holds a code, else every
+    /// equality held on every row.
+    ResidualSettled { none: bool },
     /// A residual compare left pending.
     ResidualDeferred,
     /// A piece of a pending residual compared, of this many rows.

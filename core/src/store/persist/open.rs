@@ -266,7 +266,15 @@ impl VortexRdfStore {
             opened.to_serializable_parts(),
             QuadZones::read(&quads, &source)
         )?;
-        Self::from_parts(parts, zones)
+        let store = Self::from_parts(parts, zones)?;
+        // The footer's exact bounds of the quad table's code columns, the
+        // base columns' array statistics (the whole column's level).
+        if let crate::store::Backend::InMemory(memory) = &store.quads.backend {
+            crate::store::array::stamp_quad_bounds(&memory.base, |column| {
+                crate::io::zone_map::footer_bounds(file, column)
+            });
+        }
+        Ok(store)
     }
 
     /// The open behind both: footer, component roster and resolved layout,
@@ -398,6 +406,11 @@ impl VortexRdfStore {
             })
             .collect::<Result<Vec<_>>>()?;
         let layout = resolved_layout(dict, quads.dtype())?;
+        // The footer's exact bounds of the quad table's code columns, the
+        // base columns' array statistics (the whole column's level).
+        crate::store::array::stamp_quad_bounds(&quads, |column| {
+            crate::io::zone_map::footer_bounds(&file, column)
+        });
         Self::assemble_resident(quads, components, layout, zones)
     }
 }

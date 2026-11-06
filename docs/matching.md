@@ -272,9 +272,9 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L227) | [§6.1](#61-prefix-probe) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L448), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L222) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L129) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L185) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:152-159`](../core/src/store/query/matching/memory.rs#L152-L159 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -287,7 +287,7 @@ rebuild that merges an append tail re-establishes it
 ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs)). So the stage is skipped
 only for rows that arrived without the provenance — a foreign writer's file,
 whose `quads_sorted: false` keeps
-[`with_subject_stamp`](../core/src/store/array.rs#L106) from inventing a stamp
+[`with_subject_stamp`](../core/src/store/array.rs#L149) from inventing a stamp
 those rows never earned. Compacting such a store restores the fast path.
 
 When it engages, the **subject** resolves to its exact `[lo, hi)` run in
@@ -297,7 +297,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L227), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L270), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -411,10 +411,23 @@ compile can in principle answer `AlwaysFalse` — an empty view — but not here
 the residual binds a subset of roles the [stage B gate](#4-stage-b--the-provable-emptiness-gate)
 already resolved, so that arm exists for totality.
 
-First, **zone maps** narrow the rows to compare. An in-memory base keeps a
+First, over a selection wider than a zone, the **array statistics** of the
+base's code columns answer for the whole column: each carries its exact
+smallest and largest code as `Stat::Min` and `Stat::Max`, stamped where its
+zone maps are taken (below; a loaded store's are its file's footer
+statistics). Vortex's falsifier of a constrained column's `x = c` holding on
+them leaves the selection no row, and its satisfier holding drops the
+equality from the compare; with none left the selection is the answer,
+compared nowhere ([`settled_by_statistics`](../core/src/store/scan/residual.rs#L57)).
+On a one-graph store a graph equality settles this way. The view still counts
+as narrowed by the residual, so a serve plan is dropped as a compare drops it
+and its rows read in base order, and a selection the statistics empty keeps
+the view's tail and indexes.
+
+Then **zone maps** narrow the rows to compare. An in-memory base keeps a
 Vortex zone map of each code column's 8,192-row zones, their exact bounds,
 and for the graph column the graphs each zone records with their rows
-([`QuadZones`](../core/src/store/zones.rs#L34)), as a file store's located runs
+([`QuadZones`](../core/src/store/zones.rs#L30)), as a file store's located runs
 read them: taken in the pass that compresses a build's codes (the graphs with
 Vortex's accumulator of `vortexrdf.value_counts`), or read from the zone
 tables of the file a store is loaded from (`from_file_in_memory`,
@@ -422,11 +435,11 @@ tables of the file a store is loaded from (`from_file_in_memory`,
 columns of the Default and TypedObject layouts) skips this step. Over a
 selection wider than a zone, the zones where Vortex's falsifier of a
 constrained column's `x = c` holds, or whose recorded graphs lack the code,
-are left out ([`kept_runs`](../core/src/store/zones.rs#L133)), when what is
+are left out ([`kept_runs`](../core/src/store/zones.rs#L129)), when what is
 left holds at most half the base: a run of rows (every row, or a
 subject's range) is compared zone run by zone run, each a slice of the base
 through the mask scan below
-([`runs_matching`](../core/src/store/scan/residual.rs#L102)), and an id list keeps
+([`runs_matching`](../core/src/store/scan/residual.rs#L158)), and an id list keeps
 only its ids in those runs before the implementations below compare them. A
 code most zones may hold (a predicate or graph spread over every zone) leaves
 everything to compare.

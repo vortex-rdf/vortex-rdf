@@ -366,7 +366,7 @@ Shared rules:
 - **Term encoding follows the layout**: `Utf8` strings under `Default` and
   `TypedObject` (a `TypedObject` object appears as its full N-Triples term),
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
-  ([`RowId`](../core/src/store/schema.rs#L33)), under every layout; a child
+  ([`RowId`](../core/src/store/schema.rs#L37)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
   ([`check_id_columns`](../core/src/store/persist/open.rs#L40)): rebuild such a store
   from its RDF source.
