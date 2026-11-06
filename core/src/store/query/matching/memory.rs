@@ -280,7 +280,7 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
-        // The ladder's first levels (spec §3), asked once, before the
+        // The statistics ladder's first levels, asked once, before the
         // compare is deferred or run. The base columns' array statistics:
         // an equality no row holds leaves the selection no row (the view
         // keeps its tail and indexes), one every row holds leaves the
