@@ -287,6 +287,7 @@ async fn a_pending_compare_counts_only_live_rows() {
 /// materialized.
 #[tokio::test]
 async fn a_count_or_window_reaching_every_row_compares_eagerly() {
+    let _zones_on = crate::store::test_hooks::ForcedZones::set(true);
     let (_dir, stores) = residual_stores().await;
     let p0 = probe(Some("p0"), None);
     let p0_rows = ROWS.div_ceil(3);

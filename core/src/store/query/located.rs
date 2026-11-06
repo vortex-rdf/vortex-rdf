@@ -1437,8 +1437,11 @@ async fn reference_zones(
 }
 
 /// The zone map of column `slot` of sorted table `table` (`component` names
-/// it, `None` the quad table), read on first use and kept with the file's
-/// located tables; `None` for a column without exact zone bounds.
+/// it, `None` the quad table), read on first use and kept with the file:
+/// the quad table's in the file's own maps
+/// ([`quad_zone_maps`](crate::store::persist::native_file::NativeStoreFile::quad_zone_maps)),
+/// a copy index's with its located tables; `None` for a column without exact
+/// zone bounds.
 #[cfg(feature = "file-io")]
 async fn column_zones(
     file: &crate::store::persist::native_file::NativeStoreFile,
@@ -1451,7 +1454,10 @@ async fn column_zones(
     use crate::io::zone_map::ColumnZones;
     use crate::store::schema::PRIMARY_COLUMNS;
 
-    let cell = &tables.zones[table][slot];
+    if component.is_none() {
+        return file.quad_zone_maps().get(slot).await;
+    }
+    let cell = &tables.zones[table - 1][slot];
     if let Some(zones) = cell.get() {
         return Ok(zones.clone());
     }

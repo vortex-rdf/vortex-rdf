@@ -72,6 +72,7 @@ async fn count(store: &VortexRdfStore, p: Option<&str>, g: &str) -> usize {
 /// evaluates as before; zones off, no zone is taken.
 #[tokio::test]
 async fn file_counts_take_every_row_zones_from_sizes() {
+    let _zones_on = crate::store::test_hooks::ForcedZones::set(true);
     let (_dir, path) = write_store_file(whole_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let zone = ZONE_ROWS as u64;
@@ -109,6 +110,7 @@ async fn file_counts_take_every_row_zones_from_sizes() {
 /// live rows', the deleted rows left out of the zones taken.
 #[tokio::test]
 async fn file_all_side_respects_tombstones() {
+    let _zones_on = crate::store::test_hooks::ForcedZones::set(true);
     let (_dir, path) = write_store_file(whole_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let mut store = VortexRdfStore::from_file(&path).await.unwrap();
     for i in [100, ZONE_ROWS + 8, 6 * ZONE_ROWS + 2] {
@@ -131,36 +133,29 @@ async fn file_all_side_respects_tombstones() {
     assert_eq!(count(&store, None, "A").await, want, "as with zones off");
 }
 
-/// A filter's every-row zones are found once per file: a second count of
-/// the same pattern takes them from the file's memo, and a pattern of
-/// another code searches its own.
+/// A filter's every-row zones come from the quad table's zone maps, each
+/// read once per file whatever the splits and the filters: the first count
+/// of `(? ? ? A)` reads `g`'s, a count of graph B reads none more, and
+/// `(? type ? A)` reads `p`'s alone.
 #[tokio::test]
-async fn every_row_zones_are_found_once_per_filter() {
+async fn every_row_zones_read_each_zone_map_once() {
+    let _zones = ForcedZones::set(true);
     let (_dir, path) = write_store_file(whole_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let searched = |rec: &Recorder| rec.count(&Event::EveryRowSearched);
-    let rec = Recorder::start();
-    assert_eq!(
-        count(&store, None, "A").await,
-        4 * ZONE_ROWS + ZONE_ROWS / 2
-    );
-    assert_eq!(searched(&rec), 1, "the first count searches");
-    let rec = Recorder::start();
-    assert_eq!(
-        count(&store, None, "A").await,
-        4 * ZONE_ROWS + ZONE_ROWS / 2
-    );
-    assert_eq!(searched(&rec), 0, "the second takes the memo");
-    assert_eq!(
-        split_rows(&rec).0,
-        4 * ZONE_ROWS as u64,
-        "the same zones taken"
-    );
-    let rec = Recorder::start();
-    assert_eq!(
-        count(&store, None, "B").await,
-        2 * ZONE_ROWS + ZONE_ROWS / 2
-    );
-    assert_eq!(searched(&rec), 1, "another code searches its own");
-    assert_eq!(split_rows(&rec).0, 2 * ZONE_ROWS as u64);
+    let zone = ZONE_ROWS;
+    for (p, g, want, taken, read) in [
+        (None, "A", 4 * zone + zone / 2, 4 * zone, 1),
+        (None, "B", 2 * zone + zone / 2, 2 * zone, 0),
+        (Some("type"), "A", 4 * zone + zone / 2, 4 * zone, 1),
+        (Some("type"), "B", 2 * zone + zone / 2, 2 * zone, 0),
+    ] {
+        let rec = Recorder::start();
+        assert_eq!(count(&store, p, g).await, want, "{p:?} {g}");
+        assert_eq!(split_rows(&rec).0, taken as u64, "{p:?} {g}: zones taken");
+        assert_eq!(
+            rec.count(&Event::ZoneMapRead),
+            read,
+            "{p:?} {g}: zone maps read"
+        );
+    }
 }

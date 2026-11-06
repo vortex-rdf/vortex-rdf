@@ -18,10 +18,11 @@ use vortex_scan::selection::Selection;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{available_parallelism, spawned_splits};
+use crate::io::zone_map::eq_on_bounds;
 use crate::observe::observe;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
-use crate::store::persist::native_file::{EveryRowRanges, NativeStoreFile};
+use crate::store::persist::native_file::{NativeStoreFile, QuadZoneMaps};
 use crate::store::scan::file_exprs::{PushedFilter, QUAD_SCOPE};
 use crate::store::scan::file_scans::{ScanDriver, split_window, strict_ids};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
@@ -180,87 +181,87 @@ impl ConjunctOrder {
     }
 }
 
-/// The every-row step of a filter of code equalities over a file
-/// ([`every_row_step`]): the rows of its every-row zones, from the file's
-/// memo ([`EveryRowRanges`]), or what finds them on a miss.
-enum EveryRow {
-    /// The rows, as the memo holds them; never empty, as a filter without
-    /// such zones takes no step.
-    Known(Arc<[Range<u64>]>),
-    /// A memo miss: the negation of each equality (`col != c`,
-    /// [`negations`]), the filter's expression, the memo and the file's
-    /// rows, for the first split to search the whole file
-    /// ([`whole_file_every_row`]).
-    Search {
-        negations: Vec<BoundExpression>,
-        filter: Expression,
-        memo: EveryRowRanges,
-        rows: u64,
-    },
+/// The every-row step of a filter of code equalities over a file: each
+/// equality's quad slot and code, and the file's quad zone maps
+/// ([`QuadZoneMaps`]) that decide it.
+struct EveryRow {
+    columns: Vec<(usize, u64)>,
+    maps: QuadZoneMaps,
 }
 
 /// The every-row step `filter` takes over `file`, decided once per
-/// evaluation on the calling thread: none with zones off, for a filter of
-/// any other shape, or for one the memo knows has no every-row zones; the
-/// memoized rows; or, on a miss, the search.
-fn every_row_step(
-    file: &NativeStoreFile,
-    reader: &dyn LayoutReader,
-    filter: &PushedFilter,
-) -> Result<Option<EveryRow>> {
-    if filter.eqs().is_none() || !crate::stats_rules::zones_enabled() {
-        return Ok(None);
+/// evaluation on the calling thread: none with zones off
+/// (`VORTEX_RDF_ZONES=0`) or for a filter of any other shape than code
+/// equalities on the quad table's code columns.
+fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<EveryRow> {
+    use crate::store::schema::PRIMARY_COLUMNS;
+
+    if !crate::stats_rules::zones_enabled() {
+        return None;
     }
-    let memo = file.every_row_ranges();
-    Ok(match memo.get(filter.expr()) {
-        Some(ranges) if ranges.is_empty() => None,
-        Some(ranges) => Some(EveryRow::Known(ranges)),
-        None => Some(EveryRow::Search {
-            negations: negations(file, reader, filter)?,
-            filter: filter.expr().clone(),
-            memo,
-            rows: file.row_count(),
-        }),
+    let columns = filter
+        .eqs()?
+        .iter()
+        .map(|(column, code)| {
+            let slot = PRIMARY_COLUMNS.iter().position(|c| *c == column.as_ref())?;
+            Some((slot, code))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!columns.is_empty()).then(|| EveryRow {
+        columns,
+        maps: file.quad_zone_maps(),
     })
 }
 
-/// The rows of `start` (over split `range`) in zones where no row can differ
-/// from any code of a filter of code equalities, `None` for none, beside the
-/// rest of `start` for the filter to evaluate; without the step (zones off,
-/// or a filter of another shape), `None` and `start`. The zones' rows come
-/// from the file's memo, found on a miss ([`whole_file_every_row`]).
+/// The rows of `start` (over split `range`) in zones where every row holds
+/// every code of a filter of code equalities, `None` for none, beside the
+/// rest of `start` for the filter to evaluate; without the step, `None` and
+/// `start`. A zone qualifies where each equality's column has a zone map
+/// whose bounds there are both its code ([`eq_on_bounds`]): the rule
+/// Vortex's pruning of `col != c` applies, read off the maps the file reads
+/// once ([`QuadZoneMaps`]), only for the split's own zones.
 async fn every_row_zones(
-    reader: &Arc<dyn LayoutReader>,
     every_row: Option<&EveryRow>,
     range: &Range<u64>,
     start: Mask,
 ) -> Result<(Option<Mask>, Mask)> {
-    let ranges = match every_row {
-        None => return Ok((None, start)),
-        Some(EveryRow::Known(ranges)) => Arc::clone(ranges),
-        Some(EveryRow::Search {
-            negations,
-            filter,
-            memo,
-            rows,
-        }) => match memo.get(filter) {
-            Some(ranges) => ranges,
-            None => {
-                let ranges = whole_file_every_row(reader, negations, *rows).await?;
-                memo.insert(filter.clone(), Arc::clone(&ranges));
-                ranges
-            }
-        },
+    let Some(every_row) = every_row else {
+        return Ok((None, start));
     };
-    let slices: Vec<(usize, usize)> = ranges
+    if range.is_empty() || start.all_false() {
+        return Ok((None, start));
+    }
+    let mut maps = Vec::with_capacity(every_row.columns.len());
+    for &(slot, code) in &every_row.columns {
+        let Some(zones) = every_row.maps.get(slot).await? else {
+            return Ok((None, start));
+        };
+        maps.push((zones, code));
+    }
+    let (zone_len, zones) = (maps[0].0.zone_len(), maps[0].0.zones());
+    if maps
         .iter()
-        .filter(|rows| rows.start < range.end && range.start < rows.end)
-        .map(|rows| {
-            let from = rows.start.max(range.start) - range.start;
-            let to = rows.end.min(range.end) - range.start;
-            (from as usize, to as usize)
-        })
-        .collect();
+        .any(|(map, _)| map.zone_len() != zone_len || map.zones() != zones)
+    {
+        return Ok((None, start));
+    }
+    let mut slices: Vec<(usize, usize)> = Vec::new();
+    for zone in range.start / zone_len..(range.end.div_ceil(zone_len)).min(zones) {
+        let every = maps.iter().all(|(map, code)| {
+            let (min, max) = map.zone_bounds(zone);
+            eq_on_bounds(min, max, *code) == Some(true)
+        });
+        if !every {
+            continue;
+        }
+        let rows = maps[0].0.zone_rows(zone);
+        let from = (rows.start.max(range.start) - range.start) as usize;
+        let to = (rows.end.min(range.end) - range.start) as usize;
+        match slices.last_mut() {
+            Some(last) if last.1 == from => last.1 = to,
+            _ => slices.push((from, to)),
+        }
+    }
     if slices.is_empty() {
         return Ok((None, start));
     }
@@ -271,43 +272,6 @@ async fn every_row_zones(
     observe!(SplitAllRows(all.true_count() as u64));
     let rest = start.bitand(&!&all);
     Ok((Some(all), rest))
-}
-
-/// The rows of the file's zones where every row holds every code: each
-/// negation (`col != c`) pruned over the whole file by the zone maps and
-/// footer statistics, the rows where none may differ, as ascending ranges.
-/// A negation that rules out no row of what is left ends the search with
-/// none.
-async fn whole_file_every_row(
-    reader: &Arc<dyn LayoutReader>,
-    negations: &[BoundExpression],
-    rows: u64,
-) -> Result<Arc<[Range<u64>]>> {
-    observe!(EveryRowSearched);
-    let Ok(len) = usize::try_from(rows) else {
-        return Ok(Arc::from([]));
-    };
-    let mut all = Mask::new_true(len);
-    for negation in negations {
-        if all.all_false() {
-            break;
-        }
-        let may_differ = reader
-            .pruning_evaluation(&(0..rows), negation, all.clone())?
-            .await?;
-        if may_differ.true_count() == all.true_count() {
-            return Ok(Arc::from([]));
-        }
-        all = all.bitand(&!&may_differ);
-    }
-    Ok(match all.slices() {
-        AllOr::All => std::iter::once(0..rows).collect(),
-        AllOr::None => Arc::from([]),
-        AllOr::Some(slices) => slices
-            .iter()
-            .map(|&(start, end)| start as u64..end as u64)
-            .collect(),
-    })
 }
 
 /// A filter evaluated over one file split, a narrowing mask threaded through
@@ -324,7 +288,7 @@ async fn evaluate_filter_split(
     range: &Range<u64>,
     start_mask: Mask,
 ) -> Result<Mask> {
-    let (all, start_mask) = every_row_zones(&reader, every_row, range, start_mask).await?;
+    let (all, start_mask) = every_row_zones(every_row, range, start_mask).await?;
     let matched = evaluate_conjuncts(reader, order, range, start_mask).await?;
     Ok(match all {
         Some(all) => matched.bitor(&all),
@@ -395,7 +359,7 @@ fn filter_split_tasks(
         filter,
         bound_conjuncts(file, reader.as_ref(), filter.expr()).collect::<Result<_>>()?,
     ));
-    let every_row = Arc::new(every_row_step(file, reader.as_ref(), filter)?);
+    let every_row = Arc::new(every_row_step(file, filter));
     Ok(ranges
         .into_iter()
         .map(|range| {
@@ -418,42 +382,6 @@ fn filter_split_tasks(
             .boxed()
         })
         .collect())
-}
-
-/// The negation of each equality of a filter of code equalities, `col != c`,
-/// bound against `reader`'s dtype through the file's memo: what is pruned to
-/// find the zones where every row holds every code
-/// ([`whole_file_every_row`]); none for a filter of any other shape. Vortex
-/// 0.90 has no pruning rule for `not`, so `not(col = c)` would prune
-/// nothing; `col != c` prunes where a zone's bounds are both `c`.
-fn negations(
-    file: &NativeStoreFile,
-    reader: &dyn LayoutReader,
-    filter: &PushedFilter,
-) -> Result<Vec<BoundExpression>> {
-    use vortex_array::expr::{lit, not_eq};
-
-    let Some(eqs) = filter.eqs() else {
-        return Ok(Vec::new());
-    };
-    // The columns least likely to hold one value a zone first, so a
-    // negation that rules nothing out ends the step early: the subject and
-    // the object, then the graph, then the predicate.
-    let mut eqs: Vec<_> = eqs.iter().collect();
-    eqs.sort_by_key(|(column, _)| match column.as_ref() {
-        COL_S => 0,
-        COL_O => 1,
-        COL_G => 2,
-        _ => 3,
-    });
-    eqs.into_iter()
-        .map(|(column, code)| {
-            let negation = not_eq(get_item(column.clone(), root()), lit(code));
-            Ok(file
-                .bound_exprs()
-                .bind(QUAD_SCOPE, &negation, reader.dtype())?)
-        })
-        .collect()
 }
 
 /// One split's filter evaluation, owning everything it reads: the surviving

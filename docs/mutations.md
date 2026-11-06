@@ -156,7 +156,7 @@ flowchart TD
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L227) (through
-  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L841)), and on
+  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L769)), and on
   every later read the mask is applied **inside the scan**
   ([`restrict_scan`](../core/src/store/scan/file_scans.rs#L190)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`

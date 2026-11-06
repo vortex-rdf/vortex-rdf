@@ -169,7 +169,8 @@ pub(crate) enum Event {
     /// A located run's rows read at a checked column to check them, this
     /// many rows.
     CheckRead(u64),
-    /// A column's zone map read from its file, for a located run's checks.
+    /// A column's zone map read from its file, for a located run's checks or
+    /// a file filter's every-row zones.
     ZoneMapRead,
     /// A located run's checked slots put to its file's statistics, footer
     /// and zone maps.
@@ -191,9 +192,6 @@ pub(crate) enum Event {
     /// A split's rows a filter's conjuncts were evaluated over, after its
     /// zones were pruned.
     SplitFilterRows(u64),
-    /// A file's every-row zones searched for a filter of code equalities, on
-    /// a miss of the file's memo.
-    EveryRowSearched,
     /// A split's mask the in-order fold handed on, of this range.
     SplitConsumed(Range<u64>),
 }

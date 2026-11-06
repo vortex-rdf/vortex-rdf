@@ -31,7 +31,7 @@ use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::MemoryBase;
 use crate::store::array::{bool_array_to_mask, into_struct_array, stamped_bounds, unsigned_value};
-use crate::store::scan::typed_eq::typed_residual_ids;
+use crate::store::scan::typed_eq::typed_residual_ids_reading;
 use crate::store::schema::{PRIMARY_COLUMNS, RowId};
 use crate::store::view::selection::{RowSelection, SelectedRows};
 
@@ -262,7 +262,9 @@ enum ZoneMatches {
 
 /// The matches of zone `zone`'s selected rows `part`, by its treatment:
 /// none in a "none" zone, the live rows of an "all" zone, a mixed zone's
-/// counted unread where it can be ([`counted_unread`]), else compared.
+/// counted unread where it can be ([`unread_plan`]), else compared as part
+/// of a residual reading `work` rows.
+#[allow(clippy::too_many_arguments)]
 fn zone_matches(
     memory: &MemoryBase,
     zones: &ResidualZones,
@@ -271,6 +273,7 @@ fn zone_matches(
     eqs: &[(&'static str, Scalar)],
     treatment: Treatment,
     deleted: Option<&Mask>,
+    work: usize,
 ) -> Result<ZoneMatches> {
     let base_len = memory.base.len();
     Ok(match treatment {
@@ -280,11 +283,15 @@ fn zone_matches(
             ZoneMatches::Counted(live_rows(part, deleted, base_len))
         }
         Treatment::Compare(bits) => {
-            match counted_unread(memory, zones, zone, part, eqs, bits, deleted)? {
-                Some(matches) => ZoneMatches::Counted(matches),
-                None => {
-                    ZoneMatches::Read(compared(memory, part.clone(), &picked(eqs, bits), None)?)
-                }
+            match unread_plan(memory, zones, zone, part, eqs, bits, deleted) {
+                Some(plan) => ZoneMatches::Counted(unread_count(plan)),
+                None => ZoneMatches::Read(compared(
+                    memory,
+                    part.clone(),
+                    &picked(eqs, bits),
+                    work,
+                    None,
+                )?),
             }
         }
     })
@@ -292,25 +299,36 @@ fn zone_matches(
 
 /// The matches of a zone's selected rows `part` by its treatment, read:
 /// none, every row, or those the compare keeps (tombstoned rows among
-/// them).
+/// them), as part of a residual reading `work` rows.
 fn matched_rows(
     memory: &MemoryBase,
     part: RowSelection,
     eqs: &[(&'static str, Scalar)],
     treatment: Treatment,
+    work: usize,
 ) -> Result<RowSelection> {
     match treatment {
         Treatment::Skip => Ok(RowSelection::empty()),
         Treatment::Take => Ok(part),
-        Treatment::Compare(bits) => compared(memory, part, &picked(eqs, bits), None),
+        Treatment::Compare(bits) => compared(memory, part, &picked(eqs, bits), work, None),
     }
+}
+
+/// Whether the zones a residual compares, in `runs` runs holding
+/// `compare_rows` of its `selected` rows, are compared as one selection
+/// instead: several runs holding more than half of it. As the zones-off
+/// route's `kept_runs` judges zone runs, comparing every row once costs
+/// less than comparing such runs apart.
+fn compares_whole(runs: usize, compare_rows: usize, selected: usize) -> bool {
+    runs > 1 && compare_rows.saturating_mul(2) > selected
 }
 
 /// How many live rows of `selection` (of `memory`'s base, `deleted`
 /// tombstoned) match every equality of `eqs`, by the residual's zone
-/// classes, zone by zone in base order and with no match materialized
-/// ([`zone_matches`]), stopping once `cap` are counted: the count, or at
-/// least `cap`.
+/// classes and with no match materialized, stopping once `cap` are counted:
+/// the count, or at least `cap`. A full count ([`full_count`]) plans every
+/// zone first; a capped one goes zone by zone in base order
+/// ([`zone_matches`]), as it may stop at its first.
 pub(crate) fn zoned_count(
     memory: &MemoryBase,
     selection: &RowSelection,
@@ -324,6 +342,10 @@ pub(crate) fn zoned_count(
     let Some(span) = span(&rows) else {
         return Ok(0);
     };
+    let work = selection.len(base_len);
+    if cap == usize::MAX {
+        return full_count(memory, selection, &rows, span, eqs, zones, deleted);
+    }
     let mut count = 0;
     for (zone, run, treatment) in zones.zones_of(span) {
         if count >= cap {
@@ -333,10 +355,72 @@ pub(crate) fn zoned_count(
         if part.is_empty(base_len) {
             continue;
         }
-        count += match zone_matches(memory, zones, zone, &part, eqs, treatment, deleted)? {
+        count += match zone_matches(memory, zones, zone, &part, eqs, treatment, deleted, work)? {
             ZoneMatches::Counted(matches) => matches,
             ZoneMatches::Read(matched) => live_rows(&matched, deleted, base_len),
         };
+    }
+    Ok(count)
+}
+
+/// [`zoned_count`] of every match. Each zone is planned first: skipped,
+/// taken, counted unread ([`unread_plan`]), or compared, adjacent zones
+/// compared on the same equalities joined into one run. Runs to compare
+/// that [`compares_whole`] judges fragmented compare the whole selection
+/// once; otherwise the takes and unread counts are summed and each run
+/// compared.
+fn full_count(
+    memory: &MemoryBase,
+    selection: &RowSelection,
+    rows: &SelectedRows<'_>,
+    span: Range<u64>,
+    eqs: &[(&'static str, Scalar)],
+    zones: &ResidualZones,
+    deleted: Option<&Mask>,
+) -> Result<usize> {
+    let base_len = memory.base.len();
+    let selected = selection.len(base_len);
+    let (mut taken, mut unread) = (Vec::new(), Vec::new());
+    let mut runs: Vec<(Range<u64>, u32)> = Vec::new();
+    for (zone, run, treatment) in zones.zones_of(span) {
+        let part = part_of(rows, run.clone());
+        if part.is_empty(base_len) {
+            continue;
+        }
+        match treatment {
+            Treatment::Skip => {}
+            Treatment::Take => taken.push(part),
+            Treatment::Compare(bits) => {
+                match unread_plan(memory, zones, zone, &part, eqs, bits, deleted) {
+                    Some(plan) => unread.push(plan),
+                    None => match runs.last_mut() {
+                        Some((last, joined)) if *joined == bits && last.end == run.start => {
+                            last.end = run.end;
+                        }
+                        _ => runs.push((run, bits)),
+                    },
+                }
+            }
+        }
+    }
+    let compare_rows: usize = runs
+        .iter()
+        .map(|(run, _)| part_of(rows, run.clone()).len(base_len))
+        .sum();
+    if compares_whole(runs.len(), compare_rows, selected) {
+        let matched = compared(memory, selection.clone(), eqs, selected, None)?;
+        return Ok(live_rows(&matched, deleted, base_len));
+    }
+    let mut count = 0;
+    for part in taken {
+        observe!(ResidualZoneTaken(part.len(base_len) as u64));
+        count += live_rows(&part, deleted, base_len);
+    }
+    count += unread.into_iter().map(unread_count).sum::<usize>();
+    for (run, bits) in runs {
+        let part = part_of(rows, run);
+        let matched = compared(memory, part, &picked(eqs, bits), selected, None)?;
+        count += live_rows(&matched, deleted, base_len);
     }
     Ok(count)
 }
@@ -363,6 +447,7 @@ pub(crate) fn zoned_window(
         return Ok((vortex_buffer::Buffer::empty(), 0));
     };
     let want = offset.saturating_add(limit);
+    let work = selection.len(base_len);
     // The live matches before the window's zone, and those read from it on.
     let (mut before, mut found) = (0usize, Vec::<RowId>::new());
     for (zone, run, treatment) in zones.zones_of(span) {
@@ -374,15 +459,17 @@ pub(crate) fn zoned_window(
             // A zone is counted only to be skipped: where the window starts
             // at the zone's first match, its matches are read at once.
             let counted = match before < offset {
-                true => zone_matches(memory, zones, zone, &part, eqs, treatment, deleted)?,
-                false => ZoneMatches::Read(matched_rows(memory, part.clone(), eqs, treatment)?),
+                true => zone_matches(memory, zones, zone, &part, eqs, treatment, deleted, work)?,
+                false => {
+                    ZoneMatches::Read(matched_rows(memory, part.clone(), eqs, treatment, work)?)
+                }
             };
             let matched = match counted {
                 ZoneMatches::Counted(matches) if before + matches <= offset => {
                     before += matches;
                     continue;
                 }
-                ZoneMatches::Counted(_) => matched_rows(memory, part, eqs, treatment)?,
+                ZoneMatches::Counted(_) => matched_rows(memory, part, eqs, treatment, work)?,
                 ZoneMatches::Read(matched) => matched,
             };
             let live = live_ids(&matched, deleted, base_len);
@@ -392,7 +479,7 @@ pub(crate) fn zoned_window(
             }
             found = live;
         } else {
-            let matched = matched_rows(memory, part, eqs, treatment)?;
+            let matched = matched_rows(memory, part, eqs, treatment, work)?;
             found.extend(live_ids(&matched, deleted, base_len));
         }
         if before + found.len() >= want {
@@ -407,14 +494,27 @@ pub(crate) fn zoned_window(
     ))
 }
 
-/// The matches of mixed zone `zone`'s selected rows `part`, counted unread
-/// where its one equality left to compare (`bits`) allows and no selected
-/// row is tombstoned: the zone's recorded count of the code when the
-/// selection holds the whole zone ([`ColumnZones::recorded_count`]), else
-/// the column's encoding counted over the selected rows when they are
-/// contiguous (`count_eq`, through the store's probe of the column). `None`
-/// when neither applies.
-fn counted_unread(
+/// How a mixed zone's matches are counted without reading them
+/// ([`unread_plan`]).
+enum Unread {
+    /// The zone's recorded count of the code, for a zone of `rows` rows.
+    Recorded { rows: u64, matches: u64 },
+    /// The column's encoding, through the store's probe of it, counted
+    /// over the contiguous selected rows `run` for `code`.
+    Encoded {
+        column: Arc<vortex_rdf_encoded_search::OwnedSortedProbe>,
+        code: u64,
+        run: Range<usize>,
+    },
+}
+
+/// How mixed zone `zone`'s selected rows `part` are counted unread, where
+/// its one equality left to compare (`bits`) allows and no selected row is
+/// tombstoned: the zone's recorded count of the code when the selection
+/// holds the whole zone ([`ColumnZones::recorded_count`]), else the
+/// column's encoding counted over the selected rows when they are
+/// contiguous (`count_eq`). `None` when neither applies.
+fn unread_plan(
     memory: &MemoryBase,
     zones: &ResidualZones,
     zone: u64,
@@ -422,30 +522,42 @@ fn counted_unread(
     eqs: &[(&'static str, Scalar)],
     bits: u32,
     deleted: Option<&Mask>,
-) -> Result<Option<usize>> {
+) -> Option<Unread> {
     let base_len = memory.base.len();
     if bits.count_ones() != 1 || deleted.is_some_and(|d| tombstoned(part, d, base_len) > 0) {
-        return Ok(None);
+        return None;
     }
     let eq = bits.trailing_zeros() as usize;
     let (field, value) = &eqs[eq];
-    let Some(code) = unsigned_value(value) else {
-        return Ok(None);
-    };
+    let code = unsigned_value(value)?;
     let zone_rows = zones.zone_rows(zone);
-    let whole = part.len(base_len) as u64 == zone_rows.end - zone_rows.start;
-    if whole && let Some(matches) = zones.recorded_count(eq, zone) {
-        observe!(ZoneRecorded(zone_rows.end - zone_rows.start));
-        return Ok(Some(matches as usize));
+    let rows = zone_rows.end - zone_rows.start;
+    if part.len(base_len) as u64 == rows
+        && let Some(matches) = zones.recorded_count(eq, zone)
+    {
+        return Some(Unread::Recorded { rows, matches });
     }
     let SelectedRows::Run(run) = part.as_rows(base_len) else {
-        return Ok(None);
+        return None;
     };
-    let Some(column) = memory.probes.by_name(&memory.base, field).flatten() else {
-        return Ok(None);
-    };
-    observe!(ZoneCounted(run.len() as u64));
-    Ok(Some(column.probe().count_eq(run.start, run.len(), code)))
+    let column = Arc::clone(memory.probes.by_name(&memory.base, field).flatten()?);
+    Some(Unread::Encoded { column, code, run })
+}
+
+/// The matches `plan` counts.
+fn unread_count(plan: Unread) -> usize {
+    match plan {
+        Unread::Recorded { rows, matches } => {
+            // The zone's rows feed the test event alone.
+            let _ = rows;
+            observe!(ZoneRecorded(rows));
+            matches as usize
+        }
+        Unread::Encoded { column, code, run } => {
+            observe!(ZoneCounted(run.len() as u64));
+            column.probe().count_eq(run.start, run.len(), code)
+        }
+    }
 }
 
 /// The equalities of `eqs` whose bits `bits` sets, in order.
@@ -555,7 +667,8 @@ pub(crate) fn residual_rows(
             return Ok(selection);
         }
     }
-    compared(memory, selection, eqs, t)
+    let work = selection.len(base.len());
+    compared(memory, selection, eqs, work, t)
 }
 
 /// [`residual_rows`] by the residual's zone classes.
@@ -580,6 +693,15 @@ fn zoned_rows(
         debug::step!(t, "[match_pattern] In-memory residual: every zone taken");
         return Ok(selection);
     }
+    let selected = selection.len(base_len);
+    let compare: Vec<usize> = segments
+        .iter()
+        .filter(|(_, treatment)| matches!(treatment, Treatment::Compare(_)))
+        .map(|(run, _)| part_of(&rows, run.clone()).len(base_len))
+        .collect();
+    if compares_whole(compare.len(), compare.iter().sum(), selected) {
+        return compared(memory, selection.clone(), eqs, selected, t);
+    }
     if segments
         .iter()
         .any(|(_, treatment)| *treatment == Treatment::Skip)
@@ -600,7 +722,7 @@ fn zoned_rows(
                 extend_rows(&mut ids, &part, base_len);
             }
             Treatment::Compare(bits) => {
-                let matched = compared(memory, part, &picked(eqs, bits), t)?;
+                let matched = compared(memory, part, &picked(eqs, bits), selected, t)?;
                 extend_rows(&mut ids, &matched, base_len);
             }
         }
@@ -609,11 +731,14 @@ fn zoned_rows(
 }
 
 /// The rows of `selection` where every equality of `eqs` holds, compared:
-/// the typed fast path, else the mask scan.
+/// the typed fast path, else the mask scan. `selection` is part of a
+/// residual reading `work` rows in all, which decides whether the compare
+/// decodes its columns ([`typed_residual_ids_reading`]).
 fn compared(
     memory: &MemoryBase,
     selection: RowSelection,
     eqs: &[(&'static str, Scalar)],
+    work: usize,
     t: Option<Instant>,
 ) -> Result<RowSelection> {
     let MemoryBase { base, probes, .. } = memory;
@@ -625,12 +750,13 @@ fn compared(
     // through the store's own probe. Only the selection's rows are
     // tested, so the ids are already the intersection.
     Ok(
-        match typed_residual_ids(
+        match typed_residual_ids_reading(
             &struct_arr,
             &selection,
             base.len(),
             eqs,
             Some((base, probes)),
+            work,
         ) {
             Some(ids) => {
                 debug::step!(

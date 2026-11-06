@@ -298,6 +298,7 @@ fn zone_rows_seen(rec: &Recorder) -> (u64, u64, u64, u64) {
 /// inside on the encoding.
 #[tokio::test]
 async fn residual_counts_settle_zones() {
+    let _zones_on = crate::store::test_hooks::ForcedZones::set(true);
     use super::located_zones::code_of;
 
     let store = built_store(
@@ -468,4 +469,104 @@ async fn residual_windows_jump_by_zone_counts() {
         recorded > 0,
         "the zones before it counted from their records"
     );
+}
+
+/// [`ROWS`]-free fixture of six zones: quads `(s{i:06}, p{i % 3}, "o{i % 50}",
+/// graph(i))` in row order.
+fn six_zones(graph: impl Fn(usize) -> GraphName) -> Vec<Quad> {
+    (0..6 * ZONE_ROWS)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{i:06}"),
+                &format!("http://example.org/p{}", i % 3),
+                &format!("o{}", i % 50),
+                graph(i),
+            )
+        })
+        .collect()
+}
+
+/// What a recorder saw a residual compare: its compares, the probes bound
+/// to encoded columns, and the columns decoded into their caches.
+fn compare_work(rec: &Recorder) -> (usize, usize, usize) {
+    (
+        rec.count_where(|e| matches!(e, Event::ResidualCompared(_))),
+        rec.count_where(|e| matches!(e, Event::ProbeBound { .. })),
+        rec.count(&Event::SharedDecoded),
+    )
+}
+
+/// `(? p0 ? g1)` on a built store whose zones all hold predicates p0 to p2
+/// and graphs g1 and g2 row by row: every zone is mixed in both columns, so
+/// a count compares. It compares the adjacent zones as one run, its columns
+/// decoded once for it (the residual reads every row), never bound zone by
+/// zone to the encoded columns' probes.
+#[tokio::test]
+async fn a_residual_compares_adjacent_zones_once_and_decodes_its_columns() {
+    let _zones = ForcedZones::set(true);
+    let (g1, g2) = (iri_graph("g1"), iri_graph("g2"));
+    let quads = six_zones(|i| [g1.clone(), g2.clone()][i % 2].clone());
+    let store = built_store(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let probe = Probe::new(None, Some(iri("p0")), None, Some(g1.clone()));
+    let rec = Recorder::start();
+    assert_eq!(store.count_probe(&probe).await.unwrap(), 6 * ZONE_ROWS / 6);
+    assert_eq!(
+        compare_work(&rec),
+        (1, 0, 2),
+        "one compare, no probe bound, p and g decoded once"
+    );
+}
+
+/// `(? p0 ? g1)` where only the even zones hold g1 (the odd ones hold g2
+/// and g3): the count skips the odd zones and compares the even ones apart,
+/// three runs, but decodes the columns once for all of them, as the
+/// residual's whole selection reads every row of a column; no probe bound.
+#[tokio::test]
+async fn a_residual_decodes_its_columns_for_all_its_zones() {
+    let _zones = ForcedZones::set(true);
+    let graphs = [iri_graph("g1"), iri_graph("g2"), iri_graph("g3")];
+    let graph = |i: usize| match (i / ZONE_ROWS).is_multiple_of(2) {
+        true => graphs[i % 2].clone(),
+        false => graphs[1 + i % 2].clone(),
+    };
+    let store = built_store(six_zones(graph), LayoutStrategy::Dictionary, vec![]).await;
+    let want = (0..6 * ZONE_ROWS)
+        .filter(|&i| {
+            i.is_multiple_of(3) && (i / ZONE_ROWS).is_multiple_of(2) && i.is_multiple_of(2)
+        })
+        .count();
+    let probe = Probe::new(None, Some(iri("p0")), None, Some(graphs[0].clone()));
+    let rec = Recorder::start();
+    assert_eq!(store.count_probe(&probe).await.unwrap(), want);
+    assert_eq!(
+        compare_work(&rec),
+        (3, 0, 2),
+        "three compares, decoded once"
+    );
+}
+
+/// `(? p0 ? g1)` where g1 is in zones 0, 1, 3 and 4 but not 2 and 5: the
+/// zones to compare hold more than half the store, in two runs, so the count
+/// compares the whole selection once, as before the zone classes.
+#[tokio::test]
+async fn fragmented_zones_left_to_compare_compare_the_whole_selection() {
+    let _zones = ForcedZones::set(true);
+    let graphs = [iri_graph("g1"), iri_graph("g2"), iri_graph("g3")];
+    let holds_g1 = |i: usize| !matches!(i / ZONE_ROWS, 2 | 5);
+    let graph = |i: usize| match holds_g1(i) {
+        true => graphs[i % 2].clone(),
+        false => graphs[1 + i % 2].clone(),
+    };
+    let store = built_store(six_zones(graph), LayoutStrategy::Dictionary, vec![]).await;
+    let want = (0..6 * ZONE_ROWS)
+        .filter(|&i| i.is_multiple_of(3) && holds_g1(i) && i.is_multiple_of(2))
+        .count();
+    let probe = Probe::new(None, Some(iri("p0")), None, Some(graphs[0].clone()));
+    let rec = Recorder::start();
+    assert_eq!(store.count_probe(&probe).await.unwrap(), want);
+    let compared: Vec<u64> = rec.picked(|e| match e {
+        Event::ResidualCompared(rows) => Some(*rows),
+        _ => None,
+    });
+    assert_eq!(compared, [6 * ZONE_ROWS as u64], "one compare of every row");
 }

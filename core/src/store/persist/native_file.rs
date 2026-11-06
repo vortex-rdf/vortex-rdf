@@ -56,10 +56,9 @@ pub(crate) struct NativeStoreFile {
     /// same few filters; keyed this way a hit costs a tree walk but no
     /// allocation. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
-    /// The rows of the zones where every row holds every code of a filter of
-    /// code equalities, keyed by filter shape as the envelopes are: also
-    /// statistics only, so a function of the filter (see [`EveryRowRanges`]).
-    every_row_ranges: EveryRowRanges,
+    /// The quad table's code columns' zone maps, read on first use
+    /// ([`QuadZoneMaps`]).
+    quad_zones: OnceLock<QuadZoneMaps>,
     /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]),
     /// but for the code columns', which
     /// [`code_column_chunks`](Self::code_column_chunks) holds. Each handle
@@ -142,10 +141,12 @@ pub(crate) struct LocatedTables {
     /// Per reference index, its child's `g` (each row's graph), `None` for a
     /// child written without it.
     pub(crate) reference_graphs: [Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>; 2],
-    /// Per sorted table and `(s, p, o, g)` column, its zone map, read on
-    /// first use; `None` for a column without exact zone bounds. Two `u64`
-    /// per zone of a column read, bounded by the file's layout.
-    pub(crate) zones: [[OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 3],
+    /// Per copy index (`index:posg`, `index:ospg`) and `(s, p, o, g)`
+    /// column, its zone map, read on first use; `None` for a column without
+    /// exact zone bounds. Two `u64` per zone of a column read, bounded by the
+    /// file's layout. The quad table's are the file's own
+    /// ([`NativeStoreFile::quad_zone_maps`]).
+    pub(crate) zones: [[OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 2],
     /// Per reference index, its child's `g` zone map with the zones'
     /// recorded graphs, read on first use, bounded the same way.
     pub(crate) reference_zones: [OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 2],
@@ -184,26 +185,45 @@ pub(crate) enum FileCounter {
     LocatedRidScans,
 }
 
-/// The rows of a file's zones where every row holds every code of a filter
-/// of code equalities, as ascending row ranges, keyed by the filter's
-/// expression (structural `Eq`/`Hash`): the file's statistics alone decide
-/// them, so a filter's are found once, by one pruning evaluation per
-/// equality over the whole file, and every later evaluation of it takes
-/// them from here. A shared handle, as the split tasks that read it outlive
-/// a borrow of the file. Bounded by [`PRUNING_MEMO_MAX`], cleared wholesale
-/// at the cap.
+/// The quad table's code columns' zone maps (`s`, `p`, `o`, `g`, by slot),
+/// each read from its zone table on first use ([`ColumnZones::read`]) and
+/// kept with the file; `None` for a column without exact zone bounds. Located
+/// runs over the quad table check them, and a filter of code equalities takes
+/// the zones where every row holds every code from them. A shared handle, as
+/// split tasks hold it past a borrow of the file; a map is read once however
+/// many tasks ask for it at once. Two `u64` per zone of each column read.
+///
+/// [`ColumnZones::read`]: crate::io::zone_map::ColumnZones::read
 #[derive(Clone)]
-pub(crate) struct EveryRowRanges(Arc<BoundedMemo<Expression, Arc<[Range<u64>]>>>);
+pub(crate) struct QuadZoneMaps(Arc<QuadZoneMapsInner>);
 
-impl EveryRowRanges {
-    /// The memoized rows of `filter`, `None` on a miss.
-    pub(crate) fn get(&self, filter: &Expression) -> Option<Arc<[Range<u64>]>> {
-        self.0.get(filter)
-    }
+/// What a [`QuadZoneMaps`] handle shares.
+struct QuadZoneMapsInner {
+    cells: [tokio::sync::OnceCell<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4],
+    /// Each code column's layout, `None` for a column the quad table lacks.
+    columns: [Option<LayoutRef>; 4],
+    source: Arc<dyn vortex_layout::segments::SegmentSource>,
+}
 
-    /// Memoize `filter`'s rows.
-    pub(crate) fn insert(&self, filter: Expression, ranges: Arc<[Range<u64>]>) {
-        self.0.insert(filter, ranges);
+impl QuadZoneMaps {
+    /// Slot `slot`'s zone map, read on first use.
+    pub(crate) async fn get(
+        &self,
+        slot: usize,
+    ) -> crate::error::Result<Option<Arc<crate::io::zone_map::ColumnZones>>> {
+        let inner = &*self.0;
+        inner.cells[slot]
+            .get_or_try_init(|| async {
+                crate::observe::observe!(ZoneMapRead);
+                Ok(match &inner.columns[slot] {
+                    Some(column) => crate::io::zone_map::ColumnZones::read(column, &inner.source)
+                        .await?
+                        .map(Arc::new),
+                    None => None,
+                })
+            })
+            .await
+            .cloned()
     }
 }
 
@@ -283,7 +303,7 @@ impl NativeStoreFile {
             readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
-            every_row_ranges: EveryRowRanges(Arc::new(BoundedMemo::new(PRUNING_MEMO_MAX))),
+            quad_zones: OnceLock::new(),
             quad_chunks: ChunkMemo::default(),
             code_column_chunks: Default::default(),
             component_chunks: ChunkMemo::default(),
@@ -419,10 +439,19 @@ impl NativeStoreFile {
         self.pruning_envelopes.insert(filter, envelope);
     }
 
-    /// The file's memo of every-row zone rows per filter shape, a handle
-    /// the split tasks keep.
-    pub(crate) fn every_row_ranges(&self) -> EveryRowRanges {
-        self.every_row_ranges.clone()
+    /// The quad table's code columns' zone maps ([`QuadZoneMaps`]), a handle
+    /// a split task keeps.
+    pub(crate) fn quad_zone_maps(&self) -> QuadZoneMaps {
+        self.quad_zones
+            .get_or_init(|| {
+                QuadZoneMaps(Arc::new(QuadZoneMapsInner {
+                    cells: Default::default(),
+                    columns: schema::PRIMARY_COLUMNS
+                        .map(|column| self.table_column_layout(None, column)),
+                    source: self.segment_source(),
+                }))
+            })
+            .clone()
     }
 
     /// Whether the file records its quad rows in global `(s, p, o, g)` order.

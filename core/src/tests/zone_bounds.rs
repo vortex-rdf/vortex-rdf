@@ -307,6 +307,7 @@ async fn in_memory_zone_maps_match_the_files() {
 /// compared every row.
 #[tokio::test]
 async fn records_skip_zones_in_memory() {
+    let _zones_on = crate::store::test_hooks::ForcedZones::set(true);
     use super::located_zones::{Graphs, zone_quads};
 
     let store = built_store(
@@ -339,6 +340,7 @@ async fn records_skip_zones_in_memory() {
 /// and `(? ? ? type)`, whose code no row holds as a graph, matches none.
 #[tokio::test]
 async fn array_statistics_settle_a_whole_column() {
+    let _zones_on = crate::store::test_hooks::ForcedZones::set(true);
     use super::located_zones::{Graphs, RUN, code_of, zone_quads};
 
     let store = built_store(zone_quads(Graphs::One), LayoutStrategy::Dictionary, vec![]).await;
