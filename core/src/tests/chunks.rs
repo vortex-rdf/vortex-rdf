@@ -829,15 +829,13 @@ async fn pull_and_drain<S: futures::Stream + Unpin>(
 /// parallelism, on a file of more splits than that.
 #[tokio::test]
 async fn test_chunk_stream_over_filtered_file_stays_lazy() {
-    use crate::io::read::available_parallelism;
-
     let (_dir, path) = many_splits_file().await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p0 = iri("p0");
     let view = matched_view(&store, None, Some(&p0), None, None).await;
     assert!(view.view_statistics().unwrap().pending_filter);
     let n = view.size().await.unwrap();
-    let window = 4 * available_parallelism();
+    let window = crate::store::scan::file_scans::split_window();
     let _limit = ForcedLimit::set(0);
     for read in ["code_chunks", "row_chunks", "quads"] {
         let rec = Recorder::start();

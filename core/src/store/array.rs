@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
-use vortex_array::arrays::{BoolArray, ChunkedArray, Struct, StructArray, VarBinViewArray};
-use vortex_array::dtype::{DType, FieldName};
+use vortex_array::arrays::{BoolArray, Struct, StructArray, VarBinViewArray};
+use vortex_array::dtype::FieldName;
 use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, Executable, ExecutionCtx, IntoArray, VortexSessionExecute};
@@ -159,8 +159,14 @@ pub(crate) fn with_subject_stamp(rows: ArrayRef, sorted: bool) -> Result<ArrayRe
 
 /// Assemble per-chunk arrays into one array of `dtype`: an empty
 /// `ChunkedArray` for no chunks, the chunk itself for exactly one, a
-/// `ChunkedArray` otherwise.
-pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Result<ArrayRef> {
+/// `ChunkedArray` otherwise. For chunks already in hand; a stream of them is
+/// read by Vortex's `read_all`.
+#[cfg(any(test, feature = "file-io"))]
+pub(crate) fn chunked_or_single(
+    mut chunks: Vec<ArrayRef>,
+    dtype: vortex_array::dtype::DType,
+) -> Result<ArrayRef> {
+    use vortex_array::arrays::ChunkedArray;
     match chunks.len() {
         1 => Ok(chunks.pop().expect("length checked above")),
         _ => Ok(ChunkedArray::try_new(chunks, dtype)?.into_array()),

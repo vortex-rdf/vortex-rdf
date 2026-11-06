@@ -227,10 +227,9 @@ impl IndexComponent {
     /// identity and with its `sorted` provenance.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) async fn from_stream(child: ChildStream) -> Result<Self> {
-        use futures::TryStreamExt as _;
+        use vortex_array::stream::ArrayStreamExt as _;
 
-        let chunks: Vec<ArrayRef> = child.source.open()?.try_collect().await?;
-        let rows = crate::store::array::chunked_or_single(chunks, child.source.dtype().clone())?;
+        let rows = child.source.open()?.read_all().await?;
         Ok(Self::built(
             child.identity,
             into_struct_array(rows)?,
