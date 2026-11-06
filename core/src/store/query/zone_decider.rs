@@ -44,7 +44,7 @@ pub(crate) struct CheckedColumn {
 
 /// The classes of a table's zones against a run's checked slots, each
 /// column's zones pruned once per [`classify`](Self::classify) with
-/// Vortex's proofs of `x = code`.
+/// Vortex's proofs of `x = code`, on one Vortex zone map of them.
 pub(crate) struct ZoneDecider {
     columns: Vec<CheckedColumn>,
 }
@@ -94,11 +94,19 @@ impl ZoneDecider {
                 none: falsifier,
                 all: satisfier,
             } = &column.proofs;
+            // One Vortex zone map of the zones, which both proofs prune.
+            let map = match (falsifier, satisfier) {
+                (None, None) => None,
+                _ if zones.is_empty() => None,
+                _ => Some(column.zones.zone_map(zones.clone())?),
+            };
             let holds = |proof: &Option<vortex_array::expr::BoundExpression>| -> Result<Option<vortex_mask::Mask>> {
-                proof
-                    .as_ref()
-                    .map(|proof| column.zones.prune(zones.clone(), proof))
-                    .transpose()
+                match (proof, &map) {
+                    (Some(proof), Some(map)) => {
+                        Ok(Some(map.prune(proof, &crate::session::VORTEX_SESSION)?))
+                    }
+                    _ => Ok(None),
+                }
             };
             let (no_row, every_row) = (holds(falsifier)?, holds(satisfier)?);
             for z in 0..n {
@@ -175,6 +183,20 @@ mod tests {
                 mixed
             ]
         );
+    }
+
+    /// Each checked column's zones are classed on one Vortex zone map, which
+    /// its falsifier and its satisfier both prune.
+    #[test]
+    fn each_column_classes_on_one_zone_map() {
+        use crate::observe::{Event, Recorder};
+
+        let o = checked(2, 7, &[(7, 7), (1, 9), (8, 9)]);
+        let g = checked(3, 5, &[(5, 5), (1, 4), (4, 6)]);
+        let decider = ZoneDecider::new(vec![o, g]).unwrap();
+        let rec = Recorder::start();
+        decider.classify(0..3).unwrap();
+        assert_eq!(rec.count(&Event::ZoneMapBuilt), 2, "one map per column");
     }
 
     /// Two checked columns: none where either says none, all where both say

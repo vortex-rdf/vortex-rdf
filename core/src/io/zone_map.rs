@@ -105,10 +105,11 @@ impl ExactZoneMap {
 /// `min`), one row per zone; and beside it, where the column records them
 /// (`vortexrdf.value_counts`, a graph column of a file written since the
 /// `vortexrdf 2026.11.0` edition), the values each zone holds with their
-/// rows, decoded once. A stats proof (a falsifier or a satisfier) is
-/// evaluated over a range of its zones by [`prune`](Self::prune), Vortex's
-/// [`ZoneMap::prune`] on those zones' rows of the table; a zone's recorded
-/// rows of a code are [`recorded_count`](Self::recorded_count).
+/// rows, decoded once. The stats proofs (a falsifier, a satisfier) asked of
+/// a range of its zones are evaluated by Vortex's [`ZoneMap::prune`] on one
+/// map of those zones' rows of the table ([`zone_map`](Self::zone_map)); a
+/// zone's recorded rows of a code are
+/// [`recorded_count`](Self::recorded_count).
 ///
 /// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
 /// [`ZoneMap::prune`]: vortex_layout::layouts::zoned::zone_map::ZoneMap::prune
@@ -320,22 +321,35 @@ impl ColumnZones {
 
     /// Where `proof` holds over the zones `zones`, one bit per zone in
     /// order: Vortex's [`ZoneMap::prune`] on those zones' rows of the
-    /// table.
+    /// table ([`zone_map`](Self::zone_map)), for a test asking one proof.
     ///
     /// [`ZoneMap::prune`]: vortex_layout::layouts::zoned::zone_map::ZoneMap::prune
-    #[cfg(feature = "file-io")]
+    #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn prune(
         &self,
         zones: std::ops::Range<u64>,
         proof: &vortex_array::expr::BoundExpression,
     ) -> Result<vortex_mask::Mask> {
+        if zones.is_empty() {
+            return Ok(vortex_mask::Mask::new_false(0));
+        }
+        Ok(self.zone_map(zones)?.prune(proof, &VORTEX_SESSION)?)
+    }
+
+    /// Vortex's [`ZoneMap`] of the zones `zones` (not empty), those zones'
+    /// rows of the table: built once, it prunes every proof asked of them.
+    ///
+    /// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
+    #[cfg(feature = "file-io")]
+    pub(crate) fn zone_map(
+        &self,
+        zones: std::ops::Range<u64>,
+    ) -> Result<vortex_layout::layouts::zoned::zone_map::ZoneMap> {
         use vortex_array::IntoArray as _;
         use vortex_array::dtype::{DType, Nullability, PType};
         use vortex_layout::layouts::zoned::zone_map::ZoneMap;
 
-        if zones.is_empty() {
-            return Ok(vortex_mask::Mask::new_false(0));
-        }
+        crate::observe::observe!(ZoneMapBuilt);
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let table = self
             .table
@@ -345,14 +359,13 @@ impl ColumnZones {
             .execute::<StructArray>(&mut ctx)?;
         let first_row = zones.start * self.zone_len;
         let rows = (zones.end * self.zone_len).min(self.row_count) - first_row;
-        let map = ZoneMap::try_new(
+        Ok(ZoneMap::try_new(
             DType::Primitive(PType::U64, Nullability::NonNullable),
             table,
             exact_bound_aggregates(),
             self.zone_len,
             rows,
-        )?;
-        Ok(map.prune(proof, &VORTEX_SESSION)?)
+        )?)
     }
 }
 
@@ -395,15 +408,16 @@ pub(crate) fn bounds_decide(
     if row_count == 0 {
         return Ok(None);
     }
-    let zones = ColumnZones::from_bounds(
+    let map = ColumnZones::from_bounds(
         vortex_buffer::buffer![min],
         vortex_buffer::buffer![max],
         row_count,
         row_count,
-    )?;
+    )?
+    .zone_map(0..1)?;
     let holds = |proof: &Option<vortex_array::expr::BoundExpression>| -> Result<bool> {
         match proof {
-            Some(proof) => Ok(zones.prune(0..1, proof)?.value(0)),
+            Some(proof) => Ok(map.prune(proof, &VORTEX_SESSION)?.value(0)),
             None => Ok(false),
         }
     };
@@ -653,6 +667,21 @@ mod tests {
             all: None,
         };
         assert_eq!(bounds_decide(Some((6, 9)), &unproved, 100).unwrap(), None);
+    }
+
+    /// The footer level decides a slot on one Vortex zone map, which both
+    /// proofs prune: bounds that settle neither ask both of it.
+    #[cfg(feature = "file-io")]
+    #[test]
+    fn bounds_decide_on_one_zone_map() {
+        use crate::observe::{Event, Recorder};
+        use vortex_array::dtype::{DType, Nullability, PType};
+
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let five = crate::stats_rules::eq_proofs(&dtype, 5).unwrap();
+        let rec = Recorder::start();
+        assert_eq!(bounds_decide(Some((4, 6)), &five, 100).unwrap(), None);
+        assert_eq!(rec.count(&Event::ZoneMapBuilt), 1);
     }
 
     /// A zone table's recorded states as another writer of the statistic
