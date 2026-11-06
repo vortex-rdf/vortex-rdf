@@ -342,3 +342,70 @@ fn count_eq_vortex(bencher: Bencher, shape: &str) {
             total
         });
 }
+
+/// The widths of the bulk reads timed per stored word.
+const READ_WIDTHS: [usize; 13] = [2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 256, 512, 1024];
+
+/// Bit-packed columns of `N` values, one per stored word width, each packed
+/// at a code-like width: 7 bits in `u8` words, 13 in `u16`, 20 in `u32` and
+/// `u64` (the in-memory build's encoding of a code column).
+static PACKED: LazyLock<Vec<(&'static str, ArrayRef)>> = LazyLock::new(|| {
+    fn packed<T>(bits: u8) -> ArrayRef
+    where
+        T: vortex_array::dtype::NativePType + TryFrom<u64>,
+        <T as TryFrom<u64>>::Error: std::fmt::Debug,
+    {
+        let mask = (1u64 << bits) - 1;
+        let values =
+            (0..N as u64).map(|i| T::try_from(i.wrapping_mul(2_654_435_761) & mask).unwrap());
+        let canonical = PrimitiveArray::from_iter(values);
+        let mut ctx = common::session().create_execution_ctx();
+        vortex_fastlanes::bitpack_compress::bitpack_encode(&canonical, bits, None, &mut ctx)
+            .unwrap()
+            .into_array()
+    }
+    vec![
+        ("u8", packed::<u8>(7)),
+        ("u16", packed::<u16>(13)),
+        ("u32", packed::<u32>(20)),
+        ("u64", packed::<u64>(20)),
+    ]
+});
+
+/// `read_into` of `width` values of the bit-packed column of `word`s, from
+/// 1,000 strided starts: counted per value read.
+fn read_into(bencher: Bencher, word: &str, width: usize) {
+    let (_, packed) = PACKED.iter().find(|(name, _)| *name == word).unwrap();
+    let probe = SortedProbe::resolve(packed).unwrap();
+    assert!(probe.node_kinds().contains(&NodeKind::BitPacked));
+    let starts: Vec<usize> = (0..1000).map(|i| (i * 2099) % (N - width)).collect();
+    let mut out = vec![0u64; width];
+    bencher
+        .counter(ItemsCount::new(starts.len() * width))
+        .bench_local(|| {
+            for &start in &starts {
+                probe.read_into(start, &mut out);
+                divan::black_box(&out);
+            }
+        });
+}
+
+#[divan::bench(args = READ_WIDTHS)]
+fn read_into_u8(bencher: Bencher, width: usize) {
+    read_into(bencher, "u8", width);
+}
+
+#[divan::bench(args = READ_WIDTHS)]
+fn read_into_u16(bencher: Bencher, width: usize) {
+    read_into(bencher, "u16", width);
+}
+
+#[divan::bench(args = READ_WIDTHS)]
+fn read_into_u32(bencher: Bencher, width: usize) {
+    read_into(bencher, "u32", width);
+}
+
+#[divan::bench(args = READ_WIDTHS)]
+fn read_into_u64(bencher: Bencher, width: usize) {
+    read_into(bencher, "u64", width);
+}

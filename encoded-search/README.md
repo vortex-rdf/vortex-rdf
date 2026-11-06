@@ -117,8 +117,9 @@ panicking, never unsound — answer. `bounds_in` requires only its window to be
 sorted, and never reads a row outside it. `value_at`, and `read_into` and
 `read_at` (a range, or a list of indices, each run of consecutive indices read
 in one pass: a run-end node's first run found once, a bit-packed node's
-patches searched once, a delta node's decoded blocks copied), are exact
-regardless of order.
+1024-value chunks unpacked whole where the run takes more than a measured
+crossover of them and its patches searched once, a delta node's decoded blocks
+copied), are exact regardless of order.
 
 Searches over ascending codes in a run-end node's values, and a `bounds_in`
 window's lower bound, interpolate: once a probe has landed on each side of the

@@ -1,7 +1,8 @@
 //! The resolved probe tree. A [`Node`] mirrors one encoded array node,
 //! borrowing its buffers; every operation is a slice read, integer
-//! arithmetic or one bit-packed word extraction, with no `ExecutionCtx`, no
-//! decode and no allocation. The exception is [`DeltaNode`], whose values
+//! arithmetic or a bit-packed extraction (of one word, or of a 1024-value
+//! chunk onto the stack), with no `ExecutionCtx`, no decode and no
+//! allocation. The exception is [`DeltaNode`], whose values
 //! are running sums: it decodes a 1024-value block the first time one of its
 //! values is read, and keeps it. The searches the nodes run are in
 //! [`crate::search`].
@@ -216,17 +217,31 @@ impl PackedNode<'_> {
         }
     }
 
-    /// The patch-aware values at logical `start..start + out.len()`: each
-    /// unpacked from its word, then the patches in range written over them
-    /// ([`PatchProbe::overwrite`]), where [`Self::value_at`] searches the
-    /// patches once per value.
+    /// The patch-aware values at logical `start..start + out.len()`, a
+    /// FastLanes chunk at a time: a chunk the read takes more than
+    /// [`unpack_crossover`] values of is unpacked whole and widened, a
+    /// smaller part unpacked at its positions
+    /// ([`unpack_positions`](Self::unpack_positions)), and a read or part
+    /// of at most [`UNPACK_ONE_BY_ONE`] values one by one. The patches in
+    /// range are then written over them ([`PatchProbe::overwrite`]), where
+    /// [`Self::value_at`] searches the patches once per value.
     fn read_into(&self, start: usize, out: &mut [u64]) {
         fn unpack_all<T>(node: &PackedNode<'_>, packed: &[T], start: usize, out: &mut [u64])
         where
-            T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64>,
+            T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
         {
-            for (k, o) in out.iter_mut().enumerate() {
-                *o = node.unpack(packed, node.offset + start + k);
+            let first = node.offset + start;
+            if out.len() <= UNPACK_ONE_BY_ONE {
+                for (k, o) in out.iter_mut().enumerate() {
+                    *o = node.unpack(packed, first + k);
+                }
+            } else if out.len() > unpack_crossover::<T>() {
+                node.unpack_long(packed, first, out);
+            } else {
+                for (c, part) in chunk_parts(first, first + out.len()) {
+                    let dst = &mut out[c * FL_CHUNK + part.start - first..][..part.len()];
+                    node.unpack_part(packed, c, part, dst);
+                }
             }
         }
         if self.bit_width == 0 {
@@ -258,30 +273,12 @@ impl PackedNode<'_> {
         where
             T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
         {
-            // A chunk of 1024 values packs into `width` bits apiece.
-            let words = 128 * node.bit_width / std::mem::size_of::<T>();
-            let (first, last) = (node.offset + start, node.offset + start + len);
+            let first = node.offset + start;
             let mut chunk = [T::default(); FL_CHUNK];
             let mut count = 0;
-            let mut c = first / FL_CHUNK;
-            while c * FL_CHUNK < last {
-                let lo = first.max(c * FL_CHUNK) - c * FL_CHUNK;
-                let hi = last.min((c + 1) * FL_CHUNK) - c * FL_CHUNK;
-                // SAFETY: the packed buffer holds `words` words for every
-                // chunk up to `(len + offset).div_ceil(1024)`, and `c` is
-                // below it as `c * 1024 < offset + len`.
-                unsafe {
-                    T::unchecked_unpack(
-                        node.bit_width,
-                        &packed[c * words..(c + 1) * words],
-                        &mut chunk,
-                    );
-                }
-                count += chunk[lo..hi]
-                    .iter()
-                    .filter(|&&v| v.into() == needle)
-                    .count();
-                c += 1;
+            for (c, part) in chunk_parts(first, first + len) {
+                node.unpack_chunk(packed, c, &mut chunk);
+                count += chunk[part].iter().filter(|&&v| v.into() == needle).count();
             }
             count
         }
@@ -310,33 +307,20 @@ impl PackedNode<'_> {
         ) where
             T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
         {
-            let words = 128 * node.bit_width / std::mem::size_of::<T>();
-            let (first, last) = (node.offset + start, node.offset + start + len);
+            let first = node.offset + start;
             let mut chunk = [T::default(); FL_CHUNK];
-            let mut c = first / FL_CHUNK;
-            while c * FL_CHUNK < last {
-                let lo = first.max(c * FL_CHUNK) - c * FL_CHUNK;
-                let hi = last.min((c + 1) * FL_CHUNK) - c * FL_CHUNK;
-                // SAFETY: as in `count_eq`, the packed buffer holds `words`
-                // words for every chunk up to `(len + offset).div_ceil(1024)`.
-                unsafe {
-                    T::unchecked_unpack(
-                        node.bit_width,
-                        &packed[c * words..(c + 1) * words],
-                        &mut chunk,
-                    );
-                }
-                // The chunk's position `lo + j` is the window's offset
-                // `c * 1024 + lo + j - first`.
-                let at = base + c * FL_CHUNK + lo - first;
+            for (c, part) in chunk_parts(first, first + len) {
+                node.unpack_chunk(packed, c, &mut chunk);
+                // The chunk's position `part.start + j` is the window's
+                // offset `c * 1024 + part.start + j - first`.
+                let at = base + c * FL_CHUNK + part.start - first;
                 out.extend(
-                    chunk[lo..hi]
+                    chunk[part]
                         .iter()
                         .enumerate()
                         .filter(|&(_, &v)| v.into() == needle)
                         .map(|(j, _)| at + j),
                 );
-                c += 1;
             }
         }
         debug_assert!(self.patches.is_none(), "a patched node finds by reading");
@@ -352,6 +336,111 @@ impl PackedNode<'_> {
             Words::U16(s) => push(self, s, window, out),
             Words::U32(s) => push(self, s, window, out),
             Words::U64(s) => push(self, s, window, out),
+        }
+    }
+
+    /// [`read_into`](Self::read_into)'s values at physical positions
+    /// `first..first + out.len()`, more than [`unpack_crossover`] of them: a
+    /// chunk the read takes more than the crossover of is unpacked whole and
+    /// widened, a smaller part unpacked at its positions. Out of line, so
+    /// the chunk's buffer is reserved only by reads that may fill it.
+    #[inline(never)]
+    fn unpack_long<T>(&self, packed: &[T], first: usize, out: &mut [u64])
+    where
+        T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
+    {
+        // Filled only when a part passes the crossover.
+        let mut chunk: Option<[T; FL_CHUNK]> = None;
+        for (c, part) in chunk_parts(first, first + out.len()) {
+            let dst = &mut out[c * FL_CHUNK + part.start - first..][..part.len()];
+            if part.len() > unpack_crossover::<T>() {
+                let chunk = chunk.get_or_insert_with(|| [T::default(); FL_CHUNK]);
+                self.unpack_chunk(packed, c, chunk);
+                for (o, &v) in dst.iter_mut().zip(&chunk[part]) {
+                    *o = v.into();
+                }
+            } else {
+                self.unpack_part(packed, c, part, dst);
+            }
+        }
+    }
+
+    /// The values at positions `part` of FastLanes chunk `c`, at most
+    /// [`unpack_crossover`] of them, widened into `dst`: one by one for at
+    /// most [`UNPACK_ONE_BY_ONE`], else at their positions in one batch.
+    fn unpack_part<T>(&self, packed: &[T], c: usize, part: std::ops::Range<usize>, dst: &mut [u64])
+    where
+        T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64>,
+    {
+        if part.len() <= UNPACK_ONE_BY_ONE {
+            for (o, i) in dst.iter_mut().zip(part) {
+                *o = self.unpack(packed, c * FL_CHUNK + i);
+            }
+        } else {
+            self.unpack_positions(packed, c, part, dst);
+        }
+    }
+
+    /// Unpack FastLanes chunk `c` of `packed` whole into `chunk`.
+    fn unpack_chunk<T>(&self, packed: &[T], c: usize, chunk: &mut [T; FL_CHUNK])
+    where
+        T: vortex_array::dtype::NativePType + fastlanes::BitPacking,
+    {
+        // A chunk of 1024 values packs into `bit_width` bits apiece.
+        let words = 128 * self.bit_width / std::mem::size_of::<T>();
+        // SAFETY: the slice is exactly one chunk's words, `chunk` holds 1024
+        // values, and `bit_width` fits `T` (both pinned at array
+        // construction). The slice's bounds are checked: the packed buffer
+        // holds `words` words for every chunk up to
+        // `(len + offset).div_ceil(1024)`, and callers pass a chunk that
+        // [`chunk_parts`] gave for positions below `offset + len`.
+        unsafe {
+            T::unchecked_unpack(self.bit_width, &packed[c * words..(c + 1) * words], chunk);
+        }
+    }
+
+    /// The values at positions `part` of FastLanes chunk `c`, at most
+    /// [`PART_MAX`] of them, widened into `dst`: fastlanes' batch unpack,
+    /// which dispatches on the bit width once for the part, where
+    /// [`Self::unpack`] dispatches once per value.
+    fn unpack_positions<T>(
+        &self,
+        packed: &[T],
+        c: usize,
+        part: std::ops::Range<usize>,
+        dst: &mut [u64],
+    ) where
+        T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64>,
+    {
+        use std::mem::MaybeUninit;
+        let n = part.len();
+        assert!(
+            n <= PART_MAX && dst.len() == n,
+            "a part of at most PART_MAX values"
+        );
+        let mut positions = [const { MaybeUninit::<usize>::uninit() }; PART_MAX];
+        for (slot, i) in positions.iter_mut().zip(part) {
+            slot.write(i);
+        }
+        // SAFETY: the loop above wrote the first `n` slots.
+        let positions: &[usize] =
+            unsafe { std::slice::from_raw_parts(positions.as_ptr().cast(), n) };
+        let mut values = [const { MaybeUninit::<T>::uninit() }; PART_MAX];
+        let words = 128 * self.bit_width / std::mem::size_of::<T>();
+        // SAFETY: as in `unpack_chunk`, the input is exactly one chunk's
+        // words and `bit_width` fits `T`; every position is below 1024, and
+        // the output holds one slot per position.
+        unsafe {
+            T::unchecked_unpack_indices(
+                self.bit_width,
+                &packed[c * words..(c + 1) * words],
+                positions,
+                &mut values[..n],
+            );
+        }
+        for (o, v) in dst.iter_mut().zip(&values[..n]) {
+            // SAFETY: the unpack wrote each of the first `n` slots.
+            *o = unsafe { v.assume_init() }.into();
         }
     }
 
@@ -374,6 +463,45 @@ impl PackedNode<'_> {
         .into()
     }
 }
+
+/// The FastLanes chunks that physical positions `first..last` touch: each
+/// chunk's index and the part of its 1024 positions in range.
+fn chunk_parts(first: usize, last: usize) -> impl Iterator<Item = (usize, std::ops::Range<usize>)> {
+    (first / FL_CHUNK..last.div_ceil(FL_CHUNK)).map(move |c| {
+        let at = c * FL_CHUNK;
+        (c, first.max(at) - at..last.min(at + FL_CHUNK) - at)
+    })
+}
+
+/// The most values of one FastLanes chunk that a bulk read unpacks at their
+/// positions, per stored word width: past it, unpacking the whole chunk
+/// costs no more per value. Measured with the probe bench's `read_into_*`
+/// arms, on columns packed at 7, 13, 20 and 20 bits.
+const fn unpack_crossover<T>() -> usize {
+    match std::mem::size_of::<T>() {
+        1 => 16,
+        2 => 32,
+        4 => 96,
+        _ => 128,
+    }
+}
+
+/// The most values a bulk read unpacks one by one, from a chunk or in all:
+/// below about seven, fastlanes' batch unpack
+/// ([`PackedNode::unpack_positions`]) costs more to set up than its single
+/// bit-width dispatch saves. Measured with the probe bench's `read_into_*`
+/// arms at 2, 4 and 8 values.
+const UNPACK_ONE_BY_ONE: usize = 6;
+
+/// The largest [`unpack_crossover`]: the most positions a bulk read unpacks
+/// from one chunk.
+const PART_MAX: usize = unpack_crossover::<u64>();
+
+const _: () = assert!(
+    unpack_crossover::<u8>() <= PART_MAX
+        && unpack_crossover::<u16>() <= PART_MAX
+        && unpack_crossover::<u32>() <= PART_MAX
+);
 
 /// One node of the resolved probe tree, a variant per supported encoding.
 /// Children are resolved with their parent
