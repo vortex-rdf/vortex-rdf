@@ -175,9 +175,9 @@ a probe. One query, on a 4-core VM:
 
 | Fixture | Probe | Vortex, typed | Vortex, `Scalar` | `partition_point` on decoded values |
 |---|---|---|---|---|
-| `runend_2m` | 0.05 µs | 6.1 ms | 6.0 ms | 0.18 µs |
-| `for_bitpacked_2m` | 0.29 µs | 342 µs | 335 µs | 0.18 µs |
-| `dict_2m` | 0.49 µs | 10.4 µs | 8.8 µs | 0.28 µs |
+| `runend_2m` | 0.04 µs | 4.7 ms | 4.8 ms | 0.21 µs |
+| `for_bitpacked_2m` | 0.25 µs | 268 µs | 270 µs | 0.19 µs |
+| `dict_2m` | 0.47 µs | 9.2 µs | 7.7 µs | 0.17 µs |
 
 ```console
 cargo bench -p vortex-rdf-encoded-search --bench probe

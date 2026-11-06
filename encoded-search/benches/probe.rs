@@ -157,11 +157,11 @@ fn bounds_vortex_scalar(bencher: Bencher, shape: &str) {
     let session = common::session();
     bencher.counter(ItemsCount::new(probes.len())).bench(|| {
         let mut ctx = session.create_execution_ctx();
+        let sorted = SearchSortedArray::new(&fixture.encoded, &mut ctx);
         probes
             .iter()
             .map(|&c| {
                 let scalar = Scalar::from(c);
-                let sorted = SearchSortedArray::new(&fixture.encoded, &mut ctx);
                 let lo = sorted
                     .search_sorted(&scalar, SearchSortedSide::Left)
                     .unwrap()
