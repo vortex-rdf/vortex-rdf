@@ -20,7 +20,6 @@ use std::sync::{Arc, OnceLock};
 
 use vortex_array::arrays::{Dict, PrimitiveArray};
 use vortex_array::dtype::DType;
-use vortex_array::serde::SerializedArray;
 use vortex_array::{Array, ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_error::{VortexExpect as _, VortexResult};
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
@@ -833,25 +832,34 @@ fn collect_leaves(
 }
 
 /// Fetch a flat leaf's segment and rebuild its array in the wire encoding:
-/// metadata over the segment buffers, nothing decompressed. `session` must
-/// register the encodings the leaf was written with.
+/// metadata over the segment buffers, nothing decompressed. The leaf is read
+/// by Vortex's own flat reader, its whole array projected unfiltered, as
+/// Vortex's dictionary reader loads a leaf. `session` must register the
+/// encodings the leaf was written with.
 ///
 /// # Errors
 /// The segment request's error; the decode's, for a segment that does not
 /// hold the leaf's array or an encoding `session` does not register; and a
-/// row count past what a `usize` holds.
+/// row count past what a `usize` holds (where the reader would panic).
 pub async fn fetch_flat(
     flat: &FlatLayout,
     source: &Arc<dyn SegmentSource>,
     session: &VortexSession,
 ) -> VortexResult<ArrayRef> {
-    let segment = source.request(flat.segment_id()).await?;
-    let parts = match flat.array_tree().cloned() {
-        Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment)?,
-        None => SerializedArray::try_from(segment)?,
-    };
-    let row_count = usize::try_from(flat.row_count())?;
-    parts.decode(flat.dtype(), row_count, flat.array_ctx(), session)
+    let rows = usize::try_from(flat.row_count())?;
+    let reader = flat.new_reader(
+        Arc::from("leaf"),
+        Arc::clone(source),
+        session,
+        &Default::default(),
+    )?;
+    reader
+        .projection_evaluation(
+            &(0..flat.row_count()),
+            &vortex_array::expr::BoundExpression::new_root(flat.dtype().clone()),
+            vortex_array::MaskFuture::new_true(rows),
+        )?
+        .await
 }
 
 /// The most values a dictionary leaf holds for [`ColumnChunks::count_eq`] to
