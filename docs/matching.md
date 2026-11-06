@@ -468,7 +468,7 @@ the view's tail and indexes.
 Then the **zone classes** narrow the rows to compare. An in-memory base keeps
 a Vortex zone map of each code column's 8,192-row zones, their exact bounds,
 and for the graph column the graphs each zone records with their rows
-([`QuadZones`](../core/src/store/zones.rs#L33)), as a file store's located runs
+([`QuadZones`](../core/src/store/zones.rs#L34)), as a file store's located runs
 read them: taken in the pass that compresses a build's codes (the graphs with
 Vortex's accumulator of `vortexrdf.value_counts`), or read from the zone
 tables of the file a store is loaded from (`from_file_in_memory`,
@@ -498,7 +498,7 @@ left pending (below) keeps its classes, and counts and windows by them.
 With zones off (`VORTEX_RDF_ZONES=0`) the residual keeps its route from before
 the classes, bounds only: the zones whose bounds leave a constrained
 column's code out are left out
-([`kept_runs`](../core/src/store/zones.rs#L125)), when what is left holds at
+([`kept_runs`](../core/src/store/zones.rs#L126)), when what is left holds at
 most half the base: a run of rows (every row, or a subject's range) is
 compared zone run by zone run, each a slice of the base through the mask
 scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L783)), and an
