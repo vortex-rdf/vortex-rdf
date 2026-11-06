@@ -10,13 +10,37 @@ use super::residual_zones::{LAYOUTS, answers, quads_of, tailed, tombstoned};
 use super::*;
 use crate::io::zone_map::ZONE_ROWS;
 use crate::store::test_hooks::ForcedZones;
+use crate::store::{Keep, QuadColumn};
 
 /// The probes an index run answers, by graph: `(? type ? g)`,
 /// `(? type Taxon g)` and `(? ? Taxon g)`, for the default graph and graphs
-/// 1 to 3 (a graph the store lacks matches nothing).
+/// 1 to 3 (a graph the store lacks matches nothing); and one-row runs,
+/// `(? link "o{i}" g)` and `(? ? "o{i}" g)` for graphs 1 and 2, at rows
+/// that start, end or sit inside zones (the `link` run is rows `0..RUN` of
+/// `index:posg`, the objects `"o{i}"` rows `RUN..2 * RUN` of `index:ospg` and
+/// `index:ref-o`, the last of them the component's last row).
 fn component_probes() -> Vec<(String, Probe)> {
     let taxon = plain_literal("Taxon");
     let mut probes = Vec::new();
+    for i in [960, 8_191, 8_192, RUN - 1] {
+        let object = plain_literal(&format!("o{i:05}"));
+        for k in [1, 2] {
+            let g = numbered_graph(k);
+            probes.push((
+                format!("(? link o{i} g{k})"),
+                Probe::new(
+                    None,
+                    Some(iri("link")),
+                    Some(object.clone()),
+                    Some(g.clone()),
+                ),
+            ));
+            probes.push((
+                format!("(? ? o{i} g{k})"),
+                Probe::new(None, None, Some(object.clone()), Some(g)),
+            ));
+        }
+    }
     for k in 0..=3 {
         let g = numbered_graph(k);
         probes.push((
@@ -198,7 +222,9 @@ async fn component_windows_jump_by_zone_counts() {
 /// `(? type ? g1)` by copy on `Graphs::Stretches`, the `type` run's objects
 /// in the reverse of its subjects' order: `index:posg` lists the run by
 /// object, so its rows do not ascend, and the checked run still answers in
-/// base order, its counts, windows and rows as with zones off.
+/// base order, its counts, windows and rows as with zones off. A window with
+/// no limit and a kept window reach every match, so they check the run
+/// inside the component and take their rows from its sorted ids.
 #[tokio::test]
 async fn copy_pg_answers_in_base_order() {
     let quads: Vec<Quad> = zone_quads(Graphs::Stretches)
@@ -216,27 +242,57 @@ async fn copy_pg_answers_in_base_order() {
         .collect();
     let store = built_store(quads, LayoutStrategy::Dictionary, IndexConfig::Copy.types()).await;
     let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
+    let wide = probe.clone().window(RUN / 8, None);
+    let kept = probe
+        .clone()
+        .keep(QuadColumn::O, Keep::range(0..TermCode::MAX))
+        .window(RUN / 8, Some(64));
     let read = |on: bool| {
-        let (store, probe) = (&store, &probe);
+        let (store, probe, wide, kept) = (&store, &probe, &wide, &kept);
         async move {
             let _zones = ForcedZones::set(on);
-            let rec = Recorder::start();
             let answered = answers(store, probe).await;
-            let view = store.run_probe(probe).await.unwrap();
-            let checked = rec.count_where(|e| matches!(e, Event::ComponentChecked(_)));
-            (answered, row_list(&view).await, checked)
+            // Each read, and how many zones it checked inside the component.
+            let mut rec = Recorder::start();
+            let mut reads = Vec::new();
+            for read in [probe, wide, kept] {
+                let rows = row_list(&store.run_probe(read).await.unwrap()).await;
+                let checked = rec
+                    .take()
+                    .iter()
+                    .filter(|e| matches!(e, Event::ComponentChecked(_)))
+                    .count();
+                reads.push((rows, checked));
+            }
+            let count = store.count_probe(kept).await.unwrap();
+            (answered, reads, count)
         }
     };
-    let (on, on_rows, checked) = read(true).await;
-    let (off, off_rows, unchecked) = read(false).await;
-    assert_eq!(on_rows.len(), RUN / 4, "graph 1's rows");
+    let (on, on_reads, on_count) = read(true).await;
+    let (off, off_reads, off_count) = read(false).await;
     assert_eq!(on, off, "counts, windows and rows, as with zones off");
-    assert_eq!(on_rows, off_rows);
-    let mut sorted = on_rows.clone();
-    sorted.sort_unstable();
-    assert_eq!(on_rows, sorted, "base row order");
-    assert!(checked > 0, "checked inside the component with zones on");
-    assert_eq!(unchecked, 0, "compared at base rows with zones off");
+    assert_eq!(on_count, off_count, "the kept window's count");
+    let lens = [RUN / 4, RUN / 4 - RUN / 8, 64];
+    for (((label, len), (on_rows, checked)), (off_rows, unchecked)) in ["rows", "wide", "kept"]
+        .into_iter()
+        .zip(lens)
+        .zip(&on_reads)
+        .zip(&off_reads)
+    {
+        assert_eq!(on_rows.len(), len, "{label}: graph 1's rows");
+        assert_eq!(on_rows, off_rows, "{label}: as with zones off");
+        let mut sorted = on_rows.clone();
+        sorted.sort_unstable();
+        assert_eq!(on_rows, &sorted, "{label}: base row order");
+        assert!(
+            *checked > 0,
+            "{label}: checked inside the component with zones on"
+        );
+        assert_eq!(
+            *unchecked, 0,
+            "{label}: compared at base rows with zones off"
+        );
+    }
 }
 
 /// Components without a graph zone map (a Default-layout store's), and

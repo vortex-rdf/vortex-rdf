@@ -402,14 +402,16 @@ scattered over the base:
   (`eq_offsets`: a dictionary's codes against the graph's code).
 
 The resolution reports the graph resolved (`Resolved::graph`), so nothing is
-left to compare it on, and the run's ids are its matching rows. A count adds
-the zones' counts and decodes no id. A window of a run whose ids ascend (by
+left to compare it on, and the run's ids are its matching rows. Without
+tombstones a count adds the zones' counts and decodes no id; under them it
+counts the matching ids left live. A window of a run whose ids ascend (by
 reference) skips the zones before it by their counts and reads only the
 zones it spans. A run whose ids follow its copy's order (by copy) is checked
-only when counted or read whole, its matching ids sorted into base order: a
-window of it (`IdsNeed::CountOrWindow`) leaves the graph to stage 3, whose
-zones over the run's ids in base order reach the window without finding
-every match first. A checked run carries no serve plan, as its rows are only
+only when the view reaches every match (counted, read whole, a window with
+no limit, keeps), its matching ids sorted into base order: a window with a
+limit, or a capped count (`IdsNeed::CountOrWindow` reaching fewer than every
+row), leaves the graph to stage 3, whose zones over the run's ids in base
+order reach the window without finding every match first. A checked run carries no serve plan, as its rows are only
 part of the run, and a graph absent from the dictionary answers `Empty`.
 Without the zone map (the string layouts) or with zones off, the graph is
 left to stage 3.
