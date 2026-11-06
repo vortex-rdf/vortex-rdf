@@ -257,7 +257,10 @@ impl GraphCheck {
             return Ok((Buffer::empty(), self.count()?));
         }
         let kept = self.counts.get();
-        let mut ids = BufferMut::with_capacity(limit);
+        // The run's matches bound the window, whatever its limit (`usize::MAX`
+        // for none).
+        let most = kept.map_or(self.rows.len(), |counts| counts.iter().sum());
+        let mut ids = BufferMut::with_capacity(limit.min(most));
         let mut before = 0;
         for (at, (zone, part)) in self.parts().enumerate() {
             if ids.len() == limit {

@@ -78,6 +78,13 @@ pub(super) async fn answers(store: &VortexRdfStore, probe: &Probe) -> Answers {
             windows.push(quads_of(&store.run_probe(&window).await.unwrap()).await);
         }
     }
+    // An offset with no limit: every match past it.
+    let rest = Probe {
+        offset: count / 2,
+        limit: None,
+        ..probe.clone()
+    };
+    windows.push(quads_of(&store.run_probe(&rest).await.unwrap()).await);
     let rows = quads_of(&store.run_probe(probe).await.unwrap()).await;
     Answers {
         count,
