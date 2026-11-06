@@ -1640,6 +1640,150 @@ fn checked_run_sg(bencher: divan::Bencher, read: &CheckedRead) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// Group 4g — GRAPH ZONES (graph-bound general matches)
+//
+// A graph-bound pattern that no index serves goes through the general match:
+// a filtered scan whose zones Vortex prunes with each zone's statistics. In
+// the match matrix's dataset every zone holds every graph, so there is
+// nothing to prune by graph. Here each 8,192-row zone holds 8 of 64 graphs,
+// in turn row by row, and the graphs' codes are scattered over the
+// zones: a zone's minimum and maximum graph span almost the whole range, so
+// bounds alone prune almost nothing, where the graphs a zone holds would keep
+// only the zone of the bound graph.
+//
+// One Dictionary file without an index, written as the CLI writes one:
+// 65,536 quads `(s, type, Taxon, g)`, one per subject. Each cell times one
+// read of a store opened before timing: the count of `(? ? ? g)`, its rows
+// gathered, and the count of `(? type ? g)`, two conjuncts.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Rows of the graph-zones file: 8 zones of 8,192 rows.
+const GRAPH_ZONES_ROWS: usize = 65_536;
+
+/// Rows of each zone of the graph-zones file.
+const GRAPH_ZONE_ROWS: usize = 8_192;
+
+/// Graphs each zone of the graph-zones file holds, in turn row by row.
+const GRAPHS_PER_ZONE: usize = 8;
+
+/// The graph slot the graph-zones cells bind: zone 3's fourth graph.
+const BOUND_SLOT: usize = 27;
+
+/// The rows the bound graph holds: every 8th row of its zone.
+const BOUND_ROWS: usize = GRAPH_ZONE_ROWS / GRAPHS_PER_ZONE;
+
+/// The graph-zones file's IRI named `name`.
+fn zones_iri(name: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("http://example.org/zones/{name}"))
+}
+
+/// The graph of slot `k` (zone `k / 8`'s graph `k % 8`), labelled
+/// `(k * 37) % 64`: a permutation of the 64 labels that scatters their
+/// codes over the zones.
+fn slot_graph(k: usize) -> GraphName {
+    GraphName::NamedNode(zones_iri(&format!("g{:02}", (k * 37) % 64)))
+}
+
+/// The graph of row `i`: its zone's 8 graphs in turn.
+fn row_graph(i: usize) -> GraphName {
+    slot_graph(i / GRAPH_ZONE_ROWS * GRAPHS_PER_ZONE + i % GRAPHS_PER_ZONE)
+}
+
+/// The graph-zones file, written once per process under
+/// `target/bench_vortex_files` by the writer the CLI and the bindings use.
+fn graph_zones_file() -> PathBuf {
+    static FILE: OnceLock<PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let dir = PathBuf::from("target/bench_vortex_files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("graph_zones.vortex");
+        let quads: Vec<RawQuad> = (0..GRAPH_ZONES_ROWS)
+            .map(|i| {
+                let subject = zones_iri(&format!("s{i:05}"));
+                let graph = row_graph(i);
+                let quad = Quad::new(subject, zones_iri("type"), zones_iri("Taxon"), graph);
+                RawQuad::from_quad(&quad)
+            })
+            .collect();
+        let quads = stream::iter(quads.into_iter().map(Ok));
+        rt().block_on(async {
+            io::quads_stream_to_vortex_file(
+                quads,
+                &path,
+                LayoutStrategy::Dictionary,
+                Index::None.types(),
+            )
+            .await
+            .expect("write the graph-zones file");
+        });
+        path
+    })
+    .clone()
+}
+
+/// One read of a graph-bound general match.
+#[derive(Copy, Clone)]
+enum GraphZonesRead {
+    /// `(? ? ? g)`'s `size`.
+    Count,
+    /// `(? ? ? g)`'s rows, gathered (`code_columns_gathered`).
+    Rows,
+    /// `(? type ? g)`'s `size`.
+    PgCount,
+}
+
+impl fmt::Debug for GraphZonesRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Count => "count",
+            Self::Rows => "rows",
+            Self::PgCount => "pg_count",
+        })
+    }
+}
+
+/// The reads timed on the graph-zones file.
+const GRAPH_ZONES_READS: &[GraphZonesRead] = &[
+    GraphZonesRead::Count,
+    GraphZonesRead::Rows,
+    GraphZonesRead::PgCount,
+];
+
+impl GraphZonesRead {
+    /// This read on `store`, as the rows it matches.
+    async fn rows(self, store: &VortexRdfStore) -> usize {
+        let graph = slot_graph(BOUND_SLOT);
+        let predicate = zones_iri("type");
+        let predicate = matches!(self, Self::PgCount).then_some(&predicate);
+        let view = store
+            .match_pattern(None, predicate, None, Some(&graph))
+            .await
+            .expect("match");
+        match self {
+            Self::Count | Self::PgCount => view.size().await.expect("size"),
+            Self::Rows => gathered_rows(&view).await,
+        }
+    }
+}
+
+/// One graph-zones cell: `read` on the graph-zones file, opened before
+/// timing. The setup panics unless the read matches the bound graph's
+/// stretch.
+#[divan::bench(args = GRAPH_ZONES_READS, sample_count = QUERY_SAMPLES)]
+fn graph_zones(bencher: divan::Bencher, read: &GraphZonesRead) {
+    let path = graph_zones_file();
+    let store = rt().block_on(async {
+        VortexRdfStore::from_file(path)
+            .await
+            .expect("open the graph-zones file")
+    });
+    let read = *read;
+    let rows = rt().block_on(read.rows(&store));
+    assert_eq!(rows, BOUND_ROWS, "graph_zones/{read:?}: wrong row count");
+    bencher.bench(|| black_box(rt().block_on(read.rows(&store))));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // Group 5 — MUTATE (append / delete / compact)
 //
 // Mutations are copy-on-write: appends accrete in an in-memory tail, deletes
