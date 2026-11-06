@@ -10,5 +10,5 @@ __pycache__/
 *.pyc
 *.so
 
-# Superpowers implementation plans are working files, never committed
-/docs/superpowers/plans/
+# Superpowers specs and plans are working files, never committed
+/docs/superpowers/
