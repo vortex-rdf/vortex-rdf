@@ -273,8 +273,8 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L448), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L222) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L444) | [§6.3](#63-residual-column-filtering) |
+| 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L448), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L564) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:152-159`](../core/src/store/query/matching/memory.rs#L152-L159 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -418,7 +418,7 @@ zone maps are taken (below; a loaded store's are its file's footer
 statistics). Vortex's falsifier of a constrained column's `x = c` holding on
 them leaves the selection no row, and its satisfier holding drops the
 equality from the compare; with none left the selection is the answer,
-compared nowhere ([`ask_statistics`](../core/src/store/scan/residual.rs#L67)).
+compared nowhere ([`ask_statistics`](../core/src/store/scan/residual.rs#L68)).
 On a one-graph store a graph equality settles this way. The view still counts
 as narrowed by the residual, so a serve plan is dropped as a compare drops it
 and its rows read in base order, and a selection the statistics empty keeps
@@ -435,14 +435,14 @@ tables of the file a store is loaded from (`from_file_in_memory`,
 columns of the Default and TypedObject layouts) skips this step. Over a
 selection wider than a zone, the zones it touches are classed once against
 the equalities left, by the same proofs on each bound column's zone map
-([`ResidualZones`](../core/src/store/scan/residual.rs#L135), through the
+([`ResidualZones`](../core/src/store/scan/residual.rs#L136), through the
 located runs' zone decider): "none" where a falsifier holds or the recorded
 graphs lack the code, "all" where every satisfier holds, mixed otherwise.
 The selection's rows in "none" zones are skipped, those in "all" zones are
 taken uncompared, and those in a mixed zone are compared on the columns it
 leaves unsettled only, adjacent zones of one treatment as one run, through
 the implementations below
-([`residual_rows`](../core/src/store/scan/residual.rs#L281)). A range starting
+([`residual_rows`](../core/src/store/scan/residual.rs#L407)). A range starting
 mid-zone or an id list is classed on the zones it touches, each cut at the
 zone boundaries. A residual left pending (below) keeps its classes for every
 piece it compares.
@@ -453,7 +453,7 @@ column's `x = c` holds on the zone bounds are left out
 ([`kept_runs`](../core/src/store/zones.rs#L131)), when what is left holds at
 most half the base: a run of rows (every row, or a subject's range) is
 compared zone run by zone run, each a slice of the base through the mask
-scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L417)), and an
+scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L537)), and an
 id list keeps only its ids in those runs before the implementations below
 compare them. A code most zones may hold (a predicate or graph spread over
 every zone) leaves everything to compare.
@@ -506,14 +506,24 @@ selection (`ViewSelection::Residual`), as a deferred index run's ids are. `size_
 selection in pieces, in base row order, a zone's rows first and four times as
 many each piece after, each through the zone bounds and the implementations
 above, and stop at the piece that brings the live rows they need to their
-count ([`prefix`](../core/src/store/view/pending.rs#L162)); a selection no
+count ([`prefix`](../core/src/store/view/pending.rs#L175)); a selection no
 wider than that count is one piece. A compare that runs to the end keeps its
 matches as the view's ids, and any other consumer compares the whole
-selection at once. A count without a limit, a window that reaches every row,
-a probe with keeps and `match_pattern` compare eagerly, as above. An ASK over
-a pattern every zone holds then compares the first piece, not the store, and
-the first piece is above the typed residual's caps, so the mask scan compares
-it.
+selection at once. A window that reaches every row, a probe with keeps and
+`match_pattern` compare eagerly, as above. An ASK over a pattern every zone
+holds then compares the first piece, not the store, and the first piece is
+above the typed residual's caps, so the mask scan compares it.
+
+A count without a limit (`IdsNeed::Count`: `size` through `count_probe` and
+`count_code_pattern`) leaves the compare pending too, and counts it zone by
+zone on its zone classes, with no match materialized
+([`zoned_count`](../core/src/store/scan/residual.rs#L259)): a "none" zone
+counts nothing, an "all" zone its selected live rows, and a mixed zone with
+one column left to compare and no tombstone among its selected rows counts
+from the zone's recorded graphs when the selection holds the whole zone,
+else on the column's encoding over contiguous rows (the store's probe's
+`count_eq`); any other zone is compared. Under tombstones a pending residual
+counts the same way where a count is asked without reading.
 
 **Examples** (no index unless stated):
 
@@ -625,7 +635,7 @@ Each stage in the code, and where the details are below:
 | 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L224), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L473) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`file.rs:22-91`](../core/src/store/query/matching/file.rs#L22-L91 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L222) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`file.rs:171-186`](../core/src/store/query/matching/file.rs#L171-L186 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L205) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -1044,7 +1054,7 @@ or a stream reads its graph column.
   (`ViewSelection::Pending`'s `matches`; a narrower run costs less to compute than
   the pattern's terms cost to copy, `CHAIN_MIN_ROWS`). A match chained on such
   a view is **one match of both patterns** over every base row
-  ([`match_both`](../core/src/store/query/matching/mod.rs#L172)): the pending ids
+  ([`match_both`](../core/src/store/query/matching/mod.rs#L183)): the pending ids
   are never computed, and two roles one index orders together are one run of
   it. A view built for its rows gets the ids in base order with no serve plan,
   as a chained match on an un-narrowed view leaves them; one only counted or
@@ -1194,11 +1204,11 @@ file run) and a rid-only scan of the index child otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching/mod.rs`](../core/src/store/query/matching/mod.rs#L249) | an already-narrowed view below this skips index routing |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching/mod.rs`](../core/src/store/query/matching/mod.rs#L260) | an already-narrowed view below this skips index routing |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L216) | selection size above which the typed row loop declines to the vectorized mask scan for a lone residual equality |
 | `TYPED_PROBE_MAX_ROWS` | 256 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L225) | the same for any set that binds a column through an encoded-search probe, read a row at a time: the mask scan costs less from about 256 rows of a range and 512 of scattered ids |
 | `FIRST_PIECE_ROWS` | 8192 | [`pieces.rs`](../core/src/store/scan/pieces.rs#L14) | the first piece of a residual compare left pending for a count or a window, and of a file filter's early-exit loop, each piece after four times the one before; a selection this wide or narrower is compared eagerly |
-| `CHAIN_MIN_ROWS` | 1024 | [`matching/mod.rs`](../core/src/store/query/matching/mod.rs#L243) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
+| `CHAIN_MIN_ROWS` | 1024 | [`matching/mod.rs`](../core/src/store/query/matching/mod.rs#L254) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
 `POINT_IDS_PER_SPLIT`, `TAKE_ROWS`) are in [file-format.md §11](file-format.md#11-constants).

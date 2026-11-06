@@ -40,20 +40,31 @@ pub(crate) enum IdsNeed {
     /// residual compare over more rows than `reach` is left pending, compared
     /// only as far as the count or the window reaches ([`PendingResidual`]).
     CountOrWindow { reach: usize },
+    /// The view is only counted in full (`size`): as
+    /// [`CountOrWindow`](Self::CountOrWindow) reaching every row, but an
+    /// in-memory residual compare is left pending too, so its count is
+    /// taken zone by zone and never materializes its ids
+    /// ([`PendingResidual::count`]).
+    Count,
 }
 
 impl IdsNeed {
     /// Whether the view is only counted, windowed or kept.
     pub(crate) fn counts_or_windows(self) -> bool {
-        matches!(self, IdsNeed::CountOrWindow { .. })
+        matches!(self, IdsNeed::CountOrWindow { .. } | IdsNeed::Count)
     }
 
     /// Whether a residual compare over `rows` selected rows is left pending
-    /// ([`PendingResidual`]): only a count or a window that needs fewer rows
-    /// than the selection holds can stop early, and only over more rows than
-    /// the first piece holds.
+    /// ([`PendingResidual`]): a count, or a window that needs fewer rows than
+    /// the selection holds, and only over more rows than the first piece
+    /// holds.
     fn defers_residual(self, rows: usize) -> bool {
-        matches!(self, IdsNeed::CountOrWindow { reach } if reach < rows) && rows > FIRST_PIECE_ROWS
+        let short = match self {
+            IdsNeed::Rows => false,
+            IdsNeed::CountOrWindow { reach } => reach < rows,
+            IdsNeed::Count => true,
+        };
+        short && rows > FIRST_PIECE_ROWS
     }
 }
 

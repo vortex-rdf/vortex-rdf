@@ -263,28 +263,41 @@ async fn a_pending_compare_counts_only_live_rows() {
     }
 }
 
-/// A count or a window that reaches every row the selection holds compares
-/// the residual eagerly, as do a probe with keeps, a window with no limit
-/// and every match a caller reads row by row; and so does a selection no
-/// wider than the first piece.
+/// A capped count or a window that reaches every row the selection holds
+/// compares the residual eagerly, as do a probe with keeps, a window with no
+/// limit and every match a caller reads row by row; and so does a selection
+/// no wider than the first piece. A count with no limit leaves it pending
+/// instead, counted by its zones with no row compared and no match
+/// materialized.
 #[tokio::test]
 async fn a_count_or_window_reaching_every_row_compares_eagerly() {
     let (_dir, stores) = residual_stores().await;
     let p0 = probe(Some("p0"), None);
     let p0_rows = ROWS.div_ceil(3);
     for (label, store) in &stores {
-        let deferred = Recorder::start();
         let count = |probe: Probe| async move { store.count_probe(&probe).await.unwrap() };
+        let counted = Recorder::start();
         assert_eq!(count(p0.clone()).await, p0_rows, "{label}: no limit");
-        assert_eq!(
-            count(p0.clone().window(0, Some(ROWS))).await,
-            p0_rows,
-            "{label}: a limit of every row"
-        );
         assert_eq!(
             count(p0.clone().window(3, None)).await,
             p0_rows - 3,
             "{label}: an offset alone"
+        );
+        assert_eq!(
+            counted.count(&Event::ResidualDeferred),
+            2,
+            "{label}: counts with no limit left pending"
+        );
+        assert_eq!(
+            counted.count_where(|e| matches!(e, Event::ResidualCompared(_))),
+            0,
+            "{label}: counted by zones"
+        );
+        let deferred = Recorder::start();
+        assert_eq!(
+            count(p0.clone().window(0, Some(ROWS))).await,
+            p0_rows,
+            "{label}: a limit of every row"
         );
         assert_eq!(
             count(p0.clone().window(3, Some(ROWS - 3))).await,

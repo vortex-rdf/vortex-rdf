@@ -20,6 +20,7 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_mask::Mask;
 use web_time::Instant;
 
 use crate::debug;
@@ -213,18 +214,26 @@ impl ResidualZones {
         }
     }
 
+    /// The zones `rows` touches, in order, each with its rows within
+    /// `rows` and its treatment.
+    fn zones_of(&self, rows: Range<u64>) -> impl Iterator<Item = (u64, Range<u64>, Treatment)> {
+        let zone_len = self.decider.zone_len();
+        let zones = match rows.is_empty() {
+            true => 0..0,
+            false => rows.start / zone_len..(rows.end - 1) / zone_len + 1,
+        };
+        zones.map(move |zone| {
+            let zone_rows = self.decider.zone_rows(zone);
+            let part = zone_rows.start.max(rows.start)..zone_rows.end.min(rows.end);
+            (zone, part, self.treatment(zone))
+        })
+    }
+
     /// `rows` cut at zone boundaries, each part with its zone's
     /// treatment, adjacent parts of one treatment joined, in order.
     fn segments(&self, rows: Range<u64>) -> Vec<(Range<u64>, Treatment)> {
         let mut segments: Vec<(Range<u64>, Treatment)> = Vec::new();
-        if rows.is_empty() {
-            return segments;
-        }
-        let zone_len = self.decider.zone_len();
-        for zone in rows.start / zone_len..=(rows.end - 1) / zone_len {
-            let zone_rows = self.decider.zone_rows(zone);
-            let part = zone_rows.start.max(rows.start)..zone_rows.end.min(rows.end);
-            let treatment = self.treatment(zone);
+        for (_, part, treatment) in self.zones_of(rows) {
             match segments.last_mut() {
                 Some((run, joined)) if *joined == treatment && run.end == part.start => {
                     run.end = part.end;
@@ -234,6 +243,123 @@ impl ResidualZones {
         }
         segments
     }
+
+    /// The slot of equality `eq` (by place in the residual's), where a zone
+    /// map speaks for it.
+    fn slot_of(&self, eq: usize) -> Option<usize> {
+        self.by_slot.iter().position(|&index| index == Some(eq))
+    }
+}
+
+/// How many live rows of `selection` (of `memory`'s base, `deleted`
+/// tombstoned) match every equality of `eqs`, by the residual's zone
+/// classes, zone by zone and with no match materialized: none in a "none"
+/// zone, the selected live rows of an "all" zone, a mixed zone's counted
+/// unread where it can be ([`counted_unread`]), and the rest compared.
+pub(crate) fn zoned_count(
+    memory: &MemoryBase,
+    selection: &RowSelection,
+    eqs: &[(&'static str, Scalar)],
+    zones: &ResidualZones,
+    deleted: Option<&Mask>,
+) -> Result<usize> {
+    let base_len = memory.base.len();
+    let rows = selection.as_rows(base_len);
+    let Some(span) = span(&rows) else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    for (zone, run, treatment) in zones.zones_of(span) {
+        let part = part_of(&rows, run);
+        let selected = part.len(base_len);
+        if selected == 0 {
+            continue;
+        }
+        count += match treatment {
+            Treatment::Skip => 0,
+            Treatment::Take => {
+                observe!(ResidualZoneTaken(selected as u64));
+                live_rows(&part, deleted, base_len)
+            }
+            Treatment::Compare(bits) => {
+                match counted_unread(memory, zones, zone, &part, eqs, bits, deleted)? {
+                    Some(matches) => matches,
+                    None => {
+                        let unsettled = picked(eqs, bits);
+                        let matched = compared(memory, part, &unsettled, None)?;
+                        live_rows(&matched, deleted, base_len)
+                    }
+                }
+            }
+        };
+    }
+    Ok(count)
+}
+
+/// The matches of mixed zone `zone`'s selected rows `part`, counted unread
+/// where its one equality left to compare (`bits`) allows and no selected
+/// row is tombstoned: the zone's recorded count of the code when the
+/// selection holds the whole zone ([`ZoneDecider::recorded_count`]), else
+/// the column's encoding counted over the selected rows when they are
+/// contiguous (`count_eq`, through the store's probe of the column). `None`
+/// when neither applies.
+fn counted_unread(
+    memory: &MemoryBase,
+    zones: &ResidualZones,
+    zone: u64,
+    part: &RowSelection,
+    eqs: &[(&'static str, Scalar)],
+    bits: u32,
+    deleted: Option<&Mask>,
+) -> Result<Option<usize>> {
+    let base_len = memory.base.len();
+    if bits.count_ones() != 1 || deleted.is_some_and(|d| tombstoned(part, d, base_len) > 0) {
+        return Ok(None);
+    }
+    let eq = bits.trailing_zeros() as usize;
+    let (field, value) = &eqs[eq];
+    let Some(code) = unsigned_value(value) else {
+        return Ok(None);
+    };
+    let zone_rows = zones.decider.zone_rows(zone);
+    let whole = part.len(base_len) as u64 == zone_rows.end - zone_rows.start;
+    if whole
+        && let Some(slot) = zones.slot_of(eq)
+        && let Some(matches) = zones.decider.recorded_count(slot, zone)
+    {
+        observe!(ZoneRecorded(zone_rows.end - zone_rows.start));
+        return Ok(Some(matches as usize));
+    }
+    let SelectedRows::Run(run) = part.as_rows(base_len) else {
+        return Ok(None);
+    };
+    let Some(column) = memory.probes.by_name(&memory.base, field).flatten() else {
+        return Ok(None);
+    };
+    observe!(ZoneCounted(run.len() as u64));
+    Ok(Some(column.probe().count_eq(run.start, run.len(), code)))
+}
+
+/// The equalities of `eqs` whose bits `bits` sets, in order.
+fn picked(eqs: &[(&'static str, Scalar)], bits: u32) -> Vec<(&'static str, Scalar)> {
+    eqs.iter()
+        .enumerate()
+        .filter(|(i, _)| bits & (1 << i) != 0)
+        .map(|(_, eq)| eq.clone())
+        .collect()
+}
+
+/// How many of `selection`'s rows `deleted` tombstones.
+fn tombstoned(selection: &RowSelection, deleted: &Mask, base_len: usize) -> usize {
+    match selection.as_rows(base_len) {
+        SelectedRows::Run(run) => deleted.slice(run).true_count(),
+        SelectedRows::Ids(ids) => ids.iter().filter(|&&id| deleted.value(id as usize)).count(),
+    }
+}
+
+/// How many of `selection`'s rows `deleted` leaves live.
+fn live_rows(selection: &RowSelection, deleted: Option<&Mask>, base_len: usize) -> usize {
+    selection.len(base_len) - deleted.map_or(0, |d| tombstoned(selection, d, base_len))
 }
 
 /// One bit for each of `eqs` equalities.
@@ -356,13 +482,7 @@ fn zoned_rows(
                 extend_rows(&mut ids, &part, base_len);
             }
             Treatment::Compare(bits) => {
-                let unsettled: Vec<_> = eqs
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| bits & (1 << i) != 0)
-                    .map(|(_, eq)| eq.clone())
-                    .collect();
-                let matched = compared(memory, part, &unsettled, t)?;
+                let matched = compared(memory, part, &picked(eqs, bits), t)?;
                 extend_rows(&mut ids, &matched, base_len);
             }
         }

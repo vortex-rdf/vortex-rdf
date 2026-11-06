@@ -69,7 +69,6 @@ impl ZoneDecider {
     /// the slot's column recorded them
     /// ([`ColumnZones::recorded_count`]): `None` where the column records
     /// none for the zone, or `slot` is not checked.
-    #[cfg_attr(not(feature = "file-io"), expect(dead_code))]
     pub(crate) fn recorded_count(&self, slot: usize, zone: u64) -> Option<u64> {
         let column = self.columns.iter().find(|column| column.slot == slot)?;
         column.zones.recorded_count(zone, column.code)

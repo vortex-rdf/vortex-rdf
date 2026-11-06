@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::observe::observe;
 use crate::store::MemoryBase;
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
-use crate::store::scan::residual::{ResidualZones, residual_rows};
+use crate::store::scan::residual::{ResidualZones, residual_rows, zoned_count};
 use crate::store::schema::RowId;
 use crate::store::view::selection::{RowSelection, SelectedRows, window_rows};
 
@@ -117,6 +117,19 @@ impl PendingResidual {
             SelectedRows::Ids(ids) => ids.clone(),
         };
         Ok(self.ids.get_or_init(|| ids).clone())
+    }
+
+    /// How many live rows match (`deleted` tombstoned): with the
+    /// selection's zone classes, zone by zone and with no match materialized
+    /// ([`zoned_count`]); without them, every match compared once and kept.
+    pub(crate) fn count(&self, deleted: Option<&Mask>) -> Result<usize> {
+        if let Some(ids) = self.ids.get() {
+            return Ok(count_live(ids, deleted));
+        }
+        match &self.zones {
+            Some(zones) => zoned_count(&self.memory, &self.selection, &self.eqs, zones, deleted),
+            None => Ok(count_live(&self.materialized()?, deleted)),
+        }
     }
 
     /// How many rows match, once every piece has been compared.

@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: a hash table over the batch's kept
   quads catches the latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/query/matching/mod.rs#L201) — one fully bound
+  [`contains`](../core/src/store/query/matching/mod.rs#L212) — one fully bound
   `match_pattern` over base and tail, which reads the tail rows its row key
   names rather than every tail row ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
@@ -99,7 +99,7 @@ flowchart TD
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
-- **Matching.** [`match_pattern`](../core/src/store/query/matching/mod.rs#L70) runs the
+- **Matching.** [`match_pattern`](../core/src/store/query/matching/mod.rs#L81) runs the
   base's normal routing (prefix probe / index / scan) and, independently, a
   mask scan over the tail ([`match_tail`](../core/src/store/query/matching/tail.rs#L25)),
   then unions the two. A base short-circuit (a term with no code in the
@@ -146,7 +146,7 @@ flowchart TD
 - **The contract.** `match_pattern` deliberately does **not** subtract
   tombstones when it computes a selection (keeping its row positions aligned
   for mask-based refinement); every *read* path does.
-  [`RowSelection::live_mask`](../core/src/store/view/selection.rs#L423) answers
+  [`RowSelection::live_mask`](../core/src/store/view/selection.rs#L426) answers
   "which of this selection's own rows are not tombstoned", and the in-memory
   reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L23)
   — the single place a view becomes rows — so applying the mask cannot be

@@ -261,3 +261,163 @@ async fn a_pending_residual_classes_once() {
     assert!(pieces > 1, "compared in {pieces} pieces");
     assert_eq!(classed, 1, "its zones classed once");
 }
+
+/// The rows a recorder saw counted each way: `(taken, recorded, counted,
+/// compared)`, from "all" zones, from records, on the encoding, and by a
+/// compare.
+fn zone_rows_seen(rec: &Recorder) -> (u64, u64, u64, u64) {
+    let sum = |pick: fn(&Event) -> Option<u64>| -> u64 { rec.picked(pick).iter().sum() };
+    (
+        sum(|e| match e {
+            Event::ResidualZoneTaken(rows) => Some(*rows),
+            _ => None,
+        }),
+        sum(|e| match e {
+            Event::ZoneRecorded(rows) => Some(*rows),
+            _ => None,
+        }),
+        sum(|e| match e {
+            Event::ZoneCounted(rows) => Some(*rows),
+            _ => None,
+        }),
+        sum(|e| match e {
+            Event::ResidualCompared(rows) => Some(*rows),
+            _ => None,
+        }),
+    )
+}
+
+/// `(? ? ? g1)` on `Graphs::Alternating` in memory: every zone holds
+/// graphs 1 to 4 in turn, so every zone is mixed, and its count takes each
+/// whole zone's rows of graph 1 from the zone's record, comparing no row;
+/// `(hub ? ? g1)`, over `hub`'s range, counts the zone its range ends
+/// inside on the encoding.
+#[tokio::test]
+async fn residual_counts_settle_zones() {
+    use super::located_zones::code_of;
+
+    let store = built_store(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let g1 = code_of(&store, "<http://example.org/g1>").await;
+    let hub = code_of(&store, "<http://example.org/hub>").await;
+
+    let rec = Recorder::start();
+    let every = crate::CodePattern::new(None, None, None, Some(g1));
+    assert_eq!(
+        store.count_code_pattern(every).await.unwrap(),
+        (RUN / 2) as u64
+    );
+    let (taken, recorded, counted, compared) = zone_rows_seen(&rec);
+    assert_eq!(compared, 0, "no row compared");
+    assert_eq!(
+        recorded,
+        2 * RUN as u64,
+        "every zone counted from its record"
+    );
+    assert_eq!((taken, counted), (0, 0));
+
+    let rec = Recorder::start();
+    let hubs = crate::CodePattern::new(Some(hub), None, None, Some(g1));
+    assert_eq!(
+        store.count_code_pattern(hubs).await.unwrap(),
+        (RUN / 4) as u64
+    );
+    let (_, recorded, counted, compared) = zone_rows_seen(&rec);
+    assert_eq!(compared, 0, "no row compared");
+    assert!(
+        counted > 0,
+        "the range's partial zone counted on the encoding"
+    );
+    assert_eq!(recorded + counted, RUN as u64, "every row of the range");
+}
+
+/// Counts after deleting a row in an "all" zone of `(? ? ? g1)` and rows of
+/// both graphs in a mixed one, on `Graphs::Long` in memory: they equal the
+/// rows', and the mixed zone with tombstones is compared, not counted from
+/// its record.
+#[tokio::test]
+async fn residual_counts_respect_tombstones() {
+    use super::located_zones::code_of;
+
+    let store = built_store(zone_quads(Graphs::Long), LayoutStrategy::Dictionary, vec![]).await;
+    let g1 = iri_graph("g1");
+    // Each zone's graphs, in base order.
+    let quads = store.quads_vec().await.unwrap();
+    let zones: Vec<&[Quad]> = quads.chunks(ZONE_ROWS).collect();
+    let holds_g1 = |zone: &[Quad]| zone.iter().filter(|q| q.graph_name == g1).count();
+    let all = zones
+        .iter()
+        .position(|zone| holds_g1(zone) == zone.len())
+        .expect("a zone of graph 1 alone");
+    let mixed = zones
+        .iter()
+        .position(|zone| (1..zone.len()).contains(&holds_g1(zone)))
+        .expect("a zone of both graphs");
+    let doomed = [
+        zones[all][0].clone(),
+        zones[mixed]
+            .iter()
+            .find(|q| q.graph_name == g1)
+            .unwrap()
+            .clone(),
+        zones[mixed]
+            .iter()
+            .find(|q| q.graph_name != g1)
+            .unwrap()
+            .clone(),
+    ];
+    let mut deleted = store.clone();
+    for quad in &doomed {
+        let object = quad.object.clone();
+        deleted = deleted
+            .delete_matching(
+                Some(&quad.subject),
+                Some(&quad.predicate),
+                Some(&object),
+                Some(&quad.graph_name),
+            )
+            .await
+            .unwrap();
+    }
+    let code = code_of(&store, "<http://example.org/g1>").await;
+    let pattern = crate::CodePattern::new(None, None, None, Some(code));
+    let count = |on: bool| {
+        let deleted = &deleted;
+        async move {
+            let _zones = ForcedZones::set(on);
+            let rec = Recorder::start();
+            let n = deleted.count_code_pattern(pattern).await.unwrap();
+            (n, zone_rows_seen(&rec))
+        }
+    };
+    let (on, (taken, recorded, _, compared)) = count(true).await;
+    let (off, _) = count(false).await;
+    assert_eq!(on, (RUN - 2) as u64, "graph 1's rows, two deleted");
+    assert_eq!(on, off, "as with zones off");
+    assert_eq!(
+        compared, ZONE_ROWS as u64,
+        "the mixed zone with tombstones compared"
+    );
+    let mixed_zones = zones
+        .iter()
+        .filter(|zone| (1..zone.len()).contains(&holds_g1(zone)))
+        .count() as u64;
+    assert_eq!(
+        recorded,
+        (mixed_zones - 1) * ZONE_ROWS as u64,
+        "the other mixed zones, from their records"
+    );
+    let all_zones = zones
+        .iter()
+        .filter(|zone| holds_g1(zone) == zone.len())
+        .count() as u64;
+    assert_eq!(
+        taken,
+        all_zones * ZONE_ROWS as u64,
+        "the all zones taken, their tombstone left out of the count"
+    );
+}
