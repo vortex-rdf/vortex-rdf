@@ -274,27 +274,45 @@ impl ZoneBuilder {
 
 /// The graphs each [`ZONE_ROWS`]-row zone of a built graph column holds, with
 /// their rows, as Vortex's accumulator of `vortexrdf.value_counts` records
-/// them in a written zone table: `None` for a zone past its 16 values.
-pub(crate) fn graph_records(codes: &[TermCode]) -> Result<RecordedZones> {
-    use crate::session::VORTEX_SESSION;
+/// them in a written zone table: `None` for a zone past its 16 values. The
+/// column is read chunk by chunk, each zone accumulated from slices of the
+/// chunks it spans, so no chunk is copied and the column is never joined
+/// into one array.
+pub(crate) fn graph_records(
+    column: &vortex_array::ArrayRef,
+    ctx: &mut vortex_array::ExecutionCtx,
+) -> Result<RecordedZones> {
     use crate::store::value_counts::{MAX_VALUES, ValueCounts, ValueCountsOptions, decode_state};
     use vortex_array::aggregate_fn::{Accumulator, DynAccumulator as _};
-    use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+    use vortex_array::arrays::Chunked;
+    use vortex_array::arrays::chunked::ChunkedArrayExt as _;
 
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let options = ValueCountsOptions {
         max_values: MAX_VALUES,
     };
-    codes
-        .chunks(ZONE_ROWS)
-        .map(|zone| {
-            let mut acc = Accumulator::try_new(ValueCounts, options, CODE_DTYPE)?;
-            let array =
-                vortex_array::arrays::PrimitiveArray::from_iter(zone.iter().copied()).into_array();
-            acc.accumulate(&array, &mut ctx)?;
-            Ok(decode_state(&acc.finish()?).map(Vec::into_boxed_slice))
-        })
-        .collect()
+    let new = || Accumulator::try_new(ValueCounts, options, CODE_DTYPE);
+    let chunks: Vec<vortex_array::ArrayRef> = match column.as_opt::<Chunked>() {
+        Some(chunked) => chunked.chunks(),
+        None => vec![column.clone()],
+    };
+    let mut records = Vec::with_capacity(column.len().div_ceil(ZONE_ROWS));
+    let (mut acc, mut filled) = (new()?, 0usize);
+    for chunk in chunks {
+        let mut at = 0;
+        while at < chunk.len() {
+            let take = (ZONE_ROWS - filled).min(chunk.len() - at);
+            acc.accumulate(&chunk.slice(at..at + take)?, ctx)?;
+            (filled, at) = (filled + take, at + take);
+            if filled == ZONE_ROWS {
+                records.push(decode_state(&acc.finish()?).map(Vec::into_boxed_slice));
+                (acc, filled) = (new()?, 0);
+            }
+        }
+    }
+    if filled > 0 {
+        records.push(decode_state(&acc.finish()?).map(Vec::into_boxed_slice));
+    }
+    Ok(records)
 }
 
 /// Whether slot `slot` is the graph column, whose zones record their graphs.
@@ -351,14 +369,42 @@ mod tests {
     }
 
     /// A built graph column's records are each zone's graphs with their rows,
-    /// and none for a zone of more than 16.
+    /// and none for a zone of more than 16; the same whether the column is
+    /// one array or chunks that zones cross, its short last zone included.
     #[test]
     fn graph_records_count_each_zones_graphs() {
+        use crate::session::VORTEX_SESSION;
+        use vortex_array::arrays::{ChunkedArray, PrimitiveArray};
+        use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
         let mut codes: Vec<TermCode> = (0..ZONE_ROWS as u64).map(|i| 1 + i % 3).collect();
         codes.extend((0..ZONE_ROWS as u64).map(|i| 1 + i % 17));
-        let records = graph_records(&codes).unwrap();
+        codes.extend([5, 5, 6]);
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let whole = PrimitiveArray::from_iter(codes.iter().copied()).into_array();
+        let records = graph_records(&whole, &mut ctx).unwrap();
         let third = (ZONE_ROWS / 3) as u32;
         let first = vec![(1, third + 1), (2, third + 1), (3, third)];
-        assert_eq!(records, vec![Some(first.into_boxed_slice()), None]);
+        let last = vec![(5, 2), (6, 1)];
+        assert_eq!(
+            records,
+            vec![
+                Some(first.into_boxed_slice()),
+                None,
+                Some(last.into_boxed_slice())
+            ]
+        );
+        let chunks: Vec<vortex_array::ArrayRef> = codes
+            .chunks(5_000)
+            .map(|chunk| PrimitiveArray::from_iter(chunk.iter().copied()).into_array())
+            .collect();
+        let chunked = ChunkedArray::try_new(chunks, CODE_DTYPE)
+            .unwrap()
+            .into_array();
+        assert_eq!(
+            graph_records(&chunked, &mut ctx).unwrap(),
+            records,
+            "in chunks"
+        );
     }
 }

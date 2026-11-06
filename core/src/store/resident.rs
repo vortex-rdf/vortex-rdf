@@ -109,10 +109,7 @@ pub(crate) fn with_compressed_int_children(
             && let Some(mut column) = zones_of.finish(child.len())?
         {
             if records_graphs(slot) {
-                let codes = child
-                    .clone()
-                    .execute::<vortex_array::arrays::PrimitiveArray>(ctx)?;
-                column = column.with_records(graph_records(codes.as_slice::<u64>())?)?;
+                column = column.with_records(graph_records(child, ctx)?)?;
             }
             zones.set(slot, column);
         }
