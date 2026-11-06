@@ -142,22 +142,32 @@ pub(crate) mod out_of_core {
     use vortex_array::{ArrayRef, IntoArray};
 
     use super::super::components::TermColumn;
-    use super::CHILD_COLUMNS;
+    use super::{CHILD_COLUMNS, GRAPH_CHILD_COLUMNS};
     use crate::error::Result;
     use crate::store::array::named_struct;
     use crate::store::array::stamp_is_sorted;
     use crate::store::schema::RowId;
 
     /// One chunk of a reference component's persisted child from a window of its
-    /// merged `(value, row id)` pairs, value column stamped sorted. `V` is the
-    /// value encoding: `String`, or [`TermCode`]s under the Dictionary layout.
+    /// merged `(value, row id, graph)` rows, value column stamped sorted, and
+    /// with `graphs` the graph column beside them ([`GRAPH_CHILD_COLUMNS`]).
+    /// `V` is the value encoding: `String`, or [`TermCode`]s under the
+    /// Dictionary layout.
     ///
     /// [`TermCode`]: crate::store::TermCode
-    pub(crate) fn ref_child_chunk<V: TermColumn>(pairs: &[(V, RowId)]) -> Result<ArrayRef> {
-        let val = V::column(pairs.iter().map(|(v, _)| v));
+    pub(crate) fn ref_child_chunk<V: TermColumn>(
+        rows: &[(V, RowId, V)],
+        graphs: bool,
+    ) -> Result<ArrayRef> {
+        let val = V::column(rows.iter().map(|(v, _, _)| v));
         stamp_is_sorted(&val);
-        let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
-        named_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
+        let rid = PrimitiveArray::from_iter(rows.iter().map(|(_, rid, _)| *rid)).into_array();
+        if graphs {
+            let g = V::column(rows.iter().map(|(_, _, g)| g));
+            return named_struct(&GRAPH_CHILD_COLUMNS, vec![val, rid, g], rows.len())
+                .map(|a| a.into_array());
+        }
+        named_struct(&CHILD_COLUMNS, vec![val, rid], rows.len()).map(|a| a.into_array())
     }
 }
 

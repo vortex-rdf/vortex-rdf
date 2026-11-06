@@ -172,3 +172,67 @@ async fn older_reference_children_read_as_before() {
     got.sort_unstable();
     assert_eq!(got, want);
 }
+
+/// The out-of-core build, its spill runs three entries long, carries each
+/// row's graph through the spill and the merge: every child row's `g` is the
+/// graph of the quad at its `rid`, as the in-memory build gives it.
+#[tokio::test]
+async fn spilled_reference_graphs_cross_run_boundaries() {
+    use crate::store::builders::{BuildSizes, sorted_stream};
+
+    let graphs = [
+        GraphName::DefaultGraph,
+        iri_graph("g1"),
+        iri_graph("g2"),
+        iri_graph("g3"),
+    ];
+    let built = sorted_stream::build_array(
+        Box::new(quad_stream(graph_modular_quads(40, 2, 3, 7, &graphs))),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+        BuildSizes::uniform(3),
+    )
+    .await
+    .unwrap();
+    let components = built.components.clone();
+    let store = VortexRdfStore::from_built(built).unwrap();
+    let rows = row_list(&store).await;
+    for component in &components {
+        let name = component.identity.name;
+        let columns = child_columns(component);
+        let names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["val", "rid", "g"], "{name}");
+        assert_eq!(columns[1].1.len(), rows.len(), "{name}");
+        for (i, (&rid, &g)) in columns[1].1.iter().zip(&columns[2].1).enumerate() {
+            let row = crate::store::indexes::base_row(rid) as usize;
+            assert_eq!(g, rows[row][3], "{name}: row {i}");
+        }
+    }
+}
+
+/// The out-of-core writer follows the test hook too: a file written under
+/// `ForcedReferenceGraphs::set(false)` has `{val, rid}` children, one written
+/// without it has `g`.
+#[tokio::test]
+async fn stream_written_children_follow_the_hook() {
+    for graphs in [true, false] {
+        let (_dir, path) = {
+            let _hook = ForcedReferenceGraphs::set(graphs);
+            write_store_file(
+                three_graph_quads(),
+                LayoutStrategy::Dictionary,
+                IndexConfig::Reference.types(),
+            )
+            .await
+        };
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let file = store.debug_native_file().unwrap();
+        for name in ["index:ref-p", "index:ref-o"] {
+            let g = file.table_column_layout(Some(name), "g");
+            assert_eq!(g.is_some(), graphs, "{name}, graphs {graphs}");
+            if let Some(g) = g {
+                assert!(records_value_counts(&g), "{name}: g records its graphs");
+            }
+        }
+    }
+}

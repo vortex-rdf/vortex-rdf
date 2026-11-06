@@ -428,18 +428,26 @@ pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes 
 /// the Dictionary layout), with the array a column of them assembles into:
 /// the one spelling both families' builders emit their term columns through.
 pub(crate) trait TermColumn: Clone + Default + Ord {
+    /// Whether a reference child of this encoding holds each row's graph:
+    /// the Dictionary layout's codes do, the string layouts' terms don't.
+    const RECORDS_GRAPH: bool;
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
     where
         Self: 'a;
 }
 
 impl TermColumn for String {
+    const RECORDS_GRAPH: bool = false;
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         make_string_array(it.map(String::as_str))
     }
 }
 
 impl TermColumn for TermCode {
+    const RECORDS_GRAPH: bool = true;
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         PrimitiveArray::from_iter(it.copied()).into_array()
     }
