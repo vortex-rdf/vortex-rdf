@@ -16,6 +16,7 @@ mod builders;
 mod chained;
 mod chunk_reads;
 mod chunks;
+mod component_runs;
 mod component_zones;
 mod dictionary;
 mod dictionary_file_backed;

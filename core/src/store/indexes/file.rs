@@ -69,6 +69,7 @@ async fn resolve_eager_from_scan(
         row_ids: ResolvedRowIds::Eager(row_ids),
         resolves,
         serve: None,
+        graph: false,
     })
 }
 
@@ -123,6 +124,7 @@ pub(super) async fn resolve_file(
                 )),
                 resolves: probe.resolves,
                 serve: None,
+                graph: false,
             }),
             _ => resolve_eager_from_scan(&child, &keys, probe.resolves).await,
         };
@@ -171,6 +173,7 @@ pub(super) async fn resolve_file(
         // child's columns: point reads or a range scan over a located run,
         // or the pushed-down filter scan.
         serve: Some(FileServePlan::new(decode, child, constraints, row_range)),
+        graph: false,
     })
 }
 

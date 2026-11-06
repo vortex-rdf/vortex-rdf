@@ -92,6 +92,9 @@ pub(crate) enum Event {
     /// with no row compared: `none` when no row holds a code, else every
     /// equality held on every row.
     ResidualSettled { none: bool },
+    /// An in-memory index run bound to a graph read its component's graph
+    /// column at this many rows, to check them.
+    ComponentChecked(u64),
     /// A residual compare left pending.
     ResidualDeferred,
     /// A piece of a pending residual compared, of this many rows.
@@ -155,11 +158,13 @@ pub(crate) enum Event {
     /// A block of a located run's rows read, for a lookup's window or a
     /// stream's chunk: this many rows of the run, before its checks.
     LocatedBlock(u64),
-    /// A located run's or an in-memory residual's rows of a mixed zone
-    /// counted on the checked column's encoding, this many rows.
+    /// A located run's, an in-memory residual's or a checked in-memory index
+    /// run's rows of a mixed zone counted on the checked column's encoding,
+    /// this many rows.
     ZoneCounted(u64),
-    /// A located run's or an in-memory residual's mixed zone of this many
-    /// rows counted from the checked column's recorded values, unread.
+    /// A located run's, an in-memory residual's or a checked in-memory index
+    /// run's mixed zone of this many rows counted from the checked column's
+    /// recorded values, unread.
     ZoneRecorded(u64),
     /// A reference run read its child's own `g` at this many positions.
     ReferenceGraphRead(u64),

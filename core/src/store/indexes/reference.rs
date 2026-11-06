@@ -112,6 +112,7 @@ pub(super) fn choose<'a>(pattern: QuadPattern<'a>) -> Option<IndexProbe<'a>> {
         identity: family.identity(),
         keys: vec![(COL_VAL, term)],
         residual: Vec::new(),
+        graph: pattern.graph.map(TermRef::Graph),
         resolves,
         serve: None,
         rids_ascend: true,

@@ -32,6 +32,7 @@ pub(crate) mod components;
 pub(crate) mod copy;
 #[cfg(feature = "file-io")]
 pub(crate) mod file;
+mod graph_check;
 mod lazy_ids;
 pub(crate) mod reference;
 mod resolve;
@@ -411,10 +412,16 @@ pub(crate) enum IndexResolution<Plan> {
     /// gathering the primary columns by scattered row id; a back-reference
     /// index leaves it `None`. The plan only optimizes: `row_ids` resolve
     /// the pattern on their own.
+    ///
+    /// `graph` is whether the resolution also checked the pattern's bound
+    /// graph (an in-memory run checks it inside its component): its ids
+    /// then hold only rows of that graph, and the caller drops the graph
+    /// from any residual filtering too.
     Resolved {
         row_ids: ResolvedRowIds,
         resolves: ResolvedRoles,
         serve: Option<Plan>,
+        graph: bool,
     },
 }
 

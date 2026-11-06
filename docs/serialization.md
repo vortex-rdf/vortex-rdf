@@ -400,8 +400,8 @@ than let an id wrap onto row 0:
 
 | Where | Check | Refusal |
 |---|---|---|
-| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L123)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
-| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L137)); a refused file build leaves no file | the same |
+| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L124)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
+| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L138)); a refused file build leaves no file | the same |
 
 Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
@@ -563,7 +563,10 @@ store's *compressed-resident* form (through
   graphs per zone with Vortex's accumulator of `vortexrdf.value_counts`: the
   in-memory counterpart of a file's zone maps, so a match's residual
   equality compares only the zones that may hold its code
-  ([matching.md §6.3](matching.md#63-residual-column-filtering));
+  ([matching.md §6.3](matching.md#63-residual-column-filtering)); each
+  component's graph column takes its zone map and graphs in the same pass,
+  so a run bound to a graph checks it inside the component
+  ([matching.md §6.2](matching.md#62-secondary-index-routing));
 - the same pass's smallest and largest code of the whole column are stamped
   on it as exact `Stat::Min`/`Stat::Max` array statistics
   ([`stamp_bounds`](../core/src/store/array.rs#L92)), the whole-column level
@@ -575,7 +578,8 @@ it keeps each integer child's existing encoding wherever a probe binds it and
 decodes only the ones that decline. Its zone maps are the file's own zone
 tables, the graph column's recorded graphs included, read at open
 ([`QuadZones::read`](../core/src/store/zones.rs#L71)), as `from_bytes` reads
-them, and its code columns' array statistics are the file's footer
+them, its components' the zone tables of their children's graph columns
+([`read_graph_zones`](../core/src/store/zones.rs#L327)), and its code columns' array statistics are the file's footer
 statistics, stamped on the loaded base's columns
 ([`stamp_quad_bounds`](../core/src/store/array.rs#L116)). Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).

@@ -212,6 +212,7 @@ pub(super) fn choose<'a>(
             .map(|graph| (COL_G, TermRef::Graph(graph)))
             .into_iter()
             .collect(),
+        graph: pattern.graph.map(TermRef::Graph),
         resolves,
         serve: Some(ServeDecode {
             decode_layout: copy_decode_layout(layout),

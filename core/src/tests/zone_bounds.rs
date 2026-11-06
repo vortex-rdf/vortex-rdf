@@ -426,10 +426,11 @@ async fn built_and_loaded_stores_stamp_the_same_bounds() {
 }
 
 /// `(? type ? g1)` on a one-graph store with `index:posg`: the index
-/// resolves the predicate, and the statistics settle the graph left over.
-/// The view still answers in base row order, as with zones off (the
-/// index's serve plan dropped, as a residual drops it), and keeps the
-/// store's indexes.
+/// resolves the predicate, and the graph left over is settled with no row
+/// compared, the run's zones of the component's graph column each holding
+/// the one graph. The view still answers in base row order, as with zones
+/// off (the index's serve plan dropped, as a residual drops it), and keeps
+/// the store's indexes.
 #[tokio::test]
 async fn settled_residuals_keep_base_order() {
     use super::located_zones::{Graphs, RUN, zone_quads};
@@ -452,15 +453,18 @@ async fn settled_residuals_keep_base_order() {
                 .await
                 .unwrap();
             let rows = row_list(&view).await;
-            (
-                rows,
-                view.indexes().to_vec(),
-                rec.count(&Event::ResidualSettled { none: false }),
-            )
+            let compared: u64 = rec
+                .picked(|e| match e {
+                    Event::ResidualCompared(rows) | Event::ComponentChecked(rows) => Some(*rows),
+                    _ => None,
+                })
+                .iter()
+                .sum();
+            (rows, view.indexes().to_vec(), compared)
         }
     };
     let (on, on_indexes, settled) = read(true).await;
-    let (off, off_indexes, unsettled) = read(false).await;
+    let (off, off_indexes, compared) = read(false).await;
     assert_eq!(on.len(), RUN, "every type row");
     assert_eq!(on, off, "the rows and their order, as with zones off");
     let mut sorted = on.clone();
@@ -468,5 +472,6 @@ async fn settled_residuals_keep_base_order() {
     assert_eq!(on, sorted, "base row order");
     assert_eq!(on_indexes, store.indexes(), "the view keeps its indexes");
     assert_eq!(off_indexes, store.indexes());
-    assert_eq!((settled, unsettled), (1, 0), "settled with zones on only");
+    assert_eq!(settled, 0, "no row compared with zones on");
+    assert!(compared > 0, "the graph compared with zones off");
 }

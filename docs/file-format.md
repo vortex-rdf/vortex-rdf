@@ -373,8 +373,8 @@ Shared rules:
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L123)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L137))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L124)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L138))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
@@ -503,7 +503,7 @@ code, 0: a pattern that also binds the graph checks it at position 1 itself.
 | `from_file_in_memory` | everything, through the file reader rather than a mapping: quad rows, dictionary and index children are loaded into memory, so the store never reads the file again |
 | a query | the zone-map tables the filter needs, the chunk leaves a probe bisects, then the leaves of the rows the scan finally decodes — or, on a served match, the index child's own run |
 | `size()` on a pending filter | statistics and filter masks only; no row is projected |
-| `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (still FSST), and each index child is adopted by its reader with nothing read — it is scanned and canonicalized on its first use |
+| `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (still FSST), and each index child is adopted by its reader with nothing read but its graph column's zone table — it is scanned and canonicalized on its first use |
 
 **The mapping model.** A file store is memory-mapped (`memmap2`, through
 Vortex's `open_buffer`): a segment read is a slice of the map, so the pages a
@@ -541,6 +541,14 @@ largest code as its array statistics (`Stat::Min`, `Stat::Max`). A load reads
 them from the file's zone tables and footer, a build takes them in the pass
 that compresses its codes ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)). A
 query computes its residual's zone classes from them and keeps nothing.
+Each index component keeps the zone map of its graph column the same way,
+with the column's recorded graphs (a Dictionary store's; string columns have
+none): a build takes it in the pass that compresses the component,
+`from_file_in_memory` reads it from the child's zone table, and `from_bytes`
+reads it at adoption, the component's rows still unread. A run bound to a
+graph checks it inside the component, zone by zone
+([matching.md §6.2](matching.md#62-secondary-index-routing)), and keeps only
+its matches, with the view's ids.
 
 **Scans.** A scan read to completion into one array is driven by what its
 splits cost. An index child's row-id scan always runs inline on the calling

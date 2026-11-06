@@ -151,10 +151,6 @@ pub(crate) struct IndexComponent {
     /// by zone. `None` for a string column, a reference child written
     /// without a graph column, and parts that carry none. Every rebuild of
     /// the same rows keeps it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the in-memory resolver's graph check")
-    )]
     graph_zones: Option<Arc<ColumnZones>>,
 }
 
@@ -313,10 +309,6 @@ impl IndexComponent {
 
     /// The zone map of the component's graph column, with each zone's
     /// recorded graphs, if it keeps one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the in-memory resolver's graph check")
-    )]
     pub(crate) fn graph_zones(&self) -> Option<&Arc<ColumnZones>> {
         self.graph_zones.as_ref()
     }
@@ -354,7 +346,10 @@ impl IndexComponent {
     /// `None` when the column's encoding declines (callers fall back to the
     /// per-call search). Resolving materializes a deferred component, exactly
     /// like [`rows`](Self::rows).
-    fn probe(&self, column: &str) -> Option<Arc<vortex_rdf_encoded_search::OwnedSortedProbe>> {
+    pub(super) fn probe(
+        &self,
+        column: &str,
+    ) -> Option<Arc<vortex_rdf_encoded_search::OwnedSortedProbe>> {
         self.probes
             .by_name(self.rows().ok()?.as_ref(), column)
             .flatten()

@@ -9,7 +9,7 @@ use crate::io::zone_map::ZONE_ROWS;
 use crate::store::test_hooks::ForcedZones;
 
 /// Every [`Graphs`] layout.
-const LAYOUTS: [Graphs; 8] = [
+pub(super) const LAYOUTS: [Graphs; 8] = [
     Graphs::One,
     Graphs::Long,
     Graphs::Stretches,
@@ -32,7 +32,7 @@ fn tuples(columns: &[vortex_buffer::Buffer<TermCode>; 4]) -> Vec<[TermCode; 4]> 
 /// row and 64 rows long, and every row in order (base rows, then tail
 /// rows).
 #[derive(Debug, PartialEq, Eq)]
-struct Answers {
+pub(super) struct Answers {
     count: usize,
     capped: usize,
     windows: Vec<Vec<String>>,
@@ -41,7 +41,7 @@ struct Answers {
 
 /// The rows of `view`, in the order its reads yield them: their codes, or
 /// for a view with a tail (which has none to gather) its quads.
-async fn quads_of(view: &VortexRdfStore) -> Vec<String> {
+pub(super) async fn quads_of(view: &VortexRdfStore) -> Vec<String> {
     match view.code_columns_gathered().await.unwrap() {
         Some(columns) => code_rows::<4>(&columns)
             .iter()
@@ -57,7 +57,7 @@ async fn quads_of(view: &VortexRdfStore) -> Vec<String> {
     }
 }
 
-async fn answers(store: &VortexRdfStore, probe: &Probe) -> Answers {
+pub(super) async fn answers(store: &VortexRdfStore, probe: &Probe) -> Answers {
     let count = store.count_probe(probe).await.unwrap();
     let capped = store
         .count_probe(&Probe {
@@ -128,7 +128,7 @@ async fn assert_zones_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
 
 /// `store` with a tombstone in every zone: the first row of each zone of
 /// both runs, deleted by subject or by object.
-async fn tombstoned(store: &VortexRdfStore) -> VortexRdfStore {
+pub(super) async fn tombstoned(store: &VortexRdfStore) -> VortexRdfStore {
     let mut store = store.clone();
     for i in (0..RUN).step_by(ZONE_ROWS) {
         let subject = NamedOrBlankNode::from(iri(&format!("s{i:05}")));
@@ -146,7 +146,7 @@ async fn tombstoned(store: &VortexRdfStore) -> VortexRdfStore {
 }
 
 /// `store` with a tail of quads in graphs 1 and 3 and the default graph.
-async fn tailed(store: &VortexRdfStore) -> VortexRdfStore {
+pub(super) async fn tailed(store: &VortexRdfStore) -> VortexRdfStore {
     let quads = (0..4).map(|k| {
         make_quad(
             &format!("http://example.org/tail{k}"),
