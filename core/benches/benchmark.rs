@@ -2025,8 +2025,11 @@ fn whole_counts_resident(bencher: divan::Bencher, read: &WholeRead) {
 // Group 4f's and 4h's reads on their files loaded in memory
 // (`from_file_in_memory`), where no located run answers: the general match
 // takes the run of the bound predicate or object in an index component, and
-// compares the bound graph at the base rows the run lists, scattered over the
-// base. The runs are the `(type, Taxon)` run of `index:posg` for `(? p o g)`
+// checks the bound graph inside the component, where the run's rows are
+// contiguous: on the component's own `g` a zone at a time, by its zone map,
+// not at the base rows the run lists, scattered over the base. By copy, a
+// window with a limit leaves the graph to the residual compare over the
+// run's ids. The runs are the `(type, Taxon)` run of `index:posg` for `(? p o g)`
 // and its `type` run for `(? p ? g)`, the graph left to check after the free
 // slot, and Group 4h's `type` run of `index:ref-p` and `Taxon` run of
 // `index:ref-o`, of `CHECKED_RUN_ROWS` rows each, their graphs laid out as

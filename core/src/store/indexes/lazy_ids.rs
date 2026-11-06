@@ -244,7 +244,7 @@ impl LazyRowIds {
             // A checked run counts the zones before the window and reads
             // only the zones it spans.
             LazyRowIds::Component(run) if run.ascending => match &run.check {
-                Some(check) => check.window(&run.rids, offset, limit)?,
+                Some(check) => check.window(&run.rids, offset, limit)?.0,
                 None => match window_rows(offset, limit, run.rids.len() as u64) {
                     Some(rows) => {
                         sorted_row_ids(run.rids.slice(rows.start as usize..rows.end as usize)?)?
@@ -269,6 +269,45 @@ impl LazyRowIds {
             _ => return Ok(None),
         };
         Ok(Some(ids))
+    }
+
+    /// [`window`](Self::window), beside the rows the ids cover as far as
+    /// they are known: every one ([`len_if_known`](Self::len_if_known)), or,
+    /// for a run checked against its graph, every match when the window
+    /// reaches the run's last zone and else at least `offset + limit`, its
+    /// zones counted only until the window fills ([`GraphCheck::window`]).
+    /// `None` where `window` is, or where the rows are not known without I/O.
+    pub(crate) async fn window_with_live(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<(Buffer<RowId>, usize)>> {
+        if let LazyRowIds::Component(run) = self
+            && run.ascending
+            && let Some(check) = &run.check
+            && run.sorted.get().or(run.run_order.get()).is_none()
+        {
+            return check.window(&run.rids, offset, limit).map(Some);
+        }
+        let Some(live) = self.len_if_known() else {
+            return Ok(None);
+        };
+        Ok(self.window(offset, limit).await?.map(|ids| (ids, live)))
+    }
+
+    /// `min(rows, limit)` at least, for a run checked against its graph whose
+    /// ids are not yet known: its zones counted only until `limit` matches
+    /// are ([`GraphCheck::count_capped`]). `None` for any other ids, whose
+    /// count [`len_if_known`](Self::len_if_known) gives.
+    pub(crate) fn count_capped(&self, limit: usize) -> Result<Option<usize>> {
+        match self {
+            LazyRowIds::Component(run) if run.sorted.get().or(run.run_order.get()).is_none() => run
+                .check
+                .as_ref()
+                .map(|check| check.count_capped(limit))
+                .transpose(),
+            _ => Ok(None),
+        }
     }
 
     /// A narrowed served view's ids as they were handed over, in the index's

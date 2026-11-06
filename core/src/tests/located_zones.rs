@@ -122,6 +122,11 @@ async fn column_zones_read_recorded_counts() {
 /// Rows of each run of a [`zone_quads`] store.
 pub(super) const RUN: usize = 40_000;
 
+/// The rows of [`Graphs::UnrecordedGap`]'s seventeen graphs: zone 6 of
+/// `index:ref-p`, whose `type` run is its rows `RUN..2 * RUN`.
+pub(super) const UNRECORDED_GAP: std::ops::Range<usize> =
+    6 * crate::io::zone_map::ZONE_ROWS - RUN..7 * crate::io::zone_map::ZONE_ROWS - RUN;
+
 /// How a run's rows fall into graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Graphs {
@@ -145,6 +150,10 @@ pub(super) enum Graphs {
     /// The default graph on the first half of the run, graph 3 on the
     /// second.
     DefaultThenThree,
+    /// Graph 1, but seventeen other graphs in turn on [`UNRECORDED_GAP`]:
+    /// one zone of `index:ref-p`'s `type` run recording nothing, its bounds
+    /// holding graph 1's code but none of its rows.
+    UnrecordedGap,
     /// By turns of 8,192 rows: seventeen graphs in turn (past what the
     /// statistic records), then graphs 1, 3 and 18 in turn (recorded).
     RecordedByTurns,
@@ -170,6 +179,12 @@ impl Graphs {
             Graphs::Seventeen => 1 + i % 17,
             Graphs::DefaultAndThree => 3 * (i % 2),
             Graphs::DefaultThenThree => 3 * (i / (RUN / 2)),
+            // The default graph, then graphs 2 to 17.
+            Graphs::UnrecordedGap if UNRECORDED_GAP.contains(&i) => match i % 17 {
+                0 => 0,
+                k => k + 1,
+            },
+            Graphs::UnrecordedGap => 1,
             Graphs::RecordedByTurns if (i / 8_192).is_multiple_of(2) => 1 + i % 17,
             Graphs::RecordedByTurns => [1, 3, 18][i % 3],
         }
@@ -181,7 +196,7 @@ impl Graphs {
             Graphs::One => 1,
             Graphs::Long => 2,
             Graphs::Gapped | Graphs::DefaultAndThree | Graphs::DefaultThenThree => 3,
-            Graphs::Seventeen => 17,
+            Graphs::Seventeen | Graphs::UnrecordedGap => 17,
             Graphs::RecordedByTurns => 18,
             Graphs::Stretches | Graphs::Alternating => 4,
         }

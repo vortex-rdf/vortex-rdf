@@ -112,20 +112,44 @@ impl GraphCheck {
         Ok(self.counts()?.iter().sum())
     }
 
+    /// `min(matches, limit)` at least: the zones counted in run order only
+    /// until `limit` matches are ([`zone_count`](Self::zone_count)), so a
+    /// capped count stops at the zone that meets its cap. Every match where
+    /// the counts are kept, or fewer than `limit` match.
+    pub(crate) fn count_capped(&self, limit: usize) -> Result<usize> {
+        if let Some(counts) = self.counts.get() {
+            return Ok(counts.iter().sum());
+        }
+        let mut counted = 0;
+        for (zone, part) in self.parts() {
+            if counted >= limit {
+                break;
+            }
+            counted += self.zone_count(zone, &part)?;
+        }
+        Ok(counted)
+    }
+
     /// How many of the run's rows in each zone it touches hold the graph,
-    /// counted on the first call and kept: none or every row by the zone
-    /// map, a mixed zone from its record when the run holds it whole, else
-    /// on the graph column's encoding, else by comparing its graphs.
+    /// counted on the first call and kept ([`zone_count`](Self::zone_count)).
     fn counts(&self) -> Result<Arc<[usize]>> {
         get_or_try_init(&self.counts, || {
             self.parts()
-                .map(|(zone, part)| match self.zone(zone) {
-                    Zone::None => Ok(0),
-                    Zone::All => Ok(part.len()),
-                    Zone::Mixed => self.mixed_count(zone, &part),
-                })
+                .map(|(zone, part)| self.zone_count(zone, &part))
                 .collect()
         })
+    }
+
+    /// How many of the run's rows `part` of zone `zone` hold the graph: none
+    /// or every row by the zone map, a mixed zone from its record when the
+    /// run holds it whole, else on the graph column's encoding, else by
+    /// comparing its graphs.
+    fn zone_count(&self, zone: u64, part: &Range<usize>) -> Result<usize> {
+        match self.zone(zone) {
+            Zone::None => Ok(0),
+            Zone::All => Ok(part.len()),
+            Zone::Mixed => self.mixed_count(zone, part),
+        }
     }
 
     /// How many of the run's rows `part` of mixed zone `zone` hold the graph:
@@ -198,42 +222,53 @@ impl GraphCheck {
     }
 
     /// The ids of the run's rows that hold the graph, in run order, `rids`
-    /// being the run's slice of the rid column: decoded in one pass, the
-    /// zones of the graph alone taken whole and the mixed ones' compared rows
-    /// picked.
+    /// being the run's slice of the rid column: a zone at a time
+    /// ([`part_ids`](Self::part_ids)), the zones of the graph alone decoded
+    /// whole and the mixed ones' compared rows picked, and a zone holding
+    /// none of the graph's rows (by the zone map, or counted so) neither read
+    /// nor decoded.
     pub(crate) fn ids(&self, rids: &ArrayRef) -> Result<Buffer<RowId>> {
         let counts = self.counts.get();
-        let all = run_order_row_ids(rids.clone())?;
         let mut ids = BufferMut::with_capacity(counts.map_or(0, |counts| counts.iter().sum()));
         for (at, (zone, part)) in self.parts().enumerate() {
             if counts.is_some_and(|counts| counts[at] == 0) {
                 continue;
             }
-            let in_run = &all[part.start - self.rows.start..part.end - self.rows.start];
-            match self.zone(zone) {
-                Zone::None => {}
-                Zone::All => ids.extend_from_slice(in_run),
-                Zone::Mixed => ids.extend(self.compared(&part)?.into_iter().map(|k| in_run[k])),
-            }
+            ids.extend_from_slice(&self.part_ids(rids, zone, &part)?);
         }
         Ok(ids.freeze())
     }
 
     /// The ids of the run's matches `offset..offset + limit`, in run order,
-    /// `rids` being the run's slice of the rid column: the zones before the
-    /// window skipped by their counts, and only the zones it spans read.
+    /// `rids` being the run's slice of the rid column, beside the run's
+    /// matches as far as they are known: every one when the window reaches
+    /// the run's last zone, else at least `offset + limit`. The zones are
+    /// counted in run order only until the window fills (their kept counts
+    /// where a count took them), those before the window skipped by their
+    /// counts, and only the zones it spans read, those counted empty
+    /// excepted.
     pub(crate) fn window(
         &self,
         rids: &ArrayRef,
         offset: usize,
         limit: usize,
-    ) -> Result<Buffer<RowId>> {
-        let counts = self.counts()?;
-        let mut ids = BufferMut::with_capacity(limit.min(counts.iter().sum()));
+    ) -> Result<(Buffer<RowId>, usize)> {
+        if limit == 0 {
+            return Ok((Buffer::empty(), self.count()?));
+        }
+        let kept = self.counts.get();
+        let mut ids = BufferMut::with_capacity(limit);
         let mut before = 0;
-        for ((zone, part), &count) in self.parts().zip(counts.iter()) {
+        for (at, (zone, part)) in self.parts().enumerate() {
             if ids.len() == limit {
-                break;
+                return Ok((ids.freeze(), before));
+            }
+            let count = match kept {
+                Some(counts) => counts[at],
+                None => self.zone_count(zone, &part)?,
+            };
+            if count == 0 {
+                continue;
             }
             if before + count <= offset {
                 before += count;
@@ -245,6 +280,6 @@ impl GraphCheck {
             ids.extend_from_slice(&matched[from..from + take]);
             before += count;
         }
-        Ok(ids.freeze())
+        Ok((ids.freeze(), before))
     }
 }

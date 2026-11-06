@@ -5,7 +5,7 @@
 //! contiguous, instead of comparing the graph at the base rows the run
 //! lists. Their answers are the base compare's.
 
-use super::located_zones::{Graphs, RUN, zone_quads};
+use super::located_zones::{Graphs, RUN, UNRECORDED_GAP, zone_quads};
 use super::residual_zones::{LAYOUTS, answers, quads_of, tailed, tombstoned};
 use super::*;
 use crate::io::zone_map::ZONE_ROWS;
@@ -216,6 +216,102 @@ async fn component_windows_jump_by_zone_counts() {
         rids_decoded(&rec) <= 2 * ZONE_ROWS,
         "{} row ids decoded",
         rids_decoded(&rec)
+    );
+}
+
+/// By reference, the first page of `(? type ? g1)` on `Graphs::Alternating`
+/// and its ASK (a count capped at one) count the run's zones only until the
+/// page fills or the cap is met: the run's part of its first zone, a quarter
+/// of whose rows are graph 1's, fills both, so no other zone is counted.
+/// Both answer as with zones off.
+#[tokio::test]
+async fn component_first_pages_count_their_first_zone_alone() {
+    let store = built_store(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
+    let page = probe.clone().window(0, Some(64));
+    let ask = probe.clone().window(0, Some(1));
+    let off = {
+        let _zones = ForcedZones::set(false);
+        let page = quads_of(&store.run_probe(&page).await.unwrap()).await;
+        (page, store.count_probe(&ask).await.unwrap())
+    };
+    let _zones = ForcedZones::set(true);
+    let counted = |rec: &Recorder| {
+        rows_of(rec, |e| match e {
+            Event::ZoneCounted(rows) | Event::ZoneRecorded(rows) => Some(*rows),
+            _ => None,
+        })
+    };
+    // The `type` run is `index:ref-p`'s rows `RUN..2 * RUN`.
+    let first = (RUN.next_multiple_of(ZONE_ROWS) - RUN) as u64;
+    let rec = Recorder::start();
+    let on = quads_of(&store.run_probe(&page).await.unwrap()).await;
+    assert_eq!(on.len(), 64);
+    assert_eq!(on, off.0, "the page, as with zones off");
+    assert_eq!(
+        counted(&rec),
+        first,
+        "the page: the first zone's part counted alone"
+    );
+    let rec = Recorder::start();
+    assert_eq!(store.count_probe(&ask).await.unwrap(), off.1);
+    assert_eq!(off.1, 1, "ASK: capped at one");
+    assert_eq!(
+        counted(&rec),
+        first,
+        "ASK: the first zone's part counted alone"
+    );
+}
+
+/// By reference, `(? type ? g1)` on [`Graphs::UnrecordedGap`]: one zone of
+/// the run records nothing (seventeen graphs) and its bounds hold graph 1's
+/// code, but none of its rows does. Once counted empty, that zone is
+/// neither read nor decoded: a window spanning it reads no graph inside the
+/// component, and the run's rows decode the ids of the zones holding the
+/// graph alone. Both answer as with zones off.
+#[tokio::test]
+async fn component_runs_skip_zones_counted_empty() {
+    let store = built_store(
+        zone_quads(Graphs::UnrecordedGap),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
+    // The matches before the gap's zone and 64 past it.
+    let window = probe.clone().window(0, Some(UNRECORDED_GAP.start + 64));
+    let off = {
+        let _zones = ForcedZones::set(false);
+        let window = quads_of(&store.run_probe(&window).await.unwrap()).await;
+        (
+            window,
+            quads_of(&store.run_probe(&probe).await.unwrap()).await,
+        )
+    };
+    let _zones = ForcedZones::set(true);
+    let rec = Recorder::start();
+    let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
+    assert_eq!(on.len(), UNRECORDED_GAP.start + 64);
+    assert_eq!(on, off.0, "the window, as with zones off");
+    assert_eq!(
+        rec.count_where(|e| matches!(e, Event::ComponentChecked(_))),
+        0,
+        "no graph read inside the component: the zones before and after the gap are \
+         graph 1's alone, the gap's counted empty"
+    );
+    let rec = Recorder::start();
+    let rows = quads_of(&store.run_probe(&probe).await.unwrap()).await;
+    assert_eq!(rows.len(), RUN - ZONE_ROWS);
+    assert_eq!(rows, off.1, "every row, as with zones off");
+    assert_eq!(
+        rids_decoded(&rec),
+        RUN - ZONE_ROWS,
+        "the ids of the zones holding graph 1 alone"
     );
 }
 
