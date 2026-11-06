@@ -1812,12 +1812,13 @@ fn graph_zones(bencher: divan::Bencher, read: &GraphZonesRead) {
 //
 // Group 4f's reads on a by-reference file. A bound predicate or object is a
 // run of a reference index (`index:ref-p`, `index:ref-o`) listing quad-table
-// rows, and a bound graph is checked at those rows: each check reads the quad
-// table's graph at rows scattered over the file. The file holds Group 4f's
-// quads by reference; the runs are the `type` run of `index:ref-p`,
-// `(? p ? g)`, and the `Taxon` run of `index:ref-o`, `(? ? o g)`, of
-// `CHECKED_RUN_ROWS` rows each, their graphs laid out as Group 4f's. The cells
-// time Group 4f's four reads.
+// rows, and a bound graph is checked on the child's own `g` beside them: at
+// the run's contiguous positions, a zone at a time where the child's zone
+// maps decide it, not at the listed rows scattered over the quad table. The
+// file holds Group 4f's quads by reference; the runs are the `type` run of
+// `index:ref-p`, `(? p ? g)`, and the `Taxon` run of `index:ref-o`,
+// `(? ? o g)`, of `CHECKED_RUN_ROWS` rows each, their graphs laid out as
+// Group 4f's. The cells time Group 4f's four reads.
 // ══════════════════════════════════════════════════════════════════════════
 
 /// The checked runs' file by reference, written once per process like

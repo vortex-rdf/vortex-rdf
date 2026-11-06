@@ -513,8 +513,9 @@ struct LocatedRun {
     checked: Vec<usize>,
     source: Source,
     session: vortex_session::VortexSession,
-    /// The classes of the run's table zones against its checked slots, when
-    /// zone maps decide them ([`run_zones`]); `None` checks every row.
+    /// The classes of the zones the run's positions fall in against its
+    /// checked slots, when zone maps decide them ([`run_zones`]); `None`
+    /// checks every row.
     zones: Option<RunZones>,
     /// The file statistics still to ask for the run's checked slots, until a
     /// read needs them ([`ask_statistics`](Self::ask_statistics)); `None`
@@ -522,10 +523,12 @@ struct LocatedRun {
     pending: Option<PendingStatistics>,
 }
 
-/// The classes of the zones a table run's rows fall in, against the run's
+/// The classes of the zones a run's positions fall in, against the run's
 /// checked slots (the ladder's zone level, see `zone_decider`): zones
-/// `first..first + classes.len()` of the table, `zone_len` rows each. They live with the
-/// run, so a call or a stream holds them, never the store.
+/// `first..first + classes.len()` of the table the run is located in (a
+/// sorted table, or a reference child for its own `g`), `zone_len` rows
+/// each. They live with the run, so a call or a stream holds them, never
+/// the store.
 #[cfg(feature = "file-io")]
 struct RunZones {
     zone_len: u64,
@@ -540,13 +543,13 @@ struct RunZones {
 
 #[cfg(feature = "file-io")]
 impl RunZones {
-    /// The class of table zone `zone`, one of the run's.
+    /// The class of zone `zone`, one of the run's.
     fn class(&self, zone: u64) -> crate::store::query::zone_decider::ZoneClass {
         self.classes[(zone - self.first) as usize]
     }
 
-    /// Table zone `zone`'s matches as its recorded values count them, `None`
-    /// where they don't.
+    /// Zone `zone`'s matches as its recorded values count them, `None` where
+    /// they don't.
     fn recorded(&self, zone: u64) -> Option<u64> {
         self.recorded[(zone - self.first) as usize]
     }
@@ -728,6 +731,11 @@ impl LocatedRun {
                 // zone over its child's positions: none keeps nothing, all
                 // keeps every row id unread, a mixed zone reads its graphs.
                 if let (Some(zones), Some(graph)) = (&self.zones, graph) {
+                    debug_assert_eq!(
+                        self.checked,
+                        [GRAPH_SLOT],
+                        "a reference child's zones decide its graph alone"
+                    );
                     let mut kept = Vec::new();
                     let mut at = rows.start;
                     while at < rows.end {
@@ -794,6 +802,10 @@ impl LocatedRun {
     /// order: the first slot read over the rows, still contiguous, each
     /// other one at the rows the slots before it kept.
     async fn checked_rows(&self, rows: std::ops::Range<u64>, slots: u8) -> Result<Vec<u64>> {
+        debug_assert!(
+            matches!(self.rows, RunRows::Table(_)),
+            "checked rows are a table run's: a reference run lists quad-table rows"
+        );
         let mut order = self
             .checked
             .iter()
@@ -826,12 +838,12 @@ impl LocatedRun {
         Ok(kept)
     }
 
-    /// The matches of the run's rows in table zone `zone` (one of `zones`):
+    /// The matches of the run's positions in zone `zone` (one of `zones`):
     /// none for a zone of class none, its rows for one of class all, and for
     /// a mixed zone with one slot unsettled there its recorded count of the
     /// slot's code ([`RunZones::recorded`]), else its rows counted on the
-    /// column's encoding ([`ColumnChunks::count_eq`]); a mixed zone with
-    /// more slots unsettled is checked.
+    /// checked column's encoding ([`ColumnChunks::count_eq`]); a mixed zone
+    /// with more slots unsettled (a sorted table's) is checked.
     ///
     /// [`ColumnChunks::count_eq`]: vortex_rdf_encoded_search::ColumnChunks::count_eq
     async fn zone_count(&self, zones: &RunZones, zone: u64) -> Result<u64> {
@@ -1420,20 +1432,8 @@ async fn reference_zones(
     index: usize,
     source: &Source,
 ) -> Result<Option<std::sync::Arc<crate::io::zone_map::ColumnZones>>> {
-    use crate::io::zone_map::ColumnZones;
-
     let cell = &tables.reference_zones[index];
-    if let Some(zones) = cell.get() {
-        return Ok(zones.clone());
-    }
-    crate::observe::observe!(ZoneMapRead);
-    let zones = match file.table_column_layout(Some(REFERENCES[index].0), "g") {
-        Some(column) => ColumnZones::read(&column, source)
-            .await?
-            .map(std::sync::Arc::new),
-        None => None,
-    };
-    Ok(cell.get_or_init(|| zones).clone())
+    kept_zones(cell, file, Some(REFERENCES[index].0), "g", source).await
 }
 
 /// The zone map of column `slot` of sorted table `table` (`component` names
@@ -1451,18 +1451,33 @@ async fn column_zones(
     slot: usize,
     source: &Source,
 ) -> Result<Option<std::sync::Arc<crate::io::zone_map::ColumnZones>>> {
-    use crate::io::zone_map::ColumnZones;
     use crate::store::schema::PRIMARY_COLUMNS;
 
     if component.is_none() {
         return file.quad_zone_maps().get(slot).await;
     }
     let cell = &tables.zones[table - 1][slot];
+    kept_zones(cell, file, component, PRIMARY_COLUMNS[slot], source).await
+}
+
+/// The zone map of column `column` of the located table `component` names,
+/// kept in `cell`: read on first use, `None` for a column without exact
+/// zone bounds.
+#[cfg(feature = "file-io")]
+async fn kept_zones(
+    cell: &std::sync::OnceLock<Option<std::sync::Arc<crate::io::zone_map::ColumnZones>>>,
+    file: &crate::store::persist::native_file::NativeStoreFile,
+    component: Option<&str>,
+    column: &str,
+    source: &Source,
+) -> Result<Option<std::sync::Arc<crate::io::zone_map::ColumnZones>>> {
+    use crate::io::zone_map::ColumnZones;
+
     if let Some(zones) = cell.get() {
         return Ok(zones.clone());
     }
     crate::observe::observe!(ZoneMapRead);
-    let zones = match file.table_column_layout(component, PRIMARY_COLUMNS[slot]) {
+    let zones = match file.table_column_layout(component, column) {
         Some(column) => ColumnZones::read(&column, source)
             .await?
             .map(std::sync::Arc::new),
