@@ -86,6 +86,15 @@ impl VortexRdfStore {
         if let ViewSelection::Residual(residual) = &self.quads.selection {
             return residual.count_capped(limit, self.quads.deleted.as_ref());
         }
+        // A run checked against its graph counts its zones only until
+        // `limit` matches are.
+        if self.quads.deleted.is_none()
+            && !self.quads.has_filter()
+            && let ViewSelection::Pending { ids, .. } = &self.quads.selection
+            && let Some(counted) = ids.count_capped(limit)?
+        {
+            return Ok(counted.min(limit));
+        }
         #[cfg(feature = "file-io")]
         if let Some((file, filter)) = self.quads.pending_filter() {
             // The selection resolves first (a served view's ids come from its

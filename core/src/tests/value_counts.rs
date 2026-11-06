@@ -90,6 +90,35 @@ async fn graph_columns_record_value_counts() {
     }
 }
 
+/// A graph column's zone aggregates are the ones the zoned writer picks for
+/// any `u64` column, as the subject column's show, then the statistic:
+/// `graph_column_aggregates` keeps in step with Vortex's defaults.
+#[tokio::test]
+async fn graph_columns_take_vortex_defaults_and_the_statistic() {
+    use vortex_layout::layouts::zoned::Zoned;
+
+    let (_dir, path) = write_store_file(
+        three_graph_quads(),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Copy.types(),
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let file = store.debug_native_file().unwrap();
+    let aggregates = |column: &str| {
+        file.table_column_layout(None, column)
+            .unwrap()
+            .as_opt::<Zoned>()
+            .expect("a zoned column")
+            .present_aggregates()
+            .to_vec()
+    };
+    let mut want = aggregates("s");
+    assert!(!want.is_empty(), "the subject column is zoned");
+    want.push(value_counts().to_string());
+    assert_eq!(aggregates("g"), want);
+}
+
 /// Zones of 2, 16 and 18 graphs (the default graph among the last): the
 /// first two record each graph with its rows, the third, past the limit of
 /// 16, records null.

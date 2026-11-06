@@ -122,6 +122,11 @@ async fn column_zones_read_recorded_counts() {
 /// Rows of each run of a [`zone_quads`] store.
 pub(super) const RUN: usize = 40_000;
 
+/// The rows of [`Graphs::UnrecordedGap`]'s seventeen graphs: zone 6 of
+/// `index:ref-p`, whose `type` run is its rows `RUN..2 * RUN`.
+pub(super) const UNRECORDED_GAP: std::ops::Range<usize> =
+    6 * crate::io::zone_map::ZONE_ROWS - RUN..7 * crate::io::zone_map::ZONE_ROWS - RUN;
+
 /// How a run's rows fall into graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Graphs {
@@ -142,6 +147,13 @@ pub(super) enum Graphs {
     Seventeen,
     /// The default graph on even rows, graph 3 on odd ones.
     DefaultAndThree,
+    /// The default graph on the first half of the run, graph 3 on the
+    /// second.
+    DefaultThenThree,
+    /// Graph 1, but seventeen other graphs in turn on [`UNRECORDED_GAP`]:
+    /// one zone of `index:ref-p`'s `type` run recording nothing, its bounds
+    /// holding graph 1's code but none of its rows.
+    UnrecordedGap,
     /// By turns of 8,192 rows: seventeen graphs in turn (past what the
     /// statistic records), then graphs 1, 3 and 18 in turn (recorded).
     RecordedByTurns,
@@ -166,6 +178,13 @@ impl Graphs {
             Graphs::Gapped => 1 + 2 * (i % 2),
             Graphs::Seventeen => 1 + i % 17,
             Graphs::DefaultAndThree => 3 * (i % 2),
+            Graphs::DefaultThenThree => 3 * (i / (RUN / 2)),
+            // The default graph, then graphs 2 to 17.
+            Graphs::UnrecordedGap if UNRECORDED_GAP.contains(&i) => match i % 17 {
+                0 => 0,
+                k => k + 1,
+            },
+            Graphs::UnrecordedGap => 1,
             Graphs::RecordedByTurns if (i / 8_192).is_multiple_of(2) => 1 + i % 17,
             Graphs::RecordedByTurns => [1, 3, 18][i % 3],
         }
@@ -176,8 +195,8 @@ impl Graphs {
         match self {
             Graphs::One => 1,
             Graphs::Long => 2,
-            Graphs::Gapped | Graphs::DefaultAndThree => 3,
-            Graphs::Seventeen => 17,
+            Graphs::Gapped | Graphs::DefaultAndThree | Graphs::DefaultThenThree => 3,
+            Graphs::Seventeen | Graphs::UnrecordedGap => 17,
             Graphs::RecordedByTurns => 18,
             Graphs::Stretches | Graphs::Alternating => 4,
         }
@@ -841,7 +860,8 @@ fn reference_graph_reads(rec: &Recorder) -> (u64, u64) {
 /// graphs the whole zones count from their records, the child's short last
 /// zone among them (the run reaches the child's end), and the partial first
 /// zone on its encoding; zones past 16 graphs count on their encoding; the
-/// default graph counts from records like any other.
+/// default graph counts from records like any other, and on a long stretch
+/// of it its zones settle as graph 1's do.
 #[tokio::test]
 async fn reference_runs_skip_settled_zones() {
     use crate::CodePattern;
@@ -855,6 +875,7 @@ async fn reference_runs_skip_settled_zones() {
         Graphs::Alternating,
         Graphs::RecordedByTurns,
         Graphs::DefaultAndThree,
+        Graphs::DefaultThenThree,
     ] {
         let (_dir, path) = write_store_file(
             zone_quads(graphs),
@@ -867,7 +888,7 @@ async fn reference_runs_skip_settled_zones() {
         let ty = code_of(store, "<http://example.org/type>").await;
         let link = code_of(store, "<http://example.org/link>").await;
         let graph = match graphs {
-            Graphs::DefaultAndThree => code_of(store, "").await,
+            Graphs::DefaultAndThree | Graphs::DefaultThenThree => code_of(store, "").await,
             _ => code_of(store, "<http://example.org/g1>").await,
         };
         // RecordedByTurns lays its turns out along `link`'s run, which
@@ -926,6 +947,22 @@ async fn reference_runs_skip_settled_zones() {
                 // Zones 0, 2 and 4 hold seventeen graphs; 1 and 3 recorded.
                 assert_eq!(recorded, 2 * zone, "{tag}: the recorded zones");
                 assert_eq!(counted, RUN as u64 - 2 * zone, "{tag}: the others");
+            }
+            Graphs::DefaultThenThree => {
+                // The run is the child's last RUN positions, the default
+                // graph on its first half. The zones of the default graph
+                // alone are taken and those of graph 3 alone skipped: only
+                // the run's partial first zone counts on its encoding, and
+                // the whole zone where the graphs change from its record.
+                let start = RUN as u64;
+                let partial = start.next_multiple_of(zone) - start;
+                assert_eq!((counted, recorded), (partial, zone), "{tag}");
+                // A stream reads those two zones' graphs, and only those.
+                drop(rec);
+                let rec = Recorder::start();
+                let rows = streamed(store, pattern, 4096).await;
+                assert_eq!(rows.len() as u64, want, "{tag}: the stream's rows");
+                assert_eq!(zone_work(&rec).1, partial + zone, "{tag}: the stream read");
             }
             _ => {
                 assert_eq!(recorded + counted, RUN as u64, "{tag}: every zone mixed");

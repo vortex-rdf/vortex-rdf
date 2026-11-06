@@ -105,10 +105,11 @@ impl ExactZoneMap {
 /// `min`), one row per zone; and beside it, where the column records them
 /// (`vortexrdf.value_counts`, a graph column of a file written since the
 /// `vortexrdf 2026.11.0` edition), the values each zone holds with their
-/// rows, decoded once. A stats proof (a falsifier or a satisfier) is
-/// evaluated over a range of its zones by [`prune`](Self::prune), Vortex's
-/// [`ZoneMap::prune`] on those zones' rows of the table; a zone's recorded
-/// rows of a code are [`recorded_count`](Self::recorded_count).
+/// rows, decoded once. The stats proofs (a falsifier, a satisfier) asked of
+/// a range of its zones are evaluated by Vortex's [`ZoneMap::prune`] on one
+/// map of those zones' rows of the table ([`zone_map`](Self::zone_map)); a
+/// zone's recorded rows of a code are
+/// [`recorded_count`](Self::recorded_count).
 ///
 /// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
 /// [`ZoneMap::prune`]: vortex_layout::layouts::zoned::zone_map::ZoneMap::prune
@@ -221,7 +222,8 @@ impl ColumnZones {
     }
 
     /// This zone map with the values `states` records for each zone (the
-    /// zone table's `vortexrdf.value_counts` column), decoded once.
+    /// zone table's `vortexrdf.value_counts` column), decoded once
+    /// ([`decode_states`]).
     fn with_recorded(mut self, states: ArrayRef) -> Result<Self> {
         if states.len() as u64 != self.zones() {
             return Err(crate::error::VortexRdfError::InvalidInput(format!(
@@ -230,7 +232,11 @@ impl ColumnZones {
                 self.zones()
             )));
         }
-        self.recorded = Some(decode_states(states)?);
+        let rows = |zone| {
+            let rows = self.zone_rows(zone);
+            rows.end - rows.start
+        };
+        self.recorded = Some(decode_states(states, rows)?);
         Ok(self)
     }
 
@@ -315,22 +321,35 @@ impl ColumnZones {
 
     /// Where `proof` holds over the zones `zones`, one bit per zone in
     /// order: Vortex's [`ZoneMap::prune`] on those zones' rows of the
-    /// table.
+    /// table ([`zone_map`](Self::zone_map)), for a test asking one proof.
     ///
     /// [`ZoneMap::prune`]: vortex_layout::layouts::zoned::zone_map::ZoneMap::prune
-    #[cfg(feature = "file-io")]
+    #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn prune(
         &self,
         zones: std::ops::Range<u64>,
         proof: &vortex_array::expr::BoundExpression,
     ) -> Result<vortex_mask::Mask> {
+        if zones.is_empty() {
+            return Ok(vortex_mask::Mask::new_false(0));
+        }
+        Ok(self.zone_map(zones)?.prune(proof, &VORTEX_SESSION)?)
+    }
+
+    /// Vortex's [`ZoneMap`] of the zones `zones` (not empty), those zones'
+    /// rows of the table: built once, it prunes every proof asked of them.
+    ///
+    /// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
+    #[cfg(feature = "file-io")]
+    pub(crate) fn zone_map(
+        &self,
+        zones: std::ops::Range<u64>,
+    ) -> Result<vortex_layout::layouts::zoned::zone_map::ZoneMap> {
         use vortex_array::IntoArray as _;
         use vortex_array::dtype::{DType, Nullability, PType};
         use vortex_layout::layouts::zoned::zone_map::ZoneMap;
 
-        if zones.is_empty() {
-            return Ok(vortex_mask::Mask::new_false(0));
-        }
+        crate::observe::observe!(ZoneMapBuilt);
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let table = self
             .table
@@ -340,14 +359,13 @@ impl ColumnZones {
             .execute::<StructArray>(&mut ctx)?;
         let first_row = zones.start * self.zone_len;
         let rows = (zones.end * self.zone_len).min(self.row_count) - first_row;
-        let map = ZoneMap::try_new(
+        Ok(ZoneMap::try_new(
             DType::Primitive(PType::U64, Nullability::NonNullable),
             table,
             exact_bound_aggregates(),
             self.zone_len,
             rows,
-        )?;
-        Ok(map.prune(proof, &VORTEX_SESSION)?)
+        )?)
     }
 }
 
@@ -371,31 +389,45 @@ pub(crate) fn eq_on_bounds(min: u64, max: u64, code: u64) -> Option<bool> {
     }
 }
 
-/// Whether `proof`, one of Vortex's proofs of `x = code` ([`eq_proofs`]),
-/// holds on bounds `(min, max)` of a column of `row_count` rows, a one-zone
-/// map of them: for the falsifier no row holds the code, for the satisfier
-/// every row does. `false` without bounds or a proof.
+/// What exact bounds `(min, max)` of a column of `row_count` rows decide of
+/// `x = code`, by Vortex's proofs of it (`proofs`, [`eq_proofs`]) on one
+/// one-zone map of them: `Some(false)` where the falsifier holds (no row
+/// holds the code), `Some(true)` where the satisfier does (every row does),
+/// `None` where neither does, and without bounds, rows or a proof.
 ///
 /// [`eq_proofs`]: crate::stats_rules::eq_proofs
 #[cfg(feature = "file-io")]
-pub(crate) fn bounds_prove(
+pub(crate) fn bounds_decide(
     bounds: Option<(u64, u64)>,
-    proof: Option<&vortex_array::expr::BoundExpression>,
+    proofs: &crate::stats_rules::EqProofs,
     row_count: u64,
-) -> Result<bool> {
-    let (Some((min, max)), Some(proof)) = (bounds, proof) else {
-        return Ok(false);
+) -> Result<Option<bool>> {
+    let Some((min, max)) = bounds else {
+        return Ok(None);
     };
     if row_count == 0 {
-        return Ok(false);
+        return Ok(None);
     }
-    let zones = ColumnZones::from_bounds(
+    let map = ColumnZones::from_bounds(
         vortex_buffer::buffer![min],
         vortex_buffer::buffer![max],
         row_count,
         row_count,
-    )?;
-    Ok(zones.prune(0..1, proof)?.value(0))
+    )?
+    .zone_map(0..1)?;
+    let holds = |proof: &Option<vortex_array::expr::BoundExpression>| -> Result<bool> {
+        match proof {
+            Some(proof) => Ok(map.prune(proof, &VORTEX_SESSION)?.value(0)),
+            None => Ok(false),
+        }
+    };
+    Ok(if holds(&proofs.none)? {
+        Some(false)
+    } else if holds(&proofs.all)? {
+        Some(true)
+    } else {
+        None
+    })
 }
 
 /// The footer's exact `(min, max)` of `file`'s top-level `u64` column
@@ -424,23 +456,62 @@ fn bounds_of<A: Executable>(table: &StructArray, ctx: &mut ExecutionCtx) -> Resu
     Ok(max.zip(min))
 }
 
-/// Each zone's `(code, rows)` pairs, decoded from a zone table's
-/// `vortexrdf.value_counts` column executed once to canonical arrays all
-/// through: `None` for a zone past the statistic's limit (a null state).
-fn decode_states(states: ArrayRef) -> Result<RecordedZones> {
-    use crate::store::value_counts::decode_state;
+/// Each zone's `(code, rows)` pairs, read from a zone table's
+/// `vortexrdf.value_counts` column (of the statistic's dtype) executed once
+/// to canonical arrays all through, straight from their buffers. `None` for
+/// a zone past the statistic's limit (a null state), and for a record no
+/// store writes, whose zone then stands on its bounds alone: lists of
+/// unequal lengths, codes not strictly ascending ([`pairs`]), or counts that
+/// do not sum to the zone's `zone_rows`.
+///
+/// [`pairs`]: crate::store::value_counts::pairs
+fn decode_states(states: ArrayRef, zone_rows: impl Fn(u64) -> u64) -> Result<RecordedZones> {
+    use crate::store::value_counts::pairs;
+    use vortex_array::arrays::listview::{ListViewArrayExt as _, ListViewArraySlotsExt as _};
+    use vortex_array::arrays::struct_::StructArrayExt as _;
+    use vortex_array::arrays::{ListViewArray, PrimitiveArray};
     use vortex_array::{IntoArray as _, RecursiveCanonical};
 
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let states = states
         .execute::<RecursiveCanonical>(&mut ctx)?
         .0
-        .into_array();
-    (0..states.len())
-        .map(|zone| {
-            Ok(decode_state(&states.execute_scalar(zone, &mut ctx)?).map(Vec::into_boxed_slice))
-        })
-        .collect()
+        .into_array()
+        .execute::<StructArray>(&mut ctx)?;
+    let recorded = states
+        .struct_validity()
+        .execute_mask(states.len(), &mut ctx)?;
+    let mut list = |name: &str| -> Result<(ListViewArray, PrimitiveArray)> {
+        let list = states
+            .unmasked_field_by_name(name)?
+            .clone()
+            .execute::<ListViewArray>(&mut ctx)?;
+        let elements = list
+            .elements()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        Ok((list, elements))
+    };
+    let (codes, code_items) = list("values")?;
+    let (counts, count_items) = list("counts")?;
+    let (code_items, count_items) = (code_items.as_slice::<u64>(), count_items.as_slice::<u32>());
+    let mut zones = Vec::with_capacity(states.len());
+    for zone in 0..states.len() {
+        let mut items = |list: &ListViewArray| {
+            let start = list.offset_at(zone, &mut ctx);
+            start..start.saturating_add(list.size_at(zone, &mut ctx))
+        };
+        let (codes, counts) = (items(&codes), items(&counts));
+        let record = recorded
+            .value(zone)
+            .then(|| pairs(code_items.get(codes)?, count_items.get(counts)?))
+            .flatten()
+            .filter(|pairs| {
+                pairs.iter().map(|&(_, n)| u64::from(n)).sum::<u64>() == zone_rows(zone as u64)
+            });
+        zones.push(record.map(Vec::into_boxed_slice));
+    }
+    Ok(zones)
 }
 
 /// Column `name` of a zone table executed to `A`, `None` when the table lacks
@@ -559,36 +630,117 @@ mod tests {
         assert_eq!(zones.prune(2..2, &none).unwrap().len(), 0);
     }
 
+    /// Bounds decide that every row holds a code only where both are the
+    /// code, and that none does where they leave it out, on one map for both
+    /// proofs; bounds of no rows, a file without bounds, or no proof decide
+    /// nothing.
     #[cfg(feature = "file-io")]
-    /// Bounds prove every row holds a code only where both are the
-    /// code, and no row does where they leave it out; a file without them
-    /// proves nothing.
     #[test]
-    fn bounds_prove_the_code() {
+    fn bounds_decide_the_code() {
+        use crate::stats_rules::{EqProofs, eq_proofs};
         use vortex_array::dtype::{DType, Nullability, PType};
 
         let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        let proofs = |code| crate::stats_rules::eq_proofs(&dtype, code).unwrap();
-        let (five, top) = (proofs(5), proofs(u64::MAX));
-        let (all, none) = (five.all.as_ref(), five.none.as_ref());
-        assert!(!bounds_prove(None, all, 100).unwrap());
-        assert!(!bounds_prove(Some((4, 5)), all, 100).unwrap());
-        assert!(bounds_prove(Some((5, 5)), all, 100).unwrap());
-        assert!(!bounds_prove(Some((5, 5)), None, 100).unwrap());
-        let max = (u64::MAX, u64::MAX);
-        assert!(bounds_prove(Some(max), top.all.as_ref(), 100).unwrap());
-        for (bounds, held_by_none) in [
-            ((6, 9), true),
-            ((1, 4), true),
-            ((4, 6), false),
-            ((5, 5), false),
+        let (five, top) = (
+            eq_proofs(&dtype, 5).unwrap(),
+            eq_proofs(&dtype, u64::MAX).unwrap(),
+        );
+        for (bounds, decided) in [
+            (Some((5, 5)), Some(true)),
+            (Some((4, 5)), None),
+            (Some((4, 6)), None),
+            (Some((6, 9)), Some(false)),
+            (Some((1, 4)), Some(false)),
+            (None, None),
         ] {
             assert_eq!(
-                bounds_prove(Some(bounds), none, 100).unwrap(),
-                held_by_none,
+                bounds_decide(bounds, &five, 100).unwrap(),
+                decided,
                 "{bounds:?}"
             );
         }
-        assert!(!bounds_prove(None, none, 100).unwrap());
+        let max = Some((u64::MAX, u64::MAX));
+        assert_eq!(bounds_decide(max, &top, 100).unwrap(), Some(true));
+        assert_eq!(bounds_decide(Some((5, 5)), &five, 0).unwrap(), None);
+        let unproved = EqProofs {
+            none: None,
+            all: None,
+        };
+        assert_eq!(bounds_decide(Some((6, 9)), &unproved, 100).unwrap(), None);
+    }
+
+    /// The footer level decides a slot on one Vortex zone map, which both
+    /// proofs prune: bounds that settle neither ask both of it.
+    #[cfg(feature = "file-io")]
+    #[test]
+    fn bounds_decide_on_one_zone_map() {
+        use crate::observe::{Event, Recorder};
+        use vortex_array::dtype::{DType, Nullability, PType};
+
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let five = crate::stats_rules::eq_proofs(&dtype, 5).unwrap();
+        let rec = Recorder::start();
+        assert_eq!(bounds_decide(Some((4, 6)), &five, 100).unwrap(), None);
+        assert_eq!(rec.count(&Event::ZoneMapBuilt), 1);
+    }
+
+    /// A zone table's recorded states as another writer of the statistic
+    /// could leave them: a zone whose lists differ in length, whose codes do
+    /// not ascend strictly, or whose counts do not sum to its rows reads as
+    /// unrecorded, as a zone past the limit does; well-formed zones read as
+    /// written, the last one by its own rows.
+    #[test]
+    fn malformed_records_read_as_unrecorded() {
+        use crate::store::value_counts::{state_dtype, state_of as state};
+        use vortex_array::builders::builder_with_capacity_in;
+        use vortex_array::memory::BufferAllocatorRef;
+        use vortex_array::scalar::Scalar;
+
+        let written = [
+            state(&[1, 3], &[5_000, 3_192]),
+            state(&[1, 3], &[8_192]),
+            state(&[3, 1], &[5_000, 3_192]),
+            state(&[2, 2], &[5_000, 3_192]),
+            state(&[1, 3], &[5_000, 3_000]),
+            Scalar::null(state_dtype()),
+            state(&[7], &[100]),
+        ];
+        let mut states = builder_with_capacity_in(
+            &state_dtype(),
+            written.len(),
+            BufferAllocatorRef::static_ref(),
+        );
+        for zone in &written {
+            states.append_scalar(zone).unwrap();
+        }
+        let zones = ColumnZones::from_bounds(
+            vortex_buffer::buffer![1u64, 1, 1, 2, 1, 0, 7],
+            vortex_buffer::buffer![3u64, 3, 3, 2, 3, 9, 7],
+            8_192,
+            6 * 8_192 + 100,
+        )
+        .unwrap()
+        .with_recorded(states.finish())
+        .unwrap();
+        let recorded: Vec<Option<Vec<(u64, u32)>>> = zones
+            .recorded()
+            .unwrap()
+            .iter()
+            .map(|zone| zone.as_deref().map(<[_]>::to_vec))
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                Some(vec![(1, 5_000), (3, 3_192)]),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vec![(7, 100)]),
+            ]
+        );
+        assert_eq!(zones.recorded_count(1, 3), None, "unequal lists");
+        assert_eq!(zones.eq_holds(2, 2), None, "codes out of order");
     }
 }

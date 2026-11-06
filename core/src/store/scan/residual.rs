@@ -8,7 +8,9 @@
 //! and the mask of an array's rows holding them ([`mask_for`]), which the
 //! tail's match compares with too. Functions of the base, with no store
 //! state: the match narrows a selection with them, and a residual compare
-//! left pending runs them piece by piece
+//! left pending runs them zone by zone, counting and windowing from the
+//! zones' counts ([`zoned_count`], [`zoned_window`]), or piece by piece
+//! without zone maps
 //! ([`PendingResidual`](crate::store::view::pending::PendingResidual)).
 
 use std::ops::Range;

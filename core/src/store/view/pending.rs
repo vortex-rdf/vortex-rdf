@@ -2,12 +2,15 @@
 //! ([`PendingResidual`], [`ViewSelection::Residual`]): in memory, the
 //! equalities no prefix search or index answered, over a view built only to
 //! be counted or windowed short of its rows (`IdsNeed::CountOrWindow`),
-//! compared over the view's selection in pieces, a zone's rows first and four
-//! times as many each after, only as far as a capped count or a window
-//! needs. The bindings' ASK (`count_probe` at a limit of one) and `LIMIT`
+//! compared only as far as a count or a window needs. Where the base keeps
+//! zone maps, the selection's zones are classed once and a count or a window
+//! goes zone by zone, from the zones' counts where they settle them
+//! ([`zoned_count`], [`zoned_window`]); without them, the selection is
+//! compared in pieces, a zone's rows first and four times as many each
+//! after. The bindings' ASK (`count_probe` at a limit of one) and `LIMIT`
 //! (`run_probe` with a limit) over a pattern no index serves stop at the
-//! first piece that holds their rows, instead of comparing every row the
-//! pattern's other roles leave.
+//! first zone or piece that holds their rows, instead of comparing every row
+//! the pattern's other roles leave.
 //!
 //! [`ViewSelection::Residual`]: super::selection::ViewSelection::Residual
 
@@ -29,11 +32,11 @@ use crate::store::view::selection::{RowSelection, SelectedRows, window_rows};
 /// A residual compare left pending: the rows of `selection` (of `memory`'s
 /// base) where every equality of `eqs` holds, compared as the eager compare
 /// ([`residual_rows`]) compares them, whole by a consumer that needs every
-/// match ([`materialized`](Self::materialized)), or piece by piece by a
-/// count or a window, only as far as it needs
+/// match ([`materialized`](Self::materialized)), or zone by zone (piece by
+/// piece without zone maps) by a count or a window, only as far as it needs
 /// ([`count_capped`](Self::count_capped), [`window`](Self::window)). The
-/// matches, once every piece has been compared, are kept for every clone of
-/// the view that holds the compare.
+/// matches, once every one is known, are kept for every clone of the view
+/// that holds the compare.
 pub(crate) struct PendingResidual {
     memory: MemoryBase,
     selection: RowSelection,
@@ -144,8 +147,10 @@ impl PendingResidual {
         self.ids.get().map(Buffer::len)
     }
 
-    /// `min(live matches, limit)`, `deleted` tombstoned, the pieces compared
-    /// only until `limit` live rows are found.
+    /// `min(live matches, limit)`, `deleted` tombstoned: with the
+    /// selection's zone classes, counted zone by zone until `limit` live
+    /// rows are ([`zoned_count`]); without them, the pieces compared only
+    /// until `limit` live rows are found.
     pub(crate) fn count_capped(&self, limit: usize, deleted: Option<&Mask>) -> Result<usize> {
         if self.ids.get().is_none()
             && let Some(zones) = &self.zones
@@ -164,10 +169,12 @@ impl PendingResidual {
     }
 
     /// The live rows `offset..offset + limit` of the matches (`deleted`
-    /// tombstoned), in base row order, the pieces compared only until the
-    /// window's last row is found, beside the base's live rows as far as
-    /// they are known: every one once every piece was compared, else the
-    /// ones found, at least `offset + limit`.
+    /// tombstoned), in base row order, beside the base's live matches as far
+    /// as they are known: every one once the last is found, else at least
+    /// `offset + limit`. With the selection's zone classes, the zones before
+    /// the window are counted and the window read a zone at a time
+    /// ([`zoned_window`]); without them, the pieces are compared only until
+    /// the window's last row is found.
     pub(crate) fn window(
         &self,
         offset: usize,

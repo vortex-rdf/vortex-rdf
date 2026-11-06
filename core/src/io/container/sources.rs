@@ -173,7 +173,8 @@ pub(crate) fn id_fields(dtype: &DType) -> Vec<vortex_array::dtype::FieldName> {
 
 /// [`child_strategy`] with explicit [`id_column_strategy`] targets: the
 /// tests' handle on the override, which at 1 MiB and 1 MiB must write exactly
-/// what [`default_child_strategy`] writes.
+/// what [`default_child_strategy`] writes for every column but a graph
+/// column, whose zones also record its graphs ([`graph_column_aggregates`]).
 pub(crate) fn child_strategy_with(
     dtype: &DType,
     codes_target: u64,

@@ -389,17 +389,20 @@ impl QuadsSource {
     /// The `limit` rows after skipping `offset` of a selection held pending
     /// for a window (`IdsNeed::CountOrWindow`), beside the base's live rows
     /// as far as the window knows them, read without the selection's other
-    /// ids. A residual compare left pending compares its pieces only until
-    /// the window's last live row is found ([`PendingResidual::window`]).
-    /// A run, with no tombstones, has its width as the base's live size and
-    /// reads its window's rows alone ([`LazyRowIds::window`]): in memory cut,
-    /// before decoding, from a rid column whose rids ascend; on file read
-    /// from the window's rows of a located run's rid column. `None` for any
-    /// other view (an exact selection, a run of unknown width or whose rids
-    /// do not ascend, a run under tombstones, a pending file filter), whose
-    /// window comes from its materialized selection.
+    /// ids. A residual compare left pending reads only as far as the
+    /// window's last live row: zone by zone where the base keeps zone maps,
+    /// in pieces without them ([`PendingResidual::window`]). A run, with no
+    /// tombstones, has its width as the base's live size and reads its
+    /// window's rows alone ([`LazyRowIds::window_with_live`]): in memory cut,
+    /// before decoding, from a rid column whose rids ascend (a run checked
+    /// against its graph counting its zones only until the window fills,
+    /// its live size then at least `offset + limit`); on file read from the
+    /// window's rows of a located run's rid column. `None` for any other
+    /// view (an exact selection, a run of unknown width or whose rids do not
+    /// ascend, a run under tombstones, a pending file filter), whose window
+    /// comes from its materialized selection.
     ///
-    /// [`LazyRowIds::window`]: crate::store::indexes::LazyRowIds::window
+    /// [`LazyRowIds::window_with_live`]: crate::store::indexes::LazyRowIds::window_with_live
     /// [`PendingResidual::window`]: crate::store::view::pending::PendingResidual::window
     pub(crate) async fn located_window(
         &self,
@@ -414,16 +417,13 @@ impl QuadsSource {
             ViewSelection::Pending { ids, .. } => ids,
             ViewSelection::Exact(_) => return Ok(None),
         };
-        let Some(live) = lazy
-            .len_if_known()
-            .filter(|_| self.deleted.is_none() && !self.has_filter())
-        else {
+        if self.deleted.is_some() || self.has_filter() {
             return Ok(None);
-        };
+        }
         Ok(lazy
-            .window(offset, limit)
+            .window_with_live(offset, limit)
             .await?
-            .map(|ids| (RowSelection::from_ids(ids), live)))
+            .map(|(ids, live)| (RowSelection::from_ids(ids), live)))
     }
 
     /// This source under `selection`, its reads served by `serve`, over

@@ -182,13 +182,13 @@ fn rid_column(perm: &[usize]) -> ArrayRef {
 /// table over the whole dataset in [`IDENTITIES`] order, sorted by
 /// `(value, row id)` with the value column stamped sorted, and under the
 /// Dictionary layout a `g` column beside them ([`GRAPH_CHILD_COLUMNS`],
-/// [`records_graphs`]): the in-memory builders' emission. Row ids number the input's positions (the builder
-/// passes the dataset in final row order), so term strings sort as a
-/// permutation of positions, with no per-term string copies, whose ties
-/// break by position, which is row-id order; codes sort as `(code, row id)`
-/// pairs.
+/// [`records_graphs`]): the in-memory builders' emission. Row ids number
+/// the input's positions (the builder passes the dataset in final row
+/// order), so term strings sort as a permutation of positions, with no
+/// per-term string copies, whose ties break by position, which is row-id
+/// order; codes sort as `(code, row id)` pairs.
 pub(super) fn components(input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
-    let (columns, [mut o, mut p]): (&[&'static str], [Vec<ArrayRef>; 2]) = match input {
+    let (columns, [o, p]): (&[&'static str], [Vec<ArrayRef>; 2]) = match input {
         IndexInput::Quads(quads) => {
             let perm_by = |term_of: fn(&RawQuad) -> &str| -> Vec<usize> {
                 let mut perm: Vec<usize> = (0..quads.len()).collect();
@@ -240,7 +240,6 @@ pub(super) fn components(input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
     };
     stamp_is_sorted(&o[0]);
     stamp_is_sorted(&p[0]);
-    let (o, p) = (std::mem::take(&mut o), std::mem::take(&mut p));
     components_from(
         columns,
         [

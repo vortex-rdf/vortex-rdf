@@ -749,6 +749,28 @@ fn probes_dict_permuted_values() {
     assert_probe(&arr, &data, &[NodeKind::Dict, NodeKind::Primitive]);
 }
 
+/// A dictionary holding a value under two codes, as a dictionary array may:
+/// `count_eq` and `eq_offsets` of that value read the values (one code's
+/// scan would miss the other's rows), and of every other value scan its one
+/// code, all answering as the values do.
+#[test]
+fn bulk_reads_of_a_dictionary_with_a_repeated_value() {
+    let values: Vec<u32> = vec![10, 20, 20, 30];
+    let codes: Vec<u16> = (0..5000usize)
+        .map(|i| [0, 1, 2, 1, 3, 2, 2][i % 7])
+        .collect();
+    let data: Vec<u32> = codes.iter().map(|&c| values[usize::from(c)]).collect();
+    let arr = vortex_array::arrays::DictArray::try_new(
+        PrimitiveArray::from_iter(codes).into_array(),
+        PrimitiveArray::from_iter(values).into_array(),
+    )
+    .unwrap()
+    .into_array();
+    let probe = SortedProbe::resolve(&arr).expect("a dictionary resolves");
+    assert!(probe.node_kinds().contains(&NodeKind::Dict));
+    common::assert_bulk_reads(&probe, &data);
+}
+
 #[test]
 fn probes_through_shared_wrapper() {
     // The writer wraps a values child shared between chunks in a `Shared`
