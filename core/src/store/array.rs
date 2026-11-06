@@ -423,4 +423,42 @@ mod tests {
             "a narrower needle"
         );
     }
+
+    /// A sorted `u32` column bit-packed with a width per block, ending at
+    /// `u32::MAX`, answers `u64` needles by its own type: the needle at the
+    /// type's maximum finds its last row, and needles past it, which no
+    /// `u32` holds, fall past every row.
+    #[test]
+    fn declined_narrow_columns_answer_needles_past_their_type() {
+        use vortex::encodings::fastlanes::BitPackedData;
+        use vortex_array::arrays::PrimitiveArray;
+        use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+        let mut data: Vec<u32> = (0..2048u32)
+            .map(|i| if i < 1024 { i / 256 } else { 1000 + 2 * i })
+            .collect();
+        *data.last_mut().unwrap() = u32::MAX;
+        let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let arr = BitPackedData::encode_blocked(&canonical, &[2, 32], &mut ctx)
+            .unwrap()
+            .into_array();
+        assert!(
+            vortex_rdf_encoded_search::SortedProbe::resolve(&arr).is_none(),
+            "the probe declines per-block widths"
+        );
+        let len = data.len();
+        for (needle, want) in [
+            (u64::from(u32::MAX), (len - 1, len)),
+            (u64::from(u32::MAX) + 1, (len, len)),
+            (u64::MAX, (len, len)),
+            (3, (768, 1024)),
+        ] {
+            assert_eq!(
+                super::search_sorted_bounds(&arr, &Scalar::from(needle)).unwrap(),
+                want,
+                "needle {needle}"
+            );
+        }
+    }
 }
