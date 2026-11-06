@@ -1,17 +1,14 @@
 //! Located runs decided zone by zone: the zone maps of a store file's
-//! columns read as Vortex `ZoneMap`s.
+//! columns, read back with their exact bounds and recorded graphs.
 
 use super::*;
 use crate::io::zone_map::ColumnZones;
 
 /// A store file's `g` column read as a zone map: 20,000 rows of `g1` then
-/// `g2` make three zones, and Vortex's falsifier of `g = g1` holds on the
-/// last one only.
+/// `g2` make three zones, and `g = g1` holds on every row of the first, on
+/// some of the second and on none of the last.
 #[tokio::test]
 async fn column_zones_read_from_a_written_column() {
-    use vortex_array::dtype::{DType, Nullability, PType};
-    use vortex_array::expr::{eq, lit, root};
-
     let quads: Vec<Quad> = (0..20_000)
         .map(|i| {
             make_quad(
@@ -34,16 +31,9 @@ async fn column_zones_read_from_a_written_column() {
         .unwrap()
         .expect("a written code column is zoned with exact bounds");
     assert_eq!((zones.zones(), zones.zone_len()), (3, 8_192));
-    let none = eq(root(), lit(g1))
-        .bind(&DType::Primitive(PType::U64, Nullability::NonNullable))
-        .unwrap()
-        .falsify(&crate::session::VORTEX_SESSION)
-        .unwrap()
-        .unwrap();
-    let mask = zones.prune(0..3, &none).unwrap();
     assert_eq!(
-        (0..3).map(|i| mask.value(i)).collect::<Vec<_>>(),
-        [false, false, true]
+        (0..3).map(|z| zones.eq_holds(z, g1)).collect::<Vec<_>>(),
+        [Some(true), None, Some(false)]
     );
 }
 

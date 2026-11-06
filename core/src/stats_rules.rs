@@ -1,62 +1,14 @@
-//! Statistics proofs the store adds to Vortex's own, through its extension
-//! point for them (`StatsRewriteRule`): rules a session evaluates against
-//! zone maps and footer statistics like the built-in ones.
+//! The statistics rule the store adds to Vortex's own, through its
+//! extension point for them (`StatsRewriteRule`): a falsifier of `x = c`
+//! from the values a graph column's zones record, which a session evaluates
+//! against zone maps beside the built-in rules, so Vortex's own pruning
+//! applies it in every filtered scan; and the switches that turn the store's
+//! zone decisions off (`VORTEX_RDF_ZONES=0`).
 
 use vortex_array::expr::BoundExpression;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
-
-/// `x = c` is true for every row of a scope where `x`'s minimum and maximum
-/// there are both `c`: the satisfier Vortex 0.90 lacks for an equality (its
-/// own rules satisfy literals and null tests only). Given only where it is
-/// sound: `x` a non-nullable integer and `c` a non-null literal. A float's
-/// NaNs and a nullable column's nulls fail `x = c` inside bounds of `c`.
-#[derive(Debug)]
-pub(crate) struct EqSatisfier;
-
-impl vortex_array::stats::rewrite::StatsRewriteRule for EqSatisfier {
-    fn scalar_fn_id(&self) -> ScalarFnId {
-        use vortex_array::scalar_fn::ScalarFnVTable as _;
-        vortex_array::scalar_fn::fns::binary::Binary.id()
-    }
-
-    fn satisfy(
-        &self,
-        expr: &BoundExpression,
-        _session: &VortexSession,
-    ) -> VortexResult<Option<BoundExpression>> {
-        use vortex_array::expr::bound::{and, eq};
-        use vortex_array::expr::stats::Stat;
-        use vortex_array::scalar_fn::fns::binary::Binary;
-        use vortex_array::scalar_fn::fns::literal::Literal;
-        use vortex_array::scalar_fn::fns::operators::Operator;
-        use vortex_array::stats::expr::bound::stat;
-
-        if !matches!(expr.as_::<Binary>(), Operator::Eq) {
-            return Ok(None);
-        }
-        let (lhs, rhs) = (expr.child(0), expr.child(1));
-        let (column, literal) = match (lhs.is::<Literal>(), rhs.is::<Literal>()) {
-            (false, true) => (lhs, rhs),
-            (true, false) => (rhs, lhs),
-            _ => return Ok(None),
-        };
-        if !column.dtype().is_int()
-            || column.dtype().is_nullable()
-            || literal.as_::<Literal>().is_null()
-        {
-            return Ok(None);
-        }
-        let (Some(min), Some(max)) = (Stat::Min.aggregate_fn(), Stat::Max.aggregate_fn()) else {
-            return Ok(None);
-        };
-        Ok(Some(and(
-            eq(stat(column.clone(), min), literal.clone()),
-            eq(stat(column.clone(), max), literal.clone()),
-        )))
-    }
-}
 
 /// `x = c` is false for every row of a zone whose recorded values
 /// (`vortexrdf.value_counts`, written for the graph columns) lack `c`:
@@ -66,7 +18,9 @@ impl vortex_array::stats::rewrite::StatsRewriteRule for EqSatisfier {
 /// statistic has none in scope: both leave the proof undecided. Given only
 /// for a non-nullable `u64` column (the aggregate's input) and a non-null
 /// `u64` literal, and not while `VORTEX_RDF_ZONES=0` ([`zones_switch`]).
-/// A located run applies the same records itself ([`BOUNDS_SESSION`]).
+/// A located run and the in-memory residual apply the same records
+/// themselves, decoded once
+/// ([`ColumnZones::eq_holds`](crate::io::zone_map::ColumnZones::eq_holds)).
 #[derive(Debug)]
 pub(crate) struct ValueCountsFalsifier;
 
@@ -136,51 +90,7 @@ pub(crate) fn zones_enabled() -> bool {
 /// Register the store's rules in `session`.
 pub(crate) fn register(session: &VortexSession) {
     use vortex_array::stats::session::StatsSessionExt as _;
-    session.stats().register_rewrite(EqSatisfier);
     session.stats().register_rewrite(ValueCountsFalsifier);
-}
-
-/// The session a located run builds its proofs of `x = c` in
-/// ([`eq_proofs`]): Vortex's built-in rules and [`EqSatisfier`], without the
-/// [`ValueCountsFalsifier`]. A located run applies a zone's recorded values
-/// from the records it decodes once per file
-/// ([`ColumnZones::recorded_count`](crate::io::zone_map::ColumnZones::recorded_count)),
-/// a search per zone. Asked in a proof on every call, that falsifier cost a
-/// count about 30 µs: its list function evaluated over the zone table, and
-/// its term at the footer, which kept Vortex from folding the footer's proof
-/// to a constant.
-#[cfg(feature = "file-io")]
-static BOUNDS_SESSION: std::sync::LazyLock<VortexSession> = std::sync::LazyLock::new(|| {
-    use vortex_array::stats::session::StatsSessionExt as _;
-    let session = VortexSession::empty();
-    session.stats().register_rewrite(EqSatisfier);
-    session
-});
-
-/// The two proofs of `x = code` over a column of `column` dtype, as Vortex
-/// builds them from the bounds' rules ([`BOUNDS_SESSION`]): `none` holds
-/// where no row can equal `code` (the falsifier), `all` where every row does
-/// (the satisfier); either is `None` where no rule proves it.
-#[cfg(feature = "file-io")]
-pub(crate) struct EqProofs {
-    pub(crate) none: Option<BoundExpression>,
-    pub(crate) all: Option<BoundExpression>,
-}
-
-/// [`EqProofs`] of `x = code`, `x` a column of `column` dtype (the root of a
-/// zone map's stats).
-#[cfg(feature = "file-io")]
-pub(crate) fn eq_proofs(
-    column: &vortex_array::dtype::DType,
-    code: u64,
-) -> crate::error::Result<EqProofs> {
-    use vortex_array::expr::{eq, lit, root};
-
-    let expr = eq(root(), lit(code)).bind(column)?;
-    Ok(EqProofs {
-        none: expr.falsify(&BOUNDS_SESSION)?,
-        all: expr.satisfy(&BOUNDS_SESSION)?,
-    })
 }
 
 #[cfg(test)]
@@ -201,101 +111,32 @@ mod tests {
         }
         assert_eq!(zones_enabled(), production);
     }
-}
 
-/// The proofs of `x = c` on zone maps: file-only, as only file reads build
-/// them ([`eq_proofs`]).
-#[cfg(all(test, feature = "file-io"))]
-mod proofs {
-    use super::*;
-    use crate::io::zone_map::ColumnZones;
-    use vortex_array::dtype::{DType, Nullability, PType};
-
-    const U64: DType = DType::Primitive(PType::U64, Nullability::NonNullable);
-
-    fn bits(mask: vortex_mask::Mask) -> Vec<bool> {
-        (0..mask.len()).map(|i| mask.value(i)).collect()
-    }
-
-    /// `x = 5` is proved for every row only where a zone's bounds are 5 and
-    /// 5, and refuted where they leave 5 out.
+    /// The store session's falsifier of `x = c`, which Vortex's scans prune
+    /// with, carries the values a zone records beside its bounds, unless
+    /// `VORTEX_RDF_ZONES=0` turns it off; a session without the store's
+    /// rule has the bounds' alone.
     #[test]
-    fn satisfier_holds_only_where_min_equals_max_equals_c() {
-        let zones = ColumnZones::from_bounds(
-            vortex_buffer::buffer![5u64, 4, 5, 6, 1],
-            vortex_buffer::buffer![5u64, 5, 6, 7, 3],
-            8_192,
-            36_000,
-        )
-        .unwrap();
-        let proofs = eq_proofs(&U64, 5).unwrap();
-        let all = proofs.all.expect("a satisfier for a u64 column");
-        let none = proofs.none.expect("a falsifier for a u64 column");
-        assert_eq!(
-            bits(zones.prune(0..5, &all).unwrap()),
-            [true, false, false, false, false]
-        );
-        assert_eq!(
-            bits(zones.prune(0..5, &none).unwrap()),
-            [false, false, false, true, true]
-        );
-    }
-
-    /// The satisfier at the top of the `u64` range.
-    #[test]
-    fn satisfier_at_the_top_of_u64() {
-        let zones = ColumnZones::from_bounds(
-            vortex_buffer::buffer![u64::MAX, u64::MAX - 1],
-            vortex_buffer::buffer![u64::MAX, u64::MAX],
-            8_192,
-            16_384,
-        )
-        .unwrap();
-        let all = eq_proofs(&U64, u64::MAX).unwrap().all.unwrap();
-        assert_eq!(bits(zones.prune(0..2, &all).unwrap()), [true, false]);
-    }
-
-    /// No satisfier where min = max = c proves nothing: a float zone's NaNs
-    /// and a nullable zone's nulls fail `x = c` at bounds of c.
-    #[test]
-    fn no_satisfier_for_floats_or_nullable() {
+    fn store_session_falsifier_carries_recorded_graphs() {
+        use vortex_array::dtype::{DType, Nullability, PType};
         use vortex_array::expr::{eq, lit, root};
 
-        let float = DType::Primitive(PType::F64, Nullability::NonNullable);
-        let satisfier = eq(root(), lit(5.0f64))
-            .bind(&float)
-            .unwrap()
-            .satisfy(&crate::session::VORTEX_SESSION)
+        let x = eq(root(), lit(5u64))
+            .bind(&DType::Primitive(PType::U64, Nullability::NonNullable))
             .unwrap();
-        assert!(satisfier.is_none(), "floats");
-        let nullable = DType::Primitive(PType::U64, Nullability::Nullable);
-        assert!(eq_proofs(&nullable, 5).unwrap().all.is_none(), "nullable");
-    }
-
-    /// A located run's proofs of `x = c` are the bounds' alone: it applies a
-    /// zone's recorded values from the records it decodes, a search per
-    /// zone, where Vortex would evaluate the recorded-values falsifier's list
-    /// function on every call. The store session's own falsifier, which
-    /// Vortex's scans prune with, still carries them.
-    #[test]
-    fn located_proofs_leave_recorded_values_to_the_records() {
-        use vortex_array::expr::{eq, lit, root};
-
-        let located = eq_proofs(&U64, 5).unwrap();
-        let none = located.none.expect("a falsifier from the bounds");
-        assert!(!none.to_string().contains("value_counts"), "{none}");
-        assert!(located.all.is_some(), "the satisfier stays");
-        if zones_switch() {
-            let scans = eq(root(), lit(5u64))
-                .bind(&U64)
-                .unwrap()
-                .falsify(&crate::session::VORTEX_SESSION)
-                .unwrap()
-                .expect("the store session's falsifier");
-            assert!(
-                scans.to_string().contains("vortexrdf.value_counts"),
-                "{scans}"
-            );
-        }
+        let store = x
+            .falsify(&crate::session::VORTEX_SESSION)
+            .unwrap()
+            .expect("the store session's falsifier");
+        assert_eq!(
+            store.to_string().contains("vortexrdf.value_counts"),
+            zones_switch(),
+            "{store}"
+        );
+        let bounds = x
+            .falsify(&VortexSession::empty())
+            .unwrap()
+            .expect("Vortex's own falsifier");
+        assert!(!bounds.to_string().contains("value_counts"), "{bounds}");
     }
 }

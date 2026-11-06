@@ -1288,12 +1288,14 @@ async fn locate_run(
 
 /// The statistics' decisions on `run`, located in `target` (a sorted
 /// table's gap run, or a reference child's run checked against the graph),
-/// in ladder order: the footer settles each checked slot for the
-/// whole file, leaving the run empty where no row holds a slot's code and
-/// dropping a slot every row holds; the zone maps then class the run's zones
-/// against the slots left ([`run_zones`]). Each slot's proofs of `x = code`
-/// are built once, for both. The quad table's footer speaks for an index
-/// child's columns, which hold its values.
+/// in ladder order: the footer's exact bounds of each checked slot's column
+/// settle it for the whole file ([`eq_on_bounds`]), leaving the run empty
+/// where no row holds the slot's code and dropping a slot every row holds;
+/// the zone maps then class the run's zones against the slots left
+/// ([`run_zones`]). The quad table's footer speaks for an index child's
+/// columns, which hold its values.
+///
+/// [`eq_on_bounds`]: crate::io::zone_map::eq_on_bounds
 #[cfg(feature = "file-io")]
 async fn decide_by_statistics(
     file: &crate::store::persist::native_file::NativeStoreFile,
@@ -1302,32 +1304,31 @@ async fn decide_by_statistics(
     run: &mut LocatedRun,
     source: &Source,
 ) -> Result<()> {
-    use vortex_array::dtype::{DType, Nullability, PType};
+    use crate::io::zone_map::{eq_on_bounds, footer_bounds};
+    use crate::store::schema::PRIMARY_COLUMNS;
 
     crate::observe::observe!(StatisticsAsked);
     let rows = run.positions();
-    let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-    let (mut unsettled, mut proofs) = (Vec::new(), Vec::new());
+    let mut unsettled = Vec::new();
     for &slot in &run.checked {
         let code = run.codes[slot].expect("a checked slot is bound");
-        let slot_proofs = crate::stats_rules::eq_proofs(&dtype, code)?;
-        match footer_decision(file, slot, &slot_proofs)? {
-            FooterDecision::Nothing => {
+        let footer = footer_bounds(file, PRIMARY_COLUMNS[slot])
+            .filter(|_| file.row_count() > 0)
+            .and_then(|(min, max)| eq_on_bounds(min, max, code));
+        match footer {
+            Some(false) => {
                 note(counters::ZONE_COLUMN, rows.end - rows.start);
                 run.clear_rows();
                 run.checked.clear();
                 return Ok(());
             }
-            FooterDecision::Everything => note(counters::ZONE_COLUMN, rows.end - rows.start),
-            FooterDecision::Unknown => {
-                unsettled.push(slot);
-                proofs.push(slot_proofs);
-            }
+            Some(true) => note(counters::ZONE_COLUMN, rows.end - rows.start),
+            None => unsettled.push(slot),
         }
     }
     run.checked = unsettled;
     if !run.checked.is_empty() {
-        run.zones = run_zones(file, tables, target, run, proofs, source).await?;
+        run.zones = run_zones(file, tables, target, run, source).await?;
     }
     Ok(())
 }
@@ -1344,14 +1345,13 @@ async fn run_zones(
     tables: &crate::store::persist::native_file::LocatedTables,
     target: StatisticsTarget,
     run: &LocatedRun,
-    proofs: Vec<crate::stats_rules::EqProofs>,
     source: &Source,
 ) -> Result<Option<RunZones>> {
     use crate::store::query::zone_decider::{CheckedColumn, ZoneDecider};
 
     let rows = &run.positions();
     let mut columns = Vec::with_capacity(run.checked.len());
-    for (&slot, proofs) in run.checked.iter().zip(proofs) {
+    for &slot in &run.checked {
         let zones = match target {
             StatisticsTarget::Table { table, component } => {
                 column_zones(file, tables, table, component, slot, source).await?
@@ -1368,7 +1368,6 @@ async fn run_zones(
             slot,
             code: run.codes[slot].expect("a checked slot is bound"),
             zones,
-            proofs,
         });
     }
     let Some(decider) = ZoneDecider::new(columns) else {
@@ -1376,7 +1375,7 @@ async fn run_zones(
     };
     let zone_len = decider.zone_len();
     let (first, past) = (rows.start / zone_len, rows.end.div_ceil(zone_len));
-    let classes = decider.classify(first..past)?;
+    let classes = decider.classify(first..past);
     // The ladder's third level: a mixed zone with one slot unsettled counts
     // from its column's record, when the zone lies whole within the run (a
     // partial zone's record counts rows outside it).
@@ -1462,48 +1461,6 @@ async fn kept_zones(
         None => None,
     };
     Ok(cell.get_or_init(|| zones).clone())
-}
-
-/// What a file's footer statistics say of a checked slot's code, for the
-/// whole file (the ladder's first level).
-#[cfg(feature = "file-io")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FooterDecision {
-    /// No row of the file holds the code.
-    Nothing,
-    /// Every row of the file holds it.
-    Everything,
-    /// The footer settles neither.
-    Unknown,
-}
-
-/// The footer's decision on `slot` holding the code `proofs` prove, from
-/// the footer's exact bounds of the slot's column
-/// ([`footer_bounds`](crate::io::zone_map::footer_bounds)):
-/// [`Nothing`] where Vortex's falsifier of `x = code` holds on them,
-/// [`Everything`] where its satisfier does ([`bounds_decide`]). A by-copy
-/// index holds the quad table's values, so the quad table's footer speaks
-/// for its columns too.
-///
-/// [`Nothing`]: FooterDecision::Nothing
-/// [`Everything`]: FooterDecision::Everything
-/// [`bounds_decide`]: crate::io::zone_map::bounds_decide
-#[cfg(feature = "file-io")]
-fn footer_decision(
-    file: &crate::store::persist::native_file::NativeStoreFile,
-    slot: usize,
-    proofs: &crate::stats_rules::EqProofs,
-) -> Result<FooterDecision> {
-    use crate::store::schema::PRIMARY_COLUMNS;
-
-    let bounds = crate::io::zone_map::footer_bounds(file, PRIMARY_COLUMNS[slot]);
-    Ok(
-        match crate::io::zone_map::bounds_decide(bounds, proofs, file.row_count())? {
-            Some(false) => FooterDecision::Nothing,
-            Some(true) => FooterDecision::Everything,
-            None => FooterDecision::Unknown,
-        },
-    )
 }
 
 /// The longest gap run checked row by row: [`GAP_ROWS`], or what a test

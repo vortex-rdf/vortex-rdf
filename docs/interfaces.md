@@ -245,9 +245,11 @@ same order. A code in a position its term kind cannot take matches nothing.
 Bound slots that are no such prefix, a bound slot after a free one
 (`(? p o g)` on `index:posg`, `(s p ? g)` or `(s ? o ?)` on the quad table),
 are the run of the table's longest bound prefix, its rows checked against
-the slots past it, unless a reference run is strictly shorter. Those checks are decided a zone at a time: by Vortex's own proofs of
-`x = c` on the checked columns' zone-map bounds and, for the graph, by the
-graphs each zone records. A zone where no row can hold the checked code is
+the slots past it, unless a reference run is strictly shorter. Those checks
+are decided a zone at a time, by the checked columns' exact zone bounds (no
+row holds a code outside them, every row holds one both equal) and, for the
+graph, by the graphs each zone records. A zone where no row can hold the
+checked code is
 skipped, a zone where every row holds it is taken whole without reading
 the column, and only the zones holding it among other codes are read. A
 count takes such a zone's count from the graphs it records when the graph is

@@ -100,24 +100,15 @@ impl ExactZoneMap {
     }
 }
 
-/// A non-nullable `u64` column's zone map as Vortex's own [`ZoneMap`] takes
-/// it: the zone table's exact bounds ([`exact_bound_aggregates`], `max` then
-/// `min`), one row per zone; and beside it, where the column records them
-/// (`vortexrdf.value_counts`, a graph column of a file written since the
-/// `vortexrdf 2026.11.0` edition), the values each zone holds with their
-/// rows, decoded once. The stats proofs (a falsifier, a satisfier) asked of
-/// a range of its zones are evaluated by Vortex's [`ZoneMap::prune`] on one
-/// map of those zones' rows of the table ([`zone_map`](Self::zone_map)); a
-/// zone's recorded rows of a code are
+/// A non-nullable `u64` column's zone map: each zone's exact bounds (the
+/// zone table's [`exact_bound_aggregates`]); and beside them, where the
+/// column records them (`vortexrdf.value_counts`, a graph column of a file
+/// written since the `vortexrdf 2026.11.0` edition), the values each zone
+/// holds with their rows, decoded once. How a zone stands against `x = c`
+/// is [`eq_holds`](Self::eq_holds); its recorded rows of a code are
 /// [`recorded_count`](Self::recorded_count).
-///
-/// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
-/// [`ZoneMap::prune`]: vortex_layout::layouts::zoned::zone_map::ZoneMap::prune
 pub(crate) struct ColumnZones {
-    /// The zone table: `max`, then `min`, each a nullable `u64` column.
-    table: StructArray,
-    /// The table's `min` and `max` buffers, shared with its columns: the
-    /// bounds [`eq_holds`](Self::eq_holds) reads.
+    /// Each zone's exact minimum and maximum, in zone order.
     mins: vortex_buffer::Buffer<u64>,
     maxes: vortex_buffer::Buffer<u64>,
     /// Each zone's recorded values, `None` for every zone of a column
@@ -143,10 +134,6 @@ impl ColumnZones {
         zone_len: u64,
         row_count: u64,
     ) -> Result<Self> {
-        use vortex_array::IntoArray as _;
-        use vortex_array::arrays::PrimitiveArray;
-        use vortex_array::validity::Validity;
-
         let zones = mins.len();
         if maxes.len() != zones || zone_len == 0 || row_count.div_ceil(zone_len) != zones as u64 {
             return Err(crate::error::VortexRdfError::InvalidInput(format!(
@@ -154,19 +141,7 @@ impl ColumnZones {
                 maxes.len()
             )));
         }
-        let aggregates = exact_bound_aggregates();
-        let names: Vec<String> = aggregates.iter().map(|a| a.to_string()).collect();
-        let table = StructArray::try_new(
-            names.iter().map(String::as_str).collect::<Vec<_>>().into(),
-            vec![
-                PrimitiveArray::new(maxes.clone(), Validity::AllValid).into_array(),
-                PrimitiveArray::new(mins.clone(), Validity::AllValid).into_array(),
-            ],
-            zones,
-            Validity::NonNullable,
-        )?;
         Ok(Self {
-            table,
             mins,
             maxes,
             recorded: None,
@@ -291,7 +266,7 @@ impl ColumnZones {
 
     /// How many zones the column has.
     pub(crate) fn zones(&self) -> u64 {
-        self.table.len() as u64
+        self.mins.len() as u64
     }
 
     /// The rows the zones cover.
@@ -318,67 +293,18 @@ impl ColumnZones {
                 .map_or(0, |at| u64::from(pairs[at].1)),
         )
     }
-
-    /// Where `proof` holds over the zones `zones`, one bit per zone in
-    /// order: Vortex's [`ZoneMap::prune`] on those zones' rows of the
-    /// table ([`zone_map`](Self::zone_map)), for a test asking one proof.
-    ///
-    /// [`ZoneMap::prune`]: vortex_layout::layouts::zoned::zone_map::ZoneMap::prune
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn prune(
-        &self,
-        zones: std::ops::Range<u64>,
-        proof: &vortex_array::expr::BoundExpression,
-    ) -> Result<vortex_mask::Mask> {
-        if zones.is_empty() {
-            return Ok(vortex_mask::Mask::new_false(0));
-        }
-        Ok(self.zone_map(zones)?.prune(proof, &VORTEX_SESSION)?)
-    }
-
-    /// Vortex's [`ZoneMap`] of the zones `zones` (not empty), those zones'
-    /// rows of the table: built once, it prunes every proof asked of them.
-    ///
-    /// [`ZoneMap`]: vortex_layout::layouts::zoned::zone_map::ZoneMap
-    #[cfg(feature = "file-io")]
-    pub(crate) fn zone_map(
-        &self,
-        zones: std::ops::Range<u64>,
-    ) -> Result<vortex_layout::layouts::zoned::zone_map::ZoneMap> {
-        use vortex_array::IntoArray as _;
-        use vortex_array::dtype::{DType, Nullability, PType};
-        use vortex_layout::layouts::zoned::zone_map::ZoneMap;
-
-        crate::observe::observe!(ZoneMapBuilt);
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let table = self
-            .table
-            .clone()
-            .into_array()
-            .slice(zones.start as usize..zones.end as usize)?
-            .execute::<StructArray>(&mut ctx)?;
-        let first_row = zones.start * self.zone_len;
-        let rows = (zones.end * self.zone_len).min(self.row_count) - first_row;
-        Ok(ZoneMap::try_new(
-            DType::Primitive(PType::U64, Nullability::NonNullable),
-            table,
-            exact_bound_aggregates(),
-            self.zone_len,
-            rows,
-        )?)
-    }
 }
 
 /// How rows of exact bounds `min..=max` stand against `x = code`:
 /// `Some(false)` where none can hold `code` (it lies outside the bounds),
 /// `Some(true)` where every one does (`min = max = code`), `None` where the
-/// bounds settle neither. What Vortex's falsifier of `x = c` and the store's
-/// satisfier ([`eq_proofs`]) prove on exact bounds, read off the bounds
-/// directly: the in-memory residual asks it of a column and of every zone
-/// it touches on every call, where building and evaluating the proofs cost
-/// tens of µs a column, more than many residuals' whole compare.
-///
-/// [`eq_proofs`]: crate::stats_rules::eq_proofs
+/// bounds settle neither. The store's one rule for `x = c` on exact bounds,
+/// a file's footer and zones and an in-memory column's statistics alike: it
+/// refutes where Vortex's own falsifier of `x = c` does, and proves what
+/// Vortex has no satisfier of an equality for. Read off the bounds directly,
+/// for a read asks it of a column and of every zone it touches on every
+/// call, where building and evaluating Vortex's proofs cost tens of µs a
+/// column, more than many reads' whole compare.
 pub(crate) fn eq_on_bounds(min: u64, max: u64, code: u64) -> Option<bool> {
     if code < min || code > max {
         Some(false)
@@ -387,47 +313,6 @@ pub(crate) fn eq_on_bounds(min: u64, max: u64, code: u64) -> Option<bool> {
     } else {
         None
     }
-}
-
-/// What exact bounds `(min, max)` of a column of `row_count` rows decide of
-/// `x = code`, by Vortex's proofs of it (`proofs`, [`eq_proofs`]) on one
-/// one-zone map of them: `Some(false)` where the falsifier holds (no row
-/// holds the code), `Some(true)` where the satisfier does (every row does),
-/// `None` where neither does, and without bounds, rows or a proof.
-///
-/// [`eq_proofs`]: crate::stats_rules::eq_proofs
-#[cfg(feature = "file-io")]
-pub(crate) fn bounds_decide(
-    bounds: Option<(u64, u64)>,
-    proofs: &crate::stats_rules::EqProofs,
-    row_count: u64,
-) -> Result<Option<bool>> {
-    let Some((min, max)) = bounds else {
-        return Ok(None);
-    };
-    if row_count == 0 {
-        return Ok(None);
-    }
-    let map = ColumnZones::from_bounds(
-        vortex_buffer::buffer![min],
-        vortex_buffer::buffer![max],
-        row_count,
-        row_count,
-    )?
-    .zone_map(0..1)?;
-    let holds = |proof: &Option<vortex_array::expr::BoundExpression>| -> Result<bool> {
-        match proof {
-            Some(proof) => Ok(map.prune(proof, &VORTEX_SESSION)?.value(0)),
-            None => Ok(false),
-        }
-    };
-    Ok(if holds(&proofs.none)? {
-        Some(false)
-    } else if holds(&proofs.all)? {
-        Some(true)
-    } else {
-        None
-    })
 }
 
 /// The footer's exact `(min, max)` of `file`'s top-level `u64` column
@@ -536,41 +421,89 @@ mod tests {
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_array::expr::{eq, lit, root};
 
-    /// The bounds' rule of `x = c` ([`ColumnZones::eq_holds`]) is what
-    /// Vortex's falsifier and the store's satisfier prove on each zone
-    /// ([`ColumnZones::prune`] with [`eq_proofs`]), for codes below, inside,
-    /// on and above every zone's bounds, and the recorded values rule out a
-    /// zone whose bounds hold the code but whose records lack it.
-    ///
-    /// [`eq_proofs`]: crate::stats_rules::eq_proofs
-    #[cfg(feature = "file-io")]
-    #[test]
-    fn eq_holds_proves_what_the_vortex_proofs_prove() {
-        let zones = ColumnZones::from_bounds(
-            vortex_buffer::buffer![5u64, 4, 5, 6, 1, 7],
-            vortex_buffer::buffer![5u64, 5, 6, 7, 3, 7],
-            8_192,
-            6 * 8_192 - 100,
+    /// Vortex's own zone map of zones with exact bounds `bounds`, `zone_len`
+    /// rows each but the last, `row_count` rows in all: the map its scans
+    /// prune with.
+    fn vortex_zone_map(
+        bounds: &[(u64, u64)],
+        zone_len: u64,
+        row_count: u64,
+    ) -> vortex_layout::layouts::zoned::zone_map::ZoneMap {
+        use vortex_array::IntoArray as _;
+        use vortex_array::arrays::PrimitiveArray;
+        use vortex_array::validity::Validity;
+
+        let column = |bound: fn(&(u64, u64)) -> u64| {
+            let values: vortex_buffer::Buffer<u64> = bounds.iter().map(bound).collect();
+            PrimitiveArray::new(values, Validity::AllValid).into_array()
+        };
+        let names: Vec<String> = exact_bound_aggregates()
+            .iter()
+            .map(|aggregate| aggregate.to_string())
+            .collect();
+        let table = StructArray::try_new(
+            names.iter().map(String::as_str).collect::<Vec<_>>().into(),
+            vec![column(|b| b.1), column(|b| b.0)],
+            bounds.len(),
+            Validity::NonNullable,
         )
         .unwrap();
+        vortex_layout::layouts::zoned::zone_map::ZoneMap::try_new(
+            DType::Primitive(PType::U64, Nullability::NonNullable),
+            table,
+            exact_bound_aggregates(),
+            zone_len,
+            row_count,
+        )
+        .unwrap()
+    }
+
+    /// The bounds' rule of `x = c` ([`ColumnZones::eq_holds`]) refutes a
+    /// zone exactly where Vortex's own falsifier of `x = c` holds on it, and
+    /// proves it exactly where the zone's bounds are the code alone (Vortex
+    /// has no satisfier of an equality), for codes below, inside, on and
+    /// above every zone's bounds and at the top of the `u64` range; the
+    /// recorded values refute a zone whose bounds hold the code but whose
+    /// records lack it.
+    #[test]
+    fn eq_holds_matches_vortex_falsifier() {
+        let bounds = [(5u64, 5u64), (4, 5), (5, 6), (6, 7), (1, 3), (7, 7)];
+        let (zone_len, row_count) = (8_192, 6 * 8_192 - 100);
+        let zones = ColumnZones::from_bounds(
+            bounds.iter().map(|b| b.0).collect(),
+            bounds.iter().map(|b| b.1).collect(),
+            zone_len,
+            row_count,
+        )
+        .unwrap();
+        let map = vortex_zone_map(&bounds, zone_len, row_count);
         let u64 = DType::Primitive(PType::U64, Nullability::NonNullable);
-        for code in 0..=9 {
-            let proofs = crate::stats_rules::eq_proofs(&u64, code).unwrap();
-            let none = zones.prune(0..6, proofs.none.as_ref().unwrap()).unwrap();
-            let all = zones.prune(0..6, proofs.all.as_ref().unwrap()).unwrap();
-            for zone in 0..6 {
-                let proved = match (none.value(zone), all.value(zone)) {
-                    (true, _) => Some(false),
-                    (false, true) => Some(true),
-                    (false, false) => None,
-                };
+        for code in 0..=9u64 {
+            let falsifier = eq(root(), lit(code))
+                .bind(&u64)
+                .unwrap()
+                .falsify(&vortex_session::VortexSession::empty())
+                .unwrap()
+                .expect("Vortex falsifies an equality");
+            let refuted = map.prune(&falsifier, &VORTEX_SESSION).unwrap();
+            for (zone, &(min, max)) in bounds.iter().enumerate() {
+                let held = zones.eq_holds(zone as u64, code);
                 assert_eq!(
-                    zones.eq_holds(zone as u64, code),
-                    proved,
-                    "zone {zone}, code {code}"
+                    held == Some(false),
+                    refuted.value(zone),
+                    "zone {zone}, code {code}: refuted"
+                );
+                assert_eq!(
+                    held == Some(true),
+                    min == code && max == code,
+                    "zone {zone}, code {code}: proved"
                 );
             }
         }
+        let top = u64::MAX;
+        assert_eq!(eq_on_bounds(top, top, top), Some(true));
+        assert_eq!(eq_on_bounds(top - 1, top, top), None);
+        assert_eq!(eq_on_bounds(top - 1, top - 1, top), Some(false));
         let recorded = zones
             .with_records(vec![
                 Some(vec![(5, 8_192)].into()),
@@ -594,94 +527,6 @@ mod tests {
         );
         assert_eq!(recorded.eq_holds(1, 5), None);
         assert_eq!(recorded.eq_holds(0, 5), Some(true));
-    }
-
-    /// A zone map pruned with Vortex's own falsifier of `x = 5`: the zones
-    /// whose bounds leave 5 out, over the whole table and over a range of
-    /// its zones.
-    #[cfg(feature = "file-io")]
-    #[test]
-    fn column_zones_prune_with_vortex_falsifier() {
-        let zones = ColumnZones::from_bounds(
-            vortex_buffer::buffer![5u64, 4, 5, 6, 1],
-            vortex_buffer::buffer![5u64, 5, 6, 7, 3],
-            8_192,
-            36_000,
-        )
-        .unwrap();
-        assert_eq!((zones.zones(), zones.zone_len()), (5, 8_192));
-        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        let none = eq(root(), lit(5u64))
-            .bind(&dtype)
-            .unwrap()
-            .falsify(&VORTEX_SESSION)
-            .unwrap()
-            .expect("Vortex falsifies an equality");
-        let bits =
-            |mask: vortex_mask::Mask| (0..mask.len()).map(|i| mask.value(i)).collect::<Vec<_>>();
-        assert_eq!(
-            bits(zones.prune(0..5, &none).unwrap()),
-            [false, false, false, true, true]
-        );
-        assert_eq!(
-            bits(zones.prune(1..4, &none).unwrap()),
-            [false, false, true]
-        );
-        assert_eq!(zones.prune(2..2, &none).unwrap().len(), 0);
-    }
-
-    /// Bounds decide that every row holds a code only where both are the
-    /// code, and that none does where they leave it out, on one map for both
-    /// proofs; bounds of no rows, a file without bounds, or no proof decide
-    /// nothing.
-    #[cfg(feature = "file-io")]
-    #[test]
-    fn bounds_decide_the_code() {
-        use crate::stats_rules::{EqProofs, eq_proofs};
-        use vortex_array::dtype::{DType, Nullability, PType};
-
-        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        let (five, top) = (
-            eq_proofs(&dtype, 5).unwrap(),
-            eq_proofs(&dtype, u64::MAX).unwrap(),
-        );
-        for (bounds, decided) in [
-            (Some((5, 5)), Some(true)),
-            (Some((4, 5)), None),
-            (Some((4, 6)), None),
-            (Some((6, 9)), Some(false)),
-            (Some((1, 4)), Some(false)),
-            (None, None),
-        ] {
-            assert_eq!(
-                bounds_decide(bounds, &five, 100).unwrap(),
-                decided,
-                "{bounds:?}"
-            );
-        }
-        let max = Some((u64::MAX, u64::MAX));
-        assert_eq!(bounds_decide(max, &top, 100).unwrap(), Some(true));
-        assert_eq!(bounds_decide(Some((5, 5)), &five, 0).unwrap(), None);
-        let unproved = EqProofs {
-            none: None,
-            all: None,
-        };
-        assert_eq!(bounds_decide(Some((6, 9)), &unproved, 100).unwrap(), None);
-    }
-
-    /// The footer level decides a slot on one Vortex zone map, which both
-    /// proofs prune: bounds that settle neither ask both of it.
-    #[cfg(feature = "file-io")]
-    #[test]
-    fn bounds_decide_on_one_zone_map() {
-        use crate::observe::{Event, Recorder};
-        use vortex_array::dtype::{DType, Nullability, PType};
-
-        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        let five = crate::stats_rules::eq_proofs(&dtype, 5).unwrap();
-        let rec = Recorder::start();
-        assert_eq!(bounds_decide(Some((4, 6)), &five, 100).unwrap(), None);
-        assert_eq!(rec.count(&Event::ZoneMapBuilt), 1);
     }
 
     /// A zone table's recorded states as another writer of the statistic

@@ -260,7 +260,7 @@ What the store reads from this structure:
   checks, taken only as the store writes them: as many counts as graphs, the
   graphs strictly ascending, the counts summing to the block's rows. A block
   whose record is otherwise is read as recording none
-  ([`decode_states`](../core/src/io/zone_map.rs#L468));
+  ([`decode_states`](../core/src/io/zone_map.rs#L353));
 - the **chunk leaves** of the `u64` code and row-id columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
