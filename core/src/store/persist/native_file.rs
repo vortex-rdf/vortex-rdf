@@ -534,18 +534,11 @@ impl NativeStoreFile {
         component: Option<&str>,
         column: &str,
     ) -> Option<LayoutRef> {
-        use vortex_layout::LayoutChildType;
-
         let table = match component {
             None => self.quad_layout().ok()?,
             Some(name) => self.slot_layout(self.slot_of(name)?).ok()?,
         };
-        (0..table.nslots()).find_map(|i| match table.slot_type(i) {
-            Some(LayoutChildType::Field(name)) if name.as_ref() == column => {
-                table.slot(i).ok().flatten()
-            }
-            _ => None,
-        })
+        container::struct_field(&table, column)
     }
 
     /// The quad child's layout (the root's transparent child): the struct of

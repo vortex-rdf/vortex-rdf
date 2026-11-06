@@ -90,7 +90,16 @@ impl VortexRdfStore {
         let worth_indexing = !prefix_narrowed || selection.len(base_len) >= INDEX_ROUTING_MIN_ROWS;
         let (mut resolved, mut serve) = (None, None);
         if !selection.is_empty(base_len) && pat.any_bound() && worth_indexing {
-            match resolve_indexes_in_memory(&self.indexes, components, &self.layout, pat, codes)? {
+            // A view only windowed or capped reaches its rows in base order.
+            let windowed = matches!(need, IdsNeed::CountOrWindow { reach } if reach < usize::MAX);
+            match resolve_indexes_in_memory(
+                &self.indexes,
+                components,
+                &self.layout,
+                pat,
+                codes,
+                windowed,
+            )? {
                 // The probed term is absent from the data: nothing matches.
                 IndexResolution::Empty => {
                     debug::step!(t, "[match_pattern] In-memory index proved empty");
@@ -103,8 +112,14 @@ impl VortexRdfStore {
                     row_ids,
                     resolves,
                     serve: plan,
+                    graph,
                 } => {
                     pat = resolves.clear(pat);
+                    // A run that checked the bound graph inside its
+                    // component leaves none to compare.
+                    if graph {
+                        pat.graph = None;
+                    }
                     resolved = Some(row_ids);
                     serve = plan;
                 }

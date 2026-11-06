@@ -55,7 +55,7 @@ A builder hands these back in one of two shapes
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L67), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L113) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L134) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
-| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L254) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
+| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L270) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -379,7 +379,7 @@ mapping exists only for the build; stores keep the columnar dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L121),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L123),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |
@@ -400,8 +400,8 @@ than let an id wrap onto row 0:
 
 | Where | Check | Refusal |
 |---|---|---|
-| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L123)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
-| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L137)); a refused file build leaves no file | the same |
+| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L124)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
+| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L138)); a refused file build leaves no file | the same |
 
 Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
@@ -548,7 +548,7 @@ store's *compressed-resident* form (through
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L86)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L91)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
@@ -559,11 +559,14 @@ store's *compressed-resident* form (through
 - the smallest and largest code of each 8,192-row zone of every code column
   is taken in the pass that picks the column's encoding, which reads every
   code for the column's own bounds anyway
-  ([`ZoneBuilder`](../core/src/store/zones.rs#L182)), and the graph column's
+  ([`ZoneBuilder`](../core/src/store/zones.rs#L173)), and the graph column's
   graphs per zone with Vortex's accumulator of `vortexrdf.value_counts`: the
   in-memory counterpart of a file's zone maps, so a match's residual
   equality compares only the zones that may hold its code
-  ([matching.md §6.3](matching.md#63-residual-column-filtering));
+  ([matching.md §6.3](matching.md#63-residual-column-filtering)); each
+  component's graph column takes its zone map and graphs in the same pass,
+  so a run bound to a graph checks it inside the component
+  ([matching.md §6.2](matching.md#62-secondary-index-routing));
 - the same pass's smallest and largest code of the whole column are stamped
   on it as exact `Stat::Min`/`Stat::Max` array statistics
   ([`stamp_bounds`](../core/src/store/array.rs#L92)), the whole-column level
@@ -575,7 +578,8 @@ it keeps each integer child's existing encoding wherever a probe binds it and
 decodes only the ones that decline. Its zone maps are the file's own zone
 tables, the graph column's recorded graphs included, read at open
 ([`QuadZones::read`](../core/src/store/zones.rs#L71)), as `from_bytes` reads
-them, and its code columns' array statistics are the file's footer
+them, its components' the zone tables of their children's graph columns
+([`read_graph_zones`](../core/src/store/zones.rs#L327)), and its code columns' array statistics are the file's footer
 statistics, stamped on the loaded base's columns
 ([`stamp_quad_bounds`](../core/src/store/array.rs#L116)). Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).

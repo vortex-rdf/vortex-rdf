@@ -201,6 +201,20 @@ pub(crate) fn component_child(root: &RdfStoreLayout, slot: usize) -> VortexResul
         .ok_or_else(|| vortex_error::vortex_err!("store root has no component child {slot}"))
 }
 
+/// The layout of field `name` of a table's struct layout (the quad table's,
+/// or an index child's): `None` when the table has no such field, or is not
+/// a struct.
+pub(crate) fn struct_field(table: &LayoutRef, name: &str) -> Option<LayoutRef> {
+    use vortex_layout::LayoutChildType;
+
+    (0..table.nslots()).find_map(|slot| match table.slot_type(slot) {
+        Some(LayoutChildType::Field(field)) if field.as_ref() == name => {
+            table.slot(slot).ok().flatten()
+        }
+        _ => None,
+    })
+}
+
 /// A reader of the component in `slot` of a native store file's inventory
 /// ([`component_child`]), named as its descriptor names it and reading the
 /// file's own segments: the one construction of a component reader, which

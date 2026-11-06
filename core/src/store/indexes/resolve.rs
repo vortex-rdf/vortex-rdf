@@ -11,9 +11,12 @@ use vortex_array::IntoArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 
 use super::components::{ComponentIdentity, IndexComponent};
+use super::graph_check::GraphCheck;
 use super::serve::{InMemoryServePlan, ServeDecode};
 use super::{COL_RID, ComponentRun, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::Result;
+use crate::stats_rules::zones_enabled;
+use crate::store::array::unsigned_value;
 use crate::store::layouts::{PatternCodes, TermRef};
 
 /// What an index probes for a pattern shape it covers: the shared front half
@@ -36,6 +39,12 @@ pub(super) struct IndexProbe<'a> {
     // Read by the file resolver, which is compiled in under `file-io`.
     #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
     pub(super) residual: Vec<(&'static str, TermRef<'a>)>,
+    /// The pattern's bound graph, which the in-memory resolver checks inside
+    /// the run where the probed component keeps its graph column's zone map
+    /// ([`IndexComponent::graph_zones`]). The file resolver reads a bound
+    /// graph from `residual` instead (a copy child's), or leaves it to its
+    /// located runs (a reference child's).
+    pub(super) graph: Option<TermRef<'a>>,
     /// Which pattern roles the keys resolve.
     pub(super) resolves: ResolvedRoles,
     /// How the child's columns decode as the primary quads, for an index
@@ -65,10 +74,18 @@ pub(super) struct IndexProbe<'a> {
 /// the selection, and windowed before decoding when its rids ascend), and a
 /// serving probe hands back an [`InMemoryServePlan`] over the run beside
 /// them, so reads slice the matched quads straight from the component.
+///
+/// A bound graph is checked inside the run where the component keeps its
+/// graph column's zone map and zones are on ([`GraphCheck`]), except on a
+/// view only `windowed` whose run's ids do not ascend (a copy family's): a
+/// window takes its matches in base order, which would find every match of
+/// such a run first, while the residual over the run's ids in base order
+/// reaches the window through the base's zones.
 pub(super) fn resolve_in_memory(
     probe: IndexProbe<'_>,
     components: &[IndexComponent],
     codes: &mut PatternCodes,
+    windowed: bool,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     // Route through the index only when the probed component exists and its
     // sort keys are globally sorted: the writer's provenance, not a stamp
@@ -100,12 +117,40 @@ pub(super) fn resolve_in_memory(
     let run = run.expect("`IndexType::choose` hands out only probes with keys");
     let rows = component.rows()?;
     let rids = rows.unmasked_field_by_name(COL_RID)?.slice(run.clone())?;
-    let ids = Arc::new(ComponentRun::new(rids, probe.rids_ascend));
+    // A bound graph is checked inside the run where the component keeps its
+    // graph column's zone map: the run's rows are contiguous there, so its
+    // zones count and read them, where the residual would compare the graph
+    // at the base rows the run lists.
+    let check = match (probe.graph, component.graph_zones()) {
+        (Some(graph), Some(zones)) if zones_enabled() && (probe.rids_ascend || !windowed) => {
+            // A graph absent from the dictionary matches nothing, as a key's
+            // term does.
+            let Some(native) = codes.probe_scalar(graph)? else {
+                return Ok(IndexResolution::Empty);
+            };
+            match unsigned_value(&native) {
+                Some(code) => Some(GraphCheck::new(
+                    component,
+                    run.clone(),
+                    code,
+                    Arc::clone(zones),
+                )?),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let graph = check.is_some();
+    let ids = Arc::new(match check {
+        Some(check) => ComponentRun::checked(rids, probe.rids_ascend, check),
+        None => ComponentRun::new(rids, probe.rids_ascend),
+    });
     // The matched quads are the contiguous matched run of the serving
     // component, so a read can slice them straight from it instead of
     // gathering the primary columns at the row ids. The plan shares the run
-    // with the lazy ids: its ids decode once for both.
-    let serve = probe.serve.map(|decode| {
+    // with the lazy ids: its ids decode once for both. A checked run keeps
+    // only some of the run's rows, which a plan would over-cover.
+    let serve = probe.serve.filter(|_| !graph).map(|decode| {
         InMemoryServePlan::new(
             decode,
             component.identity.name,
@@ -119,5 +164,6 @@ pub(super) fn resolve_in_memory(
         row_ids: ResolvedRowIds::Lazy(LazyRowIds::Component(ids)),
         resolves: probe.resolves,
         serve,
+        graph,
     })
 }

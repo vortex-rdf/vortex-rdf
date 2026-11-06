@@ -175,7 +175,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L126)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
-| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L64) |
+| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L65) |
 | `version` | the implementation's version, positive; a dictionary or index child above the version a reader reads (`DICT_VERSION`, `INDEX_VERSION`) fails the open ([§3](#3-the-store-root-vortex-rdfstorev2)) |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
 | `sorted` | the writer's provenance that the sort-key columns are *globally* sorted — a reader may binary-search the child only when this is set; absent means false |
@@ -301,7 +301,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L244)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L260)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L166)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -373,15 +373,15 @@ Shared rules:
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L123)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L137))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L124)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L138))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L76)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L77)).
 - **A bound graph is never a key an index is searched by** (it is the last
   key of both copy orders, and a reference child's `g` is no key), and neither
   index answers a bound-subject pattern — the sorted quad table is the better
@@ -503,7 +503,7 @@ code, 0: a pattern that also binds the graph checks it at position 1 itself.
 | `from_file_in_memory` | everything, through the file reader rather than a mapping: quad rows, dictionary and index children are loaded into memory, so the store never reads the file again |
 | a query | the zone-map tables the filter needs, the chunk leaves a probe bisects, then the leaves of the rows the scan finally decodes — or, on a served match, the index child's own run |
 | `size()` on a pending filter | statistics and filter masks only; no row is projected |
-| `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (still FSST), and each index child is adopted by its reader with nothing read — it is scanned and canonicalized on its first use |
+| `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (still FSST), and each index child is adopted by its reader with nothing read but its graph column's zone table — it is scanned and canonicalized on its first use |
 
 **The mapping model.** A file store is memory-mapped (`memmap2`, through
 Vortex's `open_buffer`): a segment read is a slice of the map, so the pages a
@@ -541,6 +541,14 @@ largest code as its array statistics (`Stat::Min`, `Stat::Max`). A load reads
 them from the file's zone tables and footer, a build takes them in the pass
 that compresses its codes ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)). A
 query computes its residual's zone classes from them and keeps nothing.
+Each index component keeps the zone map of its graph column the same way,
+with the column's recorded graphs (a Dictionary store's; string columns have
+none): a build takes it in the pass that compresses the component,
+`from_file_in_memory` reads it from the child's zone table, and `from_bytes`
+reads it at adoption, the component's rows still unread. A run bound to a
+graph checks it inside the component, zone by zone
+([matching.md §6.2](matching.md#62-secondary-index-routing)), and keeps only
+its matches, with the view's ids.
 
 **Scans.** A scan read to completion into one array is driven by what its
 splits cost. An index child's row-id scan always runs inline on the calling

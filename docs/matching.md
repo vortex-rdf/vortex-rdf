@@ -272,10 +272,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L448), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L808) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`memory.rs:152-159`](../core/src/store/query/matching/memory.rs#L152-L159 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L459), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L808) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L167-L174 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -384,6 +384,38 @@ windowed `match_many` probe: `IdsNeed::CountOrWindow`). Reads then go through
 the plan, and a count takes the run's width. In every other case the ids are
 materialized and intersected immediately.
 
+**A bound graph, checked inside the run.** With zones on (`VORTEX_RDF_ZONES`
+not `0`), the in-memory resolver checks a pattern's bound graph inside the
+run it located when the probed component keeps a zone map of its graph
+column ([`graph_zones`](../core/src/store/indexes/components.rs#L312): the
+Dictionary layout's components, built or loaded). The run's rows are
+contiguous in the component, so the component's own `g` column decides them
+a zone at a time ([`GraphCheck`](../core/src/store/indexes/graph_check.rs#L34)),
+where stage 3 would compare the graph at the base rows the run lists,
+scattered over the base:
+
+- a zone whose bounds or recorded graphs rule the graph out is skipped, and
+  a zone of the graph alone is taken whole;
+- a mixed zone is counted from its recorded graphs when the run holds the
+  whole zone, else on the graph column's encoding (`count_eq`), else by
+  comparing its graphs, and its matching rows are found on the encoding too
+  (`eq_offsets`: a dictionary's codes against the graph's code).
+
+The resolution reports the graph resolved (`Resolved::graph`), so nothing is
+left to compare it on, and the run's ids are its matching rows. Without
+tombstones a count adds the zones' counts and decodes no id; under them it
+counts the matching ids left live. A window of a run whose ids ascend (by
+reference) skips the zones before it by their counts and reads only the
+zones it spans. A run whose ids follow its copy's order (by copy) is checked
+only when the view reaches every match (counted, read whole, a window with
+no limit, keeps), its matching ids sorted into base order: a window with a
+limit, or a capped count (`IdsNeed::CountOrWindow` reaching fewer than every
+row), leaves the graph to stage 3, whose zones over the run's ids in base
+order reach the window without finding every match first. A checked run carries no serve plan, as its rows are only
+part of the run, and a graph absent from the dictionary answers `Empty`.
+Without the zone map (the string layouts) or with zones off, the graph is
+left to stage 3.
+
 **Examples** (what each index holds for the running example is laid out
 where the index is described: [§8.2](#82-secondarybycopy--two-sorted-quad-copies)
 for the sorted copies, [§8.3](#83-secondarybyreference--sorted-val-rid-pairs)
@@ -394,7 +426,7 @@ for the `{val, rid}` pairs).
 | `(? a ? ?)` | `choose` picks the POSG family; `p = 4` bounds `index:posg` to `[0, 2)` (rids `0, 2`) → `Resolved`, `Lazy` rids, plan over that run. The view started `All`, stage 1 never ran, nothing is left bound → the ids stay **pending** and the plan is kept | `ref-p`, `val = 4` → `[0, 2)` → `Lazy` rids, no plan → materialized and sorted now → selection `Ids [0, 2]` |
 | `(? a foaf:Person ?)` | the `(p, o)` prefix: `p = 4` → `[0, 2)`, then `o = 5` within it → `[0, 2)`; both components resolved, nothing residual | the object is preferred: `ref-o`, `val = 5` → `[2, 4)` → rids `[0, 2]`; `p` stays bound, and stage 3 tests it on those two rows |
 | `(? ? ? "")` | no family sorts by `g` → `Declined`; stage 3 scans `g` | same |
-| `(? a ? "")` | `p` resolves as above, but `g` is still bound — the lazy ids materialize now (`[0, 2]`), stage 3 tests `g` on them, and stage 4 drops the plan | `ref-p` → `[0, 2]`, stage 3 tests `g` |
+| `(? a ? "")` | `p` resolves as above, and `g` is checked inside the run, on `index:posg`'s own `g` column: the ids are the run's matching rows, materialized now, with no plan. Zones off: the lazy ids materialize (`[0, 2]`), stage 3 tests `g` on them, and stage 4 drops the plan | `ref-p` → `[0, 2]`, `g` checked on `index:ref-p`'s own `g` column; zones off, stage 3 tests `g` |
 | `(ex:alice ? "Alice" ?)` | stage 1 cut the view to 2 rows, under `INDEX_ROUTING_MIN_ROWS` → routing skipped (`worth_indexing` is false); on the 1M store a subject run is 10 rows, so the same | same |
 | `(? ? "Carol" ?)`, `Default` layout | the dictionary cannot prove absence, the index can: the `index:ospg` run for `"Carol"` is empty → `Empty` → empty view | `ref-o` run empty → `Empty` |
 
@@ -421,7 +453,7 @@ the compare; with none left the selection is the answer, compared nowhere
 ([`ask_statistics`](../core/src/store/scan/residual.rs#L66)). This is what
 Vortex's falsifier of `x = c` and the store's satisfier prove on exact
 bounds, read off the bounds directly
-([`eq_on_bounds`](../core/src/io/zone_map.rs#L348)): building and
+([`eq_on_bounds`](../core/src/io/zone_map.rs#L353)): building and
 evaluating the proofs for a residual cost tens of µs, more than many
 residuals' whole compare.
 On a one-graph store a graph equality settles this way. The view still counts
@@ -462,7 +494,7 @@ left pending (below) keeps its classes, and counts and windows by them.
 With zones off (`VORTEX_RDF_ZONES=0`) the residual keeps its route from before
 the classes, bounds only: the zones whose bounds leave a constrained
 column's code out are left out
-([`kept_runs`](../core/src/store/zones.rs#L131)), when what is left holds at
+([`kept_runs`](../core/src/store/zones.rs#L122)), when what is left holds at
 most half the base: a run of rows (every row, or a subject's range) is
 compared zone run by zone run, each a slice of the base through the mask
 scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L781)), and an
@@ -652,10 +684,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`file.rs:39-43`](../core/src/store/query/matching/file.rs#L39-L43 "existing_filter") | — |
-| 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L224), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L473) | [§8](#8-the-index-resolvers) |
+| 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L225), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L485) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`file.rs:22-91`](../core/src/store/query/matching/file.rs#L22-L91 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L804) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L253), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L804) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`file.rs:171-186`](../core/src/store/query/matching/file.rs#L171-L186 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L205) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -1035,7 +1067,8 @@ indexes. `→` reads "then".
 | `??O?` | OSPG lead probe → lazy ids **+ serve plan** | ref-o probe → same as above | typed/mask scan of `o` |
 | `?PO?` | POSG `(p, o)` prefix probe → both resolved, lazy ids **+ serve plan** | ref-o probe (object preferred) → ids → residual `p` scan | typed/mask scan of `p ∧ o` |
 | `???G` | indexes decline → residual `g`: the column's array statistics (a one-graph store settles here), then the zone classes, "none" zones skipped, "all" zones taken, mixed ones compared; a count takes mixed zones from their recorded graphs or the encoding (§6.3) | same | same |
-| `?P?G` | POSG lead probe → residual `g` over the ids, as above, **drops the plan**, ids materialize | ref-p probe → residual `g`, as above | residual `p ∧ g`, as above |
+| `?P?G` | POSG lead probe → `g` checked inside the run, zone by zone: zones' records, the encoding, else a compare of the run's own `g` (§6.2); the ids are its matching rows in base order, no plan. A window, or zones off: residual `g` over the ids, as above, **drops the plan** | ref-p probe → `g` checked inside the run, as by copy; a window skips the zones before it by their counts. Zones off: residual `g`, as above | residual `p ∧ g`, as above |
+| `?POG` / `??OG` | POSG `(p, o)` prefix probe, or OSPG lead probe → `g` checked inside the run, as above | ref-o probe → `g` checked inside the run; for `?POG`, residual `p` over its ids | residual over the bound columns, as above |
 | `SP??` / `SPO?` / `SPOG` (`contains`) | prefix probe → exact `Range`, nothing residual; indexes never consulted (nothing left bound) | same | same |
 | `S?O?` / `S??G` | prefix probe narrows by the subject; residual scan of `o` (or `g`) over the range — index routing skipped entirely if the range is < 4096 rows | same | same |
 

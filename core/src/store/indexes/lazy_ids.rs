@@ -1,6 +1,7 @@
 //! Lazy row ids: the exact base row ids of an index resolution, run by the
 //! first consumer that needs them ([`LazyRowIds`]), and the in-memory run a
-//! served view's plan reads beside them ([`ComponentRun`]).
+//! served view's plan reads beside them ([`ComponentRun`]), which may check
+//! its bound graph inside its component ([`GraphCheck`]).
 
 #[cfg(feature = "file-io")]
 use std::ops::Range;
@@ -14,6 +15,7 @@ use vortex_mask::Mask;
 
 use super::components::{self, run_order_row_ids, sorted_row_ids};
 use super::get_or_try_init;
+use super::graph_check::GraphCheck;
 #[cfg(feature = "file-io")]
 use super::rid_reads::{read_located_rids, scan_index_row_ids};
 use crate::error::Result;
@@ -89,6 +91,10 @@ pub(crate) enum LazyRowIds {
 /// own order, each computed once. A served read takes the run order; a
 /// consumer that needs base order sorts once, from the run order when that
 /// is decoded.
+///
+/// A run that checks its bound graph inside the component (`check`) holds
+/// only the rows of that graph: its count is taken zone by zone and its ids
+/// are its matching rows' ([`GraphCheck`]). No serve plan reads one.
 pub(crate) struct ComponentRun {
     /// The run's slice of the component's rid column.
     rids: ArrayRef,
@@ -101,6 +107,9 @@ pub(crate) struct ComponentRun {
     sorted: OnceLock<Buffer<RowId>>,
     /// The ids in the component's order.
     run_order: OnceLock<Buffer<RowId>>,
+    /// The bound graph's check inside the component, for a run that keeps
+    /// only that graph's rows.
+    check: Option<GraphCheck>,
 }
 
 impl ComponentRun {
@@ -112,14 +121,41 @@ impl ComponentRun {
             ascending,
             sorted: OnceLock::new(),
             run_order: OnceLock::new(),
+            check: None,
+        }
+    }
+
+    /// The run whose rid-column slice is `rids`, as [`new`](Self::new), that
+    /// keeps only the rows of the graph `check` checks inside its component.
+    pub(crate) fn checked(rids: ArrayRef, ascending: bool, check: GraphCheck) -> Self {
+        Self {
+            check: Some(check),
+            ..Self::new(rids, ascending)
         }
     }
 
     /// The run's ids in the component's order, decoded on the first call
     /// ([`run_order_row_ids`]) and kept: the one decode a served view's reads
-    /// and its lazy ids share.
+    /// and its lazy ids share. A checked run's are its matching rows'
+    /// ([`GraphCheck::ids`]).
     pub(crate) fn run_order(&self) -> Result<Buffer<RowId>> {
-        get_or_try_init(&self.run_order, || run_order_row_ids(self.rids.clone()))
+        get_or_try_init(&self.run_order, || match &self.check {
+            None => run_order_row_ids(self.rids.clone()),
+            Some(check) => check.ids(&self.rids),
+        })
+    }
+
+    /// How many ids the run holds: its width, or a checked run's matches,
+    /// from its ids when they are kept, else counted zone by zone
+    /// ([`GraphCheck::count`]).
+    fn len(&self) -> Result<usize> {
+        let Some(check) = &self.check else {
+            return Ok(self.rids.len());
+        };
+        match self.sorted.get().or(self.run_order.get()) {
+            Some(ids) => Ok(ids.len()),
+            None => check.count(),
+        }
     }
 }
 
@@ -205,14 +241,17 @@ impl LazyRowIds {
         limit: usize,
     ) -> Result<Option<Buffer<RowId>>> {
         let ids = match self {
-            LazyRowIds::Component(run) if run.ascending => {
-                match window_rows(offset, limit, run.rids.len() as u64) {
+            // A checked run counts the zones before the window and reads
+            // only the zones it spans.
+            LazyRowIds::Component(run) if run.ascending => match &run.check {
+                Some(check) => check.window(&run.rids, offset, limit)?,
+                None => match window_rows(offset, limit, run.rids.len() as u64) {
                     Some(rows) => {
                         sorted_row_ids(run.rids.slice(rows.start as usize..rows.end as usize)?)?
                     }
                     None => Buffer::empty(),
-                }
-            }
+                },
+            },
             #[cfg(feature = "file-io")]
             LazyRowIds::LocatedRun {
                 file,
@@ -245,13 +284,14 @@ impl LazyRowIds {
 
     /// How many rows the ids cover, when knowable without computing them: an
     /// in-memory run knows its width up front (so a count on a served match
-    /// never decodes), and so does a located file run, whether its ids come
-    /// from the run itself or from the child scan it bounds; an unlocated
-    /// child scan and a pending residual compare only once their ids are
-    /// known.
+    /// never decodes), a run checked against its graph counts its matches
+    /// zone by zone (`None` should that fail), and so does a located file
+    /// run, whether its ids come from the run itself or from the child scan
+    /// it bounds; an unlocated child scan and a pending residual compare
+    /// only once their ids are known.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match self {
-            LazyRowIds::Component(run) => Some(run.rids.len()),
+            LazyRowIds::Component(run) => run.len().ok(),
             LazyRowIds::Unsorted { ids, .. } => Some(ids.len()),
             #[cfg(feature = "file-io")]
             LazyRowIds::IndexChild {
@@ -326,10 +366,18 @@ impl LazyRowIds {
         get_or_try_init(self.sorted_cell(), || {
             let ids = match self {
                 // A run already decoded in its component's order sorts a copy
-                // of that, rather than decoding the rids again.
-                LazyRowIds::Component(run) => match run.run_order.get() {
-                    Some(run_order) => components::sorted_copy(run_order)?,
-                    None => sorted_row_ids(run.rids.clone())?,
+                // of that, rather than decoding the rids again; a checked
+                // run's matching ids are kept as they are where they ascend.
+                LazyRowIds::Component(run) => match (run.run_order.get(), &run.check) {
+                    (_, Some(_)) => {
+                        let ids = run.run_order()?;
+                        match run.ascending || ids.is_sorted() {
+                            true => ids,
+                            false => components::sorted_copy(&ids)?,
+                        }
+                    }
+                    (Some(run_order), None) => components::sorted_copy(run_order)?,
+                    (None, None) => sorted_row_ids(run.rids.clone())?,
                 },
                 LazyRowIds::Unsorted { ids, .. } => components::sorted_copy(ids)?,
                 #[cfg(feature = "file-io")]

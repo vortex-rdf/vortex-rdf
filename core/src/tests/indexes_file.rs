@@ -1348,11 +1348,12 @@ async fn test_reference_index_runs_at_the_children_edges() {
     }
 }
 
-/// With named graphs the graph term is the one a reference index does not
-/// cover: a predicate-only or object-only count is the located run's width
-/// while the graph is free, and goes through the run's ids once the pattern
-/// binds one — the same counts and windows as the row path either way, on
-/// both backends.
+/// With named graphs the graph term is the one a reference index's keys do
+/// not cover: a predicate-only or object-only count is the located run's
+/// width while the graph is free. Once the pattern binds one, a file count
+/// goes through the run's ids, and an in-memory one (zones on) checks the
+/// graph inside the run's component, its ids still pending. The counts and
+/// windows are the row path's either way, on both backends.
 #[tokio::test]
 async fn test_reference_index_counts_with_named_graphs() {
     use crate::store::{IdsNeed, Probe};
@@ -1373,10 +1374,14 @@ async fn test_reference_index_counts_with_named_graphs() {
     .await;
     let p1 = iri("p1");
     let o2 = plain_literal("o2");
-    for store in [
-        VortexRdfStore::from_file(&path).await.unwrap(),
-        VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+    for (in_memory, store) in [
+        (false, VortexRdfStore::from_file(&path).await.unwrap()),
+        (
+            true,
+            VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+        ),
     ] {
+        let checks_graphs = in_memory && crate::stats_rules::zones_enabled();
         for (p, o, run) in [(Some(&p1), None, 300usize), (None, Some(&o2), 129)] {
             for graph in [None, Some(&graphs[0]), Some(&graphs[1]), Some(&graphs[3])] {
                 let label = format!("p {p:?} o {o:?} graph {graph:?}");
@@ -1395,8 +1400,10 @@ async fn test_reference_index_counts_with_named_graphs() {
                 assert_eq!(rows.size().await.unwrap(), want, "{label}");
                 let all = rows.code_columns_gathered().await.unwrap().unwrap();
 
-                // Counted: the run's width while the graph is free, its ids
-                // once the graph is bound (a residual the index does not cover).
+                // Counted: the run's width while the graph is free; once the
+                // graph is bound, on file the run's ids (a residual the child
+                // does not cover), in memory the run checked against the graph
+                // inside its component, still pending.
                 let counted = store
                     .match_pattern_for(
                         None,
@@ -1407,7 +1414,11 @@ async fn test_reference_index_counts_with_named_graphs() {
                     )
                     .await
                     .unwrap();
-                assert_eq!(selection_pending(&counted), graph.is_none(), "{label}");
+                assert_eq!(
+                    selection_pending(&counted),
+                    graph.is_none() || checks_graphs,
+                    "{label}"
+                );
                 assert_eq!(counted.size().await.unwrap(), want, "{label}");
                 let probe = Probe::new(None, p.cloned(), o.cloned(), graph.cloned());
                 let before = store.debug_located_rid_reads();

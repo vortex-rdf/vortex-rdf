@@ -32,6 +32,7 @@ pub(crate) mod components;
 pub(crate) mod copy;
 #[cfg(feature = "file-io")]
 pub(crate) mod file;
+mod graph_check;
 mod lazy_ids;
 pub(crate) mod reference;
 mod resolve;
@@ -411,10 +412,16 @@ pub(crate) enum IndexResolution<Plan> {
     /// gathering the primary columns by scattered row id; a back-reference
     /// index leaves it `None`. The plan only optimizes: `row_ids` resolve
     /// the pattern on their own.
+    ///
+    /// `graph` is whether the resolution also checked the pattern's bound
+    /// graph (an in-memory run checks it inside its component): its ids
+    /// then hold only rows of that graph, and the caller drops the graph
+    /// from any residual filtering too.
     Resolved {
         row_ids: ResolvedRowIds,
         resolves: ResolvedRoles,
         serve: Option<Plan>,
+        graph: bool,
     },
 }
 
@@ -445,18 +452,23 @@ pub(crate) enum ResolvedRowIds {
 /// base: the first outcome that isn't `Declined`, the indexes tried in
 /// declaration (preference) order. `Declined` when none applies, and the
 /// store falls back to a mask scan.
+///
+/// `windowed` says the caller only windows the view (or caps its count): a
+/// run whose ids do not ascend then leaves its bound graph to the residual,
+/// as [`resolve::resolve_in_memory`] says.
 pub(crate) fn resolve_indexes_in_memory(
     indexes: &[IndexType],
     components: &[IndexComponent],
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
+    windowed: bool,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     for index in indexes {
         let Some(probe) = index.choose(pattern, layout) else {
             continue;
         };
-        match resolve::resolve_in_memory(probe, components, codes)? {
+        match resolve::resolve_in_memory(probe, components, codes, windowed)? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }

@@ -277,6 +277,11 @@ impl ColumnZones {
         self.table.len() as u64
     }
 
+    /// The rows the zones cover.
+    pub(crate) fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
     /// The column's rows in zone `zone`: [`zone_len`](Self::zone_len) of
     /// them from its first, or to the column's end.
     pub(crate) fn zone_rows(&self, zone: u64) -> std::ops::Range<u64> {

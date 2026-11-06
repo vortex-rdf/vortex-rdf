@@ -268,6 +268,14 @@ pub fn assert_bulk_reads<T: Copy + Into<u64>>(
                     want,
                     "count_eq({start}..+{width}, {needle})"
                 );
+                // eq_offsets against the plain positions, appended after what
+                // the buffer already holds.
+                let mut offsets = vec![usize::MAX];
+                probe.eq_offsets(start, width, needle, &mut offsets);
+                let want: Vec<usize> = std::iter::once(usize::MAX)
+                    .chain((0..width).filter(|&k| at(start + k) == needle))
+                    .collect();
+                assert_eq!(offsets, want, "eq_offsets({start}..+{width}, {needle})");
             }
         }
     }
