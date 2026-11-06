@@ -452,18 +452,23 @@ pub(crate) enum ResolvedRowIds {
 /// base: the first outcome that isn't `Declined`, the indexes tried in
 /// declaration (preference) order. `Declined` when none applies, and the
 /// store falls back to a mask scan.
+///
+/// `windowed` says the caller only windows the view (or caps its count): a
+/// run whose ids do not ascend then leaves its bound graph to the residual,
+/// as [`resolve::resolve_in_memory`] says.
 pub(crate) fn resolve_indexes_in_memory(
     indexes: &[IndexType],
     components: &[IndexComponent],
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
+    windowed: bool,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     for index in indexes {
         let Some(probe) = index.choose(pattern, layout) else {
             continue;
         };
-        match resolve::resolve_in_memory(probe, components, codes)? {
+        match resolve::resolve_in_memory(probe, components, codes, windowed)? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }

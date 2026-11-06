@@ -269,3 +269,42 @@ async fn unzoned_components_keep_the_residual() {
         }
     }
 }
+
+/// By copy, a run's ids follow its copy's order, so a window of its matches
+/// in base order would find every match first: a window of `(? type ? g1)`
+/// leaves the graph to the residual over the run's ids, whose zones over base
+/// order reach the window (as with zones off), and reads no graph inside the
+/// component.
+#[tokio::test]
+async fn copy_windows_leave_the_graph_to_the_residual() {
+    let store = built_store(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Copy.types(),
+    )
+    .await;
+    let window = Probe {
+        offset: RUN / 8,
+        limit: Some(64),
+        ..Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)))
+    };
+    let off = {
+        let _zones = ForcedZones::set(false);
+        quads_of(&store.run_probe(&window).await.unwrap()).await
+    };
+    let _zones = ForcedZones::set(true);
+    let rec = Recorder::start();
+    let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
+    assert_eq!(on.len(), 64);
+    assert_eq!(on, off, "the window, as with zones off");
+    assert_eq!(
+        rec.count_where(|e| matches!(e, Event::ComponentChecked(_))),
+        0,
+        "no graph read inside the component"
+    );
+    assert_eq!(
+        rec.count(&Event::ResidualDeferred),
+        1,
+        "the graph left to the residual, pending for the window"
+    );
+}

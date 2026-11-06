@@ -74,10 +74,18 @@ pub(super) struct IndexProbe<'a> {
 /// the selection, and windowed before decoding when its rids ascend), and a
 /// serving probe hands back an [`InMemoryServePlan`] over the run beside
 /// them, so reads slice the matched quads straight from the component.
+///
+/// A bound graph is checked inside the run where the component keeps its
+/// graph column's zone map and zones are on ([`GraphCheck`]), except on a
+/// view only `windowed` whose run's ids do not ascend (a copy family's): a
+/// window takes its matches in base order, which would find every match of
+/// such a run first, while the residual over the run's ids in base order
+/// reaches the window through the base's zones.
 pub(super) fn resolve_in_memory(
     probe: IndexProbe<'_>,
     components: &[IndexComponent],
     codes: &mut PatternCodes,
+    windowed: bool,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     // Route through the index only when the probed component exists and its
     // sort keys are globally sorted: the writer's provenance, not a stamp
@@ -114,7 +122,7 @@ pub(super) fn resolve_in_memory(
     // zones count and read them, where the residual would compare the graph
     // at the base rows the run lists.
     let check = match (probe.graph, component.graph_zones()) {
-        (Some(graph), Some(zones)) if zones_enabled() => {
+        (Some(graph), Some(zones)) if zones_enabled() && (probe.rids_ascend || !windowed) => {
             // A graph absent from the dictionary matches nothing, as a key's
             // term does.
             let Some(native) = codes.probe_scalar(graph)? else {

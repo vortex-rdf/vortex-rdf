@@ -272,10 +272,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L192), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`memory.rs:79-138`](../core/src/store/query/matching/memory.rs#L79-L138 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L455), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:140-156`](../core/src/store/query/matching/memory.rs#L140-L156 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L274), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L808) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`memory.rs:158-165`](../core/src/store/query/matching/memory.rs#L158-L165 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L270) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L459), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L808) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L167-L174 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -398,17 +398,21 @@ scattered over the base:
   a zone of the graph alone is taken whole;
 - a mixed zone is counted from its recorded graphs when the run holds the
   whole zone, else on the graph column's encoding (`count_eq`), else by
-  comparing its graphs, and its matching rows are found by comparing them.
+  comparing its graphs, and its matching rows are found on the encoding too
+  (`eq_offsets`: a dictionary's codes against the graph's code).
 
 The resolution reports the graph resolved (`Resolved::graph`), so nothing is
 left to compare it on, and the run's ids are its matching rows. A count adds
 the zones' counts and decodes no id. A window of a run whose ids ascend (by
 reference) skips the zones before it by their counts and reads only the
-zones it spans; a run whose ids follow its copy's order (`?P?G` by copy)
-sorts its matching ids into base order. A checked run carries no serve plan,
-as its rows are only part of the run, and a graph absent from the dictionary
-answers `Empty`. Without the zone map (the string layouts) or with zones
-off, the graph is left to stage 3.
+zones it spans. A run whose ids follow its copy's order (by copy) is checked
+only when counted or read whole, its matching ids sorted into base order: a
+window of it (`IdsNeed::CountOrWindow`) leaves the graph to stage 3, whose
+zones over the run's ids in base order reach the window without finding
+every match first. A checked run carries no serve plan, as its rows are only
+part of the run, and a graph absent from the dictionary answers `Empty`.
+Without the zone map (the string layouts) or with zones off, the graph is
+left to stage 3.
 
 **Examples** (what each index holds for the running example is laid out
 where the index is described: [§8.2](#82-secondarybycopy--two-sorted-quad-copies)
@@ -679,7 +683,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`file.rs:39-43`](../core/src/store/query/matching/file.rs#L39-L43 "existing_filter") | — |
 | 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L225), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L480) | [§8](#8-the-index-resolvers) |
+| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L485) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`file.rs:22-91`](../core/src/store/query/matching/file.rs#L22-L91 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
 | 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L253), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L804) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`file.rs:171-186`](../core/src/store/query/matching/file.rs#L171-L186 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L205) | [§7.3](#73-what-ends-up-on-the-view) |
@@ -1061,7 +1065,7 @@ indexes. `→` reads "then".
 | `??O?` | OSPG lead probe → lazy ids **+ serve plan** | ref-o probe → same as above | typed/mask scan of `o` |
 | `?PO?` | POSG `(p, o)` prefix probe → both resolved, lazy ids **+ serve plan** | ref-o probe (object preferred) → ids → residual `p` scan | typed/mask scan of `p ∧ o` |
 | `???G` | indexes decline → residual `g`: the column's array statistics (a one-graph store settles here), then the zone classes, "none" zones skipped, "all" zones taken, mixed ones compared; a count takes mixed zones from their recorded graphs or the encoding (§6.3) | same | same |
-| `?P?G` | POSG lead probe → `g` checked inside the run, zone by zone: zones' records, the encoding, else a compare of the run's own `g` (§6.2); the ids are its matching rows in base order, no plan. Zones off: residual `g` over the ids, as above, **drops the plan** | ref-p probe → `g` checked inside the run, as by copy; a window skips the zones before it by their counts. Zones off: residual `g`, as above | residual `p ∧ g`, as above |
+| `?P?G` | POSG lead probe → `g` checked inside the run, zone by zone: zones' records, the encoding, else a compare of the run's own `g` (§6.2); the ids are its matching rows in base order, no plan. A window, or zones off: residual `g` over the ids, as above, **drops the plan** | ref-p probe → `g` checked inside the run, as by copy; a window skips the zones before it by their counts. Zones off: residual `g`, as above | residual `p ∧ g`, as above |
 | `?POG` / `??OG` | POSG `(p, o)` prefix probe, or OSPG lead probe → `g` checked inside the run, as above | ref-o probe → `g` checked inside the run; for `?POG`, residual `p` over its ids | residual over the bound columns, as above |
 | `SP??` / `SPO?` / `SPOG` (`contains`) | prefix probe → exact `Range`, nothing residual; indexes never consulted (nothing left bound) | same | same |
 | `S?O?` / `S??G` | prefix probe narrows by the subject; residual scan of `o` (or `g`) over the range — index routing skipped entirely if the range is < 4096 rows | same | same |

@@ -77,6 +77,33 @@ impl Words<'_> {
         }
     }
 
+    /// The offsets `base + k` of the words at `start + k`, `k < len`, that
+    /// equal `needle`, ascending, appended to `out`.
+    fn eq_offsets(&self, start: usize, len: usize, needle: u64, base: usize, out: &mut Vec<usize>) {
+        fn push<T: Copy + PartialEq + TryFrom<u64>>(
+            s: &[T],
+            needle: u64,
+            base: usize,
+            out: &mut Vec<usize>,
+        ) {
+            if let Ok(n) = T::try_from(needle) {
+                out.extend(
+                    s.iter()
+                        .enumerate()
+                        .filter(|&(_, &v)| v == n)
+                        .map(|(k, _)| base + k),
+                );
+            }
+        }
+        let end = start + len;
+        match self {
+            Words::U8(s) => push(&s[start..end], needle, base, out),
+            Words::U16(s) => push(&s[start..end], needle, base, out),
+            Words::U32(s) => push(&s[start..end], needle, base, out),
+            Words::U64(s) => push(&s[start..end], needle, base, out),
+        }
+    }
+
     /// First index whose value is `>= needle`, by the native monomorphized
     /// `partition_point`; the length for a needle past the width's maximum.
     fn lower_bound(&self, needle: u64) -> usize {
@@ -267,6 +294,64 @@ impl PackedNode<'_> {
             Words::U16(s) => count(self, s, start, len, needle),
             Words::U32(s) => count(self, s, start, len, needle),
             Words::U64(s) => count(self, s, start, len, needle),
+        }
+    }
+
+    /// The offsets `base + k` of the values at `start + k`, `k < len`, that
+    /// equal `needle`, ascending, appended to `out`: the packed words
+    /// unpacked a 1024-value FastLanes chunk at a time, as
+    /// [`count_eq`](Self::count_eq) counts them. Requires no patches.
+    fn eq_offsets(&self, start: usize, len: usize, needle: u64, base: usize, out: &mut Vec<usize>) {
+        fn push<T>(
+            node: &PackedNode<'_>,
+            packed: &[T],
+            (start, len, needle, base): (usize, usize, u64, usize),
+            out: &mut Vec<usize>,
+        ) where
+            T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
+        {
+            let words = 128 * node.bit_width / std::mem::size_of::<T>();
+            let (first, last) = (node.offset + start, node.offset + start + len);
+            let mut chunk = [T::default(); FL_CHUNK];
+            let mut c = first / FL_CHUNK;
+            while c * FL_CHUNK < last {
+                let lo = first.max(c * FL_CHUNK) - c * FL_CHUNK;
+                let hi = last.min((c + 1) * FL_CHUNK) - c * FL_CHUNK;
+                // SAFETY: as in `count_eq`, the packed buffer holds `words`
+                // words for every chunk up to `(len + offset).div_ceil(1024)`.
+                unsafe {
+                    T::unchecked_unpack(
+                        node.bit_width,
+                        &packed[c * words..(c + 1) * words],
+                        &mut chunk,
+                    );
+                }
+                // The chunk's position `lo + j` is the window's offset
+                // `c * 1024 + lo + j - first`.
+                let at = base + c * FL_CHUNK + lo - first;
+                out.extend(
+                    chunk[lo..hi]
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &v)| v.into() == needle)
+                        .map(|(j, _)| at + j),
+                );
+                c += 1;
+            }
+        }
+        debug_assert!(self.patches.is_none(), "a patched node finds by reading");
+        if self.bit_width == 0 {
+            if needle == 0 {
+                out.extend(base..base + len);
+            }
+            return;
+        }
+        let window = (start, len, needle, base);
+        match &self.packed {
+            Words::U8(s) => push(self, s, window, out),
+            Words::U16(s) => push(self, s, window, out),
+            Words::U32(s) => push(self, s, window, out),
+            Words::U64(s) => push(self, s, window, out),
         }
     }
 
@@ -612,6 +697,120 @@ impl Node<'_> {
                     at += n;
                 }
                 count
+            }
+        }
+    }
+
+    /// The offsets `base + k` of the values at `start + k`, `k < len`, that
+    /// equal `needle`, ascending, appended to `out`: found on the encoding
+    /// where [`count_eq`](Self::count_eq) counts on it, and read a 1024-value
+    /// block at a time otherwise. Requires `start + len <= self.len()` but no
+    /// sortedness.
+    pub(crate) fn eq_offsets(
+        &self,
+        start: usize,
+        len: usize,
+        needle: u64,
+        base: usize,
+        out: &mut Vec<usize>,
+    ) {
+        if len == 0 {
+            return;
+        }
+        match self {
+            Node::Primitive(w) => w.eq_offsets(start, len, needle, base, out),
+            Node::Constant { value, .. } => {
+                if *value == needle {
+                    out.extend(base..base + len);
+                }
+            }
+            Node::Sequence {
+                base: first,
+                multiplier,
+                ..
+            } => {
+                if let Some(step) = needle.checked_sub(*first)
+                    && step % multiplier == 0
+                    && let Ok(at) = usize::try_from(step / multiplier)
+                    && (start..start + len).contains(&at)
+                {
+                    out.push(base + at - start);
+                }
+            }
+            Node::RunEnd {
+                ends,
+                values,
+                offset,
+                ..
+            } => {
+                let (first, last) = ((start + offset) as u64, (start + offset + len) as u64);
+                let mut run = partition(ends.len(), |r| ends.value_at(r) <= first);
+                let mut at = first;
+                while at < last {
+                    let end = ends.value_at(run).min(last);
+                    if values.value_at(run) == needle {
+                        // Run positions below `last` fit the window's `usize`.
+                        out.extend(base + (at - first) as usize..base + (end - first) as usize);
+                    }
+                    at = end;
+                    run += 1;
+                }
+            }
+            Node::FoR { reference, child } => {
+                if let Some(shifted) = needle.checked_sub(*reference) {
+                    child.eq_offsets(start, len, shifted, base, out);
+                }
+            }
+            Node::Slice {
+                child, start: at, ..
+            } => child.eq_offsets(at + start, len, needle, base, out),
+            Node::Chunked { chunks, .. } => {
+                let mut c = partition(chunks.len(), |c| chunks[c].start <= start) - 1;
+                let mut done = 0;
+                while done < len {
+                    let chunk = &chunks[c];
+                    let from = start + done - chunk.start;
+                    let take = (chunk.node.len() - from).min(len - done);
+                    chunk.node.eq_offsets(from, take, needle, base + done, out);
+                    done += take;
+                    c += 1;
+                }
+            }
+            // A dictionary small enough to scan maps the needle to its code
+            // once, then finds that code in its codes; a needle under several
+            // codes reads, which keeps the offsets ascending.
+            Node::Dict { codes, values }
+                if values.len() <= DICT_SCAN
+                    && (0..values.len())
+                        .filter(|&code| values.value_at(code) == needle)
+                        .take(2)
+                        .count()
+                        < 2 =>
+            {
+                if let Some(code) = (0..values.len()).find(|&code| values.value_at(code) == needle)
+                {
+                    codes.eq_offsets(start, len, code as u64, base, out);
+                }
+            }
+            Node::BitPacked(p) if p.patches.is_none() => {
+                p.eq_offsets(start, len, needle, base, out)
+            }
+            _ => {
+                let mut block = [0u64; FL_CHUNK];
+                let (mut at, end) = (start, start + len);
+                while at < end {
+                    let n = (end - at).min(FL_CHUNK);
+                    self.read_into(at, &mut block[..n]);
+                    let from = base + at - start;
+                    out.extend(
+                        block[..n]
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &v)| v == needle)
+                            .map(|(k, _)| from + k),
+                    );
+                    at += n;
+                }
             }
         }
     }

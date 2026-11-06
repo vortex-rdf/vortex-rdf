@@ -147,22 +147,17 @@ impl GraphCheck {
     }
 
     /// The offsets in `part` (component rows) of the rows whose graph is the
-    /// bound one, ascending, read through the column's probe or decoded.
+    /// bound one, ascending: found on the graph column's encoding through
+    /// its probe (`eq_offsets`, a dictionary's codes against the graph's
+    /// code), or decoded and compared.
     fn compared(&self, part: &Range<usize>) -> Result<Vec<usize>> {
         observe!(ComponentChecked(part.len() as u64));
-        let matching = |graphs: &[u64]| -> Vec<usize> {
-            graphs
-                .iter()
-                .enumerate()
-                .filter(|&(_, &graph)| graph == self.code)
-                .map(|(at, _)| at)
-                .collect()
-        };
+        let mut offsets = Vec::new();
         match &self.probe {
             Some(probe) => {
-                let mut graphs = vec![0u64; part.len()];
-                probe.probe().read_into(part.start, &mut graphs);
-                Ok(matching(&graphs))
+                probe
+                    .probe()
+                    .eq_offsets(part.start, part.len(), self.code, &mut offsets);
             }
             None => {
                 let mut ctx = VORTEX_SESSION.create_execution_ctx();
@@ -170,9 +165,17 @@ impl GraphCheck {
                     .graphs
                     .slice(part.start - self.rows.start..part.end - self.rows.start)?
                     .execute::<PrimitiveArray>(&mut ctx)?;
-                Ok(matching(graphs.as_slice::<u64>()))
+                offsets.extend(
+                    graphs
+                        .as_slice::<u64>()
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &graph)| graph == self.code)
+                        .map(|(at, _)| at),
+                );
             }
         }
+        Ok(offsets)
     }
 
     /// The ids of the run's rows `part` of zone `zone` that hold the graph,
@@ -195,15 +198,23 @@ impl GraphCheck {
     }
 
     /// The ids of the run's rows that hold the graph, in run order, `rids`
-    /// being the run's slice of the rid column.
+    /// being the run's slice of the rid column: decoded in one pass, the
+    /// zones of the graph alone taken whole and the mixed ones' compared rows
+    /// picked.
     pub(crate) fn ids(&self, rids: &ArrayRef) -> Result<Buffer<RowId>> {
         let counts = self.counts.get();
+        let all = run_order_row_ids(rids.clone())?;
         let mut ids = BufferMut::with_capacity(counts.map_or(0, |counts| counts.iter().sum()));
         for (at, (zone, part)) in self.parts().enumerate() {
             if counts.is_some_and(|counts| counts[at] == 0) {
                 continue;
             }
-            ids.extend_from_slice(&self.part_ids(rids, zone, &part)?);
+            let in_run = &all[part.start - self.rows.start..part.end - self.rows.start];
+            match self.zone(zone) {
+                Zone::None => {}
+                Zone::All => ids.extend_from_slice(in_run),
+                Zone::Mixed => ids.extend(self.compared(&part)?.into_iter().map(|k| in_run[k])),
+            }
         }
         Ok(ids.freeze())
     }

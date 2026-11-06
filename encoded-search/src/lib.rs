@@ -235,6 +235,23 @@ impl<'a> SortedProbe<'a> {
         self.root.count_eq(start, len, needle)
     }
 
+    /// The offsets `k` in `0..len` whose value at `start + k` equals `needle`,
+    /// ascending, appended to `out`: found on the encoding where it allows,
+    /// as [`Self::count_eq`] counts them (a constant at once, run ends by
+    /// their runs, a frame of reference against the shifted needle, a small
+    /// dictionary's codes against the needle's code, bit-packed values a
+    /// 1024-value chunk at a time), and read otherwise. Needs no sortedness.
+    ///
+    /// # Panics
+    /// Panics if `start + len > self.len()`.
+    pub fn eq_offsets(&self, start: usize, len: usize, needle: u64, out: &mut Vec<usize>) {
+        assert!(
+            start.checked_add(len).is_some_and(|end| end <= self.len()),
+            "{len} values from {start} out of bounds"
+        );
+        self.root.eq_offsets(start, len, needle, 0, out);
+    }
+
     /// The exact values at `indices`, in their order, into `out`: each run of
     /// consecutive indices read in one pass ([`Self::read_into`]), a lone
     /// index point-read.

@@ -367,11 +367,16 @@ impl LazyRowIds {
             let ids = match self {
                 // A run already decoded in its component's order sorts a copy
                 // of that, rather than decoding the rids again; a checked
-                // run's matching ids ascend already when its rids do.
+                // run's matching ids are kept as they are where they ascend.
                 LazyRowIds::Component(run) => match (run.run_order.get(), &run.check) {
-                    (_, Some(_)) if run.ascending => run.run_order()?,
-                    (Some(run_order), _) => components::sorted_copy(run_order)?,
-                    (None, Some(_)) => components::sorted_copy(&run.run_order()?)?,
+                    (_, Some(_)) => {
+                        let ids = run.run_order()?;
+                        match run.ascending || ids.is_sorted() {
+                            true => ids,
+                            false => components::sorted_copy(&ids)?,
+                        }
+                    }
+                    (Some(run_order), None) => components::sorted_copy(run_order)?,
                     (None, None) => sorted_row_ids(run.rids.clone())?,
                 },
                 LazyRowIds::Unsorted { ids, .. } => components::sorted_copy(ids)?,
