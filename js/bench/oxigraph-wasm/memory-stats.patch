@@ -1,0 +1,23 @@
+--- a/js/Cargo.toml
++++ b/js/Cargo.toml
+@@ -30,6 +30,9 @@
+ tokio.workspace = true
+ wasm-bindgen.workspace = true
+ wasm-bindgen-futures.workspace = true
++# vortex-rdf's dashboard bench: the live-byte counter and its wasm exports
++# (setMemoryCounting, memoryStats, resetMemoryPeak).
++bench-memory-stats = { path = "../../../js/bench/memory-stats", features = ["wasm"] }
+ 
+ [lints]
+ workspace = true
+--- a/js/src/lib.rs
++++ b/js/src/lib.rs
+@@ -9,3 +9,8 @@
+ pub fn main() {
+     console_error_panic_hook::set_once();
+ }
++
++// vortex-rdf's dashboard bench: every allocation goes through the counter.
++#[global_allocator]
++static ALLOCATOR: bench_memory_stats::CountingAlloc<std::alloc::System> =
++    bench_memory_stats::CountingAlloc(std::alloc::System);

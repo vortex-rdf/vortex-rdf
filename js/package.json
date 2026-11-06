@@ -43,8 +43,11 @@
     "scripts": {
         "build:wasm": "wasm-pack build --target web --out-dir pkg/web --no-pack",
         "build:wasm:fast": "wasm-pack build --target web --out-dir pkg/web --no-pack --no-opt",
+        "build:bench-wasm": "node -e \"require('fs').rmSync('pkg/bench',{recursive:true,force:true})\" && wasm-pack build --target web --out-dir pkg/bench --no-pack -- --features memory-stats && node -e \"const fs=require('fs');for (const f of ['pkg/bench/package.json','pkg/bench/.gitignore']) fs.rmSync(f,{force:true})\"",
+        "build:bench-wasm:fast": "node -e \"require('fs').rmSync('pkg/bench',{recursive:true,force:true})\" && wasm-pack build --target web --out-dir pkg/bench --no-pack --no-opt -- --features memory-stats && node -e \"const fs=require('fs');for (const f of ['pkg/bench/package.json','pkg/bench/.gitignore']) fs.rmSync(f,{force:true})\"",
         "build:hdt-wasm": "wasm-pack build bench/hdt-wasm --target web --out-dir ../hdt-pkg --no-pack && npm run build:hdt-clean-generated",
         "build:hdt-clean-generated": "node -e \"require('fs').rmSync('bench/hdt-pkg/.gitignore',{force:true})\"",
+        "build:oxigraph-wasm": "bash bench/oxigraph-wasm/build.sh",
         "build:reset": "node -e \"require('fs').rmSync('pkg/web',{recursive:true,force:true})\"",
         "build:clean-generated": "node -e \"const fs=require('fs');for (const f of ['pkg/web/package.json','pkg/web/.gitignore']) fs.rmSync(f,{force:true})\"",
         "build": "npm run build:reset && npm run build:wasm && npm run build:clean-generated",
@@ -53,7 +56,7 @@
         "test": "vitest run",
         "typecheck": "tsc -p tsconfig.json && tsc -p bench/tsconfig.json",
         "bench": "tsx --expose-gc --max-old-space-size=8192 bench/compare.bench.ts",
-        "bench:build": "npm run build && npm run bench",
+        "bench:build": "npm run build:bench-wasm && npm run bench",
         "bench:codspeed": "node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts",
         "bench:dict-memory": "tsx --expose-gc bench/dict-memory.bench.ts"
     },
@@ -70,7 +73,6 @@
     "devDependencies": {
         "@codspeed/tinybench-plugin": "^6.1.0",
         "@types/node": "^26.1.2",
-        "oxigraph": "^0.5.9",
         "rdf-data-factory": "^2.0.2",
         "rdf-stores": "^2.2.0",
         "tinybench": "^6.1.2",

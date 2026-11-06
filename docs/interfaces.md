@@ -69,14 +69,14 @@ without tombstones. On a file view whose pending filter no read by id
 serves, it evaluates the filter's masks split by split first and then reads
 only the rows they keep, point by point, by one take, or by projecting each
 split at its mask. The streams read such a view the same way, a split at a
-time as they are pulled. The chunk stream is the
-form for a match consumed
+time as they are pulled. The chunk stream is the form for a match consumed
 incrementally or of unknown size, and the bindings reach it through
 `match_code_chunks` (Python) and `matchCodeChunks` (JS and Java), and
-Java's `iterateQuads` as terms, a chunk decoded at a time. A Python
-`match_codes` call given a cancel token returns its result when its gather
-completes before the cancel is observed, and raises `Cancelled` when the
-token is cancelled before the call or while the call waits for data.
+Java's `iterateQuads`, Python's `iter_quads` and JS's `match()` as terms, a
+chunk decoded at a time. A Python `match_codes` call given a cancel token
+returns its result when its gather completes before the cancel is observed,
+and raises `Cancelled` when the token is cancelled before the call or while
+the call waits for data.
 
 A `CodePattern` streams through
 [`match_code_chunks`](../core/src/store/query/located.rs#L153):
@@ -135,7 +135,12 @@ Every read is lazy, and a stream's first poll decides how it runs:
   ([`ScanDriver`](../core/src/store/scan/file_scans.rs#L29)) onto the tokio
   runtime it is polled in, and vortex looks that runtime up
   (`Handle::current()`) at every spawn, so every later poll of the stream
-  must run inside a tokio runtime too. A filtered file view's capped count,
+  must run inside a tokio runtime too. The reads that decode quads from a
+  scan — `quads()` and its twins, `quads_vec`, `shared_quads_vec` and the
+  N-Triples/N-Quads export — spawn every split, however few, and under a
+  file-backed dictionary every chunk's decode, whenever that first poll
+  finds a runtime, and run inline without one
+  ([file-format.md §8](file-format.md#8-reading-a-file)). A filtered file view's capped count,
   window and one-shot reads evaluate the filter split by split under the
   same rule. Its uncapped count, a delete's search for the rows it
   tombstones and a `keep`'s pass spawn their splits, as `quads_vec` and

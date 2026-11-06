@@ -1,9 +1,10 @@
-// Freeing the wasm handles: the store, its TermDict, and the iterables over
-// the CodeChunks and ProbeAnswers handles.
+// Freeing the wasm handles: the store, its TermDict, the iterables over the
+// CodeChunks and ProbeAnswers handles, and the QuadChunks handle under match's
+// stream.
 import { describe, test, expect } from 'vitest';
 import { TermDict, VortexRdfStore } from '@vortex-rdf/vortex-rdf-store';
 // The wasm iterator handles, which the package entries do not re-export.
-import { CodeChunks, ProbeAnswers } from '../pkg/web/vortex_rdf.js';
+import { CodeChunks, ProbeAnswers, QuadChunks } from '../pkg/web/vortex_rdf.js';
 import { nquadsStore } from './support.js';
 
 describe('disposal', () => {
@@ -24,12 +25,15 @@ describe('disposal', () => {
         expect(VortexRdfStore.prototype[Symbol.dispose]).toBe(VortexRdfStore.prototype.free);
         expect(typeof TermDict.prototype[Symbol.dispose]).toBe('function');
         expect(TermDict.prototype[Symbol.dispose]).toBe(TermDict.prototype.free);
-        // The iterator handles under matchCodeChunks and matchCodesMany, which
-        // the package does not export: their iterables free them.
+        // The iterator handles under matchCodeChunks and matchCodesMany, and
+        // under match's stream, which the package does not export: their
+        // iterables and the stream free them.
         expect(typeof CodeChunks.prototype[Symbol.dispose]).toBe('function');
         expect(CodeChunks.prototype[Symbol.dispose]).toBe(CodeChunks.prototype.free);
         expect(typeof ProbeAnswers.prototype[Symbol.dispose]).toBe('function');
         expect(ProbeAnswers.prototype[Symbol.dispose]).toBe(ProbeAnswers.prototype.free);
+        expect(typeof QuadChunks.prototype[Symbol.dispose]).toBe('function');
+        expect(QuadChunks.prototype[Symbol.dispose]).toBe(QuadChunks.prototype.free);
     });
 
     test('an iterable over a freed store throws on its next pull, then ends', async () => {

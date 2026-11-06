@@ -6,10 +6,9 @@
 use std::borrow::Cow;
 
 use crate::common::terms::{Escapes, LiteralForm, split_literal, unescape};
-use crate::common::vocab::{RDF_LANG_STRING, XSD, XSD_STRING};
+use crate::common::vocab::{RDF_LANG_STRING, XSD_STRING};
 
 use super::Verdict;
-use super::numeric::{Num, numeric_kind, parse_number};
 
 /// A literal spelling split into its parts, borrowed from the spelling.
 pub(super) struct LiteralView<'a> {
@@ -63,37 +62,6 @@ impl<'a> LiteralView<'a> {
     /// `xsd:string` (which the ingest never writes, but a foreign file may).
     pub(super) fn is_string_like(&self) -> bool {
         self.lang.is_some() || self.datatype.is_none_or(|dt| dt == XSD_STRING)
-    }
-
-    /// The numeric value, when the datatype is numeric and the lexical form
-    /// parses under the model.
-    pub(super) fn number(&self) -> Option<Num> {
-        let dt = self.datatype?;
-        parse_number(&self.lexical()?, numeric_kind(dt)?)
-    }
-
-    /// Whether a numeric literal's lexical form parses ignoring its
-    /// datatype's bounds (an out-of-range `xsd:byte` does). An engine gives
-    /// such a form a value it then rejects and orders the literal by its
-    /// datatype; a form the grammar rejects (whitespace, `NaN`) its own, more
-    /// lenient parser may still accept, so that one is left to it.
-    pub(super) fn parses_unbounded(&self) -> bool {
-        self.datatype.and_then(numeric_kind).is_some_and(|kind| {
-            self.lexical()
-                .is_some_and(|lexical| parse_number(&lexical, kind.unbounded()).is_some())
-        })
-    }
-
-    /// Whether this is an `xsd:long` or `xsd:unsignedLong` whose lexical form
-    /// is an integer outside the type's 64-bit bounds: a value rdflib holds
-    /// to no bound and compares, which this model refuses.
-    pub(super) fn wide_64(&self) -> bool {
-        let Some(local) = self.datatype.and_then(|dt| dt.strip_prefix(XSD)) else {
-            return false;
-        };
-        (local == "long" || local == "unsignedLong")
-            && self.parses_unbounded()
-            && self.number().is_none()
     }
 }
 

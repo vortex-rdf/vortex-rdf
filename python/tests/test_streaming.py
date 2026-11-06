@@ -1,14 +1,15 @@
-"""The code chunk iterator and the per-query cancel token: a match's chunks
-concatenate to its one-shot `match_codes` columns on every backend, and a
+"""The code chunk iterator, the quad iterator and the per-query cancel token:
+a match's chunks concatenate to its one-shot `match_codes` columns on every
+backend, `iter_quads` yields `get_quads`' rows a chunk at a time, and a
 cancelled token stops chunk pulls, batch pulls and the one-shot calls."""
 
 import threading
 
 import pytest
 
-from vortex_rdf import CancelToken, Cancelled, VortexRdfError, VortexRdfStore
+from vortex_rdf import CancelToken, Cancelled, QuadIterator, VortexRdfError, VortexRdfStore
 
-from conftest import serialized, u64_rows, u64s
+from conftest import PATTERNS, serialized, u64_rows, u64s
 
 ROWS = 1_000
 #: A predicate on every seventh row: 143 rows spread over the store.
@@ -144,6 +145,7 @@ def test_one_shot_calls_race_a_token(store):
     assert u64_rows(store.match_codes(p=P3, cancel=live)) == u64_rows(store.match_codes(p=P3))
     assert store.count_quads(p=P3, cancel=live) == store.count_quads(p=P3)
     assert store.count_quads_many(probes, cancel=live) == store.count_quads_many(probes)
+    assert list(store.iter_quads(p=P3, cancel=live)) == store.get_quads(p=P3)
 
     cancelled = CancelToken()
     cancelled.cancel()
@@ -152,8 +154,76 @@ def test_one_shot_calls_race_a_token(store):
         lambda: store.count_quads(p=P3, cancel=cancelled),
         lambda: store.count_quads_many(probes, cancel=cancelled),
         lambda: store.match_code_chunks(p=P3, cancel=cancelled),
+        lambda: store.iter_quads(p=P3, cancel=cancelled),
     ):
         with pytest.raises(Cancelled):
             call()
     # A call without the token ignores its state.
     assert store.count_quads(p=P3) == len(store.match_codes(p=P3)[0])
+
+
+#: Every row, P3's (served on "served"), one subject's, and none.
+QUAD_PATTERNS = ({}, {"p": P3}, {"s": "<http://ex.org/s/5>"}, {"p": "<http://ex.org/p/none>"})
+
+
+@pytest.mark.parametrize("batch_rows", [7, 65536])
+def test_iter_quads_yields_get_quads(backend, batch_rows):
+    """On every backend and chunk size, the iterator yields `get_quads`' rows
+    in its order, is its own iterator, and stays stopped once spent."""
+    name, store = backend
+    for pattern in QUAD_PATTERNS:
+        quads = store.iter_quads(**pattern, batch_rows=batch_rows)
+        assert isinstance(quads, QuadIterator) and iter(quads) is quads
+        assert list(quads) == store.get_quads(**pattern), (name, pattern)
+        for _ in range(2):
+            with pytest.raises(StopIteration):
+                next(quads)
+
+
+def test_iter_quads_yields_get_quads_on_every_layout(layout, vortex_files, quad_files, indexed_files):
+    """Every layout, file or in-memory or adopted bytes, yields `get_quads`' rows."""
+    for path in (vortex_files[layout], quad_files[layout], indexed_files[(layout, "secondary-by-copy")]):
+        for store in (VortexRdfStore(path), VortexRdfStore(path, in_memory=True),
+                      VortexRdfStore.from_bytes(path.read_bytes())):
+            for pattern in PATTERNS:
+                assert list(store.iter_quads(**pattern, batch_rows=2)) == store.get_quads(**pattern), (path.name, pattern)
+
+
+def test_iter_quads_reads_a_chunk_at_a_time(backend):
+    """A cancel after a chunk was pulled leaves that chunk's rows; the pull
+    for the next raises, and the iterator is then spent."""
+    name, store = backend
+    token = CancelToken()
+    quads = store.iter_quads(p=P3, batch_rows=7, cancel=token)
+    rows = [next(quads)]
+    token.cancel()  # the rest of the chunk still comes; the next pull raises
+    with pytest.raises(Cancelled):
+        while True:
+            rows.append(next(quads))
+    assert rows == store.get_quads(p=P3)[: len(rows)]
+    if name in ("in-memory", "bytes"):
+        assert len(rows) == 7
+    else:
+        assert 1 <= len(rows) <= 7, len(rows)
+    for _ in range(2):
+        with pytest.raises(StopIteration):
+            next(quads)
+
+
+def test_iter_quads_cancelled_before_its_first_pull(store):
+    """A token cancelled after the call and before the first pull raises
+    `Cancelled` there, and the iterator is then spent."""
+    token = CancelToken()
+    quads = store.iter_quads(p=P3, batch_rows=7, cancel=token)
+    token.cancel()
+    with pytest.raises(Cancelled):
+        next(quads)
+    with pytest.raises(StopIteration):
+        next(quads)
+
+
+def test_iter_quads_refuses_a_zero_batch(files, store):
+    """`batch_rows=0` raises `ValueError` on a Dictionary and a Default store."""
+    for each in (store, VortexRdfStore(files["default"])):
+        with pytest.raises(ValueError, match="batch_rows must be at least 1"):
+            each.iter_quads(batch_rows=0)

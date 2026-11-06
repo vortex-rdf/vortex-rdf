@@ -204,10 +204,21 @@ export class VortexRdfStore {
      * Pass `null`/`undefined` for a variable position. Returns **synchronously**
      * an RDF/JS `Stream<Quad>` (`.on('data'|'end'|'error', …)`, `.read()`) of
      * lazy `Quad`s: a term's string is decoded from the columnar data only when
-     * its `.value`/`.termType` is read, and never eagerly. The stream also
-     * implements `Symbol.asyncIterator`, so it can be consumed with `for await`
-     * (cast to `AsyncIterable<Quad>` in typed code). An invalid pattern term
-     * throws synchronously.
+     * its `.value`/`.termType` is read, and never eagerly. The stream is
+     * incremental: it reads the match 8,192 rows at a time, in `getQuads`'
+     * order, the next chunk only once the last one's quads are taken (by
+     * `data` events, `read()` or `for await`), from the store as it was when
+     * `match` was called. A read that fails later is the stream's `error`
+     * event, and so is freeing the store before the stream ends; leaving a
+     * `for await` early releases the stream. `end` arrives once the quads are
+     * consumed, through `data` events, `read()` or `for await`, so a stream
+     * nobody reads never ends. A stream holds its match, the store as it was
+     * when `match` was called, until it is consumed, `destroy()`ed or
+     * garbage-collected; `destroy()` is a method of the returned stream
+     * object, though `@rdfjs/types`' `Stream` type does not declare it. The
+     * stream also implements `Symbol.asyncIterator`, so it can be consumed
+     * with `for await` (cast to `AsyncIterable<Quad>` in typed code). An
+     * invalid pattern term throws synchronously.
      */
     match(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): Stream<Quad>;
     /**
@@ -332,6 +343,17 @@ export class CodeChunks {
  */
 export class ProbeAnswers {
     next(): CodeColumns | null | undefined;
+    free(): void;
+    [Symbol.dispose](): void;
+}
+
+/**
+ * The wasm handle under `match`'s stream, which pulls it; not used directly.
+ * `next()` returns the next chunk of at most 8,192 rows, or `undefined` once
+ * the match is exhausted, and throws once its store is freed.
+ */
+export class QuadChunks {
+    next(): object | undefined;
     free(): void;
     [Symbol.dispose](): void;
 }

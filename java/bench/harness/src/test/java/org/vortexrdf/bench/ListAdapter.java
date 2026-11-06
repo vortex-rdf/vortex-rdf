@@ -18,14 +18,15 @@ import java.util.function.Supplier;
  * second handle cannot open while one is open, as RDF4J's on-disk stores do. {@link #throwing} and {@link #slowOn}
  * add a chosen error or a delay at one pattern (or at {@code add} / {@code delete}), {@link #calls} counts how
  * often each pattern was materialized, and {@link #holding} has every store keep a known amount of memory, which
- * {@link #pinnedToTheQueryingThread} leaves reachable from the thread that queried it.
+ * {@link #pinnedToItsThreads} leaves reachable from the thread that opened or queried it.
  */
 public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	/**
-	 * The store a handle reads: its rows, the memory {@link #holding} has it keep until it is disposed, and the
-	 * thread-local {@link #pinnedToTheQueryingThread} parks that memory in.
+	 * The store a handle reads: its rows, the memory {@link #holding} has it keep until it is disposed, the cache
+	 * {@link #cachingOnRead} fills as it is read, and the
+	 * thread-local {@link #pinnedToItsThreads} parks that memory in.
 	 */
-	public record Store(List<Quad> rows, byte[] heap, Arena offHeap, ThreadLocal<byte[]> pin) {
+	public record Store(List<Quad> rows, List<byte[]> heap, Arena offHeap, ThreadLocal<List<byte[]>> pin, List<byte[]> cache) {
 	}
 
 	private final String slug;
@@ -39,6 +40,11 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	private int heldHeap;
 	private long heldNative;
 	private boolean pinned;
+	private int cachedPerCount;
+	private int leakedOnFirstOpen;
+	private int leakedPerCount;
+	private boolean opened;
+	private final List<byte[]> leaked = new ArrayList<>();
 	private final Map<String, Supplier<? extends Throwable>> errors = new HashMap<>();
 	private final Map<String, Long> delays = new HashMap<>();
 	private final Map<String, Integer> calls = new HashMap<>();
@@ -105,11 +111,30 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	}
 
 	/**
-	 * Every count parks the store's heap memory in a thread-local of the store's that is never cleared, as Jena's
-	 * in-memory dataset does with its data: once the store is unreachable, that memory stays reachable from the
-	 * querying thread until the thread ends.
+	 * Every count adds {@code heapBytes} to a list the store keeps until it is disposed, as a library's read caches
+	 * grow with the queries it has answered.
 	 */
-	public ListAdapter pinnedToTheQueryingThread() {
+	public ListAdapter cachingOnRead(int heapBytes) {
+		cachedPerCount = heapBytes;
+		return this;
+	}
+
+	/**
+	 * The adapter, which outlives its stores, keeps {@code firstOpenBytes} from its first open and
+	 * {@code readBytes} from every count, as a library's one-time setup and first-query state outlive a dispose.
+	 */
+	public ListAdapter leaking(int firstOpenBytes, int readBytes) {
+		leakedOnFirstOpen = firstOpenBytes;
+		leakedPerCount = readBytes;
+		return this;
+	}
+
+	/**
+	 * The open, as well as every count, parks the store's heap memory in a thread-local of the store's that is never
+	 * cleared, as Jena's in-memory dataset does with its data: once the store is unreachable, that memory stays
+	 * reachable from the thread that opened or queried it until the thread ends.
+	 */
+	public ListAdapter pinnedToItsThreads() {
 		pinned = true;
 		return this;
 	}
@@ -144,6 +169,12 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 		return persistent;
 	}
 
+	/** A persistent store reads its copy into a list; one kept only in memory re-parses its source. */
+	@Override
+	public Obtained obtained() {
+		return persistent ? Obtained.LOADED : Obtained.BUILT;
+	}
+
 	@Override
 	public Store build(Path src, Path location) throws Exception {
 		lock();
@@ -156,6 +187,12 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 	@Override
 	public Store open(Path src, Path location) throws Exception {
 		lock();
+		if (!opened) {
+			opened = true;
+			if (leakedOnFirstOpen > 0) {
+				leaked.add(new byte[leakedOnFirstOpen]);
+			}
+		}
 		return store(new ArrayList<>(Inputs.rows(persistent ? location.resolve("store.nq") : src)));
 	}
 
@@ -170,6 +207,12 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 		calls.merge(p.name(), 1, Integer::sum);
 		if (store.pin() != null) {
 			store.pin().set(store.heap());
+		}
+		if (cachedPerCount > 0) {
+			store.cache().add(new byte[cachedPerCount]);
+		}
+		if (leakedPerCount > 0) {
+			leaked.add(new byte[leakedPerCount]);
 		}
 		if (printsToStdout) {
 			System.out.println("noise from the adapter");
@@ -217,7 +260,17 @@ public final class ListAdapter implements Adapter<ListAdapter.Store, Pattern> {
 			offHeap = Arena.ofShared();
 			offHeap.allocate(heldNative);
 		}
-		return new Store(rows, heldHeap > 0 ? new byte[heldHeap] : null, offHeap, pinned ? new ThreadLocal<>() : null);
+		// In small chunks: G1 rounds one huge array up to whole regions, and wastes the tail of a region that a
+		// large chunk does not fit, so the collector's figure would not be what is held.
+		List<byte[]> heap = new ArrayList<>();
+		for (int left = heldHeap; left > 0; left -= 64 << 10) {
+			heap.add(new byte[Math.min(left, 64 << 10)]);
+		}
+		ThreadLocal<List<byte[]>> pin = pinned ? new ThreadLocal<>() : null;
+		if (pin != null) {
+			pin.set(heap);
+		}
+		return new Store(rows, heap, offHeap, pin, new ArrayList<>());
 	}
 
 	private void lock() {

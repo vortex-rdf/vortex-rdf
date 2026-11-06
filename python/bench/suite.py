@@ -3,8 +3,8 @@
 `python/bench/run.py` (the Python tab) and `java/bench/run.py` (the Java tab)
 each bring their own workers and provenance line; this module holds the rest:
 the scale knobs, the one dataset every library builds from, the loop that runs
-every adapter's query role and then its mutate role, the cross-library count
-check, and the dashboard-shaped JSON `scripts/render_bench_dashboard.py` reads.
+every adapter's query role, then its mutate role, then its memory runs, the
+cross-library count check, and the dashboard-shaped JSON `scripts/render_bench_dashboard.py` reads.
 """
 
 from __future__ import annotations
@@ -49,6 +49,11 @@ def bench_graphs() -> int:
 def mut_batch() -> int:
     """Quads per add/delete batch."""
     return int(os.environ.get("MUT_BATCH", 10_000))
+
+
+def bench_memory_runs() -> int:
+    """Memory runs per adapter: BENCH_MEMORY_RUNS, default 3. 0 runs none."""
+    return int(os.environ.get("BENCH_MEMORY_RUNS", 3))
 
 
 # ─── Machine stamps ─────────────────────────────────────────────────────────
@@ -157,6 +162,20 @@ def check_count_agreement(counts_by_slug: dict[str, dict[str, int]]) -> list[str
     return warnings
 
 
+#: Each memory run's key, mapped from the worker key it is read from.
+MEMORY_FIGURES: dict[str, str] = {
+    "storeMb": "storeBytes",
+    "peakAnonMb": "peakAnonBytes",
+    "peakFileMb": "peakFileBytes",
+}
+
+
+def to_mb(n: Optional[int]) -> Optional[float]:
+    """Bytes to MiB at one decimal. A figure that does not apply stays None; a
+    negative difference (allocator noise) reads 0."""
+    return None if n is None else round(max(n, 0) / 2**20, 1)
+
+
 @dataclass
 class SuiteRun:
     """What the workers reported, aggregated in dashboard row order."""
@@ -170,12 +189,21 @@ class SuiteRun:
     failures: list = field(default_factory=list)
 
 
-def run_roles(slugs: Sequence[str], run_worker: Callable[[str, str], Optional[dict]]) -> SuiteRun:
-    """Run every adapter's query role, then every adapter's mutate role.
+def run_roles(
+    slugs: Sequence[str], run_worker: Callable[[str, str], Optional[dict]], *, memory_runs: int = 0
+) -> SuiteRun:
+    """Run every adapter's query role, then its mutate role, then its memory runs.
 
     `run_worker(slug, role)` returns the worker's result, or None when the
     worker failed: one library failing must not discard the rest of the run.
-    A query result's `memory_extra` joins that phase's memory row.
+
+    Each adapter's memory role runs up to `memory_runs` times, and only when
+    its query role reported counts (otherwise its artifact is missing or
+    stale). The runs end at the adapter's first failed run, or at its first run
+    whose counts differ from its query role's: that run is dropped and reported
+    in `failures`. Every adapter gets a `memory` entry, even with no runs, so
+    its dashboard row reads "—" rather than vanishing. With `memory_runs` 0 the
+    phase is skipped altogether and adds no entries.
     """
     run = SuiteRun()
     for slug in slugs:
@@ -191,8 +219,7 @@ def run_roles(slugs: Sequence[str], run_worker: Callable[[str, str], Optional[di
         run.iters = run.iters or res.get("iters") or {}
         if res.get("peak_rss_mb") is not None:
             run.memory.append(
-                {"slug": slug, "label": res["label"], "role": "query", "peakRssMb": res["peak_rss_mb"],
-                 **res.get("memory_extra", {})}
+                {"slug": slug, "label": res["label"], "role": "query", "peakRssMb": res["peak_rss_mb"]}
             )
         run.sizes.append({"slug": slug, "label": res["label"], "bytes": res.get("artifact_bytes")})
         run.failures.extend(res.get("failures", []))
@@ -211,6 +238,26 @@ def run_roles(slugs: Sequence[str], run_worker: Callable[[str, str], Optional[di
                 {"slug": slug, "label": res["label"], "role": "mutate", "peakRssMb": res["peak_rss_mb"]}
             )
         run.failures.extend(res.get("failures", []))
+
+    for slug in slugs if memory_runs > 0 else ():
+        label = run.labels.get(slug, slug)
+        expected = run.counts_by_slug.get(slug)
+        runs: list = []
+        obtained = None
+        for _ in range(memory_runs if expected else 0):
+            res = run_worker(slug, "memory")
+            if not res:
+                break
+            if res["counts"] != expected:
+                error = f"the memory run counted {res['counts']} where the query role counted {expected}"
+                log(f"!! [{slug}] memory {error}")
+                run.failures.append(
+                    {"slug": slug, "label": label, "role": "memory", "phase": "counts", "keys": [], "error": error}
+                )
+                break
+            obtained = obtained or res.get("obtained")
+            runs.append({k: to_mb(res[src]) for k, src in MEMORY_FIGURES.items()})
+        run.memory.append({"slug": slug, "label": label, "role": "memory", "obtained": obtained, "runs": runs})
     return run
 
 

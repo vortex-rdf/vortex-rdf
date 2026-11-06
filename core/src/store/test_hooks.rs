@@ -8,9 +8,9 @@
 //! [`dict_reader`](VortexRdfStore::dict_reader).
 //!
 //! The values a test forces on production code (a code or row-id base, a
-//! term cap, a split limit, a failing cut) are here too, each a guard of
-//! [`Override`]. Which points production code reached is recorded as events
-//! instead ([`crate::observe`]).
+//! term cap, a split limit, an in-memory chunk size, a failing cut) are here
+//! too, each a guard of [`Override`]. Which points production code reached
+//! is recorded as events instead ([`crate::observe`]).
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -58,9 +58,9 @@ thread_local! {
 /// guard is: `cell` holds the value, `None` meaning the production one, and
 /// dropping the guard restores what it replaced, so guards nest. Every
 /// guard of the test seams ([`RowIdBase`], [`CodeBase`], [`TermCap`],
-/// [`ForcedLimit`], [`FailingCut`]) is one. Thread-local because the tests
-/// share a process and run on the current-thread runtime, so a test sees
-/// only its own.
+/// [`ForcedLimit`], [`ForcedChunkRows`], [`FailingCut`]) is one.
+/// Thread-local because the tests share a process and run on the
+/// current-thread runtime, so a test sees only its own.
 pub(crate) struct Override<T: Copy + 'static> {
     cell: &'static LocalKey<Cell<Option<T>>>,
     replaced: Option<T>,
@@ -86,6 +86,10 @@ thread_local! {
     /// The split limit forced on this thread's row scans, while a
     /// [`ForcedLimit`] guard is live.
     static SPLIT_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+
+    /// The most rows a chunk of this thread's in-memory chunk streams holds,
+    /// while a [`ForcedChunkRows`] guard is live.
+    static CHUNK_ROWS: Cell<Option<usize>> = const { Cell::new(None) };
 
     /// The cuts this thread's `rechunk` iterators make before one fails,
     /// while a [`FailingCut`] guard is live.
@@ -216,6 +220,29 @@ impl ForcedLimit {
     pub(crate) fn set(limit: usize) -> Self {
         Self {
             _guard: Override::set(&SPLIT_LIMIT, limit),
+        }
+    }
+}
+
+/// The chunk rows a [`ForcedChunkRows`] forced on this thread's in-memory
+/// chunk streams.
+pub(crate) fn forced_chunk_rows() -> Option<usize> {
+    CHUNK_ROWS.get()
+}
+
+/// While alive, this thread's in-memory chunk streams (`quads`,
+/// `shared_quad_chunks`, the N-Triples/N-Quads export) hold at most `rows`
+/// rows a chunk, in place of the production cap. Dropping it restores the
+/// rows it replaced ([`Override`]).
+pub(crate) struct ForcedChunkRows {
+    _guard: Override<usize>,
+}
+
+impl ForcedChunkRows {
+    /// Force the chunk rows to `rows` until the guard drops.
+    pub(crate) fn set(rows: usize) -> Self {
+        Self {
+            _guard: Override::set(&CHUNK_ROWS, rows),
         }
     }
 }

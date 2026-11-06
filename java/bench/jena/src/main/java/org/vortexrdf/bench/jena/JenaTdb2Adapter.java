@@ -6,6 +6,7 @@ import org.apache.jena.tdb2.DatabaseMgr;
 import org.apache.jena.tdb2.loader.DataLoader;
 import org.apache.jena.tdb2.loader.LoaderFactory;
 import org.apache.jena.tdb2.sys.TDBInternal;
+import org.vortexrdf.bench.Obtained;
 
 /**
  * Jena TDB2, built with its bulk loader (the default plan, as {@code tdb2.tdbloader} uses) and keeping its default
@@ -28,6 +29,11 @@ final class JenaTdb2Adapter extends JenaDatasetAdapter {
 	@Override
 	public boolean persistent() {
 		return true;
+	}
+
+	@Override
+	public Obtained obtained() {
+		return Obtained.OPENED;
 	}
 
 	@Override

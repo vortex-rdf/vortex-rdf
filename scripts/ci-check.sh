@@ -13,8 +13,8 @@
 # tool fails it. A local run differs in three ways:
 #   * A step whose tool is missing is skipped with a warning, and the summary
 #     names it: the wasm32 clippy and js-tests need the wasm32-unknown-unknown
-#     target, python-tests needs uv, js-tests needs npm and js/node_modules,
-#     java-tests needs a JDK and Maven.
+#     target, python-tests needs uv (and node for the dashboard render test),
+#     js-tests needs npm and js/node_modules, java-tests needs a JDK and Maven.
 #   * js-tests builds with `npm run build:fast` (wasm-pack without wasm-opt,
 #     which dominates the full build's wall clock and buys no memory headroom)
 #     in the installed js/node_modules, where CI runs `npm ci` and
@@ -104,6 +104,8 @@ job_lint() {
   # that feature), which the native run cannot see.
   if have_wasm32_target; then
     run cargo clippy -p vortex-rdf --target wasm32-unknown-unknown --all-targets -- -D warnings
+    # The bench build's configuration: the counting allocator and its exports.
+    run cargo clippy -p vortex-rdf -p bench-memory-stats --target wasm32-unknown-unknown --all-targets --features vortex-rdf/memory-stats -- -D warnings
   else
     skip_step "the wasm32 clippy" "no wasm32-unknown-unknown target" \
       "rustup target add wasm32-unknown-unknown"
@@ -126,6 +128,12 @@ job_python_tests() {
   fi
   run -C python uv sync --locked
   run -C python uv run --no-sync pytest tests bench/test_codspeed.py bench/test_suite.py bench/test_worker.py -q
+  # The dashboard's render test runs the page's script in Node.
+  if command -v node >/dev/null 2>&1; then
+    run -C python uv run --no-sync pytest ../scripts/test_render_bench_dashboard.py -q
+  else
+    skip_step "the dashboard render test" "no node" "install Node.js, version in .tool-versions"
+  fi
 }
 
 job_js_tests() {
@@ -170,13 +178,20 @@ host_platform() {
 }
 
 # The Java bindings: the crate's own Rust tests run under rust-tests; this job
-# builds the JNI library and the stores and oracle the JUnit suite reads (the
-# crate's `fixtures` example), then runs Maven.
+# builds the Javadoc, which fails on any warning (the POM sets failOnWarnings,
+# and only the release build otherwise runs it), then the JNI library and the
+# stores and oracle the JUnit suite reads (the crate's `fixtures` example),
+# then runs the JUnit suite.
 job_java_tests() {
   if ! command -v java >/dev/null 2>&1 || ! command -v mvn >/dev/null 2>&1; then
     skip_job "no JDK or Maven" "install JDK 17 or later and Maven"
     return 0
   fi
+  # First: it needs no native library, so a doc warning fails before the cargo build.
+  # The plugin skips a run its record of the last one calls up to date, and that
+  # record misses an edit to an existing source file; without it, it always runs.
+  rm -f java/target/maven-javadoc-plugin-stale-data.txt
+  run -C java mvn -B javadoc:javadoc
   local target="${CARGO_TARGET_DIR:-target}" lib platform bundled=""
   case $target in /*) ;; *) target="$PWD/$target" ;; esac
   run cargo build -p vortex-rdf-java

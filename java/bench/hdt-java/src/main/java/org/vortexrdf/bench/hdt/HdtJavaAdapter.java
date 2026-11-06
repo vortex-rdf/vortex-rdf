@@ -13,6 +13,7 @@ import org.rdfhdt.hdt.triples.IteratorTripleString;
 import org.rdfhdt.hdt.triples.TripleID;
 import org.rdfhdt.hdt.triples.TripleString;
 import org.vortexrdf.bench.Adapter;
+import org.vortexrdf.bench.Obtained;
 import org.vortexrdf.bench.Pattern;
 import org.vortexrdf.bench.Sink;
 import org.vortexrdf.bench.Terms;
@@ -52,6 +53,11 @@ public final class HdtJavaAdapter implements Adapter<HDT, String[]> {
 	@Override
 	public boolean persistent() {
 		return true;
+	}
+
+	@Override
+	public Obtained obtained() {
+		return Obtained.MAPPED;
 	}
 
 	@Override

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from suite import (  # noqa: E402
     SuiteRun,
+    bench_memory_runs,
     bench_rows,
     check_count_agreement,
     prepare_dataset,
@@ -67,7 +68,6 @@ def test_run_roles_runs_queries_then_mutations():
         ("a", "query"): {
             "rows": [{"id": "a1"}], "label": "A", "counts": {"S": 1}, "iters": {"query": 10},
             "peak_rss_mb": 50, "artifact_bytes": 123, "failures": [{"slug": "a", "error": "x"}],
-            "memory_extra": {"retainedHeapMb": 2.5, "retainedNativeMb": 0.5},
         },
         ("b", "query"): {
             "rows": [{"id": "b1"}], "label": "B", "counts": {"S": 1}, "iters": {"query": 99},
@@ -87,7 +87,7 @@ def test_run_roles_runs_queries_then_mutations():
     assert calls == [("a", "query"), ("b", "query"), ("a", "mutate"), ("b", "mutate")]
     assert [r["id"] for r in run.rows] == ["a1", "b1", "b2"]
     assert run.memory == [
-        {"slug": "a", "label": "A", "role": "query", "peakRssMb": 50, "retainedHeapMb": 2.5, "retainedNativeMb": 0.5},
+        {"slug": "a", "label": "A", "role": "query", "peakRssMb": 50},
         {"slug": "b", "label": "B", "role": "mutate", "peakRssMb": 70},
     ]
     assert run.sizes == [{"slug": "a", "label": "A", "bytes": 123}, {"slug": "b", "label": "B", "bytes": None}]
@@ -124,3 +124,67 @@ def test_suite_output_keeps_the_python_json_keys(tmp_path, default_knobs):
     java = suite_output(run, "prov", ds, 16, {}, [], extra_config={"jdk": "x"}, failures=[])
     assert java["failures"] == []
     assert java["config"]["jdk"] == "x"
+
+
+def memory_run(label, counts, store, anon, file, obtained):
+    return {"label": label, "obtained": obtained, "counts": counts,
+            "storeBytes": store, "peakAnonBytes": anon, "peakFileBytes": file}
+
+
+def test_run_roles_runs_memory_after_queries_and_mutations():
+    results = {
+        ("a", "query"): {"rows": [], "label": "A", "counts": {"S": 1}, "peak_rss_mb": 50},
+        ("b", "query"): {"rows": [], "label": "B", "counts": {"S": 1}, "peak_rss_mb": 60},
+        ("a", "mutate"): None, ("b", "mutate"): None,
+        ("a", "memory"): memory_run("A", {"S": 1}, 17_196_646, 42_152_755, 0, "loaded"),
+        ("b", "memory"): memory_run("B", {"S": 1}, 104_858, -4096, None, "mapped"),
+    }
+    calls = []
+
+    def worker(slug, role):
+        calls.append((slug, role))
+        return results[(slug, role)]
+
+    run = run_roles(["a", "b"], worker, memory_runs=2)
+    assert calls == [("a", "query"), ("b", "query"), ("a", "mutate"), ("b", "mutate"),
+                     ("a", "memory"), ("a", "memory"), ("b", "memory"), ("b", "memory")]
+    # After the query entries; MiB to one decimal; a negative difference reads 0; None stays null.
+    assert run.memory[2:] == [
+        {"slug": "a", "label": "A", "role": "memory", "obtained": "loaded",
+         "runs": [{"storeMb": 16.4, "peakAnonMb": 40.2, "peakFileMb": 0.0}] * 2},
+        {"slug": "b", "label": "B", "role": "memory", "obtained": "mapped",
+         "runs": [{"storeMb": 0.1, "peakAnonMb": 0.0, "peakFileMb": None}] * 2}]
+    assert run.rows == [] and run.failures == []
+
+
+def test_memory_runs_end_at_an_adapters_first_failure():
+    # a's query fails (no artifact to open); b's first memory run fails; c counts other rows
+    # than its query role did; d is measured twice.
+    def query(label):
+        return {"rows": [], "label": label, "counts": {"S": 1}, "peak_rss_mb": None}
+
+    results = {("a", "query"): None, ("b", "query"): query("B"), ("c", "query"): query("C"),
+               ("d", "query"): query("D"), **{(s, "mutate"): None for s in "abcd"},
+               ("b", "memory"): None,
+               ("c", "memory"): memory_run("C", {"S": 2}, 0, 0, 0, "built"),
+               ("d", "memory"): memory_run("D", {"S": 1}, 0, 0, 0, "built")}
+    calls = []
+
+    def worker(slug, role):
+        calls.append((slug, role))
+        return results[(slug, role)]
+
+    run = run_roles(list("abcd"), worker, memory_runs=2)
+    assert [c for c in calls if c[1] == "memory"] == [("b", "memory"), ("c", "memory"), ("d", "memory"), ("d", "memory")]
+    # Every adapter keeps a memory entry, so its row reads "—" rather than vanishing.
+    assert [(m["slug"], m["label"], m["obtained"], len(m["runs"])) for m in run.memory if m["role"] == "memory"] == [
+        ("a", "a", None, 0), ("b", "B", None, 0), ("c", "C", None, 0), ("d", "D", "built", 2)]
+    assert run.failures == [{"slug": "c", "label": "C", "role": "memory", "phase": "counts", "keys": [],
+                             "error": "the memory run counted {'S': 2} where the query role counted {'S': 1}"}]
+
+
+def test_bench_memory_runs_defaults_to_three(monkeypatch):
+    monkeypatch.delenv("BENCH_MEMORY_RUNS", raising=False)
+    assert bench_memory_runs() == 3
+    monkeypatch.setenv("BENCH_MEMORY_RUNS", "0")
+    assert bench_memory_runs() == 0

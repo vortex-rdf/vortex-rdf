@@ -481,9 +481,14 @@ impl FileServePlan {
     /// of the plan's.
     ///
     /// The range is split by row count, about two splits per worker
-    /// (`run_split_rows`). A stream of the view's quads (`quads()`, through
-    /// Vortex's own scan stream) spawns a task per split, so the split count
-    /// is its decode's parallelism. A code read drives the splits as
+    /// (`run_split_rows`): the child's natural splits are its leaf chunks,
+    /// which cluster a run into one split however wide it is, where row
+    /// splits spread the run's reads over the workers. A stream of the
+    /// view's quads (`quads()`, through Vortex's own scan stream) spawns its
+    /// splits where a runtime runs, and decodes inside each split's task
+    /// under every layout but a file-backed dictionary's: there the chunks
+    /// leave their tasks as codes and decode two at a time ahead of the
+    /// consumer (`scan_chunks`). A code read drives the splits as
     /// `ScanDriver::for_row_scan` says: inline on its calling task up to
     /// `MAX_INLINE_SPLITS`, spawned past that, as a wide run's are on 22 or
     /// more workers. No filter rides along a located run: its range is

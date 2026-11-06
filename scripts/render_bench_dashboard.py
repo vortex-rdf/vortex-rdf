@@ -354,8 +354,11 @@ def load_suite(path, stage):
       - `results`: the rows. A row for an operation a library's API does not
         offer carries `"unsupported": true`, a `reason` and `median_ns: null`,
         so the panels leave it out of the column's best/ratio arithmetic.
-      - `memory`: one `{slug, label, role, peakRssMb}` entry per library process;
-        the Java query entries add `retainedHeapMb` and `retainedNativeMb`.
+      - `memory`: one `{slug, label, role, peakRssMb}` entry per query or mutate
+        process; the memory runs add one `{slug, label, role: "memory", obtained,
+        runs}` entry per adapter. Each run is `{storeMb, peakAnonMb, peakFileMb}`
+        (JavaScript: `{storeBuiltMb, storeLoadedMb, peakLiveMb}`) in MiB, `null`
+        where a figure does not apply; the page takes their medians and ranges.
       - `sizes` (Rust cross-library, Python, Java): one `{slug, label, bytes}` entry
         per library's on-disk artifact; `bytes` is null for a store that lives
         only in memory.

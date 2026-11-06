@@ -212,7 +212,7 @@ async fn write_unsorted_store_file(
 /// the multi-leaf columns a large file written by the default strategy has,
 /// at a scale a test can afford (the default strategy writes a 160,000-row
 /// column as one leaf). Keep the `TempDir` alive for the store's lifetime.
-async fn write_chunked_store_file(
+pub(crate) async fn write_chunked_store_file(
     quads: &[Quad],
     chunk_rows: usize,
 ) -> (tempfile::TempDir, std::path::PathBuf) {

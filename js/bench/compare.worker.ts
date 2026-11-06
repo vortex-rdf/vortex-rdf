@@ -2,22 +2,28 @@
 // Process-level isolation, not just in-process dispose+gc: a crash in one adapter
 // can't take down the whole run, and each adapter gets a clean, uncontaminated
 // peak-memory reading (see shared.ts's `peakRssMb`) instead of one polluted by
-// whatever every earlier adapter left resident.
+// whatever every earlier adapter left resident. The `memory` role is one of an
+// adapter's memory runs, each in a process of its own too (see runMemory).
 import { Bench, type BenchOptions, type Fn, type FnOptions } from 'tinybench';
 import { writeFileSync } from 'node:fs';
 
+import type { Quad } from '@rdfjs/types';
+
 import {
     ADAPTERS, MUT_ADAPTERS, N_TRIPLES, GRAPHS, MUT_BATCH,
-    genDataset, genFresh, genDatasetPrefix, datasetProbes, moduli,
+    genDataset, flattenTerms, genFresh, genDatasetPrefix, datasetProbes, moduli,
     FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
-    reclaim, collect, timeoutRow, unsupportedRow, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
+    reclaim, collect, timeoutRow, unsupportedRow, peakRssMb, heapUsedBytes, holdJsHeap, settle,
     type Row, type Pat, type StoreAdapter, type WorkerOutput,
 } from './shared.js';
-import { fmtNs, making, onFresh } from './util.js';
+import {
+    checkCounter, errorText, fmtNs, making, makingLast, memoryRunFigures, onFresh,
+    type JsMemoryRun, type StoreReadings,
+} from './util.js';
 
 const [, , slug, role, outFile] = process.argv;
 if (!slug || !role || !outFile) {
-    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate> <out-file>');
+    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate|memory> <out-file>');
     process.exit(1);
 }
 
@@ -43,7 +49,7 @@ async function bench(
         await b.run();
         collect(b, rows, regime);
     } catch (e) {
-        const error = e instanceof Error ? e.message : String(e);
+        const error = errorText(e);
         console.error(`  !! phase '${phase}' failed: ${error}`);
         failures.push({ phase, error });
     }
@@ -121,20 +127,6 @@ function coldAccess(a: StoreAdapter, snap: unknown): Access {
     };
 }
 
-/** What building the store cost, over and above the input `Quad[]`. */
-const storeFootprint: Record<string, number | null> = {};
-
-/** `wasm` is Vortex's linear memory specifically — oxigraph has its own module
- *  this cannot see, and rdf-stores has none — so it is only read for Vortex
- *  adapters and reported as null elsewhere (a 0 would misreport it). */
-async function memSnapshot(isVortex: boolean): Promise<{ rss: number | null; js: number; wasm: number | null }> {
-    // jsHeapMb forces a collection first, so the RSS read after it is post-GC too.
-    const js = jsHeapMb();
-    return { rss: rssMb(), js, wasm: isVortex ? await wasmHeapMb() : null };
-}
-
-const delta = (a: number | null, b: number | null) => (a === null || b === null ? null : a - b);
-
 /**
  * Measure `pats` through `access`: probe every pattern once, then benchmark
  * each cell that came in under the time limit with `opts`, a benchmark of its
@@ -173,7 +165,7 @@ async function measure(a: StoreAdapter, pats: Pat[], access: Access, opts: Bench
             else cells.push({ name: p.name, run: (h) => a.countMatch(h, p) });
             cells.push({ name: `${p.name}::count`, run: (h) => a.countOnly(h, p) });
         } catch (e) {
-            const error = e instanceof Error ? e.message : String(e);
+            const error = errorText(e);
             console.error(`  !! probe '${p.name}' failed: ${error}`);
             failures.push({ phase: key(p.name), error });
         }
@@ -207,40 +199,39 @@ function graphProbesUnsupported(slug: string, reason: string, regime: 'warm' | '
         [`${slug}::${p.name}`, `${slug}::${p.name}::count`].map((id) => ({ ...unsupportedRow(id, reason), regime })));
 }
 
+/** The dataset for `a`, its strings flattened once so that no timed build pays
+ *  V8's rope flattening. */
+function inputFor(a: StoreAdapter): Quad[] {
+    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    flattenTerms(triples);
+    return triples;
+}
+
 async function runQuery(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     const pats = probesFor(a);
 
     console.log(`[${a.label}] query…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
-    // Measure across the build only. The input array is ~a gigabyte of JS objects
-    // and is identical for every adapter, so a delta isolates the store's own
-    // footprint far better than any absolute reading — and unlike dropping the
-    // array it does not force us to regenerate it for the ingest phase.
-    const isVortex = a.slug.startsWith('vortex');
-    const before = await memSnapshot(isVortex);
-    let th: unknown = await a.build(triples);
-    const after = await memSnapshot(isVortex);
-    Object.assign(storeFootprint, {
-        rssMb: delta(after.rss, before.rss),
-        jsHeapMb: after.js - before.js,
-        wasmHeapMb: delta(after.wasm, before.wasm),
-    });
+    const triples = inputFor(a);
+    let th: unknown;
+    if (a.ingestUnsupported) {
+        rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
+        th = await a.build(triples); // hdt opens its file, untimed
+    } else {
+        // Three timed builds; the last one is the store the probes query.
+        console.log(`[${a.label}] ingest…`);
+        const builds = makingLast(() => a.build(triples), (h) => reclaim(a, h));
+        await bench('ingest', rows, HEAVY_OPTS, (b) => {
+            b.add(`ingest::${a.slug}`, ...builds.task);
+        });
+        th = builds.last() ?? await a.build(triples);
+    }
 
     await measure(a, pats, warmAccess(th), QUERY_OPTS, rows);
     reclaim(a, th);
     th = null;
 
     if (a.quadsUnsupported) rows.push(...graphProbesUnsupported(a.slug, a.quadsUnsupported, 'warm'));
-
-    if (a.ingestUnsupported) {
-        rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
-    } else {
-        console.log(`[${a.label}] ingest…`);
-        await bench('ingest', rows, HEAVY_OPTS, (b) => {
-            b.add(`ingest::${a.slug}`, ...making(() => a.build(triples), (h) => reclaim(a, h)));
-        });
-    }
 
     return rows;
 }
@@ -279,7 +270,7 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     const dispose = (h: unknown) => a.dispose?.(h);
 
     console.log(`[${a.label}] query cold…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    const triples = inputFor(a);
     const pats = probesFor(a);
     let th: unknown = await a.build(triples);
     const tSnap = await a.snapshot(th);
@@ -319,7 +310,7 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
 async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     console.log(`[${a.label}] full scan…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    const triples = inputFor(a);
     let h: unknown = await a.build(triples);
     // Its probes record what the scan matches, as the pattern probes do — the
     // strongest cross-adapter check there is: every store must return the
@@ -355,6 +346,103 @@ async function runMutate(a: StoreAdapter): Promise<Row[]> {
     return rows;
 }
 
+/** A collected read's result, kept reachable at module scope until the run
+ *  has read the live bytes it holds. */
+let held: unknown = null;
+
+/**
+ * One memory run: the store alone, in a process of its own, run
+ * BENCH_MEMORY_RUNS times per adapter by compare.bench.ts.
+ *
+ * Live bytes are the store module's wasm counter plus the JS heap's
+ * `heapUsed` after a collection; rdf-stores has no wasm module, so the JS heap
+ * alone. Both counters must first see an 8 MiB block held, or the run throws
+ * and the worker exits 1. The store is obtained as `a.obtained` says (built
+ * from the flattened dataset, which is passed inline so nothing keeps it
+ * alive, or hdt's file loaded), measured and freed before any read; a second
+ * store obtained the same way is then read once per probe and full scan, the
+ * counts recorded, and freed. Each reading is taken after `settle(live)`,
+ * whose rounds of collection and an event-loop turn repeat until one frees
+ * less than 1 MiB, so the finalizers a free or a read left behind have run. A
+ * built store with a persistent form (Vortex) is also measured as `fromBytes`
+ * loads it, from the bytes `toBytes()` gave before the second store was
+ * freed, then loaded again and given the same reads, whose counts must be the
+ * built store's. A failed free, or a loaded store that counts other rows,
+ * throws as a failed self-check does.
+ *
+ * - Store: live bytes right after the store is obtained minus those after its
+ *   free, on a store no read has touched, so it leaves out the caches reads
+ *   fill (Vortex's term cache, and a built Vortex store's decoded code
+ *   columns).
+ * - Peak: per probe, the counter's peak reset, the read, a collection, then
+ *   the counter's peak plus `heapUsed`; the highest above the baseline. A
+ *   collected result (oxigraph) is held until that reading; a streaming
+ *   read's current chunk cannot be seen.
+ */
+async function runMemory(a: StoreAdapter): Promise<JsMemoryRun> {
+    console.log(`[${a.label}] memory…`);
+    const counter = (await a.counter?.()) ?? null;
+    counter?.setCounting(true);
+    if (counter) checkCounter(`${counter.name} wasm`, () => counter.stats().liveBytes, counter.hold);
+    checkCounter('JS heap (heapUsed)', heapUsedBytes, holdJsHeap);
+    const live = () => heapUsedBytes() + (counter?.stats().liveBytes ?? 0);
+    await settle(live);
+    const baseline = live();
+    // Store: a store of its own, obtained and freed before any read, so it
+    // holds no cache a read fills. Not through `reclaim`, which swallows a
+    // failed free(): that would leave Store at about 0, so it fails the run.
+    let h: unknown = await a.build(inputFor(a)); // built, or hdt's file loaded
+    await settle(live);
+    const opened = live();
+    a.dispose?.(h);
+    h = null;
+    await settle(live);
+    const first: StoreReadings = { opened, disposed: live() };
+    // The reads, on a second store obtained the same way.
+    h = await a.build(inputFor(a));
+    await settle(live);
+    const probeTotals: number[] = [];
+    for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) {
+        await settle(live);
+        counter?.resetPeak();
+        const read = a.matchHeld ? a.matchHeld(h, p) : { rows: await a.countMatch(h, p), result: null };
+        held = read.result;
+        matched[p.name] = read.rows;
+        probeTotals.push(heapUsedBytes() + (counter?.stats().peakLiveBytes ?? 0));
+        held = null;
+    }
+    await settle(live);
+    const loads = a.obtained === 'built' && !!a.snapshot && !!a.open; // Vortex
+    let bytes: unknown = loads ? await a.snapshot!(h) : null; // before the free
+    a.dispose?.(h);
+    h = null;
+    await settle(live);
+    let loaded: StoreReadings | null = a.obtained === 'loaded' ? first : null;
+    if (loads) {
+        // The loaded store as `fromBytes` gives it, measured before any read.
+        let l: unknown = await a.open!(bytes);
+        await settle(live);
+        const lOpened = live();
+        a.dispose?.(l);
+        l = null;
+        await settle(live);
+        loaded = { opened: lOpened, disposed: live() };
+        // Then the same reads, which must count the built store's rows.
+        l = await a.open!(bytes);
+        bytes = null;
+        for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) {
+            const rows = await a.countMatch(l, p);
+            if (rows !== matched[p.name]) {
+                throw new Error(
+                    `the store loaded from the snapshot matched ${rows} rows for '${p.name}', `
+                    + `the built store ${matched[p.name]}`);
+            }
+        }
+        a.dispose?.(l);
+    }
+    return memoryRunFigures({ baseline, built: a.obtained === 'built' ? first : null, loaded, probeTotals });
+}
+
 async function main(): Promise<void> {
     const list = role === 'mutate' ? MUT_ADAPTERS : ADAPTERS;
     const a = list.find((x) => x.slug === slug);
@@ -362,18 +450,24 @@ async function main(): Promise<void> {
         console.error(`unknown adapter slug '${slug}' for role '${role}'`);
         process.exit(1);
     }
+    // Untimed, before any phase: no timed build pays the module's compile.
+    await a.init?.();
 
-    const rows = role === 'query' ? await runQuery(a)
-        : role === 'querycold' ? await runQueryCold(a)
-            : role === 'fullscan' ? await runFullScan(a)
-                : await runMutate(a);
+    // A memory run that fails, its self-check included, throws out of here:
+    // the worker exits 1 with the reason, and writes nothing.
+    const memoryRun = role === 'memory' ? await runMemory(a) : undefined;
+    const rows = role === 'memory' ? []
+        : role === 'query' ? await runQuery(a)
+            : role === 'querycold' ? await runQueryCold(a)
+                : role === 'fullscan' ? await runFullScan(a)
+                    : await runMutate(a);
     const out: WorkerOutput = {
         rows,
         peakRssMb: peakRssMb(),
-        storeFootprint,
         matched,
         failures,
         cardinality: role === 'query' ? moduli(N_TRIPLES, { graphs: GRAPHS }) : undefined,
+        memoryRun,
     };
     writeFileSync(outFile, JSON.stringify(out));
 }
