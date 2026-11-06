@@ -5,12 +5,10 @@
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-use vortex_array::arrays::PrimitiveArray;
+use vortex_array::ArrayRef;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::{BoundExpression, col, pack, root, select};
 use vortex_array::scalar::Scalar;
-use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray};
 use vortex_buffer::Buffer;
 use vortex_layout::layouts::row_idx::row_idx;
 use vortex_layout::scan::scan_builder::ScanBuilder;
@@ -18,7 +16,7 @@ use vortex_layout::scan::split_by::SplitBy;
 use vortex_mask::Mask;
 
 use super::{LiveRows, ServeDecode, ServedRows, ServedSpan};
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::SortOrder;
@@ -248,8 +246,9 @@ impl FileServePlan {
 
     /// The child's `columns` at the child rows `positions` (ascending, not
     /// empty), in that order: point by point through the child's cached
-    /// chunk probes, or, where a probe declines, the rows they span scanned
-    /// and the positions taken.
+    /// chunk probes, or, where a probe declines (a string column), by a scan
+    /// of those rows (Vortex's row-indices selection), which reads only the
+    /// child's chunks that hold them.
     pub(crate) async fn columns_at(
         &self,
         file: &NativeStoreFile,
@@ -259,11 +258,9 @@ impl FileServePlan {
         if let Some(rows) = component_point_rows(file, self.child.name, columns, positions).await? {
             return Ok(rows);
         }
-        let (first, last) = (positions[0], positions[positions.len() - 1]);
-        let span = read_all_rows(self.child.scan(columns)?.with_row_range(first..last + 1)).await?;
-        let indices: Buffer<u64> = positions.iter().map(|&position| position - first).collect();
-        span.take(PrimitiveArray::new(indices, Validity::NonNullable).into_array())
-            .map_err(VortexRdfError::Vortex)
+        let positions =
+            vortex_scan::strict_sorted_buffer::StrictSortedBuffer::try_new(positions.clone())?;
+        read_all_rows(self.child.scan(columns)?.with_row_indices(positions)).await
     }
 
     /// The child's rows at `positions` (ascending, not empty), every child
@@ -469,13 +466,13 @@ impl FileServePlan {
     /// this call rather than the read; rows read point by point bind nothing
     /// of the plan's.
     ///
-    /// The scan spawns one task per split and the consumer decodes each
-    /// chunk inside its task, so the split count is the decode's
-    /// parallelism. The child's natural splits are its leaf chunks, which
-    /// cluster a run into one split however wide it is; splitting the range
-    /// by row count spreads the run's decode over the workers instead. No
-    /// filter rides along a located run: its range is exactly the
-    /// constrained rows (the same fact `size` and the point reads rely on).
+    /// The range is split by row count, across the workers. Only a stream of
+    /// the view's quads (`quads()`, through Vortex's own scan stream) spawns
+    /// a task per split, so that the split count is its decode's
+    /// parallelism; a code read runs at most `MAX_INLINE_SPLITS` splits
+    /// inline on its calling task. No filter rides along a located run: its
+    /// range is exactly the constrained rows (the same fact `size` and the
+    /// point reads rely on).
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     pub(crate) fn read<'a>(
