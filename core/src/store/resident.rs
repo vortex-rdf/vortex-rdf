@@ -12,7 +12,7 @@ use crate::session::VORTEX_SESSION;
 use crate::store::array::{column_is_sorted, stamp_is_sorted};
 use crate::store::schema;
 use crate::store::schema::CODE_PTYPE;
-use crate::store::zones::{ZoneBuilder, ZoneTable};
+use crate::store::zones::{QuadZones, ZoneBuilder};
 
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -67,7 +67,8 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 ///
 /// The pass that picks a column's encoding reads all its codes, and takes
 /// the column's zone bounds on the way ([`ZoneBuilder`]): they come back
-/// beside the struct ([`ZoneTable`]), for the primary base, whose residual
+/// beside the struct ([`QuadZones`]), `g`'s with its recorded graphs, for
+/// the primary base, whose residual
 /// filter skips zones by them.
 ///
 /// `payload_lazy` wraps each compressed column in a `vortex.shared` wrapper:
@@ -78,19 +79,31 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 pub(crate) fn with_compressed_int_children(
     rows: ArrayRef,
     payload_lazy: bool,
-) -> Result<(ArrayRef, ZoneTable)> {
+) -> Result<(ArrayRef, QuadZones)> {
     use vortex_array::arrays::Primitive;
     use vortex_layout::arrays::shared::Shared;
 
-    let mut zones = ZoneTable::default();
+    let mut zones = QuadZones::default();
     let rows = map_struct_children(rows, |name, child, ctx| {
+        use crate::store::schema::PRIMARY_COLUMNS;
+        use crate::store::zones::{graph_records, records_graphs};
+
         let sorted = column_is_sorted(child);
         let mut bounds = ZoneBuilder::new();
         let Some(mut encoded) = compress_int_child(child, sorted, &mut bounds, ctx)? else {
             return Ok(None);
         };
-        if let Some(column) = bounds.finish(child.len()) {
-            zones.insert(name.clone(), column);
+        let slot = PRIMARY_COLUMNS
+            .iter()
+            .position(|column| *column == name.as_ref());
+        if let (Some(slot), Some(mut column)) = (slot, bounds.finish(child.len())?) {
+            if records_graphs(slot) {
+                let codes = child
+                    .clone()
+                    .execute::<vortex_array::arrays::PrimitiveArray>(ctx)?;
+                column = column.with_records(graph_records(codes.as_slice::<u64>())?)?;
+            }
+            zones.set(slot, column);
         }
         if payload_lazy && !encoded.is::<Primitive>() {
             encoded = Shared::new(encoded).into_array();

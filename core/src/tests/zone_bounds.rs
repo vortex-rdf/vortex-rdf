@@ -254,3 +254,81 @@ async fn zone_narrowing_answers_every_selection_as_the_full_compare() {
         );
     }
 }
+
+/// An in-memory store's zone maps are its file's: the four code columns'
+/// bounds and `g`'s recorded graphs, the same whether built from the quads,
+/// loaded from the file in memory, or adopted from its bytes. Only `g`
+/// records graphs, and a zone past 16 of them records none.
+#[tokio::test]
+async fn in_memory_zone_maps_match_the_files() {
+    use super::located_zones::{Graphs, zone_quads};
+
+    for graphs in [Graphs::Stretches, Graphs::RecordedByTurns] {
+        let quads = zone_quads(graphs);
+        let built = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+        let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
+        let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+        for column in ["s", "p", "o", "g"] {
+            let want = built.debug_zone_bounds(column).expect("built zones");
+            for (label, store) in [("loaded", &loaded), ("adopted", &adopted)] {
+                assert_eq!(
+                    store.debug_zone_bounds(column).as_ref(),
+                    Some(&want),
+                    "{graphs:?} {label} {column}"
+                );
+            }
+        }
+        let records = built.debug_zone_records("g").expect("g's records");
+        for (label, store) in [("loaded", &loaded), ("adopted", &adopted)] {
+            assert_eq!(
+                store.debug_zone_records("g").as_ref(),
+                Some(&records),
+                "{graphs:?} {label} g"
+            );
+        }
+        for column in ["s", "p", "o"] {
+            assert!(built.debug_zone_records(column).is_none(), "{column}");
+        }
+        match graphs {
+            Graphs::RecordedByTurns => assert!(
+                records.iter().any(Option::is_none) && records.iter().any(Option::is_some),
+                "zones past 16 graphs beside recorded ones"
+            ),
+            _ => assert!(records.iter().all(Option::is_some), "every zone recorded"),
+        }
+    }
+}
+
+/// A residual graph whose code every zone's bounds hold, but only two zones
+/// hold (`Graphs::Gapped`): the recorded graphs leave the others out, so
+/// `(? ? ? g2)` in memory compares only those two zones, where bounds alone
+/// compared every row.
+#[tokio::test]
+async fn records_skip_zones_in_memory() {
+    use super::located_zones::{Graphs, zone_quads};
+
+    let store = built_store(
+        zone_quads(Graphs::Gapped),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let g2 = iri_graph("g2");
+    let rec = Recorder::start();
+    let view = store
+        .match_pattern(None, None, None, Some(&g2))
+        .await
+        .unwrap();
+    assert_eq!(view.size().await.unwrap(), 2_000, "graph 2's rows");
+    assert_eq!(rec.count(&Event::ZoneNarrowed), 1, "narrowed by zones");
+    let compared: u64 = rec
+        .picked(|e| match e {
+            Event::ResidualCompared(rows) => Some(*rows),
+            _ => None,
+        })
+        .iter()
+        .sum();
+    assert_eq!(compared, 2 * ZONE_ROWS as u64, "graph 2's two zones");
+}

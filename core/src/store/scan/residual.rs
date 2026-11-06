@@ -51,7 +51,7 @@ pub(crate) fn residual_rows(
     // where a code's zones scatter); an id list keeps only its ids in them.
     let mut selection = selection;
     if selection.len(base.len()) > ZONE_ROWS
-        && let Some(runs) = zones.runs_holding(eqs, base.len())
+        && let Some(runs) = zones.kept_runs(eqs, base.len())?
     {
         observe!(ZoneNarrowed);
         debug::step!(t, "[match_pattern] In-memory narrowed by zone bounds");
@@ -106,6 +106,7 @@ fn runs_matching(
 ) -> Result<Vec<u64>> {
     let mut ids = Vec::new();
     for run in runs {
+        observe!(ResidualCompared(run.end - run.start));
         let rows = base.slice(run.start as usize..run.end as usize)?;
         match bool_array_to_mask(mask_for(&rows, eqs)?)?.bit_buffer() {
             vortex_mask::AllOr::All => ids.extend(run.clone()),

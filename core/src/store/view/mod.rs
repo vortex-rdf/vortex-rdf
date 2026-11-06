@@ -27,7 +27,7 @@ use crate::store::resident::CodeAccess;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::view::tail_keys::TailKeys;
-use crate::store::zones::ZoneTable;
+use crate::store::zones::QuadZones;
 use crate::store::{RawQuad, SortOrder};
 
 #[cfg(feature = "file-io")]
@@ -84,9 +84,10 @@ pub(crate) struct MemoryBase {
     /// resolved lazily and shared by every view of this base; a new base
     /// takes a new cache.
     pub(crate) probes: Arc<StructProbes>,
-    /// The per-zone code bounds of `base`'s code columns ([`ZoneTable`]),
-    /// shared by every view of this base; empty when the base has none.
-    pub(crate) zones: Arc<ZoneTable>,
+    /// The zone maps of `base`'s code columns ([`QuadZones`]), `g`'s with
+    /// its recorded graphs, shared by every view of this base; empty when the
+    /// base has none.
+    pub(crate) zones: Arc<QuadZones>,
     /// How `base`'s code columns read ([`CodeAccess`]), fixed when the base
     /// was built.
     pub(crate) code_access: CodeAccess,

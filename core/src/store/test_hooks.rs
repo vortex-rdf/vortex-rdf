@@ -34,6 +34,11 @@ use crate::store::{DictSnapshot, RowId, TermCode, VortexRdfStore};
 
 pub(crate) use crate::store::view::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
+/// A column's recorded graphs per zone, as
+/// [`VortexRdfStore::debug_zone_records`] reads them: `(code, rows)` pairs,
+/// `None` for a zone past 16 graphs.
+pub(crate) type ZoneRecords = Vec<Option<Vec<(u64, u32)>>>;
+
 thread_local! {
     /// The code the dictionaries built or opened on this thread give their
     /// first term, while a [`CodeBase`] guard is live.
@@ -533,12 +538,31 @@ impl VortexRdfStore {
         }
     }
 
+    /// Base column `name`'s recorded graphs per zone (`None` for a zone past
+    /// 16), of an in-memory view; `None` for a column that records none or
+    /// any other view.
+    pub(crate) fn debug_zone_records(&self, name: &str) -> Option<ZoneRecords> {
+        match &self.quads.backend {
+            crate::store::Backend::InMemory(memory) => {
+                let records = memory.zones.of_column(name)?.recorded()?;
+                Some(
+                    records
+                        .iter()
+                        .map(|zone| zone.as_ref().map(|pairs| pairs.to_vec()))
+                        .collect(),
+                )
+            }
+            #[cfg(feature = "file-io")]
+            crate::store::Backend::File(_) => None,
+        }
+    }
+
     /// Base column `name`'s zone bounds, `(min, max)` per zone, of an
     /// in-memory view; `None` for a column without them or any other view.
     pub(crate) fn debug_zone_bounds(&self, name: &str) -> Option<Vec<(TermCode, TermCode)>> {
         match &self.quads.backend {
             crate::store::Backend::InMemory(memory) => {
-                memory.zones.get(name).map(|zones| zones.bounds().to_vec())
+                memory.zones.of_column(name).map(|zones| zones.bounds())
             }
             #[cfg(feature = "file-io")]
             crate::store::Backend::File(_) => None,

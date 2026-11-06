@@ -29,7 +29,7 @@ use crate::store::VortexRdfStore;
 use crate::store::construct::resolved_layout;
 use crate::store::indexes::COL_RID;
 use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
-use crate::store::zones::ZoneTable;
+use crate::store::zones::QuadZones;
 
 /// Refuse a table whose id columns are integers of another width than this
 /// version reads: an integer `s`, `p`, `o`, `g` (the quad table and the copy
@@ -264,7 +264,7 @@ impl VortexRdfStore {
         let (quads, source) = (file.quad_layout()?, file.segment_source());
         let (parts, zones) = futures::try_join!(
             opened.to_serializable_parts(),
-            ZoneTable::read_from_file(&quads, &source)
+            QuadZones::read(&quads, &source)
         )?;
         Self::from_parts(parts, zones)
     }
@@ -366,8 +366,7 @@ impl VortexRdfStore {
         let typed = root.as_::<container::RdfStoreLayoutVTable>();
         // The base's zone bounds, from the quad child's zone maps.
         let zones =
-            ZoneTable::read_from_file(&container::quad_source(typed)?, &file.segment_source())
-                .await?;
+            QuadZones::read(&container::quad_source(typed)?, &file.segment_source()).await?;
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let quads = quads.execute::<StructArray>(&mut ctx)?.into_array();
         // Restore the subject stamp from the file's recorded provenance,

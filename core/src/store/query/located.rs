@@ -1499,13 +1499,15 @@ fn footer_decision(
 
     let bounds = footer_bounds(file, PRIMARY_COLUMNS[slot]);
     let rows = file.row_count();
-    Ok(if bounds_prove(bounds, proofs.none.as_ref(), rows)? {
-        FooterDecision::Nothing
-    } else if bounds_prove(bounds, proofs.all.as_ref(), rows)? {
-        FooterDecision::Everything
-    } else {
-        FooterDecision::Unknown
-    })
+    Ok(
+        if crate::io::zone_map::bounds_prove(bounds, proofs.none.as_ref(), rows)? {
+            FooterDecision::Nothing
+        } else if crate::io::zone_map::bounds_prove(bounds, proofs.all.as_ref(), rows)? {
+            FooterDecision::Everything
+        } else {
+            FooterDecision::Unknown
+        },
+    )
 }
 
 /// The footer's exact `(min, max)` of the file's top-level `u64` column
@@ -1526,35 +1528,6 @@ fn footer_bounds(
     let min = set.get_as::<u64>(Stat::Min, dtype).as_exact()?;
     let max = set.get_as::<u64>(Stat::Max, dtype).as_exact()?;
     Some((min, max))
-}
-
-/// Whether `proof`, one of Vortex's proofs of `x = code` ([`eq_proofs`]),
-/// holds on bounds `(min, max)` of a column of `row_count` rows, a one-zone
-/// map of them: for the falsifier no row holds the code, for the satisfier
-/// every row does. `false` without bounds or a proof.
-///
-/// [`eq_proofs`]: crate::stats_rules::eq_proofs
-#[cfg(feature = "file-io")]
-fn bounds_prove(
-    bounds: Option<(u64, u64)>,
-    proof: Option<&vortex_array::expr::BoundExpression>,
-    row_count: u64,
-) -> Result<bool> {
-    use crate::io::zone_map::ColumnZones;
-
-    let (Some((min, max)), Some(proof)) = (bounds, proof) else {
-        return Ok(false);
-    };
-    if row_count == 0 {
-        return Ok(false);
-    }
-    let zones = ColumnZones::from_bounds(
-        vortex_buffer::buffer![min],
-        vortex_buffer::buffer![max],
-        row_count,
-        row_count,
-    )?;
-    Ok(zones.prune(0..1, proof)?.value(0))
 }
 
 /// The longest gap run checked row by row: [`GAP_ROWS`], or what a test
@@ -1713,41 +1686,4 @@ fn leaves_holding(column: &vortex_rdf_encoded_search::ColumnChunks, rows: &[u64]
         leaves += 1;
     }
     leaves
-}
-
-#[cfg(all(test, feature = "file-io"))]
-mod tests {
-    use super::*;
-
-    /// Footer bounds prove every row holds a code only where both are the
-    /// code, and no row does where they leave it out; a file without them
-    /// proves nothing.
-    #[test]
-    fn footer_bounds_prove_the_code() {
-        use vortex_array::dtype::{DType, Nullability, PType};
-
-        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-        let proofs = |code| crate::stats_rules::eq_proofs(&dtype, code).unwrap();
-        let (five, top) = (proofs(5), proofs(u64::MAX));
-        let (all, none) = (five.all.as_ref(), five.none.as_ref());
-        assert!(!bounds_prove(None, all, 100).unwrap());
-        assert!(!bounds_prove(Some((4, 5)), all, 100).unwrap());
-        assert!(bounds_prove(Some((5, 5)), all, 100).unwrap());
-        assert!(!bounds_prove(Some((5, 5)), None, 100).unwrap());
-        let max = (u64::MAX, u64::MAX);
-        assert!(bounds_prove(Some(max), top.all.as_ref(), 100).unwrap());
-        for (bounds, held_by_none) in [
-            ((6, 9), true),
-            ((1, 4), true),
-            ((4, 6), false),
-            ((5, 5), false),
-        ] {
-            assert_eq!(
-                bounds_prove(Some(bounds), none, 100).unwrap(),
-                held_by_none,
-                "{bounds:?}"
-            );
-        }
-        assert!(!bounds_prove(None, none, 100).unwrap());
-    }
 }

@@ -274,7 +274,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L227) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L448), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L222) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L128) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L129) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:152-159`](../core/src/store/query/matching/memory.rs#L152-L159 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -411,16 +411,19 @@ compile can in principle answer `AlwaysFalse` — an empty view — but not here
 the residual binds a subset of roles the [stage B gate](#4-stage-b--the-provable-emptiness-gate)
 already resolved, so that arm exists for totality.
 
-First, **zone bounds** narrow the rows to compare. An in-memory base carries
-the smallest and largest code of each 8,192-row zone of its code columns
-([`CodeZones`](../core/src/store/zones.rs#L28)), the counterpart of a file's
-zone maps: taken in the pass that compresses a build's codes, or read from the
-zone maps of the file a store is loaded from (`from_file_in_memory`,
+First, **zone maps** narrow the rows to compare. An in-memory base keeps a
+Vortex zone map of each code column's 8,192-row zones, their exact bounds,
+and for the graph column the graphs each zone records with their rows
+([`QuadZones`](../core/src/store/zones.rs#L34)), as a file store's located runs
+read them: taken in the pass that compresses a build's codes (the graphs with
+Vortex's accumulator of `vortexrdf.value_counts`), or read from the zone
+tables of the file a store is loaded from (`from_file_in_memory`,
 `from_bytes`), so no query pays for them. A base without them (the string
 columns of the Default and TypedObject layouts) skips this step. Over a
-selection wider than a zone, the zones whose bounds cannot hold every
-constrained code are left out ([`runs_holding`](../core/src/store/zones.rs#L231)),
-when what is left holds at most half the base: a run of rows (every row, or a
+selection wider than a zone, the zones where Vortex's falsifier of a
+constrained column's `x = c` holds, or whose recorded graphs lack the code,
+are left out ([`kept_runs`](../core/src/store/zones.rs#L133)), when what is
+left holds at most half the base: a run of rows (every row, or a
 subject's range) is compared zone run by zone run, each a slice of the base
 through the mask scan below
 ([`runs_matching`](../core/src/store/scan/residual.rs#L102)), and an id list keeps
@@ -1105,7 +1108,7 @@ instead: filling costs it a few thousand instructions, more than the values
 so few rows skip. A window over such a filter
 ([§16.2](#162-window-size_capped-exists)), whether it keeps the filter's
 masks or resolves the filter into its matches' ids, keeps the filter's
-equalities ([`FileFilter`](../core/src/store/view/mod.rs#L133)): its reads
+equalities ([`FileFilter`](../core/src/store/view/mod.rs#L134)): its reads
 by id, one-shot or streamed, read only the free columns and fill the pinned
 ones in the same way, a point read only from 64 rows. `quads_vec` and `shared_quads_vec` read and decode a take or a
 projection split by split, spawning the split reads when there is more than

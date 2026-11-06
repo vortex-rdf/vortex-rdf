@@ -134,7 +134,6 @@ pub(crate) fn register(session: &VortexSession) {
 /// count about 30 µs: its list function evaluated over the zone table, and
 /// its term at the footer, which kept Vortex from folding the footer's proof
 /// to a constant.
-#[cfg(feature = "file-io")]
 static BOUNDS_SESSION: std::sync::LazyLock<VortexSession> = std::sync::LazyLock::new(|| {
     use vortex_array::stats::session::StatsSessionExt as _;
     let session = VortexSession::empty();
@@ -146,15 +145,14 @@ static BOUNDS_SESSION: std::sync::LazyLock<VortexSession> = std::sync::LazyLock:
 /// builds them from the bounds' rules ([`BOUNDS_SESSION`]): `none` holds
 /// where no row can equal `code` (the falsifier), `all` where every row does
 /// (the satisfier); either is `None` where no rule proves it.
-#[cfg(feature = "file-io")]
 pub(crate) struct EqProofs {
     pub(crate) none: Option<BoundExpression>,
+    #[cfg_attr(not(feature = "file-io"), expect(dead_code))]
     pub(crate) all: Option<BoundExpression>,
 }
 
 /// [`EqProofs`] of `x = code`, `x` a column of `column` dtype (the root of a
 /// zone map's stats).
-#[cfg(feature = "file-io")]
 pub(crate) fn eq_proofs(
     column: &vortex_array::dtype::DType,
     code: u64,
@@ -168,7 +166,7 @@ pub(crate) fn eq_proofs(
     })
 }
 
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::zone_map::ColumnZones;

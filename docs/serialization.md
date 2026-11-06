@@ -548,7 +548,7 @@ store's *compressed-resident* form (through
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L78)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L79)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
@@ -559,17 +559,19 @@ store's *compressed-resident* form (through
 - the smallest and largest code of each 8,192-row zone of every code column
   is taken in the pass that picks the column's encoding, which reads every
   code for the column's own bounds anyway
-  ([`ZoneBuilder`](../core/src/store/zones.rs#L79)): the in-memory
-  counterpart of a file's zone maps, so a match's residual equality compares
-  only the zones that may hold its code
+  ([`ZoneBuilder`](../core/src/store/zones.rs#L190)), and the graph column's
+  graphs per zone with Vortex's accumulator of `vortexrdf.value_counts`: the
+  in-memory counterpart of a file's zone maps, so a match's residual
+  equality compares only the zones that may hold its code
   ([matching.md §6.3](matching.md#63-residual-column-filtering)).
 
 The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L96)
 (crate-private; `from_file_in_memory` calls it), takes a store's split parts:
 it keeps each integer child's existing encoding wherever a probe binds it and
-decodes only the ones that decline. Its zone bounds are the file's own zone
-maps, read at open ([`ZoneTable::read_from_file`](../core/src/store/zones.rs#L151)),
-as `from_bytes` reads them. Opening serialized bytes in memory is
+decodes only the ones that decline. Its zone maps are the file's own zone
+tables, the graph column's recorded graphs included, read at open
+([`QuadZones::read`](../core/src/store/zones.rs#L75)), as `from_bytes` reads
+them. Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).
 
 ---
