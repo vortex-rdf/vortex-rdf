@@ -43,8 +43,7 @@ pub(crate) fn asks_statistics(rows: usize) -> bool {
 }
 
 /// What the statistics settle of a residual before its rows are compared
-/// ([`ask_statistics`]): the first two levels of the statistics ladder in
-/// memory, the columns' array statistics and then their zones.
+/// ([`ask_statistics`]): the columns' array statistics, then their zones.
 pub(crate) enum Asked {
     /// No base row holds an equality's code: the array statistics.
     Nothing,
