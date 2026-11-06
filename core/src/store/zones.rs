@@ -17,7 +17,7 @@ use std::sync::Arc;
 use vortex_array::scalar::Scalar;
 
 use crate::error::Result;
-use crate::io::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS};
+use crate::io::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS, eq_on_bounds};
 use crate::store::array::unsigned_value;
 use crate::store::schema::{CODE_DTYPE, PRIMARY_COLUMNS, TermCode};
 
@@ -121,8 +121,8 @@ impl QuadZones {
 
     /// The rows of the zones whose bounds may hold every code `eqs` binds,
     /// as ascending runs over a base of `rows` rows, adjacent zones joined:
-    /// a zone is left out where Vortex's falsifier of a bound column's
-    /// `x = c` holds on its zone map's bounds. `None` when no bound column
+    /// a zone is left out where a bound column's code lies outside its zone
+    /// bounds ([`eq_on_bounds`]). `None` when no bound column
     /// has zones, or when the zones left hold more than half the base:
     /// comparing a whole column then costs less than comparing its runs.
     /// The residual's route with zones off, bounds only; with zones on it
@@ -138,14 +138,10 @@ impl QuadZones {
             let (Some(code), Some(zones)) = (unsigned_value(scalar), self.of_column(field)) else {
                 continue;
             };
-            let proofs = crate::stats_rules::eq_proofs(&CODE_DTYPE, code)?;
-            let none = match &proofs.none {
-                Some(proof) => Some(zones.prune(0..zones.zones(), proof)?),
-                None => None,
-            };
             let keep = keep.get_or_insert_with(|| vec![true; zones.zones() as usize]);
             for (zone, kept) in keep.iter_mut().enumerate() {
-                *kept &= !none.as_ref().is_some_and(|mask| mask.value(zone));
+                let (min, max) = zones.zone_bounds(zone as u64);
+                *kept &= eq_on_bounds(min, max, code) != Some(false);
             }
         }
         let Some(keep) = keep else {

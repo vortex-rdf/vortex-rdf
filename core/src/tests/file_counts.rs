@@ -130,3 +130,37 @@ async fn file_all_side_respects_tombstones() {
     let _zones = ForcedZones::set(false);
     assert_eq!(count(&store, None, "A").await, want, "as with zones off");
 }
+
+/// A filter's every-row zones are found once per file: a second count of
+/// the same pattern takes them from the file's memo, and a pattern of
+/// another code searches its own.
+#[tokio::test]
+async fn every_row_zones_are_found_once_per_filter() {
+    let (_dir, path) = write_store_file(whole_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let searched = |rec: &Recorder| rec.count(&Event::EveryRowSearched);
+    let rec = Recorder::start();
+    assert_eq!(
+        count(&store, None, "A").await,
+        4 * ZONE_ROWS + ZONE_ROWS / 2
+    );
+    assert_eq!(searched(&rec), 1, "the first count searches");
+    let rec = Recorder::start();
+    assert_eq!(
+        count(&store, None, "A").await,
+        4 * ZONE_ROWS + ZONE_ROWS / 2
+    );
+    assert_eq!(searched(&rec), 0, "the second takes the memo");
+    assert_eq!(
+        split_rows(&rec).0,
+        4 * ZONE_ROWS as u64,
+        "the same zones taken"
+    );
+    let rec = Recorder::start();
+    assert_eq!(
+        count(&store, None, "B").await,
+        2 * ZONE_ROWS + ZONE_ROWS / 2
+    );
+    assert_eq!(searched(&rec), 1, "another code searches its own");
+    assert_eq!(split_rows(&rec).0, 2 * ZONE_ROWS as u64);
+}

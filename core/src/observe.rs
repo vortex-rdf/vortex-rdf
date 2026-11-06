@@ -191,6 +191,9 @@ pub(crate) enum Event {
     /// A split's rows a filter's conjuncts were evaluated over, after its
     /// zones were pruned.
     SplitFilterRows(u64),
+    /// A file's every-row zones searched for a filter of code equalities, on
+    /// a miss of the file's memo.
+    EveryRowSearched,
     /// A split's mask the in-order fold handed on, of this range.
     SplitConsumed(Range<u64>),
 }

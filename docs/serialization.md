@@ -559,7 +559,7 @@ store's *compressed-resident* form (through
 - the smallest and largest code of each 8,192-row zone of every code column
   is taken in the pass that picks the column's encoding, which reads every
   code for the column's own bounds anyway
-  ([`ZoneBuilder`](../core/src/store/zones.rs#L186)), and the graph column's
+  ([`ZoneBuilder`](../core/src/store/zones.rs#L182)), and the graph column's
   graphs per zone with Vortex's accumulator of `vortexrdf.value_counts`: the
   in-memory counterpart of a file's zone maps, so a match's residual
   equality compares only the zones that may hold its code

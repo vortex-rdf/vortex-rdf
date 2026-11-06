@@ -12,6 +12,7 @@
 //! ([`PendingResidual`](crate::store::view::pending::PendingResidual)).
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::constant::ConstantArray;
@@ -25,15 +26,13 @@ use web_time::Instant;
 
 use crate::debug;
 use crate::error::Result;
-use crate::io::zone_map::{ZONE_ROWS, bounds_prove};
+use crate::io::zone_map::{ColumnZones, ZONE_ROWS, eq_on_bounds};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
-use crate::stats_rules::eq_proofs;
 use crate::store::MemoryBase;
 use crate::store::array::{bool_array_to_mask, into_struct_array, stamped_bounds, unsigned_value};
-use crate::store::query::zone_decider::{CheckedColumn, ZoneClass, ZoneDecider};
 use crate::store::scan::typed_eq::typed_residual_ids;
-use crate::store::schema::{CODE_DTYPE, PRIMARY_COLUMNS, RowId};
+use crate::store::schema::{PRIMARY_COLUMNS, RowId};
 use crate::store::view::selection::{RowSelection, SelectedRows};
 
 /// Whether a residual over a selection of `rows` rows asks the statistics
@@ -60,11 +59,10 @@ pub(crate) enum Asked {
 }
 
 /// The statistics a residual over `selection` (of `memory`'s base) asks
-/// once, each equality of `eqs` by Vortex's proofs of `x = code`
-/// ([`eq_proofs`]): first against its column's exact bounds, the array
-/// statistics ([`stamped_bounds`], [`bounds_prove`]), then the equalities
-/// left against their columns' zone maps ([`ResidualZones`]), the same
-/// proofs pruning them.
+/// once, each equality of `eqs` by the bounds' rule of `x = code`
+/// ([`eq_on_bounds`]): first against its column's exact bounds, the array
+/// statistics ([`stamped_bounds`]), then the equalities left against their
+/// columns' zone maps and `g`'s recorded graphs ([`ResidualZones`]).
 pub(crate) fn ask_statistics(
     memory: &MemoryBase,
     selection: &RowSelection,
@@ -72,7 +70,6 @@ pub(crate) fn ask_statistics(
 ) -> Result<Asked> {
     let base = &memory.base;
     let struct_arr = into_struct_array(base.clone())?;
-    let rows = base.len() as u64;
     let mut open = Vec::with_capacity(eqs.len());
     let mut zoned = Vec::new();
     for (field, value) in eqs {
@@ -85,33 +82,24 @@ pub(crate) fn ask_statistics(
             .unmasked_field_by_name(field)
             .ok()
             .and_then(stamped_bounds);
-        let zones = memory.zones.get(slot);
-        if bounds.is_none() && zones.is_none() {
-            open.push((field, value));
-            continue;
+        match bounds.and_then(|(min, max)| eq_on_bounds(min, max, code)) {
+            Some(false) => return Ok(Asked::Nothing),
+            Some(true) => continue,
+            None => {}
         }
-        let proofs = eq_proofs(&CODE_DTYPE, code)?;
-        if bounds_prove(bounds, proofs.none.as_ref(), rows)? {
-            return Ok(Asked::Nothing);
-        }
-        if bounds_prove(bounds, proofs.all.as_ref(), rows)? {
-            continue;
-        }
-        if let Some(zones) = zones {
-            let column = CheckedColumn {
-                slot,
+        if let Some(zones) = memory.zones.get(slot) {
+            zoned.push(ZonedEq {
+                eq: open.len(),
                 code,
-                zones: zones.clone(),
-                proofs,
-            };
-            zoned.push((open.len(), column));
+                zones: Arc::clone(zones),
+            });
         }
         open.push((field, value));
     }
     if open.is_empty() {
         return Ok(Asked::Everything);
     }
-    let zones = ResidualZones::new(zoned, open.len(), selection, base.len())?;
+    let zones = ResidualZones::new(zoned, open.len(), selection, base.len());
     Ok(Asked::Open { eqs: open, zones })
 }
 
@@ -128,102 +116,112 @@ enum Treatment {
     Compare(u32),
 }
 
+/// An equality of a residual whose column has a zone map: its place among
+/// the residual's equalities, its code, and the map.
+struct ZonedEq {
+    eq: usize,
+    code: u64,
+    zones: Arc<ColumnZones>,
+}
+
 /// A residual's zones, classed once against its equalities: each zone its
-/// selection touches is "none", "all" or mixed ([`ZoneClass`]), as
-/// [`ZoneDecider`] finds on the zone maps of the columns the equalities
-/// bind (with `g`'s recorded graphs). Built with the residual
+/// selection touches is "none" (a column's zone cannot hold its code), "all"
+/// (every column's zone holds only its code) or mixed, by the bounds' rule
+/// of `x = c` and `g`'s recorded graphs ([`ColumnZones::eq_holds`]), and
+/// kept as how its rows are read ([`Treatment`]). Built with the residual
 /// ([`ask_statistics`]); a pending residual keeps it for every piece.
 pub(crate) struct ResidualZones {
-    decider: ZoneDecider,
+    /// The equalities whose columns have zone maps, of one zone geometry.
+    columns: Vec<ZonedEq>,
     /// The first zone classed.
     first: u64,
-    /// The class of each zone from `first` on, through the selection's last.
-    classes: Vec<ZoneClass>,
-    /// The equality (by place in the residual's) on each slot with a zone
-    /// map.
-    by_slot: [Option<usize>; 4],
-    /// The equalities no zone map speaks for, one bit each: compared in
-    /// every zone that is not "none".
-    unzoned: u32,
+    /// How the selected rows of each zone from `first` on, through the
+    /// selection's last, are read.
+    treatments: Vec<Treatment>,
+    /// Every equality's bit, for a zone outside the classed ones.
+    every: u32,
 }
 
 impl ResidualZones {
     /// The classes of the zones `selection` (of a base of `base_len` rows)
-    /// touches, against `zoned`: the checked columns of the residual's
-    /// equalities that have zone maps, each with its equality's place among
-    /// the residual's `eqs` equalities. `None` without such a column, for a
-    /// selection of no row, or past 32 equalities.
+    /// touches, against `zoned`, of the residual's `eqs` equalities. `None`
+    /// without a zoned equality, for zone maps of different geometries, for
+    /// a selection of no row, or past 32 equalities.
     fn new(
-        zoned: Vec<(usize, CheckedColumn)>,
+        zoned: Vec<ZonedEq>,
         eqs: usize,
         selection: &RowSelection,
         base_len: usize,
-    ) -> Result<Option<Self>> {
-        let Some(span) = span(&selection.as_rows(base_len)) else {
-            return Ok(None);
-        };
-        if eqs > 32 {
-            return Ok(None);
+    ) -> Option<Self> {
+        let span = span(&selection.as_rows(base_len))?;
+        let first_map = &zoned.first()?.zones;
+        let (zone_len, zones) = (first_map.zone_len(), first_map.zones());
+        if eqs > 32
+            || zoned
+                .iter()
+                .any(|c| c.zones.zone_len() != zone_len || c.zones.zones() != zones)
+        {
+            return None;
         }
-        let mut by_slot = [None; 4];
-        let mut unzoned = every_eq(eqs);
-        let mut columns = Vec::with_capacity(zoned.len());
-        for (index, column) in zoned {
-            by_slot[column.slot] = Some(index);
-            unzoned &= !(1 << index);
-            columns.push(column);
-        }
-        let Some(decider) = ZoneDecider::new(columns) else {
-            return Ok(None);
-        };
-        let zone_len = decider.zone_len();
+        let every = every_eq(eqs);
+        let unzoned = zoned.iter().fold(every, |bits, c| bits & !(1 << c.eq));
         let first = span.start / zone_len;
-        let classes = decider.classify(first..span.end.div_ceil(zone_len))?;
-        Ok(Some(Self {
-            decider,
+        let end = span.end.div_ceil(zone_len).min(zones);
+        observe!(ZonesClassed(end.saturating_sub(first)));
+        let treatments = (first..end)
+            .map(|zone| {
+                let (mut none, mut unsettled) = (false, 0u32);
+                for column in &zoned {
+                    match column.zones.eq_holds(zone, column.code) {
+                        Some(false) => none = true,
+                        Some(true) => {}
+                        None => unsettled |= 1 << column.eq,
+                    }
+                }
+                match (none, unsettled | unzoned) {
+                    (true, _) => Treatment::Skip,
+                    (false, 0) => Treatment::Take,
+                    (false, bits) => Treatment::Compare(bits),
+                }
+            })
+            .collect();
+        Some(Self {
+            columns: zoned,
             first,
-            classes,
-            by_slot,
-            unzoned,
-        }))
+            treatments,
+            every,
+        })
+    }
+
+    /// Rows per zone, the last zone's excepted.
+    fn zone_len(&self) -> u64 {
+        self.columns[0].zones.zone_len()
+    }
+
+    /// The base's rows in zone `zone`.
+    fn zone_rows(&self, zone: u64) -> Range<u64> {
+        self.columns[0].zones.zone_rows(zone)
     }
 
     /// How zone `zone`'s selected rows are read: as its class says, a zone
     /// outside the classed ones compared on every equality.
     fn treatment(&self, zone: u64) -> Treatment {
-        let class = zone
-            .checked_sub(self.first)
-            .and_then(|at| self.classes.get(at as usize));
-        let zoned = self
-            .by_slot
-            .iter()
-            .flatten()
-            .fold(0, |bits, i| bits | 1 << i);
-        match class {
-            None => Treatment::Compare(self.unzoned | zoned),
-            Some(ZoneClass::None) => Treatment::Skip,
-            Some(ZoneClass::All) if self.unzoned == 0 => Treatment::Take,
-            Some(ZoneClass::All) => Treatment::Compare(self.unzoned),
-            Some(ZoneClass::Mixed { unsettled }) => {
-                let unsettled = (0..4)
-                    .filter(|slot| unsettled & (1 << slot) != 0)
-                    .filter_map(|slot| self.by_slot[slot])
-                    .fold(0, |bits, i| bits | 1 << i);
-                Treatment::Compare(self.unzoned | unsettled)
-            }
-        }
+        zone.checked_sub(self.first)
+            .and_then(|at| self.treatments.get(at as usize))
+            .copied()
+            .unwrap_or(Treatment::Compare(self.every))
     }
 
     /// The zones `rows` touches, in order, each with its rows within
     /// `rows` and its treatment.
     fn zones_of(&self, rows: Range<u64>) -> impl Iterator<Item = (u64, Range<u64>, Treatment)> {
-        let zone_len = self.decider.zone_len();
+        let zone_len = self.zone_len();
         let zones = match rows.is_empty() {
             true => 0..0,
             false => rows.start / zone_len..(rows.end - 1) / zone_len + 1,
         };
         zones.map(move |zone| {
-            let zone_rows = self.decider.zone_rows(zone);
+            let zone_rows = self.zone_rows(zone);
             let part = zone_rows.start.max(rows.start)..zone_rows.end.min(rows.end);
             (zone, part, self.treatment(zone))
         })
@@ -244,10 +242,12 @@ impl ResidualZones {
         segments
     }
 
-    /// The slot of equality `eq` (by place in the residual's), where a zone
-    /// map speaks for it.
-    fn slot_of(&self, eq: usize) -> Option<usize> {
-        self.by_slot.iter().position(|&index| index == Some(eq))
+    /// The rows of zone `zone` holding equality `eq`'s code (by place in
+    /// the residual's), as its column's zone recorded them; `None` where it
+    /// records none or no zone map speaks for the equality.
+    fn recorded_count(&self, eq: usize, zone: u64) -> Option<u64> {
+        let column = self.columns.iter().find(|column| column.eq == eq)?;
+        column.zones.recorded_count(zone, column.code)
     }
 }
 
@@ -371,7 +371,13 @@ pub(crate) fn zoned_window(
             continue;
         }
         if found.is_empty() {
-            let matched = match zone_matches(memory, zones, zone, &part, eqs, treatment, deleted)? {
+            // A zone is counted only to be skipped: where the window starts
+            // at the zone's first match, its matches are read at once.
+            let counted = match before < offset {
+                true => zone_matches(memory, zones, zone, &part, eqs, treatment, deleted)?,
+                false => ZoneMatches::Read(matched_rows(memory, part.clone(), eqs, treatment)?),
+            };
+            let matched = match counted {
                 ZoneMatches::Counted(matches) if before + matches <= offset => {
                     before += matches;
                     continue;
@@ -404,7 +410,7 @@ pub(crate) fn zoned_window(
 /// The matches of mixed zone `zone`'s selected rows `part`, counted unread
 /// where its one equality left to compare (`bits`) allows and no selected
 /// row is tombstoned: the zone's recorded count of the code when the
-/// selection holds the whole zone ([`ZoneDecider::recorded_count`]), else
+/// selection holds the whole zone ([`ColumnZones::recorded_count`]), else
 /// the column's encoding counted over the selected rows when they are
 /// contiguous (`count_eq`, through the store's probe of the column). `None`
 /// when neither applies.
@@ -426,12 +432,9 @@ fn counted_unread(
     let Some(code) = unsigned_value(value) else {
         return Ok(None);
     };
-    let zone_rows = zones.decider.zone_rows(zone);
+    let zone_rows = zones.zone_rows(zone);
     let whole = part.len(base_len) as u64 == zone_rows.end - zone_rows.start;
-    if whole
-        && let Some(slot) = zones.slot_of(eq)
-        && let Some(matches) = zones.decider.recorded_count(slot, zone)
-    {
+    if whole && let Some(matches) = zones.recorded_count(eq, zone) {
         observe!(ZoneRecorded(zone_rows.end - zone_rows.start));
         return Ok(Some(matches as usize));
     }

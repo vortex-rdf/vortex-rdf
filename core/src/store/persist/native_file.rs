@@ -56,6 +56,10 @@ pub(crate) struct NativeStoreFile {
     /// same few filters; keyed this way a hit costs a tree walk but no
     /// allocation. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
+    /// The rows of the zones where every row holds every code of a filter of
+    /// code equalities, keyed by filter shape as the envelopes are: also
+    /// statistics only, so a function of the filter (see [`EveryRowRanges`]).
+    every_row_ranges: EveryRowRanges,
     /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]),
     /// but for the code columns', which
     /// [`code_column_chunks`](Self::code_column_chunks) holds. Each handle
@@ -180,6 +184,29 @@ pub(crate) enum FileCounter {
     LocatedRidScans,
 }
 
+/// The rows of a file's zones where every row holds every code of a filter
+/// of code equalities, as ascending row ranges, keyed by the filter's
+/// expression (structural `Eq`/`Hash`): the file's statistics alone decide
+/// them, so a filter's are found once, by one pruning evaluation per
+/// equality over the whole file, and every later evaluation of it takes
+/// them from here. A shared handle, as the split tasks that read it outlive
+/// a borrow of the file. Bounded by [`PRUNING_MEMO_MAX`], cleared wholesale
+/// at the cap.
+#[derive(Clone)]
+pub(crate) struct EveryRowRanges(Arc<BoundedMemo<Expression, Arc<[Range<u64>]>>>);
+
+impl EveryRowRanges {
+    /// The memoized rows of `filter`, `None` on a miss.
+    pub(crate) fn get(&self, filter: &Expression) -> Option<Arc<[Range<u64>]>> {
+        self.0.get(filter)
+    }
+
+    /// Memoize `filter`'s rows.
+    pub(crate) fn insert(&self, filter: Expression, ranges: Arc<[Range<u64>]>) {
+        self.0.insert(filter, ranges);
+    }
+}
+
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`]: sized for a query
 /// workload's distinct filter shapes, not for arbitrary term churn.
 const PRUNING_MEMO_MAX: usize = 512;
@@ -256,6 +283,7 @@ impl NativeStoreFile {
             readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
+            every_row_ranges: EveryRowRanges(Arc::new(BoundedMemo::new(PRUNING_MEMO_MAX))),
             quad_chunks: ChunkMemo::default(),
             code_column_chunks: Default::default(),
             component_chunks: ChunkMemo::default(),
@@ -389,6 +417,12 @@ impl NativeStoreFile {
         envelope: Option<Range<u64>>,
     ) {
         self.pruning_envelopes.insert(filter, envelope);
+    }
+
+    /// The file's memo of every-row zone rows per filter shape, a handle
+    /// the split tasks keep.
+    pub(crate) fn every_row_ranges(&self) -> EveryRowRanges {
+        self.every_row_ranges.clone()
     }
 
     /// Whether the file records its quad rows in global `(s, p, o, g)` order.
