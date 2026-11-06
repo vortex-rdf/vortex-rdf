@@ -29,8 +29,8 @@ pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v2";
 /// What every store root layout id starts with, this version's and any other's.
 pub(crate) const STORE_LAYOUT_FAMILY: &str = "vortex-rdf.store.";
 /// The transparent quad table is always child 0.
-const QUAD_SOURCE_CHILD: usize = 0;
-const QUAD_SOURCE_NAME: &str = "quad-source";
+pub(crate) const QUAD_SOURCE_CHILD: usize = 0;
+pub(crate) const QUAD_SOURCE_NAME: &str = "quad-source";
 /// Component name of the term dictionary child.
 pub(crate) const DICT_COMPONENT_NAME: &str = "dictionary";
 /// Implementation slug of the dictionary child: the lexicographically sorted
