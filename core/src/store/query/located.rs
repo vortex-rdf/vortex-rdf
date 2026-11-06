@@ -211,9 +211,11 @@ impl VortexRdfStore {
     /// by row otherwise, when the run is no longer than [`GAP_ROWS`]. Failing that, a bound `p` or
     /// `o` is located in the reference index (`index:ref-p`, `index:ref-o`)
     /// and its rows read from the quad table in its order, the other bound
-    /// slots checked at them when its run is short enough; a bound subject's
-    /// run of a `quads_sorted` file is the rows checked instead when no
-    /// longer. A code past the dictionary, or one in a position no quad
+    /// slots checked at them when its run is no longer than [`GAP_ROWS`]; a
+    /// bound graph is checked on the reference child's own `g` where it holds
+    /// one, and when the graph is the run's only check the child's zone maps
+    /// decide it, at any length. A bound subject's run of a `quads_sorted`
+    /// file is the rows checked instead when no longer. A code past the dictionary, or one in a position no quad
     /// holds, matches nothing. Whether it answers depends on the store and
     /// `pattern` alone, never on the window, so every window of one pattern
     /// comes from the same table, in the same order. A run whose rows are
@@ -934,6 +936,8 @@ impl LocatedRun {
         let (source, session) = (&self.source, &self.session);
         let code = self.codes[GRAPH_SLOT].expect("a checked graph is bound");
         crate::observe::observe!(ReferenceGraphRead(at.end - at.start));
+        crate::observe::observe!(CheckRead(at.end - at.start));
+        note(counters::CHECK_READ, at.end - at.start);
         let rids = read_codes(rid, at.clone(), source, session).await?;
         let graphs = read_codes(graph, at, source, session).await?;
         Ok(rids

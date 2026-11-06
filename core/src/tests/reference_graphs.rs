@@ -74,8 +74,23 @@ async fn reference_children_hold_each_rows_graph() {
             }
         }
     }
-    let default_graph = rows[0][3];
-    assert!(rows.iter().any(|row| row[3] == default_graph));
+    // The default graph's code (its spelling is the empty one) is among the
+    // graphs the children hold.
+    let default_graph = store
+        .dict_reader()
+        .unwrap()
+        .encode("")
+        .await
+        .unwrap()
+        .unwrap();
+    for component in &components {
+        let graphs = &child_columns(component)[2].1;
+        assert!(
+            graphs.contains(&default_graph),
+            "{}",
+            component.identity.name
+        );
+    }
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let built = build_array::<SortedInMemoryBuilder>(
             quad_stream(three_graph_quads()),

@@ -893,7 +893,20 @@ async fn reference_runs_skip_settled_zones() {
         let recorded: u64 = zone_recorded(&rec).iter().sum();
         assert_eq!(read, 0, "{tag}: no checked row read");
         match graphs {
-            Graphs::Long => assert!(counted < RUN as u64, "{tag}: {counted} counted"),
+            Graphs::Long => {
+                assert!(counted < RUN as u64, "{tag}: {counted} counted");
+                // A stream reads the mixed zones' graphs to check them, and
+                // only those.
+                drop(rec);
+                let rec = Recorder::start();
+                let rows = streamed(store, pattern, 4096).await;
+                assert_eq!(rows.len() as u64, want, "{tag}: the stream's rows");
+                let read = zone_work(&rec).1;
+                assert!(
+                    read > 0 && read < RUN as u64,
+                    "{tag}: a stream read {read} rows"
+                );
+            }
             Graphs::Alternating => {
                 // The run is the child's last RUN positions.
                 let start = 2 * RUN as u64 - RUN as u64;
@@ -973,6 +986,57 @@ async fn reference_cap_only_where_zones_cannot_decide() {
     }
 }
 
+/// A reference child whose `g` has no zone maps (written in seven-row
+/// leaves, as a foreign writer might): a graph-bound reference run reads the
+/// child's `g` row by row and answers as its rows say, and `GAP_ROWS` caps
+/// it as before, for zones cannot decide it.
+#[tokio::test]
+async fn reference_runs_without_zone_maps_check_rows() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
+
+    let _on = ForcedZones::set(true);
+    let (_dir, path) =
+        write_chunked_reference_store_file(&zone_quads(Graphs::Alternating), 7).await;
+    let store = &VortexRdfStore::from_file(&path).await.unwrap();
+    let rows = row_list(store).await;
+    let ty = code_of(store, "<http://example.org/type>").await;
+    let g1 = code_of(store, "<http://example.org/g1>").await;
+    let pattern = CodePattern::new(None, Some(ty), None, Some(g1));
+    let want = rows
+        .iter()
+        .filter(|row| row[1] == ty && row[3] == g1)
+        .count() as u64;
+    let rec = Recorder::start();
+    assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
+    let (own, taken) = reference_graph_reads(&rec);
+    assert_eq!((own, taken), (RUN as u64, 0), "the child's g, row by row");
+    assert!(
+        zone_recorded(&rec).is_empty(),
+        "no zone counted from a record"
+    );
+    drop(rec);
+    let mut got = code_rows::<4>(&store.match_code_pattern(pattern, 0, None).await.unwrap());
+    let mut expected: Vec<[TermCode; 4]> = rows
+        .iter()
+        .filter(|row| row[1] == ty && row[3] == g1)
+        .copied()
+        .collect();
+    got.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(got, expected, "the rows");
+    let _cap = ForcedGapRows::set(1_000);
+    assert!(
+        store
+            .locate_codes(pattern, 0, Some(0))
+            .await
+            .unwrap()
+            .is_none(),
+        "capped: zones cannot decide it"
+    );
+    assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
+}
+
 /// A by-reference run asks its file's statistics only when a read needs
 /// them: on alternating graphs a 64-row first page is read from the run's
 /// first block and asks none; a later page and a count ask them. Every page
@@ -1036,9 +1100,13 @@ async fn footer_settles_a_whole_file() {
     for fixture in zone_stores().await {
         let store = &fixture.store;
         let patterns = zone_patterns(store, 1).await;
+        // The copy index's posg run; on a reference store `index:ref-p`'s
+        // `type` run, checked against the graph alone; else the quad
+        // table's (hub, link) run.
         let located = match fixture.index {
             IndexConfig::Copy => patterns[0],
-            _ => patterns[1],
+            IndexConfig::Reference => patterns[4],
+            IndexConfig::NoIndex => patterns[1],
         };
         let ty = code_of(store, "<http://example.org/type>").await;
         let held_by_none = CodePattern {

@@ -281,7 +281,7 @@ own sorted runs:
 
 | Family | Spilled entry | Run files |
 |---|---|---|
-| `index:ref-o` / `index:ref-p` | `(rank, row id)` | `idx_o_run_N.bin`, `idx_p_run_N.bin` |
+| `index:ref-o` / `index:ref-p` | `(value rank, row id, graph rank)` | `idx_o_run_N.bin`, `idx_p_run_N.bin` |
 | `index:posg` / `index:ospg` | `(four ranks in the family's key order, row id)` | `idx_posg_run_N.bin`, `idx_ospg_run_N.bin` |
 
 The primary chunks then come off a second merge of the same quad runs, while
@@ -385,7 +385,7 @@ in a file as an auxiliary child.
 | Index | Children | Columns | Sorted by |
 |---|---|---|---|
 | `secondary-by-copy` | `index:posg`, `index:ospg` | `s`, `p`, `o`, `g`, `rid` | `(p, o, s, g)` and `(o, s, p, g)` |
-| `secondary-by-reference` | `index:ref-o`, `index:ref-p` | `val`, `rid` | `val`, then `rid` |
+| `secondary-by-reference` | `index:ref-o`, `index:ref-p` | `val`, `rid`; `g` under `Dictionary` | `val`, then `rid` |
 
 Term columns use the layout's encoding — strings under `Default` and
 `TypedObject` (a `TypedObject` object is recomposed to its full N-Triples term

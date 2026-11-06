@@ -28,7 +28,7 @@ and `from_file` read one grammar.
 │   │ index:ospg   {s, p, o, g, rid}   sorted (o, s, p, g)   │ │  secondary-by-copy
 │   ├────────────────────────────────────────────────────────┤ │
 │   │ index:ref-o  {val, rid, g}       sorted by val         │ │  only if built with
-│   │ index:ref-p  {val, rid, g}       sorted by val         │ │  secondary-by-reference
+│   │ index:ref-p  {val, rid, g}       g: Dictionary only    │ │  secondary-by-reference
 │   ├────────────────────────────────────────────────────────┤ │
 │   │ dictionary   {_dict_term}  one FSST window per leaf    │ │  Dictionary layout only
 │   └────────────────────────────────────────────────────────┘ │
@@ -116,9 +116,11 @@ newer vortex-rdf and is refused as such, with an error saying to open it with a
 newer version; a dictionary or index component whose version is above the one
 this version reads ([`DICT_VERSION`](../core/src/io/container/mod.rs#L47),
 [`INDEX_VERSION`](../core/src/io/container/mod.rs#L51)) is refused the same
-way. Readers rely on two guarantees of the `v2` writers that nothing checks at
-open: each quad is stored once, and a reference index's children are in
-`(val, rid)` order ([§10](#10-what-a-file-must-satisfy)).
+way. Readers rely on three guarantees of the `v2` writers that nothing checks
+at open: each quad is stored once, a reference index's children are in
+`(val, rid)` order, and a reference child's `g`, where it has one, holds at
+each row the graph of the quad its `rid` names
+([§10](#10-what-a-file-must-satisfy)).
 
 ```mermaid
 flowchart TD
@@ -643,9 +645,9 @@ checks:
 2. The inventory is JSON with `version: 1`; component names are unique and
    never `quad-source`; field kinds are `u32`, `u64` or `utf8`, all
    non-nullable. Under `Dictionary` every code column — `s`, `p`, `o`, `g`
-   of the quad table and of the copy children, `val` of the reference
-   children — is `u64`, and under every layout so is each index child's
-   `rid`.
+   of the quad table and of the copy children, `val` and `g` of the
+   reference children — is `u64`, and under every layout so is each index
+   child's `rid`.
 3. Terms are spelled in N-Triples form; the default graph is the empty string
    — in the quad columns, the dictionary and the index children alike.
 4. `quads_sorted: true` only when the rows are in global `(s, p, o, g)` order
@@ -660,7 +662,10 @@ checks:
 7. Index children hold exactly one row per quad, `rid` addressing quad-table
    rows; unknown index slugs must be `required: false`.
 8. The quad table holds each quad once, and a reference index's children are
-   in `(val, rid)` order. Readers count and window by them without checking.
+   in `(val, rid)` order. A reference child may omit `g`; where it holds one
+   (under `Dictionary`), its value at each row is the `g` of the quad-table
+   row its `rid` names. Readers count and window by these without checking:
+   a wrong `g` gives a graph-bound by-reference match wrong rows.
 9. Every `utf8` column holds valid UTF-8, and an FSST term chunk's 32-bit
    code offsets are non-negative: readers take stored terms as UTF-8 and those
    offsets as written, unchecked, so a store file is trusted input, and a
