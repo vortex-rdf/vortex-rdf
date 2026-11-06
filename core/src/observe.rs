@@ -148,6 +148,11 @@ pub(crate) enum Event {
     /// A located run's mixed zone of this many rows counted from the checked
     /// column's recorded values, unread.
     ZoneRecorded(u64),
+    /// A reference run read its child's own `g` at this many positions.
+    ReferenceGraphRead(u64),
+    /// A located run read slot `slot` of the quad table at this many
+    /// scattered rows, to check them.
+    CheckTaken { slot: usize, rows: u64 },
     /// A located run's rows read at a checked column to check them, this
     /// many rows.
     CheckRead(u64),

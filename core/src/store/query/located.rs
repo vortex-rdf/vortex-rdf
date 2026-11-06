@@ -299,6 +299,7 @@ impl VortexRdfStore {
                         file.component_column_chunks(name, "rid")?,
                     ])
                 }),
+                REFERENCES.map(|(name, _)| file.component_column_chunks(name, "g")),
             )
         });
         let run = |columns: Columns, rows, checked| LocatedRun {
@@ -547,6 +548,10 @@ enum RunRows {
         rid: Chunks,
         run: std::ops::Range<u64>,
         other: Option<OtherReference>,
+        /// The reference child's own `g`, when the graph is checked and the
+        /// child holds each row's graph: the check reads it at the run's
+        /// positions, contiguous, instead of the quad table at its rows.
+        graph: Option<Chunks>,
     },
 }
 
@@ -650,12 +655,35 @@ impl LocatedRun {
                 }
                 Ok(Rows::Ids(kept))
             }
-            RunRows::Reference { rid, run, other } => {
+            RunRows::Reference {
+                rid,
+                run,
+                other,
+                graph,
+            } => {
                 let rows = run.start + at.start..run.start + at.end;
-                let mut kept = read_codes(rid, rows, source, session).await?.to_vec();
+                let mut kept = read_codes(rid, rows.clone(), source, session)
+                    .await?
+                    .to_vec();
+                // The child's own graphs check the graph first, on the
+                // block's own contiguous rows.
+                let graph_code = self.codes[GRAPH_SLOT];
+                if let (Some(graph), Some(code)) = (graph, graph_code) {
+                    crate::observe::observe!(ReferenceGraphRead(rows.end - rows.start));
+                    let graphs = read_codes(graph, rows, source, session).await?;
+                    kept = kept
+                        .into_iter()
+                        .zip(graphs.iter())
+                        .filter(|&(_, &g)| g == code)
+                        .map(|(row, _)| row)
+                        .collect();
+                }
                 for &slot in &self.checked {
                     if kept.is_empty() {
                         break;
+                    }
+                    if slot == GRAPH_SLOT && graph.is_some() {
+                        continue;
                     }
                     // A slot with a located reference run keeps the rows that
                     // run lists too: both lists ascend, so each row is
@@ -822,6 +850,10 @@ impl LocatedRun {
     /// Of `rows` (ascending), those holding the checked `slot`'s code, read
     /// at them.
     async fn holding(&self, slot: usize, rows: Vec<u64>) -> Result<Vec<u64>> {
+        crate::observe::observe!(CheckTaken {
+            slot,
+            rows: rows.len() as u64
+        });
         let code = self.codes[slot].expect("a checked slot is bound");
         let values = take_codes(&self.columns[slot], &rows, &self.source, &self.session).await?;
         Ok(rows
@@ -986,6 +1018,10 @@ impl LocatedRun {
 #[cfg(feature = "file-io")]
 const REFERENCES: [(&str, usize); 2] = [("index:ref-p", 1), ("index:ref-o", 2)];
 
+/// The graph's slot in `(s, p, o, g)`.
+#[cfg(feature = "file-io")]
+const GRAPH_SLOT: usize = 3;
+
 /// Rows of a bound subject's run of a subject-sorted quad table up to which
 /// a lookup through a reference index checks the other bound slots at the
 /// subject's rows, when they are no more than the reference run's; a longer
@@ -1074,6 +1110,7 @@ async fn by_reference(
                 rid: rid.clone(),
                 run,
                 other,
+                graph: codes[GRAPH_SLOT].and(tables.reference_graphs[index].clone()),
             }
         }
         None => return Ok(None),

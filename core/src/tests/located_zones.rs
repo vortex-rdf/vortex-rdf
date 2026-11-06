@@ -120,11 +120,11 @@ async fn column_zones_read_recorded_counts() {
 }
 
 /// Rows of each run of a [`zone_quads`] store.
-const RUN: usize = 40_000;
+pub(super) const RUN: usize = 40_000;
 
 /// How a run's rows fall into graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Graphs {
+pub(super) enum Graphs {
     /// One graph only.
     One,
     /// Two graphs, each a half of the run.
@@ -186,7 +186,7 @@ impl Graphs {
 
 /// [`RUN`] quads `(s{i}, type, "Taxon", g(i))`, an `index:posg` run, and
 /// [`RUN`] quads `(hub, link, "o{i}", g(i))`, a quad-table run of `hub`.
-fn zone_quads(graphs: Graphs) -> Vec<Quad> {
+pub(super) fn zone_quads(graphs: Graphs) -> Vec<Quad> {
     let taxa = (0..RUN).map(|i| {
         make_quad(
             &format!("http://example.org/s{i:05}"),

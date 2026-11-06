@@ -236,3 +236,128 @@ async fn stream_written_children_follow_the_hook() {
         }
     }
 }
+
+/// What a pattern answers: its count, pages at its ends and middle, and its
+/// stream in chunks of 999 rows, every row in order.
+async fn reads(
+    store: &VortexRdfStore,
+    pattern: crate::CodePattern,
+) -> (u64, Vec<Vec<[TermCode; 4]>>, Vec<[TermCode; 4]>) {
+    let total = store.count_code_pattern(pattern).await.unwrap();
+    let t = total as usize;
+    let mut pages = Vec::new();
+    for limit in [1, 64] {
+        for offset in [0, 1, t / 2, t.saturating_sub(1)] {
+            let columns = store
+                .match_code_pattern(pattern, offset, Some(limit))
+                .await
+                .unwrap();
+            pages.push(code_rows::<4>(&columns));
+        }
+    }
+    let chunks: Vec<Vec<vortex_buffer::Buffer<TermCode>>> = store
+        .match_code_chunks(pattern, 999)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let stream = chunks
+        .iter()
+        .flat_map(|chunk| code_rows::<4>(chunk))
+        .collect();
+    (total, pages, stream)
+}
+
+/// A by-reference run checked against the graph reads its child's own `g`
+/// rows, contiguous, and never the quad table's `g` at its scattered rows:
+/// `(? type ? g1)`, `(? ? Taxon g1)` and `(? type Taxon g1)` on alternating
+/// graphs. A store written without the child `g`, as before it, reads the
+/// quad table's; both answer every read alike, as their rows say.
+#[tokio::test]
+async fn reference_runs_read_their_own_graphs() {
+    use super::located_zones::{Graphs, RUN, zone_quads};
+    use crate::CodePattern;
+
+    let mut answers = Vec::new();
+    for graphs in [true, false] {
+        let (_dir, path) = {
+            let _hook = ForcedReferenceGraphs::set(graphs);
+            write_store_file(
+                zone_quads(Graphs::Alternating),
+                LayoutStrategy::Dictionary,
+                IndexConfig::Reference.types(),
+            )
+            .await
+        };
+        let store = &VortexRdfStore::from_file(&path).await.unwrap();
+        let dict = store.dict_reader().unwrap();
+        let code = |term: &'static str| {
+            let dict = dict.clone();
+            async move { dict.encode(term).await.unwrap().unwrap() }
+        };
+        let (ty, taxon, g1) = (
+            code("<http://example.org/type>").await,
+            code("\"Taxon\"").await,
+            code("<http://example.org/g1>").await,
+        );
+        let rows = row_list(store).await;
+        let mut store_answers = Vec::new();
+        for pattern in [
+            CodePattern::new(None, Some(ty), None, Some(g1)),
+            CodePattern::new(None, None, Some(taxon), Some(g1)),
+            CodePattern::new(None, Some(ty), Some(taxon), Some(g1)),
+        ] {
+            let tag = format!("graphs {graphs} {pattern:?}");
+            let slots = [
+                pattern.subject,
+                pattern.predicate,
+                pattern.object,
+                pattern.graph,
+            ];
+            let want = rows
+                .iter()
+                .filter(|row| (0..4).all(|i| slots[i].is_none_or(|code| row[i] == code)))
+                .count() as u64;
+            assert!(
+                store
+                    .locate_codes(pattern, 0, Some(0))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{tag}"
+            );
+            let rec = Recorder::start();
+            assert_eq!(
+                store.count_code_pattern(pattern).await.unwrap(),
+                want,
+                "{tag}"
+            );
+            let taken: u64 = rec
+                .picked(|e| match e {
+                    Event::CheckTaken { slot: 3, rows } => Some(*rows),
+                    _ => None,
+                })
+                .iter()
+                .sum();
+            let own: u64 = rec
+                .picked(|e| match e {
+                    Event::ReferenceGraphRead(rows) => Some(*rows),
+                    _ => None,
+                })
+                .iter()
+                .sum();
+            match graphs {
+                true => assert_eq!((taken, own), (0, RUN as u64), "{tag}: the child's g"),
+                false => assert!(taken > 0 && own == 0, "{tag}: the quad table's g"),
+            }
+            drop(rec);
+            store_answers.push(reads(store, pattern).await);
+        }
+        answers.push(store_answers);
+    }
+    assert!(
+        answers[0] == answers[1],
+        "the child's g and the quad table's answer alike"
+    );
+}
