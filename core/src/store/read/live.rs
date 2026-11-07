@@ -68,7 +68,8 @@ impl<T: Copy> WindowCursor<T> {
     }
 
     /// Whether the walk has reached the window's first match, after which
-    /// every part is read.
+    /// every part is read (a file's located window asks it).
+    #[cfg(feature = "file-io")]
     pub(crate) fn started(&self) -> bool {
         self.seen >= self.offset
     }

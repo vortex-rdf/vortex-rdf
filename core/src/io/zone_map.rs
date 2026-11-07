@@ -331,6 +331,7 @@ pub(crate) fn eq_on_bounds(min: u64, max: u64, code: u64) -> Option<bool> {
 /// The footer's exact `(min, max)` of `file`'s top-level `u64` column
 /// `column` (a store file's quad table: its footer statistics); `None`
 /// when the file keeps no exact bounds for it.
+#[cfg(feature = "file-io")]
 pub(crate) fn footer_bounds(file: &vortex_file::VortexFile, column: &str) -> Option<(u64, u64)> {
     use vortex_array::expr::stats::Stat;
 
