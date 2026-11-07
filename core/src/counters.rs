@@ -40,7 +40,10 @@ sites! {
     ZONE_ALL = "zone_all",
     /// A located run's mixed zone counted on the checked column's encoding.
     ZONE_COUNTED = "zone_counted",
-    /// A located run's rows read at checked columns to check them.
+    /// A located run's rows read at its checked columns to check them: its
+    /// span at the first check, the rows kept so far at each later one, and
+    /// a reference run's rows at the quad table. A by-id check answered by
+    /// searching the other reference's row ids reads none of them.
     CHECK_READ = "check_read",
     /// A located run's mixed zone counted from the checked column's recorded
     /// values (`vortexrdf.value_counts`), unread.

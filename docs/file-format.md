@@ -86,8 +86,11 @@ The writer is limited to three editions:
 - the value-counts edition `vortexrdf2026.11.0` ([`VALUE_COUNTS_EDITION`](../core/src/session.rs#L92)), whose one member is the graph columns' zone aggregate `vortexrdf.value_counts` (§3).
 
 A file of the value-counts edition needs a reader that registers the
-aggregate: vortex-rdf 0.14 and earlier refuse it, naming
-`vortexrdf.value_counts`. Files written before it keep reading; their graph
+aggregate. vortex-rdf 0.14 and earlier refuse it, naming
+`vortexrdf.value_counts`, when they load it into memory (`from_bytes`,
+`from_file_in_memory`); a mapped open (`from_file`, Java `open(path)`)
+succeeds, and fails at the first read that prunes by a graph column's zones,
+such as a pattern with a bound graph. Files written before it keep reading; their graph
 columns lack the statistic, and readers skip what it would decide. A store
 whose every graph zone holds more than 16 graphs records no value counts, so
 0.14 reads it too. The
@@ -260,7 +263,7 @@ What the store reads from this structure:
   checks, taken only as the store writes them: as many counts as graphs, the
   graphs strictly ascending, the counts summing to the block's rows. A block
   whose record is otherwise is read as recording none
-  ([`decode_states`](../core/src/zone_stats/zone_map.rs#L367));
+  ([`decode_states`](../core/src/zone_stats/zone_map.rs#L368));
 - the **chunk leaves** of the `u64` code and row-id columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
@@ -702,7 +705,14 @@ checks:
    (under `Dictionary`), its value at each row is the `g` of the quad-table
    row its `rid` names. Readers count and window by these without checking:
    a wrong `g` gives a graph-bound by-reference match wrong rows.
-9. Every `utf8` column holds valid UTF-8, and an FSST term chunk's 32-bit
+9. On a graph column (the quad table's `g`, a reference child's `g`), each
+   zone's `vortexrdf.value_counts` record lists every value the zone holds
+   with its rows: values strictly ascending, each count above zero, the
+   counts summing to the zone's rows, at most 16 values, and null past them.
+   The general match's pruning trusts the values as written (a zone whose
+   list lacks a code is skipped); located runs and the in-memory residual
+   also check the rest, and leave a record they reject to the zone's bounds.
+10. Every `utf8` column holds valid UTF-8, and an FSST term chunk's 32-bit
    code offsets are non-negative: readers take stored terms as UTF-8 and those
    offsets as written, unchecked, so a store file is trusted input, and a
    corrupt or crafted one is outside this contract.

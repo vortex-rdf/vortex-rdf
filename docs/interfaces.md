@@ -282,7 +282,9 @@ decisions, not the general match's or the residual compare's: the slots the
 footer settles (`zone_column`), the zones settled none and all (`zone_none`,
 `zone_all`), the mixed zones counted from their recorded graphs
 (`zone_recorded`) or on their encoding (`zone_counted`) and the rows read to
-check (`check_read`), each with its rows.
+check (`check_read`: a run's span at its first check, the rows kept so far at
+each later one, and a reference run's rows at the quad table), each with its
+rows.
 
 `locate_codes(CodePattern, offset, limit)` is the located run alone: it
 answers only a whole file-backed Dictionary store (no tail, tombstones or

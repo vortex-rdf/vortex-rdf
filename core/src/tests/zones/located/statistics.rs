@@ -247,6 +247,40 @@ async fn gap_cap_only_where_zones_cannot_decide() {
     }
 }
 
+/// With `VORTEX_RDF_COUNTERS=1`, `check_read` counts every row a located
+/// run reads to check it: its span at the first check and the rows it kept
+/// at each later one (a no-op without the variable). `hub`'s run checked
+/// row by row at `o`, then at `g` on the one row `o` keeps.
+#[tokio::test]
+async fn check_reads_count_every_checked_row() {
+    use crate::counters::{CHECK_READ, snapshot};
+    use crate::observe::{Event, Recorder};
+    use crate::store::test_hooks::ForcedZones;
+    use vortex_rdf_encoded_search::counters::on;
+
+    if !on() || !locate_enabled() {
+        return;
+    }
+    let _off = ForcedZones::set(false);
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Long, IndexConfig::NoIndex)).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let pattern = zone_patterns(&store, 1).await[2];
+    let rec = Recorder::start();
+    let before = snapshot();
+    store.count_code_pattern(pattern).await.unwrap();
+    let counted = snapshot()[CHECK_READ + 1] - before[CHECK_READ + 1];
+    let read: u64 = rec.rows(|e| match e {
+        Event::CheckRead(n) => Some(*n),
+        Event::CheckTaken { rows, .. } => Some(*rows),
+        _ => None,
+    });
+    assert!(
+        rec.rows(|e| matches!(e, Event::CheckTaken { .. }).then_some(1u64)) > 0,
+        "a later check reads"
+    );
+    assert!(counted >= read, "{counted} counted of {read} read");
+}
+
 /// With `VORTEX_RDF_COUNTERS=1`, a zoned count is counted where it settles
 /// zones and counts mixed ones (a no-op without the variable).
 #[tokio::test]
