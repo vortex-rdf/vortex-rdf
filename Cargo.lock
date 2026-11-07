@@ -3607,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "bench-memory-stats",
  "console_error_panic_hook",
@@ -3623,7 +3623,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-cli"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3636,7 +3636,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -3678,7 +3678,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-encoded-search"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "codspeed-divan-compat",
  "fastlanes 0.7.2",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-java"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "futures",
  "jni",
@@ -3714,7 +3714,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-python"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "futures",
  "libc",
