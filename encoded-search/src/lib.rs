@@ -1,11 +1,13 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
+mod bitpacked;
 mod delta;
 mod node;
 mod owned;
 mod resolve;
 mod search;
+mod words;
 
 pub use owned::OwnedSortedProbe;
 
