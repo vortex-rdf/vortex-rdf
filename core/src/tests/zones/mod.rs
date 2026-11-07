@@ -9,10 +9,12 @@
 //! The layer: the zone-quads stores ([`Graphs`], [`zone_quads`],
 //! [`zone_stores`]) and their files, each [`ZoneFile`] written once per
 //! process ([`zone_file`]); the codes and rows their reads answer
-//! ([`code_of`], [`streamed`], [`term_rows`], [`probe_answers`]); the stores
-//! a residual reads under tombstones and with a tail ([`tombstoned`],
-//! [`tailed`]); and what a recorder saw of their zones ([`zone_work`],
-//! [`zone_recorded`], [`zone_maps_read`], [`statistics_asked`]).
+//! ([`code_of`], [`streamed`], [`term_rows`], [`code_answers`],
+//! [`probe_answers`]); the stores a residual reads under tombstones and with
+//! a tail ([`tombstoned`], [`tailed`]); the harness that reads zones off,
+//! then on, and holds the answers equal ([`zones_agree`]); and what a
+//! recorder saw of their zones ([`zone_work`], [`zone_recorded`],
+//! [`zone_maps_read`], [`statistics_asked`]).
 
 use super::*;
 use crate::zone_stats::zone_map::ZONE_ROWS;
@@ -417,6 +419,33 @@ fn statistics_asked(rec: &Recorder) -> usize {
     rec.count(&Event::StatisticsAsked)
 }
 
+/// What `read` answers with zones on, with the recorder of that read, once
+/// it answered the same with zones off: a read that zones decide answers as
+/// the rows do. Each read runs under its own [`ForcedZones`] guard, and the
+/// recorder starts just before the zones-on read, so until the caller reads
+/// again it holds that read's events alone. A difference fails as `what`'s,
+/// without the answers, which may hold tens of thousands of rows.
+///
+/// [`ForcedZones`]: crate::store::test_hooks::ForcedZones
+async fn zones_agree<T, F, Fut>(what: &str, read: F) -> (T, Recorder)
+where
+    T: PartialEq,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    use crate::store::test_hooks::ForcedZones;
+
+    let off = {
+        let _zones = ForcedZones::set(false);
+        read().await
+    };
+    let _zones = ForcedZones::set(true);
+    let rec = Recorder::start();
+    let on = read().await;
+    assert!(on == off, "{what}: zones on and off answer apart");
+    (on, rec)
+}
+
 /// Every [`Graphs`] layout.
 const ZONE_GRAPHS: [Graphs; 8] = [
     Graphs::One,
@@ -428,6 +457,66 @@ const ZONE_GRAPHS: [Graphs; 8] = [
     Graphs::DefaultAndThree,
     Graphs::RecordedByTurns,
 ];
+
+/// What a located pattern answers: its count, its pages again through
+/// `locate_codes` with the run's count beside each, its windows, and its
+/// streams, every row in order.
+#[derive(Debug, PartialEq, Eq)]
+struct CodeAnswers {
+    count: u64,
+    located: Vec<(u64, Vec<[TermCode; 4]>)>,
+    windows: Vec<Vec<[TermCode; 4]>>,
+    streams: Vec<Vec<[TermCode; 4]>>,
+}
+
+/// What `pattern` answers on `store`: its count, its windows (pages of 1,
+/// 3 and 64 at the run's ends and middle, and 32 one-row reads spread over
+/// it), its streams (chunks of 999 and 4,096 rows), and the pages again
+/// through `locate_codes`, each with the run's count beside it, which must
+/// be the count.
+async fn code_answers(store: &VortexRdfStore, pattern: crate::CodePattern) -> CodeAnswers {
+    let total = store.count_code_pattern(pattern).await.unwrap();
+    if let Some(located) = store.locate_codes(pattern, 0, Some(0)).await.unwrap() {
+        assert_eq!(located.total, total, "{pattern:?}: the located count");
+    }
+    let t = total as usize;
+    let mut reads: Vec<(usize, usize)> = Vec::new();
+    for limit in [1, 3, 64] {
+        for offset in [0, 1, t / 2, t.saturating_sub(1), t] {
+            reads.push((offset, limit));
+        }
+    }
+    let mut located = Vec::new();
+    for &(offset, limit) in &reads {
+        if let Some(found) = store
+            .locate_codes(pattern, offset, Some(limit))
+            .await
+            .unwrap()
+        {
+            assert_eq!(found.total, total, "{pattern:?}: a located page's count");
+            located.push((found.total, code_rows::<4>(&found.columns)));
+        }
+    }
+    reads.extend((0..32).map(|k| (k * t / 32, 1)));
+    let mut windows = Vec::new();
+    for (offset, limit) in reads {
+        let columns = store
+            .match_code_pattern(pattern, offset, Some(limit))
+            .await
+            .unwrap();
+        windows.push(code_rows::<4>(&columns));
+    }
+    let mut streams = Vec::new();
+    for batch in [999, 4096] {
+        streams.push(streamed(store, pattern, batch).await);
+    }
+    CodeAnswers {
+        count: total,
+        located,
+        windows,
+        streams,
+    }
+}
 
 /// What a read of `probe` answers on `store`: its count, a count capped
 /// from its middle, its windows from its first, middle and last row, one
@@ -583,4 +672,14 @@ async fn zone_files_are_written_once_per_key() {
     }
     assert_eq!(counts[0], counts[1], "the cached file and a fresh write");
     assert_eq!(counts[0], RUN as u64 / 2, "graph 1 holds half the run");
+}
+
+/// A read whose answer turns on the zones switch fails the harness.
+#[tokio::test]
+#[should_panic(expected = "zones on and off")]
+async fn zones_agree_catches_a_read_that_differs() {
+    zones_agree("the switch", || async {
+        crate::zone_stats::rules::zones_enabled()
+    })
+    .await;
 }

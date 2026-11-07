@@ -33,15 +33,7 @@ fn probes() -> Vec<(String, Probe)> {
 /// `store`'s answers to every probe, with zones on and off, equal.
 async fn assert_zones_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
     for (shape, probe) in probes() {
-        let off = {
-            let _zones = ForcedZones::set(false);
-            probe_answers(store, &probe).await
-        };
-        let on = {
-            let _zones = ForcedZones::set(true);
-            probe_answers(store, &probe).await
-        };
-        assert_eq!(on, off, "{tag} {shape}");
+        zones_agree(&format!("{tag} {shape}"), || probe_answers(store, &probe)).await;
     }
 }
 
@@ -83,33 +75,30 @@ async fn residual_zones_answer_as_rows_do() {
 async fn all_zones_are_taken_uncompared() {
     let store = built_store(zone_quads(Graphs::Long), LayoutStrategy::Dictionary, vec![]).await;
     let g1 = iri_graph("g1");
-    let read = |on: bool| {
-        let (store, g1) = (&store, &g1);
-        async move {
-            let _zones = ForcedZones::set(on);
-            let rec = Recorder::start();
-            let view = store
-                .match_pattern(None, None, None, Some(g1))
-                .await
-                .unwrap();
-            let rows = row_list(&view).await;
-            let sum = |taken: bool| -> u64 {
-                rec.rows(|e| match (e, taken) {
-                    (Event::ResidualZoneTaken(rows), true)
-                    | (Event::ResidualCompared(rows), false) => Some(*rows),
-                    _ => None,
-                })
-            };
-            (rows, sum(true), sum(false))
-        }
+    let read = || async {
+        let view = store
+            .match_pattern(None, None, None, Some(&g1))
+            .await
+            .unwrap();
+        row_list(&view).await
     };
-    let (on, taken, compared) = read(true).await;
-    let (off, _, _) = read(false).await;
-    assert_eq!(on.len(), RUN, "graph 1's rows");
-    assert_eq!(on, off, "the rows and their order, as with zones off");
-    assert_eq!(taken, 4 * ZONE_ROWS as u64, "the zones of graph 1 alone");
+    let (rows, rec) = zones_agree("the rows and their order", read).await;
+    assert_eq!(rows.len(), RUN, "graph 1's rows");
+    let sum = |taken: bool| -> u64 {
+        rec.rows(|e| match (e, taken) {
+            (Event::ResidualZoneTaken(rows), true) | (Event::ResidualCompared(rows), false) => {
+                Some(*rows)
+            }
+            _ => None,
+        })
+    };
     assert_eq!(
-        compared,
+        sum(true),
+        4 * ZONE_ROWS as u64,
+        "the zones of graph 1 alone"
+    );
+    assert_eq!(
+        sum(false),
         3 * ZONE_ROWS as u64,
         "the zones where the graphs meet"
     );
@@ -122,36 +111,32 @@ async fn a_pending_residual_classes_once() {
     let store = built_store(zone_quads(Graphs::Long), LayoutStrategy::Dictionary, vec![]).await;
     let g1 = code_of(&store, "<http://example.org/g1>").await;
     let pattern = crate::CodePattern::new(None, None, None, Some(g1));
-    let window = |on: bool| {
-        let store = &store;
-        async move {
-            let _zones = ForcedZones::set(on);
-            let rec = Recorder::start();
-            let rows = code_rows::<4>(
-                &store
-                    .match_code_pattern(pattern, 30_000, Some(64))
-                    .await
-                    .unwrap(),
-            );
-            let (taken, recorded, counted, compared) = zone_rows_seen(&rec);
-            (
-                rows,
-                rec.count_where(|e| matches!(e, Event::ZonesClassed(_))),
-                taken + recorded + counted + compared,
-                rec.count(&Event::ResidualDeferred),
-            )
-        }
+    let window = || async {
+        code_rows::<4>(
+            &store
+                .match_code_pattern(pattern, 30_000, Some(64))
+                .await
+                .unwrap(),
+        )
     };
-    let (on, classed, zone_rows, deferred) = window(true).await;
-    let (off, ..) = window(false).await;
-    assert_eq!(on.len(), 64);
-    assert_eq!(on, off, "the window, as with zones off");
-    assert_eq!(deferred, 1, "a deferred residual");
+    let (rows, rec) = zones_agree("the window", window).await;
+    assert_eq!(rows.len(), 64);
+    assert_eq!(
+        rec.count(&Event::ResidualDeferred),
+        1,
+        "a deferred residual"
+    );
+    let (taken, recorded, counted, compared) = zone_rows_seen(&rec);
+    let zone_rows = taken + recorded + counted + compared;
     assert!(
         zone_rows > 2 * ZONE_ROWS as u64,
         "{zone_rows} rows of zones counted or read"
     );
-    assert_eq!(classed, 1, "its zones classed once");
+    assert_eq!(
+        rec.count_where(|e| matches!(e, Event::ZonesClassed(_))),
+        1,
+        "its zones classed once"
+    );
 }
 
 /// The rows a recorder saw counted each way: `(taken, recorded, counted,
@@ -274,19 +259,10 @@ async fn residual_counts_respect_tombstones() {
     }
     let code = code_of(&store, "<http://example.org/g1>").await;
     let pattern = crate::CodePattern::new(None, None, None, Some(code));
-    let count = |on: bool| {
-        let deleted = &deleted;
-        async move {
-            let _zones = ForcedZones::set(on);
-            let rec = Recorder::start();
-            let n = deleted.count_code_pattern(pattern).await.unwrap();
-            (n, zone_rows_seen(&rec))
-        }
-    };
-    let (on, (taken, recorded, _, compared)) = count(true).await;
-    let (off, _) = count(false).await;
-    assert_eq!(on, (RUN - 2) as u64, "graph 1's rows, two deleted");
-    assert_eq!(on, off, "as with zones off");
+    let count = || async { deleted.count_code_pattern(pattern).await.unwrap() };
+    let (count, rec) = zones_agree("the count", count).await;
+    assert_eq!(count, (RUN - 2) as u64, "graph 1's rows, two deleted");
+    let (taken, recorded, _, compared) = zone_rows_seen(&rec);
     assert_eq!(
         compared, ZONE_ROWS as u64,
         "the mixed zone with tombstones compared"
@@ -325,24 +301,17 @@ async fn residual_windows_jump_by_zone_counts() {
     .await;
     let g1 = code_of(&store, "<http://example.org/g1>").await;
     let pattern = crate::CodePattern::new(None, None, None, Some(g1));
-    let window = |on: bool| {
-        let store = &store;
-        async move {
-            let _zones = ForcedZones::set(on);
-            let rec = Recorder::start();
-            let rows = code_rows::<4>(
-                &store
-                    .match_code_pattern(pattern, 10_000, Some(64))
-                    .await
-                    .unwrap(),
-            );
-            (rows, zone_rows_seen(&rec))
-        }
+    let window = || async {
+        code_rows::<4>(
+            &store
+                .match_code_pattern(pattern, 10_000, Some(64))
+                .await
+                .unwrap(),
+        )
     };
-    let (on, (_, recorded, _, compared)) = window(true).await;
-    let (off, _) = window(false).await;
-    assert_eq!(on.len(), 64);
-    assert_eq!(on, off, "the window, as with zones off");
+    let (rows, rec) = zones_agree("the window", window).await;
+    assert_eq!(rows.len(), 64);
+    let (_, recorded, _, compared) = zone_rows_seen(&rec);
     assert!(
         compared <= 2 * ZONE_ROWS as u64,
         "{compared} rows compared, at most the two zones the window spans"

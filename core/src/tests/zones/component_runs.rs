@@ -64,15 +64,7 @@ fn component_probes() -> Vec<(String, Probe)> {
 /// `store`'s answers to every index-run probe, with zones on and off, equal.
 async fn assert_runs_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
     for (shape, probe) in component_probes() {
-        let off = {
-            let _zones = ForcedZones::set(false);
-            probe_answers(store, &probe).await
-        };
-        let on = {
-            let _zones = ForcedZones::set(true);
-            probe_answers(store, &probe).await
-        };
-        assert_eq!(on, off, "{tag} {shape}");
+        zones_agree(&format!("{tag} {shape}"), || probe_answers(store, &probe)).await;
     }
 }
 
@@ -191,15 +183,9 @@ async fn component_windows_jump_by_zone_counts() {
         limit: Some(64),
         ..Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)))
     };
-    let off = {
-        let _zones = ForcedZones::set(false);
-        quads_of(&store.run_probe(&window).await.unwrap()).await
-    };
-    let _zones = ForcedZones::set(true);
-    let rec = Recorder::start();
-    let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
-    assert_eq!(on.len(), 64);
-    assert_eq!(on, off, "the window, as with zones off");
+    let read = || async { quads_of(&store.run_probe(&window).await.unwrap()).await };
+    let (rows, rec) = zones_agree("the window", read).await;
+    assert_eq!(rows.len(), 64);
     let checked = rec.rows(|e| match e {
         Event::ComponentChecked(rows) => Some(*rows),
         _ => None,
@@ -419,12 +405,6 @@ async fn component_first_pages_count_their_first_zone_alone() {
     let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
     let page = probe.clone().window(0, Some(64));
     let ask = probe.clone().window(0, Some(1));
-    let off = {
-        let _zones = ForcedZones::set(false);
-        let page = quads_of(&store.run_probe(&page).await.unwrap()).await;
-        (page, store.count_probe(&ask).await.unwrap())
-    };
-    let _zones = ForcedZones::set(true);
     let counted = |rec: &Recorder| {
         rec.rows(|e| match e {
             Event::ZoneCounted(rows) | Event::ZoneRecorded(rows) => Some(*rows),
@@ -433,18 +413,18 @@ async fn component_first_pages_count_their_first_zone_alone() {
     };
     // The `type` run is `index:ref-p`'s rows `RUN..2 * RUN`.
     let first = (RUN.next_multiple_of(ZONE_ROWS) - RUN) as u64;
-    let rec = Recorder::start();
-    let on = quads_of(&store.run_probe(&page).await.unwrap()).await;
-    assert_eq!(on.len(), 64);
-    assert_eq!(on, off.0, "the page, as with zones off");
+    let read = || async { quads_of(&store.run_probe(&page).await.unwrap()).await };
+    let (rows, rec) = zones_agree("the page", read).await;
+    assert_eq!(rows.len(), 64);
     assert_eq!(
         counted(&rec),
         first,
         "the page: the first zone's part counted alone"
     );
-    let rec = Recorder::start();
-    assert_eq!(store.count_probe(&ask).await.unwrap(), off.1);
-    assert_eq!(off.1, 1, "ASK: capped at one");
+    drop(rec);
+    let count = || async { store.count_probe(&ask).await.unwrap() };
+    let (count, rec) = zones_agree("ASK", count).await;
+    assert_eq!(count, 1, "ASK: capped at one");
     assert_eq!(
         counted(&rec),
         first,
@@ -469,29 +449,19 @@ async fn component_runs_skip_zones_counted_empty() {
     let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
     // The matches before the gap's zone and 64 past it.
     let window = probe.clone().window(0, Some(UNRECORDED_GAP.start + 64));
-    let off = {
-        let _zones = ForcedZones::set(false);
-        let window = quads_of(&store.run_probe(&window).await.unwrap()).await;
-        (
-            window,
-            quads_of(&store.run_probe(&probe).await.unwrap()).await,
-        )
-    };
-    let _zones = ForcedZones::set(true);
-    let rec = Recorder::start();
-    let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
-    assert_eq!(on.len(), UNRECORDED_GAP.start + 64);
-    assert_eq!(on, off.0, "the window, as with zones off");
+    let read = || async { quads_of(&store.run_probe(&window).await.unwrap()).await };
+    let (rows, rec) = zones_agree("the window", read).await;
+    assert_eq!(rows.len(), UNRECORDED_GAP.start + 64);
     assert_eq!(
         rec.count_where(|e| matches!(e, Event::ComponentChecked(_))),
         0,
         "no graph read inside the component: the zones before and after the gap are \
          graph 1's alone, the gap's counted empty"
     );
-    let rec = Recorder::start();
-    let rows = quads_of(&store.run_probe(&probe).await.unwrap()).await;
+    drop(rec);
+    let read = || async { quads_of(&store.run_probe(&probe).await.unwrap()).await };
+    let (rows, rec) = zones_agree("every row", read).await;
     assert_eq!(rows.len(), RUN - ZONE_ROWS);
-    assert_eq!(rows, off.1, "every row, as with zones off");
     assert_eq!(
         rids_decoded(&rec),
         RUN - ZONE_ROWS,
@@ -624,15 +594,9 @@ async fn copy_windows_leave_the_graph_to_the_residual() {
         limit: Some(64),
         ..Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)))
     };
-    let off = {
-        let _zones = ForcedZones::set(false);
-        quads_of(&store.run_probe(&window).await.unwrap()).await
-    };
-    let _zones = ForcedZones::set(true);
-    let rec = Recorder::start();
-    let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
-    assert_eq!(on.len(), 64);
-    assert_eq!(on, off, "the window, as with zones off");
+    let read = || async { quads_of(&store.run_probe(&window).await.unwrap()).await };
+    let (rows, rec) = zones_agree("the window", read).await;
+    assert_eq!(rows.len(), 64);
     assert_eq!(
         rec.count_where(|e| matches!(e, Event::ComponentChecked(_))),
         0,

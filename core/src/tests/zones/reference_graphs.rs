@@ -251,38 +251,6 @@ async fn stream_written_children_follow_the_hook() {
     }
 }
 
-/// What a pattern answers: its count, pages at its ends and middle, and its
-/// stream in chunks of 999 rows, every row in order.
-async fn reads(
-    store: &VortexRdfStore,
-    pattern: crate::CodePattern,
-) -> (u64, Vec<Vec<[TermCode; 4]>>, Vec<[TermCode; 4]>) {
-    let total = store.count_code_pattern(pattern).await.unwrap();
-    let t = total as usize;
-    let mut pages = Vec::new();
-    for limit in [1, 64] {
-        for offset in [0, 1, t / 2, t.saturating_sub(1)] {
-            let columns = store
-                .match_code_pattern(pattern, offset, Some(limit))
-                .await
-                .unwrap();
-            pages.push(code_rows::<4>(&columns));
-        }
-    }
-    let chunks: Vec<Vec<vortex_buffer::Buffer<TermCode>>> = store
-        .match_code_chunks(pattern, 999)
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let stream = chunks
-        .iter()
-        .flat_map(|chunk| code_rows::<4>(chunk))
-        .collect();
-    (total, pages, stream)
-}
-
 /// A by-reference run checked against the graph reads its child's own `g`
 /// rows, contiguous, and never the quad table's `g` at its scattered rows:
 /// `(? type ? g1)`, `(? ? Taxon g1)` and `(? type Taxon g1)` on alternating
@@ -357,7 +325,7 @@ async fn reference_runs_read_their_own_graphs() {
                 false => assert!(taken > 0 && own == 0, "{tag}: the quad table's g"),
             }
             drop(rec);
-            store_answers.push(reads(store, pattern).await);
+            store_answers.push(code_answers(store, pattern).await);
         }
         answers.push(store_answers);
     }
