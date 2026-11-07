@@ -190,9 +190,8 @@ impl LocatedRun {
     /// The rows at positions `at` of the run (not empty, within its
     /// [`len`](Self::len)) that the checks keep, in the run's order: the
     /// positional checks zone by zone where zones class them (none keeps
-    /// nothing, all keeps every position unread, a mixed zone checks the
-    /// slots it leaves unsettled), then a reference run's row ids at the
-    /// positions kept, then the checks by row id. With no check, a sorted
+    /// nothing, all keeps every row unread, a mixed zone checks the slots it
+    /// leaves unsettled), then the checks by row id. With no check, a sorted
     /// run's own rows.
     pub(super) async fn block(&self, at: Range<u64>) -> Result<Rows> {
         observe!(LocatedBlock(at.end - at.start));
@@ -200,30 +199,32 @@ impl LocatedRun {
         if self.checks.is_empty() && matches!(self.table, RunTable::Sorted { .. }) {
             return Ok(Rows::Run(span));
         }
-        let mut rows = Vec::new();
-        match self.zones() {
+        let mut rows = match self.zones() {
+            None => self.checked_rows(span, self.positional_bits()).await?,
             Some(zones) => {
+                let mut rows = Vec::new();
                 for ZonePart { zone, rows: part } in zones.parts(span) {
                     match zones.class(zone) {
                         ZoneClass::None => note(counters::ZONE_NONE, part.end - part.start),
                         ZoneClass::All => {
                             note(counters::ZONE_ALL, part.end - part.start);
-                            rows.extend(self.rows_at(part, None).await?);
+                            match &self.table {
+                                RunTable::Sorted { .. } => rows.extend(part),
+                                RunTable::Reference { rid, .. } => rows.extend(
+                                    read_codes(rid, part, &self.source, &self.session)
+                                        .await?
+                                        .iter(),
+                                ),
+                            }
                         }
                         ZoneClass::Mixed { unsettled } => {
-                            let kept = self.positional_rows(part.clone(), unsettled).await?;
-                            rows.extend(self.rows_at(part, kept).await?);
+                            rows.extend(self.checked_rows(part, unsettled).await?);
                         }
                     }
                 }
+                rows
             }
-            None => {
-                let kept = self
-                    .positional_rows(span.clone(), self.positional_bits())
-                    .await?;
-                rows = self.rows_at(span, kept).await?;
-            }
-        }
+        };
         for check in &self.checks {
             if rows.is_empty() {
                 break;
@@ -235,58 +236,65 @@ impl LocatedRun {
         Ok(Rows::Ids(rows))
     }
 
-    /// The positions of `span` (contiguous) that pass every positional check
-    /// in `slots` (bits `1 << slot`), in check order: the first read over
-    /// the span, still contiguous, each other one at the positions the checks
-    /// before it kept. `None` when `slots` names no positional check: every
-    /// position passes.
-    async fn positional_rows(&self, span: Range<u64>, slots: u32) -> Result<Option<Vec<u64>>> {
-        let mut checks = self.checks.iter().filter_map(|check| match &check.kind {
-            CheckKind::Positional { column } if slots & 1 << check.slot != 0 => {
-                Some((check, column))
+    /// The rows at the positions of `span` (contiguous) that pass every
+    /// positional check in `slots` (bits `1 << slot`), in check order: the
+    /// first read over the span, still contiguous, each other one at the
+    /// positions the checks before it kept. A sorted run's rows are those
+    /// positions; a reference run's, the row ids `rid` lists there, read
+    /// over the span beside its check (its child's own `g`, the one column it
+    /// holds) and picked in the same pass.
+    async fn checked_rows(&self, span: Range<u64>, slots: u32) -> Result<Vec<u64>> {
+        let checks: Vec<(&Check, &Chunks)> = self
+            .checks
+            .iter()
+            .filter_map(|check| match &check.kind {
+                CheckKind::Positional { column } if slots & 1 << check.slot != 0 => {
+                    Some((check, column))
+                }
+                _ => None,
+            })
+            .collect();
+        let ids = match &self.table {
+            RunTable::Sorted { .. } => None,
+            RunTable::Reference { rid, .. } => {
+                Some(read_codes(rid, span.clone(), &self.source, &self.session).await?)
             }
-            _ => None,
-        });
-        let Some((first, column)) = checks.next() else {
-            return Ok(None);
         };
-        if matches!(self.table, RunTable::Reference { .. }) {
+        let Some(&(first, column)) = checks.first() else {
+            return Ok(match ids {
+                Some(ids) => ids.to_vec(),
+                None => span.collect(),
+            });
+        };
+        if ids.is_some() {
             observe!(ReferenceGraphRead(span.end - span.start));
         }
         observe!(CheckRead(span.end - span.start));
         note(counters::CHECK_READ, span.end - span.start);
         let values = read_codes(column, span.clone(), &self.source, &self.session).await?;
+        let start = span.start;
+        if let (Some(ids), [_]) = (&ids, checks.as_slice()) {
+            return Ok(ids
+                .iter()
+                .zip(values.iter())
+                .filter(|&(_, &value)| value == first.code)
+                .map(|(&id, _)| id)
+                .collect());
+        }
         let mut kept: Vec<u64> = span
             .zip(values.iter())
             .filter(|&(_, &value)| value == first.code)
             .map(|(position, _)| position)
             .collect();
-        for (check, column) in checks {
+        for &(check, column) in &checks[1..] {
             if kept.is_empty() {
                 break;
             }
             kept = self.holding(column, check, kept).await?;
         }
-        Ok(Some(kept))
-    }
-
-    /// The rows at the positions `kept` of `span` (every one when `None`):
-    /// the positions themselves for a sorted run; the row ids `rid` lists
-    /// there for a reference run, read over the span, contiguous, then
-    /// picked.
-    async fn rows_at(&self, span: Range<u64>, kept: Option<Vec<u64>>) -> Result<Vec<u64>> {
-        let rid = match &self.table {
-            RunTable::Sorted { .. } => return Ok(kept.unwrap_or_else(|| span.collect())),
-            RunTable::Reference { rid, .. } => rid,
-        };
-        if kept.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Vec::new());
-        }
-        let start = span.start;
-        let ids = read_codes(rid, span, &self.source, &self.session).await?;
-        Ok(match kept {
-            None => ids.to_vec(),
-            Some(kept) => kept
+        Ok(match ids {
+            None => kept,
+            Some(ids) => kept
                 .iter()
                 .map(|&position| ids[(position - start) as usize])
                 .collect(),
@@ -361,8 +369,7 @@ impl LocatedRun {
                 .count_eq(rows, check.code, &self.source, &self.session)
                 .await?);
         }
-        let kept = self.positional_rows(rows.clone(), unsettled).await?;
-        Ok(kept.map_or(rows.end - rows.start, |kept| kept.len() as u64))
+        Ok(self.checked_rows(rows, unsettled).await?.len() as u64)
     }
 
     /// The positional check of `slot`, with its column.
