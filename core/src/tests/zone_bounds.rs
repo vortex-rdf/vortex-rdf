@@ -200,13 +200,10 @@ async fn zones_off_skips_only_by_bounds() {
     for (label, store) in &stores {
         let rec = Recorder::start();
         let view = matched_view(store, None, None, Some(&rare), None).await;
-        let compared: u64 = rec
-            .picked(|e| match e {
-                Event::ResidualCompared(rows) => Some(*rows),
-                _ => None,
-            })
-            .iter()
-            .sum();
+        let compared: u64 = rec.rows(|e| match e {
+            Event::ResidualCompared(rows) => Some(*rows),
+            _ => None,
+        });
         let unread =
             rec.count_where(|e| matches!(e, Event::ZoneRecorded(_) | Event::ZoneCounted(_)));
         drop(rec);
@@ -356,13 +353,10 @@ async fn records_skip_zones_in_memory() {
         .unwrap();
     assert_eq!(view.size().await.unwrap(), 2_000, "graph 2's rows");
     assert_eq!(rec.count(&Event::ZoneNarrowed), 1, "narrowed by zones");
-    let compared: u64 = rec
-        .picked(|e| match e {
-            Event::ResidualCompared(rows) => Some(*rows),
-            _ => None,
-        })
-        .iter()
-        .sum();
+    let compared: u64 = rec.rows(|e| match e {
+        Event::ResidualCompared(rows) => Some(*rows),
+        _ => None,
+    });
     assert_eq!(compared, 2 * ZONE_ROWS as u64, "graph 2's two zones");
 }
 
@@ -499,13 +493,10 @@ async fn settled_residuals_keep_base_order() {
                 .await
                 .unwrap();
             let rows = row_list(&view).await;
-            let compared: u64 = rec
-                .picked(|e| match e {
-                    Event::ResidualCompared(rows) | Event::ComponentChecked(rows) => Some(*rows),
-                    _ => None,
-                })
-                .iter()
-                .sum();
+            let compared: u64 = rec.rows(|e| match e {
+                Event::ResidualCompared(rows) | Event::ComponentChecked(rows) => Some(*rows),
+                _ => None,
+            });
             (rows, view.indexes().to_vec(), compared)
         }
     };

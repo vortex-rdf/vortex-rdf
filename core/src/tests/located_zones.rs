@@ -443,15 +443,15 @@ async fn zoned_runs_answer_as_rows_do() {
 
 /// Rows `rec` saw counted on a mixed zone's encoding, and read to check.
 fn zone_work(rec: &Recorder) -> (u64, u64) {
-    let counted = rec.picked(|e| match e {
+    let counted = rec.rows(|e| match e {
         Event::ZoneCounted(rows) => Some(*rows),
         _ => None,
     });
-    let read = rec.picked(|e| match e {
+    let read = rec.rows(|e| match e {
         Event::CheckRead(rows) => Some(*rows),
         _ => None,
     });
-    (counted.iter().sum(), read.iter().sum())
+    (counted, read)
 }
 
 /// Rows of each mixed zone `rec` saw counted from its recorded values, in
@@ -517,13 +517,10 @@ async fn zoned_runs_skip_settled_zones() {
             (_, _, true) => {
                 let rec = Recorder::start();
                 assert_eq!(store.count_code_pattern(links).await.unwrap(), 10_000);
-                let blocks: u64 = rec
-                    .picked(|e| match e {
-                        Event::LocatedBlock(rows) => Some(*rows),
-                        _ => None,
-                    })
-                    .iter()
-                    .sum();
+                let blocks: u64 = rec.rows(|e| match e {
+                    Event::LocatedBlock(rows) => Some(*rows),
+                    _ => None,
+                });
                 assert_eq!(blocks, RUN as u64, "{}: the run read", fixture.tag);
                 assert_eq!(
                     zone_work(&rec).0,
@@ -896,15 +893,15 @@ async fn default_graph_counts_from_records() {
 /// (`ReferenceGraphRead`), and the quad table's at its rows (`CheckTaken` of
 /// slot 3).
 fn reference_graph_reads(rec: &Recorder) -> (u64, u64) {
-    let own = rec.picked(|e| match e {
+    let own = rec.rows(|e| match e {
         Event::ReferenceGraphRead(rows) => Some(*rows),
         _ => None,
     });
-    let taken = rec.picked(|e| match e {
+    let taken = rec.rows(|e| match e {
         Event::CheckTaken { slot: 3, rows } => Some(*rows),
         _ => None,
     });
-    (own.iter().sum(), taken.iter().sum())
+    (own, taken)
 }
 
 /// A by-reference run checked against the graph alone is decided zone by
@@ -1326,13 +1323,10 @@ async fn one_graph_reference_runs_read_row_ids_only() {
     assert_eq!(streamed(store, pattern, 4096).await, want);
     assert_eq!(reference_graph_reads(&rec), (0, 0), "no graph read");
     assert_eq!(zone_maps_read(&rec), 0, "no zone map read");
-    let blocks: u64 = rec
-        .picked(|e| match e {
-            Event::LocatedBlock(rows) => Some(*rows),
-            _ => None,
-        })
-        .iter()
-        .sum();
+    let blocks: u64 = rec.rows(|e| match e {
+        Event::LocatedBlock(rows) => Some(*rows),
+        _ => None,
+    });
     assert_eq!(blocks, RUN as u64, "every position, once");
 }
 

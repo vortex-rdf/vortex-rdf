@@ -115,11 +115,6 @@ async fn component_runs_answer_as_rows_do_by_reference() {
     assert_component_runs_answer_as_rows_do(IndexConfig::Reference).await;
 }
 
-/// The rows `rec` saw an event of `pick` name, summed.
-fn rows_of(rec: &Recorder, pick: impl Fn(&Event) -> Option<u64>) -> u64 {
-    rec.picked(pick).iter().sum()
-}
-
 /// `(? type ? g1)` on `Graphs::Alternating`, by copy and by reference, in
 /// memory: the count, a quarter of the run, is taken zone by zone inside
 /// the component, the run's whole zones from their recorded graphs and its
@@ -151,18 +146,18 @@ async fn component_counts_read_no_ids() {
             "{name}: no base row compared"
         );
         assert_eq!(
-            rows_of(&rec, |e| match e {
+            rec.rows(|e| match e {
                 Event::ComponentChecked(rows) => Some(*rows),
                 _ => None,
             }),
             0,
             "{name}: no graph read"
         );
-        let recorded = rows_of(&rec, |e| match e {
+        let recorded = rec.rows(|e| match e {
             Event::ZoneRecorded(rows) => Some(*rows),
             _ => None,
         });
-        let counted = rows_of(&rec, |e| match e {
+        let counted = rec.rows(|e| match e {
             Event::ZoneCounted(rows) => Some(*rows),
             _ => None,
         });
@@ -204,7 +199,7 @@ async fn component_windows_jump_by_zone_counts() {
     let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
     assert_eq!(on.len(), 64);
     assert_eq!(on, off, "the window, as with zones off");
-    let checked = rows_of(&rec, |e| match e {
+    let checked = rec.rows(|e| match e {
         Event::ComponentChecked(rows) => Some(*rows),
         _ => None,
     });
@@ -435,7 +430,7 @@ async fn component_first_pages_count_their_first_zone_alone() {
     };
     let _zones = ForcedZones::set(true);
     let counted = |rec: &Recorder| {
-        rows_of(rec, |e| match e {
+        rec.rows(|e| match e {
             Event::ZoneCounted(rows) | Event::ZoneRecorded(rows) => Some(*rows),
             _ => None,
         })

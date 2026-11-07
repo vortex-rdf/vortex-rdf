@@ -211,13 +211,11 @@ async fn all_zones_are_taken_uncompared() {
                 .unwrap();
             let rows = row_list(&view).await;
             let sum = |taken: bool| -> u64 {
-                rec.picked(|e| match (e, taken) {
+                rec.rows(|e| match (e, taken) {
                     (Event::ResidualZoneTaken(rows), true)
                     | (Event::ResidualCompared(rows), false) => Some(*rows),
                     _ => None,
                 })
-                .iter()
-                .sum()
             };
             (rows, sum(true), sum(false))
         }
@@ -277,21 +275,20 @@ async fn a_pending_residual_classes_once() {
 /// compared)`, from "all" zones, from records, on the encoding, and by a
 /// compare.
 fn zone_rows_seen(rec: &Recorder) -> (u64, u64, u64, u64) {
-    let sum = |pick: fn(&Event) -> Option<u64>| -> u64 { rec.picked(pick).iter().sum() };
     (
-        sum(|e| match e {
+        rec.rows(|e| match e {
             Event::ResidualZoneTaken(rows) => Some(*rows),
             _ => None,
         }),
-        sum(|e| match e {
+        rec.rows(|e| match e {
             Event::ZoneRecorded(rows) => Some(*rows),
             _ => None,
         }),
-        sum(|e| match e {
+        rec.rows(|e| match e {
             Event::ZoneCounted(rows) => Some(*rows),
             _ => None,
         }),
-        sum(|e| match e {
+        rec.rows(|e| match e {
             Event::ResidualCompared(rows) => Some(*rows),
             _ => None,
         }),

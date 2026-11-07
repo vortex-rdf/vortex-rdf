@@ -30,12 +30,10 @@ async fn test_tail_keys_answer_fully_bound_matches() {
     // The tail rows keyed, and the tail matches made by a scan, that `rec`
     // saw.
     let rows_keyed = |rec: &Recorder| -> usize {
-        rec.picked(|e| match e {
+        rec.rows(|e| match e {
             Event::TailKeyed(rows) => Some(*rows),
             _ => None,
         })
-        .iter()
-        .sum()
     };
     let scanned = |rec: &Recorder| rec.count(&Event::TailMatch { keyed: false });
     let fresh = appended_quads(1_100);

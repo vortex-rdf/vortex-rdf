@@ -43,20 +43,14 @@ fn whole_quads() -> Vec<Quad> {
 /// The rows a recorder saw a file filter take from every-row zones, and
 /// evaluate.
 fn split_rows(rec: &Recorder) -> (u64, u64) {
-    let all = rec
-        .picked(|e| match e {
-            Event::SplitAllRows(rows) => Some(*rows),
-            _ => None,
-        })
-        .iter()
-        .sum();
-    let evaluated = rec
-        .picked(|e| match e {
-            Event::SplitFilterRows(rows) => Some(*rows),
-            _ => None,
-        })
-        .iter()
-        .sum();
+    let all = rec.rows(|e| match e {
+        Event::SplitAllRows(rows) => Some(*rows),
+        _ => None,
+    });
+    let evaluated = rec.rows(|e| match e {
+        Event::SplitFilterRows(rows) => Some(*rows),
+        _ => None,
+    });
     (all, evaluated)
 }
 

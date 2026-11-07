@@ -536,8 +536,6 @@ fn selection_pending(view: &VortexRdfStore) -> bool {
     view.view_statistics().unwrap().selection == SelectionKind::PendingIndexRun
 }
 
-/// The quad-row column names `layout` builds — what a schema assertion
-/// expects the primary struct to carry and nothing else.
 /// The probes the matches `rec` saw bind a column: `(the store's own,
 /// resolved for the call)`.
 fn probe_binds(rec: &Recorder) -> (usize, usize) {
@@ -549,12 +547,10 @@ fn probe_binds(rec: &Recorder) -> (usize, usize) {
 
 /// The `rid` rows of in-memory index components `rec` saw decoded.
 fn rids_decoded(rec: &Recorder) -> usize {
-    rec.picked(|e| match e {
+    rec.rows(|e| match e {
         Event::RidsDecoded(rows) => Some(*rows),
         _ => None,
     })
-    .iter()
-    .sum()
 }
 
 /// The directory the last out-of-core build `rec` saw spill its runs under.

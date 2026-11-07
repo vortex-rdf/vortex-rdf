@@ -1055,14 +1055,12 @@ async fn check_long_graph_bound_run(index: IndexConfig) {
             assert_eq!(store.count_code_pattern(pattern).await.unwrap(), 20_000);
             if matches!(index, IndexConfig::Copy) && crate::zone_stats::rules::zones_enabled() {
                 let rows = |counted_from_records: bool| -> u64 {
-                    rec.picked(|e| match (e, counted_from_records) {
+                    rec.rows(|e| match (e, counted_from_records) {
                         (Event::ZoneRecorded(rows), true) | (Event::ZoneCounted(rows), false) => {
                             Some(*rows)
                         }
                         _ => None,
                     })
-                    .iter()
-                    .sum()
                 };
                 assert_eq!(rows(true), 40_000, "a count, zone by zone, from records");
                 assert_eq!(rows(false), 0, "nothing counted on the encoding");

@@ -351,20 +351,14 @@ async fn reference_runs_read_their_own_graphs() {
                 want,
                 "{tag}"
             );
-            let taken: u64 = rec
-                .picked(|e| match e {
-                    Event::CheckTaken { slot: 3, rows } => Some(*rows),
-                    _ => None,
-                })
-                .iter()
-                .sum();
-            let own: u64 = rec
-                .picked(|e| match e {
-                    Event::ReferenceGraphRead(rows) => Some(*rows),
-                    _ => None,
-                })
-                .iter()
-                .sum();
+            let taken: u64 = rec.rows(|e| match e {
+                Event::CheckTaken { slot: 3, rows } => Some(*rows),
+                _ => None,
+            });
+            let own: u64 = rec.rows(|e| match e {
+                Event::ReferenceGraphRead(rows) => Some(*rows),
+                _ => None,
+            });
             match graphs {
                 true => assert_eq!((taken, own), (0, RUN as u64), "{tag}: the child's g"),
                 false => assert!(taken > 0 && own == 0, "{tag}: the quad table's g"),

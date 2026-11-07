@@ -329,6 +329,12 @@ impl Recorder {
         LOG.with_borrow(|log| log.events[self.from..].iter().filter_map(pick).collect())
     }
 
+    /// What `pick` reads off each of [`events`](Self::events) it picks,
+    /// summed: the rows a kind of event recorded, in the pick's own type.
+    pub(crate) fn rows<T: std::iter::Sum>(&self, pick: impl Fn(&Event) -> Option<T>) -> T {
+        LOG.with_borrow(|log| log.events[self.from..].iter().filter_map(pick).sum())
+    }
+
     /// How many of the events since the last take `event` is, after which
     /// the recorder reads only later ones.
     pub(crate) fn take_count(&mut self, event: &Event) -> usize {
@@ -351,5 +357,42 @@ impl Drop for Recorder {
                 log.events.clear();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `rows` sums what its pick reads off the events since the recorder
+    /// started, in the pick's own type.
+    #[test]
+    fn rows_sums_what_pick_reads() {
+        let _earlier = Recorder::start();
+        note(Event::CheckRead(100));
+        let rec = Recorder::start();
+        for event in [
+            Event::CheckRead(3),
+            Event::ZoneCounted(5),
+            Event::CheckRead(4),
+            Event::RidsDecoded(2),
+        ] {
+            note(event);
+        }
+        let checked: u64 = rec.rows(|e| match e {
+            Event::CheckRead(rows) => Some(*rows),
+            _ => None,
+        });
+        assert_eq!(checked, 7, "only the events since start");
+        let read: u64 = rec.rows(|e| match e {
+            Event::CheckRead(rows) | Event::ZoneCounted(rows) => Some(*rows),
+            _ => None,
+        });
+        assert_eq!(read, 12);
+        let decoded: usize = rec.rows(|e| match e {
+            Event::RidsDecoded(rows) => Some(*rows),
+            _ => None,
+        });
+        assert_eq!(decoded, 2);
     }
 }
