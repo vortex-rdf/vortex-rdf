@@ -7,16 +7,48 @@ use crate::error::Result;
 use crate::io::zone_map::{ZONE_ROWS, eq_on_bounds, footer_bounds};
 use crate::io::zone_set::{ZoneCheck, ZoneSet};
 use crate::observe::observe;
+use crate::stats_rules::zones_enabled;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::schema::PRIMARY_COLUMNS;
 use std::sync::Arc;
 use vortex_rdf_encoded_search::counters;
 
-/// Where a run asks its file's statistics when a read needs them
-/// ([`LocatedRun::ask_statistics`]): its file, whose footer and zone maps
-/// answer for the run's table.
-pub(super) struct PendingStatistics {
-    pub(super) file: Arc<NativeStoreFile>,
+/// What a located run knows of its file's statistics.
+pub(super) enum Statistics {
+    /// To ask, on the first read that needs them: the run's file, whose
+    /// footer and zone maps answer for the run's table.
+    Unasked(Arc<NativeStoreFile>),
+    /// Asked: the zones class the run's positional checks.
+    Zoned(ZoneSet),
+    /// Nothing left to class: asked, with no zones left (the footer settled
+    /// the checks, or a checked column has no zone map), or never to ask (a
+    /// run with no check or one by row id, zones off, or fewer positions
+    /// than a zone holds).
+    Settled,
+}
+
+/// `run`, if it answers its pattern, its statistics set. A run whose checks
+/// the zones may decide (at least one, and every one positional) of a
+/// zone's positions or more asks them with zones on: when a read needs them,
+/// so a first page its first block fills asks none, or at once when it is
+/// longer than [`gap_rows`], as whether it answers depends on what they
+/// decide. A shorter run reads its few rows faster than they answer (a
+/// join's one-row probe: 1 against 45 µs). A run answers with no check, its
+/// checks decided by zones, or within [`gap_rows`]; a longer one, still
+/// checked row by row, declines (`None`), as without zones.
+pub(super) async fn admit(
+    mut run: LocatedRun,
+    file: &Arc<NativeStoreFile>,
+) -> Result<Option<LocatedRun>> {
+    let decidable = !run.checks.is_empty() && run.checks.iter().all(Check::is_positional);
+    if decidable && zones_enabled() && run.len() >= STATISTICS_ROWS {
+        run.statistics = Statistics::Unasked(Arc::clone(file));
+        if run.len() > gap_rows() {
+            run.ask_statistics().await?;
+        }
+    }
+    let answers = run.checks.is_empty() || run.zones().is_some() || run.len() <= gap_rows();
+    Ok(answers.then_some(run))
 }
 
 impl LocatedRun {
@@ -24,11 +56,21 @@ impl LocatedRun {
     /// ([`decide_by_statistics`]) if they are still to ask; once asked, or
     /// with none to ask, it does nothing.
     pub(super) async fn ask_statistics(&mut self) -> Result<()> {
-        let Some(PendingStatistics { file }) = self.pending.take() else {
-            return Ok(());
+        let file = match &self.statistics {
+            Statistics::Unasked(file) => Arc::clone(file),
+            Statistics::Zoned(_) | Statistics::Settled => return Ok(()),
         };
+        self.statistics = Statistics::Settled;
         // Boxed: its state would otherwise enlarge every read's future.
         Box::pin(decide_by_statistics(&file, self)).await
+    }
+
+    /// The zones that class the run's positional checks, once asked.
+    pub(super) fn zones(&self) -> Option<&ZoneSet> {
+        match &self.statistics {
+            Statistics::Zoned(zones) => Some(zones),
+            Statistics::Unasked(_) | Statistics::Settled => None,
+        }
     }
 }
 
@@ -68,8 +110,10 @@ pub(super) async fn decide_by_statistics(
     for at in settled.into_iter().rev() {
         run.checks.remove(at);
     }
-    if !run.checks.is_empty() {
-        run.zones = run_zones(file, run).await?;
+    if !run.checks.is_empty()
+        && let Some(zones) = run_zones(file, run).await?
+    {
+        run.statistics = Statistics::Zoned(zones);
     }
     Ok(())
 }

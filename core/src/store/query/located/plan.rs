@@ -8,13 +8,11 @@ use super::statistics::*;
 use super::{CodePattern, locate_enabled};
 use crate::error::Result;
 use crate::observe::observe;
-use crate::stats_rules::zones_enabled;
 use crate::store::VortexRdfStore;
 use crate::store::persist::native_file::{FileTable, LocatedTables};
 use crate::store::schema::PRIMARY_COLUMNS;
 use crate::store::schema::TermCode;
 use std::ops::Range;
-use std::sync::Arc;
 use vortex_session::VortexSession;
 
 /// The sorted tables whose key prefix a pattern's bound slots may be: the
@@ -147,27 +145,9 @@ impl VortexRdfStore {
                     columns: columns.clone(),
                     table: TABLES[table].0,
                 };
-                let mut located =
+                let located =
                     LocatedRun::new(codes, found, table, checks, source.clone(), session.clone());
-                // A run of a zone or more asks the file's statistics; a
-                // shorter one reads its few rows faster than they answer
-                // (a join's one-row probe: 1 against 45 µs). A run within
-                // the cap asks them when a read needs them, so a first page
-                // its first block fills asks none; a longer one asks now,
-                // as whether it is capped depends on what they decide.
-                if zones_enabled() && located.len() >= STATISTICS_ROWS {
-                    located.pending = Some(PendingStatistics {
-                        file: Arc::clone(file),
-                    });
-                    if located.len() > gap_rows() {
-                        located.ask_statistics().await?;
-                    }
-                }
-                // A run still checked row by row is capped, as without zones.
-                if located.checks.is_empty()
-                    || located.zones.is_some()
-                    || located.len() <= gap_rows()
-                {
+                if let Some(located) = admit(located, file).await? {
                     return Ok(Some(located));
                 }
             }
@@ -177,29 +157,10 @@ impl VortexRdfStore {
                 *run = run.take().or(found);
             }
         }
-        let Some(mut located) = by_reference(codes, tables, runs, source, session) else {
-            return Ok(None);
-        };
-        // A run checked against the graph alone, its child holding each
-        // row's graph (its one check a positional one), asks the statistics
-        // as a table run does: its child's own `g` zones decide it.
-        if !located.checks.is_empty()
-            && located.checks.iter().all(Check::is_positional)
-            && zones_enabled()
-            && located.len() >= STATISTICS_ROWS
-        {
-            located.pending = Some(PendingStatistics {
-                file: Arc::clone(file),
-            });
-            if located.len() > gap_rows() {
-                located.ask_statistics().await?;
-            }
+        match by_reference(codes, tables, runs, source, session) {
+            Some(located) => admit(located, file).await,
+            None => Ok(None),
         }
-        // A reference run still checked row by row is capped.
-        if located.checks.is_empty() || located.zones.is_some() || located.len() <= gap_rows() {
-            return Ok(Some(located));
-        }
-        Ok(None)
     }
 }
 

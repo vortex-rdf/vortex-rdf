@@ -53,14 +53,12 @@ pub(super) struct LocatedRun {
     pub(super) checks: Vec<Check>,
     source: Source,
     session: VortexSession,
-    /// The zone checks of the run's positional checks, each named by its
-    /// slot ([`ZoneSet`]), over the run's table, when zone maps decide them
-    /// ([`run_zones`]); `None` checks every row.
-    pub(super) zones: Option<ZoneSet>,
-    /// The file statistics still to ask for the run's checks, until a read
-    /// needs them ([`ask_statistics`](Self::ask_statistics)); `None` once
-    /// asked, or when the run asks none.
-    pub(super) pending: Option<PendingStatistics>,
+    /// What the run knows of its file's statistics: to ask, until a read
+    /// needs them ([`ask_statistics`](Self::ask_statistics)); the zones of
+    /// its positional checks over its table once asked, where zone maps
+    /// decide them ([`run_zones`]); or nothing left to class, and every row
+    /// checked.
+    pub(super) statistics: Statistics,
 }
 
 /// The table a [`LocatedRun`]'s positions are in.
@@ -162,8 +160,7 @@ impl LocatedRun {
             checks,
             source,
             session,
-            zones: None,
-            pending: None,
+            statistics: Statistics::Settled,
         }
     }
 
@@ -204,7 +201,7 @@ impl LocatedRun {
             return Ok(Rows::Run(span));
         }
         let mut rows = Vec::new();
-        match &self.zones {
+        match self.zones() {
             Some(zones) => {
                 for ZonePart { zone, rows: part } in zones.parts(span) {
                     match zones.class(zone) {
@@ -493,7 +490,7 @@ impl LocatedRun {
         offset: usize,
         limit: Option<usize>,
     ) -> Result<[Buffer<TermCode>; 4]> {
-        if self.pending.is_some()
+        if matches!(self.statistics, Statistics::Unasked(_))
             && offset == 0
             && let Some(limit) = limit.filter(|&limit| limit as u64 <= FIRST_GAP_BLOCK)
         {
@@ -527,7 +524,7 @@ impl LocatedRun {
         limit: Option<usize>,
         whole: bool,
     ) -> Result<(u64, Rows)> {
-        if let Some(zones) = &self.zones {
+        if let Some(zones) = self.zones() {
             return self.zoned_window(zones, offset, limit, whole).await;
         }
         let len = self.len();
