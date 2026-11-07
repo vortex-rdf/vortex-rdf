@@ -1,19 +1,14 @@
-//! The zone maps of an in-memory base's code columns: P1's [`ColumnZones`]
-//! (each 8,192-row zone's exact bounds) per quad code column, `g`'s with the
-//! graphs each zone recorded (P2's `vortexrdf.value_counts`), as a file store's
-//! located runs read them. A residual equality over a base that no index serves
-//! classes the zones its selection touches against them
-//! ([`ResidualCompare`](crate::store::scan::residual::ResidualCompare)): it
-//! skips the zones a bound column's bounds or `g`'s records rule out and
-//! compares only the rest, as the file path's zone-map pruning reads only the
-//! zones it leaves. With zones off it skips the zones the bounds alone rule
-//! out, compared in pieces. A build takes the bounds, and `g`'s records, in
-//! the pass that picks each code column's compression, which reads every
-//! code anyway ([`ZoneBuilder`]); a store loaded from a file or from bytes
-//! reads both from the file's zone tables ([`QuadZones::read`]). A zone map
-//! also keeps its column's whole bounds, the zones' folded
-//! ([`ColumnZones::column_bounds`]), which a residual asks first. A base with
-//! neither has none, and its residual compares every row.
+//! The zone maps of an in-memory base's code columns ([`QuadZones`]): one
+//! [`ColumnZones`] per quad code column, each 8,192-row zone's exact bounds,
+//! and for `g` the graphs each zone holds (`vortexrdf.value_counts`). A build
+//! takes them in the pass that compresses the code columns, which reads
+//! every code anyway ([`ZoneBuilder`]); a store loaded from a file or from
+//! bytes reads them from the file's zone tables ([`QuadZones::read`]). The
+//! residual compare asks a column's whole bounds first
+//! ([`ColumnZones::column_bounds`]), then classes the zones a selection
+//! touches against them
+//! ([`ResidualCompare`](crate::store::scan::residual::ResidualCompare)); a
+//! base without them compares every row.
 
 use std::sync::Arc;
 

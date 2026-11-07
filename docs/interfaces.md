@@ -79,7 +79,7 @@ and raises `Cancelled` when the token is cancelled before the call or while
 the call waits for data.
 
 A `CodePattern` streams through
-[`match_code_chunks`](../core/src/store/query/located/mod.rs#L158):
+[`match_code_chunks`](../core/src/store/query/located/mod.rs#L159):
 `match_code_pattern`'s rows in its order, as chunks of all four code
 columns. A located run that answers the pattern is read a block of
 `batch_rows` of its rows at a time, the rows each block keeps checked as it
@@ -87,7 +87,7 @@ is read, so the run is read once and the stream holds only its place in it;
 any other pattern streams the general match's `code_chunks`. Java's
 `matchCodeChunks` is built on it. Two calls let a binding build its own
 chunked read of a pattern:
-[`code_probe`](../core/src/store/query/located/mod.rs#L186) turns a `CodePattern` into
+[`code_probe`](../core/src/store/query/located/mod.rs#L187) turns a `CodePattern` into
 the `Probe` that `match_code_pattern` runs when no located run answers it
 (`None` when no quad can match), for `run_probe` and then `code_chunks`;
 and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L148) decodes one of
@@ -275,8 +275,8 @@ only them, and compares the rest; a count takes a mixed zone from its
 recorded graphs or the column's encoding, and a window skips the zones
 before it by their counts.
 `VORTEX_RDF_ZONES=0` (read once)
-checks every row instead, as before, and leaves the general match's zone
-pruning to the bounds, without the recorded graphs.
+checks every row instead, and leaves the general match's zone pruning to the
+bounds, without the recorded graphs.
 With `VORTEX_RDF_COUNTERS=1` the engine counters count a located run's
 decisions, not the general match's or the residual compare's: the slots the
 footer settles (`zone_column`), the zones settled none and all (`zone_none`,

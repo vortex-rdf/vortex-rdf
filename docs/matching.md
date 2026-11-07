@@ -272,10 +272,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L233) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L459), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L824) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L167-L174 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L195), [`search_sorted_bounds`](../core/src/store/array.rs#L233) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L471), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L145-L159 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L277), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L883) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L163-L170 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -390,35 +390,29 @@ run it located when the probed component keeps a zone map of its graph
 column ([`graph_zones`](../core/src/store/indexes/components.rs#L314): the
 Dictionary layout's components, built or loaded). The run's rows are
 contiguous in the component, so the component's own `g` column decides them
-a zone at a time ([`GraphCheck`](../core/src/store/indexes/graph_check.rs#L38)),
-where stage 3 would compare the graph at the base rows the run lists,
-scattered over the base:
+a zone at a time ([`GraphCheck`](../core/src/store/indexes/graph_check.rs#L38))
+instead of stage 3 comparing the graph at the base rows the run lists:
 
 - a zone whose bounds or recorded graphs rule the graph out is skipped, and
   a zone of the graph alone is taken whole;
 - a mixed zone is counted from its recorded graphs when the run holds the
   whole zone, else on the graph column's encoding (`count_eq`), else by
-  comparing its graphs, and its matching rows are found on the encoding too
-  (`eq_offsets`: a dictionary's codes against the graph's code).
+  comparing its graphs; its matching rows are found on the encoding
+  (`eq_offsets`).
 
-The resolution reports the graph resolved (`Resolved::graph`), so nothing is
-left to compare it on, and the run's ids are its matching rows. Without
-tombstones a count adds the zones' counts and decodes no id; under them it
-counts the matching ids left live. A window of a run whose ids ascend (by
-reference) counts its zones in run order only until the window fills,
-skipping those before it by their counts, and reads only the zones it spans
-that hold a match; a capped count (an ASK) stops at the zone that meets its
-cap. A run's ids, read whole, decode only the zones holding a match. A run
-whose ids follow its copy's order (by copy) is checked only when the view
-reaches every match (counted, read whole, a window with no limit, keeps), its
-matching ids sorted into base order: a window with a limit, or a capped count
-(`IdsNeed::CountOrWindow` reaching fewer than every row), leaves the graph to
-stage 3, whose zones over the run's ids in base order reach the window
-without finding every match first. A checked run carries no serve plan, as
-its rows are only part of the run, and a graph absent from the dictionary
-answers `Empty`.
-Without the zone map (the string layouts) or with zones off, the graph is
-left to stage 3.
+The resolution marks the graph resolved with its keys (`ResolvedRoles`), so
+stage 3 has nothing left to compare it on, and the run's ids are its
+matching rows: a count adds the zones' counts and decodes no id (under
+tombstones it counts the matching ids left live); a window of a run whose
+ids ascend (by reference) counts the zones before it and reads only the
+zones it spans; a capped count (an ASK) stops at the zone that meets its
+cap. A run whose ids follow its copy's order (by copy) is checked only when
+the view reaches every match (a count, a read of every row, a window with
+no limit, keeps); a window with a limit or a capped count leaves the graph
+to stage 3, whose zones over the run's ids in base order reach the window
+without finding every match first. A checked run carries no serve plan, and
+a graph absent from the dictionary answers `Empty`. Without the zone map
+(the string layouts) or with zones off, the graph is left to stage 3.
 
 **Examples** (what each index holds for the running example is laid out
 where the index is described: [§8.2](#82-secondarybycopy--two-sorted-quad-copies)
@@ -448,63 +442,53 @@ the residual binds a subset of roles the [stage B gate](#4-stage-b--the-provable
 already resolved, so that arm exists for totality.
 
 First, over a selection wider than a zone, the **whole bounds** of the
-base's code columns answer for the whole column: each column's zone map
-(below) keeps its exact smallest and largest code, its zones' folded once
-([`column_bounds`](../core/src/zone_stats/zone_map.rs#L176)); a column without a
-zone map has neither level. A constrained column's code outside its bounds leaves the
-selection no row, and bounds that are both the code drop the equality from
-the compare; with none left the selection is the answer, compared nowhere
-([`ask_statistics`](../core/src/store/scan/residual.rs#L88)). This is the
-store's one rule for `x = c` on exact bounds, which a file's located runs
-apply too, at its footer and zone by zone
+base's code columns settle what they can: each column's zone map (below)
+keeps its exact smallest and largest code
+([`column_bounds`](../core/src/zone_stats/zone_map.rs#L176)). A code outside
+its column's bounds leaves the selection no row; bounds that are both the
+code drop the equality from the compare; with no equality left the
+selection is the answer, compared nowhere
+([`ask_statistics`](../core/src/store/scan/residual.rs#L89)). The rule for
+`x = c` on exact bounds is one function, which a file's located runs apply
+too, at the footer and zone by zone
 ([`eq_on_bounds`](../core/src/zone_stats/zone_map.rs#L321)): it refutes where
-Vortex's own falsifier of `x = c` does, and proves what Vortex has no
-satisfier of an equality for. It reads the bounds directly, as building
-and evaluating Vortex's proofs for a residual cost tens of µs, more than
-many residuals' whole compare.
-On a one-graph store a graph equality settles this way. The view still counts
-as narrowed by the residual, so a serve plan is dropped as a compare drops it
-and its rows read in base order, and a selection the statistics empty keeps
-the view's tail and indexes.
+Vortex's own falsifier of `x = c` does and proves what Vortex has no
+satisfier for. It reads the bounds directly: building and evaluating
+Vortex's proofs costs tens of µs per residual, more than many whole
+compares. On a one-graph store a graph equality settles here. The view
+still counts as narrowed by the residual (a serve plan is dropped, the rows
+read in base order), and a selection the statistics empty keeps the view's
+tail and indexes.
 
 Then the **zone classes** narrow the rows to compare. An in-memory base keeps
-a zone map of each code column's 8,192-row zones, their exact bounds,
-and for the graph column the graphs each zone records with their rows
-([`QuadZones`](../core/src/zone_stats/quad_zones.rs#L31)), as a file store's located runs
-read them: taken in the pass that compresses a build's codes (the graphs
-counted as the file writer's `vortexrdf.value_counts` counts them), or read from the zone
-tables of the file a store is loaded from (`from_file_in_memory`,
-`from_bytes`), so no query pays for them. A base without them (the string
-columns of the Default and TypedObject layouts) skips this step. Over a
+a zone map of each code column's 8,192-row zones (their exact bounds, and
+for `g` the graphs each zone holds with their rows,
+[`QuadZones`](../core/src/zone_stats/quad_zones.rs#L25)), taken in the pass
+that compresses a build's codes or read from the zone tables of the file a
+store is loaded from (`from_file_in_memory`, `from_bytes`), so no query pays
+for them. A base without them (the string layouts) skips this step. Over a
 selection wider than a zone, the zones it touches are classed against the
-equalities left, by the same rule on each bound column's zone bounds
-and the graphs `g`'s zones record
-([`Classes`](../core/src/store/scan/residual.rs#L154),
-[`ColumnZones::eq_holds`](../core/src/zone_stats/zone_map.rs#L198)): "none" where a
-code lies outside its zone's bounds or the zone's recorded graphs lack it,
-"all" where every bound column's zone bounds are its code, mixed otherwise
-(a test pins it to Vortex's falsifier on each zone).
-The selection's rows in "none" zones are skipped, those in "all" zones are
-taken uncompared, and those in a mixed zone are compared on the columns it
-leaves unsettled only, adjacent zones of one class as one run, through
-the implementations below
-([`ResidualCompare::rows`](../core/src/store/scan/residual.rs#L422)). Each run's
-compare decides whether to decode its columns on the residual's whole
-selection, not the run's rows, so a residual over every row decodes them once
-for all its runs. When the runs to compare are several and hold more than
-half the selection, the whole selection is compared once instead. A range
-starting mid-zone or an id list is
-classed on the zones it touches, each cut at the zone boundaries. A residual
-left pending (below) keeps its classes, and counts and windows by them.
+equalities left ([`Classes`](../core/src/store/scan/residual.rs#L155),
+[`ColumnZones::eq_holds`](../core/src/zone_stats/zone_map.rs#L198)): "none"
+where a code lies outside a zone's bounds or the zone's recorded graphs lack
+it, "all" where every bound column's zone bounds are its code, mixed
+otherwise (a test pins the classes to Vortex's falsifier on each zone). The
+selection's rows in "none" zones are skipped, those in "all" zones taken
+uncompared, and those in a mixed zone compared on the columns it leaves
+unsettled, adjacent zones of one class as one run
+([`ResidualCompare::rows`](../core/src/store/scan/residual.rs#L470)); when
+the runs to compare are several and hold more than half the selection, the
+whole selection is compared once instead. Each compare decides whether to
+decode its columns on the residual's whole selection, so a residual over
+every row decodes them once for all its runs. A residual left pending
+(below) keeps its classes, and counts and windows by them.
 
-With zones off (`VORTEX_RDF_ZONES=0`) the residual keeps its route from before
-the classes, bounds only
-([`unasked_classes`](../core/src/store/scan/residual.rs#L131)): past a zone's
-rows, the zones whose bounds leave a constrained column's code out are
-skipped and the rest compared, adjacent ones as one run, by the same walk as
-above, with no zone taken whole and none counted from a record or an
-encoding. A code most zones may hold (a predicate or graph spread over every
-zone) leaves everything to compare.
+With zones off (`VORTEX_RDF_ZONES=0`) only the bounds are read
+([`unasked_classes`](../core/src/store/scan/residual.rs#L122)): past a zone's
+rows, the zones whose bounds leave a code out are skipped and the rest
+compared, adjacent ones as one run, no zone taken whole and none counted
+from a record or an encoding. A code most zones may hold (a predicate or
+graph spread over every zone) leaves everything to compare.
 
 Then two implementations, in order:
 
@@ -551,36 +535,34 @@ than the rows the selection holds, and the selection holds more than one
 8,192-row piece, the compare is left pending
 ([`PendingResidual`](../core/src/store/view/pending.rs#L37)) as the view's
 selection (`ViewSelection::Residual`), as a deferred index run's ids are.
-With its zone classes, `size_capped` counts the zones in base order until
-the cap, and `window` counts each zone unread where it can be (below),
-skipping the zones before the window and those counted empty, then reads the
-matches from the zone holding its first to its last
-([`ResidualCompare::window`](../core/src/store/scan/residual.rs#L396)). A window
-of no rows reads nothing. Without them (zones off, or no zone map for its
-columns), both compare the selection in pieces, in base row order, a zone's
-rows first and four times as many each piece after, each through the
-implementations above, and stop at the piece that brings the live rows they
-need to their count ([`Classes::Pieces`](../core/src/store/scan/residual.rs#L167));
-a selection no wider than that count is one piece, compared at once and its
-matches kept as the view's ids. Any other consumer compares the whole
-selection at once. A window that reaches every row, a probe with keeps and
-`match_pattern` compare eagerly, as above. An ASK over a pattern every zone
-holds then compares the first piece, not the store, and the first piece is
-above the typed residual's caps, so the mask scan compares it.
+With zone classes, `size_capped` counts the zones in base order until the
+cap, and `window` counts each zone unread where it can be (below), skips the
+zones before the window and those counted empty, then reads the matches from
+the zone holding its first to its last
+([`ResidualCompare::window`](../core/src/store/scan/residual.rs#L444)); a
+window of no rows reads nothing. Without zone classes (zones off, or no zone
+map for its columns), both compare the selection in pieces, in base row
+order, a zone's rows first and four times as many each piece after, and stop
+at the piece that brings the live rows they need
+([`Classes::Pieces`](../core/src/store/scan/residual.rs#L168)); a selection
+no wider than that count is one piece, compared at once and its matches kept
+as the view's ids. Any other consumer compares the whole selection at once:
+a window that reaches every row, a probe with keeps and `match_pattern`. An
+ASK over a pattern every zone holds compares the first piece, not the store;
+the first piece is above the typed residual's caps, so the mask scan
+compares it.
 
 A count without a limit (`IdsNeed::Count`: `size` through `count_probe` and
-`count_code_pattern`) leaves the compare pending too, and counts it zone by
-zone on its zone classes, with no match materialized
-([`ResidualCompare::count`](../core/src/store/scan/residual.rs#L312)): a "none" zone
-counts nothing, an "all" zone its selected live rows, and a mixed zone with
-one column left to compare and no tombstone among its selected rows counts
-from the zone's recorded graphs when the selection holds the whole zone,
-else on the column's encoding over contiguous rows (the store's probe's
-`count_eq`); any other zone is compared, adjacent ones on the same columns
-as one run, and the runs as the materializing compare judges them (above).
-With zones off, or without zone maps, the count compares the whole selection
-once. Under tombstones a pending residual counts the same way where a count
-is asked without reading.
+`count_code_pattern`) leaves the compare pending too and counts it zone by
+zone, with no match materialized
+([`ResidualCompare::count`](../core/src/store/scan/residual.rs#L382)): a
+"none" zone counts nothing, an "all" zone its selected live rows, and a mixed
+zone with one column left to compare and no tombstone among its selected rows
+counts from the zone's recorded graphs when the selection holds the whole
+zone, else on the column's encoding over contiguous rows (the store's probe's
+`count_eq`); any other zone is compared, adjacent ones on the same columns as
+one run. With zones off, or without zone maps, the count compares the whole
+selection once.
 
 **Examples** (no index unless stated):
 
@@ -689,10 +671,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`file.rs:39-43`](../core/src/store/query/matching/file.rs#L39-L43 "existing_filter") | — |
-| 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L225), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L485) | [§8](#8-the-index-resolvers) |
+| 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L224), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L497) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`file.rs:22-91`](../core/src/store/query/matching/file.rs#L22-L91 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L253), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L802) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L819) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`file.rs:171-186`](../core/src/store/query/matching/file.rs#L171-L186 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L205) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -741,7 +723,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L802) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L819) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -768,16 +750,16 @@ turns the falsifier off, and the bounds alone prune.
 Dictionary layout pushes them) also takes the zones where every row holds
 every code without evaluating it: a zone whose bounds in each equality's
 column are both `c` cannot hold a differing row, the rule Vortex's pruning
-of `col != c` applies. Each split reads it off the quad table's zone maps
+of `col != c` applies. Each split takes them off the quad table's zone maps
 for its own zones
-([`every_row_zones`](../core/src/store/scan/file_filter.rs#L224)): the maps
-the file reads once per table and column on first use, which located runs
-read too ([`ZoneMaps`](../core/src/store/persist/native_file.rs#L242)), shared
-by the splits and the runs however many ask at once. The filter is then evaluated only
-over the split's other rows, after their own pruning. Counts and reads alike
-take them; a tombstoned row is not among them, as no split starts with it.
-`VORTEX_RDF_ZONES=0` (decided once per evaluation, on the calling thread)
-leaves the step out.
+([`every_row_zones`](../core/src/store/scan/file_filter.rs#L252)): the maps
+the file reads once per table and column
+([`ZoneMaps`](../core/src/zone_stats/file_maps.rs#L62)), shared with the
+located runs, and the equalities' zone checks over them, built once per
+evaluation. The filter is then evaluated only over the split's other rows,
+after their own pruning. Counts and reads alike take them; a tombstoned row
+is not among them, as no split starts with it. `VORTEX_RDF_ZONES=0` leaves
+the step out.
 
 **Example.** `(? a ? ?)` on the Dictionary file without indexes pushes
 `p = 4` down. The four-row file is one zone whose `p` statistics span `4..7`,

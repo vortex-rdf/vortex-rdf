@@ -148,7 +148,7 @@ async fn value_counts_round_trip() {
 }
 
 /// A store written under `ForcedValueCounts::set(false)` stands for one
-/// written before the statistic: no column records it.
+/// written without the statistic: no column records it.
 #[tokio::test]
 async fn forced_off_writes_no_value_counts() {
     let (_dir, path) = {

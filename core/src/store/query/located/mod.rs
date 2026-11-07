@@ -204,37 +204,32 @@ impl VortexRdfStore {
     /// [`run_probe`] instead, as
     /// [`match_code_pattern`](Self::match_code_pattern) does.
     ///
-    /// It answers on a whole, file-backed Dictionary-layout store (no tail,
-    /// tombstones or narrowing) when the bound slots are a prefix of a sorted
-    /// table's key order whose four code columns have chunk probes: the quad
-    /// table's `(s, p, o, g)` (a `quads_sorted` file), and the
-    /// secondary-by-copy children `index:posg`'s `(p, o, s, g)` and
-    /// `index:ospg`'s `(o, s, p, g)`. Rows come in that table's order. Bound
-    /// slots that are no such prefix (a bound slot after a free one) are the
-    /// run of the longest bound prefix, its rows checked against the others:
-    /// first by the file's footer statistics, which settle a slot for every
-    /// row; then zone by zone where the checked columns have zone maps; row
-    /// by row otherwise, when the run is no longer than [`GAP_ROWS`](statistics::GAP_ROWS). That
-    /// run gives way to a bound `p`'s or `o`'s run in its reference index
-    /// (`index:ref-p`, `index:ref-o`) that is strictly shorter and answers,
-    /// as a hub subject's quads do to its rare object's (`s?o`); when the
-    /// run does not answer, the shortest such run is read. A reference run's rows are read from the
-    /// quad table in its order, the other bound slots checked at them when
-    /// it is no longer than [`GAP_ROWS`](statistics::GAP_ROWS); a bound graph is checked on the
-    /// reference child's own `g` where it holds one, and when the graph is
-    /// the run's only check the child's zone maps decide it, at any length.
-    /// A code past the dictionary, or one in a position no quad holds,
-    /// matches nothing. Whether it answers depends on the store and
-    /// `pattern` alone, never on the window, so every window of one pattern
-    /// comes from the same table, in the same order. A run whose rows are
-    /// checked is counted whole: zone by zone where the statistics decide it
-    /// (zones they settle by their size, a mixed zone lying whole within the
-    /// run by the values its graph column recorded, the rest on the column's
-    /// encoding or by their rows), a block at a time otherwise, and only the
-    /// window's rows are kept; nothing is kept between calls. With the
-    /// ablation switch `VORTEX_RDF_LOCATE=0` ([`locate_enabled`]) it declines
-    /// every pattern.
+    /// A run answers on a whole, file-backed Dictionary-layout store (no
+    /// tail, tombstones or narrowing). The bound slots are searched as a
+    /// prefix of a sorted table's key order: the quad table's `(s, p, o, g)`
+    /// (a `quads_sorted` file), `index:posg`'s `(p, o, s, g)` or
+    /// `index:ospg`'s `(o, s, p, g)`, and rows come in that table's order.
+    /// Bound slots past a free one (`s ? ? g`, `? p ? g`) are checked on the
+    /// run of the longest bound prefix: by the file's footer bounds for the
+    /// whole file, then zone by zone where the checked columns have zone
+    /// maps, and row by row otherwise, up to [`GAP_ROWS`]. A bound `p` or
+    /// `o` has a run in its reference index too (`index:ref-p`,
+    /// `index:ref-o`), which answers in the prefix run's place when it is
+    /// strictly shorter (a hub subject's many quads give way to its rare
+    /// object's few, `s ? o`), or alone when no prefix run does: its rows are
+    /// read from the quad table, a bound graph checked on the child's own `g`
+    /// where it holds one, zone by zone at any length, and the other slots at
+    /// the quad table's rows, up to [`GAP_ROWS`].
     ///
+    /// A code past the dictionary, or in a position no quad holds, matches
+    /// nothing. Whether a run answers depends on the store and `pattern`
+    /// alone, so every window of one pattern comes from the same table, in
+    /// the same order. The count is of the whole run, zone by zone where the
+    /// statistics decide it and a block at a time otherwise; only the
+    /// window's rows are kept, and nothing between calls.
+    /// `VORTEX_RDF_LOCATE=0` ([`locate_enabled`]) declines every pattern.
+    ///
+    /// [`GAP_ROWS`]: statistics::GAP_ROWS
     /// [`match_pattern`]: VortexRdfStore::match_pattern
     /// [`run_probe`]: VortexRdfStore::run_probe
     pub async fn locate_codes(

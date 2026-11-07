@@ -77,10 +77,10 @@ impl ZoneSet {
             })
     }
 
-    /// This set classing by the bounds alone, as before the zone classes:
-    /// [`ZoneClass::None`] where a check's bounds rule its code out, else
-    /// [`ZoneClass::Mixed`] on every check, so no zone is taken whole and
-    /// no record is read. The route with zones off.
+    /// This set classing by the bounds alone: [`ZoneClass::None`] where a
+    /// check's bounds rule its code out, else [`ZoneClass::Mixed`] on every
+    /// check, so no zone is taken whole and no record is read. The route
+    /// with zones off (`VORTEX_RDF_ZONES=0`).
     pub(crate) fn bounds_only(self) -> Self {
         Self {
             bounds_only: true,

@@ -1,28 +1,27 @@
 //! The residual compare over an in-memory table ([`ResidualCompare`]): the
 //! equalities of a pattern no prefix search or index answered, over a
 //! selection of a table's rows, the base's or an index component's. The
-//! statistics settle what they can first ([`ask_statistics`]: the base
-//! columns' whole bounds, then their zones, which their zone maps keep, and
-//! against which the zones a selection touches are classed, [`Classes`]). Then one walk counts the
-//! matches ([`count`](ResidualCompare::count)), takes a window of them
-//! ([`window`](ResidualCompare::window)), or finds every one
+//! statistics settle what they can first ([`ask_statistics`]): the columns'
+//! whole bounds, then the zones the selection touches, classed against their
+//! zone maps ([`Classes`]). One walk then counts the matches
+//! ([`count`](ResidualCompare::count)), takes a window of them
+//! ([`window`](ResidualCompare::window)) or finds every one
 //! ([`rows`](ResidualCompare::rows)):
 //! - zone by zone where the zones are classed: "none" zones skipped, "all"
-//!   zones taken, mixed ones counted unread where a record or the column's
-//!   encoding counts them, else compared;
+//!   zones taken, mixed ones counted unread from a record or the column's
+//!   encoding where they can be, else compared;
 //! - in growing pieces where they are not (zones off, or no zone map), each
-//!   piece compared, skipping the zones whose bounds rule a code out where
-//!   the base keeps their zone maps.
+//!   piece compared, skipping the zones whose bounds rule a code out.
 //!
 //! A compare is the typed fast path or the mask scan over the base, and the
-//! graph column's encoding over a component. The mask of an array's rows
+//! graph column's encoding over a component; the mask of an array's rows
 //! holding the equalities ([`mask_for`]) is the tail's match's compare too.
-//! These are functions of the table, with no store state. The match narrows
-//! a selection with them, and two callers walk them only as far as they
-//! need: a residual compare left pending
+//! Nothing here holds store state: the match narrows a selection with these,
+//! and a residual left pending
 //! ([`PendingResidual`](crate::store::view::pending::PendingResidual)) and an
 //! index run's graph check
-//! ([`GraphCheck`](crate::store::indexes::graph_check::GraphCheck)).
+//! ([`GraphCheck`](crate::store::indexes::graph_check::GraphCheck)) walk only
+//! as far as they need.
 
 use std::convert::Infallible;
 use std::ops::Range;

@@ -180,7 +180,7 @@ impl ZoneFile {
     }
 
     /// Recording the graph columns' `vortexrdf.value_counts` (`true`), or
-    /// written as before them (`false`).
+    /// written without the statistic (`false`).
     fn value_counts(self, on: bool) -> Self {
         Self {
             value_counts: on,
@@ -189,7 +189,7 @@ impl ZoneFile {
     }
 
     /// Giving the reference children each row's graph (`true`), or written
-    /// as before that column (`false`).
+    /// without the column (`false`).
     fn reference_graphs(self, on: bool) -> Self {
         Self {
             reference_graphs: on,

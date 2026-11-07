@@ -76,10 +76,10 @@ pub(crate) fn zones_switch() -> bool {
 }
 
 /// Whether reads decide their checked rows by the statistics: located runs
-/// zone by zone, and the in-memory residual by its columns' array
-/// statistics. `VORTEX_RDF_ZONES=0` ([`zones_switch`]) puts every read on
-/// its row-by-row route, as before the statistics were asked; a test may
-/// force it for its thread ([`ForcedZones`]).
+/// zone by zone, and the in-memory residual by its columns' zone maps.
+/// `VORTEX_RDF_ZONES=0` ([`zones_switch`]) puts every read on its
+/// row-by-row route; a test may force either for its thread
+/// ([`ForcedZones`]).
 ///
 /// [`ForcedZones`]: crate::store::test_hooks::ForcedZones
 pub(crate) fn zones_enabled() -> bool {
