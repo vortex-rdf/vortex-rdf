@@ -39,11 +39,9 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          # Shared with `rust-tests`: clippy compiles *dependencies* with plain
-          # rustc (only workspace crates go through clippy-driver), so the two
-          # jobs' native dev-profile dependency artifacts are the same build.
-          # The wasm32 clippy's artifacts are this job's alone: they are in the
-          # shared entry only when this job is the one that saves it.
+          # This job's own entry, the wasm32 clippy's artifacts with it:
+          # `cargo clippy` only checks dependencies (metadata, no code), so
+          # `rust-tests`, which compiles them, keeps an entry of its own.
           shared-key: dev
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run fmt and clippy
@@ -59,7 +57,10 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: dev
+          # Not the lint job's `dev` entry: that job finishes first and saves
+          # the shared key, and its checked dependencies hold no code, so this
+          # job compiled its ~325 dependencies on every run.
+          shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Rust tests
         run: scripts/ci-check.sh rust-tests

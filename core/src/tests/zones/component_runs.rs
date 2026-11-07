@@ -68,44 +68,53 @@ async fn assert_runs_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
     }
 }
 
-/// Every graph layout's store with `index`, built, loaded from its file in
-/// memory and adopted from its bytes, each also with a tombstone in every
-/// zone and with a tail: zones on or off, every index-run probe answers the
-/// same.
-async fn assert_component_runs_answer_as_rows_do(index: IndexConfig) {
-    for graphs in ZONE_GRAPHS {
-        let built = built_store(
-            zone_quads(graphs),
-            LayoutStrategy::Dictionary,
-            index.types(),
-        )
-        .await;
-        let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
-        let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-        for (backend, store) in [("built", built), ("loaded", loaded), ("adopted", adopted)] {
-            let tag = format!("{graphs:?} {} {backend}", index.name());
-            assert_runs_answer_as_rows_do(&tag, &store).await;
-            assert_runs_answer_as_rows_do(&format!("{tag} tombstoned"), &tombstoned(&store).await)
-                .await;
-            assert_runs_answer_as_rows_do(&format!("{tag} tailed"), &tailed(&store).await).await;
-        }
+/// `graphs`' store with `index`, built, loaded from its file in memory and
+/// adopted from its bytes, each also with a tombstone in every zone and
+/// with a tail: zones on or off, every index-run probe answers the same.
+async fn assert_component_runs_answer_as_rows_do(index: IndexConfig, graphs: Graphs) {
+    let built = built_store(
+        zone_quads(graphs),
+        LayoutStrategy::Dictionary,
+        index.types(),
+    )
+    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
+    let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    for (backend, store) in [("built", built), ("loaded", loaded), ("adopted", adopted)] {
+        let tag = format!("{graphs:?} {} {backend}", index.name());
+        assert_runs_answer_as_rows_do(&tag, &store).await;
+        assert_runs_answer_as_rows_do(&format!("{tag} tombstoned"), &tombstoned(&store).await)
+            .await;
+        assert_runs_answer_as_rows_do(&format!("{tag} tailed"), &tailed(&store).await).await;
     }
 }
 
 /// Zones on or off, a by-copy index run bound to a graph answers the same:
-/// counts, windows and every row in order.
-#[tokio::test]
-async fn component_runs_answer_as_rows_do_by_copy() {
-    assert_component_runs_answer_as_rows_do(IndexConfig::Copy).await;
+/// counts, windows and every row in order. One test per layout.
+mod component_runs_answer_as_rows_do_by_copy {
+    use super::*;
+
+    /// The by-copy runs of `graphs`.
+    async fn by_copy(graphs: Graphs) {
+        assert_component_runs_answer_as_rows_do(IndexConfig::Copy, graphs).await;
+    }
+
+    layout_tests!(zone_graphs: by_copy);
 }
 
 /// Zones on or off, a by-reference index run bound to a graph answers the
-/// same: counts, windows and every row in order.
-#[tokio::test]
-async fn component_runs_answer_as_rows_do_by_reference() {
-    assert_component_runs_answer_as_rows_do(IndexConfig::Reference).await;
+/// same: counts, windows and every row in order. One test per layout.
+mod component_runs_answer_as_rows_do_by_reference {
+    use super::*;
+
+    /// The by-reference runs of `graphs`.
+    async fn by_reference(graphs: Graphs) {
+        assert_component_runs_answer_as_rows_do(IndexConfig::Reference, graphs).await;
+    }
+
+    layout_tests!(zone_graphs: by_reference);
 }
 
 /// `(? type ? g1)` on `Graphs::Alternating`, by copy and by reference, in

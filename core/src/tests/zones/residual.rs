@@ -39,30 +39,31 @@ async fn assert_zones_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
 
 /// Zones on or off, a residual answers the same: counts, windows and every
 /// row in order, on built and loaded stores of every graph layout, with no
-/// index and with the copy index, and with tombstones and a tail.
-#[tokio::test]
-async fn residual_zones_answer_as_rows_do() {
-    for graphs in ZONE_GRAPHS {
-        for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
-            let built = built_store(
-                zone_quads(graphs),
-                LayoutStrategy::Dictionary,
-                index.types(),
-            )
-            .await;
-            let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
-            let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-            for (backend, store) in [("built", built), ("loaded", loaded)] {
-                let tag = format!("{graphs:?} {index:?} {backend}");
-                assert_zones_answer_as_rows_do(&tag, &store).await;
-                assert_zones_answer_as_rows_do(
-                    &format!("{tag} tombstoned"),
-                    &tombstoned(&store).await,
-                )
+/// index and with the copy index, and with tombstones and a tail. One test
+/// per layout.
+mod residual_zones_answer_as_rows_do {
+    use super::*;
+
+    layout_tests!(zone_graphs: residual_zones_answer_as_rows_do_on);
+}
+
+/// [`residual_zones_answer_as_rows_do`] on the stores of `graphs`.
+async fn residual_zones_answer_as_rows_do_on(graphs: Graphs) {
+    for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
+        let built = built_store(
+            zone_quads(graphs),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
+        let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+        for (backend, store) in [("built", built), ("loaded", loaded)] {
+            let tag = format!("{graphs:?} {index:?} {backend}");
+            assert_zones_answer_as_rows_do(&tag, &store).await;
+            assert_zones_answer_as_rows_do(&format!("{tag} tombstoned"), &tombstoned(&store).await)
                 .await;
-                assert_zones_answer_as_rows_do(&format!("{tag} tailed"), &tailed(&store).await)
-                    .await;
-            }
+            assert_zones_answer_as_rows_do(&format!("{tag} tailed"), &tailed(&store).await).await;
         }
     }
 }
