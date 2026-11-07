@@ -10,14 +10,15 @@
 
 use crate::bitpacked::PackedNode;
 use crate::delta::DeltaNode;
-use crate::search::{partition, search_ascending, search_ascending_capped};
+use crate::search::{EqSink, partition, search_ascending, search_ascending_capped};
 use crate::words::Words;
+use std::ops::Range;
 
 /// Values per FastLanes chunk: the stride of a chunked FoR's references and
 /// of a run-length array's value offsets.
 pub(crate) const FL_CHUNK: usize = vortex_fastlanes::FL_CHUNK_SIZE;
 
-/// Values a dictionary may hold for [`Node::count_eq`] to scan them for a
+/// Values a dictionary may hold for [`Node::eq_into`] to scan them for a
 /// needle's codes; a larger one is counted by reading.
 const DICT_SCAN: usize = 4_096;
 
@@ -253,17 +254,8 @@ impl Node<'_> {
                 offset,
                 ..
             } => {
-                let first = (start + offset) as u64;
-                let mut run = partition(ends.len(), |r| ends.value_at(r) <= first);
-                let mut end = ends.value_at(run);
-                let mut value = values.value_at(run);
-                for (pos, o) in (first..).zip(out.iter_mut()) {
-                    while pos >= end {
-                        run += 1;
-                        end = ends.value_at(run);
-                        value = values.value_at(run);
-                    }
-                    *o = value;
+                for (run, value) in runs_in(ends, values, *offset, start, out.len()) {
+                    out[run].fill(value);
                 }
             }
             Node::FoR { reference, child } => {
@@ -287,15 +279,8 @@ impl Node<'_> {
                 child, start: at, ..
             } => child.read_into(at + start, out),
             Node::Chunked { chunks, .. } => {
-                let mut c = partition(chunks.len(), |c| chunks[c].start <= start) - 1;
-                let mut done = 0;
-                while done < out.len() {
-                    let chunk = &chunks[c];
-                    let from = start + done - chunk.start;
-                    let take = (chunk.node.len() - from).min(out.len() - done);
-                    chunk.node.read_into(from, &mut out[done..done + take]);
-                    done += take;
-                    c += 1;
+                for (node, from, take, done) in chunk_windows(chunks, start, out.len()) {
+                    node.read_into(from, &mut out[done..done + take]);
                 }
             }
             // A code is below the values' length (a construction invariant),
@@ -319,118 +304,30 @@ impl Node<'_> {
         }
     }
 
-    /// How many of the values at `start..start + len` equal `needle`, counted
-    /// on the encoding where it allows: a constant at once, a sequence by
+    /// The values at `start..start + len` equal to `needle`, into `sink` as
+    /// the offsets `base + k` of the values at `start + k`, ascending: found
+    /// on the encoding where it allows (a constant at once, a sequence by
     /// arithmetic, run ends by their runs, a frame of reference against the
-    /// shifted needle, a small dictionary's codes against the needle's codes,
+    /// shifted needle, a small dictionary's codes against the needle's code,
     /// unpatched bit-packed values a 1024-value chunk at a time, words as
-    /// they are; any other encoding read a 1024-value block at a time.
-    /// Requires `start + len <= self.len()` but no sortedness.
-    pub(crate) fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
-        if len == 0 {
-            return 0;
-        }
-        match self {
-            Node::Primitive(w) => w.count_eq(start, len, needle),
-            Node::Constant { value, .. } => {
-                if *value == needle {
-                    len
-                } else {
-                    0
-                }
-            }
-            Node::Sequence {
-                base, multiplier, ..
-            } => {
-                let Some(step) = needle.checked_sub(*base) else {
-                    return 0;
-                };
-                let at = step / multiplier;
-                usize::from(
-                    step % multiplier == 0 && (start as u64..(start + len) as u64).contains(&at),
-                )
-            }
-            Node::RunEnd {
-                ends,
-                values,
-                offset,
-                ..
-            } => {
-                let (first, last) = ((start + offset) as u64, (start + offset + len) as u64);
-                let mut run = partition(ends.len(), |r| ends.value_at(r) <= first);
-                let (mut at, mut count) = (first, 0);
-                while at < last {
-                    let end = ends.value_at(run).min(last);
-                    if values.value_at(run) == needle {
-                        count += end - at;
-                    }
-                    at = end;
-                    run += 1;
-                }
-                count as usize
-            }
-            Node::FoR { reference, child } => match needle.checked_sub(*reference) {
-                Some(shifted) => child.count_eq(start, len, shifted),
-                None => 0,
-            },
-            Node::Slice {
-                child, start: at, ..
-            } => child.count_eq(at + start, len, needle),
-            Node::Chunked { chunks, .. } => {
-                let mut c = partition(chunks.len(), |c| chunks[c].start <= start) - 1;
-                let (mut done, mut count) = (0, 0);
-                while done < len {
-                    let chunk = &chunks[c];
-                    let from = start + done - chunk.start;
-                    let take = (chunk.node.len() - from).min(len - done);
-                    count += chunk.node.count_eq(from, take, needle);
-                    done += take;
-                    c += 1;
-                }
-                count
-            }
-            // A dictionary small enough to scan maps the needle to its codes
-            // once, then counts those in its codes.
-            Node::Dict { codes, values } if values.len() <= DICT_SCAN => (0..values.len())
-                .filter(|&code| values.value_at(code) == needle)
-                .map(|code| codes.count_eq(start, len, code as u64))
-                .sum(),
-            Node::BitPacked(p) if p.patches().is_none() => p.count_eq(start, len, needle),
-            _ => {
-                let mut block = [0u64; FL_CHUNK];
-                let (mut at, end, mut count) = (start, start + len, 0);
-                while at < end {
-                    let n = (end - at).min(FL_CHUNK);
-                    self.read_into(at, &mut block[..n]);
-                    count += block[..n].iter().filter(|&&v| v == needle).count();
-                    at += n;
-                }
-                count
-            }
-        }
-    }
-
-    /// The offsets `base + k` of the values at `start + k`, `k < len`, that
-    /// equal `needle`, ascending, appended to `out`: found on the encoding
-    /// where [`count_eq`](Self::count_eq) counts on it, and read a 1024-value
-    /// block at a time otherwise. Requires `start + len <= self.len()` but no
-    /// sortedness.
-    pub(crate) fn eq_offsets(
+    /// they are), and read otherwise ([`Self::eq_into_read`]). Requires
+    /// `start + len <= self.len()` but no sortedness.
+    pub(crate) fn eq_into<S: EqSink>(
         &self,
         start: usize,
         len: usize,
         needle: u64,
         base: usize,
-        out: &mut Vec<usize>,
+        sink: &mut S,
     ) {
         if len == 0 {
             return;
         }
         match self {
-            Node::Primitive(w) => w.eq_offsets(start, len, needle, base, out),
+            Node::Primitive(w) => w.eq_into(start, len, needle, base, sink),
             Node::Constant { value, .. } => {
                 if *value == needle {
-                    out.extend(base..base + len);
+                    sink.run(base..base + len);
                 }
             }
             Node::Sequence {
@@ -443,7 +340,8 @@ impl Node<'_> {
                     && let Ok(at) = usize::try_from(step / multiplier)
                     && (start..start + len).contains(&at)
                 {
-                    out.push(base + at - start);
+                    let at = base + at - start;
+                    sink.run(at..at + 1);
                 }
             }
             Node::RunEnd {
@@ -452,75 +350,63 @@ impl Node<'_> {
                 offset,
                 ..
             } => {
-                let (first, last) = ((start + offset) as u64, (start + offset + len) as u64);
-                let mut run = partition(ends.len(), |r| ends.value_at(r) <= first);
-                let mut at = first;
-                while at < last {
-                    let end = ends.value_at(run).min(last);
-                    if values.value_at(run) == needle {
-                        // Run positions below `last` fit the window's `usize`.
-                        out.extend(base + (at - first) as usize..base + (end - first) as usize);
+                for (run, value) in runs_in(ends, values, *offset, start, len) {
+                    if value == needle {
+                        sink.run(base + run.start..base + run.end);
                     }
-                    at = end;
-                    run += 1;
                 }
             }
             Node::FoR { reference, child } => {
                 if let Some(shifted) = needle.checked_sub(*reference) {
-                    child.eq_offsets(start, len, shifted, base, out);
+                    child.eq_into(start, len, shifted, base, sink);
                 }
             }
             Node::Slice {
                 child, start: at, ..
-            } => child.eq_offsets(at + start, len, needle, base, out),
+            } => child.eq_into(at + start, len, needle, base, sink),
             Node::Chunked { chunks, .. } => {
-                let mut c = partition(chunks.len(), |c| chunks[c].start <= start) - 1;
-                let mut done = 0;
-                while done < len {
-                    let chunk = &chunks[c];
-                    let from = start + done - chunk.start;
-                    let take = (chunk.node.len() - from).min(len - done);
-                    chunk.node.eq_offsets(from, take, needle, base + done, out);
-                    done += take;
-                    c += 1;
+                for (node, from, take, done) in chunk_windows(chunks, start, len) {
+                    node.eq_into(from, take, needle, base + done, sink);
                 }
             }
             // A dictionary small enough to scan maps the needle to its code
-            // once, then finds that code in its codes; a needle under several
-            // codes reads, which keeps the offsets ascending.
-            Node::Dict { codes, values }
-                if values.len() <= DICT_SCAN
-                    && (0..values.len())
-                        .filter(|&code| values.value_at(code) == needle)
-                        .take(2)
-                        .count()
-                        < 2 =>
-            {
-                if let Some(code) = (0..values.len()).find(|&code| values.value_at(code) == needle)
-                {
-                    codes.eq_offsets(start, len, code as u64, base, out);
+            // once, then searches its codes for that code; a needle under
+            // several codes reads the window, which keeps the offsets
+            // ascending.
+            Node::Dict { codes, values } if values.len() <= DICT_SCAN => {
+                let mut matching =
+                    (0..values.len()).filter(|&code| values.value_at(code) == needle);
+                match (matching.next(), matching.next()) {
+                    (None, _) => {}
+                    (Some(code), None) => codes.eq_into(start, len, code as u64, base, sink),
+                    (Some(_), Some(_)) => self.eq_into_read(start, len, needle, base, sink),
                 }
             }
             Node::BitPacked(p) if p.patches().is_none() => {
-                p.eq_offsets(start, len, needle, base, out)
+                p.eq_into(start, len, needle, base, sink)
             }
-            _ => {
-                let mut block = [0u64; FL_CHUNK];
-                let (mut at, end) = (start, start + len);
-                while at < end {
-                    let n = (end - at).min(FL_CHUNK);
-                    self.read_into(at, &mut block[..n]);
-                    let from = base + at - start;
-                    out.extend(
-                        block[..n]
-                            .iter()
-                            .enumerate()
-                            .filter(|&(_, &v)| v == needle)
-                            .map(|(k, _)| from + k),
-                    );
-                    at += n;
-                }
-            }
+            _ => self.eq_into_read(start, len, needle, base, sink),
+        }
+    }
+
+    /// [`Self::eq_into`] by reading the window a 1024-value block at a time.
+    /// Out of line, so the block is reserved only by the searches that read.
+    #[inline(never)]
+    fn eq_into_read<S: EqSink>(
+        &self,
+        start: usize,
+        len: usize,
+        needle: u64,
+        base: usize,
+        sink: &mut S,
+    ) {
+        let mut block = [0u64; FL_CHUNK];
+        let (mut at, end) = (start, start + len);
+        while at < end {
+            let n = (end - at).min(FL_CHUNK);
+            self.read_into(at, &mut block[..n]);
+            sink.matching(base + at - start, &block[..n], needle);
+            at += n;
         }
     }
 
@@ -710,6 +596,54 @@ fn chunked_for_value_at(references: &Node<'_>, offset: usize, child: &Node<'_>, 
     child
         .value_at(i)
         .wrapping_add(references.value_at((offset + i) / FL_CHUNK))
+}
+
+/// The chunks of a [`Node::Chunked`] that the window `start..start + len`
+/// reaches, in order, each as `(node, from, take, done)`: the window's
+/// `take` values from the chunk's `from`, after the `done` values before
+/// them. Requires `0 < len` and `start + len <= ` the chunks' length.
+fn chunk_windows<'n, 'a>(
+    chunks: &'n [Chunk<'a>],
+    start: usize,
+    len: usize,
+) -> impl Iterator<Item = (&'n Node<'a>, usize, usize, usize)> {
+    let first = partition(chunks.len(), |c| chunks[c].start <= start) - 1;
+    let mut done = 0;
+    chunks[first..].iter().map_while(move |chunk| {
+        (done < len).then(|| {
+            let from = start + done - chunk.start;
+            let take = (chunk.node.len() - from).min(len - done);
+            let window = (&chunk.node, from, take, done);
+            done += take;
+            window
+        })
+    })
+}
+
+/// The runs of a [`Node::RunEnd`] that the window `start..start + len`
+/// reaches, in order, each as its offsets in the window and its value: the
+/// first run found once, the rest walked.
+fn runs_in<'n>(
+    ends: &'n Node<'_>,
+    values: &'n Node<'_>,
+    offset: usize,
+    start: usize,
+    len: usize,
+) -> impl Iterator<Item = (Range<usize>, u64)> + 'n {
+    let (first, last) = ((start + offset) as u64, (start + offset + len) as u64);
+    let mut run = partition(ends.len(), |r| ends.value_at(r) <= first);
+    let mut at = first;
+    std::iter::from_fn(move || {
+        (at < last).then(|| {
+            let end = ends.value_at(run).min(last);
+            // Run positions below `last` fit the window's `usize`.
+            let window = (at - first) as usize..(end - first) as usize;
+            let item = (window, values.value_at(run));
+            at = end;
+            run += 1;
+            item
+        })
+    })
 }
 
 /// Position `q` among `len` positions, clamped to `len`. A quotient the index

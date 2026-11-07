@@ -1,6 +1,8 @@
 //! A canonical buffer of unsigned words, borrowed at its own width: the
 //! leaves of the probe tree, and the packed buffer a bit-packed node unpacks.
 
+use crate::search::EqSink;
+
 /// Typed borrow of a canonical primitive buffer, one variant per unsigned width.
 pub(crate) enum Words<'a> {
     U8(&'a [u8]),
@@ -54,54 +56,33 @@ impl Words<'_> {
         }
     }
 
-    /// How many of the words at `start..start + len` equal `needle`.
-    pub(crate) fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
-        fn count<T: Copy + PartialEq + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
-            match T::try_from(needle) {
-                Ok(n) => s.iter().filter(|&&v| v == n).count(),
-                Err(_) => 0,
-            }
-        }
-        let end = start + len;
-        match self {
-            Words::U8(s) => count(&s[start..end], needle),
-            Words::U16(s) => count(&s[start..end], needle),
-            Words::U32(s) => count(&s[start..end], needle),
-            Words::U64(s) => count(&s[start..end], needle),
-        }
-    }
-
-    /// The offsets `base + k` of the words at `start + k`, `k < len`, that
-    /// equal `needle`, ascending, appended to `out`.
-    pub(crate) fn eq_offsets(
+    /// The words at `start..start + len` equal to `needle`, into `sink` as
+    /// the offsets `base + k` of the words at `start + k`. A needle wider
+    /// than the words matches none of them.
+    pub(crate) fn eq_into<S: EqSink>(
         &self,
         start: usize,
         len: usize,
         needle: u64,
         base: usize,
-        out: &mut Vec<usize>,
+        sink: &mut S,
     ) {
-        fn push<T: Copy + PartialEq + TryFrom<u64>>(
-            s: &[T],
+        fn find<T: Copy + PartialEq + TryFrom<u64>, S: EqSink>(
+            words: &[T],
             needle: u64,
             base: usize,
-            out: &mut Vec<usize>,
+            sink: &mut S,
         ) {
-            if let Ok(n) = T::try_from(needle) {
-                out.extend(
-                    s.iter()
-                        .enumerate()
-                        .filter(|&(_, &v)| v == n)
-                        .map(|(k, _)| base + k),
-                );
+            if let Ok(needle) = T::try_from(needle) {
+                sink.matching(base, words, needle);
             }
         }
         let end = start + len;
         match self {
-            Words::U8(s) => push(&s[start..end], needle, base, out),
-            Words::U16(s) => push(&s[start..end], needle, base, out),
-            Words::U32(s) => push(&s[start..end], needle, base, out),
-            Words::U64(s) => push(&s[start..end], needle, base, out),
+            Words::U8(s) => find(&s[start..end], needle, base, sink),
+            Words::U16(s) => find(&s[start..end], needle, base, sink),
+            Words::U32(s) => find(&s[start..end], needle, base, sink),
+            Words::U64(s) => find(&s[start..end], needle, base, sink),
         }
     }
 

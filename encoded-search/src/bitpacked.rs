@@ -5,6 +5,7 @@
 //! unpack relies on what [`PackedNode::new`] checks.
 
 use crate::node::{FL_CHUNK, PatchProbe};
+use crate::search::EqSink;
 use crate::words::Words;
 
 /// Bit-packed words plus the packing parameters needed for point extraction.
@@ -119,61 +120,29 @@ impl PackedNode<'_> {
         }
     }
 
-    /// How many of the values at `start..start + len` equal `needle`, the
-    /// packed words unpacked a 1024-value FastLanes chunk at a time. Requires
-    /// no patches.
-    pub(crate) fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
-        fn count<T>(
-            node: &PackedNode<'_>,
-            packed: &[T],
-            start: usize,
-            len: usize,
-            needle: u64,
-        ) -> usize
-        where
-            T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
-        {
-            let first = node.offset + start;
-            let mut chunk = [T::default(); FL_CHUNK];
-            let mut count = 0;
-            for (c, part) in chunk_parts(first, first + len) {
-                node.unpack_chunk(packed, c, &mut chunk);
-                count += chunk[part].iter().filter(|&&v| v.into() == needle).count();
-            }
-            count
-        }
-        debug_assert!(self.patches.is_none(), "a patched node counts by reading");
-        if self.bit_width == 0 {
-            return if needle == 0 { len } else { 0 };
-        }
-        match &self.packed {
-            Words::U8(s) => count(self, s, start, len, needle),
-            Words::U16(s) => count(self, s, start, len, needle),
-            Words::U32(s) => count(self, s, start, len, needle),
-            Words::U64(s) => count(self, s, start, len, needle),
-        }
-    }
-
-    /// The offsets `base + k` of the values at `start + k`, `k < len`, that
-    /// equal `needle`, ascending, appended to `out`: the packed words
-    /// unpacked a 1024-value FastLanes chunk at a time, as
-    /// [`count_eq`](Self::count_eq) counts them. Requires no patches.
-    pub(crate) fn eq_offsets(
+    /// The values at `start..start + len` equal to `needle`, into `sink` as
+    /// the offsets `base + k` of the values at `start + k`: the packed words
+    /// unpacked a 1024-value FastLanes chunk at a time. Requires no patches.
+    pub(crate) fn eq_into<S: EqSink>(
         &self,
         start: usize,
         len: usize,
         needle: u64,
         base: usize,
-        out: &mut Vec<usize>,
+        sink: &mut S,
     ) {
-        fn push<T>(
+        fn find<T, S: EqSink>(
             node: &PackedNode<'_>,
             packed: &[T],
             (start, len, needle, base): (usize, usize, u64, usize),
-            out: &mut Vec<usize>,
+            sink: &mut S,
         ) where
-            T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
+            T: vortex_array::dtype::NativePType + fastlanes::BitPacking + TryFrom<u64> + Default,
         {
+            // A needle wider than the words matches none of them.
+            let Ok(needle) = T::try_from(needle) else {
+                return;
+            };
             let first = node.offset + start;
             let mut chunk = [T::default(); FL_CHUNK];
             for (c, part) in chunk_parts(first, first + len) {
@@ -181,28 +150,22 @@ impl PackedNode<'_> {
                 // The chunk's position `part.start + j` is the window's
                 // offset `c * 1024 + part.start + j - first`.
                 let at = base + c * FL_CHUNK + part.start - first;
-                out.extend(
-                    chunk[part]
-                        .iter()
-                        .enumerate()
-                        .filter(|&(_, &v)| v.into() == needle)
-                        .map(|(j, _)| at + j),
-                );
+                sink.matching(at, &chunk[part], needle);
             }
         }
-        debug_assert!(self.patches.is_none(), "a patched node finds by reading");
+        debug_assert!(self.patches.is_none(), "a patched node searches by reading");
         if self.bit_width == 0 {
             if needle == 0 {
-                out.extend(base..base + len);
+                sink.run(base..base + len);
             }
             return;
         }
         let window = (start, len, needle, base);
         match &self.packed {
-            Words::U8(s) => push(self, s, window, out),
-            Words::U16(s) => push(self, s, window, out),
-            Words::U32(s) => push(self, s, window, out),
-            Words::U64(s) => push(self, s, window, out),
+            Words::U8(s) => find(self, s, window, sink),
+            Words::U16(s) => find(self, s, window, sink),
+            Words::U32(s) => find(self, s, window, sink),
+            Words::U64(s) => find(self, s, window, sink),
         }
     }
 

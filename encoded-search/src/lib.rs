@@ -208,7 +208,9 @@ impl<'a> SortedProbe<'a> {
             start.checked_add(len).is_some_and(|end| end <= self.len()),
             "{len} values from {start} out of bounds"
         );
-        self.root.count_eq(start, len, needle)
+        let mut count = search::Count(0);
+        self.root.eq_into(start, len, needle, 0, &mut count);
+        count.0
     }
 
     /// The offsets `k` in `0..len` whose value at `start + k` equals `needle`,
@@ -225,7 +227,8 @@ impl<'a> SortedProbe<'a> {
             start.checked_add(len).is_some_and(|end| end <= self.len()),
             "{len} values from {start} out of bounds"
         );
-        self.root.eq_offsets(start, len, needle, 0, out);
+        self.root
+            .eq_into(start, len, needle, 0, &mut search::Offsets(out));
     }
 
     /// The exact values at `indices`, in their order, into `out`: each run of
