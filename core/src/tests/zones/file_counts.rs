@@ -25,8 +25,9 @@ fn graph_of(i: usize) -> GraphName {
     iri_graph(name)
 }
 
-/// [`ROWS`] quads `(s{i:05}, type, "Taxon", graph_of(i))`, in row order:
-/// Group 4i's layout, its last zone split between two graphs.
+/// [`ROWS`] quads `(s{i:05}, type, "Taxon", graph_of(i))`, in row order: the
+/// layout of the located bench's whole file (its `whole_*` cells), its last
+/// zone split between two graphs.
 fn whole_quads() -> Vec<Quad> {
     (0..ROWS)
         .map(|i| {
