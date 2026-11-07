@@ -51,6 +51,7 @@ compile_error!(
 
 pub mod columns;
 pub mod common;
+pub mod counters;
 pub(crate) mod debug;
 mod error;
 pub mod io;

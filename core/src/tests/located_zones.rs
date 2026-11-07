@@ -1523,10 +1523,9 @@ async fn gap_cap_only_where_zones_cannot_decide() {
 /// zones and counts mixed ones (a no-op without the variable).
 #[tokio::test]
 async fn zone_counters_count_decisions() {
+    use crate::counters::{ZONE_ALL, ZONE_COUNTED, ZONE_NONE, ZONE_RECORDED, snapshot};
     use crate::store::test_hooks::ForcedZones;
-    use vortex_rdf_encoded_search::counters::{
-        ZONE_ALL, ZONE_COUNTED, ZONE_NONE, ZONE_RECORDED, on, snapshot,
-    };
+    use vortex_rdf_encoded_search::counters::on;
 
     if !on() {
         return;

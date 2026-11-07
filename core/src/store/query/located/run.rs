@@ -17,15 +17,9 @@ use vortex_layout::segments::SegmentSource;
 use vortex_rdf_encoded_search::ColumnChunks;
 use vortex_session::VortexSession;
 
+use crate::counters::{self, note};
 use crate::io::zone_set::{ZoneClass, ZonePart, ZoneSet};
 use crate::store::read::live::WindowCursor;
-use vortex_rdf_encoded_search::counters;
-
-/// One located run's zone decision of `rows` rows at counter site `site`
-/// (`VORTEX_RDF_COUNTERS=1`).
-pub(super) fn note(site: usize, rows: u64) {
-    counters::note(site, rows as usize);
-}
 
 /// A column's chunk-probe handle.
 pub(super) type Chunks = Arc<ColumnChunks>;

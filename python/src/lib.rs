@@ -150,11 +150,12 @@ impl CancelToken {
     }
 }
 
-/// The encoded-search work counters (`VORTEX_RDF_COUNTERS=1`; all zero otherwise), by name.
+/// The work counters (`VORTEX_RDF_COUNTERS=1`; all zero otherwise), by name: the encoded search's and the
+/// store's zone decisions.
 #[pyfunction]
 fn engine_counters() -> std::collections::HashMap<&'static str, u64> {
-    use vortex_rdf_encoded_search::counters::{NAMES, snapshot};
-    NAMES.into_iter().zip(snapshot()).collect()
+    use vortex_rdf_core::counters::{ENGINE_NAMES, engine_snapshot};
+    ENGINE_NAMES.into_iter().zip(engine_snapshot()).collect()
 }
 
 #[pymodule]

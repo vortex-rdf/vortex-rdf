@@ -517,15 +517,15 @@ pub extern "system" fn Java_org_vortexrdf_Native_hasDictionary<'local>(
     call(&mut env, |_| Ok(store(h).has_dictionary()))
 }
 
-/// vortex-rdf's encoded-search work counters (`VORTEX_RDF_COUNTERS=1`; all zero otherwise), cumulative in this
-/// process, in [`Java_org_vortexrdf_Native_engineCounterNames`] order.
+/// vortex-rdf's work counters (`VORTEX_RDF_COUNTERS=1`; all zero otherwise): the encoded search's, then the
+/// store's zone decisions, cumulative in this process, in [`Java_org_vortexrdf_Native_engineCounterNames`] order.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_vortexrdf_Native_engineCounters<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
 ) -> JLongArray<'local> {
     call(&mut env, |env| {
-        let values = vortex_rdf_encoded_search::counters::snapshot().map(|v| v as i64);
+        let values = vortex_rdf_core::counters::engine_snapshot().map(|v| v as i64);
         java_longs(env, &values)
     })
 }
@@ -537,7 +537,7 @@ pub extern "system" fn Java_org_vortexrdf_Native_engineCounterNames<'local>(
     _: JClass<'local>,
 ) -> JObjectArray<'local, JString<'local>> {
     call(&mut env, |env| {
-        let names = vortex_rdf_encoded_search::counters::NAMES;
+        let names = vortex_rdf_core::counters::ENGINE_NAMES;
         java_strings(env, names.iter().map(|&n| Some(n)))
     })
 }
