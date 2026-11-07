@@ -3,8 +3,8 @@
 //! gap run) checked against the slots past it, or a bound `p`'s or `o`'s
 //! run in its reference index, whichever is shorter and answers.
 
-use super::run::*;
-use super::statistics::*;
+use super::run::{Check, CheckKind, Chunks, Columns, LocatedRun, OtherReference, RunTable, Source};
+use super::statistics::{admit, gap_rows};
 use super::{CodePattern, locate_enabled};
 use crate::error::Result;
 use crate::observe::observe;

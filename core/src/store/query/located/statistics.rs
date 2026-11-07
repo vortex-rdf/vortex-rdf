@@ -2,7 +2,7 @@
 //! slot for the whole file, then the zone maps class the run's zones
 //! against the slots left, asked once, when a read first needs them.
 
-use super::run::*;
+use super::run::{Check, LocatedRun};
 use crate::counters::{self, note};
 use crate::error::Result;
 use crate::observe::observe;

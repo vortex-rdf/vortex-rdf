@@ -24,19 +24,20 @@ use vortex_buffer::Buffer;
 
 use crate::common::terms::{self, Trust};
 use crate::error::{Result, VortexRdfError};
+use crate::store::VortexRdfStore;
+use crate::store::read::chunks::check_batch;
+use crate::store::schema::TermCode;
+use crate::{CodeChunkStream, DictReader, KindRanges, Probe, QuadColumn};
 
 /// Whether [`VortexRdfStore::locate_codes`] answers at all, and
-/// [`VortexRdfStore::match_code_chunks`] reads a located run: `VORTEX_RDF_LOCATE=0` (an ablation switch, read
-/// once) makes them decline every pattern, so callers take the general match. Unset is on.
+/// [`VortexRdfStore::match_code_chunks`] reads a located run:
+/// `VORTEX_RDF_LOCATE=0` (an ablation switch, read once) makes them decline
+/// every pattern, so callers take the general match. Unset is on.
 #[cfg(feature = "file-io")]
 pub fn locate_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VORTEX_RDF_LOCATE").as_deref() != Ok("0"))
 }
-use crate::store::VortexRdfStore;
-use crate::store::read::chunks::check_batch;
-use crate::store::schema::TermCode;
-use crate::{CodeChunkStream, DictReader, KindRanges, Probe, QuadColumn};
 
 /// A quad pattern of term codes, as
 /// [`count_code_pattern`](VortexRdfStore::count_code_pattern),
