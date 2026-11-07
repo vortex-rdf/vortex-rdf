@@ -652,7 +652,9 @@ fn chunk_windows<'n, 'a>(
 
 /// The runs of a [`Node::RunEnd`] that the window `start..start + len`
 /// reaches, in order, each as its offsets in the window and its value: the
-/// first run found once, the rest walked.
+/// first run found once, the rest walked. A run whose end does not pass the
+/// window's position (ends out of order, which only a corrupt file holds)
+/// adds no rows, so no window runs backwards.
 fn runs_in<'n>(
     ends: &'n Node<'_>,
     values: &'n Node<'_>,
@@ -665,7 +667,7 @@ fn runs_in<'n>(
     let mut at = first;
     std::iter::from_fn(move || {
         (at < last).then(|| {
-            let end = ends.value_at(run).min(last);
+            let end = ends.value_at(run).clamp(at, last);
             // Run positions below `last` fit the window's `usize`.
             let window = (at - first) as usize..(end - first) as usize;
             let item = (window, values.value_at(run));
@@ -748,6 +750,27 @@ fn run_start(ends: &Node<'_>, run: usize, offset: usize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run ends that do not ascend (only a corrupt or crafted file holds
+    /// them; Vortex checks their order in debug builds only) never wrap a
+    /// count or a read: a run whose end does not pass the window's position
+    /// adds no rows.
+    #[test]
+    fn run_ends_out_of_order_count_no_more_than_their_rows() {
+        let (ends, values) = ([9u64, 9, 9, 2, 30], [1u64; 5]);
+        let n = Node::RunEnd {
+            ends: Box::new(Node::Primitive(Words::U64(&ends))),
+            values: Box::new(Node::Primitive(Words::U64(&values))),
+            offset: 5,
+            len: 10,
+        };
+        let mut c = crate::search::Count(0);
+        n.eq_into(0, 10, 1, 0, &mut c);
+        assert_eq!(c.0, 10);
+        let mut out = [0u64; 10];
+        n.read_into(0, &mut out);
+        assert_eq!(out, [1; 10]);
+    }
 
     fn seq(base: u64, multiplier: u64, len: usize) -> Node<'static> {
         Node::Sequence {
