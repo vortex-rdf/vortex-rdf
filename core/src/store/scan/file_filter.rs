@@ -18,7 +18,6 @@ use vortex_scan::selection::Selection;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{available_parallelism, spawned_splits};
-use crate::io::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 use crate::observe::observe;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
@@ -28,6 +27,7 @@ use crate::store::scan::file_scans::{ScanDriver, split_window, strict_ids};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
 use crate::store::schema::{COL_G, COL_O, COL_O_VALUE, COL_P, COL_S, RowId};
 use crate::store::view::selection::RowSelection;
+use crate::zone_stats::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 
 /// Split a file view's [`RowSelection`] into the two knobs the per-split filter
 /// loop understands: a [`Selection`] narrowing the mask (an id list, e.g. from a
@@ -196,7 +196,7 @@ struct EveryRow {
 fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<EveryRow> {
     use crate::store::schema::PRIMARY_COLUMNS;
 
-    if !crate::stats_rules::zones_enabled() {
+    if !crate::zone_stats::rules::zones_enabled() {
         return None;
     }
     let columns = filter

@@ -1053,7 +1053,7 @@ async fn check_long_graph_bound_run(index: IndexConfig) {
             // graphs it records; a reference run's rows are read and checked.
             let rec = Recorder::start();
             assert_eq!(store.count_code_pattern(pattern).await.unwrap(), 20_000);
-            if matches!(index, IndexConfig::Copy) && crate::stats_rules::zones_enabled() {
+            if matches!(index, IndexConfig::Copy) && crate::zone_stats::rules::zones_enabled() {
                 let rows = |counted_from_records: bool| -> u64 {
                     rec.picked(|e| match (e, counted_from_records) {
                         (Event::ZoneRecorded(rows), true) | (Event::ZoneCounted(rows), false) => {

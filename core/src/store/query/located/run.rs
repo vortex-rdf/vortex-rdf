@@ -18,8 +18,8 @@ use vortex_rdf_encoded_search::ColumnChunks;
 use vortex_session::VortexSession;
 
 use crate::counters::{self, note};
-use crate::io::zone_set::{ZoneClass, ZonePart, ZoneSet};
 use crate::store::read::live::WindowCursor;
+use crate::zone_stats::zone_set::{ZoneClass, ZonePart, ZoneSet};
 
 /// A column's chunk-probe handle.
 pub(super) type Chunks = Arc<ColumnChunks>;

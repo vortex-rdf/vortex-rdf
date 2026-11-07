@@ -450,14 +450,14 @@ already resolved, so that arm exists for totality.
 First, over a selection wider than a zone, the **whole bounds** of the
 base's code columns answer for the whole column: each column's zone map
 (below) keeps its exact smallest and largest code, its zones' folded once
-([`column_bounds`](../core/src/io/zone_map.rs#L176)); a column without a
+([`column_bounds`](../core/src/zone_stats/zone_map.rs#L176)); a column without a
 zone map has neither level. A constrained column's code outside its bounds leaves the
 selection no row, and bounds that are both the code drop the equality from
 the compare; with none left the selection is the answer, compared nowhere
 ([`ask_statistics`](../core/src/store/scan/residual.rs#L88)). This is the
 store's one rule for `x = c` on exact bounds, which a file's located runs
 apply too, at its footer and zone by zone
-([`eq_on_bounds`](../core/src/io/zone_map.rs#L321)): it refutes where
+([`eq_on_bounds`](../core/src/zone_stats/zone_map.rs#L321)): it refutes where
 Vortex's own falsifier of `x = c` does, and proves what Vortex has no
 satisfier of an equality for. It reads the bounds directly, as building
 and evaluating Vortex's proofs for a residual cost tens of µs, more than
@@ -470,7 +470,7 @@ the view's tail and indexes.
 Then the **zone classes** narrow the rows to compare. An in-memory base keeps
 a zone map of each code column's 8,192-row zones, their exact bounds,
 and for the graph column the graphs each zone records with their rows
-([`QuadZones`](../core/src/store/zones.rs#L31)), as a file store's located runs
+([`QuadZones`](../core/src/zone_stats/quad_zones.rs#L31)), as a file store's located runs
 read them: taken in the pass that compresses a build's codes (the graphs
 counted as the file writer's `vortexrdf.value_counts` counts them), or read from the zone
 tables of the file a store is loaded from (`from_file_in_memory`,
@@ -480,7 +480,7 @@ selection wider than a zone, the zones it touches are classed against the
 equalities left, by the same rule on each bound column's zone bounds
 and the graphs `g`'s zones record
 ([`Classes`](../core/src/store/scan/residual.rs#L154),
-[`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L198)): "none" where a
+[`ColumnZones::eq_holds`](../core/src/zone_stats/zone_map.rs#L198)): "none" where a
 code lies outside its zone's bounds or the zone's recorded graphs lack it,
 "all" where every bound column's zone bounds are its code, mixed otherwise
 (a test pins it to Vortex's falsifier on each zone).
@@ -756,7 +756,7 @@ nothing.
 with its rows (`vortexrdf.value_counts`, at most 16 per zone:
 [file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)). The
 store registers a falsifier of `g = c` over them,
-[`ValueCountsFalsifier`](../core/src/stats_rules.rs#L25), which Vortex's
+[`ValueCountsFalsifier`](../core/src/zone_stats/rules.rs#L25), which Vortex's
 pruning applies beside the bounds. A zone whose bounds contain `c` but whose
 recorded graphs don't is excluded too. So graphs spread across the zones (many
 graphs, each zone holding a few, their codes interleaved) prune as well as

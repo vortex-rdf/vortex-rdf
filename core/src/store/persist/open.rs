@@ -29,7 +29,7 @@ use crate::store::VortexRdfStore;
 use crate::store::construct::resolved_layout;
 use crate::store::indexes::COL_RID;
 use crate::store::schema::{CODE_PTYPE, COL_G, ROW_ID_PTYPE, is_code_column_name};
-use crate::store::zones::{QuadZones, read_graph_zones};
+use crate::zone_stats::quad_zones::{QuadZones, read_graph_zones};
 
 /// Refuse a table whose id columns are integers of another width than this
 /// version reads: an integer `s`, `p`, `o`, `g` (the quad table and the copy
@@ -215,7 +215,12 @@ impl ComponentRoster {
 async fn component_graph_zones(
     file: &NativeStoreFile,
     source: &Arc<dyn vortex_layout::segments::SegmentSource>,
-) -> Result<Vec<(&'static str, Option<Arc<crate::io::zone_map::ColumnZones>>)>> {
+) -> Result<
+    Vec<(
+        &'static str,
+        Option<Arc<crate::zone_stats::zone_map::ColumnZones>>,
+    )>,
+> {
     let reads = file.index_children().iter().map(|child| {
         let column = file.table_column_layout(Some(child.identity.name), COL_G);
         async move { Result::Ok((child.identity.name, read_graph_zones(column, source).await?)) }

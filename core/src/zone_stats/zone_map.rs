@@ -236,7 +236,7 @@ impl ColumnZones {
         column: &LayoutRef,
         source: &Arc<dyn SegmentSource>,
     ) -> Result<Option<Self>> {
-        use crate::store::value_counts::{state_dtype, value_counts};
+        use crate::zone_stats::value_counts::{state_dtype, value_counts};
         use vortex_array::arrays::PrimitiveArray;
         use vortex_array::dtype::{DType, Nullability, PType};
 
@@ -363,9 +363,9 @@ fn bounds_of<A: Executable>(table: &StructArray, ctx: &mut ExecutionCtx) -> Resu
 /// unequal lengths, codes not strictly ascending ([`pairs`]), or counts that
 /// do not sum to the zone's `zone_rows`.
 ///
-/// [`pairs`]: crate::store::value_counts::pairs
+/// [`pairs`]: crate::zone_stats::value_counts::pairs
 fn decode_states(states: ArrayRef, zone_rows: impl Fn(u64) -> u64) -> Result<RecordedZones> {
-    use crate::store::value_counts::pairs;
+    use crate::zone_stats::value_counts::pairs;
     use vortex_array::arrays::listview::{ListViewArrayExt as _, ListViewArraySlotsExt as _};
     use vortex_array::arrays::struct_::StructArrayExt as _;
     use vortex_array::arrays::{ListViewArray, PrimitiveArray};
@@ -550,7 +550,7 @@ mod tests {
     /// written, the last one by its own rows.
     #[test]
     fn malformed_records_read_as_unrecorded() {
-        use crate::store::value_counts::{state_dtype, state_of as state};
+        use crate::zone_stats::value_counts::{state_dtype, state_of as state};
         use vortex_array::builders::builder_with_capacity_in;
         use vortex_array::memory::BufferAllocatorRef;
         use vortex_array::scalar::Scalar;

@@ -4,8 +4,8 @@
 //! evaluating the filter; the filter runs over the rest.
 
 use super::*;
-use crate::io::zone_map::ZONE_ROWS;
 use crate::store::test_hooks::ForcedZones;
+use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// Rows of [`whole_quads`]: eight zones.
 const ROWS: usize = 8 * ZONE_ROWS;

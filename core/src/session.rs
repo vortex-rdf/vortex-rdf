@@ -24,14 +24,14 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     // Ahead of the default encodings' kernels, so that the store's are tried
     // first.
     crate::kernels::register(&session);
-    crate::stats_rules::register(&session);
+    crate::zone_stats::rules::register(&session);
     vortex_file::register_default_encodings(&session);
     crate::io::container::register(&session);
     {
         use vortex_array::aggregate_fn::session::AggregateFnSessionExt as _;
         session
             .aggregate_fns()
-            .register(crate::store::value_counts::ValueCounts);
+            .register(crate::zone_stats::value_counts::ValueCounts);
     }
     enable_write_editions(&session);
     session
@@ -97,7 +97,7 @@ static VALUE_COUNTS_DECLARATION: EditionDeclaration = EditionDeclaration {
         min_library_version: None,
     },
     added: &[EditionMember::aggregate(
-        &crate::store::value_counts::VALUE_COUNTS_ID,
+        &crate::zone_stats::value_counts::VALUE_COUNTS_ID,
     )],
 };
 
@@ -186,7 +186,7 @@ mod tests {
             for id in ids(kind) {
                 let own = (kind == ComponentKind::Layout && id == STORE_LAYOUT_ID)
                     || (kind == ComponentKind::Aggregate
-                        && id == crate::store::value_counts::VALUE_COUNTS_ID);
+                        && id == crate::zone_stats::value_counts::VALUE_COUNTS_ID);
                 assert!(
                     own || pinned.contains(&id),
                     "{kind} {id} is admitted outside {CORE_EDITION}"

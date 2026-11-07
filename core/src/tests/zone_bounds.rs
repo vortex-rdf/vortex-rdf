@@ -6,7 +6,7 @@
 //! compare's, over every kind of selection.
 
 use super::*;
-use crate::io::zone_map::ZONE_ROWS;
+use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The rows of [`zoned_quads`]: four zones and part of a fifth.
 const ROWS: usize = 4 * ZONE_ROWS + 1_000;

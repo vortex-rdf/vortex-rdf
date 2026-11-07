@@ -7,7 +7,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::io::zone_map::{ColumnZones, eq_on_bounds};
+use crate::zone_stats::zone_map::{ColumnZones, eq_on_bounds};
 
 /// How a zone stands against a set's checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

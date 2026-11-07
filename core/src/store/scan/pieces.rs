@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use crate::io::zone_map::ZONE_ROWS;
+use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The rows of the first piece: a zone's.
 pub(crate) const FIRST_PIECE_ROWS: usize = ZONE_ROWS;

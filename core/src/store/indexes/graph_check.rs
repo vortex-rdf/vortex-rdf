@@ -24,13 +24,13 @@ use vortex_buffer::{Buffer, BufferMut};
 
 use super::components::{IndexComponent, run_order_row_ids};
 use crate::error::Result;
-use crate::io::zone_map::{ColumnZones, ZONE_ROWS};
-use crate::io::zone_set::{ZoneCheck, ZoneSet};
 use crate::store::probes::StructProbes;
 use crate::store::read::live::Live;
 use crate::store::scan::residual::{Classes, ResidualCompare, ResidualTable};
 use crate::store::schema::{COL_G, RowId};
 use crate::store::view::selection::{RowSelection, SelectedRows};
+use crate::zone_stats::zone_map::{ColumnZones, ZONE_ROWS};
+use crate::zone_stats::zone_set::{ZoneCheck, ZoneSet};
 
 /// A run's check of its bound graph inside its component: the residual
 /// compare of the component's graph column against the graph's code over

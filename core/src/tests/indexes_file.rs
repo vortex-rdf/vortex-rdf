@@ -1381,7 +1381,7 @@ async fn test_reference_index_counts_with_named_graphs() {
             VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
         ),
     ] {
-        let checks_graphs = in_memory && crate::stats_rules::zones_enabled();
+        let checks_graphs = in_memory && crate::zone_stats::rules::zones_enabled();
         for (p, o, run) in [(Some(&p1), None, 300usize), (None, Some(&o2), 129)] {
             for graph in [None, Some(&graphs[0]), Some(&graphs[1]), Some(&graphs[3])] {
                 let label = format!("p {p:?} o {o:?} graph {graph:?}");

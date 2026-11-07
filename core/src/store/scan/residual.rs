@@ -40,8 +40,6 @@ use web_time::Instant;
 
 use crate::debug;
 use crate::error::Result;
-use crate::io::zone_map::{ZONE_ROWS, eq_on_bounds};
-use crate::io::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::MemoryBase;
@@ -52,6 +50,8 @@ use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
 use crate::store::scan::typed_eq::typed_residual_ids_reading;
 use crate::store::schema::{PRIMARY_COLUMNS, RowId};
 use crate::store::view::selection::{RowSelection, SelectedRows};
+use crate::zone_stats::zone_map::{ZONE_ROWS, eq_on_bounds};
+use crate::zone_stats::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 
 /// Whether a residual over a selection of `rows` rows asks the statistics
 /// before it compares: past one zone's rows, as below them the compare
@@ -84,7 +84,7 @@ pub(crate) enum Asked {
 /// statistics are not asked ([`unasked_classes`]). A column without a zone
 /// map has neither level.
 ///
-/// [`ColumnZones::column_bounds`]: crate::io::zone_map::ColumnZones::column_bounds
+/// [`ColumnZones::column_bounds`]: crate::zone_stats::zone_map::ColumnZones::column_bounds
 pub(crate) fn ask_statistics(
     memory: &MemoryBase,
     selection: &RowSelection,
