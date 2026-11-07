@@ -1177,6 +1177,241 @@ fn zone_maps_read(rec: &Recorder) -> usize {
     rec.count(&Event::ZoneMapRead)
 }
 
+/// Each zone map a file's reads ask for is read once per file and column,
+/// whoever asks: `(? type ? g1)` counted twice reads `index:posg`'s `g` map
+/// once by copy, `index:ref-p`'s once by reference, and two such counts
+/// joined on one task, on a store opened afresh, read it once in all; with
+/// no index, the general match's every-row step and a gap run of the quad
+/// table checked on `g` share the quad table's `g` map. Every count is the
+/// zones-off count.
+#[tokio::test]
+async fn each_zone_map_reads_once_per_file() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    for index in [IndexConfig::Copy, IndexConfig::Reference] {
+        let tag = index.name();
+        let (_dir, path) = write_store_file(
+            zone_quads(Graphs::Alternating),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let ty = code_of(&store, "<http://example.org/type>").await;
+        let g1 = code_of(&store, "<http://example.org/g1>").await;
+        let pattern = CodePattern::new(None, Some(ty), None, Some(g1));
+        let want = {
+            let _off = ForcedZones::set(false);
+            store.count_code_pattern(pattern).await.unwrap()
+        };
+        let _on = ForcedZones::set(true);
+        for read in [1, 0] {
+            let rec = Recorder::start();
+            assert_eq!(
+                store.count_code_pattern(pattern).await.unwrap(),
+                want,
+                "{tag}"
+            );
+            assert_eq!(zone_maps_read(&rec), read, "{tag}: maps read by this count");
+        }
+        let fresh = VortexRdfStore::from_file(&path).await.unwrap();
+        let rec = Recorder::start();
+        let (first, second) = futures::join!(
+            fresh.count_code_pattern(pattern),
+            fresh.count_code_pattern(pattern)
+        );
+        assert_eq!((first.unwrap(), second.unwrap()), (want, want), "{tag}");
+        assert_eq!(
+            zone_maps_read(&rec),
+            1,
+            "{tag}: joined counts read the map once"
+        );
+    }
+    let (_dir, path) = write_store_file(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::NoIndex.types(),
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let hub = code_of(&store, "<http://example.org/hub>").await;
+    let g1 = code_of(&store, "<http://example.org/g1>").await;
+    let every_row = CodePattern::new(None, None, None, Some(g1));
+    let gap = CodePattern::new(Some(hub), None, None, Some(g1));
+    let want = {
+        let _off = ForcedZones::set(false);
+        (
+            store.count_code_pattern(every_row).await.unwrap(),
+            store.count_code_pattern(gap).await.unwrap(),
+        )
+    };
+    let _on = ForcedZones::set(true);
+    let rec = Recorder::start();
+    assert_eq!(store.count_code_pattern(every_row).await.unwrap(), want.0);
+    assert_eq!(zone_maps_read(&rec), 1, "the every-row step reads g's map");
+    drop(rec);
+    let rec = Recorder::start();
+    assert_eq!(store.count_code_pattern(gap).await.unwrap(), want.1);
+    assert_eq!(zone_maps_read(&rec), 0, "the gap run shares it");
+}
+
+/// By reference, `(? type Taxon g1)` on alternating graphs: the key's run
+/// (`index:ref-p`'s `type`, which ties `index:ref-o`'s `"Taxon"` and wins)
+/// checks the graph in place, on the child's own `g` at every position, and
+/// the object by id; with a check by id it asks no statistics. Its count is
+/// the term path's, and it answers as with zones off.
+#[tokio::test]
+async fn reference_runs_check_their_graph_in_place_and_the_rest_by_id() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    let (_dir, path) = write_store_file(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let store = &VortexRdfStore::from_file(&path).await.unwrap();
+    let ty = code_of(store, "<http://example.org/type>").await;
+    let taxon = code_of(store, "\"Taxon\"").await;
+    let g1 = code_of(store, "<http://example.org/g1>").await;
+    let pattern = CodePattern::new(None, Some(ty), Some(taxon), Some(g1));
+    let want = term_rows(store, pattern).await.len() as u64;
+    let off = {
+        let _off = ForcedZones::set(false);
+        answers(store, pattern).await
+    };
+    let _on = ForcedZones::set(true);
+    let rec = Recorder::start();
+    assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
+    let (own, taken) = reference_graph_reads(&rec);
+    assert_eq!(own, RUN as u64, "the graph read in place at every position");
+    assert_eq!(taken, 0, "never taken by id");
+    assert_eq!(statistics_asked(&rec), 0, "a check by id asks none");
+    drop(rec);
+    assert!(
+        answers(store, pattern).await == off,
+        "zones on and off answer alike"
+    );
+}
+
+/// By reference, on a one-graph store, the footer settles `(? type ? g1)`'s
+/// graph (every row holds the one graph), so the run reads its row ids alone:
+/// no graph read and no zone map, its stream a block of row ids at a time,
+/// as with zones off.
+#[tokio::test]
+async fn one_graph_reference_runs_read_row_ids_only() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    let (_dir, path) = write_store_file(
+        zone_quads(Graphs::One),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let store = &VortexRdfStore::from_file(&path).await.unwrap();
+    let ty = code_of(store, "<http://example.org/type>").await;
+    let g1 = code_of(store, "<http://example.org/g1>").await;
+    let pattern = CodePattern::new(None, Some(ty), None, Some(g1));
+    let want = {
+        let _off = ForcedZones::set(false);
+        streamed(store, pattern, 4096).await
+    };
+    assert_eq!(want.len(), RUN, "every type row");
+    let _on = ForcedZones::set(true);
+    let rec = Recorder::start();
+    assert_eq!(streamed(store, pattern, 4096).await, want);
+    assert_eq!(reference_graph_reads(&rec), (0, 0), "no graph read");
+    assert_eq!(zone_maps_read(&rec), 0, "no zone map read");
+    let blocks: u64 = rec
+        .picked(|e| match e {
+            Event::LocatedBlock(rows) => Some(*rows),
+            _ => None,
+        })
+        .iter()
+        .sum();
+    assert_eq!(blocks, RUN as u64, "every position, once");
+}
+
+/// Runs with no checks never ask the file's statistics, however long: by
+/// copy, `(? type ? ?)` is an exact run of `index:posg`; by reference, the
+/// run of `index:ref-p`'s `type` alone. Counted and streamed, each answers
+/// as the term path.
+#[tokio::test]
+async fn runs_without_checks_ask_no_statistics() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    for index in [IndexConfig::Copy, IndexConfig::Reference] {
+        let tag = index.name();
+        let (_dir, path) = write_store_file(
+            zone_quads(Graphs::Alternating),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let store = &VortexRdfStore::from_file(&path).await.unwrap();
+        let ty = code_of(store, "<http://example.org/type>").await;
+        let pattern = CodePattern::new(None, Some(ty), None, None);
+        let mut want = term_rows(store, pattern).await;
+        want.sort_unstable();
+        assert_eq!(want.len(), RUN, "{tag}: every type row");
+        let _on = ForcedZones::set(true);
+        let rec = Recorder::start();
+        assert_eq!(
+            store.count_code_pattern(pattern).await.unwrap(),
+            RUN as u64,
+            "{tag}"
+        );
+        let mut got = streamed(store, pattern, 4096).await;
+        assert_eq!(statistics_asked(&rec), 0, "{tag}: no statistics asked");
+        got.sort_unstable();
+        assert_eq!(got, want, "{tag}");
+    }
+}
+
+/// A long checked run's stream asks the file's statistics once, on its first
+/// pull, after a 64-row first page, read from the run's first block, asked
+/// none: `(? type ? g1)` by copy on alternating graphs. Its rows are the
+/// term path's.
+#[tokio::test]
+async fn streams_ask_statistics_once() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    let (_dir, path) = write_store_file(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Copy.types(),
+    )
+    .await;
+    let store = &VortexRdfStore::from_file(&path).await.unwrap();
+    let ty = code_of(store, "<http://example.org/type>").await;
+    let g1 = code_of(store, "<http://example.org/g1>").await;
+    let pattern = CodePattern::new(None, Some(ty), None, Some(g1));
+    let _on = ForcedZones::set(true);
+    let rec = Recorder::start();
+    let page = code_rows::<4>(
+        &store
+            .match_code_pattern(pattern, 0, Some(64))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(page.len(), 64);
+    assert_eq!(statistics_asked(&rec), 0, "the first page asks none");
+    drop(rec);
+    let rec = Recorder::start();
+    let mut got = streamed(store, pattern, 4096).await;
+    assert_eq!(statistics_asked(&rec), 1, "the stream asks once");
+    drop(rec);
+    let mut want = term_rows(store, pattern).await;
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(got, want);
+}
+
 /// The footer settles a checked slot for the whole file before any zone map
 /// is read: on a one-graph store a graph check needs no reading at all, and a
 /// graph code no row holds (here the `type` predicate's) matches nothing,
