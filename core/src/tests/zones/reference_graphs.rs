@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::store::indexes::IndexComponent;
+use crate::store::query::located::locate_enabled;
 use crate::store::test_hooks::ForcedReferenceGraphs;
 
 /// 60 quads over three graphs, the default graph among them, four
@@ -134,6 +135,9 @@ async fn written_reference_graphs_record_value_counts() {
 /// counts and reads as its rows say.
 #[tokio::test]
 async fn older_reference_children_read_as_before() {
+    if !locate_enabled() {
+        return;
+    }
     let memory = {
         let _before = ForcedReferenceGraphs::set(false);
         built_store(
@@ -261,6 +265,10 @@ async fn stream_written_children_follow_the_hook() {
 async fn reference_runs_read_their_own_graphs() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
+
+    if !locate_enabled() {
+        return;
+    }
 
     let _rows = ForcedZones::set(false);
     let mut answers = Vec::new();

@@ -455,7 +455,6 @@ fn roster(indexes: &[IndexType], rows: usize) -> Vec<IndexComponentInfo> {
         name,
         index,
         sort_order,
-        sorted: true,
         rows,
     };
     indexes

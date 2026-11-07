@@ -652,7 +652,13 @@ fn chunk_windows<'n, 'a>(
 
 /// The runs of a [`Node::RunEnd`] that the window `start..start + len`
 /// reaches, in order, each as its offsets in the window and its value: the
-/// first run found once, the rest walked.
+/// first run found once, the rest walked. A run whose end does not pass the
+/// window's position (ends out of order, which only a corrupt file holds)
+/// adds no rows, so no window runs backwards, and ends that no run carries
+/// to the window's end fail the walk.
+///
+/// # Panics
+/// Panics when the runs end before the window does.
 fn runs_in<'n>(
     ends: &'n Node<'_>,
     values: &'n Node<'_>,
@@ -665,7 +671,13 @@ fn runs_in<'n>(
     let mut at = first;
     std::iter::from_fn(move || {
         (at < last).then(|| {
-            let end = ends.value_at(run).min(last);
+            // Ends that stop short of the window's end (a corrupt file's)
+            // would leave `at` short of `last` past the last run.
+            assert!(
+                run < ends.len(),
+                "corrupt run ends: no run reaches the window's end"
+            );
+            let end = ends.value_at(run).clamp(at, last);
             // Run positions below `last` fit the window's `usize`.
             let window = (at - first) as usize..(end - first) as usize;
             let item = (window, values.value_at(run));
@@ -748,6 +760,44 @@ fn run_start(ends: &Node<'_>, run: usize, offset: usize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run ends that do not ascend (only a corrupt or crafted file holds
+    /// them; Vortex checks their order in debug builds only) never wrap a
+    /// count or a read: a run whose end does not pass the window's position
+    /// adds no rows.
+    /// Run ends that never reach the window's end, under nodes that read
+    /// past their length without a bounds check (constant ends and values,
+    /// only a corrupt file holds them), fail the walk instead of looping
+    /// on the same position forever.
+    #[test]
+    #[should_panic(expected = "corrupt run ends")]
+    fn run_ends_short_of_the_window_panic_rather_than_hang() {
+        let n = Node::RunEnd {
+            ends: Box::new(Node::Constant { value: 3, len: 2 }),
+            values: Box::new(Node::Constant { value: 1, len: 2 }),
+            offset: 5,
+            len: 5,
+        };
+        let mut c = crate::search::Count(0);
+        n.eq_into(0, 5, 1, 0, &mut c);
+    }
+
+    #[test]
+    fn run_ends_out_of_order_count_no_more_than_their_rows() {
+        let (ends, values) = ([9u64, 9, 9, 2, 30], [1u64; 5]);
+        let n = Node::RunEnd {
+            ends: Box::new(Node::Primitive(Words::U64(&ends))),
+            values: Box::new(Node::Primitive(Words::U64(&values))),
+            offset: 5,
+            len: 10,
+        };
+        let mut c = crate::search::Count(0);
+        n.eq_into(0, 10, 1, 0, &mut c);
+        assert_eq!(c.0, 10);
+        let mut out = [0u64; 10];
+        n.read_into(0, &mut out);
+        assert_eq!(out, [1; 10]);
+    }
 
     fn seq(base: u64, multiplier: u64, len: usize) -> Node<'static> {
         Node::Sequence {

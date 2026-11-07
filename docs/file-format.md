@@ -86,8 +86,11 @@ The writer is limited to three editions:
 - the value-counts edition `vortexrdf2026.11.0` ([`VALUE_COUNTS_EDITION`](../core/src/session.rs#L92)), whose one member is the graph columns' zone aggregate `vortexrdf.value_counts` (§3).
 
 A file of the value-counts edition needs a reader that registers the
-aggregate: vortex-rdf 0.14 and earlier refuse it, naming
-`vortexrdf.value_counts`. Files written before it keep reading; their graph
+aggregate. vortex-rdf 0.14 and earlier refuse it, naming
+`vortexrdf.value_counts`, when they load it into memory (`from_bytes`,
+`from_file_in_memory`); a mapped open (`from_file`, Java `open(path)`, Python `VortexRdfStore(path)`)
+succeeds, and fails at the first read that prunes by a graph column's zones,
+such as a pattern with a bound graph. Files written before it keep reading; their graph
 columns lack the statistic, and readers skip what it would decide. A store
 whose every graph zone holds more than 16 graphs records no value counts, so
 0.14 reads it too. The
@@ -148,7 +151,7 @@ Two kinds of child:
 
 ### 3.1 The inventory
 
-The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L193))
+The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L195))
 carried inside the Layout flatbuffer, so it is read with the footer:
 
 ```json
@@ -177,10 +180,10 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L126)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
-| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L65) |
+| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L66) |
 | `version` | the implementation's version, positive; a dictionary or index child above the version a reader reads (`DICT_VERSION`, `INDEX_VERSION`) fails the open ([§3](#3-the-store-root-vortex-rdfstorev2)) |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
-| `sorted` | the writer's provenance that the sort-key columns are *globally* sorted — a reader may binary-search the child only when this is set; absent means false |
+| `sorted` | written `true` for every index child and the dictionary, which are sorted by definition: readers of this version binary-search an index child in its key order whatever the flag says (a writer that leaves one out of order writes a wrong file, [§10](#10-what-a-file-must-satisfy)), and the term resolvers of 0.14 and earlier only when it is set (their located code runs never read it); absent decodes as false |
 | `bracketed_iris` | dictionary children only: the writer's provenance that every IRI term (every term starting with `<`) is spelled `<`, its text, `>` — a reader may then decide a `STR()` prefix over IRIs by a code range ([§5](#5-the-dictionary-child)); written only when true, absent means false |
 | `fields` | the column shape in a closed vocabulary of non-nullable kinds: `u32`, `u64`, `utf8` |
 
@@ -260,7 +263,7 @@ What the store reads from this structure:
   checks, taken only as the store writes them: as many counts as graphs, the
   graphs strictly ascending, the counts summing to the block's rows. A block
   whose record is otherwise is read as recording none
-  ([`decode_states`](../core/src/zone_stats/zone_map.rs#L367));
+  ([`decode_states`](../core/src/zone_stats/zone_map.rs#L368));
 - the **chunk leaves** of the `u64` code and row-id columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
@@ -308,7 +311,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L265)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L261)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L166)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -359,7 +362,8 @@ one term per step, and code → term a positional read.
 
 Each secondary index persists as one or two auxiliary children, all written
 `required: false` (a reader that ignores them still answers every query, only
-slower) and `sorted: true`.
+slower) and `sorted: true`. Each child is globally sorted by its row order
+below, by definition: readers binary-search it without checking.
 
 | Child | Index | `implementation` | Columns | Row order | Answers |
 |---|---|---|---|---|---|
@@ -388,7 +392,7 @@ Shared rules:
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L77)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L78)).
 - **A bound graph is never a key an index is searched by** (it is the last
   key of both copy orders, and a reference child's `g` is no key), and neither
   index answers a bound-subject pattern — the sorted quad table is the better
@@ -417,7 +421,7 @@ row ids.
 On a file-backed store an index child is never lifted into memory. Under the
 `Dictionary` layout its run is located by binary-searching the child's
 encoded chunks through the chunk probes of [§4](#4-the-quad-table)
-([`locate_component_run`](../core/src/store/indexes/file.rs#L31)): a
+([`locate_component_run`](../core/src/store/indexes/file.rs#L32)): a
 located run of at most `POINT_GATHER_MAX_ROWS` rows is point-read, a wider
 one is read as a scan of exactly that row range. A run the probes cannot
 locate — a string-keyed child under the other layouts — is answered by a
@@ -645,7 +649,7 @@ its layout:
 |---|---|
 | `quad-source` child | `base: ArrayRef` — one struct, columns in the *compressed-resident* form: each `u64` code column `Constant`, `RunEnd` or bit-packed, behind a `vortex.shared` wrapper whose cache holds the decoded primitive once a bulk read needs it |
 | `quads_sorted` | the `IsSorted` stamp on the `s` column |
-| `index:*` children | `components: Arc<[IndexComponent]>` — the same rows under the same column names, with the descriptor's `sorted` flag; adopted from bytes they stay deferred until first use |
+| `index:*` children | `components: Arc<[IndexComponent]>` — the same rows under the same column names, in their key order; adopted from bytes they stay deferred until first use |
 | `dictionary` child | `ResolvedLayout::Dictionary(DictAccess::Resident \| FileBacked)` — in memory, or read in place for a file store |
 | footer segment map | the leaves a read slices out of the mapped file |
 | — | `probes: StructProbes` — encoded-search probes resolved once over the base's columns, shared by every view |
@@ -686,9 +690,12 @@ checks:
 4. `quads_sorted: true` only when the rows are in global `(s, p, o, g)` order
    — a true claim licenses the prefix probe on every bound role; a false one
    returns wrong matches.
-5. A component's `sorted: true` only when its sort-key columns are globally
-   sorted, not merely within each chunk; a reference child's `sorted: true`
-   also means its rows are ordered by `(val, rid)`.
+5. Every index child's rows are in its key order (§6) globally, not merely
+   within each chunk; a reference child's order is `(val, rid)`. Readers
+   binary-search them without checking, so a writer that writes one out of
+   order writes a wrong file and gets wrong matches. Write `sorted: true`:
+   the term resolvers of 0.14 and earlier search a child only when it is
+   set.
 6. Under `Dictionary`: a `dictionary` child with implementation
    `sorted-terms-fsst-v1` (version 1 or 2) holding every code's term at its
    row, sorted and unique; `required: true`.
@@ -699,7 +706,14 @@ checks:
    (under `Dictionary`), its value at each row is the `g` of the quad-table
    row its `rid` names. Readers count and window by these without checking:
    a wrong `g` gives a graph-bound by-reference match wrong rows.
-9. Every `utf8` column holds valid UTF-8, and an FSST term chunk's 32-bit
+9. On every `g` column (the quad table's and each index child's), each
+   zone's `vortexrdf.value_counts` record lists every value the zone holds
+   with its rows: values strictly ascending, each count above zero, the
+   counts summing to the zone's rows, at most 16 values, and null past them.
+   The general match's pruning trusts the values as written (a zone whose
+   list lacks a code is skipped); located runs and the in-memory residual
+   also check the rest, and leave a record they reject to the zone's bounds.
+10. Every `utf8` column holds valid UTF-8, and an FSST term chunk's 32-bit
    code offsets are non-negative: readers take stored terms as UTF-8 and those
    offsets as written, unchecked, so a store file is trusted input, and a
    corrupt or crafted one is outside this contract.

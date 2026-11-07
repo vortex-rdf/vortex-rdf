@@ -360,8 +360,9 @@ fn bounds_of<A: Executable>(table: &StructArray, ctx: &mut ExecutionCtx) -> Resu
 /// to canonical arrays all through, straight from their buffers. `None` for
 /// a zone past the statistic's limit (a null state), and for a record no
 /// store writes, whose zone then stands on its bounds alone: lists of
-/// unequal lengths, codes not strictly ascending ([`pairs`]), or counts that
-/// do not sum to the zone's `zone_rows`.
+/// unequal lengths, codes not strictly ascending, more than `MAX_VALUES`
+/// codes or a zero count ([`pairs`]), or counts that do not sum to the
+/// zone's `zone_rows`. So the memo keeps at most `MAX_VALUES` pairs a zone.
 ///
 /// [`pairs`]: crate::zone_stats::value_counts::pairs
 fn decode_states(states: ArrayRef, zone_rows: impl Fn(u64) -> u64) -> Result<RecordedZones> {
@@ -432,6 +433,36 @@ fn bound_column<A: Executable>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zone recording more values than the statistic's limit (a record no
+    /// store writes) stands on its bounds, as one its writer left null
+    /// does: the memo keeps at most `MAX_VALUES` pairs a zone.
+    #[test]
+    fn records_past_the_limit_stand_on_their_bounds() {
+        use crate::zone_stats::value_counts::{state_dtype, state_of};
+        use vortex_array::builders::builder_with_capacity_in;
+        use vortex_array::memory::BufferAllocatorRef;
+
+        let values: Vec<u64> = (0..1_000).collect();
+        let mut counts = vec![1u32; 1_000];
+        counts[0] = 8_192 - 999;
+        let mut states =
+            builder_with_capacity_in(&state_dtype(), 1, BufferAllocatorRef::static_ref());
+        states.append_scalar(&state_of(&values, &counts)).unwrap();
+        let zones = ColumnZones::from_bounds(
+            vortex_buffer::buffer![0u64],
+            vortex_buffer::buffer![999u64],
+            8_192,
+            8_192,
+        )
+        .unwrap()
+        .with_recorded(states.finish())
+        .unwrap();
+        assert!(
+            zones.recorded().unwrap()[0].is_none(),
+            "a record past the limit"
+        );
+    }
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_array::expr::{eq, lit, root};
 

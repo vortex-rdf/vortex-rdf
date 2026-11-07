@@ -102,6 +102,10 @@ async fn streams_ask_statistics_once() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
 
+    if !locate_enabled() {
+        return;
+    }
+
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
@@ -136,6 +140,10 @@ async fn streams_ask_statistics_once() {
 async fn footer_settles_a_whole_file() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
+
+    if !locate_enabled() {
+        return;
+    }
 
     let _on = ForcedZones::set(true);
     for fixture in zone_stores().await {
@@ -196,6 +204,10 @@ async fn footer_settles_a_whole_file() {
 async fn gap_cap_only_where_zones_cannot_decide() {
     use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
 
+    if !locate_enabled() {
+        return;
+    }
+
     let _cap = ForcedGapRows::set(1_000);
     for fixture in zone_stores().await {
         let store = &fixture.store;
@@ -233,6 +245,40 @@ async fn gap_cap_only_where_zones_cannot_decide() {
         );
         assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
     }
+}
+
+/// With `VORTEX_RDF_COUNTERS=1`, `check_read` counts every row a located
+/// run reads to check it: its span at the first check and the rows it kept
+/// at each later one (a no-op without the variable). `hub`'s run checked
+/// row by row at `o`, then at `g` on the one row `o` keeps.
+#[tokio::test]
+async fn check_reads_count_every_checked_row() {
+    use crate::counters::{CHECK_READ, snapshot};
+    use crate::observe::{Event, Recorder};
+    use crate::store::test_hooks::ForcedZones;
+    use vortex_rdf_encoded_search::counters::on;
+
+    if !on() || !locate_enabled() {
+        return;
+    }
+    let _off = ForcedZones::set(false);
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Long, IndexConfig::NoIndex)).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let pattern = zone_patterns(&store, 1).await[2];
+    let rec = Recorder::start();
+    let before = snapshot();
+    store.count_code_pattern(pattern).await.unwrap();
+    let counted = snapshot()[CHECK_READ + 1] - before[CHECK_READ + 1];
+    let read: u64 = rec.rows(|e| match e {
+        Event::CheckRead(n) => Some(*n),
+        Event::CheckTaken { rows, .. } => Some(*rows),
+        _ => None,
+    });
+    assert!(
+        rec.rows(|e| matches!(e, Event::CheckTaken { .. }).then_some(1u64)) > 0,
+        "a later check reads"
+    );
+    assert!(counted >= read, "{counted} counted of {read} read");
 }
 
 /// With `VORTEX_RDF_COUNTERS=1`, a zoned count is counted where it settles
@@ -274,6 +320,10 @@ async fn zone_counters_count_decisions() {
 async fn short_runs_check_rows_without_statistics() {
     use crate::CodePattern;
 
+    if !locate_enabled() {
+        return;
+    }
+
     for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
         let (_dir, path) = zone_file(ZoneFile::new(Graphs::Long, index)).await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -304,6 +354,9 @@ async fn short_runs_check_rows_without_statistics() {
 /// is the rows' own.
 #[tokio::test]
 async fn first_page_reads_the_first_block_before_statistics() {
+    if !locate_enabled() {
+        return;
+    }
     for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
         for (graphs, g, fills) in [(Graphs::Alternating, 1, true), (Graphs::Long, 2, false)] {
             let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;

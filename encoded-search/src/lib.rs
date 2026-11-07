@@ -298,7 +298,8 @@ pub enum NodeKind {
     RunEnd,
     /// Frame of reference: a reference value added to an encoded child.
     FoR,
-    /// Bit-packed words, unpacked one value at a time.
+    /// Bit-packed words: a point read unpacks one value; a bulk read, count
+    /// or find unpacks the parts of each 1,024-value chunk it covers.
     BitPacked,
     /// The exception values riding beside a [`NodeKind::BitPacked`] node.
     Patches,

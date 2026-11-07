@@ -89,9 +89,8 @@ pub struct ViewStatistics {
     /// and on file `?p?g`) and for its windows, keeps, partitions and chained
     /// matches; `Spog` for any other view over a globally sorted base (every
     /// base this crate writes), a served one's index order being base order
-    /// within its bound terms. A served file view whose index child is not
-    /// globally sorted has none, and neither has a view that reads any tail
-    /// row, since the tail's rows follow the base's in append order.
+    /// within its bound terms. A view that reads any tail row has none,
+    /// since the tail's rows follow the base's in append order.
     pub sort_order: Option<SortOrder>,
     /// Per column (`s`, `p`, `o`, `g`), the inclusive code range the view's
     /// base rows are known to lie in (a pushed-down equality's code, a
@@ -131,10 +130,9 @@ pub struct IndexComponentInfo {
     pub index: IndexType,
     /// The child's row order when it is a quad order (`index:posg`,
     /// `index:ospg`); the reference children are sorted `{val, rid}` pairs.
+    /// Every child's rows are in its order, which is what makes it
+    /// binary-searchable.
     pub sort_order: Option<SortOrder>,
-    /// Whether the child's sort keys are globally sorted (the writer's
-    /// provenance), which is what makes it binary-searchable.
-    pub sorted: bool,
     /// The child's row count: one row per quad of the base.
     pub rows: usize,
 }
@@ -232,11 +230,10 @@ impl VortexRdfStore {
     /// the store was built or opened: a child under a slug this version does
     /// not know is not listed.
     pub fn index_components(&self) -> Result<Vec<IndexComponentInfo>> {
-        let info = |identity: &ComponentIdentity, sorted: bool, rows: usize| IndexComponentInfo {
+        let info = |identity: &ComponentIdentity, rows: usize| IndexComponentInfo {
             name: identity.name,
             index: identity.index,
             sort_order: sort_order_of(identity.name),
-            sorted,
             rows,
         };
         Ok(match &self.quads.backend {
@@ -244,13 +241,13 @@ impl VortexRdfStore {
                 base, components, ..
             }) => components
                 .iter()
-                .map(|c| info(c.identity, c.sorted, base.len()))
+                .map(|c| info(c.identity, base.len()))
                 .collect(),
             #[cfg(feature = "file-io")]
             Backend::File(FileBase { file, .. }) => file
                 .index_children()
                 .iter()
-                .map(|child| info(child.identity, child.sorted, file.row_count() as usize))
+                .map(|child| info(child.identity, file.row_count() as usize))
                 .collect(),
         })
     }

@@ -52,10 +52,10 @@ A builder hands these back in one of two shapes
 | Surface | Call | Pipeline | Produces |
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
-| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
+| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L140) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L48) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L67), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L113) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L134) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
-| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L275) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
+| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L271) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -312,13 +312,13 @@ that file (where the links at its path end), `.<file name>.spill-<uuid>`
 (`.out.vortex.spill-<uuid>` for `out.vortex`), by default a hidden sibling of
 the store, so a directory a crash left behind says which output it belonged
 to; a build with no output path (an in-memory store, or
-[`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) into a caller's
+[`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L48) into a caller's
 writer), or one whose file name would make the directory's name longer than
 255 bytes, uses `.vortex-rdf.spill-<uuid>`. The parent directory is resolved in
 this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L100)):
 the `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (a
 serialization to a file,
-[`quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) and so the CLI
+[`quads_stream_to_vortex_file`](../core/src/io/write.rs#L140) and so the CLI
 and Python's `serialize_rdf`, and a compaction both pass the directory of
 their temp file: beside the file they write or replace, links followed, on the
 volume that takes the store), then the OS temp dir (a build with no output
@@ -379,7 +379,7 @@ mapping exists only for the build; stores keep the columnar dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L123),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L121),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |
@@ -417,8 +417,9 @@ is stamped `IsSorted`.
 **Out of core**, the same tables come off the spill-run mergers of
 [§6](#6-pipeline-b--sorted-out-of-core), a chunk at a time.
 
-Both hand the child over with `sorted: true` provenance, because both sorted
-the whole dataset; a reader binary-searches a child on that flag alone
+Both sort the whole dataset, as every index child must be: a reader
+binary-searches a child without consulting its descriptor's `sorted`, which
+the writer sets `true` for the term resolvers of 0.14 and earlier
 ([matching.md §8](matching.md#8-the-index-resolvers)).
 
 ---
@@ -481,10 +482,10 @@ flowchart TD
   are encoded into the root layout's metadata ([file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)).
 - **Provenance.** `quads_sorted` is read off the primary's own `s` stamp when a
   store re-serializes ([`into_stream`](../core/src/store/persist/serialize.rs#L29)) and is
-  `true` by construction for a builder's stream; each component's `sorted` flag
-  travels on its descriptor.
+  `true` by construction for a builder's stream. Every index child's descriptor
+  says `sorted: true`: an index child is in its key order by definition.
 
-One driver feeds this, [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L78):
+One driver feeds this, [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L79):
 a builder's chunk stream (files, compaction; a file is written through a
 [`PendingStore`](../core/src/io/pending.rs#L77) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store

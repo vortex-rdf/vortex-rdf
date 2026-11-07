@@ -194,11 +194,15 @@ pub(crate) fn state_of(values: &[u64], counts: &[u32]) -> Scalar {
 }
 
 /// A state's `values` paired with their `counts`, where the two make a state
-/// the aggregate writes: as many counts as values, the values strictly
-/// ascending. `None` otherwise, for a state another writer could leave.
+/// the aggregate writes: as many counts as values, at most [`MAX_VALUES`] of
+/// them, the values strictly ascending, each count above zero. `None`
+/// otherwise, for a state another writer could leave.
 pub(crate) fn pairs(values: &[u64], counts: &[u32]) -> Option<Vec<(u64, u32)>> {
-    (values.len() == counts.len() && values.is_sorted_by(|a, b| a < b))
-        .then(|| values.iter().copied().zip(counts.iter().copied()).collect())
+    (values.len() == counts.len()
+        && values.len() <= MAX_VALUES as usize
+        && values.is_sorted_by(|a, b| a < b)
+        && counts.iter().all(|&n| n > 0))
+    .then(|| values.iter().copied().zip(counts.iter().copied()).collect())
 }
 
 impl AggregateFnVTable for ValueCounts {
@@ -477,6 +481,13 @@ mod tests {
         assert_eq!(decoded(&[1], &[2, 5]), None, "more counts");
         assert_eq!(decoded(&[3, 1], &[2, 5]), None, "descending");
         assert_eq!(decoded(&[3, 3], &[2, 5]), None, "repeated");
+        let many: Vec<u64> = (0..=u64::from(MAX_VALUES)).collect();
+        assert_eq!(decoded(&many, &vec![1; many.len()]), None, "past the limit");
+        assert!(
+            decoded(&many[..MAX_VALUES as usize], &vec![1; MAX_VALUES as usize]).is_some(),
+            "at the limit"
+        );
+        assert_eq!(decoded(&[1, 2], &[3, 0]), None, "a zero count");
     }
 
     /// The field a zone table names the statistic by: the aggregate's id and

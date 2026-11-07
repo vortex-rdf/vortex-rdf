@@ -31,6 +31,10 @@ async fn reference_runs_skip_settled_zones() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
 
+    if !locate_enabled() {
+        return;
+    }
+
     let _on = ForcedZones::set(true);
     let zone = ZONE_ROWS as u64;
     for graphs in [
@@ -139,6 +143,10 @@ async fn reference_cap_only_where_zones_cannot_decide() {
     use crate::CodePattern;
     use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
 
+    if !locate_enabled() {
+        return;
+    }
+
     let _on = ForcedZones::set(true);
     for graphs in [true, false] {
         let (_dir, path) = zone_file(
@@ -184,6 +192,10 @@ async fn reference_cap_only_where_zones_cannot_decide() {
 async fn reference_runs_without_zone_maps_check_rows() {
     use crate::CodePattern;
     use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
+
+    if !locate_enabled() {
+        return;
+    }
 
     let _on = ForcedZones::set(true);
     let (_dir, path) =
@@ -235,6 +247,10 @@ async fn reference_runs_without_zone_maps_check_rows() {
 async fn reference_first_page_reads_the_first_block_before_statistics() {
     use crate::CodePattern;
 
+    if !locate_enabled() {
+        return;
+    }
+
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
@@ -268,6 +284,10 @@ async fn reference_first_page_reads_the_first_block_before_statistics() {
 async fn reference_runs_check_their_graph_in_place_and_the_rest_by_id() {
     use crate::CodePattern;
 
+    if !locate_enabled() {
+        return;
+    }
+
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
@@ -293,6 +313,10 @@ async fn reference_runs_check_their_graph_in_place_and_the_rest_by_id() {
 #[tokio::test]
 async fn one_graph_reference_runs_read_row_ids_only() {
     use crate::CodePattern;
+
+    if !locate_enabled() {
+        return;
+    }
 
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::One, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();

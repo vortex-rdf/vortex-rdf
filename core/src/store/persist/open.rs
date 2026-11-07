@@ -130,13 +130,13 @@ fn classify_component(descriptor: &container::StoreComponentDescriptor) -> Resul
 }
 
 /// One known index child of a store's component roster: the registry row its
-/// implementation slug names, its slot in the inventory (descriptor
-/// `components[slot]`, which only the open paths read), and its descriptor's
-/// `sorted` provenance.
+/// implementation slug names and its slot in the inventory (descriptor
+/// `components[slot]`, which only the open paths read). Its rows are in its
+/// key order, as every index child's are, whatever its descriptor's `sorted`
+/// says.
 pub(in crate::store) struct IndexChild {
     pub(in crate::store) identity: &'static ComponentIdentity,
     pub(super) slot: usize,
-    pub(in crate::store) sorted: bool,
 }
 
 /// A store's component roster as this version reads it, classified once at
@@ -188,11 +188,9 @@ impl ComponentRoster {
                     roster.dict = Some(slot);
                     roster.dict_bracketed_iris = descriptor.bracketed_iris;
                 }
-                ComponentKind::Index(identity) => roster.index_children.push(IndexChild {
-                    identity,
-                    slot,
-                    sorted: descriptor.sorted,
-                }),
+                ComponentKind::Index(identity) => {
+                    roster.index_children.push(IndexChild { identity, slot })
+                }
                 ComponentKind::Dict | ComponentKind::Skip => {}
             }
         }
@@ -230,8 +228,7 @@ async fn component_graph_zones(
 
 /// Lift an unrefined file view's index children into in-memory components:
 /// each known child of the file's roster is scanned whole and executed to its
-/// rows (every consumer, a write or an in-memory open, reads them at once),
-/// its descriptor's `sorted` provenance carried across.
+/// rows (every consumer, a write or an in-memory open, reads them at once).
 #[cfg(feature = "file-io")]
 pub(in crate::store) async fn scanned_index_components(
     file: &NativeStoreFile,
@@ -242,7 +239,6 @@ pub(in crate::store) async fn scanned_index_components(
         components.push(IndexComponent::built(
             child.identity,
             into_struct_array(scanned)?,
-            child.sorted,
         ));
     }
     Ok(components)
@@ -372,10 +368,10 @@ impl VortexRdfStore {
     /// (buffer-backed) and canonicalized on their first use, so a load pays
     /// nothing for an index it never queries.
     ///
-    /// Sortedness is restored from the file's own provenance, never assumed:
-    /// the subject binary-search stamp only when the root metadata records a
-    /// sorted build, and a component's binary search only when its descriptor
-    /// is `sorted` (a child sorted only per chunk is scanned, never searched).
+    /// The subject binary-search stamp is restored from the file's own
+    /// provenance, never assumed: only when the root metadata records a
+    /// sorted build. An index child is searched whatever its descriptor's
+    /// `sorted` says: its rows are in its key order by definition.
     /// Runs without a runtime handle: buffer-backed segment reads resolve
     /// synchronously.
     pub async fn from_bytes(bytes: &[u8]) -> Result<Self> {
@@ -426,10 +422,8 @@ impl VortexRdfStore {
         for child in &roster.index_children {
             let graph = container::component_child(typed, child.slot)?;
             let graph = read_graph_zones(container::struct_field(&graph, COL_G), &source).await?;
-            components.push(
-                adopt_component(child.identity, reader(child.slot)?, child.sorted)
-                    .with_graph_zones(graph),
-            );
+            components
+                .push(adopt_component(child.identity, reader(child.slot)?).with_graph_zones(graph));
         }
         let layout = resolved_layout(dict, quads.dtype())?;
         Self::assemble_resident(quads, components, layout, zones)

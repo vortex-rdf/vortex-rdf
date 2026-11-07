@@ -562,15 +562,24 @@ impl Cell {
     }
 }
 
+/// Whether located runs are on: core's ablation switch, read the way core
+/// reads it (`VORTEX_RDF_LOCATE=0` turns them off), which core keeps
+/// private.
+fn locating() -> bool {
+    std::env::var("VORTEX_RDF_LOCATE").as_deref() != Ok("0")
+}
+
 /// Times `cell`'s read of a store opened before timing, once its query is
 /// resolved. The setup panics, naming the cell, unless the read returns the
 /// rows it should and, on a mapped file, a located run answers a checked
-/// run's pattern.
+/// run's pattern (unless `VORTEX_RDF_LOCATE=0` turns located runs off, as a
+/// measurement of the general match does).
 pub(crate) fn time(bencher: divan::Bencher, cell: Cell) {
     let store = rt().block_on(cell.residency.open(&cell.run.file().path()));
     let query = rt().block_on(cell.query(&store));
     if let (DictResidency::FileBacked, true, Query::Codes(pattern)) =
         (cell.residency, cell.run.located(), &query)
+        && locating()
     {
         let located = rt().block_on(store.locate_codes(*pattern, 0, Some(0)));
         assert!(

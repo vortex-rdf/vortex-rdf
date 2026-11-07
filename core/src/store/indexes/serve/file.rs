@@ -464,10 +464,9 @@ impl FileServePlan {
     }
 
     /// The order the view's reads follow, the child's
-    /// ([`ServeDecode::order`]). `None` for a child whose rows are not
-    /// globally sorted, read in its own order.
-    pub(crate) fn read_order(&self) -> Option<SortOrder> {
-        self.child.sorted.then_some(self.decode.order)
+    /// ([`ServeDecode::order`]).
+    pub(crate) fn read_order(&self) -> SortOrder {
+        self.decode.order
     }
 
     /// How the plan reads the view's rows, decided once from what it covers,

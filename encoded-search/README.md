@@ -16,7 +16,8 @@ overhead to queries like "where does value `v` start and end".
 
 This crate resolves such an array once into a borrowed tree of typed probe
 nodes, then answers queries against the compressed representation directly:
-slice reads, integer arithmetic, and single bit-packed word extraction, with
+slice reads, integer arithmetic, and bit-packed extraction (one word for a
+point read, the covered parts of a 1,024-value chunk for a bulk read), with
 the search pushed into the encoding where it allows (a frame of reference
 shifts the needle, a run-end column bisects its run ends once). No
 `ExecutionCtx`, no scalars, no allocation per query.

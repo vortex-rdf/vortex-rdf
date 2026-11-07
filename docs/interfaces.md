@@ -16,10 +16,10 @@ tests pin each interface
 | What the engine needs | What it calls |
 |---|---|
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L85), [`code_chunks`](../core/src/store/read/chunks.rs#L121) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L162), [`index_components`](../core/src/store/read/metadata.rs#L234), [`partitions`](../core/src/store/query/partitions.rs#L29) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L160), [`index_components`](../core/src/store/read/metadata.rs#L232), [`partitions`](../core/src/store/query/partitions.rs#L29) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L193)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L151), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L149), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
 | A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L80) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
@@ -164,7 +164,7 @@ is the one way it fails.
 | Field | Meaning |
 |---|---|
 | `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones; a filter a window has evaluated, finding it cuts no row, counts as none. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
-| `sort_order` | The order every read of the view follows (`quads`, `row_chunks`, `code_chunks`, the exports), when it is a known sort and the view reads no tail row. `Some(Posg)` for a view the `index:posg` copy serves with the object unbound (`?p??`, and on file `?p?g`) and for its windows, keeps, partitions and chained matches; `Some(Spog)` for any other view over a globally sorted base (every base this crate writes), a served one's index order being base order within its bound terms. `None` for a view that reads tail rows (they follow the base in append order) and for a served file view whose index child is not globally sorted. |
+| `sort_order` | The order every read of the view follows (`quads`, `row_chunks`, `code_chunks`, the exports), when it is a known sort and the view reads no tail row. `Some(Posg)` for a view the `index:posg` copy serves with the object unbound (`?p??`, and on file `?p?g`) and for its windows, keeps, partitions and chained matches; `Some(Spog)` for any other view over a globally sorted base (every base this crate writes), a served one's index order being base order within its bound terms. `None` for a view that reads tail rows (they follow the base in append order). |
 | `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a file view's pushed-down filter binds by equality, while the view still carries the filter (pending, or evaluated by a window that kept its masks). |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |
 | `served_component` | The index child that answered the match, if any (`index:posg`, …): every read of the view, and of its windows, keeps, partitions and chained matches, follows that child's order. |
@@ -174,7 +174,7 @@ is the one way it fails.
 
 `index_components()` lists the store's index children, each with its
 component name, its `IndexType`, its sort order (`Posg`, `Ospg`, or none
-for the reference pairs), its sortedness provenance, and `rows: usize`, the
+for the reference pairs, whose rows are in `(val, rid)` order), and `rows: usize`, the
 base's row count, since every index child holds one row per base quad. It returns a `Result`, and it classifies
 a child by its implementation slug, leaving out one under a slug this
 version does not know. On a view a match or a narrowing proved empty the
@@ -282,7 +282,9 @@ decisions, not the general match's or the residual compare's: the slots the
 footer settles (`zone_column`), the zones settled none and all (`zone_none`,
 `zone_all`), the mixed zones counted from their recorded graphs
 (`zone_recorded`) or on their encoding (`zone_counted`) and the rows read to
-check (`check_read`), each with its rows.
+check (`check_read`: a run's span at its first check, the rows kept so far at
+each later one, and a reference run's rows at the quad table), each with its
+rows.
 
 `locate_codes(CodePattern, offset, limit)` is the located run alone: it
 answers only a whole file-backed Dictionary store (no tail, tombstones or
@@ -314,13 +316,13 @@ valid.
   transactional engine therefore compacts on commit, or serves strings
   (`quads`, `row_chunks` on a string layout) while a tail exists, and
   re-takes the dictionary handle after the compaction.
-- A store opened by [`from_file`](../core/src/store/persist/open.rs#L265)
+- A store opened by [`from_file`](../core/src/store/persist/open.rs#L261)
   reads its memory-mapped file in place, and so does every view, partition
   and stream derived from it: the file must not be truncated or rewritten
   while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
-  [`from_file_in_memory`](../core/src/store/persist/open.rs#L275) loads the
+  [`from_file_in_memory`](../core/src/store/persist/open.rs#L271) loads the
   file whole instead and never reads it again.
 
 ## 6. A store file through vortex's reader

@@ -219,9 +219,9 @@ pub enum IndexType {
     /// predicate **and** object prefix-search (p, o) in one probe, and a
     /// bound object binary-searches `index:ospg`'s `o` column. Reads take the
     /// matching rows from a *contiguous* run of the copy columns instead of
-    /// scattering row-id reads across the primary columns. Routing engages
-    /// only on children their writer recorded as globally sorted, as every
-    /// build here does.
+    /// scattering row-id reads across the primary columns. Routing assumes
+    /// the children globally sorted, as the format requires of every index
+    /// child.
     SecondaryByCopy,
 
     /// Sorted back-references for both predicates **and** objects.
@@ -234,8 +234,8 @@ pub enum IndexType {
     ///
     /// A pattern with a bound predicate or object and no bound subject
     /// binary-searches them instead of scanning (the object's child when both
-    /// are bound). Routing engages only on children their writer recorded as
-    /// globally sorted, as every build here does.
+    /// are bound). Routing assumes the children sorted by `(val, rid)`, as
+    /// the format requires of every index child.
     SecondaryByReference,
 }
 

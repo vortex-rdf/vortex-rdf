@@ -430,12 +430,13 @@ impl LocatedRun {
     }
 
     /// Of `rows` (ascending), those holding `check`'s code in `column`, read
-    /// at them.
+    /// at them (counted as `check_read`).
     async fn holding(&self, column: &Chunks, check: &Check, rows: Vec<u64>) -> Result<Vec<u64>> {
         observe!(CheckTaken {
             slot: check.slot,
             rows: rows.len() as u64
         });
+        note(counters::CHECK_READ, rows.len() as u64);
         let values = take_codes(column, &rows, &self.source, &self.session).await?;
         Ok(rows
             .into_iter()
