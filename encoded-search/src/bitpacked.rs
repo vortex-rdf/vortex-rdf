@@ -234,7 +234,9 @@ impl PackedNode<'_> {
 
     /// The values at positions `part` of FastLanes chunk `c`, at most the
     /// crossover of them, handed to `f`: one by one or at their positions,
-    /// by the read rule.
+    /// by the read rule. Out of line: inlined into every read, it made reads
+    /// of up to 128 values slower.
+    #[inline(never)]
     fn read_short_part<T>(&self, packed: &[T], c: usize, part: Range<usize>, f: impl FnOnce(&[T]))
     where
         T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Default,
