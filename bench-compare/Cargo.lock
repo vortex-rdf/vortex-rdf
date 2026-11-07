@@ -4013,7 +4013,6 @@ dependencies = [
  "vortex-edition",
  "vortex-error",
  "vortex-expr",
- "vortex-fastlanes",
  "vortex-file",
  "vortex-fsst",
  "vortex-io",

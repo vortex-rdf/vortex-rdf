@@ -24,8 +24,6 @@ use std::ops::Range;
 #[cfg(test)]
 use std::path::PathBuf;
 
-#[cfg(test)]
-use crate::kernels::Kernel;
 #[cfg(all(test, feature = "file-io"))]
 use crate::store::scan::read_plan::MaskedRead;
 
@@ -38,10 +36,6 @@ pub(crate) enum Event {
     FileMapped,
     /// A split future spawned onto the runtime (`io::read::spawned_splits`).
     SplitSpawned,
-
-    // ── Kernels ──────────────────────────────────────────────────────────
-    /// One of the store's own kernels answered an execution (`kernels`).
-    Kernel(Kernel),
 
     // ── Building ─────────────────────────────────────────────────────────
     /// A slice cut off an array by `rechunk`.

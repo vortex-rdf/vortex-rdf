@@ -12,18 +12,15 @@ use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
 /// The store session: the array, layout, scalar-fn and runtime registries,
-/// the store's own kernels ([`kernels`](crate::kernels)), the default
-/// encodings, the store's container layout, and the write editions
-/// enabled. The runtime is the one per-target piece: tokio natively,
-/// the microtask-queue `WasmRuntime` on wasm32-unknown-unknown, where the file
-/// writer spawns tasks.
+/// the store's statistics rule and aggregate, the default encodings, the
+/// store's container layout, and the write editions enabled. The runtime is
+/// the one per-target piece: tokio natively, the microtask-queue
+/// `WasmRuntime` on wasm32-unknown-unknown, where the file writer spawns
+/// tasks.
 pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = registries();
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     let session = session.with_handle(vortex_io::runtime::wasm::WasmRuntime::handle());
-    // Ahead of the default encodings' kernels, so that the store's are tried
-    // first.
-    crate::kernels::register(&session);
     crate::zone_stats::rules::register(&session);
     vortex_file::register_default_encodings(&session);
     crate::io::container::register(&session);
