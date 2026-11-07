@@ -9,7 +9,8 @@
 //! evaluates a filter split by split and computes statistics-only pruning
 //! envelopes, `subject_runs` locates runs of the sorted subject column,
 //! `read_plan` chooses how an exact selection's rows are read, and
-//! `file_reads` reads them by id through the file's cached chunk probes. A
+//! `file_reads` reads them by id through the file's cached chunk probes,
+//! and `column_reads` one chunked column's codes at positions. A
 //! fold that may stop at its first matches, on either side, cuts its rows
 //! into the growing pieces of `pieces`. The
 //! point-read paths on both sides decline above a selection width to the
@@ -18,6 +19,8 @@
 //!
 //! [`RowSelection`]: super::view::selection::RowSelection
 
+#[cfg(feature = "file-io")]
+pub(crate) mod column_reads;
 #[cfg(feature = "file-io")]
 pub(crate) mod file_exprs;
 #[cfg(feature = "file-io")]
