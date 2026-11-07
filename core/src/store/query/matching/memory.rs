@@ -112,14 +112,8 @@ impl VortexRdfStore {
                     row_ids,
                     resolves,
                     serve: plan,
-                    graph,
                 } => {
                     pat = resolves.clear(pat);
-                    // A run that checked the bound graph inside its
-                    // component leaves none to compare.
-                    if graph {
-                        pat.graph = None;
-                    }
                     resolved = Some(row_ids);
                     serve = plan;
                 }

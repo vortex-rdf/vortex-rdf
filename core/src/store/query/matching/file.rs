@@ -87,7 +87,6 @@ impl VortexRdfStore {
                 row_ids,
                 resolves,
                 serve,
-                graph: _,
             } => {
                 let pat = resolves.clear(pat);
                 // Built before the ids fold: a run held for a count needs
