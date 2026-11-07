@@ -79,7 +79,7 @@ and raises `Cancelled` when the token is cancelled before the call or while
 the call waits for data.
 
 A `CodePattern` streams through
-[`match_code_chunks`](../core/src/store/query/located.rs#L153):
+[`match_code_chunks`](../core/src/store/query/located/mod.rs#L158):
 `match_code_pattern`'s rows in its order, as chunks of all four code
 columns. A located run that answers the pattern is read a block of
 `batch_rows` of its rows at a time, the rows each block keeps checked as it
@@ -87,7 +87,7 @@ is read, so the run is read once and the stream holds only its place in it;
 any other pattern streams the general match's `code_chunks`. Java's
 `matchCodeChunks` is built on it. Two calls let a binding build its own
 chunked read of a pattern:
-[`code_probe`](../core/src/store/query/located.rs#L181) turns a `CodePattern` into
+[`code_probe`](../core/src/store/query/located/mod.rs#L186) turns a `CodePattern` into
 the `Probe` that `match_code_pattern` runs when no located run answers it
 (`None` when no quad can match), for `run_probe` and then `code_chunks`;
 and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L148) decodes one of
@@ -344,7 +344,7 @@ integration can register the file through vortex's own data source over it
 
 | Concern | File |
 |---|---|
-| `count_code_pattern`, `match_code_pattern`, `match_code_chunks`, `code_probe`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
+| `count_code_pattern`, `match_code_pattern`, `match_code_chunks`, `code_probe`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located/mod.rs`](../core/src/store/query/located/mod.rs) |
 | `row_chunks`, `code_chunks`, `decode_row_chunk` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
 | `view_statistics`, `index_components`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
 | `partitions` | [`core/src/store/query/partitions.rs`](../core/src/store/query/partitions.rs) |
