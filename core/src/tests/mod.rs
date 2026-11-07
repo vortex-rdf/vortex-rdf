@@ -16,8 +16,6 @@ mod builders;
 mod chained;
 mod chunk_reads;
 mod chunks;
-mod component_runs;
-mod component_zones;
 mod dictionary;
 mod dictionary_file_backed;
 mod dictionary_handle;
@@ -25,12 +23,10 @@ mod dictionary_handle;
 // shared escaped-literal case list.
 pub(crate) mod escaping;
 mod file_backed;
-mod file_counts;
 mod index_order;
 mod indexes;
 mod indexes_file;
 mod leaf_geometry;
-mod located_zones;
 mod mapping;
 mod masks_first;
 mod matching;
@@ -39,21 +35,17 @@ mod mutation;
 mod names;
 mod narrowing;
 mod open_errors;
-mod pending_residual;
 mod predicates;
 mod rebuild;
-mod reference_graphs;
-mod residual_zones;
 mod roundtrip;
 mod row_limit;
 mod serialization;
 mod streaming;
 mod tail_keys;
 mod unique_quads;
-mod value_counts;
 mod wide_codes;
 mod wide_row_ids;
-mod zone_bounds;
+mod zones;
 
 const LAYOUTS: [LayoutStrategy; 3] = [
     LayoutStrategy::Default,

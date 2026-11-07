@@ -543,7 +543,7 @@ fn hub_quads() -> Vec<Quad> {
 /// win over its object's long run.
 #[tokio::test]
 async fn subject_and_object_read_the_shorter_run() {
-    use super::located_zones::code_of;
+    use super::zones::code_of;
     use crate::CodePattern;
 
     if !crate::store::query::located::locate_enabled() {
@@ -666,7 +666,7 @@ async fn gap_runs_search_only_the_reference_runs_that_could_be_shorter() {
 /// run, its subjects checked row by row, would be capped and decline.
 #[tokio::test]
 async fn a_capped_reference_run_leaves_the_gap_run_to_answer() {
-    use super::located_zones::code_of;
+    use super::zones::code_of;
     use crate::CodePattern;
     use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
 

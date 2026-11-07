@@ -5,12 +5,9 @@
 //! contiguous, instead of comparing the graph at the base rows the run
 //! lists. Their answers are the base compare's.
 
-use super::located_zones::{Graphs, RUN, UNRECORDED_GAP, zone_quads};
-use super::residual_zones::{LAYOUTS, answers, quads_of, tailed, tombstoned};
 use super::*;
 use crate::store::test_hooks::ForcedZones;
 use crate::store::{Keep, QuadColumn};
-use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The probes an index run answers, by graph: `(? type ? g)`,
 /// `(? type Taxon g)` and `(? ? Taxon g)`, for the default graph and graphs
@@ -69,11 +66,11 @@ async fn assert_runs_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
     for (shape, probe) in component_probes() {
         let off = {
             let _zones = ForcedZones::set(false);
-            answers(store, &probe).await
+            probe_answers(store, &probe).await
         };
         let on = {
             let _zones = ForcedZones::set(true);
-            answers(store, &probe).await
+            probe_answers(store, &probe).await
         };
         assert_eq!(on, off, "{tag} {shape}");
     }
@@ -84,7 +81,7 @@ async fn assert_runs_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
 /// zone and with a tail: zones on or off, every index-run probe answers the
 /// same.
 async fn assert_component_runs_answer_as_rows_do(index: IndexConfig) {
-    for graphs in LAYOUTS {
+    for graphs in ZONE_GRAPHS {
         let quads = zone_quads(graphs);
         let built = built_store(quads.clone(), LayoutStrategy::Dictionary, index.types()).await;
         let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, index.types()).await;
@@ -535,7 +532,7 @@ async fn copy_pg_answers_in_base_order() {
         let (store, probe, wide, kept) = (&store, &probe, &wide, &kept);
         async move {
             let _zones = ForcedZones::set(on);
-            let answered = answers(store, probe).await;
+            let answered = probe_answers(store, probe).await;
             // Each read, and how many zones it checked inside the component.
             let mut rec = Recorder::start();
             let mut reads = Vec::new();

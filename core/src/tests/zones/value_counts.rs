@@ -6,17 +6,7 @@ use super::*;
 use crate::store::test_hooks::ForcedValueCounts;
 use crate::zone_stats::rules::zones_switch;
 use crate::zone_stats::value_counts::{decode_state, value_counts};
-use crate::zone_stats::zone_map::{ExactZoneMap, ZONE_ROWS};
-
-/// Whether `column` is zoned with the statistic among its aggregates.
-pub(super) fn records_value_counts(column: &vortex_layout::LayoutRef) -> bool {
-    use vortex_layout::layouts::zoned::Zoned;
-    column.as_opt::<Zoned>().is_some_and(|zoned| {
-        zoned
-            .present_aggregates()
-            .contains(&value_counts().to_string())
-    })
-}
+use crate::zone_stats::zone_map::ExactZoneMap;
 
 /// Each zone's recorded state of `column`'s statistic, decoded.
 async fn recorded_states(

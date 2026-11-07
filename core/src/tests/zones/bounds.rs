@@ -6,7 +6,6 @@
 //! compare's, over every kind of selection.
 
 use super::*;
-use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The rows of [`zoned_quads`]: four zones and part of a fifth.
 const ROWS: usize = 4 * ZONE_ROWS + 1_000;
@@ -290,8 +289,6 @@ async fn zone_narrowing_answers_every_selection_as_the_full_compare() {
 /// records graphs, and a zone past 16 of them records none.
 #[tokio::test]
 async fn in_memory_zone_maps_match_the_files() {
-    use super::located_zones::{Graphs, zone_quads};
-
     for graphs in [Graphs::Stretches, Graphs::RecordedByTurns] {
         let quads = zone_quads(graphs);
         let built = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
@@ -337,7 +334,6 @@ async fn in_memory_zone_maps_match_the_files() {
 #[tokio::test]
 async fn records_skip_zones_in_memory() {
     let _zones_on = crate::store::test_hooks::ForcedZones::set(true);
-    use super::located_zones::{Graphs, zone_quads};
 
     let store = built_store(
         zone_quads(Graphs::Gapped),
@@ -367,7 +363,6 @@ async fn records_skip_zones_in_memory() {
 #[tokio::test]
 async fn array_statistics_settle_a_whole_column() {
     let _zones_on = crate::store::test_hooks::ForcedZones::set(true);
-    use super::located_zones::{Graphs, RUN, code_of, zone_quads};
 
     let store = built_store(zone_quads(Graphs::One), LayoutStrategy::Dictionary, vec![]).await;
     let rows = 2 * RUN;
@@ -473,7 +468,6 @@ async fn built_and_loaded_stores_keep_the_same_column_bounds() {
 /// the store's indexes.
 #[tokio::test]
 async fn settled_residuals_keep_base_order() {
-    use super::located_zones::{Graphs, RUN, zone_quads};
     use crate::store::test_hooks::ForcedZones;
 
     let store = built_store(

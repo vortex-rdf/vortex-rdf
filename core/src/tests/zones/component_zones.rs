@@ -3,12 +3,10 @@
 //! does, taken while a build compresses the component or read from the
 //! child's zone table at load.
 
-use super::located_zones::{Graphs, RUN, zone_quads};
 use super::*;
-use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The components of an index configuration.
-fn component_names(index: IndexConfig) -> &'static [&'static str] {
+fn zone_components(index: IndexConfig) -> &'static [&'static str] {
     match index {
         IndexConfig::NoIndex => &[],
         IndexConfig::Copy => &["index:posg", "index:ospg"],
@@ -48,7 +46,7 @@ async fn component_graph_zones_match_the_files() {
             let bytes = std::fs::read(&path).unwrap();
             let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
             let rows = row_list(&built).await;
-            for &name in component_names(index) {
+            for &name in zone_components(index) {
                 let tag = format!("{graphs:?} {name}");
                 let column = component_graphs(name, &rows);
                 let want: Vec<(TermCode, TermCode)> = column
@@ -115,7 +113,7 @@ async fn adopted_components_stay_deferred() {
         .await;
         let bytes = std::fs::read(&path).unwrap();
         let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-        for &name in component_names(index) {
+        for &name in zone_components(index) {
             assert!(
                 adopted.debug_component_zone_bounds(name).is_some(),
                 "{name}: a zone map at adoption"
@@ -134,7 +132,7 @@ async fn adopted_components_stay_deferred() {
             .unwrap();
         assert_eq!(view.size().await.unwrap(), RUN, "{}", index.name());
         assert!(
-            component_names(index)
+            zone_components(index)
                 .iter()
                 .any(|name| adopted.debug_index_component_materialized(name) == Some(true)),
             "{}: the probed component materializes on use",
@@ -160,7 +158,7 @@ async fn string_components_have_no_zone_maps() {
             ("loaded", &loaded),
             ("adopted", &adopted),
         ] {
-            for &name in component_names(index) {
+            for &name in zone_components(index) {
                 assert!(
                     store.debug_index_component_materialized(name).is_some(),
                     "{label} {name}: the component exists"

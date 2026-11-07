@@ -2,14 +2,13 @@
 //! reference child holds, beside each row id, the graph of the quad that row
 //! id names, so a by-reference run checks its own graph rows.
 
-use super::value_counts::records_value_counts;
 use super::*;
 use crate::store::indexes::IndexComponent;
 use crate::store::test_hooks::ForcedReferenceGraphs;
 
 /// 60 quads over three graphs, the default graph among them, four
 /// predicates and five objects: each predicate and object meets every graph.
-fn three_graph_quads() -> Vec<Quad> {
+fn three_graph_sixty() -> Vec<Quad> {
     let graphs = [GraphName::DefaultGraph, iri_graph("g1"), iri_graph("g2")];
     graph_modular_quads(60, 2, 4, 5, &graphs)
 }
@@ -47,7 +46,7 @@ fn child_names(component: &IndexComponent) -> Vec<String> {
 #[tokio::test]
 async fn reference_children_hold_each_rows_graph() {
     let built = build_array::<SortedInMemoryBuilder>(
-        quad_stream(three_graph_quads()),
+        quad_stream(three_graph_sixty()),
         LayoutStrategy::Dictionary,
         IndexConfig::Reference.types(),
     )
@@ -93,7 +92,7 @@ async fn reference_children_hold_each_rows_graph() {
     }
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let built = build_array::<SortedInMemoryBuilder>(
-            quad_stream(three_graph_quads()),
+            quad_stream(three_graph_sixty()),
             layout,
             IndexConfig::Reference.types(),
         )
@@ -111,7 +110,7 @@ async fn reference_children_hold_each_rows_graph() {
 #[tokio::test]
 async fn written_reference_graphs_record_value_counts() {
     let memory = built_store(
-        three_graph_quads(),
+        three_graph_sixty(),
         LayoutStrategy::Dictionary,
         IndexConfig::Reference.types(),
     )
@@ -138,7 +137,7 @@ async fn older_reference_children_read_as_before() {
     let memory = {
         let _before = ForcedReferenceGraphs::set(false);
         built_store(
-            three_graph_quads(),
+            three_graph_sixty(),
             LayoutStrategy::Dictionary,
             IndexConfig::Reference.types(),
         )
@@ -234,7 +233,7 @@ async fn stream_written_children_follow_the_hook() {
         let (_dir, path) = {
             let _hook = ForcedReferenceGraphs::set(graphs);
             write_store_file(
-                three_graph_quads(),
+                three_graph_sixty(),
                 LayoutStrategy::Dictionary,
                 IndexConfig::Reference.types(),
             )
@@ -288,11 +287,10 @@ async fn reads(
 /// rows, contiguous, and never the quad table's `g` at its scattered rows:
 /// `(? type ? g1)`, `(? ? Taxon g1)` and `(? type Taxon g1)` on alternating
 /// graphs, read row by row (zones off; zones deciding these runs are pinned
-/// in `located_zones`). A store written without the child `g`, as before it,
+/// in `located`). A store written without the child `g`, as before it,
 /// reads the quad table's; both answer every read alike, as their rows say.
 #[tokio::test]
 async fn reference_runs_read_their_own_graphs() {
-    use super::located_zones::{Graphs, RUN, zone_quads};
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
 
