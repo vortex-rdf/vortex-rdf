@@ -584,9 +584,6 @@ impl LocatedRun {
     }
 }
 
-/// The graph's slot in `(s, p, o, g)`.
-pub(super) const GRAPH_SLOT: usize = 3;
-
 /// How many searches of a reference run's `rid`s cost about as much as
 /// reaching one more quad-table leaf to read a slot there (about 250 ns
 /// against 4 µs per leaf on WatDiv 100M's reference store, warm).

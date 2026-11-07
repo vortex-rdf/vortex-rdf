@@ -87,6 +87,15 @@ pub(crate) const COL_G: &str = "g";
 /// The four primary columns in emission order.
 pub(crate) const PRIMARY_COLUMNS: [&str; 4] = [COL_S, COL_P, COL_O, COL_G];
 
+/// The graph column's slot in `(s, p, o, g)`: [`QuadColumn::G`]'s index.
+pub(crate) const GRAPH_SLOT: usize = QuadColumn::G as usize;
+
+/// The slot of the primary column named `name` in `(s, p, o, g)`: `s` is 0,
+/// `g` is 3; `None` for any other name.
+pub(crate) fn primary_slot(name: &str) -> Option<usize> {
+    QuadColumn::from_name(name).map(QuadColumn::index)
+}
+
 /// TypedObject: the term kind tag; its presence in a schema marks the layout.
 pub(crate) const COL_O_KIND: &str = "o_kind";
 /// TypedObject: the object's lexical value: IRI string, blank node id, or

@@ -18,12 +18,11 @@
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::store::schema::{CODE_DTYPE, PRIMARY_COLUMNS, TermCode};
+#[cfg(test)]
+use crate::store::schema::PRIMARY_COLUMNS;
+use crate::store::schema::{CODE_DTYPE, TermCode, primary_slot};
 use crate::zone_stats::value_counts::{Counts, MAX_VALUES};
 use crate::zone_stats::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS};
-
-/// The graph column's slot in `(s, p, o, g)`.
-const GRAPH_SLOT: usize = 3;
 
 /// A base's quad code columns' zone maps, in `(s, p, o, g)` slot order; a
 /// column without one is `None`.
@@ -38,8 +37,7 @@ impl QuadZones {
 
     /// Column `name`'s zone map (`s`, `p`, `o` or `g`), if it has one.
     pub(crate) fn of_column(&self, name: &str) -> Option<&Arc<ColumnZones>> {
-        let slot = PRIMARY_COLUMNS.iter().position(|column| *column == name)?;
-        self.get(slot)
+        self.get(primary_slot(name)?)
     }
 
     /// Record `zones` as slot `slot`'s.
@@ -86,10 +84,7 @@ impl QuadZones {
             let Some(LayoutChildType::Field(name)) = quads.slot_type(slot) else {
                 continue;
             };
-            let Some(quad_slot) = PRIMARY_COLUMNS
-                .iter()
-                .position(|column| *column == name.as_ref())
-            else {
+            let Some(quad_slot) = primary_slot(name.as_ref()) else {
                 continue;
             };
             let Some(column) = quads.slot(slot)? else {
@@ -253,14 +248,10 @@ pub(crate) async fn read_graph_zones(
     }
 }
 
-/// Whether slot `slot` is the graph column, whose zones record their graphs.
-pub(crate) fn records_graphs(slot: usize) -> bool {
-    slot == GRAPH_SLOT
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::schema::GRAPH_SLOT;
 
     /// A zone's bounds are its own codes' smallest and largest, whether the
     /// codes arrive in one slice or across slices cut anywhere; the last zone

@@ -194,7 +194,7 @@ struct EveryRow {
 /// (`VORTEX_RDF_ZONES=0`) or for a filter of any other shape than code
 /// equalities on the quad table's code columns.
 fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<EveryRow> {
-    use crate::store::schema::PRIMARY_COLUMNS;
+    use crate::store::schema::primary_slot;
 
     if !crate::zone_stats::rules::zones_enabled() {
         return None;
@@ -202,10 +202,7 @@ fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<Every
     let columns = filter
         .eqs()?
         .iter()
-        .map(|(column, code)| {
-            let slot = PRIMARY_COLUMNS.iter().position(|c| *c == column.as_ref())?;
-            Some((slot, code))
-        })
+        .map(|(column, code)| Some((primary_slot(column.as_ref())?, code)))
         .collect::<Option<Vec<_>>>()?;
     (!columns.is_empty()).then(|| EveryRow {
         columns,

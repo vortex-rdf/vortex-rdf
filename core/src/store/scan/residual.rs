@@ -48,7 +48,7 @@ use crate::store::probes::StructProbes;
 use crate::store::read::live::{Live, WindowCursor};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
 use crate::store::scan::typed_eq::typed_residual_ids_reading;
-use crate::store::schema::{PRIMARY_COLUMNS, RowId};
+use crate::store::schema::{RowId, primary_slot};
 use crate::store::view::selection::{RowSelection, SelectedRows};
 use crate::zone_stats::zone_map::{ZONE_ROWS, eq_on_bounds};
 use crate::zone_stats::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
@@ -94,8 +94,7 @@ pub(crate) fn ask_statistics(
     let mut open = Vec::with_capacity(eqs.len());
     let mut zoned = Vec::new();
     for (field, value) in eqs {
-        let slot = PRIMARY_COLUMNS.iter().position(|column| *column == field);
-        let (Some(slot), Some(code)) = (slot, unsigned_value(&value)) else {
+        let (Some(slot), Some(code)) = (primary_slot(field), unsigned_value(&value)) else {
             open.push((field, value));
             continue;
         };
@@ -133,11 +132,10 @@ pub(crate) fn unasked_classes(memory: &MemoryBase, eqs: &[(&'static str, Scalar)
         .iter()
         .enumerate()
         .filter_map(|(at, (field, value))| {
-            let slot = PRIMARY_COLUMNS.iter().position(|column| column == field)?;
             Some(ZoneCheck {
                 bit: u32::try_from(at).ok()?,
                 code: unsigned_value(value)?,
-                zones: Arc::clone(memory.zones.get(slot)?),
+                zones: Arc::clone(memory.zones.get(primary_slot(field)?)?),
             })
         })
         .collect();

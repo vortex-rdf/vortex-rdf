@@ -10,8 +10,7 @@ use crate::error::Result;
 use crate::observe::observe;
 use crate::store::VortexRdfStore;
 use crate::store::persist::native_file::{FileTable, LocatedTables};
-use crate::store::schema::PRIMARY_COLUMNS;
-use crate::store::schema::TermCode;
+use crate::store::schema::{GRAPH_SLOT, PRIMARY_COLUMNS, TermCode};
 use std::ops::Range;
 use vortex_session::VortexSession;
 
