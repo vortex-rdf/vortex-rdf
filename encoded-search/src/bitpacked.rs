@@ -173,17 +173,28 @@ impl PackedNode<'_> {
 
     /// Hands `f` the values at physical positions `first..first + n`, a
     /// chunk part at a time, each with its offset in the window, unpacked as
-    /// the read rule takes it ([`unpack_tier`]).
+    /// the read rule takes it ([`unpack_tier`]). A read the rule takes one by
+    /// one in all is read so across its chunks, in one part.
+    #[inline]
     fn read_parts<T>(&self, packed: &[T], first: usize, n: usize, mut f: impl FnMut(usize, &[T]))
     where
         T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Default,
     {
-        if n > unpack_crossover::<T>() {
-            return self.read_long_parts(packed, first, n, f);
-        }
-        for (c, part) in chunk_parts(first, first + n) {
-            let at = c * FL_CHUNK + part.start - first;
-            self.read_short_part(packed, c, part, |values| f(at, values));
+        match unpack_tier::<T>(n) {
+            Tier::OneByOne => {
+                let mut values = [T::default(); UNPACK_ONE_BY_ONE];
+                for (v, i) in values.iter_mut().zip(first..first + n) {
+                    *v = self.unpack(packed, i);
+                }
+                f(0, &values[..n]);
+            }
+            Tier::Positions => {
+                for (c, part) in chunk_parts(first, first + n) {
+                    let at = c * FL_CHUNK + part.start - first;
+                    self.read_short_part(packed, c, part, |values| f(at, values));
+                }
+            }
+            Tier::Chunk => self.read_long_parts(packed, first, n, f),
         }
     }
 
