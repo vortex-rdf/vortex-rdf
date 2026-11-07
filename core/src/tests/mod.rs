@@ -556,6 +556,8 @@ fn last_spill_dir(rec: &Recorder) -> std::path::PathBuf {
     .expect("the build made a run directory")
 }
 
+/// The quad-row column names `layout` builds — what a schema assertion
+/// expects the primary struct to carry and nothing else.
 fn primary_columns(layout: LayoutStrategy) -> &'static [&'static str] {
     match layout {
         LayoutStrategy::Default | LayoutStrategy::Dictionary => &["s", "p", "o", "g"],

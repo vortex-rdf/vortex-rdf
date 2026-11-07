@@ -13,7 +13,6 @@
 use super::*;
 use crate::store::scan::pieces::FIRST_PIECE_ROWS;
 use crate::store::test_hooks::ForcedZones;
-use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The rows of each piece of a pending residual `rec` saw compared since its
 /// last take, in order.

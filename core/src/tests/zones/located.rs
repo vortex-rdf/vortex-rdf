@@ -59,8 +59,6 @@ async fn column_zones_absent_without_zone_maps() {
 /// zone's.
 #[tokio::test]
 async fn column_zones_read_recorded_counts() {
-    use crate::zone_stats::zone_map::ZONE_ROWS;
-
     for recorded in [true, false] {
         let (_dir, path) =
             zone_file(ZoneFile::new(Graphs::Stretches, IndexConfig::Copy).value_counts(recorded))
@@ -220,8 +218,6 @@ async fn zoned_runs_skip_settled_zones() {
 /// (Review Focus 4).
 #[tokio::test]
 async fn recorded_graphs_settle_zones_without_the_code() {
-    use crate::zone_stats::zone_map::ZONE_ROWS;
-
     for recorded in [true, false] {
         let (_dir, path) =
             zone_file(ZoneFile::new(Graphs::Gapped, IndexConfig::Copy).value_counts(recorded))
@@ -261,7 +257,6 @@ async fn recorded_graphs_settle_zones_without_the_code() {
 #[tokio::test]
 async fn first_pages_count_the_zones_before_their_first_match() {
     use crate::CodePattern;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     // The run is rows RUN..2 * RUN of its child, graph 2's rows its rows
     // 20,000..21,000: they lie in the child's zone from 57,344.
@@ -309,7 +304,6 @@ async fn first_pages_count_the_zones_before_their_first_match() {
 #[tokio::test]
 async fn recorded_counts_answer_mixed_zones() {
     use crate::store::test_hooks::ForcedZones;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
@@ -393,7 +387,6 @@ async fn zones_past_max_values_count_their_encoding() {
 async fn recorded_and_unrecorded_zones_by_turns() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
     use std::collections::BTreeSet;
 
     let (_dir, path) =
@@ -479,7 +472,6 @@ async fn recorded_and_unrecorded_zones_by_turns() {
 async fn default_graph_counts_from_records() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::DefaultAndThree, IndexConfig::Copy)).await;
@@ -542,7 +534,6 @@ fn reference_graph_reads(rec: &Recorder) -> (u64, u64) {
 async fn reference_runs_skip_settled_zones() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
     let zone = ZONE_ROWS as u64;
