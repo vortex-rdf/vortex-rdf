@@ -340,7 +340,9 @@ async fn zone_patterns(store: &VortexRdfStore, g: usize) -> Vec<crate::CodePatte
     patterns
 }
 
-/// The rows `pattern` streams in chunks of `batch` rows, in order.
+/// The rows [`match_code_chunks`](VortexRdfStore::match_code_chunks) streams
+/// for `pattern`, in the stream's order, each chunk its four code columns of
+/// `batch` rows or fewer, none empty.
 pub(super) async fn streamed(
     store: &VortexRdfStore,
     pattern: crate::CodePattern,
@@ -353,10 +355,17 @@ pub(super) async fn streamed(
         .try_collect()
         .await
         .unwrap();
-    chunks
-        .iter()
-        .flat_map(|chunk| code_rows::<4>(chunk))
-        .collect()
+    let mut rows = Vec::new();
+    for chunk in &chunks {
+        assert_eq!(chunk.len(), 4, "the four code columns");
+        assert!(
+            (1..=batch).contains(&chunk[0].len()),
+            "a chunk of {} rows",
+            chunk[0].len()
+        );
+        rows.extend(code_rows::<4>(chunk));
+    }
+    rows
 }
 
 /// The term path's rows of `pattern`: its codes spelled out and matched.
@@ -374,7 +383,12 @@ pub(super) async fn term_rows(
     ];
     for (spelling, code) in spelled.iter_mut().zip(slots) {
         if let Some(code) = code {
-            *spelling = dict.decode(code).await.unwrap();
+            *spelling = Some(
+                dict.decode(code)
+                    .await
+                    .unwrap()
+                    .expect("a code the dictionary holds"),
+            );
         }
     }
     let probe = crate::Probe::parse(

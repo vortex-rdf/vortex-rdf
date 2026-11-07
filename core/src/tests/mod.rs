@@ -27,6 +27,7 @@ mod index_order;
 mod indexes;
 mod indexes_file;
 mod leaf_geometry;
+mod locate_codes;
 mod mapping;
 mod masks_first;
 mod matching;
