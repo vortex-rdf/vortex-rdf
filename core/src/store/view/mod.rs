@@ -412,7 +412,7 @@ impl QuadsSource {
         let lazy = match &self.selection {
             ViewSelection::Residual(residual) => {
                 let (ids, live) = residual.window(offset, limit, self.deleted.as_ref())?;
-                return Ok(Some((RowSelection::from_ids(ids), live)));
+                return Ok(Some((RowSelection::from_ids(ids), live.at_least())));
             }
             ViewSelection::Pending { ids, .. } => ids,
             ViewSelection::Exact(_) => return Ok(None),

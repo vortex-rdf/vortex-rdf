@@ -7,7 +7,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::io::zone_map::ColumnZones;
+use crate::io::zone_map::{ColumnZones, eq_on_bounds};
 
 /// How a zone stands against a set's checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +49,8 @@ pub(crate) struct ZoneSet {
     /// The bits of the checks no zone map speaks for, unsettled in every
     /// zone.
     unzoned: u32,
+    /// Whether classes read the bounds alone ([`bounds_only`](Self::bounds_only)).
+    bounds_only: bool,
 }
 
 impl ZoneSet {
@@ -68,7 +70,22 @@ impl ZoneSet {
                         check.zones.row_count(),
                     ) == geometry
             })
-            .then_some(Self { checks, unzoned })
+            .then_some(Self {
+                checks,
+                unzoned,
+                bounds_only: false,
+            })
+    }
+
+    /// This set classing by the bounds alone, as before the zone classes:
+    /// [`ZoneClass::None`] where a check's bounds rule its code out, else
+    /// [`ZoneClass::Mixed`] on every check, so no zone is taken whole and
+    /// no record is read. The route with zones off.
+    pub(crate) fn bounds_only(self) -> Self {
+        Self {
+            bounds_only: true,
+            ..self
+        }
     }
 
     /// Rows per zone, the last zone's excepted.
@@ -93,6 +110,20 @@ impl ZoneSet {
     /// holds it in every row and no check is unzoned, [`ZoneClass::Mixed`]
     /// otherwise.
     pub(crate) fn class(&self, zone: u64) -> ZoneClass {
+        if self.bounds_only {
+            let ruled_out = self.checks.iter().any(|check| {
+                let (min, max) = check.zones.zone_bounds(zone);
+                eq_on_bounds(min, max, check.code) == Some(false)
+            });
+            let every = self
+                .checks
+                .iter()
+                .fold(self.unzoned, |bits, check| bits | 1 << check.bit);
+            return match ruled_out {
+                true => ZoneClass::None,
+                false => ZoneClass::Mixed { unsettled: every },
+            };
+        }
         let mut unsettled = self.unzoned;
         for check in &self.checks {
             match check.zones.eq_holds(zone, check.code) {
@@ -261,6 +292,43 @@ mod tests {
         assert_eq!(
             [set.class(0), set.class(1)],
             [ZoneClass::All, ZoneClass::None]
+        );
+    }
+
+    /// By the bounds alone, a zone is none where they rule the code out and
+    /// mixed on every check otherwise: a zone of the code alone, and one
+    /// whose record lacks the code, are both compared.
+    #[test]
+    fn bounds_only_skips_by_bounds_alone() {
+        let recorded = ColumnZones::from_bounds(
+            vortex_buffer::buffer![5u64, 1, 4],
+            vortex_buffer::buffer![5u64, 4, 6],
+            Z,
+            3 * Z,
+        )
+        .unwrap()
+        .with_records(vec![
+            Some(vec![(5, Z as u32)].into()),
+            Some(vec![(1, Z as u32)].into()),
+            Some(vec![(4, 8_000), (6, 192)].into()),
+        ])
+        .unwrap();
+        let set = ZoneSet::new(
+            vec![ZoneCheck {
+                bit: 1,
+                code: 5,
+                zones: Arc::new(recorded),
+            }],
+            1 << 4,
+        )
+        .unwrap()
+        .bounds_only();
+        let every = ZoneClass::Mixed {
+            unsettled: 1 << 1 | 1 << 4,
+        };
+        assert_eq!(
+            (0..3).map(|zone| set.class(zone)).collect::<Vec<_>>(),
+            [every, ZoneClass::None, every]
         );
     }
 

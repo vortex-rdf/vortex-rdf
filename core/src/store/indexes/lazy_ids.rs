@@ -287,7 +287,8 @@ impl LazyRowIds {
             && let Some(check) = &run.check
             && run.sorted.get().or(run.run_order.get()).is_none()
         {
-            return check.window(&run.rids, offset, limit).map(Some);
+            let (ids, live) = check.window(&run.rids, offset, limit)?;
+            return Ok(Some((ids, live.at_least())));
         }
         let Some(live) = self.len_if_known() else {
             return Ok(None);

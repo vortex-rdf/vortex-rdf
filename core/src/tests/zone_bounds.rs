@@ -188,6 +188,38 @@ async fn a_rare_code_compares_only_the_zones_that_may_hold_it() {
     }
 }
 
+/// With zones off the residual still skips the zones whose bounds rule its
+/// code out, as before the zone classes, and reads no zone's record or
+/// encoding: a match of `"rare"` compares only its two zones, the first and
+/// the last (short) one.
+#[tokio::test]
+async fn zones_off_skips_only_by_bounds() {
+    let _zones = crate::store::test_hooks::ForcedZones::set(false);
+    let (_dir, _file, stores) = zoned_stores().await;
+    let rare = plain_literal("rare");
+    for (label, store) in &stores {
+        let rec = Recorder::start();
+        let view = matched_view(store, None, None, Some(&rare), None).await;
+        let compared: u64 = rec
+            .picked(|e| match e {
+                Event::ResidualCompared(rows) => Some(*rows),
+                _ => None,
+            })
+            .iter()
+            .sum();
+        let unread =
+            rec.count_where(|e| matches!(e, Event::ZoneRecorded(_) | Event::ZoneCounted(_)));
+        drop(rec);
+        assert_eq!(view.size().await.unwrap(), RARE.len(), "{label}");
+        assert_eq!(
+            compared,
+            (ZONE_ROWS + 1_000) as u64,
+            "{label}: the first and last zones' rows"
+        );
+        assert_eq!(unread, 0, "{label}: no zone counted unread");
+    }
+}
+
 /// The zone-narrowed answer over a window of the base (a range), a chained
 /// match's rows (an id list), tombstones and a tail is the full compare's.
 #[tokio::test]

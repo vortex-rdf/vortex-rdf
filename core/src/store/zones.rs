@@ -2,26 +2,22 @@
 //! (each 8,192-row zone's exact bounds) per quad code column, `g`'s with the
 //! graphs each zone recorded (P2's `vortexrdf.value_counts`), as a file store's
 //! located runs read them. A residual equality over a base that no index serves
-//! classes the zones its selection touches against them once
-//! ([`ResidualZones`](crate::store::scan::residual::ResidualZones)): it skips
-//! the zones a bound column's bounds or `g`'s records rule out and compares
-//! only the rest, as the file path's zone-map pruning reads only the zones it
-//! leaves. With zones off it compares the runs of the zones the bounds alone
-//! leave ([`QuadZones::kept_runs`]). A build takes the bounds in the pass that
+//! classes the zones its selection touches against them
+//! ([`ResidualCompare`](crate::store::scan::residual::ResidualCompare)): it
+//! skips the zones a bound column's bounds or `g`'s records rule out and
+//! compares only the rest, as the file path's zone-map pruning reads only the
+//! zones it leaves. With zones off it skips the zones the bounds alone rule
+//! out, compared in pieces. A build takes the bounds in the pass that
 //! picks each code column's compression, which reads every code anyway
 //! ([`ZoneBuilder`]), and `g`'s records with Vortex's accumulator; a store
 //! loaded from a file or from bytes reads both from the file's zone tables
 //! ([`QuadZones::read`]). A base with neither has none, and its residual
 //! compares every row.
 
-use std::ops::Range;
 use std::sync::Arc;
 
-use vortex_array::scalar::Scalar;
-
 use crate::error::Result;
-use crate::io::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS, eq_on_bounds};
-use crate::store::array::unsigned_value;
+use crate::io::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS};
 use crate::store::schema::{CODE_DTYPE, PRIMARY_COLUMNS, TermCode};
 
 /// The graph column's slot in `(s, p, o, g)`.
@@ -111,50 +107,6 @@ impl QuadZones {
             }
         }
         Ok(zones)
-    }
-
-    /// The rows of the zones whose bounds may hold every code `eqs` binds,
-    /// as ascending runs over a base of `rows` rows, adjacent zones joined:
-    /// a zone is left out where a bound column's code lies outside its zone
-    /// bounds ([`eq_on_bounds`]). `None` when no bound column
-    /// has zones, or when the zones left hold more than half the base:
-    /// comparing a whole column then costs less than comparing its runs.
-    /// The residual's route with zones off, bounds only; with zones on it
-    /// classes its zones once
-    /// ([`ResidualZones`](crate::store::scan::residual::ResidualZones)).
-    pub(crate) fn kept_runs(
-        &self,
-        eqs: &[(&str, Scalar)],
-        rows: usize,
-    ) -> Result<Option<Vec<Range<u64>>>> {
-        let mut keep: Option<Vec<bool>> = None;
-        for (field, scalar) in eqs {
-            let (Some(code), Some(zones)) = (unsigned_value(scalar), self.of_column(field)) else {
-                continue;
-            };
-            let keep = keep.get_or_insert_with(|| vec![true; zones.zones() as usize]);
-            for (zone, kept) in keep.iter_mut().enumerate() {
-                let (min, max) = zones.zone_bounds(zone as u64);
-                *kept &= eq_on_bounds(min, max, code) != Some(false);
-            }
-        }
-        let Some(keep) = keep else {
-            return Ok(None);
-        };
-        let kept = keep.iter().filter(|&&kept| kept).count();
-        if kept.saturating_mul(2) > keep.len() {
-            return Ok(None);
-        }
-        let mut runs: Vec<Range<u64>> = Vec::new();
-        for zone in (0..keep.len()).filter(|&zone| keep[zone]) {
-            let start = (zone * ZONE_ROWS) as u64;
-            let end = ((zone + 1) * ZONE_ROWS).min(rows) as u64;
-            match runs.last_mut() {
-                Some(run) if run.end == start => run.end = end,
-                _ => runs.push(start..end),
-            }
-        }
-        Ok(Some(runs))
     }
 
     /// The columns that have zones, in `(s, p, o, g)` order.

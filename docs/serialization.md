@@ -559,7 +559,7 @@ store's *compressed-resident* form (through
 - the smallest and largest code of each 8,192-row zone of every code column
   is taken in the pass that picks the column's encoding, which reads every
   code for the column's own bounds anyway
-  ([`ZoneBuilder`](../core/src/store/zones.rs#L176)), and the graph column's
+  ([`ZoneBuilder`](../core/src/store/zones.rs#L129)), and the graph column's
   graphs per zone with Vortex's accumulator of `vortexrdf.value_counts`: the
   in-memory counterpart of a file's zone maps, so a match's residual
   equality compares only the zones that may hold its code
@@ -577,9 +577,9 @@ The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L96)
 it keeps each integer child's existing encoding wherever a probe binds it and
 decodes only the ones that decline. Its zone maps are the file's own zone
 tables, the graph column's recorded graphs included, read at open
-([`QuadZones::read`](../core/src/store/zones.rs#L74)), as `from_bytes` reads
+([`QuadZones::read`](../core/src/store/zones.rs#L71)), as `from_bytes` reads
 them, its components' the zone tables of their children's graph columns
-([`read_graph_zones`](../core/src/store/zones.rs#L330)), and its code columns' array statistics are the file's footer
+([`read_graph_zones`](../core/src/store/zones.rs#L283)), and its code columns' array statistics are the file's footer
 statistics, stamped on the loaded base's columns
 ([`stamp_quad_bounds`](../core/src/store/array.rs#L116)). Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).

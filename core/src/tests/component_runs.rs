@@ -219,6 +219,35 @@ async fn component_windows_jump_by_zone_counts() {
     );
 }
 
+/// A window of no rows of a checked run counts no zone: no record, no
+/// encoding and no graph read, at the run's start and past it. It holds no
+/// row.
+#[tokio::test]
+async fn checked_run_limit_zero_windows_count_nothing() {
+    let _zones = ForcedZones::set(true);
+    let store = built_store(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    for offset in [0, RUN / 8] {
+        let window = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)))
+            .window(offset, Some(0));
+        let rec = Recorder::start();
+        let page = store.run_probe(&window).await.unwrap();
+        let counted = rec.count_where(|e| {
+            matches!(
+                e,
+                Event::ZoneRecorded(_) | Event::ZoneCounted(_) | Event::ComponentChecked(_)
+            )
+        });
+        drop(rec);
+        assert_eq!(counted, 0, "offset {offset}: no zone counted");
+        assert!(quads_of(&page).await.is_empty(), "offset {offset}");
+    }
+}
+
 /// By reference, the first page of `(? type ? g1)` on `Graphs::Alternating`
 /// and its ASK (a count capped at one) count the run's zones only until the
 /// page fills or the cap is met: the run's part of its first zone, a quarter

@@ -144,6 +144,42 @@ async fn a_window_compares_only_the_pieces_it_reaches() {
     }
 }
 
+/// A window of no rows reads nothing on every route of a pending compare:
+/// by zones (zones on), by pieces whose compares skip zones by their bounds
+/// (zones off), and by pieces over columns without zone maps (the Default
+/// layout's strings), at the matches' start and past it. It holds no row.
+#[tokio::test]
+async fn limit_zero_windows_read_nothing_on_every_route() {
+    let (_dir, mut stores) = residual_stores().await;
+    stores.push((
+        "default",
+        built_store(residual_quads(), LayoutStrategy::Default, vec![]).await,
+    ));
+    for zones in [true, false] {
+        let _zones = ForcedZones::set(zones);
+        for (label, store) in &stores {
+            for offset in [0, 5] {
+                let window = probe(Some("p0"), None).window(offset, Some(0));
+                let rec = Recorder::start();
+                let page = store.run_probe(&window).await.unwrap();
+                let read = rec.count_where(|e| {
+                    matches!(
+                        e,
+                        Event::ResidualCompared(_)
+                            | Event::ResidualPiece(_)
+                            | Event::ZoneRecorded(_)
+                            | Event::ZoneCounted(_)
+                    )
+                });
+                drop(rec);
+                let tag = format!("{label} zones {zones} offset {offset}");
+                assert_eq!(read, 0, "{tag}: nothing read");
+                assert!(page.quads_vec().await.unwrap().is_empty(), "{tag}");
+            }
+        }
+    }
+}
+
 /// Every count and window of a pending compare answers as the eager match,
 /// zones off (by pieces) and on (by zone classes):
 /// patterns whose rows every piece holds (`p0`, `"o7"`, the default graph)

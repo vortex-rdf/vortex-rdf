@@ -275,7 +275,7 @@ impl VortexRdfStore {
 
     /// The residual column filter: `selection` narrowed to its rows matching
     /// every role the fast paths left bound in `pat`, compared column-wise
-    /// over those rows only ([`residual_rows`](residual::residual_rows)). A view
+    /// over those rows only ([`ResidualCompare`](residual::ResidualCompare)). A view
     /// only counted or windowed short of the selection's rows (`need`) leaves
     /// a compare over more rows than one piece holds pending instead
     /// ([`PendingResidual`]), compared only as far as the count or the window
@@ -304,30 +304,39 @@ impl VortexRdfStore {
         // compare drops it, and the rows read in base order. Then the zones
         // the selection touches, classed against the equalities left.
         let rows = selection.len(memory.base.len());
-        let (eqs, zones) = if residual::asks_statistics(rows) && crate::stats_rules::zones_enabled()
-        {
-            match residual::ask_statistics(memory, &selection, eqs)? {
-                residual::Asked::Nothing => {
-                    observe!(ResidualSettled { none: true });
-                    debug::step!(t, "[match_pattern] In-memory residual settled: no row");
-                    return Ok(Some(ViewSelection::Exact(RowSelection::empty())));
+        let (eqs, classes) =
+            if residual::asks_statistics(rows) && crate::stats_rules::zones_enabled() {
+                match residual::ask_statistics(memory, &selection, eqs)? {
+                    residual::Asked::Nothing => {
+                        observe!(ResidualSettled { none: true });
+                        debug::step!(t, "[match_pattern] In-memory residual settled: no row");
+                        return Ok(Some(ViewSelection::Exact(RowSelection::empty())));
+                    }
+                    residual::Asked::Everything => {
+                        observe!(ResidualSettled { none: false });
+                        debug::step!(t, "[match_pattern] In-memory residual settled: every row");
+                        return Ok(Some(ViewSelection::Exact(selection)));
+                    }
+                    residual::Asked::Open { eqs, classes } => (eqs, classes),
                 }
-                residual::Asked::Everything => {
-                    observe!(ResidualSettled { none: false });
-                    debug::step!(t, "[match_pattern] In-memory residual settled: every row");
-                    return Ok(Some(ViewSelection::Exact(selection)));
-                }
-                residual::Asked::Open { eqs, zones } => (eqs, zones),
-            }
-        } else {
-            (eqs, None)
-        };
+            } else {
+                let classes = residual::unasked_classes(memory, &eqs);
+                (eqs, classes)
+            };
         if need.defers_residual(rows) {
             debug::step!(t, "[match_pattern] In-memory residual left pending");
-            let pending = PendingResidual::new(memory.clone(), selection, eqs, zones);
+            let pending = PendingResidual::new(memory.clone(), selection, eqs, classes);
             return Ok(Some(ViewSelection::Residual(Arc::new(pending))));
         }
-        let narrowed = residual::residual_rows(memory, selection, &eqs, zones.as_ref(), t)?;
+        let narrowed = residual::ResidualCompare {
+            table: residual::ResidualTable::base(memory),
+            selection: &selection,
+            eqs: &eqs,
+            classes: &classes,
+            deleted: None,
+            t,
+        }
+        .rows()?;
         Ok(Some(ViewSelection::Exact(narrowed)))
     }
 }

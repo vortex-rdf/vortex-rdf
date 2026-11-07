@@ -486,6 +486,8 @@ fn holds(kinds: &KindRanges, slot: usize, code: TermCode) -> bool {
 #[cfg(feature = "file-io")]
 use crate::io::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 #[cfg(feature = "file-io")]
+use crate::store::read::live::WindowCursor;
+#[cfg(feature = "file-io")]
 use vortex_rdf_encoded_search::counters;
 
 /// One located run's zone decision of `rows` rows at counter site `site`
@@ -856,22 +858,17 @@ impl LocatedRun {
     ) -> Result<(u64, Rows)> {
         let run = &self.positions();
         let parts: Vec<ZonePart> = zones.parts(run.clone()).collect();
-        let from = offset as u64;
-        let to = limit.map(|limit| from.saturating_add(limit as u64));
-        let (mut at, mut before) = (0, 0);
-        if to != Some(from) {
-            while at < parts.len() {
-                let n = self.zone_count(zones, &parts[at]).await?;
-                if before + n > from {
-                    break;
-                }
-                before += n;
-                at += 1;
-            }
-        }
-        let (mut seen, mut window) = (before, Vec::new());
-        while at < parts.len() && to.is_none_or(|to| seen < to) {
+        let mut cursor = WindowCursor::new(offset, limit);
+        let mut at = 0;
+        while at < parts.len() && !cursor.is_full() {
             let rows = &parts[at].rows;
+            if !cursor.started() {
+                let n = self.zone_count(zones, &parts[at]).await?;
+                if cursor.skips(n as usize) {
+                    at += 1;
+                    continue;
+                }
+            }
             let kept = match self
                 .block(rows.start - run.start..rows.end - run.start)
                 .await?
@@ -879,16 +876,11 @@ impl LocatedRun {
                 Rows::Ids(kept) => kept,
                 Rows::Run(rows) => rows.collect(),
             };
-            let n = kept.len() as u64;
-            let lo = from.saturating_sub(seen).min(n);
-            let hi = to.map_or(n, |to| to.saturating_sub(seen).min(n));
-            if lo < hi {
-                window.extend_from_slice(&kept[lo as usize..hi as usize]);
-            }
-            seen += n;
+            cursor.take(&kept);
             at += 1;
         }
-        let mut total = seen;
+        let (window, live) = cursor.finish(at == parts.len());
+        let mut total = live.at_least() as u64;
         if whole {
             for part in &parts[at..] {
                 total += self.zone_count(zones, part).await?;
@@ -1031,12 +1023,10 @@ impl LocatedRun {
             };
             return Ok((len, rows));
         }
-        let from = offset as u64;
-        let to = limit.map(|limit| from.saturating_add(limit as u64));
-        let (mut total, mut window) = (0u64, Vec::new());
+        let mut cursor = WindowCursor::new(offset, limit);
         let (mut at, mut block) = (0, FIRST_GAP_BLOCK);
         while at < len {
-            if !whole && to.is_some_and(|to| total >= to) {
+            if !whole && cursor.is_full() {
                 break;
             }
             let next = at.saturating_add(block).min(len);
@@ -1044,18 +1034,12 @@ impl LocatedRun {
                 Rows::Ids(kept) => kept,
                 Rows::Run(rows) => rows.collect(),
             };
-            // The kept rows' positions among the matches start at `total`.
-            let n = kept.len() as u64;
-            let lo = from.saturating_sub(total).min(n);
-            let hi = to.map_or(n, |to| to.saturating_sub(total).min(n));
-            if lo < hi {
-                window.extend_from_slice(&kept[lo as usize..hi as usize]);
-            }
-            total += n;
+            cursor.take(&kept);
             at = next;
             block = (block * 2).min(GAP_BLOCK);
         }
-        Ok((total, Rows::Ids(window)))
+        let (window, live) = cursor.finish(at >= len);
+        Ok((live.at_least() as u64, Rows::Ids(window)))
     }
 
     /// The run's matches as chunks of their four code columns, a block of
