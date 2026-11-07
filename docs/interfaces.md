@@ -16,10 +16,10 @@ tests pin each interface
 | What the engine needs | What it calls |
 |---|---|
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L85), [`code_chunks`](../core/src/store/read/chunks.rs#L121) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L162), [`index_components`](../core/src/store/read/metadata.rs#L234), [`partitions`](../core/src/store/query/partitions.rs#L29) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L160), [`index_components`](../core/src/store/read/metadata.rs#L232), [`partitions`](../core/src/store/query/partitions.rs#L29) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L193)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L151), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L149), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
 | A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L80) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
@@ -174,7 +174,7 @@ is the one way it fails.
 
 `index_components()` lists the store's index children, each with its
 component name, its `IndexType`, its sort order (`Posg`, `Ospg`, or none
-for the reference pairs), its sortedness provenance, and `rows: usize`, the
+for the reference pairs, whose rows are in `(val, rid)` order), and `rows: usize`, the
 base's row count, since every index child holds one row per base quad. It returns a `Result`, and it classifies
 a child by its implementation slug, leaving out one under a slug this
 version does not know. On a view a match or a narrowing proved empty the
@@ -314,13 +314,13 @@ valid.
   transactional engine therefore compacts on commit, or serves strings
   (`quads`, `row_chunks` on a string layout) while a tail exists, and
   re-takes the dictionary handle after the compaction.
-- A store opened by [`from_file`](../core/src/store/persist/open.rs#L265)
+- A store opened by [`from_file`](../core/src/store/persist/open.rs#L261)
   reads its memory-mapped file in place, and so does every view, partition
   and stream derived from it: the file must not be truncated or rewritten
   while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
-  [`from_file_in_memory`](../core/src/store/persist/open.rs#L275) loads the
+  [`from_file_in_memory`](../core/src/store/persist/open.rs#L271) loads the
   file whole instead and never reads it again.
 
 ## 6. A store file through vortex's reader

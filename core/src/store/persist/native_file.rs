@@ -172,7 +172,8 @@ pub(crate) enum FileCounter {
 const PRUNING_MEMO_MAX: usize = 512;
 
 /// One index child of the file, as the index readers use it: the child's
-/// reader, its `sorted` provenance, and the file's bind memo, through which
+/// reader, whose rows are in its key order (as every index child's are), and
+/// the file's bind memo, through which
 /// every expression over the child binds under the child's name, so the eager
 /// scans, the deferred row-id sources and the serve plans of one child all
 /// hand its reader the same bound-tree identities (see [`BoundExprMemo`]).
@@ -182,10 +183,6 @@ pub(crate) struct ChildReader {
     /// The component name: the child's bind scope, and the key of its
     /// columns' chunk-probe handles on the file.
     pub(crate) name: &'static str,
-    /// Whether the child's rows are globally sorted by its sort keys (the
-    /// descriptor's provenance), so a run of them can be located by binary
-    /// search.
-    pub(crate) sorted: bool,
     /// The child's reader, from the reader tree current when it was taken.
     pub(crate) reader: LayoutReaderRef,
     memo: Arc<BoundExprMemo>,
@@ -430,8 +427,8 @@ impl NativeStoreFile {
     }
 
     /// The known index child under the registry name `name` as a
-    /// [`ChildReader`]: its reader from the current tree, its descriptor's
-    /// `sorted` provenance, and the handle's bind memo. `None` when the
+    /// [`ChildReader`]: its reader from the current tree and the handle's
+    /// bind memo. `None` when the
     /// roster holds no such child: the file has none, or only one under an
     /// implementation slug this version does not know.
     pub(crate) fn child_reader(&self, name: &str) -> VortexResult<Option<ChildReader>> {
@@ -440,7 +437,6 @@ impl NativeStoreFile {
         };
         Ok(Some(ChildReader {
             name: child.identity.name,
-            sorted: child.sorted,
             reader: self.slot_reader(child.slot)?,
             memo: Arc::clone(&self.bound_exprs),
         }))

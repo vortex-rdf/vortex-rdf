@@ -206,7 +206,6 @@ where
         .map(|(identity, empty, pull)| ChildStream {
             identity,
             // The merger emits the family in its global sort order.
-            sorted: true,
             source: Arc::new(PullComponentSource::new(empty, chunk_size, pull)),
         })
         .collect())

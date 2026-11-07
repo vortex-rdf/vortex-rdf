@@ -134,10 +134,11 @@ pub(crate) struct StoreComponentDescriptor {
     /// component; unknown optional components are skipped.
     pub(crate) required: bool,
     /// Whether the component's sort-key columns are *globally* sorted, not
-    /// merely per chunk: provenance, recorded by the writer that knows how the
-    /// component was built. A reader may binary-search the component only when
-    /// this is set; stamping per-chunk-sorted data as sorted corrupts query
-    /// results, so absent means `false`.
+    /// merely per chunk. Written `true` for every index child and the
+    /// dictionary, which are sorted by definition: this version's readers
+    /// search an index child whatever the flag says (a writer that leaves one
+    /// out of order writes a wrong file), while readers of 0.14 and earlier
+    /// search one only when it is set. Absent decodes as `false`.
     #[serde(default)]
     pub(crate) sorted: bool,
     /// Dictionary children only: whether every IRI term (every term starting

@@ -1,6 +1,6 @@
 //! The vortex-rdf.store.v2 wire contract. The round-trips assert it from
-//! different starting states (tailed, tombstoned, file-backed, dictionary,
-//! locally-sorted multi-chunk): `to_bytes` / `from_bytes` must carry the
+//! different starting states (tailed, tombstoned, file-backed, dictionary):
+//! `to_bytes` / `from_bytes` must carry the
 //! store's index components and its sortedness provenance faithfully —
 //! rebuilt where a mutation invalidated them, never silently dropped, never
 //! over-claimed. Every writer stamps its index children with the version the
@@ -235,96 +235,96 @@ async fn test_to_bytes_is_byte_stable() {
     assert_eq!(bytes_a, bytes_b);
 }
 
-/// Index children whose chunks carry only local sorts are not globally
-/// sorted. Reading them back must NOT restore binary-search routing: the
-/// descriptors carry `sorted: false`, in-memory resolution declines, and the
-/// mask scan answers correctly. Re-stamping such columns sorted would make
-/// this match return 5 rows instead of 4.
+/// Index children are sorted by definition: a reader searches and serves
+/// them whatever their descriptor's `sorted` says, and a store writes
+/// `sorted: true` on every index child it writes, so a reader that honors
+/// the flag (0.14 and earlier) keeps routing through them. The file here
+/// claims `sorted: false` on children that are sorted. An untouched mapped
+/// store hands back its file's bytes as they are, descriptors included.
 #[tokio::test]
-async fn test_locally_sorted_children_from_bytes_match_correctly() {
-    // Predicates interleave across chunks so per-chunk sorted != global.
-    let quads: Vec<Quad> = (0..12)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s/{i:02}"),
-                &format!("http://example.org/p/{}", i % 3),
-                &format!("o{}", i),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-    let raws: Vec<crate::store::RawQuad> =
-        quads.iter().map(crate::store::RawQuad::from_quad).collect();
-    // Cut the rows into three chunks and sort each family's child WITHIN a
-    // chunk only: the concatenated child is not globally sorted, so its
-    // descriptor must say so — the shape a chunked foreign writer could
-    // produce and a reader must not binary-search.
-    use crate::store::indexes::copy::CopyFamily;
-    use crate::store::indexes::copy::out_of_core::{CopyKey, copy_child_chunk};
-    let mut quad_chunks = Vec::new();
-    let mut child_chunks: Vec<Vec<vortex_array::ArrayRef>> = vec![Vec::new(), Vec::new()];
-    for (n, rows) in raws.chunks(4).enumerate() {
-        quad_chunks.push(
-            crate::store::builders::build_struct_array(rows, LayoutStrategy::Default, false)
-                .unwrap(),
-        );
-        for (family_ix, family) in [CopyFamily::Posg, CopyFamily::Ospg].into_iter().enumerate() {
-            let mut keys: Vec<(CopyKey<String>, crate::store::RowId)> = rows
-                .iter()
-                .enumerate()
-                .map(|(i, q)| {
-                    let spog = [q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()];
-                    (
-                        CopyKey::new(family, spog),
-                        (n * 4 + i) as crate::store::RowId,
-                    )
-                })
-                .collect();
-            keys.sort_unstable();
-            child_chunks[family_ix].push(copy_child_chunk(family, &keys).unwrap());
-        }
-    }
-    let components: Vec<container::NativeComponentWrite> = [CopyFamily::Posg, CopyFamily::Ospg]
-        .into_iter()
-        .zip(child_chunks)
-        .map(|(family, chunks)| {
-            component_write(
-                container::StoreComponentDescriptor {
-                    name: family.identity().name.into(),
-                    role: container::StoreComponentRole::Index,
-                    implementation: family.identity().slug.into(),
-                    version: 1,
-                    required: false,
-                    // Per-chunk sorts only: the writer may not claim global order.
-                    sorted: false,
-                    bracketed_iris: false,
-                    dtype: copy_child_chunk::<String>(family, &[])
-                        .unwrap()
-                        .dtype()
-                        .clone(),
-                },
-                chunks,
-                container::default_child_strategy(),
-            )
-        })
-        .collect();
-    let bytes = unstamped_store_bytes(quad_chunks, components).await;
+async fn index_children_are_read_sorted_whatever_their_descriptor_says() {
+    use crate::SortOrder;
+    use crate::io::container::{StoreComponentDescriptor, StoreComponentRole};
+    use vortex_array::IntoArray as _;
 
-    let store = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-    assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
-    let p = iri("p/1");
-    let matched: Vec<Quad> = matched_view(&store, None, Some(&p), None, None)
-        .await
-        .quads()
-        .try_collect()
+    for layout in [LayoutStrategy::Dictionary, LayoutStrategy::Default] {
+        let built = build_array::<SortedInMemoryBuilder>(
+            quad_stream(modular_quads(12, 3, 4)),
+            layout,
+            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        )
         .await
         .unwrap();
-    // Ground truth: p/1 appears for i = 1, 4, 7, 10 -> 4 quads.
-    assert_eq!(
-        matched.len(),
-        4,
-        "index-routed match after from_bytes is wrong"
-    );
+        let mut components = Vec::new();
+        if let Some(dict) = &built.dict {
+            components.push(dict.to_write().unwrap());
+        }
+        for component in &built.components {
+            let rows = component.rows().unwrap().clone().into_array();
+            let dtype = rows.dtype().clone();
+            components.push(component_write(
+                StoreComponentDescriptor {
+                    name: component.identity.name.into(),
+                    role: StoreComponentRole::Index,
+                    implementation: component.identity.slug.into(),
+                    version: 1,
+                    required: false,
+                    sorted: false,
+                    bracketed_iris: false,
+                    dtype: dtype.clone(),
+                },
+                vec![rows],
+                container::child_strategy(&dtype),
+            ));
+        }
+        let bytes = unstamped_store_bytes(vec![built.array.clone()], components).await;
+        let (_dir, path) = temp_store_file(&bytes);
+        let p1 = iri("p1");
+        for (open, store) in [
+            (
+                "from_bytes",
+                VortexRdfStore::from_bytes(&bytes).await.unwrap(),
+            ),
+            ("from_file", VortexRdfStore::from_file(&path).await.unwrap()),
+            (
+                "from_file_in_memory",
+                VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+            ),
+        ] {
+            let view = matched_view(&store, None, Some(&p1), None, None).await;
+            let stats = view.view_statistics().unwrap();
+            assert_eq!(
+                stats.served_component,
+                Some("index:posg"),
+                "{layout:?} {open}"
+            );
+            assert_eq!(stats.sort_order, Some(SortOrder::Posg), "{layout:?} {open}");
+            assert_eq!(view.size().await.unwrap(), 4, "{layout:?} {open}");
+            if layout == LayoutStrategy::Dictionary && open == "from_file" {
+                assert!(
+                    store
+                        .debug_reference_index_located_run(Some(&p1), None)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "{layout:?} {open}: the reference child is located"
+                );
+            }
+            let written = store.to_bytes().await.unwrap();
+            if open == "from_file" {
+                assert_eq!(written, bytes, "{layout:?} {open}: the file's bytes");
+                continue;
+            }
+            let (_, descriptors) = container::store_metadata_of_bytes(&written);
+            assert!(
+                descriptors
+                    .iter()
+                    .filter(|c| c.role == StoreComponentRole::Index)
+                    .all(|c| c.sorted),
+                "{layout:?} {open}: every index child written sorted"
+            );
+        }
+    }
 }
 
 /// The file writer records its build's sortedness provenance on the wire:

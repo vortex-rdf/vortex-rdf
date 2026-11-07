@@ -68,9 +68,8 @@ pub(super) struct IndexProbe<'a> {
 /// of the keys before it, then the matched run's paired row ids.
 ///
 /// Declines (so the store falls back to a mask scan) when the probed
-/// component is absent, probe-incompatible, or not globally sorted
-/// (`IndexComponent::sorted`: per-chunk-sorted data is not
-/// binary-searchable); `Empty` when a key's term is absent from the
+/// component is absent or probe-incompatible (its rows are in its key order,
+/// as every index child's are); `Empty` when a key's term is absent from the
 /// dictionary or its run is empty. The row ids are always lazy (the run's
 /// rid slice, decoded and sorted into base row order when a consumer needs
 /// the selection, and windowed before decoding when its rids ascend), and a
@@ -89,10 +88,8 @@ pub(super) fn resolve_in_memory(
     codes: &mut PatternCodes,
     windowed: bool,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
-    // Route through the index only when the probed component exists and its
-    // sort keys are globally sorted: the writer's provenance, not a stamp
-    // inspection.
-    let Some(component) = IndexComponent::find_sorted(components, probe.identity.name) else {
+    // Route through the index whenever the probed component exists.
+    let Some(component) = IndexComponent::find(components, probe.identity.name) else {
         return Ok(IndexResolution::Declined);
     };
     let mut run: Option<Range<usize>> = None;

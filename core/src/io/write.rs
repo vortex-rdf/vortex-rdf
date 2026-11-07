@@ -1,7 +1,8 @@
 //! The write side of the native store container: the driver that writes a
 //! [`BuiltStream`] (a builder's, or a store's parts) through
-//! [`write_store`](crate::io::container::write_store), carrying each part's
-//! sortedness provenance onto the descriptors a reader trusts; the
+//! [`write_store`](crate::io::container::write_store), carrying the quad
+//! table's sortedness provenance (`quads_sorted`) onto the root metadata a
+//! reader trusts; the
 //! `quads_stream_to_*` entry points; and [`write_sorted_store`], the sorted
 //! build into a file that the file writer and a compaction share, through
 //! [`PendingStore`], the one way a store reaches a path on disk.

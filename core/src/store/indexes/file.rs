@@ -26,8 +26,9 @@ use crate::store::view::selection::point_sized;
 /// (a lead run for a prefix probe).
 ///
 /// `Ok(None)` declines the location (the caller keeps its pushed-down scan):
-/// a child not globally sorted, a probe value that is not an integer (string
-/// value columns), or a column whose chunks resolve no probe.
+/// a probe value that is not an integer (string value columns), or a column
+/// whose chunks resolve no probe. The child's rows are in its key order, as
+/// every index child's are.
 async fn locate_component_run(
     file: &NativeStoreFile,
     child: &ChildReader,
@@ -35,9 +36,6 @@ async fn locate_component_run(
     native: &Scalar,
     within: Option<Range<u64>>,
 ) -> Result<Option<Range<u64>>> {
-    if !child.sorted {
-        return Ok(None);
-    }
     let Some(needle) = crate::store::array::unsigned_value(native) else {
         return Ok(None);
     };

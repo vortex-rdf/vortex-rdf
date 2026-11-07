@@ -346,9 +346,8 @@ impl QuadsSource {
 
     /// The order the view's base rows read in, when it is a known sort: a
     /// served view's, its plan's (`(p, o, s, g)` for an `index:posg` run with
-    /// the object unbound, else base order; none over a file child whose
-    /// rows are not globally sorted), any other view's `(s, p, o, g)` over a
-    /// globally sorted base.
+    /// the object unbound, else base order), any other view's `(s, p, o, g)`
+    /// over a globally sorted base.
     pub(crate) fn read_order(&self) -> Option<SortOrder> {
         match &self.backend {
             Backend::InMemory(memory) => {
@@ -359,7 +358,7 @@ impl QuadsSource {
             #[cfg(feature = "file-io")]
             Backend::File(base) => {
                 if let Some(plan) = &base.serve {
-                    return plan.read_order();
+                    return Some(plan.read_order());
                 }
             }
         }

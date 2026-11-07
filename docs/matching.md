@@ -387,7 +387,7 @@ materialized and intersected immediately.
 **A bound graph, checked inside the run.** With zones on (`VORTEX_RDF_ZONES`
 not `0`), the in-memory resolver checks a pattern's bound graph inside the
 run it located when the probed component keeps a zone map of its graph
-column ([`graph_zones`](../core/src/store/indexes/components.rs#L314): the
+column ([`graph_zones`](../core/src/store/indexes/components.rs#L295): the
 Dictionary layout's components, built or loaded). The run's rows are
 contiguous in the component, so the component's own `g` column decides them
 a zone at a time ([`GraphCheck`](../core/src/store/indexes/graph_check.rs#L38))
@@ -854,8 +854,8 @@ a `FileServePlan`, which carries a graph equality of its own (see 8.4).
 Children: `index:posg` (quads sorted by p, o, s, g) and `index:ospg` (sorted by
 o, s, p, g), each `{s, p, o, g, rid}`, term strings or `u64` codes.
 
-**In memory:** requires the family's component to exist and be *globally* sorted
-(`IndexComponent::find_sorted` — per-chunk sorted data is not binary-searchable).
+**In memory:** requires the family's component to exist
+(`IndexComponent::find`); its rows are globally sorted, as every index child's are.
 Binary-searches the lead column for the probe run, then — for a `(p, o)` pattern
 — re-searches the second key **within** that run (valid because the family's full
 comparator makes the second column sorted inside each lead run). It returns:
@@ -866,7 +866,7 @@ comparator makes the second column sorted inside each lead run). It returns:
   re-sorted only on demand) and **always a serve plan** over the matched run.
 
 **On file:** locates the run by binary-searching the child's cached chunk probes
-([`locate_component_run`](../core/src/store/indexes/file.rs#L31): lead,
+([`locate_component_run`](../core/src/store/indexes/file.rs#L32): lead,
 then a windowed second-key search), integers only. Then:
 
 | Located run | Row ids |
@@ -918,7 +918,7 @@ own rows out of the run before decoding them (the rows of one value are in row
 id order). Declines when the component is absent, unsorted, or
 probe-incompatible.
 
-**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L31)
+**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L32)
 binary-searches the value column's chunk probes (sorted child + integer probe
 required). A located run's ids are `Lazy`
 ([`read_located_rids`](../core/src/store/indexes/rid_reads.rs#L100)): a count
@@ -961,7 +961,7 @@ longer list for each of the shorter's instead of merging the two.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_rows`](../core/src/store/scan/file_reads.rs#L632) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::read`](../core/src/store/indexes/serve/file.rs#L499)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_rows`](../core/src/store/scan/file_reads.rs#L632) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::read`](../core/src/store/indexes/serve/file.rs#L498)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped at match time when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Kept by | a window, keep, partition or chained match of the served view, narrowed ([§6.4](#64-keeping-or-dropping-the-serve-plan)) | the same, its residual filter resolved |
@@ -1170,7 +1170,7 @@ a one-shot read, `StreamedPlan` for a stream):
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads, a stream 65,536 rows a chunk; file: point reads ≤ 256 rows, else a range scan of the located run (`FileServePlan::read`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries (in memory a stream 65,536 rows a chunk); on file, read it by id or scan it as `ExactRead` chooses (below) |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — under the Dictionary layout one `Arc<str>` per distinct term of a chunk, under the string layouts one per run of rows repeating a term, each read in place, handed to every row that holds it | the same gather or file read, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located run's width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/serve/file.rs#L551)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
+| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/serve/file.rs#L550)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
 | `row_chunks()` / `code_chunks()` | the plan's rows in the index's order, the ids never sorted: in memory gathered off the base at the run's ids, one window of ids per chunk, or, over a Dictionary base whose columns stay encoded (read off a file or adopted from bytes), read off the index component, a slice or a take of a window of the run's live rows per chunk; on file the index child's own chunks (the located range, the kept rows' positions, or the filtered scan) cut to the cap, except TypedObject's rows, taken from the base a window of ids at a time | the selection's rows in base row order: sliced or gathered in memory; on file read by id, by a pending filter's masks, or scanned |
 | `nquad_line_chunks()` (the N-Triples/N-Quads export) | as `quads()`, in the index's order, each chunk written as N-Quads lines | as `quads()`, in base row order, each chunk written as N-Quads lines: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
 
