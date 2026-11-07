@@ -20,7 +20,9 @@ use super::memo::{BoundExprMemo, BoundedMemo, ChunkMemo, ColumnHandle};
 use crate::io::container::{self, RdfStoreLayoutVTable};
 use crate::io::file::{FileIdentity, OpenedFile};
 use crate::store::persist::open::{ComponentRoster, IndexChild};
+use crate::store::query::located::LocatedTables;
 use crate::store::schema;
+use crate::zone_stats::file_maps::{FileTable, TableColumns, ZoneMaps};
 
 /// An opened native store file: the [`vortex_file::VortexFile`] plus its
 /// classified component roster and reader tree.
@@ -149,34 +151,6 @@ impl ReaderTree {
     }
 }
 
-/// The chunk-probe handles of the tables a located run is found in, `None`
-/// where one declines or the file has no such table.
-pub(crate) struct LocatedTables {
-    /// Per sorted table (the quad table, `index:posg`, `index:ospg`), its
-    /// `(s, p, o, g)` columns.
-    pub(crate) sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
-    /// Per reference index (`index:ref-p`, `index:ref-o`), its `(val, rid)`.
-    pub(crate) references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
-    /// Per reference index, its child's `g` (each row's graph), `None` for a
-    /// child written without it.
-    pub(crate) reference_graphs: [Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>; 2],
-}
-
-impl LocatedTables {
-    /// The tables' handles.
-    pub(crate) fn new(
-        sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
-        references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
-        reference_graphs: [Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>; 2],
-    ) -> Self {
-        Self {
-            sorted,
-            references,
-            reference_graphs,
-        }
-    }
-}
-
 /// What the tests count of how reads reached a file
 /// ([`NativeStoreFile::note`], [`NativeStoreFile::count`]).
 #[cfg(test)]
@@ -191,88 +165,6 @@ pub(crate) enum FileCounter {
     /// Those reads that were rid-only scans rather than point reads: pins
     /// that a narrow run is point-read wherever it sits.
     LocatedRidScans,
-}
-
-/// A table of a store file whose code columns' zone maps a read may ask for:
-/// the quad table, a copy index's child or a reference index's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FileTable {
-    Quads,
-    Posg,
-    Ospg,
-    RefP,
-    RefO,
-}
-
-impl FileTable {
-    /// Every table, in the order [`ZoneMaps`] keeps them.
-    pub(crate) const ALL: [FileTable; 5] = [
-        FileTable::Quads,
-        FileTable::Posg,
-        FileTable::Ospg,
-        FileTable::RefP,
-        FileTable::RefO,
-    ];
-
-    /// The index child holding the table, `None` for the quad table.
-    pub(crate) fn component(self) -> Option<&'static str> {
-        match self {
-            FileTable::Quads => None,
-            FileTable::Posg => Some("index:posg"),
-            FileTable::Ospg => Some("index:ospg"),
-            FileTable::RefP => Some("index:ref-p"),
-            FileTable::RefO => Some("index:ref-o"),
-        }
-    }
-}
-
-/// The zone maps of a store file's code columns, per table ([`FileTable`])
-/// and `(s, p, o, g)` slot, each read from its zone table on first use
-/// ([`ColumnZones::read`]) and kept with the file; `None` for a column the
-/// table lacks (a reference child holds `g` alone) or one without exact zone
-/// bounds. Located runs check them, and a filter of code equalities takes the
-/// zones where every row holds every code from the quad table's. A shared
-/// handle, as split tasks hold it past a borrow of the file. A map is read
-/// once however many readers ask for it at once, and a read that fails is not
-/// kept, for the next reader to retry. Two `u64` per zone of each column
-/// read.
-///
-/// [`ColumnZones::read`]: crate::zone_stats::zone_map::ColumnZones::read
-#[derive(Clone)]
-pub(crate) struct ZoneMaps(Arc<ZoneMapsInner>);
-
-/// What a [`ZoneMaps`] handle shares.
-struct ZoneMapsInner {
-    cells: [[tokio::sync::OnceCell<Option<Arc<crate::zone_stats::zone_map::ColumnZones>>>; 4]; 5],
-    /// Each table's code columns' layouts, `None` for a column it lacks.
-    columns: [[Option<LayoutRef>; 4]; 5],
-    source: Arc<dyn vortex_layout::segments::SegmentSource>,
-}
-
-impl ZoneMaps {
-    /// The zone map of `table`'s column at `slot`, read on first use.
-    pub(crate) async fn get(
-        &self,
-        table: FileTable,
-        slot: usize,
-    ) -> crate::error::Result<Option<Arc<crate::zone_stats::zone_map::ColumnZones>>> {
-        let inner = &*self.0;
-        let at = table as usize;
-        inner.cells[at][slot]
-            .get_or_try_init(|| async {
-                crate::observe::observe!(ZoneMapRead);
-                Ok(match &inner.columns[at][slot] {
-                    Some(column) => {
-                        crate::zone_stats::zone_map::ColumnZones::read(column, &inner.source)
-                            .await?
-                            .map(Arc::new)
-                    }
-                    None => None,
-                })
-            })
-            .await
-            .cloned()
-    }
 }
 
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`]: sized for a query
@@ -485,20 +377,17 @@ impl NativeStoreFile {
     /// ([`ZoneMaps`]), a handle a split task keeps.
     pub(crate) fn zone_maps(&self) -> ZoneMaps {
         self.zone_maps
-            .get_or_init(|| self.new_zone_maps(self.segment_source()))
+            .get_or_init(|| ZoneMaps::new(self.zone_map_layouts(), self.segment_source()))
             .clone()
     }
 
-    /// A zone-map handle over `source`, none of its maps read yet.
-    fn new_zone_maps(&self, source: Arc<dyn vortex_layout::segments::SegmentSource>) -> ZoneMaps {
-        ZoneMaps(Arc::new(ZoneMapsInner {
-            cells: Default::default(),
-            columns: FileTable::ALL.map(|table| {
-                schema::PRIMARY_COLUMNS
-                    .map(|column| self.table_column_layout(table.component(), column))
-            }),
-            source,
-        }))
+    /// The layouts of every table's code columns, as [`ZoneMaps`] reads
+    /// them.
+    pub(crate) fn zone_map_layouts(&self) -> TableColumns {
+        FileTable::ALL.map(|table| {
+            schema::PRIMARY_COLUMNS
+                .map(|column| self.table_column_layout(table.component(), column))
+        })
     }
 
     /// Whether the file records its quad rows in global `(s, p, o, g)` order.
@@ -653,104 +542,6 @@ mod tests {
     use super::*;
     use crate::store::persist::memo::BIND_MEMO_MAX;
     use vortex_array::expr::{eq, get_item, lit, root};
-
-    /// A segment source over another whose every read is pending on its
-    /// first poll (and wakes its task), then completes as the inner read:
-    /// readers joined on one task interleave at each read.
-    struct WaitingSource(Arc<dyn vortex_layout::segments::SegmentSource>);
-
-    impl vortex_layout::segments::SegmentSource for WaitingSource {
-        fn request(
-            &self,
-            id: vortex_layout::segments::SegmentId,
-        ) -> vortex_layout::segments::SegmentFuture {
-            use futures::FutureExt as _;
-
-            let read = self.0.request(id);
-            let mut waited = false;
-            let wait = futures::future::poll_fn(move |cx| {
-                if waited {
-                    std::task::Poll::Ready(())
-                } else {
-                    waited = true;
-                    cx.waker().wake_by_ref();
-                    std::task::Poll::Pending
-                }
-            });
-            async move {
-                wait.await;
-                read.await
-            }
-            .boxed()
-        }
-    }
-
-    /// A segment source over another whose first read fails, every later one
-    /// the inner source's.
-    struct FailingOnce {
-        inner: Arc<dyn vortex_layout::segments::SegmentSource>,
-        failed: std::sync::atomic::AtomicBool,
-    }
-
-    impl vortex_layout::segments::SegmentSource for FailingOnce {
-        fn request(
-            &self,
-            id: vortex_layout::segments::SegmentId,
-        ) -> vortex_layout::segments::SegmentFuture {
-            use futures::FutureExt as _;
-
-            if !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                let failed = Err(vortex_error::vortex_err!("a failing segment read"));
-                return futures::future::ready(failed).boxed();
-            }
-            self.inner.request(id)
-        }
-    }
-
-    /// A zone map is read once however many readers ask for it at once: two
-    /// readers of `index:ref-p`'s `g` map, joined on one task over a source
-    /// whose every read waits, get the one map, read once (Review Focus 1).
-    #[tokio::test]
-    async fn joined_readers_read_a_zone_map_once() {
-        use crate::IndexType;
-        use crate::observe::{Event, Recorder};
-
-        let (_dir, native) =
-            crate::tests::mapped_file(50, vec![IndexType::SecondaryByReference]).await;
-        let maps = native.new_zone_maps(Arc::new(WaitingSource(native.segment_source())));
-        let rec = Recorder::start();
-        let (first, second) =
-            futures::join!(maps.get(FileTable::RefP, 3), maps.get(FileTable::RefP, 3));
-        let first = first.unwrap().expect("index:ref-p's g map");
-        let second = second.unwrap().expect("index:ref-p's g map");
-        assert!(Arc::ptr_eq(&first, &second), "the one map");
-        assert_eq!(rec.count(&Event::ZoneMapRead), 1, "read once");
-    }
-
-    /// A zone map whose read fails is not kept: the next reader reads it
-    /// again and gets it (Review Focus 1).
-    #[tokio::test]
-    async fn a_failed_zone_map_read_is_read_again() {
-        use crate::IndexType;
-        use crate::observe::{Event, Recorder};
-
-        let (_dir, native) =
-            crate::tests::mapped_file(50, vec![IndexType::SecondaryByReference]).await;
-        let maps = native.new_zone_maps(Arc::new(FailingOnce {
-            inner: native.segment_source(),
-            failed: std::sync::atomic::AtomicBool::new(false),
-        }));
-        let rec = Recorder::start();
-        assert!(
-            maps.get(FileTable::RefP, 3).await.is_err(),
-            "the failing read"
-        );
-        assert!(
-            maps.get(FileTable::RefP, 3).await.unwrap().is_some(),
-            "read again"
-        );
-        assert_eq!(rec.count(&Event::ZoneMapRead), 2, "two reads");
-    }
 
     /// Chunk-probe handles are memoized, one per quad column and one per
     /// (index component, column): every call hands out the same handle, so

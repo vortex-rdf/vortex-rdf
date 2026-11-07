@@ -188,7 +188,7 @@ async fn a_rare_code_compares_only_the_zones_that_may_hold_it() {
 }
 
 /// With zones off the residual still skips the zones whose bounds rule its
-/// code out, as before the zone classes, and reads no zone's record or
+/// code out, and reads no zone's record or
 /// encoding: a match of `"rare"` compares only its two zones, the first and
 /// the last (short) one.
 #[tokio::test]

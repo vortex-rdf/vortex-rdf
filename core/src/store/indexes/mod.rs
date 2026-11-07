@@ -346,36 +346,54 @@ impl IndexType {
     }
 }
 
-/// Which pattern components an index lookup resolves; residual filtering
-/// over the fetched rows omits them, as the index's row ids are exactly
-/// their matches.
+/// Which pattern roles an index lookup resolved; residual filtering over the
+/// fetched rows omits them, as the index's row ids are exactly their matches.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ResolvedRoles {
-    Predicate,
-    Object,
-    /// Both predicate and object at once: a prefix search of the
-    /// (p, o, …)-sorted copy in [`IndexType::SecondaryByCopy`].
-    PredicateObject,
+pub(crate) struct ResolvedRoles {
+    predicate: bool,
+    object: bool,
+    /// The bound graph, checked inside the run on the component's own graph
+    /// column ([`GraphCheck`](graph_check::GraphCheck)).
+    graph: bool,
 }
 
 impl ResolvedRoles {
-    /// The pattern with this (index-resolved) component cleared: what still
-    /// needs checking against the rows the index returned.
+    /// The predicate alone.
+    pub(crate) const PREDICATE: Self = Self {
+        predicate: true,
+        object: false,
+        graph: false,
+    };
+    /// The object alone.
+    pub(crate) const OBJECT: Self = Self {
+        predicate: false,
+        object: true,
+        graph: false,
+    };
+    /// Both predicate and object at once: a prefix search of the
+    /// (p, o, …)-sorted copy in [`IndexType::SecondaryByCopy`].
+    pub(crate) const PREDICATE_OBJECT: Self = Self {
+        predicate: true,
+        object: true,
+        graph: false,
+    };
+
+    /// These roles and the graph.
+    pub(crate) fn with_graph(self) -> Self {
+        Self {
+            graph: true,
+            ..self
+        }
+    }
+
+    /// The pattern with the resolved roles cleared: what still needs checking
+    /// against the rows the index returned.
     pub(crate) fn clear<'a>(self, pattern: QuadPattern<'a>) -> QuadPattern<'a> {
-        match self {
-            ResolvedRoles::Predicate => QuadPattern {
-                predicate: None,
-                ..pattern
-            },
-            ResolvedRoles::Object => QuadPattern {
-                object: None,
-                ..pattern
-            },
-            ResolvedRoles::PredicateObject => QuadPattern {
-                predicate: None,
-                object: None,
-                ..pattern
-            },
+        QuadPattern {
+            predicate: pattern.predicate.filter(|_| !self.predicate),
+            object: pattern.object.filter(|_| !self.object),
+            graph: pattern.graph.filter(|_| !self.graph),
+            ..pattern
         }
     }
 }
@@ -412,16 +430,10 @@ pub(crate) enum IndexResolution<Plan> {
     /// gathering the primary columns by scattered row id; a back-reference
     /// index leaves it `None`. The plan only optimizes: `row_ids` resolve
     /// the pattern on their own.
-    ///
-    /// `graph` is whether the resolution also checked the pattern's bound
-    /// graph (an in-memory run checks it inside its component): its ids
-    /// then hold only rows of that graph, and the caller drops the graph
-    /// from any residual filtering too.
     Resolved {
         row_ids: ResolvedRowIds,
         resolves: ResolvedRoles,
         serve: Option<Plan>,
-        graph: bool,
     },
 }
 
@@ -541,19 +553,25 @@ mod tests {
 
         let bound = QuadPattern::new(Some(&s), Some(&p), Some(&o), Some(&g));
 
-        let r = ResolvedRoles::Object.clear(bound);
+        let r = ResolvedRoles::OBJECT.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_some() && r.object.is_none() && r.graph.is_some()
         );
 
-        let r = ResolvedRoles::Predicate.clear(bound);
+        let r = ResolvedRoles::PREDICATE.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_none() && r.object.is_some() && r.graph.is_some()
         );
 
-        let r = ResolvedRoles::PredicateObject.clear(bound);
+        let r = ResolvedRoles::PREDICATE_OBJECT.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_none() && r.object.is_none() && r.graph.is_some()
+        );
+
+        // A run that checked the graph inside its component clears it too.
+        let r = ResolvedRoles::PREDICATE.with_graph().clear(bound);
+        assert!(
+            r.subject.is_some() && r.predicate.is_none() && r.object.is_some() && r.graph.is_none()
         );
     }
 }

@@ -1,29 +1,29 @@
 //! The residual compare over an in-memory table ([`ResidualCompare`]): the
 //! equalities of a pattern no prefix search or index answered, over a
 //! selection of a table's rows, the base's or an index component's. The
-//! statistics settle what they can first ([`ask_statistics`]: the base
-//! columns' whole bounds, then their zones, which their zone maps keep, and
-//! against which the zones a selection touches are classed, [`Classes`]). Then one walk counts the
-//! matches ([`count`](ResidualCompare::count)), takes a window of them
-//! ([`window`](ResidualCompare::window)), or finds every one
+//! statistics settle what they can first ([`ask_statistics`]): the columns'
+//! whole bounds, then the zones the selection touches, classed against their
+//! zone maps ([`Classes`]). One walk then counts the matches
+//! ([`count`](ResidualCompare::count)), takes a window of them
+//! ([`window`](ResidualCompare::window)) or finds every one
 //! ([`rows`](ResidualCompare::rows)):
 //! - zone by zone where the zones are classed: "none" zones skipped, "all"
-//!   zones taken, mixed ones counted unread where a record or the column's
-//!   encoding counts them, else compared;
+//!   zones taken, mixed ones counted unread from a record or the column's
+//!   encoding where they can be, else compared;
 //! - in growing pieces where they are not (zones off, or no zone map), each
-//!   piece compared, skipping the zones whose bounds rule a code out where
-//!   the base keeps their zone maps.
+//!   piece compared, skipping the zones whose bounds rule a code out.
 //!
 //! A compare is the typed fast path or the mask scan over the base, and the
-//! graph column's encoding over a component. The mask of an array's rows
+//! graph column's encoding over a component; the mask of an array's rows
 //! holding the equalities ([`mask_for`]) is the tail's match's compare too.
-//! These are functions of the table, with no store state. The match narrows
-//! a selection with them, and two callers walk them only as far as they
-//! need: a residual compare left pending
+//! Nothing here holds store state: the match narrows a selection with these,
+//! and a residual left pending
 //! ([`PendingResidual`](crate::store::view::pending::PendingResidual)) and an
 //! index run's graph check
-//! ([`GraphCheck`](crate::store::indexes::graph_check::GraphCheck)).
+//! ([`GraphCheck`](crate::store::indexes::graph_check::GraphCheck)) walk only
+//! as far as they need.
 
+use std::convert::Infallible;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -48,8 +48,9 @@ use crate::store::probes::StructProbes;
 use crate::store::read::live::{Live, WindowCursor};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
 use crate::store::scan::typed_eq::typed_residual_ids_reading;
-use crate::store::schema::{PRIMARY_COLUMNS, RowId};
+use crate::store::schema::{RowId, primary_slot};
 use crate::store::view::selection::{RowSelection, SelectedRows};
+use crate::zone_stats::quad_zones::QuadZones;
 use crate::zone_stats::zone_map::{ZONE_ROWS, eq_on_bounds};
 use crate::zone_stats::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 
@@ -77,7 +78,7 @@ pub(crate) enum Asked {
 
 /// The statistics a residual over `selection` (of `memory`'s base) asks
 /// once, each equality of `eqs` by the bounds' rule of `x = code`
-/// ([`eq_on_bounds`]): first against its column's exact bounds, which its
+/// ([`eq_on_bounds`]): first against its column's whole bounds, which its
 /// zone map keeps ([`ColumnZones::column_bounds`]), then the equalities left
 /// against their columns' zones and `g`'s recorded graphs
 /// ([`Classes::Zoned`]); where those decline, the pieces of a residual whose
@@ -90,35 +91,26 @@ pub(crate) fn ask_statistics(
     selection: &RowSelection,
     eqs: Vec<(&'static str, Scalar)>,
 ) -> Result<Asked> {
-    let base = &memory.base;
     let mut open = Vec::with_capacity(eqs.len());
     let mut zoned = Vec::new();
     for (field, value) in eqs {
-        let slot = PRIMARY_COLUMNS.iter().position(|column| *column == field);
-        let (Some(slot), Some(code)) = (slot, unsigned_value(&value)) else {
-            open.push((field, value));
-            continue;
-        };
-        let zones = memory.zones.get(slot);
-        let bounds = zones.and_then(|zones| zones.column_bounds());
-        match bounds.and_then(|(min, max)| eq_on_bounds(min, max, code)) {
-            Some(false) => return Ok(Asked::Nothing),
-            Some(true) => continue,
-            None => {}
-        }
-        if let Some(zones) = zones {
-            zoned.push(ZoneCheck {
-                bit: open.len() as u32,
-                code,
-                zones: Arc::clone(zones),
-            });
+        if let Some(check) = zone_check(&memory.zones, open.len(), field, &value) {
+            let settled = check
+                .zones
+                .column_bounds()
+                .and_then(|(min, max)| eq_on_bounds(min, max, check.code));
+            match settled {
+                Some(false) => return Ok(Asked::Nothing),
+                Some(true) => continue,
+                None => zoned.push(check),
+            }
         }
         open.push((field, value));
     }
     if open.is_empty() {
         return Ok(Asked::Everything);
     }
-    let classes = Classes::zoned(zoned, open.len(), selection, base.len())
+    let classes = Classes::zoned(zoned, open.len(), selection, memory.base.len())
         .unwrap_or_else(|| unasked_classes(memory, &open));
     Ok(Asked::Open { eqs: open, classes })
 }
@@ -126,27 +118,36 @@ pub(crate) fn ask_statistics(
 /// The classes of a residual over `memory`'s base whose statistics are not
 /// asked (zones off, or a selection of no more than a zone's rows): growing
 /// pieces, whose compares skip the zones the bounds of `eqs`' columns rule
-/// out where the base keeps their zone maps ([`ZoneSet::bounds_only`]), as
-/// before the zone classes.
+/// out where the base keeps their zone maps ([`ZoneSet::bounds_only`]).
 pub(crate) fn unasked_classes(memory: &MemoryBase, eqs: &[(&'static str, Scalar)]) -> Classes {
     let checks: Vec<ZoneCheck> = eqs
         .iter()
         .enumerate()
-        .filter_map(|(at, (field, value))| {
-            let slot = PRIMARY_COLUMNS.iter().position(|column| column == field)?;
-            Some(ZoneCheck {
-                bit: u32::try_from(at).ok()?,
-                code: unsigned_value(value)?,
-                zones: Arc::clone(memory.zones.get(slot)?),
-            })
-        })
+        .filter_map(|(at, (field, value))| zone_check(&memory.zones, at, field, value))
         .collect();
-    let unzoned = checks
-        .iter()
-        .fold(every_eq(eqs.len()), |bits, check| bits & !(1 << check.bit));
+    let unzoned = unzoned(eqs.len(), &checks);
     Classes::Pieces {
         bounds: ZoneSet::new(checks, unzoned).map(ZoneSet::bounds_only),
     }
+}
+
+/// The zone check of the equality `field = value`, the `bit`th of a
+/// residual's, against the zone map `zones` keeps of its column: `None` for
+/// a column without one, a value that is no code, or a bit past a
+/// [`ZoneClass`]'s 32.
+fn zone_check(zones: &QuadZones, bit: usize, field: &str, value: &Scalar) -> Option<ZoneCheck> {
+    Some(ZoneCheck {
+        bit: u32::try_from(bit).ok().filter(|&bit| bit < u32::BITS)?,
+        code: unsigned_value(value)?,
+        zones: Arc::clone(zones.get(primary_slot(field)?)?),
+    })
+}
+
+/// The bits of the `eqs` equalities no check of `checks` speaks for.
+fn unzoned(eqs: usize, checks: &[ZoneCheck]) -> u32 {
+    checks
+        .iter()
+        .fold(every_eq(eqs), |bits, check| bits & !(1 << check.bit))
 }
 
 /// How a residual's selection is walked ([`ask_statistics`],
@@ -179,12 +180,10 @@ impl Classes {
         base_len: usize,
     ) -> Option<Self> {
         let _span = span(&selection.as_rows(base_len))?;
-        if eqs > 32 {
+        if eqs > u32::BITS as usize {
             return None;
         }
-        let unzoned = zoned
-            .iter()
-            .fold(every_eq(eqs), |bits, check| bits & !(1 << check.bit));
+        let unzoned = unzoned(eqs, &zoned);
         let set = ZoneSet::new(zoned, unzoned)?;
         observe!(ZonesClassed(
             _span.end.div_ceil(set.zone_len()).min(set.zones()) - _span.start / set.zone_len()
@@ -230,16 +229,49 @@ pub(crate) struct ResidualCompare<'a> {
     pub(crate) t: Option<Instant>,
 }
 
-/// A part of a residual's selection read as one: a zone's selected rows, or
-/// a piece's.
-struct Part {
-    /// The selected rows of the part.
-    selected: RowSelection,
-    /// How they are read.
-    class: ZoneClass,
-    /// The zone they lie in, its rows within the selection's span, when the
-    /// classes are zones'.
-    zone: Option<ZonePart>,
+/// A part of a residual's selection read as one, by a walk that may stop
+/// short ([`ResidualCompare::parts`]).
+enum Part<'a> {
+    /// A zone's selected rows, with the zone's class against `set`.
+    Zone {
+        set: &'a ZoneSet,
+        zone: ZonePart,
+        selected: RowSelection,
+        class: ZoneClass,
+    },
+    /// A piece's selected rows, compared on every equality
+    /// ([`ResidualCompare::pieces_compared`]).
+    Piece {
+        bounds: &'a Option<ZoneSet>,
+        selected: RowSelection,
+    },
+}
+
+/// One step of a walk over a residual's whole selection
+/// ([`ResidualCompare::steps`]): the selected rows of adjacent zones read
+/// as one. `C` is how a mixed zone is counted unread: [`Unread`] in a
+/// count, never in a walk for the rows ([`Infallible`]).
+enum Step<C> {
+    /// No row matches: skipped.
+    Skip,
+    /// Every row matches: taken uncompared.
+    Take,
+    /// A mixed zone's matches counted unread.
+    Unread(C),
+    /// Compared on the equalities `bits` names.
+    Compare(u32),
+}
+
+impl<C> Step<C> {
+    /// Whether this step and `next`, of the zone after it, are one step:
+    /// both skip, both take, or both compare on the same equalities.
+    fn joins(&self, next: &Self) -> bool {
+        match (self, next) {
+            (Step::Skip, Step::Skip) | (Step::Take, Step::Take) => true,
+            (Step::Compare(bits), Step::Compare(other)) => bits == other,
+            _ => false,
+        }
+    }
 }
 
 impl ResidualCompare<'_> {
@@ -269,37 +301,75 @@ impl ResidualCompare<'_> {
     /// four times as many each after, or every row when no more than `want`
     /// are selected, as no count or window of `want` rows could stop short
     /// of them.
-    fn parts(&self, span: Range<u64>, want: usize) -> Box<dyn Iterator<Item = Part> + '_> {
+    fn parts(&self, span: Range<u64>, want: usize) -> Box<dyn Iterator<Item = Part<'_>> + '_> {
         let rows = self.selected_rows();
         let len = self.len();
         match self.classes {
             Classes::Zoned(set) => Box::new(set.parts(span).filter_map(move |zone| {
                 let selected = part_of(&rows, zone.rows.clone());
-                (!selected.is_empty(len)).then(|| Part {
-                    selected,
+                (!selected.is_empty(len)).then(|| Part::Zone {
+                    set,
                     class: set.class(zone.zone),
-                    zone: Some(zone),
+                    zone,
+                    selected,
                 })
             })),
-            Classes::Pieces { .. } => {
+            Classes::Pieces { bounds } => {
                 let total = self.work();
                 let first = if total <= want {
                     total
                 } else {
                     FIRST_PIECE_ROWS
                 };
-                let every = every_eq(self.eqs.len());
                 Box::new(
                     growing_pieces(std::iter::once(0..total as u64), first as u64).map(
-                        move |(_, piece)| Part {
+                        move |(_, piece)| Part::Piece {
+                            bounds,
                             selected: rows_at(&rows, piece.start as usize..piece.end as usize),
-                            class: ZoneClass::Mixed { unsettled: every },
-                            zone: None,
                         },
                     ),
                 )
             }
         }
+    }
+
+    /// The walk over the selected rows `rows` within `span`, zone by zone
+    /// of `set`, in table order: a zone with no selected row is skipped, and
+    /// any other is a step by its class ([`Step`]), a mixed zone's chosen by
+    /// `mixed` from the zone, its selected rows and its unsettled bits.
+    /// Adjacent zones of one step are joined, across zones with no selected
+    /// row, so a run of zones compared on the same equalities is compared
+    /// once.
+    fn steps<C>(
+        &self,
+        set: &ZoneSet,
+        rows: &SelectedRows<'_>,
+        span: Range<u64>,
+        mut mixed: impl FnMut(&ZonePart, &RowSelection, u32) -> Step<C>,
+    ) -> Vec<(Range<u64>, Step<C>)> {
+        let len = self.len();
+        let mut steps: Vec<(Range<u64>, Step<C>)> = Vec::new();
+        for zone in set.parts(span) {
+            let selected = part_of(rows, zone.rows.clone());
+            if selected.is_empty(len) {
+                if let Some((run, _)) = steps.last_mut() {
+                    run.end = zone.rows.end;
+                }
+                continue;
+            }
+            let step = match set.class(zone.zone) {
+                ZoneClass::None => Step::Skip,
+                ZoneClass::All => Step::Take,
+                ZoneClass::Mixed { unsettled } => mixed(&zone, &selected, unsettled),
+            };
+            match steps.last_mut() {
+                Some((run, last)) if run.end == zone.rows.start && last.joins(&step) => {
+                    run.end = zone.rows.end;
+                }
+                _ => steps.push((zone.rows, step)),
+            }
+        }
+        steps
     }
 
     /// How many live rows match, stopping once `cap` are counted (`None`:
@@ -332,56 +402,34 @@ impl ResidualCompare<'_> {
         }
     }
 
-    /// [`count`](Self::count) of every match, by zones. Each zone is
-    /// planned first: skipped, taken, counted unread ([`unread_plan`]), or
-    /// compared, adjacent zones compared on the same equalities joined into
-    /// one run. Runs to compare that [`compares_whole`] judges fragmented
-    /// compare the whole selection once; otherwise the takes and unread
-    /// counts are summed and each run compared.
+    /// [`count`](Self::count) of every match, by zones: the walk's steps
+    /// ([`steps`](Self::steps)), a mixed zone counted unread where it can be
+    /// ([`unread_plan`](Self::unread_plan)), summed; or the whole selection
+    /// compared once where the compares are fragmented ([`compares_whole`]).
     fn full_count(&self, set: &ZoneSet, span: Range<u64>) -> Result<usize> {
         let rows = self.selected_rows();
-        let (len, selected) = (self.len(), self.work());
-        let (mut taken, mut unread) = (Vec::new(), Vec::new());
-        let mut runs: Vec<(Range<u64>, u32)> = Vec::new();
-        for zone in set.parts(span) {
-            let part = part_of(&rows, zone.rows.clone());
-            if part.is_empty(len) {
-                continue;
+        let steps = self.steps(set, &rows, span, |zone, selected, bits| {
+            match self.unread_plan(set, zone, selected, bits) {
+                Some(plan) => Step::Unread(plan),
+                None => Step::Compare(bits),
             }
-            match set.class(zone.zone) {
-                ZoneClass::None => {}
-                ZoneClass::All => taken.push(part),
-                ZoneClass::Mixed { unsettled } => {
-                    match self.unread_plan(set, &zone, &part, unsettled) {
-                        Some(plan) => unread.push(plan),
-                        None => match runs.last_mut() {
-                            Some((last, joined))
-                                if *joined == unsettled && last.end == zone.rows.start =>
-                            {
-                                last.end = zone.rows.end;
-                            }
-                            _ => runs.push((zone.rows, unsettled)),
-                        },
-                    }
-                }
-            }
-        }
-        let compare_rows: usize = runs
-            .iter()
-            .map(|(run, _)| part_of(&rows, run.clone()).len(len))
-            .sum();
-        if compares_whole(runs.len(), compare_rows, selected) {
+        });
+        if compares_whole(&rows, &steps, self.work(), self.len()) {
             let every = every_eq(self.eqs.len());
             return Ok(self.live(&self.compare(self.selection.clone(), every)?));
         }
         let mut count = 0;
-        for part in taken {
-            self.observe_taken(&part);
-            count += self.live(&part);
-        }
-        count += unread.into_iter().map(unread_count).sum::<usize>();
-        for (run, bits) in runs {
-            count += self.live(&self.compare(part_of(&rows, run), bits)?);
+        for (run, step) in steps {
+            count += match step {
+                Step::Skip => 0,
+                Step::Take => {
+                    let part = part_of(&rows, run);
+                    self.observe_taken(&part);
+                    self.live(&part)
+                }
+                Step::Unread(plan) => unread_count(plan),
+                Step::Compare(bits) => self.live(&self.compare(part_of(&rows, run), bits)?),
+            };
         }
         Ok(count)
     }
@@ -426,22 +474,28 @@ impl ResidualCompare<'_> {
         }
     }
 
-    /// A part's matches counted unread, where a part of zones' classes can
-    /// be: none in a "none" zone, the live rows of an "all" zone, a mixed
-    /// zone's from its record or its column's encoding ([`unread_plan`]).
-    /// `None` for a part that must be compared, and for every piece.
-    fn unread(&self, part: &Part) -> Option<usize> {
-        let (Classes::Zoned(set), Some(zone)) = (self.classes, &part.zone) else {
+    /// A part's matches counted unread, where a zone's can be: none in a
+    /// "none" zone, the live rows of an "all" zone, a mixed zone's from its
+    /// record or its column's encoding ([`unread_plan`](Self::unread_plan)).
+    /// `None` for a zone that must be compared, and for every piece.
+    fn unread(&self, part: &Part<'_>) -> Option<usize> {
+        let Part::Zone {
+            set,
+            zone,
+            selected,
+            class,
+        } = part
+        else {
             return None;
         };
-        match part.class {
+        match *class {
             ZoneClass::None => Some(0),
             ZoneClass::All => {
-                self.observe_taken(&part.selected);
-                Some(self.live(&part.selected))
+                self.observe_taken(selected);
+                Some(self.live(selected))
             }
             ZoneClass::Mixed { unsettled } => self
-                .unread_plan(set, zone, &part.selected, unsettled)
+                .unread_plan(set, zone, selected, unsettled)
                 .map(unread_count),
         }
     }
@@ -493,23 +547,32 @@ impl ResidualCompare<'_> {
 
     /// A part's matches, read: none, every row, or those the compare keeps
     /// (tombstoned rows among them).
-    fn matched(&self, part: &Part) -> Result<RowSelection> {
-        match (part.class, self.classes) {
-            (ZoneClass::None, _) => Ok(RowSelection::empty()),
-            (ZoneClass::All, _) => Ok(part.selected.clone()),
-            (ZoneClass::Mixed { .. }, Classes::Pieces { bounds }) => {
-                observe!(ResidualPiece(part.selected.len(self.len())));
-                self.pieces_compared(bounds, part.selected.clone())
-            }
-            (ZoneClass::Mixed { unsettled }, Classes::Zoned(_)) => {
-                self.compare(part.selected.clone(), unsettled)
+    fn matched(&self, part: &Part<'_>) -> Result<RowSelection> {
+        match part {
+            Part::Zone {
+                class: ZoneClass::None,
+                ..
+            } => Ok(RowSelection::empty()),
+            Part::Zone {
+                class: ZoneClass::All,
+                selected,
+                ..
+            } => Ok(selected.clone()),
+            Part::Zone {
+                class: ZoneClass::Mixed { unsettled },
+                selected,
+                ..
+            } => self.compare(selected.clone(), *unsettled),
+            Part::Piece { bounds, selected } => {
+                observe!(ResidualPiece(selected.len(self.len())));
+                self.pieces_compared(bounds, selected.clone())
             }
         }
     }
 
     /// The matches of `selection` (a piece, or the whole selection) on every
-    /// equality: by the zones `bounds` leaves past a zone's rows, as before
-    /// the zone classes, else compared whole.
+    /// equality: by the zones `bounds` leaves past a zone's rows, else
+    /// compared whole.
     fn pieces_compared(
         &self,
         bounds: &Option<ZoneSet>,
@@ -521,28 +584,21 @@ impl ResidualCompare<'_> {
         }
     }
 
-    /// The matches of `selection`, zone by zone by `set`'s classes: "none"
-    /// zones skipped, the rows of "all" zones taken uncompared, and mixed
-    /// zones compared on the equalities they leave unsettled, adjacent zones
-    /// of one class compared as one run, or the whole selection compared
-    /// once where those runs are fragmented ([`compares_whole`]).
+    /// The matches of `selection`, zone by zone by `set`'s classes: the
+    /// walk's steps ([`steps`](Self::steps)), "none" zones skipped, "all"
+    /// zones taken uncompared and the rest compared on the equalities they
+    /// leave unsettled; or the whole selection compared once where the
+    /// compares are fragmented ([`compares_whole`]).
     fn rows_by(&self, set: &ZoneSet, selection: RowSelection) -> Result<RowSelection> {
         let len = self.len();
         let rows = selection.as_rows(len);
         let Some(span) = span(&rows) else {
             return Ok(selection);
         };
-        let mut segments: Vec<(Range<u64>, ZoneClass)> = Vec::new();
-        for zone in set.parts(span) {
-            let class = set.class(zone.zone);
-            match segments.last_mut() {
-                Some((run, joined)) if *joined == class && run.end == zone.rows.start => {
-                    run.end = zone.rows.end;
-                }
-                _ => segments.push((zone.rows, class)),
-            }
-        }
-        if segments.iter().all(|(_, class)| *class == ZoneClass::All) {
+        let steps = self.steps(set, &rows, span, |_, _, bits| {
+            Step::<Infallible>::Compare(bits)
+        });
+        if steps.iter().all(|(_, step)| matches!(step, Step::Take)) {
             self.observe_taken(&selection);
             if !self.table.component {
                 debug::step!(
@@ -552,35 +608,24 @@ impl ResidualCompare<'_> {
             }
             return Ok(selection);
         }
-        let selected = selection.len(len);
-        let compare: Vec<usize> = segments
-            .iter()
-            .filter(|(_, class)| matches!(class, ZoneClass::Mixed { .. }))
-            .map(|(run, _)| part_of(&rows, run.clone()).len(len))
-            .collect();
-        if compares_whole(compare.len(), compare.iter().sum(), selected) {
-            return self.compare(selection.clone(), every_eq(self.eqs.len()));
+        if compares_whole(&rows, &steps, selection.len(len), len) {
+            return self.compare(selection, every_eq(self.eqs.len()));
         }
-        if !self.table.component && segments.iter().any(|(_, class)| *class == ZoneClass::None) {
+        if !self.table.component && steps.iter().any(|(_, step)| matches!(step, Step::Skip)) {
             observe!(ZoneNarrowed);
             debug::step!(self.t, "[match_pattern] In-memory narrowed by zone classes");
         }
         let mut ids: Vec<RowId> = Vec::new();
-        for (run, class) in segments {
+        for (run, step) in steps {
             let part = part_of(&rows, run);
-            if part.is_empty(len) {
-                continue;
-            }
-            match class {
-                ZoneClass::None => {}
-                ZoneClass::All => {
+            match step {
+                Step::Skip => {}
+                Step::Take => {
                     self.observe_taken(&part);
                     extend_rows(&mut ids, &part, len);
                 }
-                ZoneClass::Mixed { unsettled } => {
-                    let matched = self.compare(part, unsettled)?;
-                    extend_rows(&mut ids, &matched, len);
-                }
+                Step::Unread(never) => match never {},
+                Step::Compare(bits) => extend_rows(&mut ids, &self.compare(part, bits)?, len),
             }
         }
         Ok(RowSelection::from_ids(Buffer::from(ids)))
@@ -605,12 +650,22 @@ impl ResidualCompare<'_> {
     }
 }
 
-/// Whether the zones a residual compares, in `runs` runs holding
-/// `compare_rows` of its `selected` rows, are compared as one selection
-/// instead: several runs holding more than half of it, as comparing every
-/// row once costs less than comparing such runs apart.
-fn compares_whole(runs: usize, compare_rows: usize, selected: usize) -> bool {
-    runs > 1 && compare_rows.saturating_mul(2) > selected
+/// Whether the compares among `steps`, over the `selected` rows of `rows`
+/// (of a table of `len` rows), are one compare of the whole selection
+/// instead: several, holding more than half of it, as comparing every row
+/// once costs less than comparing such runs apart.
+fn compares_whole<C>(
+    rows: &SelectedRows<'_>,
+    steps: &[(Range<u64>, Step<C>)],
+    selected: usize,
+    len: usize,
+) -> bool {
+    let compares: Vec<usize> = steps
+        .iter()
+        .filter(|(_, step)| matches!(step, Step::Compare(_)))
+        .map(|(run, _)| part_of(rows, run.clone()).len(len))
+        .collect();
+    compares.len() > 1 && compares.iter().sum::<usize>().saturating_mul(2) > selected
 }
 
 /// How a mixed zone's matches are counted without reading them
@@ -643,11 +698,15 @@ fn unread_count(plan: Unread) -> usize {
     }
 }
 
-/// The equalities of `eqs` whose bits `bits` sets, in order.
+/// The equalities of `eqs` whose bits `bits` sets, in order; an equality
+/// past the 32 bits, which no zone settles, is always picked.
 fn picked(eqs: &[(&'static str, Scalar)], bits: u32) -> Vec<(&'static str, Scalar)> {
     eqs.iter()
         .enumerate()
-        .filter(|(i, _)| bits & (1 << i) != 0)
+        .filter(|(i, _)| {
+            1u32.checked_shl(*i as u32)
+                .is_none_or(|bit| bits & bit != 0)
+        })
         .map(|(_, eq)| eq.clone())
         .collect()
 }

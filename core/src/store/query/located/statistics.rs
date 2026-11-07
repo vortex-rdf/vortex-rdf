@@ -2,7 +2,7 @@
 //! slot for the whole file, then the zone maps class the run's zones
 //! against the slots left, asked once, when a read first needs them.
 
-use super::run::*;
+use super::run::{Check, LocatedRun};
 use crate::counters::{self, note};
 use crate::error::Result;
 use crate::observe::observe;
@@ -123,7 +123,7 @@ pub(super) async fn decide_by_statistics(
 /// read once per file ([`ZoneMaps`]). `None` when a check reads by row id
 /// or a checked column has no zone map, for the run to check every row.
 ///
-/// [`ZoneMaps`]: crate::store::persist::native_file::ZoneMaps
+/// [`ZoneMaps`]: crate::zone_stats::file_maps::ZoneMaps
 pub(super) async fn run_zones(file: &NativeStoreFile, run: &LocatedRun) -> Result<Option<ZoneSet>> {
     let (maps, table) = (file.zone_maps(), run.table.file_table());
     let mut checks = Vec::with_capacity(run.checks.len());

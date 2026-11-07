@@ -74,19 +74,15 @@ pub(crate) fn with_compressed_int_children(
     rows: ArrayRef,
     table: CodeTable,
 ) -> Result<(ArrayRef, QuadZones)> {
-    use crate::store::schema::PRIMARY_COLUMNS;
-    use crate::zone_stats::quad_zones::records_graphs;
+    use crate::store::schema::{GRAPH_SLOT, primary_slot};
     use vortex_array::arrays::Primitive;
     use vortex_layout::arrays::shared::Shared;
 
     let mut zones = QuadZones::default();
     let rows = map_struct_children(rows, |name, child, ctx| {
-        let slot = PRIMARY_COLUMNS
-            .iter()
-            .position(|column| *column == name.as_ref())
-            .filter(|&slot| table.zoned(slot));
+        let slot = primary_slot(name.as_ref()).filter(|&slot| table.zoned(slot));
         let mut zones_of = match slot {
-            Some(slot) if records_graphs(slot) => ZoneBuilder::recording(),
+            Some(GRAPH_SLOT) => ZoneBuilder::recording(),
             _ => ZoneBuilder::new(),
         };
         let sorted = column_is_sorted(child);
@@ -133,7 +129,7 @@ pub(crate) enum CodeTable {
 impl CodeTable {
     /// Whether the column in slot `slot` of `(s, p, o, g)` keeps its zone map.
     fn zoned(self, slot: usize) -> bool {
-        self == CodeTable::Base || crate::zone_stats::quad_zones::records_graphs(slot)
+        self == CodeTable::Base || slot == crate::store::schema::GRAPH_SLOT
     }
 
     /// Whether a compressed column is wrapped in `vortex.shared`.

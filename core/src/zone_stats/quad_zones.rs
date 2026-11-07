@@ -1,29 +1,23 @@
-//! The zone maps of an in-memory base's code columns: P1's [`ColumnZones`]
-//! (each 8,192-row zone's exact bounds) per quad code column, `g`'s with the
-//! graphs each zone recorded (P2's `vortexrdf.value_counts`), as a file store's
-//! located runs read them. A residual equality over a base that no index serves
-//! classes the zones its selection touches against them
-//! ([`ResidualCompare`](crate::store::scan::residual::ResidualCompare)): it
-//! skips the zones a bound column's bounds or `g`'s records rule out and
-//! compares only the rest, as the file path's zone-map pruning reads only the
-//! zones it leaves. With zones off it skips the zones the bounds alone rule
-//! out, compared in pieces. A build takes the bounds, and `g`'s records, in
-//! the pass that picks each code column's compression, which reads every
-//! code anyway ([`ZoneBuilder`]); a store loaded from a file or from bytes
-//! reads both from the file's zone tables ([`QuadZones::read`]). A zone map
-//! also keeps its column's whole bounds, the zones' folded
-//! ([`ColumnZones::column_bounds`]), which a residual asks first. A base with
-//! neither has none, and its residual compares every row.
+//! The zone maps of an in-memory base's code columns ([`QuadZones`]): one
+//! [`ColumnZones`] per quad code column, each 8,192-row zone's exact bounds,
+//! and for `g` the graphs each zone holds (`vortexrdf.value_counts`). A build
+//! takes them in the pass that compresses the code columns, which reads
+//! every code anyway ([`ZoneBuilder`]); a store loaded from a file or from
+//! bytes reads them from the file's zone tables ([`QuadZones::read`]). The
+//! residual compare asks a column's whole bounds first
+//! ([`ColumnZones::column_bounds`]), then classes the zones a selection
+//! touches against them
+//! ([`ResidualCompare`](crate::store::scan::residual::ResidualCompare)); a
+//! base without them compares every row.
 
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::store::schema::{CODE_DTYPE, PRIMARY_COLUMNS, TermCode};
+#[cfg(test)]
+use crate::store::schema::PRIMARY_COLUMNS;
+use crate::store::schema::{CODE_DTYPE, TermCode, primary_slot};
 use crate::zone_stats::value_counts::{Counts, MAX_VALUES};
 use crate::zone_stats::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS};
-
-/// The graph column's slot in `(s, p, o, g)`.
-const GRAPH_SLOT: usize = 3;
 
 /// A base's quad code columns' zone maps, in `(s, p, o, g)` slot order; a
 /// column without one is `None`.
@@ -38,8 +32,7 @@ impl QuadZones {
 
     /// Column `name`'s zone map (`s`, `p`, `o` or `g`), if it has one.
     pub(crate) fn of_column(&self, name: &str) -> Option<&Arc<ColumnZones>> {
-        let slot = PRIMARY_COLUMNS.iter().position(|column| *column == name)?;
-        self.get(slot)
+        self.get(primary_slot(name)?)
     }
 
     /// Record `zones` as slot `slot`'s.
@@ -86,10 +79,7 @@ impl QuadZones {
             let Some(LayoutChildType::Field(name)) = quads.slot_type(slot) else {
                 continue;
             };
-            let Some(quad_slot) = PRIMARY_COLUMNS
-                .iter()
-                .position(|column| *column == name.as_ref())
-            else {
+            let Some(quad_slot) = primary_slot(name.as_ref()) else {
                 continue;
             };
             let Some(column) = quads.slot(slot)? else {
@@ -253,14 +243,10 @@ pub(crate) async fn read_graph_zones(
     }
 }
 
-/// Whether slot `slot` is the graph column, whose zones record their graphs.
-pub(crate) fn records_graphs(slot: usize) -> bool {
-    slot == GRAPH_SLOT
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::schema::GRAPH_SLOT;
 
     /// A zone's bounds are its own codes' smallest and largest, whether the
     /// codes arrive in one slice or across slices cut anywhere; the last zone

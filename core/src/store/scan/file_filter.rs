@@ -21,12 +21,13 @@ use crate::io::read::{available_parallelism, spawned_splits};
 use crate::observe::observe;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
-use crate::store::persist::native_file::{FileTable, NativeStoreFile, ZoneMaps};
+use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{PushedFilter, QUAD_SCOPE};
 use crate::store::scan::file_scans::{ScanDriver, split_window, strict_ids};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
 use crate::store::schema::{COL_G, COL_O, COL_O_VALUE, COL_P, COL_S, RowId};
 use crate::store::view::selection::RowSelection;
+use crate::zone_stats::file_maps::{FileTable, ZoneMaps};
 use crate::zone_stats::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 
 /// Split a file view's [`RowSelection`] into the two knobs the per-split filter
@@ -182,11 +183,41 @@ impl ConjunctOrder {
 }
 
 /// The every-row step of a filter of code equalities over a file: each
-/// equality's quad slot and code, and the file's quad zone maps
-/// ([`ZoneMaps`]) that decide it.
+/// equality's quad slot and code, the file's quad zone maps ([`ZoneMaps`])
+/// that decide it, and the equalities' zone checks over the quad table,
+/// built from the maps once, by the first split that asks
+/// ([`zone_set`](Self::zone_set)).
 struct EveryRow {
     columns: Vec<(usize, u64)>,
     maps: ZoneMaps,
+    set: tokio::sync::OnceCell<Option<ZoneSet>>,
+}
+
+impl EveryRow {
+    /// The equalities' zone checks over the quad table: `None` where an
+    /// equality's column has no zone map, as a filter over such a column
+    /// takes no zone whole. Built once; a failed read is tried again by the
+    /// next split.
+    async fn zone_set(&self) -> Result<Option<&ZoneSet>> {
+        let set = self
+            .set
+            .get_or_try_init(|| async {
+                let mut checks = Vec::with_capacity(self.columns.len());
+                for (bit, &(slot, code)) in self.columns.iter().enumerate() {
+                    let Some(zones) = self.maps.get(FileTable::Quads, slot).await? else {
+                        return Ok(None);
+                    };
+                    checks.push(ZoneCheck {
+                        bit: bit as u32,
+                        code,
+                        zones,
+                    });
+                }
+                Result::Ok(ZoneSet::new(checks, 0))
+            })
+            .await?;
+        Ok(set.as_ref())
+    }
 }
 
 /// The every-row step `filter` takes over `file`, decided once per
@@ -194,7 +225,7 @@ struct EveryRow {
 /// (`VORTEX_RDF_ZONES=0`) or for a filter of any other shape than code
 /// equalities on the quad table's code columns.
 fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<EveryRow> {
-    use crate::store::schema::PRIMARY_COLUMNS;
+    use crate::store::schema::primary_slot;
 
     if !crate::zone_stats::rules::zones_enabled() {
         return None;
@@ -202,14 +233,12 @@ fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<Every
     let columns = filter
         .eqs()?
         .iter()
-        .map(|(column, code)| {
-            let slot = PRIMARY_COLUMNS.iter().position(|c| *c == column.as_ref())?;
-            Some((slot, code))
-        })
+        .map(|(column, code)| Some((primary_slot(column.as_ref())?, code)))
         .collect::<Option<Vec<_>>>()?;
     (!columns.is_empty()).then(|| EveryRow {
         columns,
         maps: file.zone_maps(),
+        set: tokio::sync::OnceCell::new(),
     })
 }
 
@@ -218,9 +247,8 @@ fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<Every
 /// rest of `start` for the filter to evaluate; without the step, `None` and
 /// `start`. A zone qualifies where each equality's column has a zone map
 /// whose bounds there are both its code, the class all of the equalities'
-/// [`ZoneSet`]: the rule Vortex's pruning of `col != c` applies, read off
-/// the maps the file reads once ([`ZoneMaps`]), only for the split's own
-/// zones.
+/// zone checks ([`EveryRow::zone_set`]): the rule Vortex's pruning of
+/// `col != c` applies, read for the split's own zones.
 async fn every_row_zones(
     every_row: Option<&EveryRow>,
     range: &Range<u64>,
@@ -232,18 +260,7 @@ async fn every_row_zones(
     if range.is_empty() || start.all_false() {
         return Ok((None, start));
     }
-    let mut checks = Vec::with_capacity(every_row.columns.len());
-    for (bit, &(slot, code)) in every_row.columns.iter().enumerate() {
-        let Some(zones) = every_row.maps.get(FileTable::Quads, slot).await? else {
-            return Ok((None, start));
-        };
-        checks.push(ZoneCheck {
-            bit: bit as u32,
-            code,
-            zones,
-        });
-    }
-    let Some(set) = ZoneSet::new(checks, 0) else {
+    let Some(set) = every_row.zone_set().await? else {
         return Ok((None, start));
     };
     let mut slices: Vec<(usize, usize)> = Vec::new();

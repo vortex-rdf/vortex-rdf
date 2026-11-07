@@ -3,13 +3,13 @@
 //! windows, counts and streams.
 
 use super::LocatedCodes;
-use super::statistics::*;
+use super::statistics::Statistics;
 use crate::CodeChunkStream;
 use crate::error::Result;
 use crate::observe::observe;
-use crate::store::persist::native_file::FileTable;
 use crate::store::scan::column_reads::{leaves_holding, listed_in, read_codes, take_codes};
 use crate::store::schema::TermCode;
+use crate::zone_stats::file_maps::FileTable;
 use std::ops::Range;
 use std::sync::Arc;
 use vortex_buffer::Buffer;
@@ -132,6 +132,14 @@ impl Rows {
         match self {
             Rows::Run(run) => run.is_empty(),
             Rows::Ids(ids) => ids.is_empty(),
+        }
+    }
+
+    /// The rows as ascending ids, a run's listed out.
+    fn into_ids(self) -> Vec<u64> {
+        match self {
+            Rows::Run(run) => run.collect(),
+            Rows::Ids(ids) => ids,
         }
     }
 }
@@ -404,13 +412,10 @@ impl LocatedRun {
                 }
                 counting = false;
             }
-            let kept = match self
+            let kept = self
                 .block(rows.start - run.start..rows.end - run.start)
                 .await?
-            {
-                Rows::Ids(kept) => kept,
-                Rows::Run(rows) => rows.collect(),
-            };
+                .into_ids();
             cursor.take(&kept);
             at += 1;
         }
@@ -495,10 +500,10 @@ impl LocatedRun {
             && offset == 0
             && let Some(limit) = limit.filter(|&limit| limit as u64 <= FIRST_GAP_BLOCK)
         {
-            let mut kept = match self.block(0..FIRST_GAP_BLOCK.min(self.len())).await? {
-                Rows::Ids(kept) => kept,
-                Rows::Run(rows) => rows.collect(),
-            };
+            let mut kept = self
+                .block(0..FIRST_GAP_BLOCK.min(self.len()))
+                .await?
+                .into_ids();
             if kept.len() >= limit {
                 kept.truncate(limit);
                 return self.columns(&Rows::Ids(kept)).await;
@@ -545,10 +550,7 @@ impl LocatedRun {
                 break;
             }
             let next = at.saturating_add(block).min(len);
-            let kept = match self.block(at..next).await? {
-                Rows::Ids(kept) => kept,
-                Rows::Run(rows) => rows.collect(),
-            };
+            let kept = self.block(at..next).await?.into_ids();
             cursor.take(&kept);
             at = next;
             block = (block * 2).min(GAP_BLOCK);
@@ -583,9 +585,6 @@ impl LocatedRun {
         .boxed()
     }
 }
-
-/// The graph's slot in `(s, p, o, g)`.
-pub(super) const GRAPH_SLOT: usize = 3;
 
 /// How many searches of a reference run's `rid`s cost about as much as
 /// reaching one more quad-table leaf to read a slot there (about 250 ns

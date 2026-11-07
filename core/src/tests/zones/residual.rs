@@ -398,7 +398,7 @@ async fn a_residual_decodes_its_columns_for_all_its_zones() {
 
 /// `(? p0 ? g1)` where g1 is in zones 0, 1, 3 and 4 but not 2 and 5: the
 /// zones to compare hold more than half the store, in two runs, so the count
-/// compares the whole selection once, as before the zone classes.
+/// compares the whole selection once.
 #[tokio::test]
 async fn fragmented_zones_left_to_compare_compare_the_whole_selection() {
     let _zones = ForcedZones::set(true);

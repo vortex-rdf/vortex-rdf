@@ -63,7 +63,7 @@ async fn count(store: &VortexRdfStore, p: Option<&str>, g: &str) -> usize {
 /// On a file without an index, `(? ? ? A)` and `(? type ? A)` count the four
 /// zones of graph A alone from their sizes and evaluate the filter on zone 6
 /// alone, the zones of other graphs pruned; `(? ? ? C)`, alone in no zone,
-/// evaluates as before; zones off, no zone is taken.
+/// evaluates the filter over every zone; zones off, no zone is taken.
 #[tokio::test]
 async fn file_counts_take_every_row_zones_from_sizes() {
     let _zones_on = crate::store::test_hooks::ForcedZones::set(true);

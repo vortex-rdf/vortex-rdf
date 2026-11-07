@@ -3,15 +3,14 @@
 //! gap run) checked against the slots past it, or a bound `p`'s or `o`'s
 //! run in its reference index, whichever is shorter and answers.
 
-use super::run::*;
-use super::statistics::*;
+use super::run::{Check, CheckKind, Chunks, Columns, LocatedRun, OtherReference, RunTable, Source};
+use super::statistics::{admit, gap_rows};
 use super::{CodePattern, locate_enabled};
 use crate::error::Result;
 use crate::observe::observe;
 use crate::store::VortexRdfStore;
-use crate::store::persist::native_file::{FileTable, LocatedTables};
-use crate::store::schema::PRIMARY_COLUMNS;
-use crate::store::schema::TermCode;
+use crate::store::schema::{GRAPH_SLOT, PRIMARY_COLUMNS, TermCode};
+use crate::zone_stats::file_maps::FileTable;
 use std::ops::Range;
 use vortex_session::VortexSession;
 
@@ -23,6 +22,21 @@ const TABLES: [(FileTable, [usize; 4]); 3] = [
     (FileTable::Posg, [1, 2, 0, 3]),
     (FileTable::Ospg, [2, 0, 1, 3]),
 ];
+
+/// The chunk-probe handles of the tables a located run is found in, resolved
+/// once per file ([`NativeStoreFile::located_tables`]); `None` where one
+/// declines or the file has no such table.
+///
+/// [`NativeStoreFile::located_tables`]: crate::store::persist::native_file::NativeStoreFile::located_tables
+pub(crate) struct LocatedTables {
+    /// Per sorted table ([`TABLES`]), its `(s, p, o, g)` columns.
+    sorted: [Option<Columns>; 3],
+    /// Per reference index ([`REFERENCES`]), its `(val, rid)`.
+    references: [Option<[Chunks; 2]>; 2],
+    /// Per reference index, its child's `g` (each row's graph), `None` for a
+    /// child written without it.
+    reference_graphs: [Option<Chunks>; 2],
+}
 
 impl VortexRdfStore {
     /// The located run answering `pattern` ([`locate_codes`](Self::locate_codes)
@@ -47,29 +61,28 @@ impl VortexRdfStore {
         if bound == 0 {
             return Ok(None);
         }
-        let tables = file.located_tables(|| {
-            LocatedTables::new(
-                TABLES.map(|(table, _)| {
-                    let handle = |column: &str| match table.component() {
-                        None => file.column_chunks(column),
-                        Some(name) => file.component_column_chunks(name, column),
-                    };
-                    Some([
-                        handle(PRIMARY_COLUMNS[0])?,
-                        handle(PRIMARY_COLUMNS[1])?,
-                        handle(PRIMARY_COLUMNS[2])?,
-                        handle(PRIMARY_COLUMNS[3])?,
-                    ])
-                }),
-                REFERENCES.map(|(table, _)| {
-                    let name = table.component()?;
-                    Some([
-                        file.component_column_chunks(name, "val")?,
-                        file.component_column_chunks(name, "rid")?,
-                    ])
-                }),
-                REFERENCES.map(|(table, _)| file.component_column_chunks(table.component()?, "g")),
-            )
+        let tables = file.located_tables(|| LocatedTables {
+            sorted: TABLES.map(|(table, _)| {
+                let handle = |column: &str| match table.component() {
+                    None => file.column_chunks(column),
+                    Some(name) => file.component_column_chunks(name, column),
+                };
+                Some([
+                    handle(PRIMARY_COLUMNS[0])?,
+                    handle(PRIMARY_COLUMNS[1])?,
+                    handle(PRIMARY_COLUMNS[2])?,
+                    handle(PRIMARY_COLUMNS[3])?,
+                ])
+            }),
+            references: REFERENCES.map(|(table, _)| {
+                let name = table.component()?;
+                Some([
+                    file.component_column_chunks(name, "val")?,
+                    file.component_column_chunks(name, "rid")?,
+                ])
+            }),
+            reference_graphs: REFERENCES
+                .map(|(table, _)| file.component_column_chunks(table.component()?, "g")),
         });
         // The table whose key order starts with the most bound slots, when
         // none starts with all of them: a bound graph after a free slot.

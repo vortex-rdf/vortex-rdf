@@ -121,14 +121,14 @@ pub(super) fn choose<'a>(pattern: QuadPattern<'a>) -> Option<IndexProbe<'a>> {
         return Some(probe(
             RefFamily::Object,
             TermRef::Object(object),
-            ResolvedRoles::Object,
+            ResolvedRoles::OBJECT,
         ));
     }
     if let Some(predicate) = pattern.predicate {
         return Some(probe(
             RefFamily::Predicate,
             TermRef::Predicate(predicate),
-            ResolvedRoles::Predicate,
+            ResolvedRoles::PREDICATE,
         ));
     }
     None
@@ -269,7 +269,7 @@ mod tests {
         // residual — and serves no reads, and its runs' rids ascend.
         let g = oxrdf::GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
         let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), Some(&g))).unwrap();
-        assert_eq!(probe.resolves, ResolvedRoles::Object);
+        assert_eq!(probe.resolves, ResolvedRoles::OBJECT);
         assert_eq!(probe.identity.name, "index:ref-o");
         let [(column, term)] = probe.keys[..] else {
             panic!("one key")
@@ -279,7 +279,7 @@ mod tests {
 
         // Predicate-only patterns use the predicate side.
         let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
-        assert_eq!(probe.resolves, ResolvedRoles::Predicate);
+        assert_eq!(probe.resolves, ResolvedRoles::PREDICATE);
         assert_eq!(probe.identity.name, "index:ref-p");
         let [(column, term)] = probe.keys[..] else {
             panic!("one key")

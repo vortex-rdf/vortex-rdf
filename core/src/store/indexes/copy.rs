@@ -7,7 +7,7 @@
 //! - **`index:posg`**, quads sorted by (p, o, s, g): a bound predicate is a
 //!   binary search of the child's `p` column, and a bound predicate and
 //!   object a two-key *prefix* search, as the object column is itself sorted
-//!   within a predicate's run (`ResolvedRoles::PredicateObject`).
+//!   within a predicate's run (`ResolvedRoles::PREDICATE_OBJECT`).
 //! - **`index:ospg`**, quads sorted by (o, s, p, g): a bound object is a
 //!   binary search of the child's `o` column.
 //!
@@ -180,21 +180,21 @@ pub(super) fn choose<'a>(
             CopyFamily::Posg,
             TermRef::Predicate(predicate),
             Some(TermRef::Object(object)),
-            ResolvedRoles::PredicateObject,
+            ResolvedRoles::PREDICATE_OBJECT,
             SortOrder::Spog,
         ),
         (Some(predicate), None) => (
             CopyFamily::Posg,
             TermRef::Predicate(predicate),
             None,
-            ResolvedRoles::Predicate,
+            ResolvedRoles::PREDICATE,
             SortOrder::Posg,
         ),
         (None, Some(object)) => (
             CopyFamily::Ospg,
             TermRef::Object(object),
             None,
-            ResolvedRoles::Object,
+            ResolvedRoles::OBJECT,
             SortOrder::Spog,
         ),
         (None, None) => return None,
@@ -416,7 +416,7 @@ mod tests {
         // family's copy, whose rids follow the family's order.
         let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None), &layout).unwrap();
         assert_eq!(probe.identity.name, CopyFamily::Posg.identity().name);
-        assert_eq!(probe.resolves, ResolvedRoles::PredicateObject);
+        assert_eq!(probe.resolves, ResolvedRoles::PREDICATE_OBJECT);
         assert_eq!(
             terms(&probe.keys),
             [(COL_P, p.to_string()), (COL_O, o.to_string())]
@@ -427,13 +427,13 @@ mod tests {
         // Predicate-only patterns probe the POSG lead alone.
         let probe = choose(QuadPattern::new(None, Some(&p), None, None), &layout).unwrap();
         assert_eq!(probe.identity.name, CopyFamily::Posg.identity().name);
-        assert_eq!(probe.resolves, ResolvedRoles::Predicate);
+        assert_eq!(probe.resolves, ResolvedRoles::PREDICATE);
         assert_eq!(terms(&probe.keys), [(COL_P, p.to_string())]);
 
         // Object-only patterns probe the OSPG lead.
         let probe = choose(QuadPattern::new(None, None, Some(&o), None), &layout).unwrap();
         assert_eq!(probe.identity.name, CopyFamily::Ospg.identity().name);
-        assert_eq!(probe.resolves, ResolvedRoles::Object);
+        assert_eq!(probe.resolves, ResolvedRoles::OBJECT);
         assert_eq!(terms(&probe.keys), [(COL_O, o.to_string())]);
 
         // A bound graph is never a searched key: it rides as a residual term.

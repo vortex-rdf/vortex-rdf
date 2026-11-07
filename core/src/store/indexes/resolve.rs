@@ -142,7 +142,10 @@ pub(super) fn resolve_in_memory(
         }
         _ => None,
     };
-    let graph = check.is_some();
+    let resolves = match check {
+        Some(_) => probe.resolves.with_graph(),
+        None => probe.resolves,
+    };
     // The matched quads are the contiguous matched run of the serving
     // component, so a read can slice them straight from it instead of
     // gathering the primary columns at the row ids. The plan shares the run
@@ -170,8 +173,7 @@ pub(super) fn resolve_in_memory(
     };
     Ok(IndexResolution::Resolved {
         row_ids: ResolvedRowIds::Lazy(ids),
-        resolves: probe.resolves,
+        resolves,
         serve,
-        graph,
     })
 }

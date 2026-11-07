@@ -401,9 +401,9 @@ Shared rules:
   recorded graphs (`vortexrdf.value_counts`) as every graph column is. A
   by-reference run checked against a graph reads these contiguous rows
   instead of the quad table's `g` at scattered row ids. Readers find the
-  column by name; a child written without it, before it existed, holds
-  `{val, rid}` and is read as before. The string layouts' children hold
-  `{val, rid}`.
+  column by name; a child without it holds `{val, rid}`, and a run of it
+  checks a bound graph at the quad table's rows. The string layouts' children
+  hold `{val, rid}`.
 
 Both copy families keep the same column names; the child's *identity* says
 which order its rows are in. Inside a lead-column run the next key is itself
@@ -520,7 +520,7 @@ a call is working on and the bounded structures below. Residency is the
 kernel's decision; no segment cache sits in between.
 
 What a file store keeps for its lifetime, and what bounds it. The opened handle
-([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L36)) and the file-backed
+([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L38)) and the file-backed
 dictionary handle
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L166))
 keep:

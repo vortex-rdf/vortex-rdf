@@ -255,7 +255,7 @@ async fn stream_written_children_follow_the_hook() {
 /// rows, contiguous, and never the quad table's `g` at its scattered rows:
 /// `(? type ? g1)`, `(? ? Taxon g1)` and `(? type Taxon g1)` on alternating
 /// graphs, read row by row (zones off; zones deciding these runs are pinned
-/// in `located`). A store written without the child `g`, as before it,
+/// in `located`). A store written without the child `g`
 /// reads the quad table's; both answer every read alike, as their rows say.
 #[tokio::test]
 async fn reference_runs_read_their_own_graphs() {
