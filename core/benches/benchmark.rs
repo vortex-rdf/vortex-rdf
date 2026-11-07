@@ -78,6 +78,8 @@ use vortex_rdf_core::{LayoutStrategy, Probe, QuadColumn, VortexRdfError, VortexR
 mod support;
 use support::*;
 
+mod located;
+
 fn main() {
     // Stamp what this run generated; the dashboard reads the line, divan
     // ignores it.
@@ -1380,6 +1382,109 @@ served_reads!(
     served_reused_file(File, Reused, SERVED_REUSED_READS),
     served_reused_mem(InMemory, Reused, SERVED_REUSED_READS),
 );
+
+// ══════════════════════════════════════════════════════════════════════════
+// Groups 4f-4j — LOCATED READS (checked runs and graph-bound general matches)
+//
+// One parameterized group, its cells listed and documented in `located/`: a
+// checked run's code reads (`countCodes`, `matchCodes`, `matchCodeChunks`) on
+// a mapped file, by copy or by reference, where a located run answers them,
+// and on the file loaded in memory, where the index run is checked inside its
+// component; and a graph-bound general match's counts, rows and middle page
+// over zones that each hold a few graphs, or one graph whole.
+// ══════════════════════════════════════════════════════════════════════════
+
+#[divan::bench(args = located::cells(), sample_count = QUERY_SAMPLES)]
+fn located(bencher: divan::Bencher, cell: &located::Cell) {
+    located::time(bencher, *cell);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4k — SERVED STRING READS (narrowed reads of a string-layout run)
+//
+// Group 4e's served view on a file whose columns hold strings: the `P` view of
+// the Group 2 by-copy Default-layout store, one run of `index:posg`. A
+// narrowed view of it reads its positions in the child, and no probe reads a
+// string column, so every read below scans the child for its rows. Each cell
+// times one read of the view matched once before timing, as an engine paging
+// through it does: a window near its start and a deep one, and four
+// partitions, each read as quads.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// One narrowed read of a served string-layout view: an argument of the
+/// served-string cells.
+#[derive(Copy, Clone)]
+enum StringRead {
+    /// `window(10, 100)`, a page near the start.
+    CutWindow,
+    /// `window(n / 2, n / 4)`, a quarter of the view's `n` rows from its middle.
+    DeepWindow,
+    /// `partitions(4)`, each read.
+    Partitions,
+}
+
+impl fmt::Debug for StringRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CutWindow => "cut_window",
+            Self::DeepWindow => "deep_window",
+            Self::Partitions => "partitions",
+        })
+    }
+}
+
+/// The reads timed on the served string-layout view.
+const STRING_READS: &[StringRead] = &[
+    StringRead::CutWindow,
+    StringRead::DeepWindow,
+    StringRead::Partitions,
+];
+
+impl StringRead {
+    /// This read of `view`, of `rows` rows, as the quads it returns.
+    async fn rows(self, view: &VortexRdfStore, rows: usize) -> usize {
+        let quads =
+            |view: VortexRdfStore| async move { view.quads_vec().await.expect("quads").len() };
+        match self {
+            Self::CutWindow => quads(view.window(10, 100).await.expect("window")).await,
+            Self::DeepWindow => {
+                let window = view.window(rows / 2, rows / 4).await.expect("window");
+                quads(window).await
+            }
+            Self::Partitions => {
+                let four = std::num::NonZeroUsize::new(4).expect("four is not zero");
+                let mut read = 0;
+                for part in view.partitions(four).await.expect("partitions") {
+                    read += quads(part).await;
+                }
+                read
+            }
+        }
+    }
+}
+
+/// One served-string cell: `read` of the `P` view of the by-copy Default-layout
+/// file store, matched once before timing. The setup panics, naming `cell` and
+/// the read, unless the read returns rows.
+fn served_strings(bencher: divan::Bencher, cell: &str, read: StringRead) {
+    let store = make_store(Source::File, Layout::Default, Index::ByCopy, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let view = rt().block_on(async {
+        store
+            .match_pattern(None, p.as_ref(), None, None)
+            .await
+            .expect("match P")
+    });
+    let rows = rt().block_on(view.size()).expect("size");
+    let read_rows = rt().block_on(read.rows(&view, rows));
+    assert!(read_rows > 0, "{cell}/{read:?}: the read returned no rows");
+    bencher.bench(|| black_box(rt().block_on(read.rows(&view, rows))));
+}
+
+#[divan::bench(args = STRING_READS, sample_count = QUERY_SAMPLES)]
+fn served_strings_file(bencher: divan::Bencher, read: &StringRead) {
+    served_strings(bencher, "served_strings_file", *read);
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // Group 5 — MUTATE (append / delete / compact)

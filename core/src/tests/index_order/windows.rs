@@ -402,3 +402,150 @@ async fn unlocated_runs_read_once_then_narrow() {
         );
     }
 }
+
+/// A served view of a string-layout file (Default or TypedObject, by copy),
+/// whose columns no probe reads, reads its narrowed rows from the child at
+/// their positions: a 4-row window from its middle, each of 4 partitions,
+/// and a match on an object chained on a window answer as the same view of
+/// the store read into memory, in the same order, under a tombstone too.
+#[tokio::test]
+async fn string_served_views_read_their_positions() {
+    // The run lists its rows by object, so its first 400 hold objects 0 and 1.
+    let object = plain_literal("object 1");
+    let doomed = NamedOrBlankNode::from(iri("s9998"));
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let (_dir, path) = write_store_file(
+            modular_quads(20_000, 7, 11),
+            layout,
+            vec![IndexType::SecondaryByCopy],
+        )
+        .await;
+        let file = VortexRdfStore::from_file(&path).await.unwrap();
+        let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+        let tombstoned = |store: VortexRdfStore| {
+            let doomed = doomed.clone();
+            async move {
+                store
+                    .delete_matching(Some(&doomed), None, None, None)
+                    .await
+                    .unwrap()
+            }
+        };
+        let cases = [
+            ("plain", file.clone(), memory.clone()),
+            (
+                "tombstoned",
+                tombstoned(file).await,
+                tombstoned(memory).await,
+            ),
+        ];
+        for (case, file, memory) in cases {
+            let tag = format!("{layout:?} {case}");
+            let on_file = matched_view(&file, None, Some(&iri("p2")), None, None).await;
+            let in_memory = matched_view(&memory, None, Some(&iri("p2")), None, None).await;
+            assert_eq!(served_component(&on_file), Some("index:posg"), "{tag}");
+            let n = on_file.size().await.unwrap();
+            assert_eq!(n, in_memory.size().await.unwrap(), "{tag}: size");
+            assert_eq!(
+                on_file
+                    .window(n / 2, 4)
+                    .await
+                    .unwrap()
+                    .quads_vec()
+                    .await
+                    .unwrap(),
+                in_memory
+                    .window(n / 2, 4)
+                    .await
+                    .unwrap()
+                    .quads_vec()
+                    .await
+                    .unwrap(),
+                "{tag}: a window"
+            );
+            let four = std::num::NonZeroUsize::new(4).unwrap();
+            let file_parts = on_file.partitions(four).await.unwrap();
+            let memory_parts = in_memory.partitions(four).await.unwrap();
+            assert_eq!(file_parts.len(), memory_parts.len(), "{tag}: partitions");
+            for (k, (file_part, memory_part)) in file_parts.iter().zip(&memory_parts).enumerate() {
+                assert_eq!(
+                    file_part.quads_vec().await.unwrap(),
+                    memory_part.quads_vec().await.unwrap(),
+                    "{tag}: partition {k}"
+                );
+            }
+            let chained = |view: VortexRdfStore| {
+                let object = object.clone();
+                async move {
+                    let window = view.window(0, 400).await.unwrap();
+                    let matched = window
+                        .match_pattern(None, None, Some(&object), None)
+                        .await
+                        .unwrap();
+                    matched.quads_vec().await.unwrap()
+                }
+            };
+            let file_chained = chained(on_file.clone()).await;
+            assert!(!file_chained.is_empty(), "{tag}: the chain matches rows");
+            assert_eq!(
+                file_chained,
+                chained(in_memory.clone()).await,
+                "{tag}: chained"
+            );
+        }
+    }
+}
+
+/// A narrowed served view of a string-layout file reads its positions by a
+/// scan bounded to the rows they span, never to the whole index child: the
+/// scan's row range bounds the splits Vortex plans, which it would otherwise
+/// plan over every chunk of the child's columns on each read.
+#[tokio::test]
+async fn string_served_positions_scan_their_span() {
+    let (_dir, path) = write_store_file(
+        modular_quads(20_000, 7, 11),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    // A tombstone inside the run leaves the partitions' positions holes.
+    let store = VortexRdfStore::from_file(&path)
+        .await
+        .unwrap()
+        .delete_matching(
+            Some(&NamedOrBlankNode::from(iri("s9998"))),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let view = matched_view(&store, None, Some(&iri("p2")), None, None).await;
+    assert_eq!(served_component(&view), Some("index:posg"));
+    let n = view.size().await.unwrap();
+    let rec = Recorder::start();
+    for part in view
+        .partitions(std::num::NonZeroUsize::new(4).unwrap())
+        .await
+        .unwrap()
+    {
+        part.quads_vec().await.unwrap();
+    }
+    view.window(n / 2, 4)
+        .await
+        .unwrap()
+        .quads_vec()
+        .await
+        .unwrap();
+    let spans = rec.picked(|e| match e {
+        Event::ServedPositionsScanned(rows) => Some(rows.clone()),
+        _ => None,
+    });
+    assert!(!spans.is_empty(), "the reads scan their positions");
+    for rows in &spans {
+        assert!(
+            rows.end - rows.start <= n as u64,
+            "a positions scan spans at most the {n}-row view, not the child: {rows:?}"
+        );
+    }
+}

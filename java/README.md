@@ -113,13 +113,13 @@ if (name != VortexRdfStore.NONE) {                            // the store holds
 
 `matchCodes` fills a reusable, writable direct buffer with `(s, p, o, g)` codes, four longs per row, from its start.
 
-- A long match is read in windows by passing the offset. Every window of one pattern comes in the same row order.
-- `matchCodeChunks` reads a whole match into the same kind of buffer, the next rows each call, with no offset to keep; close it, or drain it, when done.
+- A match can be read in windows by passing the offset. Every window of one pattern comes in the same row order, but each call finds its window anew.
+- `matchCodeChunks` reads a whole match into the same kind of buffer, the next rows each call, with no offset to keep, and reads each row once; close it, or drain it, when done. Read a long match this way rather than in windows.
 - A pattern that cannot match gives no rows, not an error: a code past the dictionary, or a literal in the subject position.
 
-When a file store can locate the pattern's rows by binary search (a prefix of the quad table's `(s, p, o, g)` order, or with `secondary-by-copy` the predicate- and object-led orders), a code lookup is one located run with no dictionary search; it takes the general path otherwise, and returns the same rows.
+When a file store can locate the pattern's rows by binary search (a prefix of the quad table's `(s, p, o, g)` order, or with `secondary-by-copy` the predicate- and object-led orders), a code lookup is one located run with no dictionary search; it takes the general path otherwise, and returns the same rows. A pattern with a bound slot past the located prefix (a bound graph after a free position) checks the run's rows against it, a zone at a time: the file's statistics settle most zones whole (none of their rows hold the graph, or all do), so a count reads only the zones holding the graph among other graphs, on their encoding, and a window reads only those zones' rows. A first window that the run's first 4,096 rows fill, such as a 64-row first page, is read from those rows without asking the statistics. Every `matchCodes` window still finds its place anew, while `matchCodeChunks` reads each row it checks once.
 
-For measurements, two switches are read once when the native library loads: `VORTEX_RDF_LOCATE=0` makes every code lookup take the general path, and `VORTEX_RDF_COUNTERS=1` makes `VortexRdfStore.engineCounters()` count the encoded-search work (leaves searched encoded or decoded, probes, gathers, equality scans; all zero without it).
+For measurements, three switches are read once when the native library loads: `VORTEX_RDF_LOCATE=0` makes every code lookup take the general path, `VORTEX_RDF_ZONES=0` makes a located run check every row instead of deciding zones from the file's statistics, and leaves the general match's zone pruning to the bounds, without the recorded graphs, and `VORTEX_RDF_COUNTERS=1` makes `VortexRdfStore.engineCounters()` count the encoded-search work (leaves searched encoded or decoded, probes, gathers, equality scans), a located run's zone decisions (`zone_column`, `zone_none`, `zone_all`, `zone_recorded`, `zone_counted`) and the rows it reads to check (`check_read`); all zero without it.
 
 ## Streaming a match
 

@@ -1,5 +1,6 @@
-//! Probe mechanism benchmarks: resolve cost, bounds vs the generic vortex
-//! kernel and the canonical floor, windowed bounds, and point access.
+//! Probe mechanism benchmarks: resolve cost, bounds vs Vortex's own sorted
+//! search (typed and by `Scalar`) and the canonical floor, windowed bounds,
+//! and point access.
 //!
 //! Deliberately outside the CodSpeed surface: CI uploads only core's
 //! `benchmark` target, so these groups exist for local A/B runs. The
@@ -13,12 +14,15 @@ use std::sync::LazyLock;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
-use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::{BoolArray, DictArray, PrimitiveArray};
+use vortex_array::expr::{BoundExpression, eq, lit, root};
 use vortex_array::scalar::Scalar;
-use vortex_array::search_sorted::{SearchSorted, SearchSortedArray, SearchSortedSide};
+use vortex_array::search_sorted::{
+    SearchSorted, SearchSortedArray, SearchSortedPrimitiveArray, SearchSortedSide,
+};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
-use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme};
+use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme, SchemeExt as _};
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 
 const N: usize = 2_097_152;
@@ -116,18 +120,48 @@ fn bounds_encoded(bencher: Bencher, shape: &str) {
     });
 }
 
+/// Vortex's typed sorted search over each fixture: one bisection of point
+/// reads, each read through the array's probe as a `Scalar` (a run-end array
+/// bisects its ends on every read), its comparisons typed.
 #[divan::bench(args = SHAPES)]
-fn bounds_generic_search_sorted(bencher: Bencher, shape: &str) {
+fn bounds_vortex_typed(bencher: Bencher, shape: &str) {
     let fixture = fixture(shape);
     let probes: Vec<u32> = needles(&fixture.data).into_iter().take(20).collect();
     let session = common::session();
     bencher.counter(ItemsCount::new(probes.len())).bench(|| {
         let mut ctx = session.create_execution_ctx();
+        let sorted = SearchSortedPrimitiveArray::<u32>::new(&fixture.encoded, &mut ctx);
+        probes
+            .iter()
+            .map(|c| {
+                let lo = sorted
+                    .search_sorted(c, SearchSortedSide::Left)
+                    .unwrap()
+                    .to_index();
+                let hi = sorted
+                    .search_sorted(c, SearchSortedSide::Right)
+                    .unwrap()
+                    .to_index();
+                hi - lo
+            })
+            .sum::<usize>()
+    });
+}
+
+/// Vortex's sorted search by `Scalar` over each fixture: the same bisection,
+/// its comparisons between scalars.
+#[divan::bench(args = SHAPES)]
+fn bounds_vortex_scalar(bencher: Bencher, shape: &str) {
+    let fixture = fixture(shape);
+    let probes: Vec<u32> = needles(&fixture.data).into_iter().take(20).collect();
+    let session = common::session();
+    bencher.counter(ItemsCount::new(probes.len())).bench(|| {
+        let mut ctx = session.create_execution_ctx();
+        let sorted = SearchSortedArray::new(&fixture.encoded, &mut ctx);
         probes
             .iter()
             .map(|&c| {
                 let scalar = Scalar::from(c);
-                let sorted = SearchSortedArray::new(&fixture.encoded, &mut ctx);
                 let lo = sorted
                     .search_sorted(&scalar, SearchSortedSide::Left)
                     .unwrap()
@@ -188,4 +222,190 @@ fn value_at(bencher: Bencher, shape: &str) {
     bencher
         .counter(ItemsCount::new(indices.len()))
         .bench(|| indices.iter().map(|&i| probe.value_at(i)).sum::<u64>());
+}
+
+/// Values per window the equality counts take: a zone of a store's zone maps.
+const COUNT_WINDOW: usize = 8_192;
+
+/// The count benches' fixtures: dictionaries shaped like a store's graph
+/// column (a layout dictionary of a few values, its codes compressed: run
+/// ends for graphs in stretches, bit-packed for graphs row by row), one of
+/// 256 values, and the probe benches' run-end and 2,048-value dictionary.
+const COUNT_SHAPES: [&str; 5] = [
+    "graphs_stretch_2m",
+    "graphs_alternating_2m",
+    "dict256_alternating_2m",
+    "runend_2m",
+    "dict_2m",
+];
+
+/// A dictionary fixture: its name, its number of values, and the code of
+/// row `i`.
+type DictShape = (&'static str, usize, fn(usize) -> usize);
+
+static DICT_FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
+    let session = common::session();
+    let mut ctx = session.create_execution_ctx();
+    let codes_compressor = BtrBlocksCompressorBuilder::from_session(&session)
+        .exclude_schemes([integer::IntDictScheme.id()])
+        .build();
+    let shapes: [DictShape; 3] = [
+        ("graphs_stretch_2m", 4, |i| (i / 1000) % 4),
+        ("graphs_alternating_2m", 4, |i| i % 4),
+        ("dict256_alternating_2m", 256, |i| i % 256),
+    ];
+    shapes
+        .into_iter()
+        .map(|(name, distinct, code)| {
+            let codes: Vec<u8> = (0..N).map(|i| code(i) as u8).collect();
+            let values: Vec<u32> = (0..distinct as u32).map(|v| 1_000 + 7 * v).collect();
+            let data: Vec<u32> = codes.iter().map(|&c| values[c as usize]).collect();
+            let codes = codes_compressor
+                .compress(&PrimitiveArray::from_iter(codes).into_array(), &mut ctx)
+                .unwrap();
+            let encoded = DictArray::try_new(codes, PrimitiveArray::from_iter(values).into_array())
+                .unwrap()
+                .into_array();
+            let probe = SortedProbe::resolve(&encoded)
+                .unwrap_or_else(|| panic!("{name}: resolve declined ({})", encoded.encoding_id()));
+            assert_eq!(probe.node_kinds()[0], NodeKind::Dict, "{name}");
+            Fixture {
+                name,
+                data,
+                encoded,
+            }
+        })
+        .collect()
+});
+
+fn count_fixture(shape: &str) -> &'static Fixture {
+    DICT_FIXTURES
+        .iter()
+        .chain(FIXTURES.iter())
+        .find(|f| f.name == shape)
+        .unwrap()
+}
+
+/// Equality counts through the probe (`SortedProbe::count_eq`): 20 needles,
+/// each counted in every `COUNT_WINDOW`-value window of the fixture.
+#[divan::bench(args = COUNT_SHAPES)]
+fn count_eq_probe(bencher: Bencher, shape: &str) {
+    let fixture = count_fixture(shape);
+    let probe = SortedProbe::resolve(&fixture.encoded).unwrap();
+    let needles: Vec<u32> = needles(&fixture.data).into_iter().take(20).collect();
+    let windows = fixture.data.len() / COUNT_WINDOW;
+    bencher
+        .counter(ItemsCount::new(needles.len() * windows))
+        .bench(|| {
+            let mut total = 0;
+            for &needle in &needles {
+                for w in 0..windows {
+                    total += probe.count_eq(w * COUNT_WINDOW, COUNT_WINDOW, u64::from(needle));
+                }
+            }
+            total
+        });
+}
+
+/// The same counts through Vortex's own kernels: each window sliced, compared
+/// to the needle (`eq(root(), lit(needle))`) and its true values counted.
+#[divan::bench(args = COUNT_SHAPES)]
+fn count_eq_vortex(bencher: Bencher, shape: &str) {
+    let fixture = count_fixture(shape);
+    let session = common::session();
+    let needles: Vec<BoundExpression> = needles(&fixture.data)
+        .into_iter()
+        .take(20)
+        .map(|c| eq(root(), lit(c)).bind(fixture.encoded.dtype()).unwrap())
+        .collect();
+    let windows = fixture.data.len() / COUNT_WINDOW;
+    bencher
+        .counter(ItemsCount::new(needles.len() * windows))
+        .bench(|| {
+            let mut ctx = session.create_execution_ctx();
+            let mut total = 0;
+            for needle in &needles {
+                for w in 0..windows {
+                    let window = fixture
+                        .encoded
+                        .slice(w * COUNT_WINDOW..(w + 1) * COUNT_WINDOW)
+                        .unwrap();
+                    total += window
+                        .apply_bound(needle)
+                        .unwrap()
+                        .execute::<BoolArray>(&mut ctx)
+                        .unwrap()
+                        .into_bit_buffer()
+                        .true_count();
+                }
+            }
+            total
+        });
+}
+
+/// The widths of the bulk reads timed per stored word.
+const READ_WIDTHS: [usize; 13] = [2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 256, 512, 1024];
+
+/// Bit-packed columns of `N` values, one per stored word width, each packed
+/// at a code-like width: 7 bits in `u8` words, 13 in `u16`, 20 in `u32` and
+/// `u64` (the in-memory build's encoding of a code column).
+static PACKED: LazyLock<Vec<(&'static str, ArrayRef)>> = LazyLock::new(|| {
+    fn packed<T>(bits: u8) -> ArrayRef
+    where
+        T: vortex_array::dtype::NativePType + TryFrom<u64>,
+        <T as TryFrom<u64>>::Error: std::fmt::Debug,
+    {
+        let mask = (1u64 << bits) - 1;
+        let values =
+            (0..N as u64).map(|i| T::try_from(i.wrapping_mul(2_654_435_761) & mask).unwrap());
+        let canonical = PrimitiveArray::from_iter(values);
+        let mut ctx = common::session().create_execution_ctx();
+        vortex_fastlanes::bitpack_compress::bitpack_encode(&canonical, bits, None, &mut ctx)
+            .unwrap()
+            .into_array()
+    }
+    vec![
+        ("u8", packed::<u8>(7)),
+        ("u16", packed::<u16>(13)),
+        ("u32", packed::<u32>(20)),
+        ("u64", packed::<u64>(20)),
+    ]
+});
+
+/// `read_into` of `width` values of the bit-packed column of `word`s, from
+/// 1,000 strided starts: counted per value read.
+fn read_into(bencher: Bencher, word: &str, width: usize) {
+    let (_, packed) = PACKED.iter().find(|(name, _)| *name == word).unwrap();
+    let probe = SortedProbe::resolve(packed).unwrap();
+    assert!(probe.node_kinds().contains(&NodeKind::BitPacked));
+    let starts: Vec<usize> = (0..1000).map(|i| (i * 2099) % (N - width)).collect();
+    let mut out = vec![0u64; width];
+    bencher
+        .counter(ItemsCount::new(starts.len() * width))
+        .bench_local(|| {
+            for &start in &starts {
+                probe.read_into(start, &mut out);
+                divan::black_box(&out);
+            }
+        });
+}
+
+#[divan::bench(args = READ_WIDTHS)]
+fn read_into_u8(bencher: Bencher, width: usize) {
+    read_into(bencher, "u8", width);
+}
+
+#[divan::bench(args = READ_WIDTHS)]
+fn read_into_u16(bencher: Bencher, width: usize) {
+    read_into(bencher, "u16", width);
+}
+
+#[divan::bench(args = READ_WIDTHS)]
+fn read_into_u32(bencher: Bencher, width: usize) {
+    read_into(bencher, "u32", width);
+}
+
+#[divan::bench(args = READ_WIDTHS)]
+fn read_into_u64(bencher: Bencher, width: usize) {
+    read_into(bencher, "u64", width);
 }

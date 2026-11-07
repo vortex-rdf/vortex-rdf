@@ -32,6 +32,7 @@ pub(crate) mod components;
 pub(crate) mod copy;
 #[cfg(feature = "file-io")]
 pub(crate) mod file;
+mod graph_check;
 mod lazy_ids;
 pub(crate) mod reference;
 mod resolve;
@@ -43,7 +44,7 @@ pub(crate) use components::{
     ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
     indexes_from_components, known_component,
 };
-pub(crate) use lazy_ids::{ComponentRun, LazyRowIds};
+pub(crate) use lazy_ids::{CheckedRun, ComponentRun, LazyRowIds};
 #[cfg(test)]
 pub(crate) use serve::ServedSpan;
 #[cfg(feature = "file-io")]
@@ -218,9 +219,9 @@ pub enum IndexType {
     /// predicate **and** object prefix-search (p, o) in one probe, and a
     /// bound object binary-searches `index:ospg`'s `o` column. Reads take the
     /// matching rows from a *contiguous* run of the copy columns instead of
-    /// scattering row-id reads across the primary columns. Routing engages
-    /// only on children their writer recorded as globally sorted, as every
-    /// build here does.
+    /// scattering row-id reads across the primary columns. Routing assumes
+    /// the children globally sorted, as the format requires of every index
+    /// child.
     SecondaryByCopy,
 
     /// Sorted back-references for both predicates **and** objects.
@@ -233,8 +234,8 @@ pub enum IndexType {
     ///
     /// A pattern with a bound predicate or object and no bound subject
     /// binary-searches them instead of scanning (the object's child when both
-    /// are bound). Routing engages only on children their writer recorded as
-    /// globally sorted, as every build here does.
+    /// are bound). Routing assumes the children sorted by `(val, rid)`, as
+    /// the format requires of every index child.
     SecondaryByReference,
 }
 
@@ -345,36 +346,54 @@ impl IndexType {
     }
 }
 
-/// Which pattern components an index lookup resolves; residual filtering
-/// over the fetched rows omits them, as the index's row ids are exactly
-/// their matches.
+/// Which pattern roles an index lookup resolved; residual filtering over the
+/// fetched rows omits them, as the index's row ids are exactly their matches.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ResolvedRoles {
-    Predicate,
-    Object,
-    /// Both predicate and object at once: a prefix search of the
-    /// (p, o, …)-sorted copy in [`IndexType::SecondaryByCopy`].
-    PredicateObject,
+pub(crate) struct ResolvedRoles {
+    predicate: bool,
+    object: bool,
+    /// The bound graph, checked inside the run on the component's own graph
+    /// column ([`GraphCheck`](graph_check::GraphCheck)).
+    graph: bool,
 }
 
 impl ResolvedRoles {
-    /// The pattern with this (index-resolved) component cleared: what still
-    /// needs checking against the rows the index returned.
+    /// The predicate alone.
+    pub(crate) const PREDICATE: Self = Self {
+        predicate: true,
+        object: false,
+        graph: false,
+    };
+    /// The object alone.
+    pub(crate) const OBJECT: Self = Self {
+        predicate: false,
+        object: true,
+        graph: false,
+    };
+    /// Both predicate and object at once: a prefix search of the
+    /// (p, o, …)-sorted copy in [`IndexType::SecondaryByCopy`].
+    pub(crate) const PREDICATE_OBJECT: Self = Self {
+        predicate: true,
+        object: true,
+        graph: false,
+    };
+
+    /// These roles and the graph.
+    pub(crate) fn with_graph(self) -> Self {
+        Self {
+            graph: true,
+            ..self
+        }
+    }
+
+    /// The pattern with the resolved roles cleared: what still needs checking
+    /// against the rows the index returned.
     pub(crate) fn clear<'a>(self, pattern: QuadPattern<'a>) -> QuadPattern<'a> {
-        match self {
-            ResolvedRoles::Predicate => QuadPattern {
-                predicate: None,
-                ..pattern
-            },
-            ResolvedRoles::Object => QuadPattern {
-                object: None,
-                ..pattern
-            },
-            ResolvedRoles::PredicateObject => QuadPattern {
-                predicate: None,
-                object: None,
-                ..pattern
-            },
+        QuadPattern {
+            predicate: pattern.predicate.filter(|_| !self.predicate),
+            object: pattern.object.filter(|_| !self.object),
+            graph: pattern.graph.filter(|_| !self.graph),
+            ..pattern
         }
     }
 }
@@ -445,18 +464,23 @@ pub(crate) enum ResolvedRowIds {
 /// base: the first outcome that isn't `Declined`, the indexes tried in
 /// declaration (preference) order. `Declined` when none applies, and the
 /// store falls back to a mask scan.
+///
+/// `windowed` says the caller only windows the view (or caps its count): a
+/// run whose ids do not ascend then leaves its bound graph to the residual,
+/// as [`resolve::resolve_in_memory`] says.
 pub(crate) fn resolve_indexes_in_memory(
     indexes: &[IndexType],
     components: &[IndexComponent],
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
+    windowed: bool,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     for index in indexes {
         let Some(probe) = index.choose(pattern, layout) else {
             continue;
         };
-        match resolve::resolve_in_memory(probe, components, codes)? {
+        match resolve::resolve_in_memory(probe, components, codes, windowed)? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }
@@ -529,19 +553,25 @@ mod tests {
 
         let bound = QuadPattern::new(Some(&s), Some(&p), Some(&o), Some(&g));
 
-        let r = ResolvedRoles::Object.clear(bound);
+        let r = ResolvedRoles::OBJECT.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_some() && r.object.is_none() && r.graph.is_some()
         );
 
-        let r = ResolvedRoles::Predicate.clear(bound);
+        let r = ResolvedRoles::PREDICATE.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_none() && r.object.is_some() && r.graph.is_some()
         );
 
-        let r = ResolvedRoles::PredicateObject.clear(bound);
+        let r = ResolvedRoles::PREDICATE_OBJECT.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_none() && r.object.is_none() && r.graph.is_some()
+        );
+
+        // A run that checked the graph inside its component clears it too.
+        let r = ResolvedRoles::PREDICATE.with_graph().clear(bound);
+        assert!(
+            r.subject.is_some() && r.predicate.is_none() && r.object.is_some() && r.graph.is_none()
         );
     }
 }

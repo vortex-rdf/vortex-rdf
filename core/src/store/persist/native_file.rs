@@ -20,7 +20,9 @@ use super::memo::{BoundExprMemo, BoundedMemo, ChunkMemo, ColumnHandle};
 use crate::io::container::{self, RdfStoreLayoutVTable};
 use crate::io::file::{FileIdentity, OpenedFile};
 use crate::store::persist::open::{ComponentRoster, IndexChild};
+use crate::store::query::located::LocatedTables;
 use crate::store::schema;
+use crate::zone_stats::file_maps::{FileTable, TableColumns, ZoneMaps};
 
 /// An opened native store file: the [`vortex_file::VortexFile`] plus its
 /// classified component roster and reader tree.
@@ -56,6 +58,9 @@ pub(crate) struct NativeStoreFile {
     /// same few filters; keyed this way a hit costs a tree walk but no
     /// allocation. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
+    /// The code columns' zone maps of the quad table and the index
+    /// children, each read on first use ([`ZoneMaps`]).
+    zone_maps: OnceLock<ZoneMaps>,
     /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]),
     /// but for the code columns', which
     /// [`code_column_chunks`](Self::code_column_chunks) holds. Each handle
@@ -96,7 +101,9 @@ pub(crate) struct NativeStoreFile {
 }
 
 /// The readers of one opened file: the quad table's root reader and one
-/// reader per component slot, each built on first use.
+/// reader per component slot, each built on first use by Vortex's
+/// [`LazyReaderChildren`](vortex_layout::LazyReaderChildren) over the root's
+/// children, named and typed as the inventory describes them.
 ///
 /// Vortex keeps caches inside a reader (zone-map pruning results,
 /// partitioned expressions, dictionary evaluations) keyed by the identity of
@@ -114,27 +121,34 @@ struct ReaderTree {
     /// The file with a reader cache of its own: it builds and holds the root
     /// reader.
     root: vortex_file::VortexFile,
-    components: Vec<OnceLock<LayoutReaderRef>>,
+    /// The root's children's readers: the quad source's, then each
+    /// component's.
+    children: vortex_layout::LazyReaderChildren,
 }
 
 impl ReaderTree {
-    fn new(file: &vortex_file::VortexFile, components: usize, generation: u64) -> Self {
+    fn new(file: &vortex_file::VortexFile, generation: u64) -> Self {
+        let layout = file.footer().layout().as_::<RdfStoreLayoutVTable>();
+        let components = &layout.data().components;
+        let dtypes = std::iter::once(layout.dtype().clone())
+            .chain(components.iter().map(|c| c.dtype.clone()))
+            .collect();
+        let names = std::iter::once(Arc::from(container::QUAD_SOURCE_NAME))
+            .chain(components.iter().map(|c| Arc::from(c.name.as_str())))
+            .collect();
         Self {
             generation,
             root: file.clone().with_caching(),
-            components: (0..components).map(|_| OnceLock::new()).collect(),
+            children: vortex_layout::LazyReaderChildren::new(
+                Arc::clone(layout.children()),
+                dtypes,
+                names,
+                file.segment_source(),
+                file.session().clone(),
+                Default::default(),
+            ),
         }
     }
-}
-
-/// The chunk-probe handles of the tables a located run is found in, `None`
-/// where one declines or the file has no such table.
-pub(crate) struct LocatedTables {
-    /// Per sorted table (the quad table, `index:posg`, `index:ospg`), its
-    /// `(s, p, o, g)` columns.
-    pub(crate) sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
-    /// Per reference index (`index:ref-p`, `index:ref-o`), its `(val, rid)`.
-    pub(crate) references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
 }
 
 /// What the tests count of how reads reached a file
@@ -158,7 +172,8 @@ pub(crate) enum FileCounter {
 const PRUNING_MEMO_MAX: usize = 512;
 
 /// One index child of the file, as the index readers use it: the child's
-/// reader, its `sorted` provenance, and the file's bind memo, through which
+/// reader, whose rows are in its key order (as every index child's are), and
+/// the file's bind memo, through which
 /// every expression over the child binds under the child's name, so the eager
 /// scans, the deferred row-id sources and the serve plans of one child all
 /// hand its reader the same bound-tree identities (see [`BoundExprMemo`]).
@@ -168,10 +183,6 @@ pub(crate) struct ChildReader {
     /// The component name: the child's bind scope, and the key of its
     /// columns' chunk-probe handles on the file.
     pub(crate) name: &'static str,
-    /// Whether the child's rows are globally sorted by its sort keys (the
-    /// descriptor's provenance), so a run of them can be located by binary
-    /// search.
-    pub(crate) sorted: bool,
     /// The child's reader, from the reader tree current when it was taken.
     pub(crate) reader: LayoutReaderRef,
     memo: Arc<BoundExprMemo>,
@@ -221,7 +232,7 @@ impl NativeStoreFile {
         let roster = ComponentRoster::of(&file)?;
         let data = file.footer().layout().as_::<RdfStoreLayoutVTable>().data();
         let quads_sorted = data.quads_sorted;
-        let readers = Mutex::new(Arc::new(ReaderTree::new(&file, data.components.len(), 0)));
+        let readers = Mutex::new(Arc::new(ReaderTree::new(&file, 0)));
         Ok(Self {
             file,
             roster,
@@ -229,6 +240,7 @@ impl NativeStoreFile {
             readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
+            zone_maps: OnceLock::new(),
             quad_chunks: ChunkMemo::default(),
             code_column_chunks: Default::default(),
             component_chunks: ChunkMemo::default(),
@@ -358,6 +370,23 @@ impl NativeStoreFile {
         self.pruning_envelopes.insert(filter, envelope);
     }
 
+    /// The code columns' zone maps of every table of the file
+    /// ([`ZoneMaps`]), a handle a split task keeps.
+    pub(crate) fn zone_maps(&self) -> ZoneMaps {
+        self.zone_maps
+            .get_or_init(|| ZoneMaps::new(self.zone_map_layouts(), self.segment_source()))
+            .clone()
+    }
+
+    /// The layouts of every table's code columns, as [`ZoneMaps`] reads
+    /// them.
+    pub(crate) fn zone_map_layouts(&self) -> TableColumns {
+        FileTable::ALL.map(|table| {
+            schema::PRIMARY_COLUMNS
+                .map(|column| self.table_column_layout(table.component(), column))
+        })
+    }
+
     /// Whether the file records its quad rows in global `(s, p, o, g)` order.
     pub(crate) fn quads_sorted(&self) -> bool {
         self.quads_sorted
@@ -398,8 +427,8 @@ impl NativeStoreFile {
     }
 
     /// The known index child under the registry name `name` as a
-    /// [`ChildReader`]: its reader from the current tree, its descriptor's
-    /// `sorted` provenance, and the handle's bind memo. `None` when the
+    /// [`ChildReader`]: its reader from the current tree and the handle's
+    /// bind memo. `None` when the
     /// roster holds no such child: the file has none, or only one under an
     /// implementation slug this version does not know.
     pub(crate) fn child_reader(&self, name: &str) -> VortexResult<Option<ChildReader>> {
@@ -408,7 +437,6 @@ impl NativeStoreFile {
         };
         Ok(Some(ChildReader {
             name: child.identity.name,
-            sorted: child.sorted,
             reader: self.slot_reader(child.slot)?,
             memo: Arc::clone(&self.bound_exprs),
         }))
@@ -431,6 +459,20 @@ impl NativeStoreFile {
         self.index_child(name).map(|child| child.slot)
     }
 
+    /// The layout of column `column` of the quad table (`component` `None`)
+    /// or of index component `component`; `None` when either is missing.
+    pub(crate) fn table_column_layout(
+        &self,
+        component: Option<&str>,
+        column: &str,
+    ) -> Option<LayoutRef> {
+        let table = match component {
+            None => self.quad_layout().ok()?,
+            Some(name) => self.slot_layout(self.slot_of(name)?).ok()?,
+        };
+        container::struct_field(&table, column)
+    }
+
     /// The quad child's layout (the root's transparent child): the struct of
     /// the primary columns.
     pub(crate) fn quad_layout(&self) -> VortexResult<LayoutRef> {
@@ -451,13 +493,8 @@ impl NativeStoreFile {
     /// The reader of the component in `slot` of the inventory, from the
     /// current tree: built on its first use there.
     fn slot_reader(&self, slot: usize) -> VortexResult<LayoutReaderRef> {
-        let tree = self.readers();
-        let cell = &tree.components[slot];
-        if let Some(reader) = cell.get() {
-            return Ok(reader.clone());
-        }
-        let reader = container::component_reader(&self.file, slot)?;
-        Ok(cell.get_or_init(|| reader).clone())
+        let child = container::QUAD_SOURCE_CHILD + 1 + slot;
+        Ok(self.readers().children.get(child)?.clone())
     }
 
     /// The current reader tree: the one made for the bound tree memo's
@@ -471,11 +508,7 @@ impl NativeStoreFile {
         // took the lock must not put an older tree back.
         let generation = self.bound_exprs.clears();
         if current.generation != generation {
-            *current = Arc::new(ReaderTree::new(
-                &self.file,
-                self.root().data().components.len(),
-                generation,
-            ));
+            *current = Arc::new(ReaderTree::new(&self.file, generation));
         }
         Arc::clone(&current)
     }

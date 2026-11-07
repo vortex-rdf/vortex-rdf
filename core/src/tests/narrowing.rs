@@ -7,12 +7,10 @@ use crate::store::{Keep, QuadColumn, TermCode};
 
 /// The selected rows the keeps `rec` saw read one by one through a probe.
 fn probed_rows(rec: &Recorder) -> usize {
-    rec.picked(|e| match e {
+    rec.rows(|e| match e {
         Event::KeepRowsProbed(rows) => Some(*rows),
         _ => None,
     })
-    .iter()
-    .sum()
 }
 
 fn brute_keep(rows: &[[TermCode; 4]], column: QuadColumn, keep: &Keep) -> Vec<[TermCode; 4]> {

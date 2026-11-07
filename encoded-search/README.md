@@ -4,16 +4,23 @@
 Bounds search and point access over compressed [Vortex](https://github.com/spiraldb/vortex)
 arrays, without decoding them.
 
-Vortex's generic `search_sorted` is correct for every encoding, but it goes
-through the compute kernel machinery: an `ExecutionCtx`, scalar boxing, and —
-for encodings without a specialised kernel — canonicalization of the array
-being searched. When the column is a sorted, non-nullable unsigned integer
-column (a dictionary code column, a row-id column, an index key), that adds significant overhead to queries like "where does value `v` start and end".
+Vortex's `search_sorted` is correct for every encoding, but in Vortex 0.90 it
+is one bisection over point reads: each read goes through the array's probe
+with an `ExecutionCtx` and comes back as a `Scalar` (the typed
+`SearchSortedPrimitiveArray` compares values as their type but reads them the
+same way), and the encoding answers every read on its own: a run-end array
+bisects its run ends on each one, a delta array decodes a 1,024-value block.
+When the column is a sorted, non-nullable unsigned integer column (a
+dictionary code column, a row-id column, an index key), that adds significant
+overhead to queries like "where does value `v` start and end".
 
 This crate resolves such an array once into a borrowed tree of typed probe
 nodes, then answers queries against the compressed representation directly:
-slice reads, integer arithmetic, and single bit-packed word extraction. No
-`ExecutionCtx`, no scalars, no canonicalization, no allocation per query.
+slice reads, integer arithmetic, and bit-packed extraction (one word for a
+point read, the covered parts of a 1,024-value chunk for a bulk read), with
+the search pushed into the encoding where it allows (a frame of reference
+shifts the needle, a run-end column bisects its run ends once). No
+`ExecutionCtx`, no scalars, no allocation per query.
 
 It is not RDF-specific: it is independent from
 [vortex-rdf](https://github.com/vortex-rdf/vortex-rdf), which uses it to probe
@@ -111,8 +118,9 @@ panicking, never unsound — answer. `bounds_in` requires only its window to be
 sorted, and never reads a row outside it. `value_at`, and `read_into` and
 `read_at` (a range, or a list of indices, each run of consecutive indices read
 in one pass: a run-end node's first run found once, a bit-packed node's
-patches searched once, a delta node's decoded blocks copied), are exact
-regardless of order.
+1024-value chunks unpacked whole where the run takes more than a measured
+crossover of them and its patches searched once, a delta node's decoded blocks
+copied), are exact regardless of order.
 
 Searches over ascending codes in a run-end node's values, and a `bounds_in`
 window's lower bound, interpolate: once a probe has landed on each side of the
@@ -160,12 +168,17 @@ cargo add vortex-rdf-encoded-search --features layout
 
 ## Performance
 
-[`benches/probe.rs`](./benches/probe.rs) times one two-sided `bounds` query on
+[`benches/probe.rs`](./benches/probe.rs) times two-sided `bounds` queries on
 a 2M-row column per fixture (`runend_2m`, `for_bitpacked_2m`, `dict_2m`)
-against Vortex's `search_sorted` and a `partition_point` over the decoded
-column, plus the one-time cost of resolving a probe. Where an encoding has no
-specialised `search_sorted` kernel (run-end), the generic path canonicalizes
-the whole column on every call; the probe never decodes it.
+against Vortex's `search_sorted` (typed and by `Scalar`) and a
+`partition_point` over the decoded column, plus the one-time cost of resolving
+a probe. One query, on a 4-core VM:
+
+| Fixture | Probe | Vortex, typed | Vortex, `Scalar` | `partition_point` on decoded values |
+|---|---|---|---|---|
+| `runend_2m` | 0.04 µs | 4.7 ms | 4.8 ms | 0.21 µs |
+| `for_bitpacked_2m` | 0.25 µs | 268 µs | 270 µs | 0.19 µs |
+| `dict_2m` | 0.47 µs | 9.2 µs | 7.7 µs | 0.17 µs |
 
 ```console
 cargo bench -p vortex-rdf-encoded-search --bench probe

@@ -1,12 +1,11 @@
 //! Counting a view's rows: the exact size and its base and tail halves, the
-//! capped count behind `exists`, and the base count known without reading
-//! ([`QuadsSource::live_len_if_known`], [`QuadsSource::base_rows`]) that the
+//! capped count behind `exists`, and the base count without I/O
+//! ([`QuadsSource::live_count`], [`QuadsSource::base_rows`]) that the
 //! counts, the planner metadata and the window start from.
 
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
-use crate::store::view::selection::ViewSelection;
 use crate::store::{QuadsSource, Tail, VortexRdfStore};
 
 impl VortexRdfStore {
@@ -19,17 +18,18 @@ impl VortexRdfStore {
 
     /// [`size`](Self::size) of the base alone: the live rows the selection
     /// and a pending file filter cover. The masks a window kept of its filter
-    /// answer when the view holds them; with no filter pending, a count known
-    /// without reading ([`live_len_if_known`](QuadsSource::live_len_if_known))
-    /// does. Otherwise the selection materializes (a deferred resolution's
-    /// ids, computed once and cached on the view) and a pending filter is
-    /// evaluated over its live rows.
+    /// answer when the view holds them; with no filter pending, the
+    /// selection's count without I/O ([`live_count`](QuadsSource::live_count))
+    /// does: a pending residual's or a checked run's by their zones, never
+    /// materializing their ids. Otherwise the selection materializes (a
+    /// file run's ids, read once and cached on the view) and a pending filter
+    /// is evaluated over its live rows.
     pub(crate) async fn base_size(&self) -> Result<usize> {
         if let Some(live) = self.quads.evaluated_len() {
             return Ok(live);
         }
         if !self.quads.has_filter()
-            && let Some(live) = self.quads.live_len_if_known()?
+            && let Some(live) = self.quads.live_count()?
         {
             return Ok(live);
         }
@@ -69,17 +69,23 @@ impl VortexRdfStore {
         Ok((base + self.tail_size()).min(limit))
     }
 
-    /// [`base_size`](Self::base_size), a pending file filter or residual
-    /// compare stopping at `limit` matches; a window's kept masks answer
-    /// first.
+    /// [`base_size`](Self::base_size), a pending file filter or a selection
+    /// that counts only as far as its limit (a residual compare, a checked
+    /// run: [`ViewSelection::count_capped`]) stopping at `limit` matches; a
+    /// window's kept masks answer first.
+    ///
+    /// [`ViewSelection::count_capped`]: crate::store::view::selection::ViewSelection::count_capped
     async fn base_size_capped(&self, limit: usize) -> Result<usize> {
         if let Some(live) = self.quads.evaluated_len() {
             return Ok(live.min(limit));
         }
-        // A residual compare left pending compares its pieces only until
-        // `limit` live rows are found.
-        if let ViewSelection::Residual(residual) = &self.quads.selection {
-            return residual.count_capped(limit, self.quads.deleted.as_ref());
+        if !self.quads.has_filter()
+            && let Some(counted) = self
+                .quads
+                .selection
+                .count_capped(limit, self.quads.deleted.as_ref())?
+        {
+            return Ok(counted);
         }
         #[cfg(feature = "file-io")]
         if let Some((file, filter)) = self.quads.pending_filter() {
@@ -106,35 +112,30 @@ impl VortexRdfStore {
 }
 
 impl QuadsSource {
-    /// The live base rows the selection covers, when known without I/O
-    /// ([`ViewSelection::len_if_known`]), on either backend: an exact
-    /// selection less its tombstones, a pending run's width while nothing is
-    /// tombstoned, and under tombstones a pending run's ids when they take no
-    /// I/O (an in-memory run's, decoded here, the one way this fails; a file
-    /// run's once read). A pending filter is not applied, so with one the
-    /// count is a bound on the view's rows.
+    /// The live base rows the selection covers, counted without I/O
+    /// ([`ViewSelection::count`]), on either backend. A pending filter is not
+    /// applied, so with one the count is a bound on the view's rows.
     ///
-    /// [`ViewSelection::len_if_known`]: crate::store::view::selection::ViewSelection::len_if_known
-    pub(crate) fn live_len_if_known(&self) -> Result<Option<usize>> {
-        self.selection
-            .len_if_known(self.deleted.as_ref(), self.base_len())
+    /// [`ViewSelection::count`]: crate::store::view::selection::ViewSelection::count
+    pub(crate) fn live_count(&self) -> Result<Option<usize>> {
+        self.selection.count(self.deleted.as_ref(), self.base_len())
     }
 
     /// The base's rows as far as they are known without I/O ([`BaseRows`]):
     /// the bound `view_statistics` reports and a window tests. Under
     /// tombstones the live rows are counted only when `count_live` asks for
-    /// them, given the selected rows ([`live_len_if_known`](Self::live_len_if_known)
-    /// walks the tombstones, and decodes an in-memory pending run's ids);
+    /// them, given the selected rows ([`live_count`](Self::live_count) walks
+    /// the tombstones, and decodes an in-memory pending run's ids);
     /// without tombstones they are the selected rows wherever those are
     /// known.
     pub(crate) fn base_rows(&self, count_live: impl FnOnce(usize) -> bool) -> Result<BaseRows> {
         let base_len = self.base_len();
-        let known = self.selection.len_if_known(None, base_len)?;
+        let known = self.selection.len_if_known(base_len);
         let selected = known.unwrap_or(base_len);
         let live = match self.evaluated_len() {
             Some(live) => Some(live),
             None if self.deleted.is_none() => known,
-            None if count_live(selected) => self.live_len_if_known()?,
+            None if count_live(selected) => self.live_count()?,
             None => None,
         };
         Ok(BaseRows { live, selected })

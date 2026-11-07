@@ -210,7 +210,7 @@ fn entry_runs_round_trip_row_ids_past_u32() {
     let base = u64::from(u32::MAX) + 10;
 
     let refs: Vec<RefEntry> = (0..10u64)
-        .map(|i| (((i * 7) % 10) as u32, base + i))
+        .map(|i| (((i * 7) % 10) as u32, base + i, (i % 3) as u32))
         .collect();
     let mut spiller = EntrySpiller::<RefEntry>::new(guard.path(), "idx_o", 3).unwrap();
     for entry in &refs {
@@ -227,7 +227,7 @@ fn entry_runs_round_trip_row_ids_past_u32() {
     let lens: Vec<u64> = (0..4)
         .map(|n| file_len(guard.path(), &format!("idx_o_run_{n}.bin")))
         .collect();
-    assert_eq!(lens, [32, 32, 32, 16]);
+    assert_eq!(lens, [44, 44, 44, 20]);
 
     let copies: Vec<CopyEntry> = (0..10u64)
         .map(|i| {
@@ -261,7 +261,7 @@ fn entry_runs_round_trip_row_ids_past_u32() {
 #[test]
 fn a_cut_off_header_or_record_is_a_deserialization_error() {
     let guard = TempRunsGuard::create(None, None).unwrap();
-    let entries: Vec<RefEntry> = (0..10u64).map(|i| ((i % 4) as u32, i)).collect();
+    let entries: Vec<RefEntry> = (0..10u64).map(|i| ((i % 4) as u32, i, 0)).collect();
     // Runs 0..2 are written by the pushes; the last at `into_merger`.
     for (name, keep) in [("idx_h", 4u64), ("idx_r", 8 + 3)] {
         let mut spiller = EntrySpiller::<RefEntry>::new(guard.path(), name, 3).unwrap();

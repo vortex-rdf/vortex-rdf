@@ -3,7 +3,7 @@
 //! no store state.
 
 use std::borrow::Borrow;
-use std::ops::{BitAnd, Range};
+use std::ops::{BitAnd, BitOr, Range};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::future::BoxFuture;
@@ -27,6 +27,8 @@ use crate::store::scan::file_scans::{ScanDriver, split_window, strict_ids};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
 use crate::store::schema::{COL_G, COL_O, COL_O_VALUE, COL_P, COL_S, RowId};
 use crate::store::view::selection::RowSelection;
+use crate::zone_stats::file_maps::{FileTable, ZoneMaps};
+use crate::zone_stats::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 
 /// Split a file view's [`RowSelection`] into the two knobs the per-split filter
 /// loop understands: a [`Selection`] narrowing the mask (an id list, e.g. from a
@@ -180,12 +182,137 @@ impl ConjunctOrder {
     }
 }
 
+/// The every-row step of a filter of code equalities over a file: each
+/// equality's quad slot and code, the file's quad zone maps ([`ZoneMaps`])
+/// that decide it, and the equalities' zone checks over the quad table,
+/// built from the maps once, by the first split that asks
+/// ([`zone_set`](Self::zone_set)).
+struct EveryRow {
+    columns: Vec<(usize, u64)>,
+    maps: ZoneMaps,
+    set: tokio::sync::OnceCell<Option<ZoneSet>>,
+}
+
+impl EveryRow {
+    /// The equalities' zone checks over the quad table: `None` where an
+    /// equality's column has no zone map, as a filter over such a column
+    /// takes no zone whole. Built once; a failed read is tried again by the
+    /// next split.
+    async fn zone_set(&self) -> Result<Option<&ZoneSet>> {
+        let set = self
+            .set
+            .get_or_try_init(|| async {
+                let mut checks = Vec::with_capacity(self.columns.len());
+                for (bit, &(slot, code)) in self.columns.iter().enumerate() {
+                    let Some(zones) = self.maps.get(FileTable::Quads, slot).await? else {
+                        return Ok(None);
+                    };
+                    checks.push(ZoneCheck {
+                        bit: bit as u32,
+                        code,
+                        zones,
+                    });
+                }
+                Result::Ok(ZoneSet::new(checks, 0))
+            })
+            .await?;
+        Ok(set.as_ref())
+    }
+}
+
+/// The every-row step `filter` takes over `file`, decided once per
+/// evaluation on the calling thread: none with zones off
+/// (`VORTEX_RDF_ZONES=0`) or for a filter of any other shape than code
+/// equalities on the quad table's code columns.
+fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<EveryRow> {
+    use crate::store::schema::primary_slot;
+
+    if !crate::zone_stats::rules::zones_enabled() {
+        return None;
+    }
+    let columns = filter
+        .eqs()?
+        .iter()
+        .map(|(column, code)| Some((primary_slot(column.as_ref())?, code)))
+        .collect::<Option<Vec<_>>>()?;
+    (!columns.is_empty()).then(|| EveryRow {
+        columns,
+        maps: file.zone_maps(),
+        set: tokio::sync::OnceCell::new(),
+    })
+}
+
+/// The rows of `start` (over split `range`) in zones where every row holds
+/// every code of a filter of code equalities, `None` for none, beside the
+/// rest of `start` for the filter to evaluate; without the step, `None` and
+/// `start`. A zone qualifies where each equality's column has a zone map
+/// whose bounds there are both its code, the class all of the equalities'
+/// zone checks ([`EveryRow::zone_set`]): the rule Vortex's pruning of
+/// `col != c` applies, read for the split's own zones.
+async fn every_row_zones(
+    every_row: Option<&EveryRow>,
+    range: &Range<u64>,
+    start: Mask,
+) -> Result<(Option<Mask>, Mask)> {
+    let Some(every_row) = every_row else {
+        return Ok((None, start));
+    };
+    if range.is_empty() || start.all_false() {
+        return Ok((None, start));
+    }
+    let Some(set) = every_row.zone_set().await? else {
+        return Ok((None, start));
+    };
+    let mut slices: Vec<(usize, usize)> = Vec::new();
+    for ZonePart { zone, rows } in set.parts(range.clone()) {
+        // Every row holds every code only where each zone's bounds are its
+        // code alone: a class of all reads no record.
+        if set.class(zone) != ZoneClass::All {
+            continue;
+        }
+        let from = (rows.start - range.start) as usize;
+        let to = (rows.end - range.start) as usize;
+        match slices.last_mut() {
+            Some(last) if last.1 == from => last.1 = to,
+            _ => slices.push((from, to)),
+        }
+    }
+    if slices.is_empty() {
+        return Ok((None, start));
+    }
+    let all = (&start).bitand(&Mask::from_slices(start.len(), slices));
+    if all.all_false() {
+        return Ok((None, start));
+    }
+    observe!(SplitAllRows(all.true_count() as u64));
+    let rest = start.bitand(&!&all);
+    Ok((Some(all), rest))
+}
+
 /// A filter evaluated over one file split, a narrowing mask threaded through
-/// the layout reader's two phases: statistics-only pruning, then each
-/// conjunct's evaluation over what survives, in the order `order` gives.
-/// Answers the split-relative mask of the rows that match, exactly; mirrors
-/// the filter phase of vortex's `split_exec`.
+/// the layout reader's phases: for a filter of code equalities, the zones
+/// where every row holds every code taken unevaluated ([`every_row_zones`]);
+/// then statistics-only pruning, then each conjunct's evaluation over what
+/// survives, in the order `order` gives. Answers the split-relative mask of
+/// the rows that match, exactly; mirrors the filter phase of vortex's
+/// `split_exec`.
 async fn evaluate_filter_split(
+    reader: Arc<dyn LayoutReader>,
+    order: &ConjunctOrder,
+    every_row: Option<&EveryRow>,
+    range: &Range<u64>,
+    start_mask: Mask,
+) -> Result<Mask> {
+    let (all, start_mask) = every_row_zones(every_row, range, start_mask).await?;
+    let matched = evaluate_conjuncts(reader, order, range, start_mask).await?;
+    Ok(match all {
+        Some(all) => matched.bitor(&all),
+        None => matched,
+    })
+}
+
+/// [`evaluate_filter_split`]'s pruning and evaluation of the conjuncts.
+async fn evaluate_conjuncts(
     reader: Arc<dyn LayoutReader>,
     order: &ConjunctOrder,
     range: &Range<u64>,
@@ -198,6 +325,7 @@ async fn evaluate_filter_split(
     // awaits cannot be proven `Send`.
     let bound = (0..sequence.len()).map(|k| Ok(&order.conjuncts[sequence[k]]));
     let mut mask = prune_mask(&reader, bound, range, start_mask).await?;
+    observe!(SplitFilterRows(mask.true_count() as u64));
     // Phase 2: for whatever the stats couldn't rule out, read and evaluate each
     // conjunct for real, threading the narrowing mask so later conjuncts see
     // fewer rows, and report what each kept.
@@ -246,15 +374,24 @@ fn filter_split_tasks(
         filter,
         bound_conjuncts(file, reader.as_ref(), filter.expr()).collect::<Result<_>>()?,
     ));
+    let every_row = Arc::new(every_row_step(file, filter));
     Ok(ranges
         .into_iter()
         .map(|range| {
             let reader = Arc::clone(&reader);
             let order = Arc::clone(&order);
+            let every_row = Arc::clone(&every_row);
             let start_mask = split_start_mask(mask_selection, deleted, &range);
             async move {
                 observe!(SplitEvaluated);
-                let mask = evaluate_filter_split(reader, &order, &range, start_mask).await?;
+                let mask = evaluate_filter_split(
+                    reader,
+                    &order,
+                    every_row.as_ref().as_ref(),
+                    &range,
+                    start_mask,
+                )
+                .await?;
                 Ok::<_, VortexRdfError>((mask, range))
             }
             .boxed()

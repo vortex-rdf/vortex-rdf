@@ -424,7 +424,7 @@ mod tests {
     use vortex_array::{IntoArray, VortexSessionExecute as _};
 
     use crate::store::array::{chunked_or_single, stamp_is_sorted};
-    use crate::store::resident::with_compressed_int_children;
+    use crate::store::resident::{CodeTable, with_compressed_int_children};
 
     /// A piece is decoded past sixteen selected rows, at one or more per
     /// sixteen rows of its span.
@@ -487,7 +487,9 @@ mod tests {
         )
         .unwrap()
         .into_array();
-        let base = with_compressed_int_children(rows, true).unwrap().0;
+        let base = with_compressed_int_children(rows, CodeTable::Base)
+            .unwrap()
+            .0;
         let probes = StructProbes::new();
         probes.warm(&base);
         (into_struct_array(base.clone()).unwrap(), base, probes)
@@ -681,14 +683,11 @@ mod tests {
         let run = |selection: &RowSelection, piece_rows: usize| {
             let rec = Recorder::start();
             keep_by_pieces(col, probe, selection, &test, ROWS, piece_rows).unwrap();
-            let probed = rec.picked(|e| match e {
+            let probed: usize = rec.rows(|e| match e {
                 Event::KeepRowsProbed(rows) => Some(*rows),
                 _ => None,
             });
-            (
-                rec.count(&Event::KeepPieceDecoded),
-                probed.iter().sum::<usize>(),
-            )
+            (rec.count(&Event::KeepPieceDecoded), probed)
         };
         let ids = |admit: &dyn Fn(u64) -> bool| -> Vec<u64> {
             (0..ROWS as u64).filter(|&i| admit(i)).collect()

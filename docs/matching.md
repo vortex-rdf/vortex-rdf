@@ -208,8 +208,8 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` matches on the
-[`Backend`](../core/src/store/view/mod.rs#L63) of the store's
-[`QuadsSource`](../core/src/store/view/mod.rs#L47) and hands that backend's
+[`Backend`](../core/src/store/view/mod.rs#L64) of the store's
+[`QuadsSource`](../core/src/store/view/mod.rs#L48) and hands that backend's
 base and the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
@@ -272,10 +272,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L186), [`search_sorted_bounds`](../core/src/store/array.rs#L227) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`memory.rs:79-132`](../core/src/store/query/matching/memory.rs#L79-L132 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L448), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L222) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:134-150`](../core/src/store/query/matching/memory.rs#L134-L150 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L268), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L239), [`mask_for`](../core/src/store/scan/residual.rs#L128) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`memory.rs:152-159`](../core/src/store/query/matching/memory.rs#L152-L159 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L195), [`search_sorted_bounds`](../core/src/store/array.rs#L233) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L471), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L145-L159 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L277), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L883) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L163-L170 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -297,7 +297,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L227), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L233), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -384,6 +384,36 @@ windowed `match_many` probe: `IdsNeed::CountOrWindow`). Reads then go through
 the plan, and a count takes the run's width. In every other case the ids are
 materialized and intersected immediately.
 
+**A bound graph, checked inside the run.** With zones on (`VORTEX_RDF_ZONES`
+not `0`), the in-memory resolver checks a pattern's bound graph inside the
+run it located when the probed component keeps a zone map of its graph
+column ([`graph_zones`](../core/src/store/indexes/components.rs#L295): the
+Dictionary layout's components, built or loaded). The run's rows are
+contiguous in the component, so the component's own `g` column decides them
+a zone at a time ([`GraphCheck`](../core/src/store/indexes/graph_check.rs#L38))
+instead of stage 3 comparing the graph at the base rows the run lists:
+
+- a zone whose bounds or recorded graphs rule the graph out is skipped, and
+  a zone of the graph alone is taken whole;
+- a mixed zone is counted from its recorded graphs when the run holds the
+  whole zone, else on the graph column's encoding (`count_eq`), else by
+  comparing its graphs; its matching rows are found on the encoding
+  (`eq_offsets`).
+
+The resolution marks the graph resolved with its keys (`ResolvedRoles`), so
+stage 3 has nothing left to compare it on, and the run's ids are its
+matching rows: a count adds the zones' counts and decodes no id (under
+tombstones it counts the matching ids left live); a window of a run whose
+ids ascend (by reference) counts the zones before it and reads only the
+zones it spans; a capped count (an ASK) stops at the zone that meets its
+cap. A run whose ids follow its copy's order (by copy) is checked only when
+the view reaches every match (a count, a read of every row, a window with
+no limit, keeps); a window with a limit or a capped count leaves the graph
+to stage 3, whose zones over the run's ids in base order reach the window
+without finding every match first. A checked run carries no serve plan, and
+a graph absent from the dictionary answers `Empty`. Without the zone map
+(the string layouts) or with zones off, the graph is left to stage 3.
+
 **Examples** (what each index holds for the running example is laid out
 where the index is described: [§8.2](#82-secondarybycopy--two-sorted-quad-copies)
 for the sorted copies, [§8.3](#83-secondarybyreference--sorted-val-rid-pairs)
@@ -394,7 +424,7 @@ for the `{val, rid}` pairs).
 | `(? a ? ?)` | `choose` picks the POSG family; `p = 4` bounds `index:posg` to `[0, 2)` (rids `0, 2`) → `Resolved`, `Lazy` rids, plan over that run. The view started `All`, stage 1 never ran, nothing is left bound → the ids stay **pending** and the plan is kept | `ref-p`, `val = 4` → `[0, 2)` → `Lazy` rids, no plan → materialized and sorted now → selection `Ids [0, 2]` |
 | `(? a foaf:Person ?)` | the `(p, o)` prefix: `p = 4` → `[0, 2)`, then `o = 5` within it → `[0, 2)`; both components resolved, nothing residual | the object is preferred: `ref-o`, `val = 5` → `[2, 4)` → rids `[0, 2]`; `p` stays bound, and stage 3 tests it on those two rows |
 | `(? ? ? "")` | no family sorts by `g` → `Declined`; stage 3 scans `g` | same |
-| `(? a ? "")` | `p` resolves as above, but `g` is still bound — the lazy ids materialize now (`[0, 2]`), stage 3 tests `g` on them, and stage 4 drops the plan | `ref-p` → `[0, 2]`, stage 3 tests `g` |
+| `(? a ? "")` | `p` resolves as above, and `g` is checked inside the run, on `index:posg`'s own `g` column: the ids are the run's matching rows, materialized now, with no plan. Zones off: the lazy ids materialize (`[0, 2]`), stage 3 tests `g` on them, and stage 4 drops the plan | `ref-p` → `[0, 2]`, `g` checked on `index:ref-p`'s own `g` column; zones off, stage 3 tests `g` |
 | `(ex:alice ? "Alice" ?)` | stage 1 cut the view to 2 rows, under `INDEX_ROUTING_MIN_ROWS` → routing skipped (`worth_indexing` is false); on the 1M store a subject run is 10 rows, so the same | same |
 | `(? ? "Carol" ?)`, `Default` layout | the dictionary cannot prove absence, the index can: the `index:ospg` run for `"Carol"` is empty → `Empty` → empty view | `ref-o` run empty → `Empty` |
 
@@ -411,22 +441,54 @@ compile can in principle answer `AlwaysFalse` — an empty view — but not here
 the residual binds a subset of roles the [stage B gate](#4-stage-b--the-provable-emptiness-gate)
 already resolved, so that arm exists for totality.
 
-First, **zone bounds** narrow the rows to compare. An in-memory base carries
-the smallest and largest code of each 8,192-row zone of its code columns
-([`CodeZones`](../core/src/store/zones.rs#L28)), the counterpart of a file's
-zone maps: taken in the pass that compresses a build's codes, or read from the
-zone maps of the file a store is loaded from (`from_file_in_memory`,
-`from_bytes`), so no query pays for them. A base without them (the string
-columns of the Default and TypedObject layouts) skips this step. Over a
-selection wider than a zone, the zones whose bounds cannot hold every
-constrained code are left out ([`runs_holding`](../core/src/store/zones.rs#L231)),
-when what is left holds at most half the base: a run of rows (every row, or a
-subject's range) is compared zone run by zone run, each a slice of the base
-through the mask scan below
-([`runs_matching`](../core/src/store/scan/residual.rs#L102)), and an id list keeps
-only its ids in those runs before the implementations below compare them. A
-code most zones may hold (a predicate or graph spread over every zone) leaves
-everything to compare.
+First, over a selection wider than a zone, the **whole bounds** of the
+base's code columns settle what they can: each column's zone map (below)
+keeps its exact smallest and largest code
+([`column_bounds`](../core/src/zone_stats/zone_map.rs#L176)). A code outside
+its column's bounds leaves the selection no row; bounds that are both the
+code drop the equality from the compare; with no equality left the
+selection is the answer, compared nowhere
+([`ask_statistics`](../core/src/store/scan/residual.rs#L89)). The rule for
+`x = c` on exact bounds is one function, which a file's located runs apply
+too, at the footer and zone by zone
+([`eq_on_bounds`](../core/src/zone_stats/zone_map.rs#L321)): it refutes where
+Vortex's own falsifier of `x = c` does and proves what Vortex has no
+satisfier for. It reads the bounds directly: building and evaluating
+Vortex's proofs costs tens of µs per residual, more than many whole
+compares. On a one-graph store a graph equality settles here. The view
+still counts as narrowed by the residual (a serve plan is dropped, the rows
+read in base order), and a selection the statistics empty keeps the view's
+tail and indexes.
+
+Then the **zone classes** narrow the rows to compare. An in-memory base keeps
+a zone map of each code column's 8,192-row zones (their exact bounds, and
+for `g` the graphs each zone holds with their rows,
+[`QuadZones`](../core/src/zone_stats/quad_zones.rs#L25)), taken in the pass
+that compresses a build's codes or read from the zone tables of the file a
+store is loaded from (`from_file_in_memory`, `from_bytes`), so no query pays
+for them. A base without them (the string layouts) skips this step. Over a
+selection wider than a zone, the zones it touches are classed against the
+equalities left ([`Classes`](../core/src/store/scan/residual.rs#L155),
+[`ColumnZones::eq_holds`](../core/src/zone_stats/zone_map.rs#L198)): "none"
+where a code lies outside a zone's bounds or the zone's recorded graphs lack
+it, "all" where every bound column's zone bounds are its code, mixed
+otherwise (a test pins the classes to Vortex's falsifier on each zone). The
+selection's rows in "none" zones are skipped, those in "all" zones taken
+uncompared, and those in a mixed zone compared on the columns it leaves
+unsettled, adjacent zones of one class as one run
+([`ResidualCompare::rows`](../core/src/store/scan/residual.rs#L470)); when
+the runs to compare are several and hold more than half the selection, the
+whole selection is compared once instead. Each compare decides whether to
+decode its columns on the residual's whole selection, so a residual over
+every row decodes them once for all its runs. A residual left pending
+(below) keeps its classes, and counts and windows by them.
+
+With zones off (`VORTEX_RDF_ZONES=0`) only the bounds are read
+([`unasked_classes`](../core/src/store/scan/residual.rs#L122)): past a zone's
+rows, the zones whose bounds leave a code out are skipped and the rest
+compared, adjacent ones as one run, no zone taken whole and none counted
+from a record or an encoding. A code most zones may hold (a predicate or
+graph spread over every zone) leaves everything to compare.
 
 Then two implementations, in order:
 
@@ -472,18 +534,35 @@ how many rows it needs, its window's offset and limit. When those are fewer
 than the rows the selection holds, and the selection holds more than one
 8,192-row piece, the compare is left pending
 ([`PendingResidual`](../core/src/store/view/pending.rs#L37)) as the view's
-selection (`ViewSelection::Residual`), as a deferred index run's ids are. `size_capped` and `window` then compare the
-selection in pieces, in base row order, a zone's rows first and four times as
-many each piece after, each through the zone bounds and the implementations
-above, and stop at the piece that brings the live rows they need to their
-count ([`prefix`](../core/src/store/view/pending.rs#L151)); a selection no
-wider than that count is one piece. A compare that runs to the end keeps its
-matches as the view's ids, and any other consumer compares the whole
-selection at once. A count without a limit, a window that reaches every row,
-a probe with keeps and `match_pattern` compare eagerly, as above. An ASK over
-a pattern every zone holds then compares the first piece, not the store, and
-the first piece is above the typed residual's caps, so the mask scan compares
-it.
+selection (`ViewSelection::Residual`), as a deferred index run's ids are.
+With zone classes, `size_capped` counts the zones in base order until the
+cap, and `window` counts each zone unread where it can be (below), skips the
+zones before the window and those counted empty, then reads the matches from
+the zone holding its first to its last
+([`ResidualCompare::window`](../core/src/store/scan/residual.rs#L444)); a
+window of no rows reads nothing. Without zone classes (zones off, or no zone
+map for its columns), both compare the selection in pieces, in base row
+order, a zone's rows first and four times as many each piece after, and stop
+at the piece that brings the live rows they need
+([`Classes::Pieces`](../core/src/store/scan/residual.rs#L168)); a selection
+no wider than that count is one piece, compared at once and its matches kept
+as the view's ids. Any other consumer compares the whole selection at once:
+a window that reaches every row, a probe with keeps and `match_pattern`. An
+ASK over a pattern every zone holds compares the first piece, not the store;
+the first piece is above the typed residual's caps, so the mask scan
+compares it.
+
+A count without a limit (`IdsNeed::Count`: `size` through `count_probe` and
+`count_code_pattern`) leaves the compare pending too and counts it zone by
+zone, with no match materialized
+([`ResidualCompare::count`](../core/src/store/scan/residual.rs#L382)): a
+"none" zone counts nothing, an "all" zone its selected live rows, and a mixed
+zone with one column left to compare and no tombstone among its selected rows
+counts from the zone's recorded graphs when the selection holds the whole
+zone, else on the column's encoding over contiguous rows (the store's probe's
+`count_eq`); any other zone is compared, adjacent ones on the same columns as
+one run. With zones off, or without zone maps, the count compares the whole
+selection once.
 
 **Examples** (no index unless stated):
 
@@ -593,9 +672,9 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`file.rs:39-43`](../core/src/store/query/matching/file.rs#L39-L43 "existing_filter") | — |
 | 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L224), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L473) | [§8](#8-the-index-resolvers) |
+| 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L497) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`file.rs:22-91`](../core/src/store/query/matching/file.rs#L22-L91 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L222) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L252), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L819) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`file.rs:171-186`](../core/src/store/query/matching/file.rs#L171-L186 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L205) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -644,7 +723,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L682) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L819) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -654,6 +733,33 @@ memoized on the shared file handle, keyed by the filter expression.
 
 Results: `Some(0..0)` when nothing can match, `None` when statistics exclude
 nothing.
+
+**Graph conjuncts.** A graph column's zones also record their graphs, each
+with its rows (`vortexrdf.value_counts`, at most 16 per zone:
+[file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)). The
+store registers a falsifier of `g = c` over them,
+[`ValueCountsFalsifier`](../core/src/zone_stats/rules.rs#L25), which Vortex's
+pruning applies beside the bounds. A zone whose bounds contain `c` but whose
+recorded graphs don't is excluded too. So graphs spread across the zones (many
+graphs, each zone holding a few, their codes interleaved) prune as well as
+graphs sorted by zone. A zone holding more than 16 graphs records none and is
+kept, as its bounds say. `VORTEX_RDF_ZONES=0` (an ablation switch, read once)
+turns the falsifier off, and the bounds alone prune.
+
+**Every-row zones.** A filter of code equalities (`col = c` alone, as the
+Dictionary layout pushes them) also takes the zones where every row holds
+every code without evaluating it: a zone whose bounds in each equality's
+column are both `c` cannot hold a differing row, the rule Vortex's pruning
+of `col != c` applies. Each split takes them off the quad table's zone maps
+for its own zones
+([`every_row_zones`](../core/src/store/scan/file_filter.rs#L252)): the maps
+the file reads once per table and column
+([`ZoneMaps`](../core/src/zone_stats/file_maps.rs#L62)), shared with the
+located runs, and the equalities' zone checks over them, built once per
+evaluation. The filter is then evaluated only over the split's other rows,
+after their own pruning. Counts and reads alike take them; a tombstoned row
+is not among them, as no split starts with it. `VORTEX_RDF_ZONES=0` leaves
+the step out.
 
 **Example.** `(? a ? ?)` on the Dictionary file without indexes pushes
 `p = 4` down. The four-row file is one zone whose `p` statistics span `4..7`,
@@ -748,19 +854,19 @@ a `FileServePlan`, which carries a graph equality of its own (see 8.4).
 Children: `index:posg` (quads sorted by p, o, s, g) and `index:ospg` (sorted by
 o, s, p, g), each `{s, p, o, g, rid}`, term strings or `u64` codes.
 
-**In memory:** requires the family's component to exist and be *globally* sorted
-(`IndexComponent::find_sorted` — per-chunk sorted data is not binary-searchable).
+**In memory:** requires the family's component to exist
+(`IndexComponent::find`); its rows are globally sorted, as every index child's are.
 Binary-searches the lead column for the probe run, then — for a `(p, o)` pattern
 — re-searches the second key **within** that run (valid because the family's full
 comparator makes the second column sorted inside each lead run). It returns:
 
 - `Empty` if the probe term is absent from the dictionary, or the run is empty;
-- `Declined` if the component is missing, unsorted, or probe-incompatible;
+- `Declined` if the component is missing or probe-incompatible;
 - otherwise `Resolved` with **`Lazy` row ids** (the rid slice, decoded and
   re-sorted only on demand) and **always a serve plan** over the matched run.
 
 **On file:** locates the run by binary-searching the child's cached chunk probes
-([`locate_component_run`](../core/src/store/indexes/file.rs#L31): lead,
+([`locate_component_run`](../core/src/store/indexes/file.rs#L32): lead,
 then a windowed second-key search), integers only. Then:
 
 | Located run | Row ids |
@@ -786,12 +892,13 @@ point-read now (`Eager`) while the plan still serves the quads.
 `1, 3, 0, 2` — where `o = 5` bounds `[2, 4)`, rids `0, 2`. On the 1M file
 `P`'s located run is 31,776 rows: over the point-read cap, so the ids become a
 deferred rid-only pushed-down scan and reads stream the run through the plan
-— a scan of exactly that row range, no filter, split by row count so that its
-reads run on many of the runtime's workers rather than inside the single
-leaf-chunk split the child's own layout would make of the run. Its decode
-runs there with them, except under a file-backed dictionary, whose chunks
-decode two at a time ahead of the consumer
-([file-format.md §8](file-format.md#8-reading-a-file)).
+— a scan of exactly that row range, no filter, split by row count into about
+two splits per worker rather than the single leaf-chunk split the child's own
+layout would make of the run. A stream of the quads runs its splits on the
+runtime's workers and decodes there, except under a file-backed dictionary,
+whose chunks decode two at a time ahead of the consumer
+([file-format.md §8](file-format.md#8-reading-a-file)); a code read polls up
+to 42 splits on its calling task and spawns them past that.
 
 **Cost.** Locating a run is a handful of binary searches on either backend,
 whatever its width. Reading through the plan is what differs: a copy serves
@@ -808,12 +915,11 @@ supplies a serve plan**.
 `rid` run: `Lazy` ids, which `sorted_row_ids` puts back in base row order when
 a consumer needs them; a count takes the run's width, and a window cuts its
 own rows out of the run before decoding them (the rows of one value are in row
-id order). Declines when the component is absent, unsorted, or
-probe-incompatible.
+id order). Declines when the component is absent or probe-incompatible.
 
-**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L31)
-binary-searches the value column's chunk probes (sorted child + integer probe
-required). A located run's ids are `Lazy`
+**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L32)
+binary-searches the value column's chunk probes (an integer probe required;
+every index child is sorted by its keys). A located run's ids are `Lazy`
 ([`read_located_rids`](../core/src/store/indexes/rid_reads.rs#L100)): a count
 takes the run's width, a window reads only its own rows, and materialized, a
 run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/rid_reads.rs#L35)
@@ -854,7 +960,7 @@ longer list for each of the shorter's instead of merging the two.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_rows`](../core/src/store/scan/file_reads.rs#L632) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::read`](../core/src/store/indexes/serve/file.rs#L483)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_rows`](../core/src/store/scan/file_reads.rs#L632) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`FileServePlan::read`](../core/src/store/indexes/serve/file.rs#L498)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped at match time when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Kept by | a window, keep, partition or chained match of the served view, narrowed ([§6.4](#64-keeping-or-dropping-the-serve-plan)) | the same, its residual filter resolved |
@@ -950,8 +1056,9 @@ indexes. `→` reads "then".
 | `?P??` | POSG lead probe → lazy ids **+ serve plan** | ref-p probe → lazy ids, materialized unless only counted or windowed | typed/mask scan of `p` over all rows |
 | `??O?` | OSPG lead probe → lazy ids **+ serve plan** | ref-o probe → same as above | typed/mask scan of `o` |
 | `?PO?` | POSG `(p, o)` prefix probe → both resolved, lazy ids **+ serve plan** | ref-o probe (object preferred) → ids → residual `p` scan | typed/mask scan of `p ∧ o` |
-| `???G` | indexes decline → typed/mask scan of `g` | same | same |
-| `?P?G` | POSG lead probe → residual `g` scan **drops the plan**, ids materialize | ref-p probe → residual `g` scan | typed/mask scan |
+| `???G` | indexes decline → residual `g`: the column's whole bounds (a one-graph store settles here), then the zone classes, "none" zones skipped, "all" zones taken, mixed ones compared; a count takes mixed zones from their recorded graphs or the encoding (§6.3) | same | same |
+| `?P?G` | POSG lead probe → `g` checked inside the run, zone by zone: zones' records, the encoding, else a compare of the run's own `g` (§6.2); the ids are its matching rows in base order, no plan. A window, or zones off: residual `g` over the ids, as above, **drops the plan** | ref-p probe → `g` checked inside the run, as by copy; a window skips the zones before it by their counts. Zones off: residual `g`, as above | residual `p ∧ g`, as above |
+| `?POG` / `??OG` | POSG `(p, o)` prefix probe, or OSPG lead probe → `g` checked inside the run, as above | ref-o probe → `g` checked inside the run; for `?POG`, residual `p` over its ids | residual over the bound columns, as above |
 | `SP??` / `SPO?` / `SPOG` (`contains`) | prefix probe → exact `Range`, nothing residual; indexes never consulted (nothing left bound) | same | same |
 | `S?O?` / `S??G` | prefix probe narrows by the subject; residual scan of `o` (or `g`) over the range — index routing skipped entirely if the range is < 4096 rows | same | same |
 
@@ -968,6 +1075,7 @@ and the object of a `TypedObject` store expands into 2–4 residual equalities.
 | `S???` | subject chunk probe → exact `Range`, no filter | same | same |
 | `?P??` | POSG located run → eager ids (≤ 256) or lazy ids **+ serve plan** | ref-p located run → lazy ids, materialized unless only counted or windowed; filter empty | filter `p = code` → pruning envelope |
 | `??O?` | OSPG located run → same as above | ref-o located run → same as above | filter `o = code` → pruning envelope |
+| `???G` | filter `g = code` → pruning envelope, from the zones' bounds and their recorded graphs; per split, the zones of the graph alone taken unevaluated (§7.2) | same | same |
 | `?PO?` | POSG `(p, o)` windowed location → both resolved, **serve plan** | ref-o located run → ids; `p` read at them by point reads when they are sparse in their splits, else the filter keeps `p` | filter `p ∧ o` → pruning envelope |
 | `?POG` | as above; plan carries `g` too, but its `row_range` is dropped | ref-o ids; `p ∧ g` read at them as above, else the filter keeps them | filter `p ∧ o ∧ g` |
 | `SP??` … `SPOG` | subject chunk probe, then the prefix behind it → exact `Range`, nothing residual; index routing skipped when the range is < 4096 rows | same | same |
@@ -976,6 +1084,19 @@ Under the string layouts the subject chunk probe and both indexes' `locate_compo
 decline (they need integer probes), so a file match reduces to *pushed-down
 filter + zone-map pruning* — plus, for `SecondaryByCopy`, a filtered index-child
 scan that still supplies a serve plan.
+
+The code lookups (`count_code_pattern`, `match_code_pattern`, `locate_codes`;
+[interfaces.md §4](interfaces.md#4-narrowing-natively)) answer a bound graph
+after a free slot, `?POG` on `index:posg` or `SP?G` on the quad table, from
+the bound prefix's run on a Dictionary file, and by reference `?P?G` or `??OG`
+from the reference child's run, its graph read from the child's own `g`
+column (a child written without one checks the quad table's `g` at the run's
+rows, row by row). The graph is checked a zone at a
+time: zones whose bounds or recorded graphs rule it out are skipped, zones of
+it alone taken whole, and a mixed zone lying whole within the run counted
+from its recorded graphs (`zone_recorded`), else on the graph column's
+encoding (`zone_counted`). A count reads no rows of a mixed zone; a window
+or a stream reads its graph column.
 
 ---
 
@@ -991,7 +1112,7 @@ scan that still supplies a serve plan.
   (`ViewSelection::Pending`'s `matches`; a narrower run costs less to compute than
   the pattern's terms cost to copy, `CHAIN_MIN_ROWS`). A match chained on such
   a view is **one match of both patterns** over every base row
-  ([`match_both`](../core/src/store/query/matching/mod.rs#L172)): the pending ids
+  ([`match_both`](../core/src/store/query/matching/mod.rs#L183)): the pending ids
   are never computed, and two roles one index orders together are one run of
   it. A view built for its rows gets the ids in base order with no serve plan,
   as a chained match on an un-narrowed view leaves them; one only counted or
@@ -1048,7 +1169,7 @@ a one-shot read, `StreamedPlan` for a stream):
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads, a stream 65,536 rows a chunk; file: point reads ≤ 256 rows, else a range scan of the located run (`FileServePlan::read`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries (in memory a stream 65,536 rows a chunk); on file, read it by id or scan it as `ExactRead` chooses (below) |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — under the Dictionary layout one `Arc<str>` per distinct term of a chunk, under the string layouts one per run of rows repeating a term, each read in place, handed to every row that holds it | the same gather or file read, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located run's width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/serve/file.rs#L535)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
+| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns, in the index's order as `quads()` reads them: in memory point reads through its probes for a run of at most 256 rows, else the component sliced to the run and each column decoded whole; on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/serve/file.rs#L550)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses, a point read filling the code buffers straight from the chunk probes |
 | `row_chunks()` / `code_chunks()` | the plan's rows in the index's order, the ids never sorted: in memory gathered off the base at the run's ids, one window of ids per chunk, or, over a Dictionary base whose columns stay encoded (read off a file or adopted from bytes), read off the index component, a slice or a take of a window of the run's live rows per chunk; on file the index child's own chunks (the located range, the kept rows' positions, or the filtered scan) cut to the cap, except TypedObject's rows, taken from the base a window of ids at a time | the selection's rows in base row order: sliced or gathered in memory; on file read by id, by a pending filter's masks, or scanned |
 | `nquad_line_chunks()` (the N-Triples/N-Quads export) | as `quads()`, in the index's order, each chunk written as N-Quads lines | as `quads()`, in base row order, each chunk written as N-Quads lines: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
 
@@ -1082,7 +1203,7 @@ instead: filling costs it a few thousand instructions, more than the values
 so few rows skip. A window over such a filter
 ([§16.2](#162-window-size_capped-exists)), whether it keeps the filter's
 masks or resolves the filter into its matches' ids, keeps the filter's
-equalities ([`FileFilter`](../core/src/store/view/mod.rs#L133)): its reads
+equalities ([`FileFilter`](../core/src/store/view/mod.rs#L135)): its reads
 by id, one-shot or streamed, read only the free columns and fill the pinned
 ones in the same way, a point read only from 64 rows. `quads_vec` and `shared_quads_vec` read and decode a take or a
 projection split by split, spawning the split reads when there is more than
@@ -1141,11 +1262,11 @@ file run) and a rid-only scan of the index child otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching/mod.rs`](../core/src/store/query/matching/mod.rs#L249) | an already-narrowed view below this skips index routing |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching/mod.rs`](../core/src/store/query/matching/mod.rs#L260) | an already-narrowed view below this skips index routing |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L216) | selection size above which the typed row loop declines to the vectorized mask scan for a lone residual equality |
 | `TYPED_PROBE_MAX_ROWS` | 256 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L225) | the same for any set that binds a column through an encoded-search probe, read a row at a time: the mask scan costs less from about 256 rows of a range and 512 of scattered ids |
 | `FIRST_PIECE_ROWS` | 8192 | [`pieces.rs`](../core/src/store/scan/pieces.rs#L14) | the first piece of a residual compare left pending for a count or a window, and of a file filter's early-exit loop, each piece after four times the one before; a selection this wide or narrower is compared eagerly |
-| `CHAIN_MIN_ROWS` | 1024 | [`matching/mod.rs`](../core/src/store/query/matching/mod.rs#L243) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
+| `CHAIN_MIN_ROWS` | 1024 | [`matching/mod.rs`](../core/src/store/query/matching/mod.rs#L254) | the narrowest pending run whose match, built for its rows, names its pattern, so that a match chained on its view is one match of both patterns ([§11](#11-chained-matches)) |
 
 The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
 `POINT_IDS_PER_SPLIT`, `TAKE_ROWS`) are in [file-format.md §11](file-format.md#11-constants).
@@ -1517,7 +1638,7 @@ checked against Oxigraph (the numeric kinds) and rdflib (the others) by
 | The in-memory backend and its steps (`prefix_probe`, `residual_narrow`) | [`core/src/store/query/matching/memory.rs`](../core/src/store/query/matching/memory.rs) |
 | The file backend and its steps (`locate_subject`, `prune_by_filter`) | [`core/src/store/query/matching/file.rs`](../core/src/store/query/matching/file.rs) |
 | `match_tail` | [`core/src/store/query/matching/tail.rs`](../core/src/store/query/matching/tail.rs) |
-| `residual_rows`, `mask_for` | [`core/src/store/scan/residual.rs`](../core/src/store/scan/residual.rs) |
+| `ResidualCompare`, `mask_for` | [`core/src/store/scan/residual.rs`](../core/src/store/scan/residual.rs) |
 | Layouts | [`core/src/store/layouts/mod.rs`](../core/src/store/layouts/mod.rs) |
 | `QuadPattern`, `PatternCodes`, `Constraints`, `prepare_pattern` | [`core/src/store/layouts/pattern.rs`](../core/src/store/layouts/pattern.rs) |
 | Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs) |
@@ -1540,7 +1661,7 @@ checked against Oxigraph (the numeric kinds) and rdflib (the others) by
 | `Keep`, `keep` | [`core/src/store/query/keep/mod.rs`](../core/src/store/query/keep/mod.rs), [`memory.rs`](../core/src/store/query/keep/memory.rs), [`file.rs`](../core/src/store/query/keep/file.rs) |
 | `window` | [`core/src/store/query/window.rs`](../core/src/store/query/window.rs) |
 | `empty_view` | [`core/src/store/mod.rs`](../core/src/store/mod.rs) |
-| `size`, `size_capped`, `exists`, `live_len_if_known` | [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
+| `size`, `size_capped`, `exists`, `live_count` | [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
 | `Probe` (with `Probe::parse`), `match_many`, `count_many`, `run_probe`, `count_probe` | [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs) |
 | `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
 | `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules, the regex subset | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs), [`numeric.rs`](../core/src/store/layouts/dictionary/predicates/numeric.rs), [`literal.rs`](../core/src/store/layouts/dictionary/predicates/literal.rs), [`text.rs`](../core/src/store/layouts/dictionary/predicates/text.rs), [`regex_filter/mod.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter/mod.rs) |

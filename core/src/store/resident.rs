@@ -12,7 +12,7 @@ use crate::session::VORTEX_SESSION;
 use crate::store::array::{column_is_sorted, stamp_is_sorted};
 use crate::store::schema;
 use crate::store::schema::CODE_PTYPE;
-use crate::store::zones::{ZoneBuilder, ZoneTable};
+use crate::zone_stats::quad_zones::{QuadZones, ZoneBuilder};
 
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -65,34 +65,36 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// untouched. A chunked column is compressed chunk by chunk
 /// ([`compress_int_child`]).
 ///
-/// The pass that picks a column's encoding reads all its codes, and takes
-/// the column's zone bounds on the way ([`ZoneBuilder`]): they come back
-/// beside the struct ([`ZoneTable`]), for the primary base, whose residual
-/// filter skips zones by them.
-///
-/// `payload_lazy` wraps each compressed column in a `vortex.shared` wrapper:
-/// the match fast paths probe the compressed source through it, while the
-/// code-column payload path decodes the canonical primitive once into its
-/// cache (`shared_code_primitive`) and is zero-copy on every later call. Pass
-/// it for the primary base, the only array the payload path reads.
+/// `table` says which table `rows` is ([`CodeTable`]), and so what its code
+/// columns keep. The pass that picks a code column's encoding reads all its
+/// codes, and takes the zone map of each column the table zones on the way
+/// ([`ZoneBuilder`]): they come back beside the struct ([`QuadZones`]),
+/// `g`'s with its recorded graphs, counted in the same pass.
 pub(crate) fn with_compressed_int_children(
     rows: ArrayRef,
-    payload_lazy: bool,
-) -> Result<(ArrayRef, ZoneTable)> {
+    table: CodeTable,
+) -> Result<(ArrayRef, QuadZones)> {
+    use crate::store::schema::{GRAPH_SLOT, primary_slot};
     use vortex_array::arrays::Primitive;
     use vortex_layout::arrays::shared::Shared;
 
-    let mut zones = ZoneTable::default();
+    let mut zones = QuadZones::default();
     let rows = map_struct_children(rows, |name, child, ctx| {
+        let slot = primary_slot(name.as_ref()).filter(|&slot| table.zoned(slot));
+        let mut zones_of = match slot {
+            Some(GRAPH_SLOT) => ZoneBuilder::recording(),
+            _ => ZoneBuilder::new(),
+        };
         let sorted = column_is_sorted(child);
-        let mut bounds = ZoneBuilder::new();
-        let Some(mut encoded) = compress_int_child(child, sorted, &mut bounds, ctx)? else {
+        let Some(mut encoded) = compress_int_child(child, sorted, &mut zones_of, ctx)? else {
             return Ok(None);
         };
-        if let Some(column) = bounds.finish(child.len()) {
-            zones.insert(name.clone(), column);
+        if let Some(slot) = slot
+            && let Some(column) = zones_of.finish(child.len())?
+        {
+            zones.set(slot, column);
         }
-        if payload_lazy && !encoded.is::<Primitive>() {
+        if table.shared() && !encoded.is::<Primitive>() {
             encoded = Shared::new(encoded).into_array();
         }
         if sorted {
@@ -101,6 +103,39 @@ pub(crate) fn with_compressed_int_children(
         Ok(Some(encoded))
     })?;
     Ok((rows, zones))
+}
+
+/// Which table a build's struct is ([`with_compressed_int_children`]), and so
+/// what its code columns keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodeTable {
+    /// The store's primary base. Each code column keeps its zone map, which
+    /// a residual reads, its whole bounds first
+    /// ([`ColumnZones::column_bounds`](crate::zone_stats::zone_map::ColumnZones::column_bounds));
+    /// and each compressed column is wrapped in a `vortex.shared` wrapper:
+    /// the match fast paths probe the compressed source through it, while
+    /// the code-column payload path decodes the canonical primitive once into
+    /// its cache (`shared_code_primitive`) and is zero-copy on every later
+    /// call.
+    Base,
+    /// An index component's child. Only its graph column (`g`) keeps a zone
+    /// map, with its recorded graphs, which a run bound to a graph checks
+    /// inside the component
+    /// ([`IndexComponent::graph_zones`](crate::store::indexes::components::IndexComponent::graph_zones));
+    /// no column is wrapped, as no payload path reads them.
+    Component,
+}
+
+impl CodeTable {
+    /// Whether the column in slot `slot` of `(s, p, o, g)` keeps its zone map.
+    fn zoned(self, slot: usize) -> bool {
+        self == CodeTable::Base || slot == crate::store::schema::GRAPH_SLOT
+    }
+
+    /// Whether a compressed column is wrapped in `vortex.shared`.
+    fn shared(self) -> bool {
+        self == CodeTable::Base
+    }
 }
 
 /// `rows` executed to a struct, each child replaced by the array `f` returns
@@ -305,8 +340,9 @@ fn compress_int_child(
 }
 
 /// One column's encoding choice; see [`with_compressed_int_children`].
-/// `values` is `prim`'s slice; `zones` folds in their bounds zone by zone, in
-/// the pass that takes the column's own.
+/// `values` is `prim`'s slice; `zones` folds them in zone by zone (their
+/// bounds, and a graph column's values), in the pass that takes the column's
+/// own bounds.
 fn compress_int_column(
     prim: &vortex_array::arrays::PrimitiveArray,
     values: &[u64],
@@ -341,7 +377,7 @@ fn compress_int_column(
                 prev = v;
             }
         }
-        zones.push(part.len(), lo, hi);
+        zones.push(part, lo, hi);
         min = min.min(lo);
         max = max.max(hi);
         rest = next;

@@ -23,12 +23,13 @@ use crate::store::array::subject_sorted;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout, StringLayout};
 use crate::store::probes::StructProbes;
+use crate::store::read::live::Live;
 use crate::store::resident::CodeAccess;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::view::tail_keys::TailKeys;
-use crate::store::zones::ZoneTable;
 use crate::store::{RawQuad, SortOrder};
+use crate::zone_stats::quad_zones::QuadZones;
 
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
@@ -84,9 +85,10 @@ pub(crate) struct MemoryBase {
     /// resolved lazily and shared by every view of this base; a new base
     /// takes a new cache.
     pub(crate) probes: Arc<StructProbes>,
-    /// The per-zone code bounds of `base`'s code columns ([`ZoneTable`]),
-    /// shared by every view of this base; empty when the base has none.
-    pub(crate) zones: Arc<ZoneTable>,
+    /// The zone maps of `base`'s code columns ([`QuadZones`]), `g`'s with
+    /// its recorded graphs, shared by every view of this base; empty when the
+    /// base has none.
+    pub(crate) zones: Arc<QuadZones>,
     /// How `base`'s code columns read ([`CodeAccess`]), fixed when the base
     /// was built.
     pub(crate) code_access: CodeAccess,
@@ -344,9 +346,8 @@ impl QuadsSource {
 
     /// The order the view's base rows read in, when it is a known sort: a
     /// served view's, its plan's (`(p, o, s, g)` for an `index:posg` run with
-    /// the object unbound, else base order; none over a file child whose
-    /// rows are not globally sorted), any other view's `(s, p, o, g)` over a
-    /// globally sorted base.
+    /// the object unbound, else base order), any other view's `(s, p, o, g)`
+    /// over a globally sorted base.
     pub(crate) fn read_order(&self) -> Option<SortOrder> {
         match &self.backend {
             Backend::InMemory(memory) => {
@@ -357,7 +358,7 @@ impl QuadsSource {
             #[cfg(feature = "file-io")]
             Backend::File(base) => {
                 if let Some(plan) = &base.serve {
-                    return plan.read_order();
+                    return Some(plan.read_order());
                 }
             }
         }
@@ -387,42 +388,21 @@ impl QuadsSource {
 
     /// The `limit` rows after skipping `offset` of a selection held pending
     /// for a window (`IdsNeed::CountOrWindow`), beside the base's live rows
-    /// as far as the window knows them, read without the selection's other
-    /// ids. A residual compare left pending compares its pieces only until
-    /// the window's last live row is found ([`PendingResidual::window`]).
-    /// A run, with no tombstones, has its width as the base's live size and
-    /// reads its window's rows alone ([`LazyRowIds::window`]): in memory cut,
-    /// before decoding, from a rid column whose rids ascend; on file read
-    /// from the window's rows of a located run's rid column. `None` for any
-    /// other view (an exact selection, a run of unknown width or whose rids
-    /// do not ascend, a run under tombstones, a pending file filter), whose
-    /// window comes from its materialized selection.
-    ///
-    /// [`LazyRowIds::window`]: crate::store::indexes::LazyRowIds::window
-    /// [`PendingResidual::window`]: crate::store::view::pending::PendingResidual::window
+    /// as far as the window knows them ([`Live`]), read without the
+    /// selection's other ids ([`ViewSelection::window`]). `None` for a view
+    /// with a pending file filter, and for any selection that window does
+    /// not cut, whose window comes from its materialized selection.
     pub(crate) async fn located_window(
         &self,
         offset: usize,
         limit: usize,
-    ) -> Result<Option<(RowSelection, usize)>> {
-        let lazy = match &self.selection {
-            ViewSelection::Residual(residual) => {
-                let (ids, live) = residual.window(offset, limit, self.deleted.as_ref())?;
-                return Ok(Some((RowSelection::from_ids(ids), live)));
-            }
-            ViewSelection::Pending { ids, .. } => ids,
-            ViewSelection::Exact(_) => return Ok(None),
-        };
-        let Some(live) = lazy
-            .len_if_known()
-            .filter(|_| self.deleted.is_none() && !self.has_filter())
-        else {
+    ) -> Result<Option<(RowSelection, Live)>> {
+        if self.has_filter() {
             return Ok(None);
-        };
-        Ok(lazy
-            .window(offset, limit)
-            .await?
-            .map(|ids| (RowSelection::from_ids(ids), live)))
+        }
+        self.selection
+            .window(offset, limit, self.deleted.as_ref())
+            .await
     }
 
     /// This source under `selection`, its reads served by `serve`, over

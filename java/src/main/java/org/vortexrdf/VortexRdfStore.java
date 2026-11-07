@@ -187,10 +187,11 @@ public final class VortexRdfStore implements AutoCloseable {
 	}
 
 	/**
-	 * vortex-rdf's encoded-search work counters by name, cumulative in this process: the chunk leaves searched
-	 * encoded or decoded, resident probes, gathers, shared canonical decodes and equality-scan binds, each also by the
-	 * number of values. They count only with {@code VORTEX_RDF_COUNTERS=1} set when the native library loads; otherwise
-	 * every value is 0. Meant for measurements, not for applications.
+	 * vortex-rdf's work counters by name, cumulative in this process: the encoded search's (the chunk leaves
+	 * searched encoded or decoded, resident probes, gathers, shared canonical decodes and equality-scan binds), then a
+	 * located run's zone decisions, each also by the number of values. They count only with
+	 * {@code VORTEX_RDF_COUNTERS=1} set when the native library loads; otherwise every value is 0. Meant for
+	 * measurements, not for applications.
 	 *
 	 * @return each counter's value by name, in an unmodifiable map
 	 */
@@ -317,7 +318,9 @@ public final class VortexRdfStore implements AutoCloseable {
 	 * The quads matching a pattern of codes (negative is free) as their codes, read at most {@code batchRows} rows at
 	 * a time: the rows of {@link #matchCodes(long, long, long, long, long, ByteBuffer, int)} in its order, base row
 	 * order except on a pattern a {@code secondary-by-copy} index serves, read in that index's order. A code that
-	 * cannot match gives no rows. Close the chunks, or drain them, when done.
+	 * cannot match gives no rows. Each row is read once, the chunks holding their place in the match until they are
+	 * closed: read a long match this way rather than paging {@code matchCodes} through it, whose every call finds its
+	 * window anew. Close the chunks, or drain them, when done.
 	 *
 	 * @param s the subject's code, or negative (such as {@link #NONE}) for any
 	 * @param p the predicate's code, or negative for any
@@ -347,7 +350,10 @@ public final class VortexRdfStore implements AutoCloseable {
 	 * Writes up to {@code maxRows} quads matching a pattern of codes, after {@code offset} rows of the match, as
 	 * {@code (s, p, o, g)} codes of eight bytes each ({@link #ROW_BYTES} per row), from the start of {@code out}
 	 * (its position and limit are neither read nor changed), and returns the rows written; negative is free. A code
-	 * that cannot match (past the dictionary, or a term in a position it cannot take) gives no rows.
+	 * that cannot match (past the dictionary, or a term in a position it cannot take) gives no rows. Each call finds
+	 * its window anew, reading the match's rows before it again (on a match whose rows are checked against a bound
+	 * position, as a bound graph after a free one is, checking them): paging a long match this way reads it again
+	 * for every page, where {@link #matchCodeChunks(long, long, long, long, int)} reads it once.
 	 *
 	 * @param s the subject's code, or negative (such as {@link #NONE}) for any
 	 * @param p the predicate's code, or negative for any

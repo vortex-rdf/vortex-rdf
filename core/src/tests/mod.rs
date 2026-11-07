@@ -27,6 +27,7 @@ mod index_order;
 mod indexes;
 mod indexes_file;
 mod leaf_geometry;
+mod locate_codes;
 mod mapping;
 mod masks_first;
 mod matching;
@@ -35,7 +36,6 @@ mod mutation;
 mod names;
 mod narrowing;
 mod open_errors;
-mod pending_residual;
 mod predicates;
 mod rebuild;
 mod roundtrip;
@@ -46,7 +46,7 @@ mod tail_keys;
 mod unique_quads;
 mod wide_codes;
 mod wide_row_ids;
-mod zone_bounds;
+mod zones;
 
 const LAYOUTS: [LayoutStrategy; 3] = [
     LayoutStrategy::Default,
@@ -529,8 +529,6 @@ fn selection_pending(view: &VortexRdfStore) -> bool {
     view.view_statistics().unwrap().selection == SelectionKind::PendingIndexRun
 }
 
-/// The quad-row column names `layout` builds — what a schema assertion
-/// expects the primary struct to carry and nothing else.
 /// The probes the matches `rec` saw bind a column: `(the store's own,
 /// resolved for the call)`.
 fn probe_binds(rec: &Recorder) -> (usize, usize) {
@@ -542,12 +540,10 @@ fn probe_binds(rec: &Recorder) -> (usize, usize) {
 
 /// The `rid` rows of in-memory index components `rec` saw decoded.
 fn rids_decoded(rec: &Recorder) -> usize {
-    rec.picked(|e| match e {
+    rec.rows(|e| match e {
         Event::RidsDecoded(rows) => Some(*rows),
         _ => None,
     })
-    .iter()
-    .sum()
 }
 
 /// The directory the last out-of-core build `rec` saw spill its runs under.
@@ -560,6 +556,8 @@ fn last_spill_dir(rec: &Recorder) -> std::path::PathBuf {
     .expect("the build made a run directory")
 }
 
+/// The quad-row column names `layout` builds — what a schema assertion
+/// expects the primary struct to carry and nothing else.
 fn primary_columns(layout: LayoutStrategy) -> &'static [&'static str] {
     match layout {
         LayoutStrategy::Default | LayoutStrategy::Dictionary => &["s", "p", "o", "g"],

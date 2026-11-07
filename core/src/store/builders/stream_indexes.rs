@@ -81,8 +81,8 @@ impl IndexSpillers {
     /// requested family keys on, in its key order.
     fn push(&mut self, ranks: [u32; 4], rid: RowId) -> Result<()> {
         if let Some((o, p)) = self.refs.as_mut() {
-            o.push((ranks[2], rid))?;
-            p.push((ranks[1], rid))?;
+            o.push((ranks[2], rid, ranks[3]))?;
+            p.push((ranks[1], rid, ranks[3]))?;
         }
         if let Some((posg, ospg)) = self.copies.as_mut() {
             posg.push((CopyKey::new(CopyFamily::Posg, ranks).0, rid))?;
@@ -181,16 +181,21 @@ where
         }
     }
     if let Some((o, p)) = mergers.refs {
+        // Read here, on the building thread: the chunks are pulled later.
+        let graphs = V::RECORDS_GRAPH && crate::store::indexes::reference::records_graphs();
         for (family, mut merger) in [(RefFamily::Object, o), (RefFamily::Predicate, p)] {
-            let empty = ref_child_chunk::<V>(&[])?;
+            let empty = ref_child_chunk::<V>(&[], graphs)?;
             let decode = decode.clone();
             let pull = pull_fn(guard, move |n| {
                 chunk_of(merger.next_batch(n)?, |entries| {
-                    let pairs = entries
+                    let rows = entries
                         .iter()
-                        .map(|&(rank, rid)| Ok((decode(rank)?, rid)))
+                        .map(|&(rank, rid, graph)| {
+                            let graph = if graphs { decode(graph)? } else { V::default() };
+                            Ok((decode(rank)?, rid, graph))
+                        })
                         .collect::<Result<Vec<_>>>()?;
-                    ref_child_chunk(&pairs)
+                    ref_child_chunk(&rows, graphs)
                 })
             });
             families.push((family.identity(), empty, pull));
@@ -201,7 +206,6 @@ where
         .map(|(identity, empty, pull)| ChildStream {
             identity,
             // The merger emits the family in its global sort order.
-            sorted: true,
             source: Arc::new(PullComponentSource::new(empty, chunk_size, pull)),
         })
         .collect())
@@ -299,7 +303,7 @@ mod tests {
     /// error.
     #[test]
     fn pull_source_replays_once() {
-        let empty = ref_child_chunk::<String>(&[]).unwrap();
+        let empty = ref_child_chunk::<String>(&[], false).unwrap();
         let source = PullComponentSource::new(empty, 1, Box::new(|_| Ok(None)));
         assert!(source.open().is_ok());
         assert!(source.open().is_err());

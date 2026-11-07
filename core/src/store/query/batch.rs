@@ -126,8 +126,11 @@ impl VortexRdfStore {
     /// less the offset. The match knows the cap, so an in-memory compare it
     /// may stop short of is left to the count.
     pub async fn count_probe(&self, probe: &Probe) -> Result<usize> {
-        let need = IdsNeed::CountOrWindow {
-            reach: probe.reach(),
+        let need = match probe.limit {
+            Some(_) => IdsNeed::CountOrWindow {
+                reach: probe.reach(),
+            },
+            None => IdsNeed::Count,
         };
         let view = self.run_pattern_and_keeps(probe, need).await?;
         match probe.limit {
@@ -176,7 +179,7 @@ impl VortexRdfStore {
         // The keeps resolve the match's whole selection, whatever the window
         // takes of what they keep.
         let need = match need {
-            IdsNeed::CountOrWindow { .. } if !probe.keeps.is_empty() => {
+            IdsNeed::CountOrWindow { .. } | IdsNeed::Count if !probe.keeps.is_empty() => {
                 IdsNeed::CountOrWindow { reach: usize::MAX }
             }
             need => need,

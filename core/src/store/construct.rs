@@ -11,10 +11,10 @@ use crate::store::builders::{BuiltArray, VortexArrayBuilder, build_struct_array}
 use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
 use crate::store::resident::CodeAccess;
-use crate::store::zones::ZoneTable;
 use crate::store::{
     Backend, MemoryBase, QuadsSource, RawQuad, VortexRdfStore, next_generation, probes, resident,
 };
+use crate::zone_stats::quad_zones::QuadZones;
 
 use std::sync::Arc;
 
@@ -90,10 +90,10 @@ impl VortexRdfStore {
     /// `(s, p, o, g)` order, and the match fast paths search every bound role
     /// on it: rows sorted by subject alone must not carry it.
     ///
-    /// `zones` are the base's code columns' zone bounds ([`ZoneTable`]): the
+    /// `zones` are the base's code columns' zone bounds ([`QuadZones`]): the
     /// zone maps of the file the parts were read from, or none.
     #[cfg(feature = "file-io")]
-    pub(crate) fn from_parts(parts: BuiltArray, zones: ZoneTable) -> Result<Self> {
+    pub(crate) fn from_parts(parts: BuiltArray, zones: QuadZones) -> Result<Self> {
         Self::adopt(
             parts,
             |base| Ok((resident::with_searchable_int_children(base)?, zones)),
@@ -108,12 +108,12 @@ impl VortexRdfStore {
     /// children are re-encoded into encodings the probes read in place
     /// (`with_compressed_int_children`), the base's also wrapped so the
     /// code-column read path decodes each once and is zero-copy after. The
-    /// pass that compresses a code column also takes its zone bounds
-    /// ([`ZoneTable`]).
+    /// pass that compresses a code column also takes its zone map
+    /// ([`QuadZones`]), which keeps the whole column's bounds.
     pub fn from_built(built: BuiltArray) -> Result<Self> {
         Self::adopt(
             built,
-            |base| resident::with_compressed_int_children(base, true),
+            |base| resident::with_compressed_int_children(base, resident::CodeTable::Base),
             IndexComponent::into_compressed,
         )
     }
@@ -125,7 +125,7 @@ impl VortexRdfStore {
     /// `encode_component`, and assemble the store.
     fn adopt(
         built: BuiltArray,
-        encode_base: impl FnOnce(ArrayRef) -> Result<(ArrayRef, ZoneTable)>,
+        encode_base: impl FnOnce(ArrayRef) -> Result<(ArrayRef, QuadZones)>,
         encode_component: impl FnMut(IndexComponent) -> Result<IndexComponent>,
     ) -> Result<Self> {
         let layout = resolved_layout(built.dict.map(DictAccess::Resident), built.array.dtype())?;
@@ -147,12 +147,12 @@ impl VortexRdfStore {
     /// view decodes its rows without suspending, through that dictionary
     /// ([`in_memory_chunk`](Self::in_memory_chunk)). Of `zones`, the base
     /// keeps each column whose zones cover its rows
-    /// ([`ZoneTable::covering`]).
+    /// ([`QuadZones::covering`]).
     pub(super) fn assemble_resident(
         base: ArrayRef,
         components: Vec<IndexComponent>,
         layout: ResolvedLayout,
-        zones: ZoneTable,
+        zones: QuadZones,
     ) -> Result<Self> {
         debug_assert!(
             !matches!(&layout, ResolvedLayout::Dictionary(access) if access.is_file_backed()),
@@ -195,7 +195,7 @@ impl VortexRdfStore {
             base,
             Vec::new(),
             ResolvedLayout::Default,
-            ZoneTable::default(),
+            QuadZones::default(),
         )
         .expect("an empty base assembles")
     }

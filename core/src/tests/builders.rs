@@ -568,7 +568,7 @@ async fn test_input_error_after_spilling_removes_the_runs() {
 /// The peak spill of an out-of-core build — its run directory once the merge
 /// that numbers the rows has run, before any chunk is pulled — is the quads as
 /// term ids, 16 bytes each, and the requested families' compact entries (an
-/// 8-byte header per run, 8 bytes per reference entry, 20 per copy entry),
+/// 8-byte header per run, 12 bytes per reference entry, 20 per copy entry),
 /// with no merged copy of the quads, under every layout.
 #[tokio::test]
 async fn test_peak_spill_is_term_ids_and_compact_entries() {
@@ -601,7 +601,7 @@ async fn test_peak_spill_is_term_ids_and_compact_entries() {
             );
             let families = |index| if indexes.contains(&index) { 2 } else { 0 };
             let want = 16 * 10
-                + families(IndexType::SecondaryByReference) * (4 * 8 + 10 * 8)
+                + families(IndexType::SecondaryByReference) * (4 * 8 + 10 * 12)
                 + families(IndexType::SecondaryByCopy) * (4 * 8 + 10 * 20);
             let total: u64 = files.iter().map(|(_, len)| len).sum();
             assert_eq!(total, want, "{who}: {files:?}");

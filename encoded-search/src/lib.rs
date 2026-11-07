@@ -1,11 +1,13 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
+mod bitpacked;
 mod delta;
 mod node;
 mod owned;
 mod resolve;
 mod search;
+mod words;
 
 pub use owned::OwnedSortedProbe;
 
@@ -33,8 +35,11 @@ pub mod counters {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// How many counters there are: a pair per site.
+    pub const LEN: usize = 18;
+
     /// Names in [`snapshot`] order.
-    pub const NAMES: [&str; 18] = [
+    pub const NAMES: [&str; LEN] = [
         "leaf_encoded",
         "leaf_encoded_values",
         "leaf_decoded",
@@ -73,7 +78,7 @@ pub mod counters {
     /// An equality scan bound to a primitive (decoded) column.
     pub const TYPED_EQ_PRIMITIVE: usize = 16;
 
-    static C: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+    static C: [AtomicU64; LEN] = [const { AtomicU64::new(0) }; LEN];
 
     /// Whether the counters are on.
     pub fn on() -> bool {
@@ -90,7 +95,7 @@ pub mod counters {
     }
 
     /// The counters, in [`NAMES`] order.
-    pub fn snapshot() -> [u64; 18] {
+    pub fn snapshot() -> [u64; LEN] {
         std::array::from_fn(|i| C[i].load(Ordering::Relaxed))
     }
 }
@@ -191,6 +196,41 @@ impl<'a> SortedProbe<'a> {
         self.root.read_into(start, out);
     }
 
+    /// How many of the values at `start..start + len` equal `needle`, counted
+    /// on the encoding where it allows (a constant at once, run ends by their
+    /// runs, a dictionary by its codes, bit-packed values a chunk at a time)
+    /// and read otherwise. Needs no sortedness.
+    ///
+    /// # Panics
+    /// Panics if `start + len > self.len()`.
+    pub fn count_eq(&self, start: usize, len: usize, needle: u64) -> usize {
+        assert!(
+            start.checked_add(len).is_some_and(|end| end <= self.len()),
+            "{len} values from {start} out of bounds"
+        );
+        let mut count = search::Count(0);
+        self.root.eq_into(start, len, needle, 0, &mut count);
+        count.0
+    }
+
+    /// The offsets `k` in `0..len` whose value at `start + k` equals `needle`,
+    /// ascending, appended to `out`: found on the encoding where it allows,
+    /// as [`Self::count_eq`] counts them (a constant at once, run ends by
+    /// their runs, a frame of reference against the shifted needle, a small
+    /// dictionary's codes against the needle's code, bit-packed values a
+    /// 1024-value chunk at a time), and read otherwise. Needs no sortedness.
+    ///
+    /// # Panics
+    /// Panics if `start + len > self.len()`.
+    pub fn eq_offsets(&self, start: usize, len: usize, needle: u64, out: &mut Vec<usize>) {
+        assert!(
+            start.checked_add(len).is_some_and(|end| end <= self.len()),
+            "{len} values from {start} out of bounds"
+        );
+        self.root
+            .eq_into(start, len, needle, 0, &mut search::Offsets(out));
+    }
+
     /// The exact values at `indices`, in their order, into `out`: each run of
     /// consecutive indices read in one pass ([`Self::read_into`]), a lone
     /// index point-read.
@@ -258,7 +298,8 @@ pub enum NodeKind {
     RunEnd,
     /// Frame of reference: a reference value added to an encoded child.
     FoR,
-    /// Bit-packed words, unpacked one value at a time.
+    /// Bit-packed words: a point read unpacks one value; a bulk read, count
+    /// or find unpacks the parts of each 1,024-value chunk it covers.
     BitPacked,
     /// The exception values riding beside a [`NodeKind::BitPacked`] node.
     Patches,

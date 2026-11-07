@@ -18,10 +18,10 @@ use vortex_rdf_encoded_search::{fetch_flat, flat_leaves};
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
-use crate::io::zone_map::ExactZoneMap;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::StrColReader;
 use crate::store::persist::native_file::NativeStoreFile;
+use crate::zone_stats::zone_map::ExactZoneMap;
 
 use super::super::storage::{COL_DICT_TERM, TermChunk};
 use super::super::term_dict::{CodeSpace, next_dictionary_id};
@@ -223,9 +223,9 @@ fn ordered(bounds: &[Bounds]) -> bool {
 mod tests {
     use super::super::fixtures::windowed_handle;
     use super::*;
-    use crate::io::zone_map::exact_bound_aggregates;
     use crate::store::layouts::dictionary::TermDictionary;
     use crate::store::schema::TermCode;
+    use crate::zone_stats::zone_map::exact_bound_aggregates;
     use vortex_array::arrays::struct_::{StructArray, StructArrayExt as _};
     use vortex_buffer::ByteBuffer;
     use vortex_file::OpenOptionsSessionExt as _;

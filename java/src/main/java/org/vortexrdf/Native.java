@@ -69,7 +69,7 @@ final class Native {
 	/** The number of terms of a store with a term dictionary. */
 	static native long termCount(long handle);
 
-	/** vortex-rdf's encoded-search work counters, in {@link #engineCounterNames()} order. */
+	/** vortex-rdf's work counters, in {@link #engineCounterNames()} order. */
 	static native long[] engineCounters();
 
 	static native String[] engineCounterNames();

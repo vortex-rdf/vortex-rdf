@@ -79,6 +79,22 @@ pub(crate) enum Event {
     ProbeBound { cached: bool },
     /// A residual narrowed by zone bounds.
     ZoneNarrowed,
+    /// An in-memory residual compared this many rows: a zone run its zone
+    /// maps kept, or the selection the typed loop or the mask scan read.
+    ResidualCompared(u64),
+    /// An in-memory residual took this many rows of its selection from
+    /// zones where every row holds its codes, uncompared.
+    ResidualZoneTaken(u64),
+    /// An in-memory residual's zone checks built, once per residual, over
+    /// the selection's this many zones.
+    ZonesClassed(u64),
+    /// An in-memory residual settled by its columns' whole bounds,
+    /// with no row compared: `none` when no row holds a code, else every
+    /// equality held on every row.
+    ResidualSettled { none: bool },
+    /// An in-memory index run bound to a graph read its component's graph
+    /// column at this many rows, to check them.
+    ComponentChecked(u64),
     /// A residual compare left pending.
     ResidualDeferred,
     /// A piece of a pending residual compared, of this many rows.
@@ -97,6 +113,10 @@ pub(crate) enum Event {
     /// buffers: the index child's columns read (those its terms do not pin,
     /// the row id only under tombstones).
     ServedCodesRead(Vec<&'static str>),
+    /// A served file view's child rows at its positions read by a scan
+    /// (where no probe reads the child's columns), bounded to these child
+    /// rows: the splits Vortex plans for it lie inside them.
+    ServedPositionsScanned(Range<u64>),
     /// A served in-memory view's chunk read off its index component (a slice
     /// of its run, or a take at its live rows), the base's code columns being
     /// encoded (a store read off a file), this many rows.
@@ -145,6 +165,34 @@ pub(crate) enum Event {
     ColumnsRead(Vec<String>),
     /// A take by id: through the chunk probes, else split by split.
     Take { through_chunks: bool },
+    /// A block of a located run's rows read, for a lookup's window or a
+    /// stream's chunk: this many rows of the run, before its checks.
+    LocatedBlock(u64),
+    /// A located run's, an in-memory residual's or a checked in-memory index
+    /// run's rows of a mixed zone counted on the checked column's encoding,
+    /// this many rows.
+    ZoneCounted(u64),
+    /// A located run's, an in-memory residual's or a checked in-memory index
+    /// run's mixed zone of this many rows counted from the checked column's
+    /// recorded values, unread.
+    ZoneRecorded(u64),
+    /// A reference run read its child's own `g` at this many positions.
+    ReferenceGraphRead(u64),
+    /// A located run searched the reference index of slot `slot` (`p` or
+    /// `o`) for its code's run.
+    ReferenceSearched { slot: usize },
+    /// A located run read slot `slot` of the quad table at this many
+    /// scattered rows, to check them.
+    CheckTaken { slot: usize, rows: u64 },
+    /// A located run's rows read at a checked column to check them, this
+    /// many rows.
+    CheckRead(u64),
+    /// A column's zone map read from its file, for a located run's checks or
+    /// a file filter's every-row zones.
+    ZoneMapRead,
+    /// A located run's checked slots put to its file's statistics, footer
+    /// and zone maps.
+    StatisticsAsked,
     /// A row scan run (`read_all_rows`, `stream_rows`).
     RowScan,
     /// A restricted file scan built with a filter pushed down.
@@ -156,6 +204,12 @@ pub(crate) enum Event {
     MaskedRead(MaskedRead),
     /// A filter evaluated over one split.
     SplitEvaluated,
+    /// A split's rows a filter of code equalities took uncompared, from
+    /// zones where no row can differ from any of its codes.
+    SplitAllRows(u64),
+    /// A split's rows a filter's conjuncts were evaluated over, after its
+    /// zones were pruned.
+    SplitFilterRows(u64),
     /// A split's mask the in-order fold handed on, of this range.
     SplitConsumed(Range<u64>),
 }
@@ -275,6 +329,12 @@ impl Recorder {
         LOG.with_borrow(|log| log.events[self.from..].iter().filter_map(pick).collect())
     }
 
+    /// What `pick` reads off each of [`events`](Self::events) it picks,
+    /// summed: the rows a kind of event recorded, in the pick's own type.
+    pub(crate) fn rows<T: std::iter::Sum>(&self, pick: impl Fn(&Event) -> Option<T>) -> T {
+        LOG.with_borrow(|log| log.events[self.from..].iter().filter_map(pick).sum())
+    }
+
     /// How many of the events since the last take `event` is, after which
     /// the recorder reads only later ones.
     pub(crate) fn take_count(&mut self, event: &Event) -> usize {
@@ -297,5 +357,42 @@ impl Drop for Recorder {
                 log.events.clear();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `rows` sums what its pick reads off the events since the recorder
+    /// started, in the pick's own type.
+    #[test]
+    fn rows_sums_what_pick_reads() {
+        let _earlier = Recorder::start();
+        note(Event::CheckRead(100));
+        let rec = Recorder::start();
+        for event in [
+            Event::CheckRead(3),
+            Event::ZoneCounted(5),
+            Event::CheckRead(4),
+            Event::RidsDecoded(2),
+        ] {
+            note(event);
+        }
+        let checked: u64 = rec.rows(|e| match e {
+            Event::CheckRead(rows) => Some(*rows),
+            _ => None,
+        });
+        assert_eq!(checked, 7, "only the events since start");
+        let read: u64 = rec.rows(|e| match e {
+            Event::CheckRead(rows) | Event::ZoneCounted(rows) => Some(*rows),
+            _ => None,
+        });
+        assert_eq!(read, 12);
+        let decoded: usize = rec.rows(|e| match e {
+            Event::RidsDecoded(rows) => Some(*rows),
+            _ => None,
+        });
+        assert_eq!(decoded, 2);
     }
 }

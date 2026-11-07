@@ -52,10 +52,10 @@ A builder hands these back in one of two shapes
 | Surface | Call | Pipeline | Produces |
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
-| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
+| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L140) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L48) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L67), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L113) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L134) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
-| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L254) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
+| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L271) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -229,7 +229,7 @@ kept as its four ids. The buffer holds up to
 [`DEFAULT_RUN_ROWS`](../core/src/store/builders/mod.rs#L54) (1,048,576) quads,
 16 bytes each; a buffer that would overflow is sorted in its terms' order,
 deduplicated and spilled as one run
-([`QuadSpiller`](../core/src/store/builders/runs/mod.rs#L268)). Where its terms
+([`QuadSpiller`](../core/src/store/builders/runs/mod.rs#L269)). Where its terms
 repeat (at most one distinct term for two quads), the buffer's distinct terms
 are compared once, to rank them among themselves, and the quads sort in place
 as tuples of those ranks; otherwise they are compared term by term, a role's
@@ -249,7 +249,7 @@ byte order, and maps each id to its term's rank. A rank keeps its term's order
 sorted by its terms is sorted by rank tuple once its ids are read as ranks: no
 spilled run is sorted again. The in-memory run of a build that spilled nothing
 is sorted here, its ids replaced by their ranks
-([`SpilledQuads::ranked`](../core/src/store/builders/runs/mod.rs#L414)), so its
+([`SpilledQuads::ranked`](../core/src/store/builders/runs/mod.rs#L415)), so its
 sort compares integers where a spilled run's compares terms. Under the Dictionary layout the ranked terms become the
 term dictionary (a rank's code is its position), each term moved into the
 column and freed as it is copied.
@@ -265,7 +265,7 @@ same way, are unique because their row ids are: none equals the one before
 it.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
-([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L229)):
+([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L232)):
 every poll pulls up to a chunk's worth of quads off the heap and builds one
 struct, their ranks spelled as dictionary codes
 ([`build_code_chunk`](../core/src/store/layouts/dictionary/codec/mod.rs#L107)) or,
@@ -276,12 +276,12 @@ first merge runs to completion
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's ranks are pushed into one spiller per requested family
-([`EntrySpiller`](../core/src/store/builders/runs/mod.rs#L591)), each spilling its
+([`EntrySpiller`](../core/src/store/builders/runs/mod.rs#L596)), each spilling its
 own sorted runs:
 
 | Family | Spilled entry | Run files |
 |---|---|---|
-| `index:ref-o` / `index:ref-p` | `(rank, row id)` | `idx_o_run_N.bin`, `idx_p_run_N.bin` |
+| `index:ref-o` / `index:ref-p` | `(value rank, row id, graph rank)` | `idx_o_run_N.bin`, `idx_p_run_N.bin` |
 | `index:posg` / `index:ospg` | `(four ranks in the family's key order, row id)` | `idx_posg_run_N.bin`, `idx_ospg_run_N.bin` |
 
 The primary chunks then come off a second merge of the same quad runs, while
@@ -297,13 +297,13 @@ directory, removed when the stream is dropped:
 | Run | Header | Record |
 |---|---|---|
 | `quads_run_N.bin` | none | four `u32` term ids: 16 bytes |
-| `idx_o_…`, `idx_p_…` | the run's first row id, `u64` | rank `u32`, row offset `u32`: 8 bytes |
+| `idx_o_…`, `idx_p_…` | the run's first row id, `u64` | value rank `u32`, graph rank `u32` (the row's graph, for the Dictionary children's `g`), row offset `u32`: 12 bytes |
 | `idx_posg_…`, `idx_ospg_…` | the run's first row id, `u64` | four ranks `u32`, row offset `u32`: 20 bytes |
 
 A run holds at most `DEFAULT_RUN_ROWS` entries numbered consecutively (one per
 quad, in row order), so a row offset from the run's first row id fits a `u32`.
 The spill peaks at the end of the first merge, when the quad runs and every
-index run exist at once: 16 bytes a quad, plus 16 for the reference index and
+index run exist at once: 16 bytes a quad, plus 24 for the reference index and
 40 for the copy index (plus 8 bytes a run). A record cut off partway, or an id
 or rank past its table, is a `Deserialization` error.
 
@@ -312,13 +312,13 @@ that file (where the links at its path end), `.<file name>.spill-<uuid>`
 (`.out.vortex.spill-<uuid>` for `out.vortex`), by default a hidden sibling of
 the store, so a directory a crash left behind says which output it belonged
 to; a build with no output path (an in-memory store, or
-[`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) into a caller's
+[`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L48) into a caller's
 writer), or one whose file name would make the directory's name longer than
 255 bytes, uses `.vortex-rdf.spill-<uuid>`. The parent directory is resolved in
 this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L100)):
 the `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (a
 serialization to a file,
-[`quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) and so the CLI
+[`quads_stream_to_vortex_file`](../core/src/io/write.rs#L140) and so the CLI
 and Python's `serialize_rdf`, and a compaction both pass the directory of
 their temp file: beside the file they write or replace, links followed, on the
 volume that takes the store), then the OS temp dir (a build with no output
@@ -385,13 +385,13 @@ in a file as an auxiliary child.
 | Index | Children | Columns | Sorted by |
 |---|---|---|---|
 | `secondary-by-copy` | `index:posg`, `index:ospg` | `s`, `p`, `o`, `g`, `rid` | `(p, o, s, g)` and `(o, s, p, g)` |
-| `secondary-by-reference` | `index:ref-o`, `index:ref-p` | `val`, `rid` | `val`, then `rid` |
+| `secondary-by-reference` | `index:ref-o`, `index:ref-p` | `val`, `rid`; `g` under `Dictionary` | `val`, then `rid` |
 
 Term columns use the layout's encoding — strings under `Default` and
 `TypedObject` (a `TypedObject` object is recomposed to its full N-Triples term
 for the index), `u64` codes under `Dictionary` — and `rid` is always the `u64`
 position of the quad in the sorted primary rows
-([`RowId`](../core/src/store/schema.rs#L33)).
+([`RowId`](../core/src/store/schema.rs#L37)).
 
 **Row ids never wrap.** A `u64` row id numbers more rows than any store holds,
 so row ids do not limit a store. Every build still numbers rows with checked
@@ -400,8 +400,8 @@ than let an id wrap onto row 0:
 
 | Where | Check | Refusal |
 |---|---|---|
-| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L123)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
-| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L137)); a refused file build leaves no file | the same |
+| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L124)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
+| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L138)); a refused file build leaves no file | the same |
 
 Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
@@ -417,8 +417,9 @@ is stamped `IsSorted`.
 **Out of core**, the same tables come off the spill-run mergers of
 [§6](#6-pipeline-b--sorted-out-of-core), a chunk at a time.
 
-Both hand the child over with `sorted: true` provenance, because both sorted
-the whole dataset; a reader binary-searches a child on that flag alone
+Both sort the whole dataset, as every index child must be: a reader
+binary-searches a child without consulting its descriptor's `sorted`, which
+the writer sets `true` for the term resolvers of 0.14 and earlier
 ([matching.md §8](matching.md#8-the-index-resolvers)).
 
 ---
@@ -451,21 +452,24 @@ flowchart TD
   BtrBlocks-style compressor, and write flat leaf layouts. Each id column —
   a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid` —
   is handed, through the builder's per-field override, to
-  [`id_column_strategy`](../core/src/io/container/sources.rs#L213): the same
+  [`id_column_strategy`](../core/src/io/container/sources.rs#L225): the same
   per-column pipeline rebuilt step for step from Vortex's layout strategies,
-  with the coalescing target split in two. A column that does not
+  with the coalescing target split in two. The graph column `g` also records
+  each block's graphs with their rows in its zone statistics
+  ([`graph_column_aggregates`](../core/src/io/container/sources.rs#L301):
+  `vortexrdf.value_counts`, at most 16 graphs, null past). A column that does not
   dictionary-encode coalesces toward ~2 MiB, 262,144 rows per leaf for a
   plain `u64` id column; a dictionary's codes, as narrow as its cardinality
   needs, stay at ~1 MiB. A test pins the
   copy to Vortex's pipeline: at 1 MiB for both targets it must write the
-  stock bytes. A table without id columns — the string layouts' quad
+  stock bytes for every column but `g`, whose zones also record its graphs. A table without id columns — the string layouts' quad
   table — gets the stock pipeline unchanged
   ([`default_child_strategy`](../core/src/io/container/sources.rs#L135)).
 - **Index children** take exactly the same strategy, so their encoding is what a
   plain table write produces: plain code columns and `rid` (row ids are
   unique, so never dictionary-encoded) at ~2 MiB, dictionary codes at ~1 MiB,
   term strings under the string layouts at ~1 MiB.
-- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L290):
+- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L335):
   its chunks are already FSST-compressed windows, so they are written verbatim
   as one flat leaf each under a chunked node — no sampling, no re-encoding —
   zoned one zone per window with the window's exact first and last term when
@@ -478,10 +482,10 @@ flowchart TD
   are encoded into the root layout's metadata ([file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)).
 - **Provenance.** `quads_sorted` is read off the primary's own `s` stamp when a
   store re-serializes ([`into_stream`](../core/src/store/persist/serialize.rs#L29)) and is
-  `true` by construction for a builder's stream; each component's `sorted` flag
-  travels on its descriptor.
+  `true` by construction for a builder's stream. Every index child's descriptor
+  says `sorted: true`: an index child is in its key order by definition.
 
-One driver feeds this, [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L78):
+One driver feeds this, [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L79):
 a builder's chunk stream (files, compaction; a file is written through a
 [`PendingStore`](../core/src/io/pending.rs#L77) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store
@@ -545,7 +549,7 @@ store's *compressed-resident* form (through
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L78)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L73)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
@@ -556,17 +560,28 @@ store's *compressed-resident* form (through
 - the smallest and largest code of each 8,192-row zone of every code column
   is taken in the pass that picks the column's encoding, which reads every
   code for the column's own bounds anyway
-  ([`ZoneBuilder`](../core/src/store/zones.rs#L79)): the in-memory
-  counterpart of a file's zone maps, so a match's residual equality compares
-  only the zones that may hold its code
-  ([matching.md §6.3](matching.md#63-residual-column-filtering)).
+  ([`ZoneBuilder`](../core/src/zone_stats/quad_zones.rs#L123)), and in the same pass the
+  graph column's graphs per zone, counted as the file writer's
+  `vortexrdf.value_counts` counts them: the in-memory counterpart of a
+  file's zone maps, so a match's residual equality compares only the zones
+  that may hold its code
+  ([matching.md §6.3](matching.md#63-residual-column-filtering)); each
+  component's graph column takes its zone map and graphs in the same pass,
+  so a run bound to a graph checks it inside the component
+  ([matching.md §6.2](matching.md#62-secondary-index-routing));
+- each zone map keeps its column's smallest and largest code, its zones'
+  folded once ([`column_bounds`](../core/src/zone_stats/zone_map.rs#L176)), the
+  whole-column level a residual asks first.
 
 The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L96)
 (crate-private; `from_file_in_memory` calls it), takes a store's split parts:
 it keeps each integer child's existing encoding wherever a probe binds it and
-decodes only the ones that decline. Its zone bounds are the file's own zone
-maps, read at open ([`ZoneTable::read_from_file`](../core/src/store/zones.rs#L151)),
-as `from_bytes` reads them. Opening serialized bytes in memory is
+decodes only the ones that decline. Its zone maps are the file's own zone
+tables, the graph column's recorded graphs included, read at open
+([`QuadZones::read`](../core/src/zone_stats/quad_zones.rs#L65)), as `from_bytes` reads
+them, its components' the zone tables of their children's graph columns
+([`read_graph_zones`](../core/src/zone_stats/quad_zones.rs#L236)); each keeps its column's whole bounds, as a build's
+does. Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).
 
 ---

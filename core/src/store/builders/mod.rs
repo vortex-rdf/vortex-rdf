@@ -16,8 +16,8 @@
 //! index's persisted child, the one form index data takes: the in-memory sort
 //! builds them over the whole dataset ([`build_components`]), the out-of-core
 //! one streams each family off its own spill-run merger. Both sort globally,
-//! so their components are `sorted`, the provenance a reader binary-searches
-//! on. The rows' own subject sortedness travels as the `s` column's
+//! as every index child must be: a reader binary-searches them without
+//! checking. The rows' own subject sortedness travels as the `s` column's
 //! `IsSorted` stamp and is re-read rather than assumed: an append loses it.
 //!
 //! Quads are unique and terms canonical in what a build emits. The input
@@ -112,8 +112,8 @@ pub(crate) struct BuiltStream {
     pub dtype: DType,
     /// The lazy stream of primary-only quad chunks.
     pub chunks: ChunkStream,
-    /// The index children riding beside the rows, each its identity,
-    /// provenance and rows: the writer spells their descriptors.
+    /// The index children riding beside the rows, each its identity and its
+    /// rows in its key order: the writer spells their descriptors.
     pub(crate) components: Vec<crate::store::indexes::components::ChildStream>,
     /// Whether the chunks are in global `(s, p, o, g)` order; written as the
     /// root's `quads_sorted`.

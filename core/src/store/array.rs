@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
-use vortex_array::arrays::{BoolArray, ChunkedArray, Struct, StructArray, VarBinViewArray};
-use vortex_array::dtype::{DType, FieldName};
+use vortex_array::arrays::{BoolArray, Struct, StructArray, VarBinViewArray};
+use vortex_array::dtype::FieldName;
 use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, Executable, ExecutionCtx, IntoArray, VortexSessionExecute};
@@ -116,8 +116,14 @@ pub(crate) fn with_subject_stamp(rows: ArrayRef, sorted: bool) -> Result<ArrayRe
 
 /// Assemble per-chunk arrays into one array of `dtype`: an empty
 /// `ChunkedArray` for no chunks, the chunk itself for exactly one, a
-/// `ChunkedArray` otherwise.
-pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Result<ArrayRef> {
+/// `ChunkedArray` otherwise. For chunks already in hand; a stream of them is
+/// read by Vortex's `read_all`.
+#[cfg(any(test, feature = "file-io"))]
+pub(crate) fn chunked_or_single(
+    mut chunks: Vec<ArrayRef>,
+    dtype: vortex_array::dtype::DType,
+) -> Result<ArrayRef> {
+    use vortex_array::arrays::ChunkedArray;
     match chunks.len() {
         1 => Ok(chunks.pop().expect("length checked above")),
         _ => Ok(ChunkedArray::try_new(chunks, dtype)?.into_array()),
@@ -232,6 +238,10 @@ pub(crate) fn search_sorted_bounds(
         SearchResult, SearchSorted, SearchSortedArray, SearchSortedSide,
     };
 
+    let index_of = |result: SearchResult| match result {
+        SearchResult::Found(i) | SearchResult::NotFound(i) => i,
+    };
+
     // Encoded fast path: probe the column's representation directly, canonical
     // or wire-encoded (`from_bytes` adoption, sliced index runs), without
     // decoding it; declines fall through to the generic kernel.
@@ -250,11 +260,25 @@ pub(crate) fn search_sorted_bounds(
         if let Some(encoded) = vortex_rdf_encoded_search::SortedProbe::resolve(searched) {
             return Ok(encoded.bounds(needle));
         }
+        // An encoding the probe declines (per-block bit widths, say) is
+        // searched typed, by Vortex's primitive search, whatever the needle's
+        // own width; a needle past the column's type is past every value.
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        return vortex_array::match_each_unsigned_integer_ptype!(arr.dtype().as_ptype(), |T| {
+            match T::try_from(needle) {
+                Ok(needle) => {
+                    let sorted = vortex_array::search_sorted::SearchSortedPrimitiveArray::<T>::new(
+                        arr, &mut ctx,
+                    );
+                    let lo = sorted.search_sorted(&needle, SearchSortedSide::Left)?;
+                    let hi = sorted.search_sorted(&needle, SearchSortedSide::Right)?;
+                    Ok((index_of(lo), index_of(hi)))
+                }
+                Err(_) => Ok((arr.len(), arr.len())),
+            }
+        });
     }
 
-    let index_of = |result: SearchResult| match result {
-        SearchResult::Found(i) | SearchResult::NotFound(i) => i,
-    };
     // One probe and one execution context serve both searches.
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let sorted = SearchSortedArray::new(arr, &mut ctx);
@@ -311,5 +335,87 @@ mod tests {
         assert_eq!(unsigned_value(&Scalar::from(7i64)), None);
         let null = Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable));
         assert_eq!(unsigned_value(&null), None);
+    }
+
+    /// A sorted `u64` column bit-packed with a width per block, which the
+    /// encoded probe declines, is searched by the fallback: the bounds of
+    /// every value, of values between and past them, of 0 and of `u64::MAX`
+    /// are the `partition_point`s of its values, for a needle of the column's
+    /// width or a narrower one.
+    #[test]
+    fn declined_unsigned_columns_search_typed() {
+        use vortex::encodings::fastlanes::BitPackedData;
+        use vortex_array::arrays::PrimitiveArray;
+        use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+        let data: Vec<u64> = (0..2048u64)
+            .map(|i| if i < 1024 { i / 256 } else { 1000 + 2 * i })
+            .collect();
+        let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let arr = BitPackedData::encode_blocked(&canonical, &[2, 13], &mut ctx)
+            .unwrap()
+            .into_array();
+        assert!(
+            vortex_rdf_encoded_search::SortedProbe::resolve(&arr).is_none(),
+            "the probe declines per-block widths"
+        );
+        let mut needles = data.clone();
+        needles.dedup();
+        needles.extend([0, 5, 1001, 3049, 6000, u64::MAX]);
+        for needle in needles {
+            let want = (
+                data.partition_point(|&v| v < needle),
+                data.partition_point(|&v| v <= needle),
+            );
+            assert_eq!(
+                super::search_sorted_bounds(&arr, &Scalar::from(needle)).unwrap(),
+                want,
+                "needle {needle}"
+            );
+        }
+        assert_eq!(
+            super::search_sorted_bounds(&arr, &Scalar::from(3u8)).unwrap(),
+            (768, 1024),
+            "a narrower needle"
+        );
+    }
+
+    /// A sorted `u32` column bit-packed with a width per block, ending at
+    /// `u32::MAX`, answers `u64` needles by its own type: the needle at the
+    /// type's maximum finds its last row, and needles past it, which no
+    /// `u32` holds, fall past every row.
+    #[test]
+    fn declined_narrow_columns_answer_needles_past_their_type() {
+        use vortex::encodings::fastlanes::BitPackedData;
+        use vortex_array::arrays::PrimitiveArray;
+        use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+        let mut data: Vec<u32> = (0..2048u32)
+            .map(|i| if i < 1024 { i / 256 } else { 1000 + 2 * i })
+            .collect();
+        *data.last_mut().unwrap() = u32::MAX;
+        let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let arr = BitPackedData::encode_blocked(&canonical, &[2, 32], &mut ctx)
+            .unwrap()
+            .into_array();
+        assert!(
+            vortex_rdf_encoded_search::SortedProbe::resolve(&arr).is_none(),
+            "the probe declines per-block widths"
+        );
+        let len = data.len();
+        for (needle, want) in [
+            (u64::from(u32::MAX), (len - 1, len)),
+            (u64::from(u32::MAX) + 1, (len, len)),
+            (u64::MAX, (len, len)),
+            (3, (768, 1024)),
+        ] {
+            assert_eq!(
+                super::search_sorted_bounds(&arr, &Scalar::from(needle)).unwrap(),
+                want,
+                "needle {needle}"
+            );
+        }
     }
 }

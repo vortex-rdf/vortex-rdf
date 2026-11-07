@@ -90,7 +90,16 @@ impl VortexRdfStore {
         let worth_indexing = !prefix_narrowed || selection.len(base_len) >= INDEX_ROUTING_MIN_ROWS;
         let (mut resolved, mut serve) = (None, None);
         if !selection.is_empty(base_len) && pat.any_bound() && worth_indexing {
-            match resolve_indexes_in_memory(&self.indexes, components, &self.layout, pat, codes)? {
+            // A view only windowed or capped reaches its rows in base order.
+            let windowed = matches!(need, IdsNeed::CountOrWindow { reach } if reach < usize::MAX);
+            match resolve_indexes_in_memory(
+                &self.indexes,
+                components,
+                &self.layout,
+                pat,
+                codes,
+                windowed,
+            )? {
                 // The probed term is absent from the data: nothing matches.
                 IndexResolution::Empty => {
                     debug::step!(t, "[match_pattern] In-memory index proved empty");
@@ -260,7 +269,7 @@ impl VortexRdfStore {
 
     /// The residual column filter: `selection` narrowed to its rows matching
     /// every role the fast paths left bound in `pat`, compared column-wise
-    /// over those rows only ([`residual_rows`](residual::residual_rows)). A view
+    /// over those rows only ([`ResidualCompare`](residual::ResidualCompare)). A view
     /// only counted or windowed short of the selection's rows (`need`) leaves
     /// a compare over more rows than one piece holds pending instead
     /// ([`PendingResidual`]), compared only as far as the count or the window
@@ -280,12 +289,48 @@ impl VortexRdfStore {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
-        if need.defers_residual(selection.len(memory.base.len())) {
+        // The statistics ladder's first levels, asked once, before the
+        // compare is deferred or run. The base columns' whole bounds:
+        // an equality no row holds leaves the selection no row (the view
+        // keeps its tail and indexes), one every row holds leaves the
+        // compare, and with none left the selection is the answer. Either way
+        // the residual has narrowed the view, so a serve plan is dropped as a
+        // compare drops it, and the rows read in base order. Then the zones
+        // the selection touches, classed against the equalities left.
+        let rows = selection.len(memory.base.len());
+        let (eqs, classes) =
+            if residual::asks_statistics(rows) && crate::zone_stats::rules::zones_enabled() {
+                match residual::ask_statistics(memory, &selection, eqs)? {
+                    residual::Asked::Nothing => {
+                        observe!(ResidualSettled { none: true });
+                        debug::step!(t, "[match_pattern] In-memory residual settled: no row");
+                        return Ok(Some(ViewSelection::Exact(RowSelection::empty())));
+                    }
+                    residual::Asked::Everything => {
+                        observe!(ResidualSettled { none: false });
+                        debug::step!(t, "[match_pattern] In-memory residual settled: every row");
+                        return Ok(Some(ViewSelection::Exact(selection)));
+                    }
+                    residual::Asked::Open { eqs, classes } => (eqs, classes),
+                }
+            } else {
+                let classes = residual::unasked_classes(memory, &eqs);
+                (eqs, classes)
+            };
+        if need.defers_residual(rows) {
             debug::step!(t, "[match_pattern] In-memory residual left pending");
-            let pending = PendingResidual::new(memory.clone(), selection, eqs);
+            let pending = PendingResidual::new(memory.clone(), selection, eqs, classes);
             return Ok(Some(ViewSelection::Residual(Arc::new(pending))));
         }
-        let narrowed = residual::residual_rows(memory, selection, &eqs, t)?;
+        let narrowed = residual::ResidualCompare {
+            table: residual::ResidualTable::base(memory),
+            selection: &selection,
+            eqs: &eqs,
+            classes: &classes,
+            deleted: None,
+            t,
+        }
+        .rows()?;
         Ok(Some(ViewSelection::Exact(narrowed)))
     }
 }

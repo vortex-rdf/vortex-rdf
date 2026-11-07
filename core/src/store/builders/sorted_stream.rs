@@ -31,14 +31,14 @@ use super::{
 };
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
-use crate::store::array::{chunked_or_single, with_subject_stamp};
+use crate::store::array::with_subject_stamp;
 use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 use crate::store::schema::TermCode;
 
 use crate::debug;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -88,12 +88,15 @@ pub(crate) async fn build_array(
         dict,
         ..
     } = build_chunk_stream(quad_stream, layout, indexes, sizes, None).await?;
-    let chunks: Vec<ArrayRef> = chunks.try_collect().await?;
+    let rows = vortex_array::stream::ArrayStreamExt::read_all(
+        vortex_array::stream::ArrayStreamAdapter::new(dtype, chunks),
+    )
+    .await?;
     let mut components = Vec::with_capacity(children.len());
     for child in children {
         components.push(IndexComponent::from_stream(child).await?);
     }
-    let array = with_subject_stamp(chunked_or_single(chunks, dtype)?, true)?;
+    let array = with_subject_stamp(rows, true)?;
     log::debug!(
         "[SortedStreamBuilder] Materialized {} quads in {:?}",
         array.len(),

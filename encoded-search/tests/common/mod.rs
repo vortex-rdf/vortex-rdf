@@ -238,16 +238,44 @@ pub fn assert_bulk_reads<T: Copy + Into<u64>>(
         (0..data.len()).map(at).collect::<Vec<_>>(),
         "read_into the whole array"
     );
-    for width in [1, 2, 7, 1023, 1024, 1025, 3000] {
+    // Widths on both sides of each bit-packed read's limits: six values read
+    // one by one, the chunk-unpack crossover (16, 32, 96 and 128 values for
+    // 1-, 2-, 4- and 8-byte words) and a whole chunk, from starts strided
+    // across the array and from starts that straddle the first FastLanes
+    // chunk boundary (row 1,024) with each side short. Each window is read,
+    // and counted and searched for needles drawn from the data and one past
+    // it.
+    let widths = [
+        1, 2, 3, 6, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 159, 160,
+        161, 255, 256, 257, 1023, 1024, 1025, 3000,
+    ];
+    let needles: Vec<u64> = (0..data.len())
+        .step_by((data.len() / 5).max(1))
+        .map(at)
+        .chain([u64::MAX])
+        .collect();
+    for width in widths {
         let Some(last) = data.len().checked_sub(width) else {
             continue;
         };
-        for start in (0..=last).step_by((last / 7).max(1)) {
+        let straddling = [
+            1023,
+            1024usize.saturating_sub(width.div_ceil(2)),
+            1025usize.saturating_sub(width),
+        ];
+        let strided = (0..=last).step_by((last / 7).max(1));
+        for start in strided.chain(straddling.into_iter().filter(|&s| s <= last)) {
             let mut out = vec![0; width];
             probe.read_into(start, &mut out);
             let want: Vec<u64> = (start..start + width).map(at).collect();
             assert_eq!(out, want, "read_into({start}..+{width})");
+            for &needle in &needles {
+                assert_eq_search(probe, &at, start, width, needle);
+            }
         }
+    }
+    for &needle in &needles {
+        assert_eq_search(probe, &at, 0, data.len(), needle);
     }
     let lists: [Vec<usize>; 3] = [
         (0..data.len()).filter(|i| i % 5 < 3).collect(),
@@ -265,4 +293,27 @@ pub fn assert_bulk_reads<T: Copy + Into<u64>>(
             &indices[..indices.len().min(6)]
         );
     }
+}
+
+/// `count_eq` and `eq_offsets` over `start..start + width` against a plain
+/// scan of `at`, the offsets appended after what the buffer already holds.
+fn assert_eq_search(
+    probe: &vortex_rdf_encoded_search::SortedProbe,
+    at: &impl Fn(usize) -> u64,
+    start: usize,
+    width: usize,
+    needle: u64,
+) {
+    let want = (start..start + width).filter(|&i| at(i) == needle).count();
+    assert_eq!(
+        probe.count_eq(start, width, needle),
+        want,
+        "count_eq({start}..+{width}, {needle})"
+    );
+    let mut offsets = vec![usize::MAX];
+    probe.eq_offsets(start, width, needle, &mut offsets);
+    let want: Vec<usize> = std::iter::once(usize::MAX)
+        .chain((0..width).filter(|&k| at(start + k) == needle))
+        .collect();
+    assert_eq!(offsets, want, "eq_offsets({start}..+{width}, {needle})");
 }

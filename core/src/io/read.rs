@@ -13,22 +13,13 @@ use vortex_layout::scan::scan_builder::ScanBuilder;
 use crate::error::{Result, VortexRdfError};
 #[cfg(feature = "file-io")]
 use crate::observe::observe;
-use crate::store::array::chunked_or_single;
 
-/// The host's available parallelism, read once; 1 where the target cannot
-/// answer (wasm). The in-flight split count of [`inline_splits`] and of the
-/// store's scan and serve split loops ([`available_parallelism`]).
-static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-});
-
-/// The host's available parallelism: how many workers a scan's per-split
-/// tasks can spread over.
-#[cfg(feature = "file-io")]
+/// The host's available parallelism, as Vortex reads it once for its own
+/// scans; 1 where the target cannot answer (wasm): how many workers a scan's
+/// per-split tasks can spread over, and the in-flight split count of
+/// [`inline_splits`] and of the store's scan and serve split loops.
 pub(crate) fn available_parallelism() -> usize {
-    *AVAILABLE_PARALLELISM
+    vortex::utils::parallelism::get_available_parallelism().unwrap_or(1)
 }
 
 /// Per-split futures (a scan's, or any other split loop's) driven inline:
@@ -39,33 +30,23 @@ pub(crate) fn inline_splits<F, T>(tasks: Vec<F>) -> impl futures::Stream<Item = 
 where
     F: Future<Output = T>,
 {
-    futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)
+    futures::stream::iter(tasks).buffered(available_parallelism())
 }
 
-/// Drive a scan's per-split futures inline ([`inline_splits`]) and collect
-/// the chunks in split (row) order.
-async fn collect_chunks<F>(tasks: Vec<F>) -> Result<Vec<ArrayRef>>
+/// The chunks of a stream of per-split results, in stream order, the splits
+/// that keep no rows left out.
+fn kept<S>(results: S) -> impl futures::Stream<Item = VortexResult<ArrayRef>>
 where
-    F: Future<Output = VortexResult<Option<ArrayRef>>>,
+    S: futures::Stream<Item = VortexResult<Option<ArrayRef>>>,
 {
-    drain_chunks(inline_splits(tasks)).await
+    use futures::TryStreamExt as _;
+    results.try_filter_map(|chunk| futures::future::ready(Ok(chunk)))
 }
 
-/// The non-empty chunks of a stream of per-split results, in stream order.
-async fn drain_chunks<S>(mut results: S) -> Result<Vec<ArrayRef>>
-where
-    S: futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin,
-{
-    let mut chunks = Vec::new();
-    while let Some(chunk) = results.next().await {
-        if let Some(chunk) = chunk? {
-            chunks.push(chunk);
-        }
-    }
-    Ok(chunks)
-}
-
-/// [`collect_chunks`] assembled into one array of `dtype`.
+/// A scan's per-split futures driven inline ([`inline_splits`]) and their
+/// chunks read into one array of `dtype` in split (row) order by Vortex's
+/// [`read_all`](vortex_array::stream::ArrayStreamExt::read_all): the one
+/// chunk itself, or a chunked array of the chunks, empty for none.
 pub(crate) async fn collect_scan<F>(
     dtype: vortex_array::dtype::DType,
     tasks: Vec<F>,
@@ -73,7 +54,10 @@ pub(crate) async fn collect_scan<F>(
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
-    chunked_or_single(collect_chunks(tasks).await?, dtype)
+    use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt as _};
+    Ok(ArrayStreamAdapter::new(dtype, kept(inline_splits(tasks)))
+        .read_all()
+        .await?)
 }
 
 /// `scan` planned and run to completion inline ([`collect_scan`]) into one
@@ -124,7 +108,12 @@ pub(crate) async fn collect_scan_spawned<F>(
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
 {
-    chunked_or_single(drain_chunks(spawned_splits(tasks, window)).await?, dtype)
+    use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt as _};
+    Ok(
+        ArrayStreamAdapter::new(dtype, kept(spawned_splits(tasks, window)))
+            .read_all()
+            .await?,
+    )
 }
 
 /// Materialize a whole layout reader (a file's root, or one of the store
@@ -153,7 +142,10 @@ pub(crate) fn scan_all_reader_sync(reader: vortex_layout::LayoutReaderRef) -> Re
 pub(crate) async fn scan_reader_chunks(
     reader: vortex_layout::LayoutReaderRef,
 ) -> Result<Vec<ArrayRef>> {
-    collect_chunks(reader_scan(reader).build()?).await
+    use futures::TryStreamExt as _;
+    Ok(kept(inline_splits(reader_scan(reader).build()?))
+        .try_collect()
+        .await?)
 }
 
 /// A scan of every row and column of `reader`, on the crate's session.
@@ -209,6 +201,39 @@ mod tests {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+    /// A whole scan of no split is an empty array of the scan's dtype, one of a
+    /// single split is that split's array itself (callers rely on the unwrap),
+    /// and splits that keep no rows are left out.
+    #[tokio::test]
+    async fn whole_scans_unwrap_one_chunk_and_type_an_empty_one() {
+        use futures::future::{Ready, ready};
+
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let none: Vec<Ready<VortexResult<Option<ArrayRef>>>> = Vec::new();
+        let empty = collect_scan(dtype.clone(), none).await.unwrap();
+        assert_eq!((empty.len(), empty.dtype()), (0, &dtype), "an empty scan");
+        let chunk = PrimitiveArray::from_iter([7u64, 8]).into_array();
+        let one = collect_scan(
+            dtype.clone(),
+            vec![ready(Ok(None)), ready(Ok(Some(chunk.clone())))],
+        )
+        .await
+        .unwrap();
+        assert_eq!(one.addr(), chunk.addr(), "one chunk comes back as it is");
+        let two = collect_scan(
+            dtype,
+            vec![
+                ready(Ok(Some(chunk.clone()))),
+                ready(Ok(None)),
+                ready(Ok(Some(chunk.clone()))),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(two.len(), 4, "two chunks, the empty split left out");
+        assert!(two.is::<vortex_array::arrays::Chunked>());
+    }
 
     /// The spawned collector returns the chunks in split order when the splits
     /// finish in reverse: split `i` yields to the scheduler `splits - 1 - i`

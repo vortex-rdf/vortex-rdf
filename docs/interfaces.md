@@ -16,11 +16,11 @@ tests pin each interface
 | What the engine needs | What it calls |
 |---|---|
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L85), [`code_chunks`](../core/src/store/read/chunks.rs#L121) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L162), [`index_components`](../core/src/store/read/metadata.rs#L234), [`partitions`](../core/src/store/query/partitions.rs#L29) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L194)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L160), [`index_components`](../core/src/store/read/metadata.rs#L232), [`partitions`](../core/src/store/query/partitions.rs#L29) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L193)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L151), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
-| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L78) ([§6](#6-a-store-file-through-vortexs-reader)) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L149), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
+| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L80) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
 
@@ -78,16 +78,23 @@ returns its result when its gather completes before the cancel is observed,
 and raises `Cancelled` when the token is cancelled before the call or while
 the call waits for data.
 
-Two calls let a binding build its own chunked read of a pattern:
-[`code_probe`](../core/src/store/query/located.rs#L131) turns a `CodePattern` into
+A `CodePattern` streams through
+[`match_code_chunks`](../core/src/store/query/located/mod.rs#L159):
+`match_code_pattern`'s rows in its order, as chunks of all four code
+columns. A located run that answers the pattern is read a block of
+`batch_rows` of its rows at a time, the rows each block keeps checked as it
+is read, so the run is read once and the stream holds only its place in it;
+any other pattern streams the general match's `code_chunks`. Java's
+`matchCodeChunks` is built on it. Two calls let a binding build its own
+chunked read of a pattern:
+[`code_probe`](../core/src/store/query/located/mod.rs#L187) turns a `CodePattern` into
 the `Probe` that `match_code_pattern` runs when no located run answers it
 (`None` when no quad can match), for `run_probe` and then `code_chunks`;
 and [`decode_row_chunk`](../core/src/store/read/chunks.rs#L148) decodes one of
 a string layout's `row_chunks` into `SharedQuad`s, each distinct term of the
 chunk once, as `shared_quads_vec` decodes it (a Dictionary store's chunks
-hold codes, which `dict_reader` decodes). Java's `matchCodeChunks` is built
-on the first, and its `iterateQuads` on the second for a store without a
-dictionary.
+hold codes, which `dict_reader` decodes). Java's `iterateQuads` is built on
+the second for a store without a dictionary.
 
 **To Arrow.** vortex converts a chunk through its own session:
 `vortex_session().arrow().execute_arrow(chunk, None, &mut ctx)` (the
@@ -157,7 +164,7 @@ is the one way it fails.
 | Field | Meaning |
 |---|---|
 | `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones; a filter a window has evaluated, finding it cuts no row, counts as none. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
-| `sort_order` | The order every read of the view follows (`quads`, `row_chunks`, `code_chunks`, the exports), when it is a known sort and the view reads no tail row. `Some(Posg)` for a view the `index:posg` copy serves with the object unbound (`?p??`, and on file `?p?g`) and for its windows, keeps, partitions and chained matches; `Some(Spog)` for any other view over a globally sorted base (every base this crate writes), a served one's index order being base order within its bound terms. `None` for a view that reads tail rows (they follow the base in append order) and for a served file view whose index child is not globally sorted. |
+| `sort_order` | The order every read of the view follows (`quads`, `row_chunks`, `code_chunks`, the exports), when it is a known sort and the view reads no tail row. `Some(Posg)` for a view the `index:posg` copy serves with the object unbound (`?p??`, and on file `?p?g`) and for its windows, keeps, partitions and chained matches; `Some(Spog)` for any other view over a globally sorted base (every base this crate writes), a served one's index order being base order within its bound terms. `None` for a view that reads tail rows (they follow the base in append order). |
 | `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a file view's pushed-down filter binds by equality, while the view still carries the filter (pending, or evaluated by a window that kept its masks). |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |
 | `served_component` | The index child that answered the match, if any (`index:posg`, …): every read of the view, and of its windows, keeps, partitions and chained matches, follows that child's order. |
@@ -167,7 +174,7 @@ is the one way it fails.
 
 `index_components()` lists the store's index children, each with its
 component name, its `IndexType`, its sort order (`Posg`, `Ospg`, or none
-for the reference pairs), its sortedness provenance, and `rows: usize`, the
+for the reference pairs, whose rows are in `(val, rid)` order), and `rows: usize`, the
 base's row count, since every index child holds one row per base quad. It returns a `Result`, and it classifies
 a child by its implementation slug, leaving out one under a slug this
 version does not know. On a view a match or a narrowing proved empty the
@@ -221,13 +228,63 @@ one located run answers the match's size and the window's code columns, with
 no dictionary search, view or gather, in that table's order. With the
 reference index, a bound `p` or `o` is a run of `index:ref-p` or
 `index:ref-o` listing quad-table rows: the shorter one answers, in
-quad-table order, and any other bound slot is checked at its rows (for runs
-of at most 16,384 rows). A bound subject's run of a subject-sorted quad
-table is checked instead when it is no longer, so `s?o` reads the subject's
-few rows, not a common object's many. Any other pattern goes through the
-general match of the codes' terms. Which of the two answers depends on the
+quad-table order, and any other bound slot is checked at its rows. A bound
+graph is checked on the reference child's own rows, where the child holds
+each row's graph (`g`, in files written from this version on): as the run's
+only check, it is decided a zone at a time from those rows' zone maps and
+recorded graphs, as below, at any length. Otherwise, and in files written
+before, the run is checked row by row, for runs of at most 8,388,608 rows
+(`GAP_ROWS`). With a free predicate, a bound subject's run of a
+subject-sorted quad table (below) is read instead unless a shorter
+reference run answers in its place, so `s?o` reads the subject's few rows
+rather than a common object's many, and a rare object's few rather than a
+hub subject's many.
+Any other pattern goes through the general match of the codes' terms. Which of the two answers depends on the
 store and the pattern alone, so every window of one pattern comes in the
 same order. A code in a position its term kind cannot take matches nothing.
+
+Bound slots that are no such prefix, a bound slot after a free one
+(`(? p o g)` on `index:posg`, `(s p ? g)` or `(s ? o ?)` on the quad table),
+are the run of the table's longest bound prefix, its rows checked against
+the slots past it, unless a reference run is strictly shorter. Those checks
+are decided a zone at a time, by the checked columns' exact zone bounds (no
+row holds a code outside them, every row holds one both equal) and, for the
+graph, by the graphs each zone records. A zone where no row can hold the
+checked code is
+skipped, a zone where every row holds it is taken whole without reading
+the column, and only the zones holding it among other codes are read. A
+count takes such a zone's count from the graphs it records when the graph is
+the one checked slot left in it and the zone lies whole within the run,
+counts it on the column's encoding otherwise when one checked slot is left,
+reading no rows either way, and checks its rows when two are; a window finds
+its first zone from those counts and reads from there. A graph column
+records each zone's graphs with their rows up to 16 of them (files written
+since the `vortexrdf 2026.11.0` edition); a zone of more, or a file written
+before, keeps its bounds alone.
+A run shorter than a zone checks its few rows directly, as a join's probe of
+a row or two is answered faster that way. A longer run asks the statistics
+only when a read needs them: a first window that the run's first 4,096 rows
+fill, such as a 64-row first page, is read from those rows without them.
+The general match, which no located run answers, uses the same statistics.
+On file, a filter of code equalities takes the zones where every row holds
+every code without evaluating itself, and prunes the rest by the zones'
+bounds and recorded graphs. In memory, the residual compare asks the
+columns' whole bounds first, then classes the zones it touches once:
+it skips the zones that cannot hold its codes, takes the zones that hold
+only them, and compares the rest; a count takes a mixed zone from its
+recorded graphs or the column's encoding, and a window skips the zones
+before it by their counts.
+`VORTEX_RDF_ZONES=0` (read once)
+checks every row instead, and leaves the general match's zone pruning to the
+bounds, without the recorded graphs.
+With `VORTEX_RDF_COUNTERS=1` the engine counters count a located run's
+decisions, not the general match's or the residual compare's: the slots the
+footer settles (`zone_column`), the zones settled none and all (`zone_none`,
+`zone_all`), the mixed zones counted from their recorded graphs
+(`zone_recorded`) or on their encoding (`zone_counted`) and the rows read to
+check (`check_read`: a run's span at its first check, the rows kept so far at
+each later one, and a reference run's rows at the quad table), each with its
+rows.
 
 `locate_codes(CodePattern, offset, limit)` is the located run alone: it
 answers only a whole file-backed Dictionary store (no tail, tombstones or
@@ -259,18 +316,18 @@ valid.
   transactional engine therefore compacts on commit, or serves strings
   (`quads`, `row_chunks` on a string layout) while a tail exists, and
   re-takes the dictionary handle after the compaction.
-- A store opened by [`from_file`](../core/src/store/persist/open.rs#L244)
+- A store opened by [`from_file`](../core/src/store/persist/open.rs#L261)
   reads its memory-mapped file in place, and so does every view, partition
   and stream derived from it: the file must not be truncated or rewritten
   while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
-  [`from_file_in_memory`](../core/src/store/persist/open.rs#L254) loads the
+  [`from_file_in_memory`](../core/src/store/persist/open.rs#L271) loads the
   file whole instead and never reads it again.
 
 ## 6. A store file through vortex's reader
 
-[`vortex_session`](../core/src/lib.rs#L78) holds this crate's store layout,
+[`vortex_session`](../core/src/lib.rs#L80) holds this crate's store layout,
 encodings and write editions. vortex's own reader opens a store file through
 it, and the file scans as the quad table: the root hands its dtype, row
 count and scan to child 0
@@ -289,7 +346,7 @@ integration can register the file through vortex's own data source over it
 
 | Concern | File |
 |---|---|
-| `count_code_pattern`, `match_code_pattern`, `code_probe`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
+| `count_code_pattern`, `match_code_pattern`, `match_code_chunks`, `code_probe`, `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located/mod.rs`](../core/src/store/query/located/mod.rs) |
 | `row_chunks`, `code_chunks`, `decode_row_chunk` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
 | `view_statistics`, `index_components`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
 | `partitions` | [`core/src/store/query/partitions.rs`](../core/src/store/query/partitions.rs) |

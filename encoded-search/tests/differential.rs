@@ -243,6 +243,59 @@ fn probes_bitpacked_zero_width() {
     assert_probe(&packed, &data, &[NodeKind::BitPacked]);
 }
 
+/// Bit-packed columns of every stored word width, with values past the packed
+/// width carried as patches: every bulk read (`read_into`, `read_at`,
+/// `count_eq`, `eq_offsets`) answers as the values do, the patches written
+/// over the values unpacked around them, whole and sliced to start inside a
+/// chunk.
+#[test]
+fn bulk_reads_of_bitpacked_words_with_patches() {
+    use vortex_array::arrays::slice::SliceKernel;
+
+    fn check<T>(outliers: [u64; 3])
+    where
+        T: vortex_array::dtype::NativePType + Into<u64> + TryFrom<u64>,
+        <T as TryFrom<u64>>::Error: std::fmt::Debug,
+    {
+        let mut data: Vec<T> = (0..5000u64)
+            .map(|i| T::try_from(i % 100).unwrap())
+            .collect();
+        for (at, outlier) in [17, 1500, 4999].into_iter().zip(outliers) {
+            data[at] = T::try_from(outlier).unwrap();
+        }
+        let canonical = PrimitiveArray::from_iter(data.iter().copied());
+        let packed =
+            vortex_fastlanes::bitpack_compress::bitpack_encode(&canonical, 7, None, &mut ctx())
+                .unwrap()
+                .into_array();
+        let probe = SortedProbe::resolve(&packed).expect("a bit-packed column resolves");
+        assert!(
+            probe.node_kinds().contains(&NodeKind::Patches),
+            "{:?}: the outliers are patches",
+            T::PTYPE
+        );
+        common::assert_bulk_reads(&probe, &data);
+        // Sliced, the node reads from an offset into its first chunk: one
+        // inside the chunk, one across chunks into the patched tail, and a
+        // single patched row.
+        for range in [1..5000usize, 1000..4100, 3000..5000, 1500..1501] {
+            let sliced = <vortex_fastlanes::BitPacked as SliceKernel>::slice(
+                packed.as_::<vortex_fastlanes::BitPacked>(),
+                range.clone(),
+                &mut ctx(),
+            )
+            .unwrap()
+            .unwrap();
+            let probe = SortedProbe::resolve(&sliced).expect("a sliced bit-packed column resolves");
+            common::assert_bulk_reads(&probe, &data[range]);
+        }
+    }
+    check::<u8>([200, 255, 129]);
+    check::<u16>([40_000, 65_535, 1_000]);
+    check::<u32>([1 << 30, u32::MAX as u64, 5_000]);
+    check::<u64>([1 << 40, u64::MAX, 12_345]);
+}
+
 #[test]
 fn probes_bitpacked_with_patches() {
     use vortex_array::arrays::slice::SliceKernel;
@@ -696,6 +749,28 @@ fn probes_dict_permuted_values() {
     assert_probe(&arr, &data, &[NodeKind::Dict, NodeKind::Primitive]);
 }
 
+/// A dictionary holding a value under two codes, as a dictionary array may:
+/// `count_eq` and `eq_offsets` of that value read the values (one code's
+/// scan would miss the other's rows), and of every other value scan its one
+/// code, all answering as the values do.
+#[test]
+fn bulk_reads_of_a_dictionary_with_a_repeated_value() {
+    let values: Vec<u32> = vec![10, 20, 20, 30];
+    let codes: Vec<u16> = (0..5000usize)
+        .map(|i| [0, 1, 2, 1, 3, 2, 2][i % 7])
+        .collect();
+    let data: Vec<u32> = codes.iter().map(|&c| values[usize::from(c)]).collect();
+    let arr = vortex_array::arrays::DictArray::try_new(
+        PrimitiveArray::from_iter(codes).into_array(),
+        PrimitiveArray::from_iter(values).into_array(),
+    )
+    .unwrap()
+    .into_array();
+    let probe = SortedProbe::resolve(&arr).expect("a dictionary resolves");
+    assert!(probe.node_kinds().contains(&NodeKind::Dict));
+    common::assert_bulk_reads(&probe, &data);
+}
+
 #[test]
 fn probes_through_shared_wrapper() {
     // The writer wraps a values child shared between chunks in a `Shared`
@@ -798,4 +873,54 @@ fn bounds_in_edge_windows() {
         probe.bounds(100),
         "full-window bounds_in must equal bounds"
     );
+}
+
+/// Dictionaries of 4, 2,000 and 10,000 values over bit-packed, run-end and
+/// plain codes: reads, counts and finds over windows shorter and longer than
+/// the dictionary answer as a plain scan.
+#[test]
+fn dictionary_counts_and_finds() {
+    for distinct in [4u16, 2_000, 10_000] {
+        let values: Vec<u32> = (0..u32::from(distinct)).map(|v| 1_000 + 7 * v).collect();
+        let spread: Vec<u16> = (0..20_000u32)
+            .map(|i| ((i * 7_919) % u32::from(distinct)) as u16)
+            .collect();
+        let runs: Vec<u16> = (0..20_000u32)
+            .map(|i| ((i / 50) % u32::from(distinct)) as u16)
+            .collect();
+        let shapes = [
+            (
+                compress_with(&[&BITPACKING], &spread),
+                &spread,
+                NodeKind::BitPacked,
+            ),
+            (
+                compress_with(&[&integer::RunEndScheme], &runs),
+                &runs,
+                NodeKind::RunEnd,
+            ),
+            (
+                PrimitiveArray::from_iter(spread.clone()).into_array(),
+                &spread,
+                NodeKind::Primitive,
+            ),
+        ];
+        for (codes, plain, kind) in shapes {
+            let data: Vec<u32> = plain.iter().map(|&c| values[usize::from(c)]).collect();
+            let arr = vortex_array::arrays::DictArray::try_new(
+                codes,
+                PrimitiveArray::from_iter(values.clone()).into_array(),
+            )
+            .unwrap()
+            .into_array();
+            let probe = SortedProbe::resolve(&arr).expect("a dictionary resolves");
+            let kinds = probe.node_kinds();
+            assert_eq!(
+                kinds[..2],
+                [NodeKind::Dict, kind],
+                "{distinct} values: {kinds:?}"
+            );
+            common::assert_bulk_reads(&probe, &data);
+        }
+    }
 }

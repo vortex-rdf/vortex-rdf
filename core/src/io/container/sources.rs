@@ -9,7 +9,7 @@ use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
 use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 
 use super::wire::StoreComponentDescriptor;
-use crate::io::zone_map::ZONE_ROWS;
+use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// A producer of one component's chunks: buffered arrays
 /// ([`BufferedComponentSource`], replayable) or a spill-run merger pulled
@@ -173,7 +173,8 @@ pub(crate) fn id_fields(dtype: &DType) -> Vec<vortex_array::dtype::FieldName> {
 
 /// [`child_strategy`] with explicit [`id_column_strategy`] targets: the
 /// tests' handle on the override, which at 1 MiB and 1 MiB must write exactly
-/// what [`default_child_strategy`] writes.
+/// what [`default_child_strategy`] writes for every column but a graph
+/// column, whose zones also record its graphs ([`graph_column_aggregates`]).
 pub(crate) fn child_strategy_with(
     dtype: &DType,
     codes_target: u64,
@@ -185,12 +186,23 @@ pub(crate) fn child_strategy_with(
     if id_fields.is_empty() {
         return default_child_strategy();
     }
-    let id = id_column_strategy(codes_target, fallback_target);
+    let id = id_column_strategy(codes_target, fallback_target, None);
+    let graph = records_value_counts().then(|| {
+        id_column_strategy(
+            codes_target,
+            fallback_target,
+            Some(graph_column_aggregates()),
+        )
+    });
     let mut builder =
         vortex_file::WriteStrategyBuilder::from_session(&crate::session::VORTEX_SESSION)
             .with_btrblocks_builder(store_compressor());
     for name in id_fields {
-        builder = builder.with_field_writer(FieldPath::from_name(name), Arc::clone(&id));
+        let strategy = match &graph {
+            Some(graph) if name.as_ref() == crate::store::schema::COL_G => Arc::clone(graph),
+            _ => Arc::clone(&id),
+        };
+        builder = builder.with_field_writer(FieldPath::from_name(name), strategy);
     }
     builder.build()
 }
@@ -213,6 +225,7 @@ pub(crate) fn child_strategy_with(
 fn id_column_strategy(
     codes_target: u64,
     fallback_target: u64,
+    aggregate_fns: Option<Arc<[vortex_array::aggregate_fn::AggregateFnRef]>>,
 ) -> Arc<dyn vortex_layout::LayoutStrategy> {
     use std::num::NonZeroUsize;
 
@@ -266,6 +279,7 @@ fn id_column_strategy(
         compress_then_flat,
         ZonedLayoutOptions {
             block_size: NonZeroUsize::new(ZONE_ROWS).expect("a zone is not empty"),
+            aggregate_fns,
             ..Default::default()
         },
     );
@@ -278,6 +292,37 @@ fn id_column_strategy(
             canonicalize: false,
         },
     ))
+}
+
+/// The zone aggregates of a graph column (`g`, a `u64` term code): the zoned
+/// writer's defaults for a `u64` column (exact `max` and `min`, then the NaN
+/// and null counts), and `vortexrdf.value_counts`, each zone's graphs with
+/// their rows ([`value_counts`](crate::zone_stats::value_counts::value_counts)).
+pub(crate) fn graph_column_aggregates() -> Arc<[vortex_array::aggregate_fn::AggregateFnRef]> {
+    use vortex_array::aggregate_fn::fns::{
+        max::Max, min::Min, nan_count::NanCount, null_count::NullCount,
+    };
+    use vortex_array::aggregate_fn::{
+        AggregateFnVTableExt as _, EmptyOptions, NumericalAggregateOpts,
+    };
+    Arc::from([
+        Max.bind(NumericalAggregateOpts::skip_nans()),
+        Min.bind(NumericalAggregateOpts::skip_nans()),
+        NanCount.bind(EmptyOptions),
+        NullCount.bind(EmptyOptions),
+        crate::zone_stats::value_counts::value_counts(),
+    ])
+}
+
+/// Whether graph columns are written with [`graph_column_aggregates`]:
+/// always, but for a test standing for a file written before them
+/// ([`ForcedValueCounts`](crate::store::test_hooks::ForcedValueCounts)).
+fn records_value_counts() -> bool {
+    #[cfg(test)]
+    if let Some(on) = crate::store::test_hooks::forced_value_counts() {
+        return on;
+    }
+    true
 }
 
 /// The dictionary child's strategy: every source chunk written verbatim as
@@ -302,7 +347,7 @@ pub(crate) fn dict_child_strategy(
             FlatLayoutStrategy::default(),
             ZonedLayoutOptions {
                 block_size,
-                aggregate_fns: Some(crate::io::zone_map::exact_bound_aggregates()),
+                aggregate_fns: Some(crate::zone_stats::zone_map::exact_bound_aggregates()),
                 concurrency: std::num::NonZeroUsize::MIN,
             },
         )),

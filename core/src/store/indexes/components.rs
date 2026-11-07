@@ -1,7 +1,8 @@
 //! The persistence model of a secondary index: the *component*, the one form
 //! index data takes. One [`IndexComponent`] is one child of a native store
 //! file, or its in-memory twin: rows under the child's own column names,
-//! carrying the writer's sortedness provenance. Builders emit components
+//! sorted by its key order, as every index child is by definition (a writer
+//! that leaves one out of order writes a wrong file). Builders emit components
 //! beside primary-only quad rows; this module streams a child's rows to the
 //! writer, which spells its descriptor ([`ChildStream`]), adopts a
 //! persisted one back into memory ([`adopt_component`]), maps an
@@ -36,6 +37,7 @@ use crate::session::VORTEX_SESSION;
 use crate::store::array::{into_struct_array, make_string_array, named_struct};
 use crate::store::probes::StructProbes;
 use crate::store::schema::{ROW_ID_PTYPE, RowId, TermCode};
+use crate::zone_stats::zone_map::{ColumnZones, ZONE_ROWS};
 
 use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 
@@ -84,8 +86,7 @@ pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u
 }
 
 /// A persisted child adopted as an in-memory [`IndexComponent`] under the
-/// registry row `identity`, `sorted` the descriptor's provenance, reading
-/// nothing of it now: its scan and canonicalization wait for the component's
+/// registry row `identity`, reading nothing of it now: its scan and canonicalization wait for the component's
 /// first use (how `from_bytes` adopts its children, off the wire TOC alone).
 /// `reader` MUST sit over a buffer-backed segment source (a `from_bytes`
 /// buffer): [`IndexComponent::rows`] drives its scan synchronously, and only
@@ -95,7 +96,6 @@ pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u
 pub(crate) fn adopt_component(
     identity: &'static ComponentIdentity,
     reader: vortex_layout::LayoutReaderRef,
-    sorted: bool,
 ) -> IndexComponent {
     IndexComponent {
         identity,
@@ -103,8 +103,8 @@ pub(crate) fn adopt_component(
             cell: OnceLock::new(),
             pending: Some(reader),
         }),
-        sorted,
         probes: StructProbes::new(),
+        graph_zones: None,
     }
 }
 
@@ -128,12 +128,6 @@ pub(crate) struct IndexComponent {
     /// `Arc<[IndexComponent]>` roster the store's views share, sees one
     /// materialization.
     rows: Arc<ComponentRows>,
-    /// Whether the sort-key columns are GLOBALLY sorted: the writer's
-    /// provenance, not an inspection. Binary-search resolution is gated on
-    /// it, and per-chunk-sorted data must never claim it (a false stamp
-    /// corrupts query results; see the `sorted` field on the wire
-    /// descriptor).
-    pub(crate) sorted: bool,
     /// The encoded-search probes over the component's columns, resolved
     /// lazily and shared by every clone, so the resolvers' searches and the
     /// serve path's point reads skip the per-call encoding-tree walk. The
@@ -141,6 +135,15 @@ pub(crate) struct IndexComponent {
     /// guard holds for the component's lifetime; [`rebuilt`](Self::rebuilt)
     /// takes a fresh cache.
     probes: Arc<StructProbes>,
+    /// The zone map of the component's graph column (`g`), with each zone's
+    /// recorded graphs, when that column is a code column zoned in
+    /// [`ZONE_ROWS`]-row zones covering the component's rows: taken while a
+    /// build compresses the component, or read from its child's zone table
+    /// at load. A run bound to a graph checks it inside the component, zone
+    /// by zone. `None` for a string column, a reference child written
+    /// without a graph column, and parts that carry none. Every rebuild of
+    /// the same rows keeps it.
+    graph_zones: Option<Arc<ColumnZones>>,
 }
 
 /// An [`IndexComponent`]'s rows: `cell` holds them as one struct in child
@@ -155,19 +158,15 @@ struct ComponentRows {
 impl IndexComponent {
     /// A component whose rows are already canonical in memory: the
     /// construction every builder's emission uses.
-    pub(crate) fn built(
-        identity: &'static ComponentIdentity,
-        array: StructArray,
-        sorted: bool,
-    ) -> Self {
+    pub(crate) fn built(identity: &'static ComponentIdentity, array: StructArray) -> Self {
         Self {
             identity,
             rows: Arc::new(ComponentRows {
                 cell: OnceLock::from(array),
                 pending: None,
             }),
-            sorted,
             probes: StructProbes::new(),
+            graph_zones: None,
         }
     }
 
@@ -187,15 +186,13 @@ impl IndexComponent {
         Ok(self.rows.cell.get_or_init(|| executed))
     }
 
-    /// This component as a [`ChildStream`] over its rows, carrying its own
-    /// sortedness provenance: how a store's serialization hands its
-    /// components to the writer. A deferred adoption materializes here, so
+    /// This component as a [`ChildStream`] over its rows: how a store's
+    /// serialization hands its components to the writer. A deferred adoption materializes here, so
     /// the written child is byte-identical to an eagerly adopted one's.
     pub(crate) fn to_stream(&self) -> Result<ChildStream> {
         let array = self.rows()?.clone().into_array();
         Ok(ChildStream {
             identity: self.identity,
-            sorted: self.sorted,
             source: Arc::new(crate::io::container::BufferedComponentSource::try_new(
                 vec![array],
             )?),
@@ -212,18 +209,13 @@ impl IndexComponent {
 
     /// The inverse of [`to_stream`](Self::to_stream): the child's streamed
     /// chunks executed to one struct in child schema, under the child's
-    /// identity and with its `sorted` provenance.
+    /// identity.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) async fn from_stream(child: ChildStream) -> Result<Self> {
-        use futures::TryStreamExt as _;
+        use vortex_array::stream::ArrayStreamExt as _;
 
-        let chunks: Vec<ArrayRef> = child.source.open()?.try_collect().await?;
-        let rows = crate::store::array::chunked_or_single(chunks, child.source.dtype().clone())?;
-        Ok(Self::built(
-            child.identity,
-            into_struct_array(rows)?,
-            child.sorted,
-        ))
+        let rows = child.source.open()?.read_all().await?;
+        Ok(Self::built(child.identity, into_struct_array(rows)?))
     }
 
     /// Whether the rows have been canonicalized yet (a test-hook probe).
@@ -242,8 +234,8 @@ impl IndexComponent {
     /// This component with its rows materialized and passed through
     /// `transform`, held as canonical built rows under a fresh probe cache
     /// (the rebuilt rows are a different array, so the old cache's identity
-    /// guard would only ever decline against them). Identity and sortedness
-    /// provenance carry across unchanged.
+    /// guard would only ever decline against them). The identity carries
+    /// across unchanged.
     fn rebuilt(self, transform: impl FnOnce(ArrayRef) -> Result<ArrayRef>) -> Result<Self> {
         let rows = self.rows()?.clone().into_array();
         // The transforms only ever hand back a struct (their input was one),
@@ -282,17 +274,65 @@ impl IndexComponent {
     /// sorted probes bind the compressed columns directly.
     ///
     /// [`resident::with_compressed_int_children`]: crate::store::resident::with_compressed_int_children
+    ///
+    /// The pass that compresses the graph column takes its zone map, with
+    /// each zone's recorded graphs ([`graph_zones`](Self::graph_zones)).
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        self.rebuilt(|rows| {
-            crate::store::resident::with_compressed_int_children(rows, false).map(|(rows, _)| rows)
-        })
+        let mut graph = None;
+        let component = self.rebuilt(|rows| {
+            let (rows, zones) = crate::store::resident::with_compressed_int_children(
+                rows,
+                crate::store::resident::CodeTable::Component,
+            )?;
+            graph = zones.of_column(crate::store::schema::COL_G).cloned();
+            Ok(rows)
+        })?;
+        Ok(component.with_graph_zones(graph))
+    }
+
+    /// The zone map of the component's graph column, with each zone's
+    /// recorded graphs, if it keeps one.
+    pub(crate) fn graph_zones(&self) -> Option<&Arc<ColumnZones>> {
+        self.graph_zones.as_ref()
+    }
+
+    /// This component keeping `zones` as its graph column's zone map, or none
+    /// when they do not cover its rows in [`ZONE_ROWS`]-row zones: a map of
+    /// other zones or rows would not line up with them. Reads no row, a
+    /// deferred adoption's count coming from its reader.
+    pub(crate) fn with_graph_zones(self, zones: Option<Arc<ColumnZones>>) -> Self {
+        let rows = self.row_count();
+        let graph_zones = zones.filter(|zones| {
+            zones.zone_len() == ZONE_ROWS as u64
+                && zones.zones() == rows.div_ceil(ZONE_ROWS as u64)
+                && zones.row_count() == rows
+        });
+        Self {
+            graph_zones,
+            ..self
+        }
+    }
+
+    /// How many rows the component holds: its rows' length, or a deferred
+    /// adoption's reader's count, which materializes nothing.
+    fn row_count(&self) -> u64 {
+        match (self.rows.cell.get(), &self.rows.pending) {
+            (Some(rows), _) => rows.len() as u64,
+            (None, Some(reader)) => reader.row_count(),
+            (None, None) => {
+                unreachable!("a component without a pending adoption holds its built rows")
+            }
+        }
     }
 
     /// The cached encoded-search probe over the component's `column`, or
     /// `None` when the column's encoding declines (callers fall back to the
     /// per-call search). Resolving materializes a deferred component, exactly
     /// like [`rows`](Self::rows).
-    fn probe(&self, column: &str) -> Option<Arc<vortex_rdf_encoded_search::OwnedSortedProbe>> {
+    pub(super) fn probe(
+        &self,
+        column: &str,
+    ) -> Option<Arc<vortex_rdf_encoded_search::OwnedSortedProbe>> {
         self.probes
             .by_name(self.rows().ok()?.as_ref(), column)
             .flatten()
@@ -365,34 +405,33 @@ impl IndexComponent {
         Ok(Some(within.start + lo..within.start + hi))
     }
 
-    /// The component named `name`, if its provenance says globally sorted:
-    /// the front gate of the in-memory resolver, where an absent or not
-    /// globally sorted component declines (per-chunk-sorted rows are not
-    /// binary-searchable).
-    pub(crate) fn find_sorted<'a>(
+    /// The component named `name`: the front gate of the in-memory
+    /// resolver, which declines where the store holds none. Its rows are
+    /// sorted by its key order, as every index child's are.
+    pub(crate) fn find<'a>(
         components: &'a [IndexComponent],
         name: &str,
     ) -> Option<&'a IndexComponent> {
-        components
-            .iter()
-            .find(|c| c.identity.name == name && c.sorted)
+        components.iter().find(|c| c.identity.name == name)
     }
 }
 
-/// An index child on its way to the writer: the registry row it is, the
-/// writer's sortedness provenance, and the source of its rows. A store's
+/// An index child on its way to the writer: the registry row it is and the
+/// source of its rows, in its key order. A store's
 /// components ([`IndexComponent::to_stream`]) and the out-of-core builder's
 /// merged children travel as one, and the writer alone spells its descriptor
 /// ([`into_write`](Self::into_write)), as it does the dictionary's.
 pub(crate) struct ChildStream {
     pub(crate) identity: &'static ComponentIdentity,
-    pub(crate) sorted: bool,
     pub(crate) source: Arc<dyn NativeComponentSource>,
 }
 
 impl ChildStream {
     /// This child as a native child write: its descriptor names the
-    /// component and its slug, carries `sorted` and the source's dtype, and
+    /// component and its slug, says `sorted: true` (an index child is in its
+    /// key order by definition; the term resolvers of 0.14 and earlier search
+    /// a child only when its descriptor says so) and carries the source's
+    /// dtype, and
     /// the child is written through [`child_strategy`]. The one spelling of
     /// an index child's descriptor.
     pub(crate) fn into_write(self) -> Result<NativeComponentWrite> {
@@ -405,7 +444,7 @@ impl ChildStream {
                 implementation: self.identity.slug.into(),
                 version: INDEX_VERSION,
                 required: false,
-                sorted: self.sorted,
+                sorted: true,
                 bracketed_iris: false,
                 dtype,
             },
@@ -428,18 +467,29 @@ pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes 
 /// the Dictionary layout), with the array a column of them assembles into:
 /// the one spelling both families' builders emit their term columns through.
 pub(crate) trait TermColumn: Clone + Default + Ord {
+    /// Whether a reference child of this encoding holds each row's graph:
+    /// the Dictionary layout's codes do, the string layouts' terms don't.
+    /// Read by the out-of-core builder, which wasm32-unknown-unknown builds
+    /// without.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), expect(dead_code))]
+    const RECORDS_GRAPH: bool;
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
     where
         Self: 'a;
 }
 
 impl TermColumn for String {
+    const RECORDS_GRAPH: bool = false;
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         make_string_array(it.map(String::as_str))
     }
 }
 
 impl TermColumn for TermCode {
+    const RECORDS_GRAPH: bool = true;
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         PrimitiveArray::from_iter(it.copied()).into_array()
     }
@@ -447,7 +497,7 @@ impl TermColumn for TermCode {
 
 /// An index's two persisted children from one family's columns each, under
 /// `child_columns`: the in-memory builders' emission, globally sorted by
-/// construction and handed over with that provenance.
+/// construction.
 pub(crate) fn components_from(
     child_columns: &[&'static str],
     families: [(&'static ComponentIdentity, Vec<ArrayRef>); 2],
@@ -457,7 +507,7 @@ pub(crate) fn components_from(
         .map(|(identity, columns)| {
             let len = columns.first().map_or(0, |column| column.len());
             let rows = named_struct(child_columns, columns, len)?;
-            Ok(IndexComponent::built(identity, rows, true))
+            Ok(IndexComponent::built(identity, rows))
         })
         .collect()
 }
@@ -680,7 +730,7 @@ mod tests {
         let val = PrimitiveArray::from_iter([0 as TermCode]).into_array();
         let rid = PrimitiveArray::from_iter([0 as RowId]).into_array();
         let rows = named_struct(&["val", "rid"], vec![val, rid], 1).unwrap();
-        IndexComponent::built(identity, rows, true)
+        IndexComponent::built(identity, rows)
     }
 
     #[test]
