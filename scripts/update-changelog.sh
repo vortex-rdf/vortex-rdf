@@ -10,10 +10,11 @@
 # also sets X.Y.Z everywhere a version is declared: the three version lines of
 # Cargo.toml ([workspace.package] and the two path dependencies), the workspace
 # entries of Cargo.lock and bench-compare/Cargo.lock (`cargo update -w`),
-# js/package.json with its lock (`npm version`), and the project version of
-# java/pom.xml (its first <version>, the line release.yml
-# checks). Python inherits the workspace version through maturin. Released
-# sections (## [x.y.z]) are kept verbatim.
+# js/package.json with its lock (`npm version`), the project version of
+# java/pom.xml (its first <version>, the line release.yml checks), and the
+# Maven and Gradle install snippets of java/README.md. Python inherits the
+# workspace version through maturin. Released sections (## [x.y.z]) are kept
+# verbatim.
 #
 # Cut the changelog last, once nothing else is waiting to land: a cut section
 # is frozen (the script refuses to cut the same version twice), so a commit
@@ -134,6 +135,19 @@ awk -v ver="$ver" '!done && sub(/<version>[^<]*<\/version>/, "<version>" ver "</
 mv java/pom.xml.tmp java/pom.xml
 pom_version="$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' java/pom.xml | head -n 1)"
 [ "$pom_version" = "$ver" ] || { echo "error: java/pom.xml's version is '$pom_version', not $ver; check it by hand" >&2; exit 1; }
+# java/README.md's install snippets pin the release: Maven's <version> on the
+# line after <artifactId>vortex-rdf</artifactId>, and Gradle's coordinate.
+awk -v ver="$ver" '
+  after_artifact { sub(/<version>[^<]*<\/version>/, "<version>" ver "</version>") }
+  { after_artifact = /<artifactId>vortex-rdf<\/artifactId>/; print }' java/README.md \
+  | sed -E "s/(io\.github\.vortex-rdf:vortex-rdf:)[0-9][0-9A-Za-z.-]*/\1$ver/g" > java/README.md.tmp
+mv java/README.md.tmp java/README.md
+maven_pins="$(awk -v v="<version>$ver</version>" 'after && index($0, v) { n++ } { after = /<artifactId>vortex-rdf<\/artifactId>/ } END { print n + 0 }' java/README.md)"
+gradle_pins="$(grep -cF "io.github.vortex-rdf:vortex-rdf:$ver\"" java/README.md || true)"
+if [ "$maven_pins" != 1 ] || [ "$gradle_pins" != 1 ]; then
+  echo "error: java/README.md pins $ver in $maven_pins Maven and $gradle_pins Gradle snippet(s), not one each; check it by hand" >&2
+  exit 1
+fi
 
 write_changelog --tag "$version"
 echo "Cut release $version: versions set to $ver, and its CHANGELOG.md section written."

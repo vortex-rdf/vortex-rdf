@@ -15,14 +15,14 @@ From 0.14.0 the bindings are on Maven Central as `io.github.vortex-rdf:vortex-rd
 <dependency>
   <groupId>io.github.vortex-rdf</groupId>
   <artifactId>vortex-rdf</artifactId>
-  <version>0.14.0</version>
+  <version>0.15.0</version>
 </dependency>
 ```
 
 With Gradle:
 
 ```kotlin
-implementation("io.github.vortex-rdf:vortex-rdf:0.14.0")
+implementation("io.github.vortex-rdf:vortex-rdf:0.15.0")
 ```
 
 The jar carries the native library for Linux on x86_64 and arm64 (glibc 2.28 or later), macOS on Intel and Apple Silicon, and Windows on x64, and loads the one for its platform with nothing to set. [Build](#build) says how the JVM finds the library, how to point it at another, and the flag Java 24 and later want.
