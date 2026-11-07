@@ -183,11 +183,41 @@ impl ConjunctOrder {
 }
 
 /// The every-row step of a filter of code equalities over a file: each
-/// equality's quad slot and code, and the file's quad zone maps
-/// ([`ZoneMaps`]) that decide it.
+/// equality's quad slot and code, the file's quad zone maps ([`ZoneMaps`])
+/// that decide it, and the equalities' zone checks over the quad table,
+/// built from the maps once, by the first split that asks
+/// ([`zone_set`](Self::zone_set)).
 struct EveryRow {
     columns: Vec<(usize, u64)>,
     maps: ZoneMaps,
+    set: tokio::sync::OnceCell<Option<ZoneSet>>,
+}
+
+impl EveryRow {
+    /// The equalities' zone checks over the quad table: `None` where an
+    /// equality's column has no zone map, as a filter over such a column
+    /// takes no zone whole. Built once; a failed read is tried again by the
+    /// next split.
+    async fn zone_set(&self) -> Result<Option<&ZoneSet>> {
+        let set = self
+            .set
+            .get_or_try_init(|| async {
+                let mut checks = Vec::with_capacity(self.columns.len());
+                for (bit, &(slot, code)) in self.columns.iter().enumerate() {
+                    let Some(zones) = self.maps.get(FileTable::Quads, slot).await? else {
+                        return Ok(None);
+                    };
+                    checks.push(ZoneCheck {
+                        bit: bit as u32,
+                        code,
+                        zones,
+                    });
+                }
+                Result::Ok(ZoneSet::new(checks, 0))
+            })
+            .await?;
+        Ok(set.as_ref())
+    }
 }
 
 /// The every-row step `filter` takes over `file`, decided once per
@@ -208,6 +238,7 @@ fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<Every
     (!columns.is_empty()).then(|| EveryRow {
         columns,
         maps: file.zone_maps(),
+        set: tokio::sync::OnceCell::new(),
     })
 }
 
@@ -216,9 +247,8 @@ fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<Every
 /// rest of `start` for the filter to evaluate; without the step, `None` and
 /// `start`. A zone qualifies where each equality's column has a zone map
 /// whose bounds there are both its code, the class all of the equalities'
-/// [`ZoneSet`]: the rule Vortex's pruning of `col != c` applies, read off
-/// the maps the file reads once ([`ZoneMaps`]), only for the split's own
-/// zones.
+/// zone checks ([`EveryRow::zone_set`]): the rule Vortex's pruning of
+/// `col != c` applies, read for the split's own zones.
 async fn every_row_zones(
     every_row: Option<&EveryRow>,
     range: &Range<u64>,
@@ -230,18 +260,7 @@ async fn every_row_zones(
     if range.is_empty() || start.all_false() {
         return Ok((None, start));
     }
-    let mut checks = Vec::with_capacity(every_row.columns.len());
-    for (bit, &(slot, code)) in every_row.columns.iter().enumerate() {
-        let Some(zones) = every_row.maps.get(FileTable::Quads, slot).await? else {
-            return Ok((None, start));
-        };
-        checks.push(ZoneCheck {
-            bit: bit as u32,
-            code,
-            zones,
-        });
-    }
-    let Some(set) = ZoneSet::new(checks, 0) else {
+    let Some(set) = every_row.zone_set().await? else {
         return Ok((None, start));
     };
     let mut slices: Vec<(usize, usize)> = Vec::new();
