@@ -188,13 +188,15 @@ jobs:
         platform:
           - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64 }
           - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64 }
-          - { name: macos-arm64, runner: macos-14, target: aarch64 }
+          # macos-15, Apple Silicon: GitHub retired macos-14 on 2026-11-02, and
+          # its jobs are cancelled before they start (v0.15.0's tag run).
+          - { name: macos-arm64, runner: macos-15, target: aarch64 }
           # GitHub retired the Intel macos-13 runner (jobs queue forever), so
           # the x86_64 wheel is cross-compiled on Apple Silicon: maturin-action
           # installs the x86_64-apple-darwin Rust target, and bindgen picks the
           # arch up from $TARGET. The transitional macos-15-intel runner would
           # build natively but sunsets in 2027.
-          - { name: macos-x86_64, runner: macos-14, target: x86_64 }
+          - { name: macos-x86_64, runner: macos-15, target: x86_64 }
           - { name: windows-x64, runner: windows-latest, target: x64 }
     steps:
       - uses: actions/checkout@v7
@@ -298,7 +300,8 @@ jobs:
           path: target/release/libvortex_rdf_jni.so
           if-no-files-found: error
 
-  # macOS (Intel cross-compiled on Apple Silicon, as for the wheels) and Windows.
+  # macOS (Intel cross-compiled on Apple Silicon, as for the wheels, on the
+  # same macos-15 runner) and Windows.
   jni-macos-windows:
     name: JNI library (${{ matrix.platform }})
     needs: [ci, docs, verify-versions]
@@ -308,8 +311,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { platform: macos-aarch64, runner: macos-14, target: aarch64-apple-darwin, file: libvortex_rdf_jni.dylib }
-          - { platform: macos-x86_64, runner: macos-14, target: x86_64-apple-darwin, file: libvortex_rdf_jni.dylib }
+          - { platform: macos-aarch64, runner: macos-15, target: aarch64-apple-darwin, file: libvortex_rdf_jni.dylib }
+          - { platform: macos-x86_64, runner: macos-15, target: x86_64-apple-darwin, file: libvortex_rdf_jni.dylib }
           - { platform: windows-x86_64, runner: windows-latest, target: x86_64-pc-windows-msvc, file: vortex_rdf_jni.dll }
     steps:
       - uses: actions/checkout@v7
