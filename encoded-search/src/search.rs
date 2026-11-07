@@ -117,7 +117,25 @@ impl EqSink for Count {
     }
 
     fn matching<T: Copy + PartialEq>(&mut self, _: usize, values: &[T], needle: T) {
-        self.0 += values.iter().filter(|&&v| v == needle).count();
+        self.0 += if size_of::<T>() < size_of::<u64>() {
+            // Narrow words are tallied in a byte, 255 at a time, so whole
+            // vectors of them compare and add as they are: a `usize` tally
+            // widens each comparison to 64 bits first, which made counts of
+            // byte codes a third slower than a scalar loop (the probe bench's
+            // `count_eq_probe/graphs_alternating_2m`). A byte tally of 64-bit
+            // words costs more than it saves, so those count as they compare.
+            values
+                .chunks(usize::from(u8::MAX))
+                .map(|block| {
+                    let tally = block
+                        .iter()
+                        .fold(0u8, |tally, &v| tally + u8::from(v == needle));
+                    usize::from(tally)
+                })
+                .sum::<usize>()
+        } else {
+            values.iter().filter(|&&v| v == needle).count()
+        };
     }
 }
 
