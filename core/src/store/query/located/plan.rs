@@ -73,19 +73,9 @@ impl VortexRdfStore {
                 REFERENCES.map(|(table, _)| file.component_column_chunks(table.component()?, "g")),
             )
         });
-        let run = |columns: Columns, rows, checked| LocatedRun {
-            codes,
-            columns,
-            rows,
-            checked,
-            source: source.clone(),
-            session: session.clone(),
-            zones: None,
-            pending: None,
-        };
         // The table whose key order starts with the most bound slots, when
         // none starts with all of them: a bound graph after a free slot.
-        let mut gap: Option<(usize, usize)> = None;
+        let mut gap: Option<(usize, usize, &Columns)> = None;
         for (table, ((file_table, order), columns)) in TABLES.iter().zip(&tables.sorted).enumerate()
         {
             let prefix = order.iter().take_while(|&&c| codes[c].is_some()).count();
@@ -96,8 +86,8 @@ impl VortexRdfStore {
                 continue;
             };
             if prefix != bound {
-                if prefix > 0 && gap.is_none_or(|(_, longest)| prefix > longest) {
-                    gap = Some((table, prefix));
+                if prefix > 0 && gap.is_none_or(|(_, longest, _)| prefix > longest) {
+                    gap = Some((table, prefix, columns));
                 }
                 continue;
             }
@@ -105,10 +95,17 @@ impl VortexRdfStore {
             else {
                 continue;
             };
-            return Ok(Some(run(
-                columns.clone(),
-                RunRows::Table(found),
+            let table = RunTable::Sorted {
+                columns: columns.clone(),
+                table: *file_table,
+            };
+            return Ok(Some(LocatedRun::new(
+                codes,
+                found,
+                table,
                 Vec::new(),
+                source,
+                session.clone(),
             )));
         }
         // The bound reference slots' runs, each searched once and only for a
@@ -117,7 +114,7 @@ impl VortexRdfStore {
         // so its run is never shorter), and the lookup by reference, reached
         // when the gap step does not answer, reads the rest too.
         let past_prefix = |slot: usize| {
-            gap.is_none_or(|(table, prefix)| !TABLES[table].1[..prefix].contains(&slot))
+            gap.is_none_or(|(table, prefix, _)| !TABLES[table].1[..prefix].contains(&slot))
         };
         let mut runs = reference_runs(codes, tables, past_prefix, &source, session).await?;
         // The run of the longest bound prefix, its rows checked against the
@@ -125,8 +122,7 @@ impl VortexRdfStore {
         // answers in its place: one strictly shorter and within the cap on a
         // run checked row by row, as a hub subject's many quads give way to
         // its rare object's few (`s?o`).
-        if let Some((table, prefix)) = gap {
-            let columns = tables.sorted[table].as_ref().expect("a table with columns");
+        if let Some((table, prefix, columns)) = gap {
             let order = &TABLES[table].1;
             let shorter_reference = |found: &Range<u64>| {
                 runs.iter().flatten().any(|run| {
@@ -138,12 +134,21 @@ impl VortexRdfStore {
                 .await?
                 .filter(|found| !shorter_reference(found))
             {
-                let checked: Vec<usize> = order[prefix..]
+                let checks = order[prefix..]
                     .iter()
-                    .copied()
-                    .filter(|&slot| codes[slot].is_some())
+                    .filter_map(|&slot| {
+                        let code = codes[slot]?;
+                        let column = columns[slot].clone();
+                        let kind = CheckKind::Positional { column };
+                        Some(Check { slot, code, kind })
+                    })
                     .collect();
-                let mut located = run(columns.clone(), RunRows::Table(found), checked);
+                let table = RunTable::Sorted {
+                    columns: columns.clone(),
+                    table: TABLES[table].0,
+                };
+                let mut located =
+                    LocatedRun::new(codes, found, table, checks, source.clone(), session.clone());
                 // A run of a zone or more asks the file's statistics; a
                 // shorter one reads its few rows faster than they answer
                 // (a join's one-row probe: 1 against 45 µs). A run within
@@ -153,14 +158,13 @@ impl VortexRdfStore {
                 if zones_enabled() && located.len() >= STATISTICS_ROWS {
                     located.pending = Some(PendingStatistics {
                         file: Arc::clone(file),
-                        table: TABLES[table].0,
                     });
                     if located.len() > gap_rows() {
                         located.ask_statistics().await?;
                     }
                 }
                 // A run still checked row by row is capped, as without zones.
-                if located.checked.is_empty()
+                if located.checks.is_empty()
                     || located.zones.is_some()
                     || located.len() <= gap_rows()
                 {
@@ -173,28 +177,26 @@ impl VortexRdfStore {
                 *run = run.take().or(found);
             }
         }
-        let Some((columns, rows, checked, index)) = by_reference(codes, tables, runs) else {
+        let Some(mut located) = by_reference(codes, tables, runs, source, session) else {
             return Ok(None);
         };
-        let mut located = run(columns, rows, checked);
         // A run checked against the graph alone, its child holding each
-        // row's graph, asks the statistics as a table run does: its child's
-        // own `g` zones decide it.
-        if matches!(&located.rows, RunRows::Reference { graph: Some(_), .. })
-            && located.checked == [GRAPH_SLOT]
+        // row's graph (its one check a positional one), asks the statistics
+        // as a table run does: its child's own `g` zones decide it.
+        if !located.checks.is_empty()
+            && located.checks.iter().all(Check::is_positional)
             && zones_enabled()
             && located.len() >= STATISTICS_ROWS
         {
             located.pending = Some(PendingStatistics {
                 file: Arc::clone(file),
-                table: REFERENCES[index].0,
             });
             if located.len() > gap_rows() {
                 located.ask_statistics().await?;
             }
         }
         // A reference run still checked row by row is capped.
-        if located.checked.is_empty() || located.zones.is_some() || located.len() <= gap_rows() {
+        if located.checks.is_empty() || located.zones.is_some() || located.len() <= gap_rows() {
             return Ok(Some(located));
         }
         Ok(None)
@@ -234,48 +236,68 @@ pub(super) async fn reference_runs(
 /// [`located_run`](VortexRdfStore::located_run) through a reference index:
 /// the shortest of `runs` ([`reference_runs`]) gives the quad-table rows in
 /// order, all of them, or, with other slots bound, those that hold them,
-/// checked: against the other reference's run for `p` or `o`, by reading the
-/// quad table for `s`, and for `g` by the child's own `g` where it holds one,
-/// else the quad table's. Answers the table the rows are read from (the quad
-/// table), where they are, the slots checked, and the reference index; the
-/// caller caps a run its statistics leave checked row by row at
-/// [`GAP_ROWS`]. A bound subject's own run is the gap step's, which reads it
-/// unless a shorter reference run answers in its place.
+/// checked: `g` in place on the child's own `g` where it holds one, the
+/// other slots by row id in the quad table, `p` or `o` against the other
+/// reference's run where it was located. The caller caps a run its
+/// statistics leave checked row by row at [`GAP_ROWS`]. A bound subject's
+/// own run is the gap step's, which reads it unless a shorter reference run
+/// answers in its place.
 pub(super) fn by_reference(
     codes: [Option<TermCode>; 4],
     tables: &LocatedTables,
     runs: [Option<Range<u64>>; 2],
-) -> Option<(Columns, RunRows, Vec<usize>, usize)> {
+    source: Source,
+    session: &VortexSession,
+) -> Option<LocatedRun> {
     let quads = tables.sorted[0].as_ref()?;
-    let index = (0..2)
-        .filter(|&i| runs[i].is_some())
-        .min_by_key(|&i| runs[i].as_ref().map(|run| run.end - run.start))?;
-    let run = runs[index].clone().expect("a located run");
-    let [_, rid] = tables.references[index]
-        .as_ref()
-        .expect("a reference that located a run");
-    let key = REFERENCES[index].1;
-    let checked: Vec<usize> = (0..4)
-        .filter(|&slot| slot != key && codes[slot].is_some())
-        .collect();
-    let other = (0..2).filter(|&i| i != index).find_map(|i| {
-        let slot = REFERENCES[i].1;
-        let (Some(run), Some([_, rid])) = (&runs[i], &tables.references[i]) else {
-            return None;
-        };
-        checked.contains(&slot).then(|| OtherReference {
-            slot,
-            rid: rid.clone(),
-            run: run.clone(),
+    let (index, run) = (0..2)
+        .filter_map(|i| Some((i, runs[i].clone()?)))
+        .min_by_key(|(_, run)| run.end - run.start)?;
+    let [_, rid] = tables.references[index].as_ref()?;
+    let (table, key) = REFERENCES[index];
+    // The graph in place, on the child's own `g`, first.
+    let own_graph = codes[GRAPH_SLOT].zip(tables.reference_graphs[index].clone());
+    let in_place = own_graph.is_some();
+    let mut checks: Vec<Check> = own_graph
+        .map(|(code, column)| Check {
+            slot: GRAPH_SLOT,
+            code,
+            kind: CheckKind::Positional { column },
         })
-    });
-    let rows = RunRows::Reference {
+        .into_iter()
+        .collect();
+    for (slot, code) in codes.into_iter().enumerate() {
+        let Some(code) = code else {
+            continue;
+        };
+        if slot == key || (slot == GRAPH_SLOT && in_place) {
+            continue;
+        }
+        let other = (0..2).filter(|&i| i != index).find_map(|i| {
+            let (Some(run), Some([_, rid])) = (&runs[i], &tables.references[i]) else {
+                return None;
+            };
+            (REFERENCES[i].1 == slot).then(|| OtherReference {
+                rid: rid.clone(),
+                run: run.clone(),
+            })
+        });
+        let kind = CheckKind::ById { other };
+        checks.push(Check { slot, code, kind });
+    }
+    let table = RunTable::Reference {
         rid: rid.clone(),
-        run,
-        other,
-        graph: codes[GRAPH_SLOT].and(tables.reference_graphs[index].clone()),
+        quads: quads.clone(),
+        table,
     };
-    Some((quads.clone(), rows, checked, index))
+    Some(LocatedRun::new(
+        codes,
+        run,
+        table,
+        checks,
+        source,
+        session.clone(),
+    ))
 }
 
 /// The run of a sorted table's rows holding `codes` in the first `prefix`

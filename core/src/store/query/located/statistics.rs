@@ -7,93 +7,92 @@ use crate::error::Result;
 use crate::io::zone_map::{ZONE_ROWS, eq_on_bounds, footer_bounds};
 use crate::io::zone_set::{ZoneCheck, ZoneSet};
 use crate::observe::observe;
-use crate::store::persist::native_file::{FileTable, NativeStoreFile};
+use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::schema::PRIMARY_COLUMNS;
 use std::sync::Arc;
 use vortex_rdf_encoded_search::counters;
 
 /// Where a run asks its file's statistics when a read needs them
-/// ([`LocatedRun::ask_statistics`]): the file, and the table whose zones
-/// class the run's positions (a sorted table, or a reference child, whose
-/// own `g` is the one column it holds a zone map of).
+/// ([`LocatedRun::ask_statistics`]): its file, whose footer and zone maps
+/// answer for the run's table.
 pub(super) struct PendingStatistics {
     pub(super) file: Arc<NativeStoreFile>,
-    pub(super) table: FileTable,
 }
 
 impl LocatedRun {
-    /// Asks the file's statistics for the run's checked slots
+    /// Asks the file's statistics for the run's checks
     /// ([`decide_by_statistics`]) if they are still to ask; once asked, or
     /// with none to ask, it does nothing.
     pub(super) async fn ask_statistics(&mut self) -> Result<()> {
-        let Some(PendingStatistics { file, table }) = self.pending.take() else {
+        let Some(PendingStatistics { file }) = self.pending.take() else {
             return Ok(());
         };
         // Boxed: its state would otherwise enlarge every read's future.
-        Box::pin(decide_by_statistics(&file, table, self)).await
+        Box::pin(decide_by_statistics(&file, self)).await
     }
 }
 
-/// The statistics' decisions on `run`, located in `table` (a sorted table's
-/// gap run, or a reference child's run checked against the graph), in
-/// ladder order: the footer's exact bounds of each checked slot's column
-/// settle it for the whole file ([`eq_on_bounds`]), leaving the run empty
-/// where no row holds the slot's code and dropping a slot every row holds;
-/// the zone maps then class the run's zones against the slots left
-/// ([`run_zones`]). The quad table's footer speaks for an index child's
-/// columns, which hold its values.
+/// The statistics' decisions on `run` (a sorted table's gap run, or a
+/// reference child's run checked against the graph), in ladder order: the
+/// footer's exact bounds of each check's column settle it for the whole
+/// file ([`eq_on_bounds`]), leaving the run empty where no row holds the
+/// check's code and dropping a check every row holds; the zone maps then
+/// class the run's zones against the checks left ([`run_zones`]). The quad
+/// table's footer speaks for an index child's columns, which hold its
+/// values.
 pub(super) async fn decide_by_statistics(
     file: &NativeStoreFile,
-    table: FileTable,
     run: &mut LocatedRun,
 ) -> Result<()> {
     observe!(StatisticsAsked);
     let rows = run.positions();
-    let mut unsettled = Vec::new();
-    for &slot in &run.checked {
-        let code = run.codes[slot].expect("a checked slot is bound");
-        let footer = footer_bounds(file, PRIMARY_COLUMNS[slot])
+    let mut settled = Vec::new();
+    for (at, check) in run.checks.iter().enumerate() {
+        let footer = footer_bounds(file, PRIMARY_COLUMNS[check.slot])
             .filter(|_| file.row_count() > 0)
-            .and_then(|(min, max)| eq_on_bounds(min, max, code));
+            .and_then(|(min, max)| eq_on_bounds(min, max, check.code));
         match footer {
             Some(false) => {
                 note(counters::ZONE_COLUMN, rows.end - rows.start);
                 run.clear_rows();
-                run.checked.clear();
+                run.checks.clear();
                 return Ok(());
             }
-            Some(true) => note(counters::ZONE_COLUMN, rows.end - rows.start),
-            None => unsettled.push(slot),
+            Some(true) => {
+                note(counters::ZONE_COLUMN, rows.end - rows.start);
+                settled.push(at);
+            }
+            None => {}
         }
     }
-    run.checked = unsettled;
-    if !run.checked.is_empty() {
-        run.zones = run_zones(file, table, run).await?;
+    for at in settled.into_iter().rev() {
+        run.checks.remove(at);
+    }
+    if !run.checks.is_empty() {
+        run.zones = run_zones(file, run).await?;
     }
     Ok(())
 }
 
-/// The zone checks of `run`'s checked slots, each named by its slot, over
-/// `table`, the table `run`'s positions are in ([`ZoneSet`]): its checked
-/// columns' zone maps, read once per file ([`ZoneMaps`]). `None` when a
-/// checked column has no zone map (a reference child keeps `g`'s alone), for
-/// the run to check every row.
+/// The zone checks of `run`'s checks, each named by its slot, over the
+/// run's table ([`ZoneSet`]): its positional checks' columns' zone maps,
+/// read once per file ([`ZoneMaps`]). `None` when a check reads by row id
+/// or a checked column has no zone map, for the run to check every row.
 ///
 /// [`ZoneMaps`]: crate::store::persist::native_file::ZoneMaps
-pub(super) async fn run_zones(
-    file: &NativeStoreFile,
-    table: FileTable,
-    run: &LocatedRun,
-) -> Result<Option<ZoneSet>> {
-    let maps = file.zone_maps();
-    let mut checks = Vec::with_capacity(run.checked.len());
-    for &slot in &run.checked {
-        let Some(zones) = maps.get(table, slot).await? else {
+pub(super) async fn run_zones(file: &NativeStoreFile, run: &LocatedRun) -> Result<Option<ZoneSet>> {
+    let (maps, table) = (file.zone_maps(), run.table.file_table());
+    let mut checks = Vec::with_capacity(run.checks.len());
+    for check in &run.checks {
+        if !check.is_positional() {
+            return Ok(None);
+        }
+        let Some(zones) = maps.get(table, check.slot).await? else {
             return Ok(None);
         };
         checks.push(ZoneCheck {
-            bit: slot as u32,
-            code: run.codes[slot].expect("a checked slot is bound"),
+            bit: check.slot as u32,
+            code: check.code,
             zones,
         });
     }
