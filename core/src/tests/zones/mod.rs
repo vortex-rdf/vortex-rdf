@@ -19,6 +19,49 @@
 use super::*;
 use crate::zone_stats::zone_map::ZONE_ROWS;
 
+/// One test per [`Graphs`] layout, each running `$check(graphs)`, in place
+/// of one test looping over the layouts: the harness runs the layouts side
+/// by side on its threads, where a loop ran them one after another in the
+/// suite's longest tail. `zone_graphs:` makes the tests of [`ZONE_GRAPHS`],
+/// `all:` those of [`Graphs::ALL`], and `covers_every_layout` pins the tests
+/// to their list.
+macro_rules! layout_tests {
+    (@tests $check:path, $list:expr; $($name:ident: $variant:ident,)+) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                $check(Graphs::$variant).await;
+            }
+        )+
+
+        /// The tests above run every layout of their list.
+        #[test]
+        fn covers_every_layout() {
+            assert_eq!([$(Graphs::$variant),+].as_slice(), $list.as_slice());
+        }
+    };
+    (zone_graphs: $check:path) => {
+        layout_tests!(@tests $check, ZONE_GRAPHS;
+            one: One,
+            long: Long,
+            stretches: Stretches,
+            alternating: Alternating,
+            gapped: Gapped,
+            seventeen: Seventeen,
+            default_and_three: DefaultAndThree,
+            recorded_by_turns: RecordedByTurns,
+        );
+    };
+    (all: $check:path) => {
+        layout_tests!(@tests $check, Graphs::ALL;
+            one: One,
+            long: Long,
+            stretches: Stretches,
+            alternating: Alternating,
+        );
+    };
+}
+
 mod bounds;
 mod component_runs;
 mod component_zones;
@@ -296,31 +339,54 @@ struct ZoneStore {
 async fn zone_stores() -> Vec<ZoneStore> {
     let mut stores = Vec::new();
     for graphs in Graphs::ALL {
-        for index in [
-            IndexConfig::NoIndex,
-            IndexConfig::Copy,
-            IndexConfig::Reference,
-        ] {
-            let (dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
-            stores.push(ZoneStore {
-                tag: format!("{graphs:?}/{}", index.name()),
-                graphs,
-                index,
-                store: VortexRdfStore::from_file(&path).await.unwrap(),
-                _dir: dir,
-            });
-        }
+        stores.extend(indexed_zone_stores(graphs).await);
     }
+    stores.push(seven_row_leaves_store().await);
+    stores
+}
+
+/// [`zone_stores`]' stores of `graphs`: its three index sets and, for
+/// [`Graphs::Stretches`], the seven-row leaves.
+async fn zone_stores_of(graphs: Graphs) -> Vec<ZoneStore> {
+    let mut stores = indexed_zone_stores(graphs).await;
+    if graphs == Graphs::Stretches {
+        stores.push(seven_row_leaves_store().await);
+    }
+    stores
+}
+
+/// `graphs` written without indexes, with the copy index and with the
+/// reference index.
+async fn indexed_zone_stores(graphs: Graphs) -> Vec<ZoneStore> {
+    let mut stores = Vec::new();
+    for index in [
+        IndexConfig::NoIndex,
+        IndexConfig::Copy,
+        IndexConfig::Reference,
+    ] {
+        let (dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
+        stores.push(ZoneStore {
+            tag: format!("{graphs:?}/{}", index.name()),
+            graphs,
+            index,
+            store: VortexRdfStore::from_file(&path).await.unwrap(),
+            _dir: dir,
+        });
+    }
+    stores
+}
+
+/// The 1,000-row stretches in seven-row leaves, which have no zone maps.
+async fn seven_row_leaves_store() -> ZoneStore {
     let (dir, path) =
         zone_file(ZoneFile::new(Graphs::Stretches, IndexConfig::NoIndex).leaves(7)).await;
-    stores.push(ZoneStore {
+    ZoneStore {
         tag: "Stretches/seven-row-leaves".to_string(),
         graphs: Graphs::Stretches,
         index: IndexConfig::NoIndex,
         store: VortexRdfStore::from_file(&path).await.unwrap(),
         _dir: dir,
-    });
-    stores
+    }
 }
 
 /// The code of `term` (its N-Triples spelling) in `store`'s dictionary.

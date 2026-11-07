@@ -109,10 +109,16 @@ async fn column_zones_read_recorded_counts() {
 
 /// Every pattern of every store answers the same with zones and without:
 /// counts, windows and streams, row for row and in order, and as the term
-/// path does.
-#[tokio::test]
-async fn zoned_runs_answer_as_rows_do() {
-    for fixture in zone_stores().await {
+/// path does. One test per layout.
+mod zoned_runs_answer_as_rows_do {
+    use super::*;
+
+    layout_tests!(all: zoned_runs_answer_as_rows_do_on);
+}
+
+/// [`zoned_runs_answer_as_rows_do`] on the stores of `layout`.
+async fn zoned_runs_answer_as_rows_do_on(layout: Graphs) {
+    for fixture in zone_stores_of(layout).await {
         let store = &fixture.store;
         let mut graphs = vec![1, fixture.graphs.last()];
         graphs.dedup();
