@@ -2,8 +2,11 @@
 //! its exact bounds and recorded graphs, and the runs of the sorted tables
 //! (the quad table's and the copy index's) checked against a bound graph.
 //! The reference index's runs are in `reference`, and what the runs ask of
-//! the file's statistics, and when, in `statistics`.
+//! the file's statistics, and when, in `statistics`. With
+//! `VORTEX_RDF_LOCATE=0` no located run answers, so each test that asserts
+//! how one read returns at once.
 use super::*;
+use crate::store::query::located::locate_enabled;
 use crate::zone_stats::zone_map::ColumnZones;
 
 mod reference;
@@ -150,6 +153,10 @@ async fn zoned_runs_answer_as_rows_do() {
 async fn zoned_runs_skip_settled_zones() {
     use crate::store::test_hooks::ForcedZones;
 
+    if !locate_enabled() {
+        return;
+    }
+
     let _on = ForcedZones::set(true);
     for fixture in zone_stores().await {
         let store = &fixture.store;
@@ -221,6 +228,9 @@ async fn zoned_runs_skip_settled_zones() {
 /// counts every zone of the run on its encoding.
 #[tokio::test]
 async fn recorded_graphs_settle_zones_without_the_code() {
+    if !locate_enabled() {
+        return;
+    }
     for recorded in [true, false] {
         let (_dir, path) =
             zone_file(ZoneFile::new(Graphs::Gapped, IndexConfig::Copy).value_counts(recorded))
@@ -260,6 +270,10 @@ async fn recorded_graphs_settle_zones_without_the_code() {
 #[tokio::test]
 async fn first_pages_count_the_zones_before_their_first_match() {
     use crate::CodePattern;
+
+    if !locate_enabled() {
+        return;
+    }
 
     // The run is rows RUN..2 * RUN of its child, graph 2's rows its rows
     // 20,000..21,000: they lie in the child's zone from 57,344.
@@ -308,6 +322,10 @@ async fn first_pages_count_the_zones_before_their_first_match() {
 async fn recorded_counts_answer_mixed_zones() {
     use crate::store::test_hooks::ForcedZones;
 
+    if !locate_enabled() {
+        return;
+    }
+
     let _on = ForcedZones::set(true);
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
@@ -348,6 +366,10 @@ async fn recorded_counts_answer_mixed_zones() {
 #[tokio::test]
 async fn zones_past_max_values_count_their_encoding() {
     use crate::store::test_hooks::ForcedZones;
+
+    if !locate_enabled() {
+        return;
+    }
 
     let _on = ForcedZones::set(true);
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::Seventeen, IndexConfig::Copy)).await;
@@ -391,6 +413,10 @@ async fn recorded_and_unrecorded_zones_by_turns() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
     use std::collections::BTreeSet;
+
+    if !locate_enabled() {
+        return;
+    }
 
     let (_dir, path) =
         zone_file(ZoneFile::new(Graphs::RecordedByTurns, IndexConfig::NoIndex)).await;
@@ -475,6 +501,10 @@ async fn recorded_and_unrecorded_zones_by_turns() {
 async fn default_graph_counts_from_records() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
+
+    if !locate_enabled() {
+        return;
+    }
 
     let _on = ForcedZones::set(true);
     let (_dir, path) = zone_file(ZoneFile::new(Graphs::DefaultAndThree, IndexConfig::Copy)).await;

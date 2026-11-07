@@ -354,6 +354,10 @@ fn compare_work(rec: &Recorder) -> (usize, usize, usize) {
 /// zone to the encoded columns' probes.
 #[tokio::test]
 async fn a_residual_compares_adjacent_zones_once_and_decodes_its_columns() {
+    // With `VORTEX_RDF_ENCODED_SEARCH=0` columns are decoded otherwise.
+    if !vortex_rdf_encoded_search::encoded_search_enabled() {
+        return;
+    }
     let _zones = ForcedZones::set(true);
     let (g1, g2) = (iri_graph("g1"), iri_graph("g2"));
     let quads = six_zones(|i| [g1.clone(), g2.clone()][i % 2].clone());
@@ -374,6 +378,10 @@ async fn a_residual_compares_adjacent_zones_once_and_decodes_its_columns() {
 /// residual's whole selection reads every row of a column; no probe bound.
 #[tokio::test]
 async fn a_residual_decodes_its_columns_for_all_its_zones() {
+    // With `VORTEX_RDF_ENCODED_SEARCH=0` columns are decoded otherwise.
+    if !vortex_rdf_encoded_search::encoded_search_enabled() {
+        return;
+    }
     let _zones = ForcedZones::set(true);
     let graphs = [iri_graph("g1"), iri_graph("g2"), iri_graph("g3")];
     let graph = |i: usize| match (i / ZONE_ROWS).is_multiple_of(2) {
