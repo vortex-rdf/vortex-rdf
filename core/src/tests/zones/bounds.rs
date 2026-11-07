@@ -290,9 +290,8 @@ async fn zone_narrowing_answers_every_selection_as_the_full_compare() {
 #[tokio::test]
 async fn in_memory_zone_maps_match_the_files() {
     for graphs in [Graphs::Stretches, Graphs::RecordedByTurns] {
-        let quads = zone_quads(graphs);
-        let built = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-        let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
+        let built = built_store(zone_quads(graphs), LayoutStrategy::Dictionary, vec![]).await;
+        let (_dir, path) = zone_file(ZoneFile::new(graphs, IndexConfig::NoIndex)).await;
         let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();

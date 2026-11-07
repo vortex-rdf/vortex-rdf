@@ -52,10 +52,13 @@ async fn assert_zones_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
 async fn residual_zones_answer_as_rows_do() {
     for graphs in ZONE_GRAPHS {
         for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
-            let quads = zone_quads(graphs);
-            let built = built_store(quads.clone(), LayoutStrategy::Dictionary, index.types()).await;
-            let (_dir, path) =
-                write_store_file(quads, LayoutStrategy::Dictionary, index.types()).await;
+            let built = built_store(
+                zone_quads(graphs),
+                LayoutStrategy::Dictionary,
+                index.types(),
+            )
+            .await;
+            let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
             let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
             for (backend, store) in [("built", built), ("loaded", loaded)] {
                 let tag = format!("{graphs:?} {index:?} {backend}");

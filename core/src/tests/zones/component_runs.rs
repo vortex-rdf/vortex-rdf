@@ -82,9 +82,13 @@ async fn assert_runs_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
 /// same.
 async fn assert_component_runs_answer_as_rows_do(index: IndexConfig) {
     for graphs in ZONE_GRAPHS {
-        let quads = zone_quads(graphs);
-        let built = built_store(quads.clone(), LayoutStrategy::Dictionary, index.types()).await;
-        let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, index.types()).await;
+        let built = built_store(
+            zone_quads(graphs),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
         let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
@@ -377,13 +381,8 @@ async fn capped_counts_never_exceed_their_limit() {
     )
     .await;
     let zoned = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let pieces = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
-    let (_dir, path) = write_store_file(
-        quads,
-        LayoutStrategy::Dictionary,
-        IndexConfig::Reference.types(),
-    )
-    .await;
+    let pieces = built_store(quads, LayoutStrategy::Default, vec![]).await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference)).await;
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
     for (label, store) in [

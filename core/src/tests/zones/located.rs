@@ -59,19 +59,12 @@ async fn column_zones_absent_without_zone_maps() {
 /// zone's.
 #[tokio::test]
 async fn column_zones_read_recorded_counts() {
-    use crate::store::test_hooks::ForcedValueCounts;
     use crate::zone_stats::zone_map::ZONE_ROWS;
 
     for recorded in [true, false] {
-        let (_dir, path) = {
-            let _statistic = ForcedValueCounts::set(recorded);
-            write_store_file(
-                zone_quads(Graphs::Stretches),
-                LayoutStrategy::Dictionary,
-                IndexConfig::Copy.types(),
-            )
-            .await
-        };
+        let (_dir, path) =
+            zone_file(ZoneFile::new(Graphs::Stretches, IndexConfig::Copy).value_counts(recorded))
+                .await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let native = open_mapped(&path).await;
         let column = native
@@ -289,19 +282,13 @@ async fn zoned_runs_skip_settled_zones() {
 /// (Review Focus 4).
 #[tokio::test]
 async fn recorded_graphs_settle_zones_without_the_code() {
-    use crate::store::test_hooks::{ForcedValueCounts, ForcedZones};
+    use crate::store::test_hooks::ForcedZones;
     use crate::zone_stats::zone_map::ZONE_ROWS;
 
     for recorded in [true, false] {
-        let (_dir, path) = {
-            let _statistic = ForcedValueCounts::set(recorded);
-            write_store_file(
-                zone_quads(Graphs::Gapped),
-                LayoutStrategy::Dictionary,
-                IndexConfig::Copy.types(),
-            )
-            .await
-        };
+        let (_dir, path) =
+            zone_file(ZoneFile::new(Graphs::Gapped, IndexConfig::Copy).value_counts(recorded))
+                .await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let taxa = zone_patterns(store, 2).await[0];
         let want = term_rows(store, taxa).await.len() as u64;
@@ -343,22 +330,15 @@ async fn recorded_graphs_settle_zones_without_the_code() {
 #[tokio::test]
 async fn first_pages_count_the_zones_before_their_first_match() {
     use crate::CodePattern;
-    use crate::store::test_hooks::{ForcedValueCounts, ForcedZones};
+    use crate::store::test_hooks::ForcedZones;
     use crate::zone_stats::zone_map::ZONE_ROWS;
 
     // The run is rows RUN..2 * RUN of its child, graph 2's rows its rows
     // 20,000..21,000: they lie in the child's zone from 57,344.
     let first_match_zone = (RUN + 20_000) / ZONE_ROWS * ZONE_ROWS;
     for index in [IndexConfig::Copy, IndexConfig::Reference] {
-        let (_dir, path) = {
-            let _statistic = ForcedValueCounts::set(false);
-            write_store_file(
-                zone_quads(Graphs::Gapped),
-                LayoutStrategy::Dictionary,
-                index.types(),
-            )
-            .await
-        };
+        let (_dir, path) =
+            zone_file(ZoneFile::new(Graphs::Gapped, index).value_counts(false)).await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let ty = code_of(store, "<http://example.org/type>").await;
         let g2 = code_of(store, "<http://example.org/g2>").await;
@@ -409,12 +389,7 @@ async fn recorded_counts_answer_mixed_zones() {
     use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let taxa = zone_patterns(store, 1).await[0];
     // index:posg holds the quad table's rows in (p, o, s, g) order.
@@ -455,12 +430,7 @@ async fn zones_past_max_values_count_their_encoding() {
     use crate::store::test_hooks::ForcedZones;
 
     let _on = ForcedZones::set(true);
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Seventeen),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Seventeen, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let native = store.debug_native_file().unwrap();
     let column = native.table_column_layout(Some("index:posg"), "g").unwrap();
@@ -503,12 +473,8 @@ async fn recorded_and_unrecorded_zones_by_turns() {
     use crate::zone_stats::zone_map::ZONE_ROWS;
     use std::collections::BTreeSet;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::RecordedByTurns),
-        LayoutStrategy::Dictionary,
-        IndexConfig::NoIndex.types(),
-    )
-    .await;
+    let (_dir, path) =
+        zone_file(ZoneFile::new(Graphs::RecordedByTurns, IndexConfig::NoIndex)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let native = store.debug_native_file().unwrap();
     let column = native.table_column_layout(None, "g").unwrap();
@@ -598,12 +564,7 @@ async fn default_graph_counts_from_records() {
     use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::DefaultAndThree),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::DefaultAndThree, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     // The default graph's spelling is the empty one.
     let default = code_of(store, "").await;
@@ -674,12 +635,7 @@ async fn reference_runs_skip_settled_zones() {
         Graphs::DefaultAndThree,
         Graphs::DefaultThenThree,
     ] {
-        let (_dir, path) = write_store_file(
-            zone_quads(graphs),
-            LayoutStrategy::Dictionary,
-            IndexConfig::Reference.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(graphs, IndexConfig::Reference)).await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let rows = row_list(store).await;
         let ty = code_of(store, "<http://example.org/type>").await;
@@ -776,19 +732,14 @@ async fn reference_runs_skip_settled_zones() {
 #[tokio::test]
 async fn reference_cap_only_where_zones_cannot_decide() {
     use crate::CodePattern;
-    use crate::store::test_hooks::{ForcedGapRows, ForcedReferenceGraphs, ForcedZones};
+    use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
 
     let _on = ForcedZones::set(true);
     for graphs in [true, false] {
-        let (_dir, path) = {
-            let _hook = ForcedReferenceGraphs::set(graphs);
-            write_store_file(
-                zone_quads(Graphs::Alternating),
-                LayoutStrategy::Dictionary,
-                IndexConfig::Reference.types(),
-            )
-            .await
-        };
+        let (_dir, path) = zone_file(
+            ZoneFile::new(Graphs::Alternating, IndexConfig::Reference).reference_graphs(graphs),
+        )
+        .await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let rows = row_list(store).await;
         let ty = code_of(store, "<http://example.org/type>").await;
@@ -831,7 +782,7 @@ async fn reference_runs_without_zone_maps_check_rows() {
 
     let _on = ForcedZones::set(true);
     let (_dir, path) =
-        write_chunked_reference_store_file(&zone_quads(Graphs::Alternating), 7).await;
+        zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference).leaves(7)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let rows = row_list(store).await;
     let ty = code_of(store, "<http://example.org/type>").await;
@@ -880,12 +831,7 @@ async fn reference_first_page_reads_the_first_block_before_statistics() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Reference.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
     let g1 = code_of(store, "<http://example.org/g1>").await;
@@ -930,12 +876,7 @@ async fn each_zone_map_reads_once_per_file() {
 
     for index in [IndexConfig::Copy, IndexConfig::Reference] {
         let tag = index.name();
-        let (_dir, path) = write_store_file(
-            zone_quads(Graphs::Alternating),
-            LayoutStrategy::Dictionary,
-            index.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, index)).await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let ty = code_of(&store, "<http://example.org/type>").await;
         let g1 = code_of(&store, "<http://example.org/g1>").await;
@@ -967,12 +908,7 @@ async fn each_zone_map_reads_once_per_file() {
             "{tag}: joined counts read the map once"
         );
     }
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::NoIndex.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::NoIndex)).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let hub = code_of(&store, "<http://example.org/hub>").await;
     let g1 = code_of(&store, "<http://example.org/g1>").await;
@@ -1005,12 +941,7 @@ async fn reference_runs_check_their_graph_in_place_and_the_rest_by_id() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Reference.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
     let taxon = code_of(store, "\"Taxon\"").await;
@@ -1044,12 +975,7 @@ async fn one_graph_reference_runs_read_row_ids_only() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::One),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Reference.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::One, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
     let g1 = code_of(store, "<http://example.org/g1>").await;
@@ -1082,12 +1008,7 @@ async fn runs_without_checks_ask_no_statistics() {
 
     for index in [IndexConfig::Copy, IndexConfig::Reference] {
         let tag = index.name();
-        let (_dir, path) = write_store_file(
-            zone_quads(Graphs::Alternating),
-            LayoutStrategy::Dictionary,
-            index.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, index)).await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let ty = code_of(store, "<http://example.org/type>").await;
         let pattern = CodePattern::new(None, Some(ty), None, None);
@@ -1117,12 +1038,7 @@ async fn streams_ask_statistics_once() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
     let g1 = code_of(store, "<http://example.org/g1>").await;
@@ -1267,9 +1183,7 @@ async fn zone_counters_count_decisions() {
         return;
     }
     let _on = ForcedZones::set(true);
-    let quads = zone_quads(Graphs::Long);
-    let (_dir, path) =
-        write_store_file(quads, LayoutStrategy::Dictionary, IndexConfig::Copy.types()).await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Long, IndexConfig::Copy)).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let taxa = zone_patterns(&store, 1).await[0];
     let before = snapshot();
@@ -1280,12 +1194,7 @@ async fn zone_counters_count_decisions() {
     }
     // Alternating graphs mix every zone: the whole ones count from their
     // records.
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let taxa = zone_patterns(&store, 1).await[0];
     let before = snapshot();
@@ -1303,12 +1212,7 @@ async fn short_runs_check_rows_without_statistics() {
     use crate::store::test_hooks::ForcedZones;
 
     for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
-        let (_dir, path) = write_store_file(
-            zone_quads(Graphs::Long),
-            LayoutStrategy::Dictionary,
-            index.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(Graphs::Long, index)).await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let ty = code_of(&store, "<http://example.org/type>").await;
         let g1 = code_of(&store, "<http://example.org/g1>").await;
@@ -1351,12 +1255,7 @@ async fn first_page_reads_the_first_block_before_statistics() {
 
     for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
         for (graphs, g, fills) in [(Graphs::Alternating, 1, true), (Graphs::Long, 2, false)] {
-            let (_dir, path) = write_store_file(
-                zone_quads(graphs),
-                LayoutStrategy::Dictionary,
-                index.types(),
-            )
-            .await;
+            let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
             let store = &VortexRdfStore::from_file(&path).await.unwrap();
             let patterns = zone_patterns(store, g).await;
             // The quad table's (hub, link) run, and on a copy store the

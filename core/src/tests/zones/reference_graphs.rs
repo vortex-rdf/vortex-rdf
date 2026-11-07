@@ -297,15 +297,10 @@ async fn reference_runs_read_their_own_graphs() {
     let _rows = ForcedZones::set(false);
     let mut answers = Vec::new();
     for graphs in [true, false] {
-        let (_dir, path) = {
-            let _hook = ForcedReferenceGraphs::set(graphs);
-            write_store_file(
-                zone_quads(Graphs::Alternating),
-                LayoutStrategy::Dictionary,
-                IndexConfig::Reference.types(),
-            )
-            .await
-        };
+        let (_dir, path) = zone_file(
+            ZoneFile::new(Graphs::Alternating, IndexConfig::Reference).reference_graphs(graphs),
+        )
+        .await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let dict = store.dict_reader().unwrap();
         let code = |term: &'static str| {

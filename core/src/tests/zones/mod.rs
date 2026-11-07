@@ -7,11 +7,12 @@
 //! and the recorded graphs (`value_counts`).
 //!
 //! The layer: the zone-quads stores ([`Graphs`], [`zone_quads`],
-//! [`zone_stores`]), the codes and rows their reads answer ([`code_of`],
-//! [`streamed`], [`term_rows`], [`probe_answers`]), the stores a residual
-//! reads under tombstones and with a tail ([`tombstoned`], [`tailed`]), and
-//! what a recorder saw of their zones ([`zone_work`], [`zone_recorded`],
-//! [`zone_maps_read`], [`statistics_asked`]).
+//! [`zone_stores`]) and their files, each [`ZoneFile`] written once per
+//! process ([`zone_file`]); the codes and rows their reads answer
+//! ([`code_of`], [`streamed`], [`term_rows`], [`probe_answers`]); the stores
+//! a residual reads under tombstones and with a tail ([`tombstoned`],
+//! [`tailed`]); and what a recorder saw of their zones ([`zone_work`],
+//! [`zone_recorded`], [`zone_maps_read`], [`statistics_asked`]).
 
 use super::*;
 use crate::zone_stats::zone_map::ZONE_ROWS;
@@ -131,6 +132,135 @@ fn zone_quads(graphs: Graphs) -> Vec<Quad> {
     taxa.chain(links).collect()
 }
 
+/// A zone-quads store file: [`zone_quads`] of `graphs`, written under
+/// `layout` with `index`'s indexes, in `leaves`-row flat leaves where set,
+/// and recording the graph columns' `vortexrdf.value_counts` and the
+/// reference children's graphs unless the key turns them off. The
+/// write-time hooks are in the key, so each key is one file's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ZoneFile {
+    graphs: Graphs,
+    index: IndexConfig,
+    layout: LayoutStrategy,
+    leaves: Option<usize>,
+    value_counts: bool,
+    reference_graphs: bool,
+}
+
+impl ZoneFile {
+    /// `graphs`' quads with `index`'s indexes, as the Dictionary layout
+    /// writes them in its own leaves, recording both.
+    fn new(graphs: Graphs, index: IndexConfig) -> Self {
+        Self {
+            graphs,
+            index,
+            layout: LayoutStrategy::Dictionary,
+            leaves: None,
+            value_counts: true,
+            reference_graphs: true,
+        }
+    }
+
+    /// Written under `layout`.
+    fn layout(self, layout: LayoutStrategy) -> Self {
+        Self { layout, ..self }
+    }
+
+    /// Written in `rows`-row flat leaves (the Dictionary layout, with no
+    /// index or the reference index).
+    fn leaves(self, rows: usize) -> Self {
+        Self {
+            leaves: Some(rows),
+            ..self
+        }
+    }
+
+    /// Recording the graph columns' `vortexrdf.value_counts` (`true`), or
+    /// written as before them (`false`).
+    fn value_counts(self, on: bool) -> Self {
+        Self {
+            value_counts: on,
+            ..self
+        }
+    }
+
+    /// Giving the reference children each row's graph (`true`), or written
+    /// as before that column (`false`).
+    fn reference_graphs(self, on: bool) -> Self {
+        Self {
+            reference_graphs: on,
+            ..self
+        }
+    }
+
+    /// The file's bytes, written under the key's hooks by the writer of its
+    /// shape.
+    async fn write(self) -> Vec<u8> {
+        use crate::store::test_hooks::{ForcedReferenceGraphs, ForcedValueCounts};
+
+        let _value_counts = ForcedValueCounts::set(self.value_counts);
+        let _reference_graphs = ForcedReferenceGraphs::set(self.reference_graphs);
+        let quads = zone_quads(self.graphs);
+        let (_dir, path) = match (self.leaves, self.layout, self.index) {
+            (None, layout, index) => write_store_file(quads, layout, index.types()).await,
+            (Some(rows), LayoutStrategy::Dictionary, IndexConfig::NoIndex) => {
+                write_chunked_store_file(&quads, rows).await
+            }
+            (Some(rows), LayoutStrategy::Dictionary, IndexConfig::Reference) => {
+                write_chunked_reference_store_file(&quads, rows).await
+            }
+            (Some(_), layout, index) => panic!("no writer of {layout:?} leaves with {index:?}"),
+        };
+        std::fs::read(path).unwrap()
+    }
+}
+
+/// A [`ZoneFile`]'s bytes, written on the key's first ask, and the times
+/// they were written.
+#[derive(Default)]
+struct ZoneFileCell {
+    bytes: tokio::sync::OnceCell<Vec<u8>>,
+    builds: std::sync::atomic::AtomicUsize,
+}
+
+/// The cell of `key`, made on its first ask and kept for the process.
+fn zone_file_cell(key: ZoneFile) -> &'static ZoneFileCell {
+    static CELLS: std::sync::Mutex<Vec<(ZoneFile, &'static ZoneFileCell)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut cells = CELLS.lock().unwrap();
+    if let Some(&(_, cell)) = cells.iter().find(|(k, _)| *k == key) {
+        return cell;
+    }
+    let cell: &'static ZoneFileCell = Box::leak(Box::default());
+    cells.push((key, cell));
+    cell
+}
+
+/// `key`'s store file in a fresh temp dir. Each key is written once per
+/// process, its first askers waiting on that one write, and its bytes are
+/// copied into each file asked for, so every caller opens a file of its own.
+/// Keep the `TempDir` alive for the file's lifetime.
+async fn zone_file(key: ZoneFile) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::sync::atomic::Ordering;
+
+    let cell = zone_file_cell(key);
+    let bytes = cell
+        .bytes
+        .get_or_init(|| async {
+            cell.builds.fetch_add(1, Ordering::Relaxed);
+            key.write().await
+        })
+        .await;
+    temp_store_file(bytes)
+}
+
+/// The times `key`'s file was written in this process.
+fn zone_file_builds(key: ZoneFile) -> usize {
+    zone_file_cell(key)
+        .builds
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A store under test, its tag and its file's guard.
 struct ZoneStore {
     tag: String,
@@ -151,12 +281,7 @@ async fn zone_stores() -> Vec<ZoneStore> {
             IndexConfig::Copy,
             IndexConfig::Reference,
         ] {
-            let (dir, path) = write_store_file(
-                zone_quads(graphs),
-                LayoutStrategy::Dictionary,
-                index.types(),
-            )
-            .await;
+            let (dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
             stores.push(ZoneStore {
                 tag: format!("{graphs:?}/{}", index.name()),
                 graphs,
@@ -166,7 +291,8 @@ async fn zone_stores() -> Vec<ZoneStore> {
             });
         }
     }
-    let (dir, path) = write_chunked_store_file(&zone_quads(Graphs::Stretches), 7).await;
+    let (dir, path) =
+        zone_file(ZoneFile::new(Graphs::Stretches, IndexConfig::NoIndex).leaves(7)).await;
     stores.push(ZoneStore {
         tag: "Stretches/seven-row-leaves".to_string(),
         graphs: Graphs::Stretches,
@@ -411,4 +537,50 @@ fn records_value_counts(column: &vortex_layout::LayoutRef) -> bool {
             .present_aggregates()
             .contains(&value_counts().to_string())
     })
+}
+
+/// A zone file is written once per key, however often it is asked for: a
+/// second ask copies the first write's bytes, a key that differs only in a
+/// write-time hook is written apart (and records what its hook says), and a
+/// copied file answers as a fresh write of the same quads does.
+#[tokio::test]
+async fn zone_files_are_written_once_per_key() {
+    use crate::CodePattern;
+
+    let key = ZoneFile::new(Graphs::Long, IndexConfig::Copy);
+    let (_first_dir, first) = zone_file(key).await;
+    let (_second_dir, second) = zone_file(key).await;
+    assert_eq!(zone_file_builds(key), 1, "two asks, one write");
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&second).unwrap()
+    );
+
+    let unrecorded = key.value_counts(false);
+    let (_unrecorded_dir, third) = zone_file(unrecorded).await;
+    assert_eq!(zone_file_builds(unrecorded), 1, "its own write");
+    assert_eq!(zone_file_builds(key), 1, "the first key's write stands");
+    for (path, recorded) in [(&second, true), (&third, false)] {
+        let native = open_mapped(path).await;
+        let g = native.table_column_layout(Some("index:posg"), "g").unwrap();
+        assert_eq!(records_value_counts(&g), recorded, "{path:?}");
+    }
+
+    let (_fresh_dir, fresh) = write_store_file(
+        zone_quads(Graphs::Long),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Copy.types(),
+    )
+    .await;
+    let mut counts = Vec::new();
+    for path in [&second, &fresh] {
+        let store = VortexRdfStore::from_file(path).await.unwrap();
+        let ty = code_of(&store, "<http://example.org/type>").await;
+        let taxon = code_of(&store, "\"Taxon\"").await;
+        let g1 = code_of(&store, "<http://example.org/g1>").await;
+        let pattern = CodePattern::new(None, Some(ty), Some(taxon), Some(g1));
+        counts.push(store.count_code_pattern(pattern).await.unwrap());
+    }
+    assert_eq!(counts[0], counts[1], "the cached file and a fresh write");
+    assert_eq!(counts[0], RUN as u64 / 2, "graph 1 holds half the run");
 }
