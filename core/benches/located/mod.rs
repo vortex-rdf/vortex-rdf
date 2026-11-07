@@ -495,23 +495,34 @@ impl Cell {
     }
 
     /// This cell's read of `query` on `store`, as the rows it returns (a
-    /// count, its value).
-    async fn rows(self, store: &VortexRdfStore, query: &Query) -> usize {
-        match (self.read, query) {
-            (Read::Count, &Query::Codes(pattern)) => {
+    /// count, its value). A code read and a term read each run as their own
+    /// future, so neither times the other's state.
+    fn rows(self, store: &VortexRdfStore, query: &Query) -> usize {
+        match query {
+            &Query::Codes(pattern) => rt().block_on(self.code_rows(store, pattern)),
+            Query::Terms(predicate, graph) => {
+                rt().block_on(self.match_rows(store, predicate.as_ref(), graph))
+            }
+        }
+    }
+
+    /// This cell's code read of `pattern`.
+    async fn code_rows(self, store: &VortexRdfStore, pattern: CodePattern) -> usize {
+        match self.read {
+            Read::Count => {
                 let count = store.count_code_pattern(pattern).await.expect("count");
                 usize::try_from(count).expect("a count fits usize")
             }
-            (Read::FirstPage, &Query::Codes(pattern)) => {
+            Read::FirstPage => {
                 let columns = store.match_code_pattern(pattern, 0, Some(FIRST_PAGE_ROWS));
                 columns.await.expect("window")[0].len()
             }
-            (Read::MiddlePage, &Query::Codes(pattern)) => {
+            Read::MiddlePage => {
                 let offset = self.run.middle();
                 let columns = store.match_code_pattern(pattern, offset, Some(PAGE_ROWS));
                 columns.await.expect("window")[0].len()
             }
-            (Read::Stream, &Query::Codes(pattern)) => {
+            Read::Stream => {
                 let chunks = store.match_code_chunks(pattern, PAGE_ROWS).await;
                 let mut chunks = chunks.expect("stream");
                 let mut rows = 0;
@@ -520,17 +531,24 @@ impl Cell {
                 }
                 rows
             }
-            (Read::MatchCount | Read::MatchRows, Query::Terms(predicate, graph)) => {
-                let view = store
-                    .match_pattern(None, predicate.as_ref(), None, Some(graph))
-                    .await
-                    .expect("match");
-                match self.read {
-                    Read::MatchRows => gathered_rows(&view).await,
-                    _ => view.size().await.expect("size"),
-                }
-            }
-            _ => unreachable!("{self}: each read has its query"),
+            Read::MatchCount | Read::MatchRows => unreachable!("{self}: a term read"),
+        }
+    }
+
+    /// This cell's term read of `(? predicate ? graph)`.
+    async fn match_rows(
+        self,
+        store: &VortexRdfStore,
+        predicate: Option<&NamedNode>,
+        graph: &GraphName,
+    ) -> usize {
+        let view = store
+            .match_pattern(None, predicate, None, Some(graph))
+            .await
+            .expect("match");
+        match self.read {
+            Read::MatchRows => gathered_rows(&view).await,
+            _ => view.size().await.expect("size"),
         }
     }
 
@@ -560,7 +578,7 @@ pub(crate) fn time(bencher: divan::Bencher, cell: Cell) {
             "{cell}: no located run answers the pattern"
         );
     }
-    let rows = rt().block_on(cell.rows(&store, &query));
+    let rows = cell.rows(&store, &query);
     assert_eq!(rows, cell.expected_rows(), "{cell}: wrong row count");
-    bencher.bench(|| black_box(rt().block_on(cell.rows(&store, &query))));
+    bencher.bench(|| black_box(cell.rows(&store, &query)));
 }
