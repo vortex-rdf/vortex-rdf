@@ -39,26 +39,10 @@ pub(crate) use crate::store::view::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 /// `None` for a zone past 16 graphs.
 pub(crate) type ZoneRecords = Vec<Option<Vec<(u64, u32)>>>;
 
-thread_local! {
-    /// The code the dictionaries built or opened on this thread give their
-    /// first term, while a [`CodeBase`] guard is live.
-    static CODE_BASE: Cell<Option<TermCode>> = const { Cell::new(None) };
-
-    /// The most distinct terms an out-of-core build on this thread may hold,
-    /// while a [`TermCap`] guard is live.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    static TERM_CAP: Cell<Option<usize>> = const { Cell::new(None) };
-
-    /// The row id the indexed builds on this thread give their first row,
-    /// while a [`RowIdBase`] guard is live.
-    static ROW_ID_BASE: Cell<Option<RowId>> = const { Cell::new(None) };
-}
-
 /// A thread's override of a value production code reads, live while the
 /// guard is: `cell` holds the value, `None` meaning the production one, and
 /// dropping the guard restores what it replaced, so guards nest. Every
-/// guard of the test seams ([`RowIdBase`], [`CodeBase`], [`TermCap`],
-/// [`ForcedLimit`], [`ForcedChunkRows`], [`FailingCut`]) is one.
+/// guard of the test seams is one, most through [`override_hook!`].
 /// Thread-local because the tests share a process and run on the
 /// current-thread runtime, so a test sees only its own.
 pub(crate) struct Override<T: Copy + 'static> {
@@ -82,169 +66,120 @@ impl<T: Copy + 'static> Drop for Override<T> {
     }
 }
 
+/// One test seam ([`Override`]): the thread-local cell holding the forced
+/// value, the getter production code reads (`None`: the production value)
+/// and the guard a test holds, whose `set` forces the value until it drops.
+/// A trailing `cfg(...)` gates all three.
+///
+/// ```ignore
+/// override_hook! {
+///     /// While alive, this thread's reads decide zone by zone (`true`) or
+///     /// row by row (`false`).
+///     ZONES: bool, forced_zones, ForcedZones;
+/// }
+/// let _on = ForcedZones::set(true);
+/// assert_eq!(forced_zones(), Some(true));
+/// ```
+macro_rules! override_hook {
+    ($(
+        $(#[doc = $doc:literal])+
+        $cell:ident: $t:ty, $get:ident, $guard:ident $(, cfg($cfg:meta))?;
+    )+) => {$(
+        thread_local! {
+            $(#[cfg($cfg)])?
+            static $cell: Cell<Option<$t>> = const { Cell::new(None) };
+        }
+
+        #[doc = concat!("The value a [`", stringify!($guard), "`] forced on this thread, `None` without one.")]
+        $(#[cfg($cfg)])?
+        pub(crate) fn $get() -> Option<$t> {
+            $cell.get()
+        }
+
+        $(#[doc = $doc])+
+        $(#[cfg($cfg)])?
+        pub(crate) struct $guard {
+            _guard: Override<$t>,
+        }
+
+        $(#[cfg($cfg)])?
+        impl $guard {
+            /// Force the value until the guard drops.
+            pub(crate) fn set(value: $t) -> Self {
+                Self {
+                    _guard: Override::set(&$cell, value),
+                }
+            }
+        }
+    )+};
+}
+
+override_hook! {
+    /// While alive, every dictionary built or opened on this thread numbers
+    /// its terms from `base` instead of 0: code = `base` + rank, read once
+    /// by every dictionary constructor (`TermDictionary::new`,
+    /// `FileBackedDict::open`). A dictionary of a handful of terms then
+    /// hands out codes past `u32::MAX`, so a test drives codes a 32-bit
+    /// width cannot hold through every path (the build's code map, the
+    /// written code columns, matches, keeps, index children, the dictionary
+    /// handles and the column kernels) without four billion terms. The base
+    /// is never written: a file built under a guard must be reopened under
+    /// the same one, as a file of 2^32 more terms would be.
+    CODE_BASE: TermCode, code_base, CodeBase;
+
+    /// While alive, every out-of-core build on this thread refuses its term
+    /// past `cap` instead of past `i32::MAX`, so a few terms reach the
+    /// refusal a dictionary of two billion terms would. Read by the build's
+    /// term interner at every new term. Not built for wasm32-unknown-unknown,
+    /// which has no out-of-core build.
+    TERM_CAP: usize, term_cap, TermCap, cfg(not(all(target_arch = "wasm32", target_os = "unknown")));
+
+    /// While alive, every indexed build on this thread numbers its rows from
+    /// `base` instead of 0 (row id = `base` + row) and every reader on this
+    /// thread maps a row id back to its row by taking `base` off again. A
+    /// handful of quads then carry row ids a 32-bit width cannot hold,
+    /// through every path that stores or reads one: the in-memory index
+    /// builds, the out-of-core merge's spilled records, the written `rid`
+    /// columns, located runs, served reads under tombstones and the
+    /// rebuilds. A base close to `RowId::MAX` instead makes the refusal of
+    /// an id past the last one reachable with a handful of quads. The base
+    /// is never written: a store built under a guard must be read under the
+    /// same one, as a store of 2^32 more rows would be.
+    ROW_ID_BASE: RowId, row_id_base, RowIdBase;
+
+    /// While alive, this thread's row scans run inline up to `limit` splits
+    /// and spawn above it, in place of the production limit.
+    SPLIT_LIMIT: usize, forced_split_limit, ForcedLimit;
+
+    /// While alive, this thread's in-memory chunk streams (`quads`,
+    /// `shared_quad_chunks`, the N-Triples/N-Quads export) hold at most
+    /// `rows` rows a chunk, in place of the production cap.
+    CHUNK_ROWS: usize, forced_chunk_rows, ForcedChunkRows;
+
+    /// While alive, this thread's reads decide their checked rows zone by
+    /// zone (`true`) or row by row (`false`), whatever `VORTEX_RDF_ZONES`
+    /// says.
+    ZONES: bool, forced_zones, ForcedZones;
+
+    /// While alive, this thread's store writes record the graph columns'
+    /// `vortexrdf.value_counts` (`true`) or leave the statistic out
+    /// (`false`), as a file without it.
+    VALUE_COUNTS: bool, forced_value_counts, ForcedValueCounts;
+
+    /// While alive, this thread's builds give the Dictionary layout's
+    /// reference children each row's graph (`true`) or write `{val, rid}`
+    /// alone (`false`), as a file without the column.
+    REFERENCE_GRAPHS: bool, forced_reference_graphs, ForcedReferenceGraphs;
+
+    /// While alive, this thread's located runs check a gap run row by row
+    /// only when it holds at most `rows` rows, in place of `GAP_ROWS`.
+    GAP_ROWS: u64, forced_gap_rows, ForcedGapRows;
+}
+
 thread_local! {
-    /// The split limit forced on this thread's row scans, while a
-    /// [`ForcedLimit`] guard is live.
-    static SPLIT_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
-
-    /// The most rows a chunk of this thread's in-memory chunk streams holds,
-    /// while a [`ForcedChunkRows`] guard is live.
-    static CHUNK_ROWS: Cell<Option<usize>> = const { Cell::new(None) };
-
     /// The cuts this thread's `rechunk` iterators make before one fails,
     /// while a [`FailingCut`] guard is live.
     static CUTS_BEFORE_FAILURE: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-thread_local! {
-    /// Whether this thread's located runs decide zone by zone, while a
-    /// [`ForcedZones`] guard is live.
-    static ZONES: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-thread_local! {
-    /// Whether this thread's store writes record the graph columns'
-    /// `vortexrdf.value_counts`, while a [`ForcedValueCounts`] guard is live.
-    static VALUE_COUNTS: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-/// The value-counts switch a [`ForcedValueCounts`] forced on this thread.
-pub(crate) fn forced_value_counts() -> Option<bool> {
-    VALUE_COUNTS.get()
-}
-
-/// While alive, this thread's store writes record the graph columns'
-/// `vortexrdf.value_counts` (`true`), or write them as earlier versions did
-/// (`false`), to stand for a file written before the statistic.
-pub(crate) struct ForcedValueCounts {
-    _guard: Override<bool>,
-}
-
-impl ForcedValueCounts {
-    /// Force the statistic on or off until the guard drops.
-    pub(crate) fn set(on: bool) -> Self {
-        Self {
-            _guard: Override::set(&VALUE_COUNTS, on),
-        }
-    }
-}
-
-thread_local! {
-    /// Whether this thread's builds give the reference children each row's
-    /// graph, while a [`ForcedReferenceGraphs`] guard is live.
-    static REFERENCE_GRAPHS: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-/// The reference-graphs switch a [`ForcedReferenceGraphs`] forced on this
-/// thread.
-pub(crate) fn forced_reference_graphs() -> Option<bool> {
-    REFERENCE_GRAPHS.get()
-}
-
-/// While alive, this thread's builds give the Dictionary layout's reference
-/// children each row's graph (`true`), or write `{val, rid}` as earlier
-/// versions did (`false`), to stand for a file written before the column.
-pub(crate) struct ForcedReferenceGraphs {
-    _guard: Override<bool>,
-}
-
-impl ForcedReferenceGraphs {
-    /// Force the column on or off until the guard drops.
-    pub(crate) fn set(on: bool) -> Self {
-        Self {
-            _guard: Override::set(&REFERENCE_GRAPHS, on),
-        }
-    }
-}
-
-thread_local! {
-    /// The longest gap run this thread's located runs check row by row,
-    /// while a [`ForcedGapRows`] guard is live.
-    static GAP_ROWS: Cell<Option<u64>> = const { Cell::new(None) };
-}
-
-/// The gap-run cap a [`ForcedGapRows`] forced on this thread.
-pub(crate) fn forced_gap_rows() -> Option<u64> {
-    GAP_ROWS.get()
-}
-
-/// While alive, this thread's located runs check a gap run row by row only
-/// when it holds at most `rows` rows, in place of `GAP_ROWS`.
-pub(crate) struct ForcedGapRows {
-    _guard: Override<u64>,
-}
-
-impl ForcedGapRows {
-    /// Force the gap-run cap to `rows` until the guard drops.
-    pub(crate) fn set(rows: u64) -> Self {
-        Self {
-            _guard: Override::set(&GAP_ROWS, rows),
-        }
-    }
-}
-
-/// The zone switch a [`ForcedZones`] forced on this thread.
-pub(crate) fn forced_zones() -> Option<bool> {
-    ZONES.get()
-}
-
-/// While alive, this thread's located runs decide their checked rows zone by
-/// zone (`true`) or row by row (`false`), whatever `VORTEX_RDF_ZONES` says.
-pub(crate) struct ForcedZones {
-    _guard: Override<bool>,
-}
-
-impl ForcedZones {
-    /// Force the zone switch to `on` until the guard drops.
-    pub(crate) fn set(on: bool) -> Self {
-        Self {
-            _guard: Override::set(&ZONES, on),
-        }
-    }
-}
-
-/// The split limit a [`ForcedLimit`] forced on this thread's row scans.
-pub(crate) fn forced_split_limit() -> Option<usize> {
-    SPLIT_LIMIT.get()
-}
-
-/// While alive, this thread's row scans run inline up to `limit` splits and
-/// spawn above it, in place of the production limit. Dropping it restores
-/// the limit it replaced ([`Override`]).
-pub(crate) struct ForcedLimit {
-    _guard: Override<usize>,
-}
-
-impl ForcedLimit {
-    /// Force the split limit to `limit` until the guard drops.
-    pub(crate) fn set(limit: usize) -> Self {
-        Self {
-            _guard: Override::set(&SPLIT_LIMIT, limit),
-        }
-    }
-}
-
-/// The chunk rows a [`ForcedChunkRows`] forced on this thread's in-memory
-/// chunk streams.
-pub(crate) fn forced_chunk_rows() -> Option<usize> {
-    CHUNK_ROWS.get()
-}
-
-/// While alive, this thread's in-memory chunk streams (`quads`,
-/// `shared_quad_chunks`, the N-Triples/N-Quads export) hold at most `rows`
-/// rows a chunk, in place of the production cap. Dropping it restores the
-/// rows it replaced ([`Override`]).
-pub(crate) struct ForcedChunkRows {
-    _guard: Override<usize>,
-}
-
-impl ForcedChunkRows {
-    /// Force the chunk rows to `rows` until the guard drops.
-    pub(crate) fn set(rows: usize) -> Self {
-        Self {
-            _guard: Override::set(&CHUNK_ROWS, rows),
-        }
-    }
 }
 
 /// One cut of this thread's `rechunk` iterators: an error when it is the cut
@@ -277,96 +212,6 @@ impl FailingCut {
     pub(crate) fn after(n: usize) -> Self {
         Self {
             _guard: Override::set(&CUTS_BEFORE_FAILURE, n),
-        }
-    }
-}
-
-/// The row id the indexed builds on this thread give their first row, and
-/// that the readers on this thread take off every row id they read, while a
-/// [`RowIdBase`] guard is live.
-pub(crate) fn row_id_base() -> Option<RowId> {
-    ROW_ID_BASE.get()
-}
-
-/// While alive, every indexed build on this thread numbers its rows from
-/// `base` instead of 0 — row id = `base` + row — and every reader on this
-/// thread maps a row id back to its row by taking `base` off again. A
-/// handful of quads then carry row ids a 32-bit width cannot hold, through
-/// every path that stores or reads one: the in-memory index builds, the
-/// out-of-core merge's spilled records, the written `rid` columns, located
-/// runs, served reads under tombstones and the rebuilds. A base close to
-/// `RowId::MAX` instead makes the refusal of an id past the last one
-/// reachable with a handful of quads. The base is never written: a store
-/// built under a guard must be read under the same one, as a store of 2^32
-/// more rows would be. Dropping the guard restores the base it replaced
-/// ([`Override`]).
-pub(crate) struct RowIdBase {
-    _guard: Override<RowId>,
-}
-
-impl RowIdBase {
-    /// Number this thread's indexed builds from `base` until the guard
-    /// drops.
-    pub(crate) fn set(base: RowId) -> Self {
-        Self {
-            _guard: Override::set(&ROW_ID_BASE, base),
-        }
-    }
-}
-
-/// The code a dictionary built or opened on this thread gives its first
-/// term, while a [`CodeBase`] guard is live. Read once by every dictionary
-/// constructor (`TermDictionary::new`, `FileBackedDict::open`).
-pub(crate) fn code_base() -> Option<TermCode> {
-    CODE_BASE.get()
-}
-
-/// While alive, every dictionary built or opened on this thread numbers its
-/// terms from `base` instead of 0: code = `base` + rank. A dictionary of a
-/// handful of terms then hands out codes past `u32::MAX`, so a test drives
-/// codes a 32-bit width cannot hold through every path — the build's code
-/// map, the written code columns, matches, keeps, index children, the
-/// dictionary handles and the column kernels — without four billion terms.
-/// The base is never written: a file built under a guard must be reopened
-/// under the same one, as a file of 2^32 more terms would be. Dropping the
-/// guard restores the base it replaced ([`Override`]).
-pub(crate) struct CodeBase {
-    _guard: Override<TermCode>,
-}
-
-impl CodeBase {
-    /// Number this thread's dictionaries from `base` until the guard drops.
-    pub(crate) fn set(base: TermCode) -> Self {
-        Self {
-            _guard: Override::set(&CODE_BASE, base),
-        }
-    }
-}
-
-/// The most distinct terms an out-of-core build on this thread may hold,
-/// while a [`TermCap`] guard is live. Read by the build's term interner at
-/// every new term.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn term_cap() -> Option<usize> {
-    TERM_CAP.get()
-}
-
-/// While alive, every out-of-core build on this thread refuses its term past
-/// `cap` instead of past `i32::MAX`, so a few terms reach the refusal a
-/// dictionary of two billion terms would. Dropping the guard restores the cap
-/// it replaced ([`Override`]).
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) struct TermCap {
-    _guard: Override<usize>,
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-impl TermCap {
-    /// Cap this thread's builds at `cap` distinct terms until the guard
-    /// drops.
-    pub(crate) fn set(cap: usize) -> Self {
-        Self {
-            _guard: Override::set(&TERM_CAP, cap),
         }
     }
 }
