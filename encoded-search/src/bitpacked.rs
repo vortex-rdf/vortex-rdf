@@ -106,8 +106,16 @@ impl PackedNode<'_> {
         where
             T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
         {
-            node.read_parts(packed, node.offset + start, out.len(), |at, values| {
-                for (o, &v) in out[at..].iter_mut().zip(values) {
+            let first = node.offset + start;
+            // A read the rule takes one by one in all goes straight into place.
+            if unpack_tier::<T>(out.len()) == Tier::OneByOne {
+                for (o, i) in out.iter_mut().zip(first..) {
+                    *o = node.unpack(packed, i).into();
+                }
+                return;
+            }
+            node.read_parts(packed, first, out.len(), |at, values| {
+                for (o, &v) in out[at..at + values.len()].iter_mut().zip(values) {
                     *o = v.into();
                 }
             });
@@ -175,7 +183,6 @@ impl PackedNode<'_> {
     /// chunk part at a time, each with its offset in the window, unpacked as
     /// the read rule takes it ([`unpack_tier`]). A read the rule takes one by
     /// one in all is read so across its chunks, in one part.
-    #[inline]
     fn read_parts<T>(&self, packed: &[T], first: usize, n: usize, mut f: impl FnMut(usize, &[T]))
     where
         T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Default,
