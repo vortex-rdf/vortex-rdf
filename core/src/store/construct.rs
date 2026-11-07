@@ -108,12 +108,12 @@ impl VortexRdfStore {
     /// children are re-encoded into encodings the probes read in place
     /// (`with_compressed_int_children`), the base's also wrapped so the
     /// code-column read path decodes each once and is zero-copy after. The
-    /// pass that compresses a code column also takes its zone bounds
-    /// ([`QuadZones`]).
+    /// pass that compresses a code column also takes its zone map
+    /// ([`QuadZones`]), which keeps the whole column's bounds.
     pub fn from_built(built: BuiltArray) -> Result<Self> {
         Self::adopt(
             built,
-            |base| resident::with_compressed_int_children(base, true),
+            |base| resident::with_compressed_int_children(base, resident::CodeTable::Base),
             IndexComponent::into_compressed,
         )
     }

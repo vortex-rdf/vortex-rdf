@@ -272,7 +272,7 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L276) | [§6.1](#61-prefix-probe) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L233) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L459), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L824) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L167-L174 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
@@ -287,7 +287,7 @@ rebuild that merges an append tail re-establishes it
 ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs)). So the stage is skipped
 only for rows that arrived without the provenance — a foreign writer's file,
 whose `quads_sorted: false` keeps
-[`with_subject_stamp`](../core/src/store/array.rs#L149) from inventing a stamp
+[`with_subject_stamp`](../core/src/store/array.rs#L106) from inventing a stamp
 those rows never earned. Compacting such a store restores the fast path.
 
 When it engages, the **subject** resolves to its exact `[lo, hi)` run in
@@ -297,7 +297,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L276), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L233), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -387,7 +387,7 @@ materialized and intersected immediately.
 **A bound graph, checked inside the run.** With zones on (`VORTEX_RDF_ZONES`
 not `0`), the in-memory resolver checks a pattern's bound graph inside the
 run it located when the probed component keeps a zone map of its graph
-column ([`graph_zones`](../core/src/store/indexes/components.rs#L312): the
+column ([`graph_zones`](../core/src/store/indexes/components.rs#L314): the
 Dictionary layout's components, built or loaded). The run's rows are
 contiguous in the component, so the component's own `g` column decides them
 a zone at a time ([`GraphCheck`](../core/src/store/indexes/graph_check.rs#L38)),
@@ -447,17 +447,17 @@ compile can in principle answer `AlwaysFalse` — an empty view — but not here
 the residual binds a subset of roles the [stage B gate](#4-stage-b--the-provable-emptiness-gate)
 already resolved, so that arm exists for totality.
 
-First, over a selection wider than a zone, the **array statistics** of the
-base's code columns answer for the whole column: each carries its exact
-smallest and largest code as `Stat::Min` and `Stat::Max`, stamped where its
-zone maps are taken (below; a loaded store's are its file's footer
-statistics). A constrained column's code outside its bounds leaves the
+First, over a selection wider than a zone, the **whole bounds** of the
+base's code columns answer for the whole column: each column's zone map
+(below) keeps its exact smallest and largest code, its zones' folded once
+([`column_bounds`](../core/src/io/zone_map.rs#L176)); a column without a
+zone map has neither level. A constrained column's code outside its bounds leaves the
 selection no row, and bounds that are both the code drop the equality from
 the compare; with none left the selection is the answer, compared nowhere
-([`ask_statistics`](../core/src/store/scan/residual.rs#L85)). This is the
+([`ask_statistics`](../core/src/store/scan/residual.rs#L88)). This is the
 store's one rule for `x = c` on exact bounds, which a file's located runs
 apply too, at its footer and zone by zone
-([`eq_on_bounds`](../core/src/io/zone_map.rs#L308)): it refutes where
+([`eq_on_bounds`](../core/src/io/zone_map.rs#L321)): it refutes where
 Vortex's own falsifier of `x = c` does, and proves what Vortex has no
 satisfier of an equality for. It reads the bounds directly, as building
 and evaluating Vortex's proofs for a residual cost tens of µs, more than
@@ -470,9 +470,9 @@ the view's tail and indexes.
 Then the **zone classes** narrow the rows to compare. An in-memory base keeps
 a zone map of each code column's 8,192-row zones, their exact bounds,
 and for the graph column the graphs each zone records with their rows
-([`QuadZones`](../core/src/store/zones.rs#L29)), as a file store's located runs
-read them: taken in the pass that compresses a build's codes (the graphs with
-Vortex's accumulator of `vortexrdf.value_counts`), or read from the zone
+([`QuadZones`](../core/src/store/zones.rs#L31)), as a file store's located runs
+read them: taken in the pass that compresses a build's codes (the graphs
+counted as the file writer's `vortexrdf.value_counts` counts them), or read from the zone
 tables of the file a store is loaded from (`from_file_in_memory`,
 `from_bytes`), so no query pays for them. A base without them (the string
 columns of the Default and TypedObject layouts) skips this step. Over a
@@ -480,7 +480,7 @@ selection wider than a zone, the zones it touches are classed against the
 equalities left, by the same rule on each bound column's zone bounds
 and the graphs `g`'s zones record
 ([`Classes`](../core/src/store/scan/residual.rs#L154),
-[`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L185)): "none" where a
+[`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L198)): "none" where a
 code lies outside its zone's bounds or the zone's recorded graphs lack it,
 "all" where every bound column's zone bounds are its code, mixed otherwise
 (a test pins it to Vortex's falsifier on each zone).
@@ -1075,7 +1075,7 @@ indexes. `→` reads "then".
 | `?P??` | POSG lead probe → lazy ids **+ serve plan** | ref-p probe → lazy ids, materialized unless only counted or windowed | typed/mask scan of `p` over all rows |
 | `??O?` | OSPG lead probe → lazy ids **+ serve plan** | ref-o probe → same as above | typed/mask scan of `o` |
 | `?PO?` | POSG `(p, o)` prefix probe → both resolved, lazy ids **+ serve plan** | ref-o probe (object preferred) → ids → residual `p` scan | typed/mask scan of `p ∧ o` |
-| `???G` | indexes decline → residual `g`: the column's array statistics (a one-graph store settles here), then the zone classes, "none" zones skipped, "all" zones taken, mixed ones compared; a count takes mixed zones from their recorded graphs or the encoding (§6.3) | same | same |
+| `???G` | indexes decline → residual `g`: the column's whole bounds (a one-graph store settles here), then the zone classes, "none" zones skipped, "all" zones taken, mixed ones compared; a count takes mixed zones from their recorded graphs or the encoding (§6.3) | same | same |
 | `?P?G` | POSG lead probe → `g` checked inside the run, zone by zone: zones' records, the encoding, else a compare of the run's own `g` (§6.2); the ids are its matching rows in base order, no plan. A window, or zones off: residual `g` over the ids, as above, **drops the plan** | ref-p probe → `g` checked inside the run, as by copy; a window skips the zones before it by their counts. Zones off: residual `g`, as above | residual `p ∧ g`, as above |
 | `?POG` / `??OG` | POSG `(p, o)` prefix probe, or OSPG lead probe → `g` checked inside the run, as above | ref-o probe → `g` checked inside the run; for `?POG`, residual `p` over its ids | residual over the bound columns, as above |
 | `SP??` / `SPO?` / `SPOG` (`contains`) | prefix probe → exact `Range`, nothing residual; indexes never consulted (nothing left bound) | same | same |

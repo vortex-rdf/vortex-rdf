@@ -548,7 +548,7 @@ store's *compressed-resident* form (through
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L91)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L73)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
@@ -559,18 +559,18 @@ store's *compressed-resident* form (through
 - the smallest and largest code of each 8,192-row zone of every code column
   is taken in the pass that picks the column's encoding, which reads every
   code for the column's own bounds anyway
-  ([`ZoneBuilder`](../core/src/store/zones.rs#L128)), and the graph column's
-  graphs per zone with Vortex's accumulator of `vortexrdf.value_counts`: the
-  in-memory counterpart of a file's zone maps, so a match's residual
-  equality compares only the zones that may hold its code
+  ([`ZoneBuilder`](../core/src/store/zones.rs#L133)), and in the same pass the
+  graph column's graphs per zone, counted as the file writer's
+  `vortexrdf.value_counts` counts them: the in-memory counterpart of a
+  file's zone maps, so a match's residual equality compares only the zones
+  that may hold its code
   ([matching.md §6.3](matching.md#63-residual-column-filtering)); each
   component's graph column takes its zone map and graphs in the same pass,
   so a run bound to a graph checks it inside the component
   ([matching.md §6.2](matching.md#62-secondary-index-routing));
-- the same pass's smallest and largest code of the whole column are stamped
-  on it as exact `Stat::Min`/`Stat::Max` array statistics
-  ([`stamp_bounds`](../core/src/store/array.rs#L92)), the whole-column level
-  a residual asks first.
+- each zone map keeps its column's smallest and largest code, its zones'
+  folded once ([`column_bounds`](../core/src/io/zone_map.rs#L176)), the
+  whole-column level a residual asks first.
 
 The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L96)
 (crate-private; `from_file_in_memory` calls it), takes a store's split parts:
@@ -579,9 +579,8 @@ decodes only the ones that decline. Its zone maps are the file's own zone
 tables, the graph column's recorded graphs included, read at open
 ([`QuadZones::read`](../core/src/store/zones.rs#L70)), as `from_bytes` reads
 them, its components' the zone tables of their children's graph columns
-([`read_graph_zones`](../core/src/store/zones.rs#L282)), and its code columns' array statistics are the file's footer
-statistics, stamped on the loaded base's columns
-([`stamp_quad_bounds`](../core/src/store/array.rs#L116)). Opening serialized bytes in memory is
+([`read_graph_zones`](../core/src/store/zones.rs#L246)); each keeps its column's whole bounds, as a build's
+does. Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).
 
 ---

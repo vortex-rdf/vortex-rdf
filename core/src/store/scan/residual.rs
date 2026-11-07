@@ -2,8 +2,8 @@
 //! equalities of a pattern no prefix search or index answered, over a
 //! selection of a table's rows, the base's or an index component's. The
 //! statistics settle what they can first ([`ask_statistics`]: the base
-//! columns' array statistics, then their zone maps, against which the zones
-//! a selection touches are classed, [`Classes`]). Then one walk counts the
+//! columns' whole bounds, then their zones, which their zone maps keep, and
+//! against which the zones a selection touches are classed, [`Classes`]). Then one walk counts the
 //! matches ([`count`](ResidualCompare::count)), takes a window of them
 //! ([`window`](ResidualCompare::window)), or finds every one
 //! ([`rows`](ResidualCompare::rows)):
@@ -45,7 +45,7 @@ use crate::io::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::MemoryBase;
-use crate::store::array::{bool_array_to_mask, into_struct_array, stamped_bounds, unsigned_value};
+use crate::store::array::{bool_array_to_mask, into_struct_array, unsigned_value};
 use crate::store::probes::StructProbes;
 use crate::store::read::live::{Live, WindowCursor};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
@@ -61,13 +61,13 @@ pub(crate) fn asks_statistics(rows: usize) -> bool {
 }
 
 /// What the statistics settle of a residual before its rows are compared
-/// ([`ask_statistics`]): the columns' array statistics, then their zones.
+/// ([`ask_statistics`]): the columns' whole bounds, then their zones.
 pub(crate) enum Asked {
-    /// No base row holds an equality's code: the array statistics.
+    /// No base row holds an equality's code: the columns' bounds.
     Nothing,
-    /// Every equality holds on every base row: the array statistics.
+    /// Every equality holds on every base row: the columns' bounds.
     Everything,
-    /// The equalities the array statistics leave, in order, and how the
+    /// The equalities the columns' bounds leave, in order, and how the
     /// zones the selection touches are classed against them ([`Classes`]).
     Open {
         eqs: Vec<(&'static str, Scalar)>,
@@ -77,18 +77,20 @@ pub(crate) enum Asked {
 
 /// The statistics a residual over `selection` (of `memory`'s base) asks
 /// once, each equality of `eqs` by the bounds' rule of `x = code`
-/// ([`eq_on_bounds`]): first against its column's exact bounds, the array
-/// statistics ([`stamped_bounds`]), then the equalities left against their
-/// columns' zone maps and `g`'s recorded graphs ([`Classes::Zoned`]); where
-/// those decline, the pieces of a residual whose statistics are not asked
-/// ([`unasked_classes`]).
+/// ([`eq_on_bounds`]): first against its column's exact bounds, which its
+/// zone map keeps ([`ColumnZones::column_bounds`]), then the equalities left
+/// against their columns' zones and `g`'s recorded graphs
+/// ([`Classes::Zoned`]); where those decline, the pieces of a residual whose
+/// statistics are not asked ([`unasked_classes`]). A column without a zone
+/// map has neither level.
+///
+/// [`ColumnZones::column_bounds`]: crate::io::zone_map::ColumnZones::column_bounds
 pub(crate) fn ask_statistics(
     memory: &MemoryBase,
     selection: &RowSelection,
     eqs: Vec<(&'static str, Scalar)>,
 ) -> Result<Asked> {
     let base = &memory.base;
-    let struct_arr = into_struct_array(base.clone())?;
     let mut open = Vec::with_capacity(eqs.len());
     let mut zoned = Vec::new();
     for (field, value) in eqs {
@@ -97,16 +99,14 @@ pub(crate) fn ask_statistics(
             open.push((field, value));
             continue;
         };
-        let bounds = struct_arr
-            .unmasked_field_by_name(field)
-            .ok()
-            .and_then(stamped_bounds);
+        let zones = memory.zones.get(slot);
+        let bounds = zones.and_then(|zones| zones.column_bounds());
         match bounds.and_then(|(min, max)| eq_on_bounds(min, max, code)) {
             Some(false) => return Ok(Asked::Nothing),
             Some(true) => continue,
             None => {}
         }
-        if let Some(zones) = memory.zones.get(slot) {
+        if let Some(zones) = zones {
             zoned.push(ZoneCheck {
                 bit: open.len() as u32,
                 code,

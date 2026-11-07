@@ -260,7 +260,7 @@ What the store reads from this structure:
   checks, taken only as the store writes them: as many counts as graphs, the
   graphs strictly ascending, the counts summing to the block's rows. A block
   whose record is otherwise is read as recording none
-  ([`decode_states`](../core/src/io/zone_map.rs#L353));
+  ([`decode_states`](../core/src/io/zone_map.rs#L366));
 - the **chunk leaves** of the `u64` code and row-id columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
@@ -544,9 +544,8 @@ the same statistics of its quad table beside its rows, built once: the zone
 map of each code column (`s`, `p`, `o`, `g`: each zone's `min` and `max`,
 two `u64` per 8,192-row zone), the graph column's recorded graphs per zone
 (up to 16 `(code, rows)` pairs), and each code column's exact smallest and
-largest code as its array statistics (`Stat::Min`, `Stat::Max`). A load reads
-them from the file's zone tables and footer, a build takes them in the pass
-that compresses its codes ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)). A
+largest code, its zones' folded. A load reads them from the file's zone
+tables, a build takes them in the pass that compresses its codes ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)). A
 query computes its residual's zone classes from them and keeps nothing.
 Each index component keeps the zone map of its graph column the same way,
 with the column's recorded graphs (a Dictionary store's; string columns have

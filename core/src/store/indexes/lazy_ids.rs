@@ -338,10 +338,7 @@ impl LazyRowIds {
         limit: usize,
     ) -> Result<Option<(Buffer<RowId>, Live)>> {
         if let LazyRowIds::Checked(run) = self {
-            return run
-                .ascending
-                .then(|| run.window(offset, limit))
-                .transpose();
+            return run.ascending.then(|| run.window(offset, limit)).transpose();
         }
         let Some(live) = self.len_if_known() else {
             return Ok(None);

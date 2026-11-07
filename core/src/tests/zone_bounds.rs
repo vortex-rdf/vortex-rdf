@@ -413,41 +413,55 @@ async fn array_statistics_settle_a_whole_column() {
     assert_eq!(compared(&rec), 0, "no row compared");
 }
 
-/// Every in-memory Dictionary store stamps its four code columns with
-/// their exact bounds, the same whether built from the quads, loaded from
-/// the file in memory, or adopted from its bytes, and the zone maps'
-/// smallest and largest codes; a Default-layout store, whose columns hold
-/// strings, stamps none.
+/// Every in-memory Dictionary store keeps its four code columns' exact
+/// bounds with their zone maps, the smallest and largest code of their
+/// zones: the same whether built (in one chunk or in chunks that zones
+/// cross), loaded from the file in memory, or adopted from its bytes, which
+/// read them off the file's zone maps, and a compaction's rebuild keeps its
+/// own; a Default-layout store, whose columns hold strings, keeps none.
 #[tokio::test]
-async fn built_and_loaded_stores_stamp_the_same_bounds() {
-    use super::located_zones::{Graphs, zone_quads};
-
-    let quads = zone_quads(Graphs::Stretches);
-    let built = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-    let bytes = std::fs::read(&path).unwrap();
-    let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+async fn built_and_loaded_stores_keep_the_same_column_bounds() {
+    let folded = |store: &VortexRdfStore, column: &str| {
+        let zones = store.debug_zone_bounds(column)?;
+        Some((
+            zones.iter().map(|zone| zone.0).min()?,
+            zones.iter().map(|zone| zone.1).max()?,
+        ))
+    };
+    let (_dir, _file, stores) = zoned_stores().await;
+    let built = &stores[0].1;
     for column in ["s", "p", "o", "g"] {
-        let zones = built.debug_zone_bounds(column).expect("built zones");
-        let folded = (
-            zones.iter().map(|z| z.0).min().unwrap(),
-            zones.iter().map(|z| z.1).max().unwrap(),
-        );
-        assert_eq!(
-            built.debug_column_bounds(column),
-            Some(folded),
-            "built {column}"
-        );
-        for (label, store) in [("loaded", &loaded), ("adopted", &adopted)] {
+        let want = folded(built, column).expect("built zones");
+        for (label, store) in &stores {
             assert_eq!(
                 store.debug_column_bounds(column),
-                Some(folded),
+                Some(want),
                 "{label} {column}"
             );
         }
     }
-    let strings = built_store(quads, LayoutStrategy::Default, vec![]).await;
+    let extra = make_quad(
+        "http://example.org/tail",
+        "http://example.org/p9",
+        "o1",
+        GraphName::DefaultGraph,
+    );
+    let compacted = built
+        .add_quads([extra])
+        .await
+        .unwrap()
+        .compact()
+        .await
+        .unwrap();
+    for column in ["s", "p", "o", "g"] {
+        let want = folded(&compacted, column).expect("compacted zones");
+        assert_eq!(
+            compacted.debug_column_bounds(column),
+            Some(want),
+            "compacted {column}"
+        );
+    }
+    let strings = built_store(zoned_quads(), LayoutStrategy::Default, vec![]).await;
     for column in ["s", "p", "o", "g"] {
         assert_eq!(
             strings.debug_column_bounds(column),

@@ -296,7 +296,7 @@ impl VortexRdfStore {
             Constraints::Eq(eqs) => eqs,
         };
         // The statistics ladder's first levels, asked once, before the
-        // compare is deferred or run. The base columns' array statistics:
+        // compare is deferred or run. The base columns' whole bounds:
         // an equality no row holds leaves the selection no row (the view
         // keeps its tail and indexes), one every row holds leaves the
         // compare, and with none left the selection is the answer. Either way

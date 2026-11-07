@@ -111,6 +111,9 @@ pub(crate) struct ColumnZones {
     /// Each zone's exact minimum and maximum, in zone order.
     mins: vortex_buffer::Buffer<u64>,
     maxes: vortex_buffer::Buffer<u64>,
+    /// The whole column's exact `(min, max)`, the zones' folded; `None` for
+    /// a column of no rows.
+    bounds: Option<(u64, u64)>,
     /// Each zone's recorded values, `None` for every zone of a column
     /// without the statistic.
     recorded: Option<RecordedZones>,
@@ -141,7 +144,9 @@ impl ColumnZones {
                 maxes.len()
             )));
         }
+        let bounds = mins.iter().min().zip(maxes.iter().max());
         Ok(Self {
+            bounds: bounds.map(|(&min, &max)| (min, max)),
             mins,
             maxes,
             recorded: None,
@@ -164,9 +169,17 @@ impl ColumnZones {
         Ok(self)
     }
 
+    /// The whole column's exact `(min, max)`: the smallest of its zones'
+    /// minimums and the largest of their maximums, folded once when the map
+    /// is made. A residual asks it before the zones ([`eq_on_bounds`]).
+    /// `None` for a column of no rows.
+    pub(crate) fn column_bounds(&self) -> Option<(u64, u64)> {
+        self.bounds
+    }
+
     /// Each zone's `(min, max)`, in zone order.
     #[cfg(test)]
-    pub(crate) fn bounds(&self) -> Vec<(u64, u64)> {
+    pub(crate) fn zone_bounds_list(&self) -> Vec<(u64, u64)> {
         self.mins
             .iter()
             .copied()

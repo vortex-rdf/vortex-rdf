@@ -299,7 +299,10 @@ impl IndexComponent {
     pub(crate) fn into_compressed(self) -> Result<Self> {
         let mut graph = None;
         let component = self.rebuilt(|rows| {
-            let (rows, zones) = crate::store::resident::with_compressed_int_children(rows, false)?;
+            let (rows, zones) = crate::store::resident::with_compressed_int_children(
+                rows,
+                crate::store::resident::CodeTable::Component,
+            )?;
             graph = zones.of_column(crate::store::schema::COL_G).cloned();
             Ok(rows)
         })?;
