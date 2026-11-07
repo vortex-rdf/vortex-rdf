@@ -138,7 +138,9 @@ fn zone_quads(graphs: Graphs) -> Vec<Quad> {
 /// `layout` with `index`'s indexes, in `leaves`-row flat leaves where set,
 /// and recording the graph columns' `vortexrdf.value_counts` and the
 /// reference children's graphs unless the key turns them off. The
-/// write-time hooks are in the key, so each key is one file's bytes.
+/// write-time hooks are in the key, and the write runs on a thread of its
+/// own ([`write`](Self::write)), so each key is one file's bytes whoever
+/// asks for it first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ZoneFile {
     graphs: Graphs,
@@ -195,9 +197,25 @@ impl ZoneFile {
         }
     }
 
-    /// The file's bytes, written under the key's hooks by the writer of its
-    /// shape.
+    /// The file's bytes, written on a thread of its own: nothing of the
+    /// asking thread's state reaches them (a test hook's override, which a
+    /// write reads, or a live recorder, which would keep its events), and two
+    /// first asks polled together never share hook guards.
     async fn write(self) -> Vec<u8> {
+        let (sent, bytes) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = sent.send(runtime.block_on(self.write_here()));
+        });
+        bytes.await.expect("the zone file's writer thread panicked")
+    }
+
+    /// [`write`](Self::write) on its thread: the bytes, written under the
+    /// key's hooks by the writer of its shape.
+    async fn write_here(self) -> Vec<u8> {
         use crate::store::test_hooks::{ForcedReferenceGraphs, ForcedValueCounts};
 
         let _value_counts = ForcedValueCounts::set(self.value_counts);
@@ -438,12 +456,13 @@ fn statistics_asked(rec: &Recorder) -> usize {
 /// the rows do. Each read runs under its own [`ForcedZones`] guard, and the
 /// recorder starts just before the zones-on read, so until the caller reads
 /// again it holds that read's events alone. A difference fails as `what`'s,
-/// without the answers, which may hold tens of thousands of rows.
+/// with both answers when they are short enough to read (a count, a page),
+/// and without them when they hold more rows than a message can.
 ///
 /// [`ForcedZones`]: crate::store::test_hooks::ForcedZones
 async fn zones_agree<T, F, Fut>(what: &str, read: F) -> (T, Recorder)
 where
-    T: PartialEq,
+    T: PartialEq + std::fmt::Debug,
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
@@ -456,9 +475,22 @@ where
     let _zones = ForcedZones::set(true);
     let rec = Recorder::start();
     let on = read().await;
-    assert!(on == off, "{what}: zones on and off answer apart");
+    if on != off {
+        let (on, off) = (format!("{on:?}"), format!("{off:?}"));
+        if on.len() + off.len() <= ANSWERS_SHOWN {
+            panic!("{what}: zones on and off answer apart: on {on}, off {off}");
+        }
+        panic!(
+            "{what}: zones on and off answer apart ({} and {} characters of answers)",
+            on.len(),
+            off.len()
+        );
+    }
     (on, rec)
 }
+
+/// The characters of two answers a [`zones_agree`] failure shows.
+const ANSWERS_SHOWN: usize = 2_000;
 
 /// Every [`Graphs`] layout.
 const ZONE_GRAPHS: [Graphs; 8] = [
@@ -692,6 +724,57 @@ async fn zone_files_are_written_once_per_key() {
 #[tokio::test]
 #[should_panic(expected = "zones on and off")]
 async fn zones_agree_catches_a_read_that_differs() {
+    zones_agree("the switch", || async {
+        crate::zone_stats::rules::zones_enabled()
+    })
+    .await;
+}
+
+/// A zone file is written apart from the thread that first asks for it, so
+/// nothing of that thread's state reaches the shared bytes: a live recorder
+/// sees none of the write's events, and a code-base override (which shifts
+/// the codes a write gives its terms, and is not stored in the file) does
+/// not reach the file. Each key here is one no other test asks for, so this
+/// test makes its first write.
+#[tokio::test]
+async fn zone_files_are_written_apart_from_the_asking_thread() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::CodeBase;
+
+    let rec = Recorder::start();
+    let (_dir, _path) = zone_file(ZoneFile::new(
+        Graphs::DefaultThenThree,
+        IndexConfig::NoIndex,
+    ))
+    .await;
+    let seen = rec.events();
+    assert!(
+        seen.is_empty(),
+        "the write's events reached the asker: {seen:?}"
+    );
+    drop(rec);
+
+    let key = ZoneFile::new(Graphs::DefaultThenThree, IndexConfig::Copy);
+    let (_dir, path) = {
+        let _base = CodeBase::set(u64::from(u32::MAX) + 7);
+        zone_file(key).await
+    };
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let ty = code_of(&store, "<http://example.org/type>").await;
+    let taxon = code_of(&store, "\"Taxon\"").await;
+    let g3 = code_of(&store, "<http://example.org/g3>").await;
+    let pattern = CodePattern::new(None, Some(ty), Some(taxon), Some(g3));
+    assert_eq!(
+        store.count_code_pattern(pattern).await.unwrap(),
+        RUN as u64 / 2,
+        "graph 3 holds the second half of the run, read without the override"
+    );
+}
+
+/// A read whose short answers differ fails with both of them.
+#[tokio::test]
+#[should_panic(expected = "on true, off false")]
+async fn zones_agree_shows_short_answers_that_differ() {
     zones_agree("the switch", || async {
         crate::zone_stats::rules::zones_enabled()
     })
