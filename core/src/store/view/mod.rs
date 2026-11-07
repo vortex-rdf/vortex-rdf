@@ -28,8 +28,8 @@ use crate::store::resident::CodeAccess;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::view::tail_keys::TailKeys;
-use crate::store::zones::QuadZones;
 use crate::store::{RawQuad, SortOrder};
+use crate::zone_stats::quad_zones::QuadZones;
 
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;

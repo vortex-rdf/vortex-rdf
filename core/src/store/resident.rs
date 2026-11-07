@@ -12,7 +12,7 @@ use crate::session::VORTEX_SESSION;
 use crate::store::array::{column_is_sorted, stamp_is_sorted};
 use crate::store::schema;
 use crate::store::schema::CODE_PTYPE;
-use crate::store::zones::{QuadZones, ZoneBuilder};
+use crate::zone_stats::quad_zones::{QuadZones, ZoneBuilder};
 
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -75,7 +75,7 @@ pub(crate) fn with_compressed_int_children(
     table: CodeTable,
 ) -> Result<(ArrayRef, QuadZones)> {
     use crate::store::schema::PRIMARY_COLUMNS;
-    use crate::store::zones::records_graphs;
+    use crate::zone_stats::quad_zones::records_graphs;
     use vortex_array::arrays::Primitive;
     use vortex_layout::arrays::shared::Shared;
 
@@ -115,7 +115,7 @@ pub(crate) fn with_compressed_int_children(
 pub(crate) enum CodeTable {
     /// The store's primary base. Each code column keeps its zone map, which
     /// a residual reads, its whole bounds first
-    /// ([`ColumnZones::column_bounds`](crate::io::zone_map::ColumnZones::column_bounds));
+    /// ([`ColumnZones::column_bounds`](crate::zone_stats::zone_map::ColumnZones::column_bounds));
     /// and each compressed column is wrapped in a `vortex.shared` wrapper:
     /// the match fast paths probe the compressed source through it, while
     /// the code-column payload path decodes the canonical primitive once into
@@ -133,7 +133,7 @@ pub(crate) enum CodeTable {
 impl CodeTable {
     /// Whether the column in slot `slot` of `(s, p, o, g)` keeps its zone map.
     fn zoned(self, slot: usize) -> bool {
-        self == CodeTable::Base || crate::store::zones::records_graphs(slot)
+        self == CodeTable::Base || crate::zone_stats::quad_zones::records_graphs(slot)
     }
 
     /// Whether a compressed column is wrapped in `vortex.shared`.

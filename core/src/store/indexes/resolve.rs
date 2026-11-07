@@ -17,9 +17,9 @@ use super::{
     COL_RID, CheckedRun, ComponentRun, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds,
 };
 use crate::error::Result;
-use crate::stats_rules::zones_enabled;
 use crate::store::array::unsigned_value;
 use crate::store::layouts::{PatternCodes, TermRef};
+use crate::zone_stats::rules::zones_enabled;
 
 /// What an index probes for a pattern shape it covers: the shared front half
 /// of resolution, chosen by the index's leaf module (`copy::choose`,

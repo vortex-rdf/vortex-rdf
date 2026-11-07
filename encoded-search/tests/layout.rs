@@ -26,7 +26,7 @@ use vortex_layout::layouts::struct_::StructStrategy;
 use vortex_layout::segments::{SegmentFuture, SegmentId, SegmentSinkRef, SegmentSource};
 use vortex_layout::sequence::{SendableSequentialStream, SequencePointer};
 use vortex_layout::{LayoutRef, LayoutStrategy, LayoutWriterContext};
-use vortex_rdf_encoded_search::{ColumnChunks, fetch_flat, flat_leaves};
+use vortex_rdf_encoded_search::{ColumnChunks, NodeKind, SortedProbe, fetch_flat, flat_leaves};
 use vortex_session::VortexSession;
 
 /// A dictionary strategy with the given codes and values strategies and a
@@ -878,5 +878,63 @@ async fn column_chunks_take_rows_across_leaves() {
         let taken = column.take(&rows, &source, &session).await.unwrap();
         let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
         assert_eq!(taken_u32(taken, &session), want, "{field}");
+    }
+}
+
+/// Leaves that are dictionaries of 2,000 values, past the 1,024 at which
+/// counts once went through Vortex's compare: counts over the whole column,
+/// one leaf, three rows and a leaf boundary agree with a plain count, for
+/// needles present, absent inside the values' range, and wider than the
+/// values.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_dictionaries_count_on_their_probe() {
+    let session = writer_session();
+    // 2,000 distinct values, ten rows each, spread across the column, in
+    // four leaves that each hold the whole dictionary.
+    let values: Vec<u32> = (0..2_000u32).map(|v| 1_000 + 3 * v).collect();
+    let codes: Vec<u16> = (0..20_000u32).map(|i| ((i * 7) % 2_000) as u16).collect();
+    let data: Vec<u32> = codes.iter().map(|&c| values[usize::from(c)]).collect();
+    let chunks: Vec<ArrayRef> = codes
+        .chunks(5_000)
+        .map(|leaf| {
+            let dict = vortex_array::arrays::DictArray::try_new(
+                PrimitiveArray::from_iter(leaf.iter().copied()).into_array(),
+                PrimitiveArray::from_iter(values.iter().copied()).into_array(),
+            )
+            .unwrap()
+            .into_array();
+            struct_of(vec![("s", dict)])
+        })
+        .collect();
+    let leaves = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
+    let file = write_file(&session, chunks, Some(struct_strategy(leaves))).await;
+    let root = file.footer().layout().clone();
+    let source = file.segment_source();
+    for leaf in flat_leaves(&data_node(&root, "s")).expect("flat leaves") {
+        let array = fetch_flat(&leaf.layout, &source, &session).await.unwrap();
+        let kinds = SortedProbe::resolve(&array)
+            .expect("a leaf resolves")
+            .node_kinds();
+        assert_eq!(
+            kinds[0],
+            NodeKind::Dict,
+            "each leaf a dictionary: {kinds:?}"
+        );
+    }
+    let source = file.segment_source();
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("a dictionary resolves");
+    let needles = [u64::from(data[0]), u64::from(data[7_001]), 1_001, u64::MAX];
+    for rows in [0..20_000u64, 5_000..10_000, 7_000..7_003, 4_990..5_010] {
+        for needle in needles {
+            let got = column
+                .count_eq(rows.clone(), needle, &source, &session)
+                .await
+                .unwrap();
+            let want = data[rows.start as usize..rows.end as usize]
+                .iter()
+                .filter(|&&v| u64::from(v) == needle)
+                .count() as u64;
+            assert_eq!(got, want, "count_eq({rows:?}, {needle})");
+        }
     }
 }

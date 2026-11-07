@@ -260,7 +260,7 @@ What the store reads from this structure:
   checks, taken only as the store writes them: as many counts as graphs, the
   graphs strictly ascending, the counts summing to the block's rows. A block
   whose record is otherwise is read as recording none
-  ([`decode_states`](../core/src/io/zone_map.rs#L367));
+  ([`decode_states`](../core/src/zone_stats/zone_map.rs#L367));
 - the **chunk leaves** of the `u64` code and row-id columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
@@ -308,7 +308,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L260)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L265)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed/mod.rs#L166)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -715,7 +715,7 @@ open rather than being read around.
 |---|---|---|
 | `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L28) |
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L16) |
-| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ZONE_ROWS`](../core/src/io/zone_map.rs#L24) |
+| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ZONE_ROWS`](../core/src/zone_stats/zone_map.rs#L24) |
 | data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L112), [`child_strategy`](../core/src/io/container/sources.rs#L153) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs#L37) |
 | `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, and a chunk decode hold in place, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L16) |
@@ -740,7 +740,7 @@ open rather than being read around.
 | Container identity, root layout vtable, component addressing | [`core/src/io/container/mod.rs`](../core/src/io/container/mod.rs), [`layout.rs`](../core/src/io/container/layout.rs) |
 | Inventory descriptors and their JSON codec | [`core/src/io/container/wire.rs`](../core/src/io/container/wire.rs) |
 | Write strategy, component sources | [`core/src/io/container/write.rs`](../core/src/io/container/write.rs), [`sources.rs`](../core/src/io/container/sources.rs) |
-| Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers, exact zone maps | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/file.rs`](../core/src/io/file.rs), [`read.rs`](../core/src/io/read.rs), [`zone_map.rs`](../core/src/io/zone_map.rs) |
+| Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers, exact zone maps | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/file.rs`](../core/src/io/file.rs), [`read.rs`](../core/src/io/read.rs), [`zone_map.rs`](../core/src/zone_stats/zone_map.rs) |
 | The opened-file handle and its bounded memos | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs), [`memo.rs`](../core/src/store/persist/memo.rs) |
 | Primary column names | [`core/src/store/schema.rs`](../core/src/store/schema.rs), [`layouts/typed_object.rs`](../core/src/store/layouts/typed_object.rs) |
 | Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/storage/mod.rs`](../core/src/store/layouts/dictionary/storage/mod.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed/mod.rs`](../core/src/store/layouts/dictionary/file_backed/mod.rs), [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs), [`held.rs`](../core/src/store/layouts/dictionary/file_backed/held.rs), [`open.rs`](../core/src/store/layouts/dictionary/file_backed/open.rs) |

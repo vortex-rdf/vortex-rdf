@@ -55,7 +55,7 @@ A builder hands these back in one of two shapes
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L139) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L47) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L67), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L63) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L33) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L113) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L134) | — (re-serializes a store; one opened from a file and left untouched copies the file) | bytes |
-| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L270) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
+| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L275) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -559,7 +559,7 @@ store's *compressed-resident* form (through
 - the smallest and largest code of each 8,192-row zone of every code column
   is taken in the pass that picks the column's encoding, which reads every
   code for the column's own bounds anyway
-  ([`ZoneBuilder`](../core/src/store/zones.rs#L133)), and in the same pass the
+  ([`ZoneBuilder`](../core/src/zone_stats/quad_zones.rs#L133)), and in the same pass the
   graph column's graphs per zone, counted as the file writer's
   `vortexrdf.value_counts` counts them: the in-memory counterpart of a
   file's zone maps, so a match's residual equality compares only the zones
@@ -569,7 +569,7 @@ store's *compressed-resident* form (through
   so a run bound to a graph checks it inside the component
   ([matching.md §6.2](matching.md#62-secondary-index-routing));
 - each zone map keeps its column's smallest and largest code, its zones'
-  folded once ([`column_bounds`](../core/src/io/zone_map.rs#L176)), the
+  folded once ([`column_bounds`](../core/src/zone_stats/zone_map.rs#L176)), the
   whole-column level a residual asks first.
 
 The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L96)
@@ -577,9 +577,9 @@ The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L96)
 it keeps each integer child's existing encoding wherever a probe binds it and
 decodes only the ones that decline. Its zone maps are the file's own zone
 tables, the graph column's recorded graphs included, read at open
-([`QuadZones::read`](../core/src/store/zones.rs#L70)), as `from_bytes` reads
+([`QuadZones::read`](../core/src/zone_stats/quad_zones.rs#L70)), as `from_bytes` reads
 them, its components' the zone tables of their children's graph columns
-([`read_graph_zones`](../core/src/store/zones.rs#L246)); each keeps its column's whole bounds, as a build's
+([`read_graph_zones`](../core/src/zone_stats/quad_zones.rs#L246)); each keeps its column's whole bounds, as a build's
 does. Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).
 

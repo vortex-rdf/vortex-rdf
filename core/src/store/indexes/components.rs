@@ -31,12 +31,12 @@ use crate::io::container::{
     INDEX_VERSION, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
     child_strategy,
 };
-use crate::io::zone_map::{ColumnZones, ZONE_ROWS};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{into_struct_array, make_string_array, named_struct};
 use crate::store::probes::StructProbes;
 use crate::store::schema::{ROW_ID_PTYPE, RowId, TermCode};
+use crate::zone_stats::zone_map::{ColumnZones, ZONE_ROWS};
 
 use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 

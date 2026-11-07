@@ -237,13 +237,13 @@ impl FileTable {
 /// kept, for the next reader to retry. Two `u64` per zone of each column
 /// read.
 ///
-/// [`ColumnZones::read`]: crate::io::zone_map::ColumnZones::read
+/// [`ColumnZones::read`]: crate::zone_stats::zone_map::ColumnZones::read
 #[derive(Clone)]
 pub(crate) struct ZoneMaps(Arc<ZoneMapsInner>);
 
 /// What a [`ZoneMaps`] handle shares.
 struct ZoneMapsInner {
-    cells: [[tokio::sync::OnceCell<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 5],
+    cells: [[tokio::sync::OnceCell<Option<Arc<crate::zone_stats::zone_map::ColumnZones>>>; 4]; 5],
     /// Each table's code columns' layouts, `None` for a column it lacks.
     columns: [[Option<LayoutRef>; 4]; 5],
     source: Arc<dyn vortex_layout::segments::SegmentSource>,
@@ -255,16 +255,18 @@ impl ZoneMaps {
         &self,
         table: FileTable,
         slot: usize,
-    ) -> crate::error::Result<Option<Arc<crate::io::zone_map::ColumnZones>>> {
+    ) -> crate::error::Result<Option<Arc<crate::zone_stats::zone_map::ColumnZones>>> {
         let inner = &*self.0;
         let at = table as usize;
         inner.cells[at][slot]
             .get_or_try_init(|| async {
                 crate::observe::observe!(ZoneMapRead);
                 Ok(match &inner.columns[at][slot] {
-                    Some(column) => crate::io::zone_map::ColumnZones::read(column, &inner.source)
-                        .await?
-                        .map(Arc::new),
+                    Some(column) => {
+                        crate::zone_stats::zone_map::ColumnZones::read(column, &inner.source)
+                            .await?
+                            .map(Arc::new)
+                    }
                     None => None,
                 })
             })

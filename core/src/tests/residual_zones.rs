@@ -5,8 +5,8 @@
 
 use super::located_zones::{Graphs, RUN, zone_quads};
 use super::*;
-use crate::io::zone_map::ZONE_ROWS;
 use crate::store::test_hooks::ForcedZones;
+use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// Every [`Graphs`] layout.
 pub(super) const LAYOUTS: [Graphs; 8] = [

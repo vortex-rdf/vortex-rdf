@@ -544,11 +544,12 @@ class VortexRdfStore:
         ...
 
 def engine_counters() -> Dict[str, int]:
-    """The encoded-search work counters, by name, cumulative since the process started.
+    """The work counters, by name, cumulative since the process started.
 
     They count only with ``VORTEX_RDF_COUNTERS=1`` set when the process starts (one relaxed atomic
     load per site otherwise, and every value stays 0): leaves searched encoded or decoded, resident
-    probes, gathers, shared canonical decodes and equality-scan binds, each with the values it covered.
+    probes, gathers, shared canonical decodes and equality-scan binds, and a located run's zone
+    decisions, each with the values it covered.
     """
     ...
 

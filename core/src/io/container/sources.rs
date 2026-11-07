@@ -9,7 +9,7 @@ use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
 use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 
 use super::wire::StoreComponentDescriptor;
-use crate::io::zone_map::ZONE_ROWS;
+use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// A producer of one component's chunks: buffered arrays
 /// ([`BufferedComponentSource`], replayable) or a spill-run merger pulled
@@ -297,7 +297,7 @@ fn id_column_strategy(
 /// The zone aggregates of a graph column (`g`, a `u64` term code): the zoned
 /// writer's defaults for a `u64` column (exact `max` and `min`, then the NaN
 /// and null counts), and `vortexrdf.value_counts`, each zone's graphs with
-/// their rows ([`value_counts`](crate::store::value_counts::value_counts)).
+/// their rows ([`value_counts`](crate::zone_stats::value_counts::value_counts)).
 pub(crate) fn graph_column_aggregates() -> Arc<[vortex_array::aggregate_fn::AggregateFnRef]> {
     use vortex_array::aggregate_fn::fns::{
         max::Max, min::Min, nan_count::NanCount, null_count::NullCount,
@@ -310,7 +310,7 @@ pub(crate) fn graph_column_aggregates() -> Arc<[vortex_array::aggregate_fn::Aggr
         Min.bind(NumericalAggregateOpts::skip_nans()),
         NanCount.bind(EmptyOptions),
         NullCount.bind(EmptyOptions),
-        crate::store::value_counts::value_counts(),
+        crate::zone_stats::value_counts::value_counts(),
     ])
 }
 
@@ -347,7 +347,7 @@ pub(crate) fn dict_child_strategy(
             FlatLayoutStrategy::default(),
             ZonedLayoutOptions {
                 block_size,
-                aggregate_fns: Some(crate::io::zone_map::exact_bound_aggregates()),
+                aggregate_fns: Some(crate::zone_stats::zone_map::exact_bound_aggregates()),
                 concurrency: std::num::NonZeroUsize::MIN,
             },
         )),

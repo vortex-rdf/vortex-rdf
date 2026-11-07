@@ -874,3 +874,53 @@ fn bounds_in_edge_windows() {
         "full-window bounds_in must equal bounds"
     );
 }
+
+/// Dictionaries of 4, 2,000 and 10,000 values over bit-packed, run-end and
+/// plain codes: reads, counts and finds over windows shorter and longer than
+/// the dictionary answer as a plain scan.
+#[test]
+fn dictionary_counts_and_finds() {
+    for distinct in [4u16, 2_000, 10_000] {
+        let values: Vec<u32> = (0..u32::from(distinct)).map(|v| 1_000 + 7 * v).collect();
+        let spread: Vec<u16> = (0..20_000u32)
+            .map(|i| ((i * 7_919) % u32::from(distinct)) as u16)
+            .collect();
+        let runs: Vec<u16> = (0..20_000u32)
+            .map(|i| ((i / 50) % u32::from(distinct)) as u16)
+            .collect();
+        let shapes = [
+            (
+                compress_with(&[&BITPACKING], &spread),
+                &spread,
+                NodeKind::BitPacked,
+            ),
+            (
+                compress_with(&[&integer::RunEndScheme], &runs),
+                &runs,
+                NodeKind::RunEnd,
+            ),
+            (
+                PrimitiveArray::from_iter(spread.clone()).into_array(),
+                &spread,
+                NodeKind::Primitive,
+            ),
+        ];
+        for (codes, plain, kind) in shapes {
+            let data: Vec<u32> = plain.iter().map(|&c| values[usize::from(c)]).collect();
+            let arr = vortex_array::arrays::DictArray::try_new(
+                codes,
+                PrimitiveArray::from_iter(values.clone()).into_array(),
+            )
+            .unwrap()
+            .into_array();
+            let probe = SortedProbe::resolve(&arr).expect("a dictionary resolves");
+            let kinds = probe.node_kinds();
+            assert_eq!(
+                kinds[..2],
+                [NodeKind::Dict, kind],
+                "{distinct} values: {kinds:?}"
+            );
+            common::assert_bulk_reads(&probe, &data);
+        }
+    }
+}

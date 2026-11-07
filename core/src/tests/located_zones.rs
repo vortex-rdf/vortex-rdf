@@ -2,7 +2,7 @@
 //! columns, read back with their exact bounds and recorded graphs.
 
 use super::*;
-use crate::io::zone_map::ColumnZones;
+use crate::zone_stats::zone_map::ColumnZones;
 
 /// A store file's `g` column read as a zone map: 20,000 rows of `g1` then
 /// `g2` make three zones, and `g = g1` holds on every row of the first, on
@@ -59,8 +59,8 @@ async fn column_zones_absent_without_zone_maps() {
 /// zone's.
 #[tokio::test]
 async fn column_zones_read_recorded_counts() {
-    use crate::io::zone_map::ZONE_ROWS;
     use crate::store::test_hooks::ForcedValueCounts;
+    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     for recorded in [true, false] {
         let (_dir, path) = {
@@ -114,8 +114,9 @@ pub(super) const RUN: usize = 40_000;
 
 /// The rows of [`Graphs::UnrecordedGap`]'s seventeen graphs: zone 6 of
 /// `index:ref-p`, whose `type` run is its rows `RUN..2 * RUN`.
-pub(super) const UNRECORDED_GAP: std::ops::Range<usize> =
-    6 * crate::io::zone_map::ZONE_ROWS - RUN..7 * crate::io::zone_map::ZONE_ROWS - RUN;
+pub(super) const UNRECORDED_GAP: std::ops::Range<usize> = 6 * crate::zone_stats::zone_map::ZONE_ROWS
+    - RUN
+    ..7 * crate::zone_stats::zone_map::ZONE_ROWS - RUN;
 
 /// How a run's rows fall into graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -508,7 +509,7 @@ async fn zoned_runs_skip_settled_zones() {
                 let (counted, read) = zone_work(&rec);
                 assert_eq!(read, 0, "{}: a count reads no checked rows", fixture.tag);
                 assert!(
-                    counted < crate::io::zone_map::ZONE_ROWS as u64,
+                    counted < crate::zone_stats::zone_map::ZONE_ROWS as u64,
                     "{}: {counted} rows counted",
                     fixture.tag
                 );
@@ -545,8 +546,8 @@ async fn zoned_runs_skip_settled_zones() {
 /// (Review Focus 4).
 #[tokio::test]
 async fn recorded_graphs_settle_zones_without_the_code() {
-    use crate::io::zone_map::ZONE_ROWS;
     use crate::store::test_hooks::{ForcedValueCounts, ForcedZones};
+    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     for recorded in [true, false] {
         let (_dir, path) = {
@@ -599,8 +600,8 @@ async fn recorded_graphs_settle_zones_without_the_code() {
 #[tokio::test]
 async fn first_pages_count_the_zones_before_their_first_match() {
     use crate::CodePattern;
-    use crate::io::zone_map::ZONE_ROWS;
     use crate::store::test_hooks::{ForcedValueCounts, ForcedZones};
+    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     // The run is rows RUN..2 * RUN of its child, graph 2's rows its rows
     // 20,000..21,000: they lie in the child's zone from 57,344.
@@ -661,8 +662,8 @@ async fn first_pages_count_the_zones_before_their_first_match() {
 /// the run, on its encoding. It reads no checked rows.
 #[tokio::test]
 async fn recorded_counts_answer_mixed_zones() {
-    use crate::io::zone_map::ZONE_ROWS;
     use crate::store::test_hooks::ForcedZones;
+    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
     let (_dir, path) = write_store_file(
@@ -755,8 +756,8 @@ async fn zones_past_max_values_count_their_encoding() {
 #[tokio::test]
 async fn recorded_and_unrecorded_zones_by_turns() {
     use crate::CodePattern;
-    use crate::io::zone_map::ZONE_ROWS;
     use crate::store::test_hooks::ForcedZones;
+    use crate::zone_stats::zone_map::ZONE_ROWS;
     use std::collections::BTreeSet;
 
     let (_dir, path) = write_store_file(
@@ -850,8 +851,8 @@ async fn recorded_and_unrecorded_zones_by_turns() {
 #[tokio::test]
 async fn default_graph_counts_from_records() {
     use crate::CodePattern;
-    use crate::io::zone_map::ZONE_ROWS;
     use crate::store::test_hooks::ForcedZones;
+    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
     let (_dir, path) = write_store_file(
@@ -918,8 +919,8 @@ fn reference_graph_reads(rec: &Recorder) -> (u64, u64) {
 #[tokio::test]
 async fn reference_runs_skip_settled_zones() {
     use crate::CodePattern;
-    use crate::io::zone_map::ZONE_ROWS;
     use crate::store::test_hooks::ForcedZones;
+    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
     let zone = ZONE_ROWS as u64;
@@ -1523,10 +1524,9 @@ async fn gap_cap_only_where_zones_cannot_decide() {
 /// zones and counts mixed ones (a no-op without the variable).
 #[tokio::test]
 async fn zone_counters_count_decisions() {
+    use crate::counters::{ZONE_ALL, ZONE_COUNTED, ZONE_NONE, ZONE_RECORDED, snapshot};
     use crate::store::test_hooks::ForcedZones;
-    use vortex_rdf_encoded_search::counters::{
-        ZONE_ALL, ZONE_COUNTED, ZONE_NONE, ZONE_RECORDED, on, snapshot,
-    };
+    use vortex_rdf_encoded_search::counters::on;
 
     if !on() {
         return;

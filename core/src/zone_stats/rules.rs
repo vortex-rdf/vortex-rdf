@@ -20,7 +20,7 @@ use vortex_session::VortexSession;
 /// `u64` literal, and not while `VORTEX_RDF_ZONES=0` ([`zones_switch`]).
 /// A located run and the in-memory residual apply the same records
 /// themselves, decoded once
-/// ([`ColumnZones::eq_holds`](crate::io::zone_map::ColumnZones::eq_holds)).
+/// ([`ColumnZones::eq_holds`](crate::zone_stats::zone_map::ColumnZones::eq_holds)).
 #[derive(Debug)]
 pub(crate) struct ValueCountsFalsifier;
 
@@ -55,7 +55,10 @@ impl vortex_array::stats::rewrite::StatsRewriteRule for ValueCountsFalsifier {
         if column.dtype() != &u64 || literal.dtype() != &u64 || literal.as_::<Literal>().is_null() {
             return Ok(None);
         }
-        let recorded = stat(column.clone(), crate::store::value_counts::value_counts());
+        let recorded = stat(
+            column.clone(),
+            crate::zone_stats::value_counts::value_counts(),
+        );
         Ok(Some(not(list_contains(
             get_item("values", recorded),
             literal.clone(),

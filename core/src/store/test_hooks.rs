@@ -631,7 +631,7 @@ impl VortexRdfStore {
     }
 
     /// Base column `name`'s exact `(min, max)`, kept with its zone map
-    /// ([`ColumnZones::column_bounds`](crate::io::zone_map::ColumnZones::column_bounds)),
+    /// ([`ColumnZones::column_bounds`](crate::zone_stats::zone_map::ColumnZones::column_bounds)),
     /// of an in-memory view; `None` for a column without a zone map or any
     /// other view.
     pub(crate) fn debug_column_bounds(&self, name: &str) -> Option<(TermCode, TermCode)> {

@@ -187,10 +187,11 @@ public final class VortexRdfStore implements AutoCloseable {
 	}
 
 	/**
-	 * vortex-rdf's encoded-search work counters by name, cumulative in this process: the chunk leaves searched
-	 * encoded or decoded, resident probes, gathers, shared canonical decodes and equality-scan binds, each also by the
-	 * number of values. They count only with {@code VORTEX_RDF_COUNTERS=1} set when the native library loads; otherwise
-	 * every value is 0. Meant for measurements, not for applications.
+	 * vortex-rdf's work counters by name, cumulative in this process: the encoded search's (the chunk leaves
+	 * searched encoded or decoded, resident probes, gathers, shared canonical decodes and equality-scan binds), then a
+	 * located run's zone decisions, each also by the number of values. They count only with
+	 * {@code VORTEX_RDF_COUNTERS=1} set when the native library loads; otherwise every value is 0. Meant for
+	 * measurements, not for applications.
 	 *
 	 * @return each counter's value by name, in an unmodifiable map
 	 */

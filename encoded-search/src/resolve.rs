@@ -19,8 +19,10 @@ use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
 use vortex_sparse::{Sparse, SparseSlots};
 
+use crate::bitpacked::PackedNode;
 use crate::delta::{DeltaNode, DeltaWidth};
-use crate::node::{Chunk, Node, PackedNode, PatchProbe, Words};
+use crate::node::{Chunk, Node, PatchProbe};
+use crate::words::Words;
 
 /// Child array at a fixed slot index, `'a`-borrowed from the erased slots.
 fn slot(slots: &[Option<ArrayRef>], idx: usize) -> Option<&ArrayRef> {
@@ -173,13 +175,14 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
             }),
             _ => return None,
         };
-        return Some(Node::BitPacked(PackedNode {
+        return PackedNode::new(
             packed,
-            bit_width: usize::from(bit_width),
-            offset: usize::from(data.offset()),
-            len: arr.len(),
+            usize::from(bit_width),
+            usize::from(data.offset()),
+            arr.len(),
             patches,
-        }));
+        )
+        .map(Node::BitPacked);
     }
 
     if let Some(view) = arr.as_opt::<Delta>() {

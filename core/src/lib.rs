@@ -51,16 +51,17 @@ compile_error!(
 
 pub mod columns;
 pub mod common;
+pub mod counters;
 pub(crate) mod debug;
 mod error;
 pub mod io;
 mod kernels;
 pub(crate) mod observe;
 mod session;
-mod stats_rules;
 // The quad store. Its public items, like `error`'s, are re-exported below and
 // reached at the crate root only.
 mod store;
+pub(crate) mod zone_stats;
 
 pub use error::{Result, VortexRdfError};
 

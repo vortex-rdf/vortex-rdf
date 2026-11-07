@@ -1,11 +1,13 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
+mod bitpacked;
 mod delta;
 mod node;
 mod owned;
 mod resolve;
 mod search;
+mod words;
 
 pub use owned::OwnedSortedProbe;
 
@@ -34,7 +36,7 @@ pub mod counters {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// How many counters there are: a pair per site.
-    pub const LEN: usize = 30;
+    pub const LEN: usize = 18;
 
     /// Names in [`snapshot`] order.
     pub const NAMES: [&str; LEN] = [
@@ -56,18 +58,6 @@ pub mod counters {
         "typed_eq_probe_values",
         "typed_eq_primitive",
         "typed_eq_primitive_values",
-        "zone_column",
-        "zone_column_values",
-        "zone_none",
-        "zone_none_values",
-        "zone_all",
-        "zone_all_values",
-        "zone_counted",
-        "zone_counted_values",
-        "check_read",
-        "check_read_values",
-        "zone_recorded",
-        "zone_recorded_values",
     ];
     /// A chunk leaf loaded and resolved as it is encoded.
     pub const LEAF_ENCODED: usize = 0;
@@ -87,20 +77,6 @@ pub mod counters {
     pub const TYPED_EQ_PROBE: usize = 14;
     /// An equality scan bound to a primitive (decoded) column.
     pub const TYPED_EQ_PRIMITIVE: usize = 16;
-    /// A located run's checked slot settled for the whole file by its footer
-    /// statistics (values: the run's rows).
-    pub const ZONE_COLUMN: usize = 18;
-    /// A located run's zone (its rows of it) settled as holding no match.
-    pub const ZONE_NONE: usize = 20;
-    /// A located run's zone (its rows of it) settled as all matches, unread.
-    pub const ZONE_ALL: usize = 22;
-    /// A located run's mixed zone counted on the checked column's encoding.
-    pub const ZONE_COUNTED: usize = 24;
-    /// A located run's rows read at checked columns to check them.
-    pub const CHECK_READ: usize = 26;
-    /// A located run's mixed zone counted from the checked column's recorded
-    /// values (`vortexrdf.value_counts`), unread.
-    pub const ZONE_RECORDED: usize = 28;
 
     static C: [AtomicU64; LEN] = [const { AtomicU64::new(0) }; LEN];
 
@@ -232,7 +208,9 @@ impl<'a> SortedProbe<'a> {
             start.checked_add(len).is_some_and(|end| end <= self.len()),
             "{len} values from {start} out of bounds"
         );
-        self.root.count_eq(start, len, needle)
+        let mut count = search::Count(0);
+        self.root.eq_into(start, len, needle, 0, &mut count);
+        count.0
     }
 
     /// The offsets `k` in `0..len` whose value at `start + k` equals `needle`,
@@ -249,7 +227,8 @@ impl<'a> SortedProbe<'a> {
             start.checked_add(len).is_some_and(|end| end <= self.len()),
             "{len} values from {start} out of bounds"
         );
-        self.root.eq_offsets(start, len, needle, 0, out);
+        self.root
+            .eq_into(start, len, needle, 0, &mut search::Offsets(out));
     }
 
     /// The exact values at `indices`, in their order, into `out`: each run of
@@ -270,21 +249,6 @@ impl<'a> SortedProbe<'a> {
                 self.read_into(indices[i], &mut out[i..i + run]);
             }
             i += run;
-        }
-    }
-
-    /// Whether the resolved tree's root is a dictionary: codes into a values
-    /// array.
-    pub fn is_dictionary(&self) -> bool {
-        self.dictionary_len().is_some()
-    }
-
-    /// How many values the resolved tree's root dictionary holds; `None`
-    /// when its root is no dictionary.
-    pub fn dictionary_len(&self) -> Option<usize> {
-        match &self.root {
-            node::Node::Dict { values, .. } => Some(values.len()),
-            _ => None,
         }
     }
 

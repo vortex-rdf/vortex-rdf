@@ -8,9 +8,9 @@
 use super::located_zones::{Graphs, RUN, UNRECORDED_GAP, zone_quads};
 use super::residual_zones::{LAYOUTS, answers, quads_of, tailed, tombstoned};
 use super::*;
-use crate::io::zone_map::ZONE_ROWS;
 use crate::store::test_hooks::ForcedZones;
 use crate::store::{Keep, QuadColumn};
+use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The probes an index run answers, by graph: `(? type ? g)`,
 /// `(? type Taxon g)` and `(? ? Taxon g)`, for the default graph and graphs

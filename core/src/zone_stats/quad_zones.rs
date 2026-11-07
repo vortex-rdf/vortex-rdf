@@ -18,9 +18,9 @@
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::io::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS};
 use crate::store::schema::{CODE_DTYPE, PRIMARY_COLUMNS, TermCode};
-use crate::store::value_counts::{Counts, MAX_VALUES};
+use crate::zone_stats::value_counts::{Counts, MAX_VALUES};
+use crate::zone_stats::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS};
 
 /// The graph column's slot in `(s, p, o, g)`.
 const GRAPH_SLOT: usize = 3;
@@ -325,7 +325,7 @@ mod tests {
         column: &vortex_array::ArrayRef,
         ctx: &mut vortex_array::ExecutionCtx,
     ) -> RecordedZones {
-        use crate::store::value_counts::{
+        use crate::zone_stats::value_counts::{
             MAX_VALUES, ValueCounts, ValueCountsOptions, decode_state,
         };
         use vortex_array::aggregate_fn::{Accumulator, DynAccumulator as _};

@@ -305,7 +305,7 @@ impl VortexRdfStore {
         // the selection touches, classed against the equalities left.
         let rows = selection.len(memory.base.len());
         let (eqs, classes) =
-            if residual::asks_statistics(rows) && crate::stats_rules::zones_enabled() {
+            if residual::asks_statistics(rows) && crate::zone_stats::rules::zones_enabled() {
                 match residual::ask_statistics(memory, &selection, eqs)? {
                     residual::Asked::Nothing => {
                         observe!(ResidualSettled { none: true });

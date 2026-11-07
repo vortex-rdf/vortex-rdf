@@ -3,10 +3,10 @@
 //! counted.
 
 use super::*;
-use crate::io::zone_map::{ExactZoneMap, ZONE_ROWS};
-use crate::stats_rules::zones_switch;
 use crate::store::test_hooks::ForcedValueCounts;
-use crate::store::value_counts::{decode_state, value_counts};
+use crate::zone_stats::rules::zones_switch;
+use crate::zone_stats::value_counts::{decode_state, value_counts};
+use crate::zone_stats::zone_map::{ExactZoneMap, ZONE_ROWS};
 
 /// Whether `column` is zoned with the statistic among its aggregates.
 pub(super) fn records_value_counts(column: &vortex_layout::LayoutRef) -> bool {

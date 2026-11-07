@@ -1,5 +1,8 @@
 //! The searches over a virtual index range that every probe node runs:
-//! bisection, and the interpolating search over ascending values.
+//! bisection, and the interpolating search over ascending values; and what
+//! an equality search gathers ([`EqSink`]): a count, or the offsets.
+
+use std::ops::Range;
 
 /// Split points [`search_ascending`] may place by interpolation.
 const INTERPOLATION_STEPS: usize = 4;
@@ -92,6 +95,67 @@ pub(crate) fn partition(n: usize, mut below: impl FnMut(usize) -> bool) -> usize
         }
     }
     lo
+}
+
+/// What an equality search gathers from its window, handed the matching
+/// offsets in ascending order: a count of them ([`Count`]) or the offsets
+/// themselves ([`Offsets`]).
+pub(crate) trait EqSink {
+    /// Every offset in `offsets` matches.
+    fn run(&mut self, offsets: Range<usize>);
+
+    /// Offset `at + k` matches where `values[k] == needle`.
+    fn matching<T: Copy + PartialEq>(&mut self, at: usize, values: &[T], needle: T);
+}
+
+/// Counts the matching offsets.
+pub(crate) struct Count(pub(crate) usize);
+
+impl EqSink for Count {
+    fn run(&mut self, offsets: Range<usize>) {
+        self.0 += offsets.len();
+    }
+
+    fn matching<T: Copy + PartialEq>(&mut self, _: usize, values: &[T], needle: T) {
+        self.0 += if size_of::<T>() < size_of::<u64>() {
+            // Narrow words are tallied in a byte, 255 at a time, so whole
+            // vectors of them compare and add as they are: a `usize` tally
+            // widens each comparison to 64 bits first, which made counts of
+            // byte codes a third slower than a scalar loop (the probe bench's
+            // `count_eq_probe/graphs_alternating_2m`). A byte tally of 64-bit
+            // words costs more than it saves, so those count as they compare.
+            values
+                .chunks(usize::from(u8::MAX))
+                .map(|block| {
+                    let tally = block
+                        .iter()
+                        .fold(0u8, |tally, &v| tally + u8::from(v == needle));
+                    usize::from(tally)
+                })
+                .sum::<usize>()
+        } else {
+            values.iter().filter(|&&v| v == needle).count()
+        };
+    }
+}
+
+/// Appends the matching offsets.
+pub(crate) struct Offsets<'v>(pub(crate) &'v mut Vec<usize>);
+
+impl EqSink for Offsets<'_> {
+    fn run(&mut self, offsets: Range<usize>) {
+        self.0.extend(offsets);
+    }
+
+    fn matching<T: Copy + PartialEq>(&mut self, at: usize, values: &[T], needle: T) {
+        self.0.extend(
+            values
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v == needle)
+                .map(|(k, _)| at + k),
+        );
+    }
 }
 
 #[cfg(test)]

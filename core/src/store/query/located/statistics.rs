@@ -3,15 +3,15 @@
 //! against the slots left, asked once, when a read first needs them.
 
 use super::run::*;
+use crate::counters::{self, note};
 use crate::error::Result;
-use crate::io::zone_map::{ZONE_ROWS, eq_on_bounds, footer_bounds};
-use crate::io::zone_set::{ZoneCheck, ZoneSet};
 use crate::observe::observe;
-use crate::stats_rules::zones_enabled;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::schema::PRIMARY_COLUMNS;
+use crate::zone_stats::rules::zones_enabled;
+use crate::zone_stats::zone_map::{ZONE_ROWS, eq_on_bounds, footer_bounds};
+use crate::zone_stats::zone_set::{ZoneCheck, ZoneSet};
 use std::sync::Arc;
-use vortex_rdf_encoded_search::counters;
 
 /// What a located run knows of its file's statistics.
 pub(super) enum Statistics {

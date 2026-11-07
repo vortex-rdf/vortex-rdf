@@ -5,7 +5,7 @@
 
 use super::located_zones::{Graphs, RUN, zone_quads};
 use super::*;
-use crate::io::zone_map::ZONE_ROWS;
+use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The components of an index configuration.
 fn component_names(index: IndexConfig) -> &'static [&'static str] {

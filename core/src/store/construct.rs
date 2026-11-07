@@ -11,10 +11,10 @@ use crate::store::builders::{BuiltArray, VortexArrayBuilder, build_struct_array}
 use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
 use crate::store::resident::CodeAccess;
-use crate::store::zones::QuadZones;
 use crate::store::{
     Backend, MemoryBase, QuadsSource, RawQuad, VortexRdfStore, next_generation, probes, resident,
 };
+use crate::zone_stats::quad_zones::QuadZones;
 
 use std::sync::Arc;
 
