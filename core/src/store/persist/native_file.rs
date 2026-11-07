@@ -483,17 +483,20 @@ impl NativeStoreFile {
     /// ([`ZoneMaps`]), a handle a split task keeps.
     pub(crate) fn zone_maps(&self) -> ZoneMaps {
         self.zone_maps
-            .get_or_init(|| {
-                ZoneMaps(Arc::new(ZoneMapsInner {
-                    cells: Default::default(),
-                    columns: FileTable::ALL.map(|table| {
-                        schema::PRIMARY_COLUMNS
-                            .map(|column| self.table_column_layout(table.component(), column))
-                    }),
-                    source: self.segment_source(),
-                }))
-            })
+            .get_or_init(|| self.new_zone_maps(self.segment_source()))
             .clone()
+    }
+
+    /// A zone-map handle over `source`, none of its maps read yet.
+    fn new_zone_maps(&self, source: Arc<dyn vortex_layout::segments::SegmentSource>) -> ZoneMaps {
+        ZoneMaps(Arc::new(ZoneMapsInner {
+            cells: Default::default(),
+            columns: FileTable::ALL.map(|table| {
+                schema::PRIMARY_COLUMNS
+                    .map(|column| self.table_column_layout(table.component(), column))
+            }),
+            source,
+        }))
     }
 
     /// Whether the file records its quad rows in global `(s, p, o, g)` order.
@@ -648,6 +651,104 @@ mod tests {
     use super::*;
     use crate::store::persist::memo::BIND_MEMO_MAX;
     use vortex_array::expr::{eq, get_item, lit, root};
+
+    /// A segment source over another whose every read is pending on its
+    /// first poll (and wakes its task), then completes as the inner read:
+    /// readers joined on one task interleave at each read.
+    struct WaitingSource(Arc<dyn vortex_layout::segments::SegmentSource>);
+
+    impl vortex_layout::segments::SegmentSource for WaitingSource {
+        fn request(
+            &self,
+            id: vortex_layout::segments::SegmentId,
+        ) -> vortex_layout::segments::SegmentFuture {
+            use futures::FutureExt as _;
+
+            let read = self.0.request(id);
+            let mut waited = false;
+            let wait = futures::future::poll_fn(move |cx| {
+                if waited {
+                    std::task::Poll::Ready(())
+                } else {
+                    waited = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            });
+            async move {
+                wait.await;
+                read.await
+            }
+            .boxed()
+        }
+    }
+
+    /// A segment source over another whose first read fails, every later one
+    /// the inner source's.
+    struct FailingOnce {
+        inner: Arc<dyn vortex_layout::segments::SegmentSource>,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl vortex_layout::segments::SegmentSource for FailingOnce {
+        fn request(
+            &self,
+            id: vortex_layout::segments::SegmentId,
+        ) -> vortex_layout::segments::SegmentFuture {
+            use futures::FutureExt as _;
+
+            if !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let failed = Err(vortex_error::vortex_err!("a failing segment read"));
+                return futures::future::ready(failed).boxed();
+            }
+            self.inner.request(id)
+        }
+    }
+
+    /// A zone map is read once however many readers ask for it at once: two
+    /// readers of `index:ref-p`'s `g` map, joined on one task over a source
+    /// whose every read waits, get the one map, read once (Review Focus 1).
+    #[tokio::test]
+    async fn joined_readers_read_a_zone_map_once() {
+        use crate::IndexType;
+        use crate::observe::{Event, Recorder};
+
+        let (_dir, native) =
+            crate::tests::mapped_file(50, vec![IndexType::SecondaryByReference]).await;
+        let maps = native.new_zone_maps(Arc::new(WaitingSource(native.segment_source())));
+        let rec = Recorder::start();
+        let (first, second) =
+            futures::join!(maps.get(FileTable::RefP, 3), maps.get(FileTable::RefP, 3));
+        let first = first.unwrap().expect("index:ref-p's g map");
+        let second = second.unwrap().expect("index:ref-p's g map");
+        assert!(Arc::ptr_eq(&first, &second), "the one map");
+        assert_eq!(rec.count(&Event::ZoneMapRead), 1, "read once");
+    }
+
+    /// A zone map whose read fails is not kept: the next reader reads it
+    /// again and gets it (Review Focus 1).
+    #[tokio::test]
+    async fn a_failed_zone_map_read_is_read_again() {
+        use crate::IndexType;
+        use crate::observe::{Event, Recorder};
+
+        let (_dir, native) =
+            crate::tests::mapped_file(50, vec![IndexType::SecondaryByReference]).await;
+        let maps = native.new_zone_maps(Arc::new(FailingOnce {
+            inner: native.segment_source(),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        }));
+        let rec = Recorder::start();
+        assert!(
+            maps.get(FileTable::RefP, 3).await.is_err(),
+            "the failing read"
+        );
+        assert!(
+            maps.get(FileTable::RefP, 3).await.unwrap().is_some(),
+            "read again"
+        );
+        assert_eq!(rec.count(&Event::ZoneMapRead), 2, "two reads");
+    }
 
     /// Chunk-probe handles are memoized, one per quad column and one per
     /// (index component, column): every call hands out the same handle, so
