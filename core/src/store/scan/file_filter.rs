@@ -22,7 +22,7 @@ use crate::io::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 use crate::observe::observe;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
-use crate::store::persist::native_file::{NativeStoreFile, QuadZoneMaps};
+use crate::store::persist::native_file::{FileTable, NativeStoreFile, ZoneMaps};
 use crate::store::scan::file_exprs::{PushedFilter, QUAD_SCOPE};
 use crate::store::scan::file_scans::{ScanDriver, split_window, strict_ids};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
@@ -183,10 +183,10 @@ impl ConjunctOrder {
 
 /// The every-row step of a filter of code equalities over a file: each
 /// equality's quad slot and code, and the file's quad zone maps
-/// ([`QuadZoneMaps`]) that decide it.
+/// ([`ZoneMaps`]) that decide it.
 struct EveryRow {
     columns: Vec<(usize, u64)>,
-    maps: QuadZoneMaps,
+    maps: ZoneMaps,
 }
 
 /// The every-row step `filter` takes over `file`, decided once per
@@ -209,7 +209,7 @@ fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<Every
         .collect::<Option<Vec<_>>>()?;
     (!columns.is_empty()).then(|| EveryRow {
         columns,
-        maps: file.quad_zone_maps(),
+        maps: file.zone_maps(),
     })
 }
 
@@ -219,7 +219,7 @@ fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<Every
 /// `start`. A zone qualifies where each equality's column has a zone map
 /// whose bounds there are both its code, the class all of the equalities'
 /// [`ZoneSet`]: the rule Vortex's pruning of `col != c` applies, read off
-/// the maps the file reads once ([`QuadZoneMaps`]), only for the split's own
+/// the maps the file reads once ([`ZoneMaps`]), only for the split's own
 /// zones.
 async fn every_row_zones(
     every_row: Option<&EveryRow>,
@@ -234,7 +234,7 @@ async fn every_row_zones(
     }
     let mut checks = Vec::with_capacity(every_row.columns.len());
     for (bit, &(slot, code)) in every_row.columns.iter().enumerate() {
-        let Some(zones) = every_row.maps.get(slot).await? else {
+        let Some(zones) = every_row.maps.get(FileTable::Quads, slot).await? else {
             return Ok((None, start));
         };
         checks.push(ZoneCheck {

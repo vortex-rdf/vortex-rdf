@@ -771,9 +771,9 @@ column are both `c` cannot hold a differing row, the rule Vortex's pruning
 of `col != c` applies. Each split reads it off the quad table's zone maps
 for its own zones
 ([`every_row_zones`](../core/src/store/scan/file_filter.rs#L224)): the maps
-the file reads once per column on first use, as located runs read them
-([`QuadZoneMaps`](../core/src/store/persist/native_file.rs#L217)), shared
-by the splits however many ask at once. The filter is then evaluated only
+the file reads once per table and column on first use, which located runs
+read too ([`ZoneMaps`](../core/src/store/persist/native_file.rs#L242)), shared
+by the splits and the runs however many ask at once. The filter is then evaluated only
 over the split's other rows, after their own pruning. Counts and reads alike
 take them; a tombstoned row is not among them, as no split starts with it.
 `VORTEX_RDF_ZONES=0` (decided once per evaluation, on the calling thread)

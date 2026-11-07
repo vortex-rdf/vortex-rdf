@@ -1177,6 +1177,85 @@ fn zone_maps_read(rec: &Recorder) -> usize {
     rec.count(&Event::ZoneMapRead)
 }
 
+/// Each zone map a file's reads ask for is read once per file and column,
+/// whoever asks: `(? type ? g1)` counted twice reads `index:posg`'s `g` map
+/// once by copy, `index:ref-p`'s once by reference, and two such counts
+/// joined on one task, on a store opened afresh, read it once in all; with
+/// no index, the general match's every-row step and a gap run of the quad
+/// table checked on `g` share the quad table's `g` map. Every count is the
+/// zones-off count.
+#[tokio::test]
+async fn each_zone_map_reads_once_per_file() {
+    use crate::CodePattern;
+    use crate::store::test_hooks::ForcedZones;
+
+    for index in [IndexConfig::Copy, IndexConfig::Reference] {
+        let tag = index.name();
+        let (_dir, path) = write_store_file(
+            zone_quads(Graphs::Alternating),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let ty = code_of(&store, "<http://example.org/type>").await;
+        let g1 = code_of(&store, "<http://example.org/g1>").await;
+        let pattern = CodePattern::new(None, Some(ty), None, Some(g1));
+        let want = {
+            let _off = ForcedZones::set(false);
+            store.count_code_pattern(pattern).await.unwrap()
+        };
+        let _on = ForcedZones::set(true);
+        for read in [1, 0] {
+            let rec = Recorder::start();
+            assert_eq!(
+                store.count_code_pattern(pattern).await.unwrap(),
+                want,
+                "{tag}"
+            );
+            assert_eq!(zone_maps_read(&rec), read, "{tag}: maps read by this count");
+        }
+        let fresh = VortexRdfStore::from_file(&path).await.unwrap();
+        let rec = Recorder::start();
+        let (first, second) = futures::join!(
+            fresh.count_code_pattern(pattern),
+            fresh.count_code_pattern(pattern)
+        );
+        assert_eq!((first.unwrap(), second.unwrap()), (want, want), "{tag}");
+        assert_eq!(
+            zone_maps_read(&rec),
+            1,
+            "{tag}: joined counts read the map once"
+        );
+    }
+    let (_dir, path) = write_store_file(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::NoIndex.types(),
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let hub = code_of(&store, "<http://example.org/hub>").await;
+    let g1 = code_of(&store, "<http://example.org/g1>").await;
+    let every_row = CodePattern::new(None, None, None, Some(g1));
+    let gap = CodePattern::new(Some(hub), None, None, Some(g1));
+    let want = {
+        let _off = ForcedZones::set(false);
+        (
+            store.count_code_pattern(every_row).await.unwrap(),
+            store.count_code_pattern(gap).await.unwrap(),
+        )
+    };
+    let _on = ForcedZones::set(true);
+    let rec = Recorder::start();
+    assert_eq!(store.count_code_pattern(every_row).await.unwrap(), want.0);
+    assert_eq!(zone_maps_read(&rec), 1, "the every-row step reads g's map");
+    drop(rec);
+    let rec = Recorder::start();
+    assert_eq!(store.count_code_pattern(gap).await.unwrap(), want.1);
+    assert_eq!(zone_maps_read(&rec), 0, "the gap run shares it");
+}
+
 /// The footer settles a checked slot for the whole file before any zone map
 /// is read: on a one-graph store a graph check needs no reading at all, and a
 /// graph code no row holds (here the `type` predicate's) matches nothing,

@@ -56,9 +56,9 @@ pub(crate) struct NativeStoreFile {
     /// same few filters; keyed this way a hit costs a tree walk but no
     /// allocation. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
-    /// The quad table's code columns' zone maps, read on first use
-    /// ([`QuadZoneMaps`]).
-    quad_zones: OnceLock<QuadZoneMaps>,
+    /// The code columns' zone maps of the quad table and the index
+    /// children, each read on first use ([`ZoneMaps`]).
+    zone_maps: OnceLock<ZoneMaps>,
     /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]),
     /// but for the code columns', which
     /// [`code_column_chunks`](Self::code_column_chunks) holds. Each handle
@@ -160,19 +160,10 @@ pub(crate) struct LocatedTables {
     /// Per reference index, its child's `g` (each row's graph), `None` for a
     /// child written without it.
     pub(crate) reference_graphs: [Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>; 2],
-    /// Per copy index (`index:posg`, `index:ospg`) and `(s, p, o, g)`
-    /// column, its zone map, read on first use; `None` for a column without
-    /// exact zone bounds. Two `u64` per zone of a column read, bounded by the
-    /// file's layout. The quad table's are the file's own
-    /// ([`NativeStoreFile::quad_zone_maps`]).
-    pub(crate) zones: [[OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 2],
-    /// Per reference index, its child's `g` zone map with the zones'
-    /// recorded graphs, read on first use, bounded the same way.
-    pub(crate) reference_zones: [OnceLock<Option<Arc<crate::io::zone_map::ColumnZones>>>; 2],
 }
 
 impl LocatedTables {
-    /// The tables' handles, none of their zone maps read yet.
+    /// The tables' handles.
     pub(crate) fn new(
         sorted: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 4]>; 3],
         references: [Option<[Arc<vortex_rdf_encoded_search::ColumnChunks>; 2]>; 2],
@@ -182,8 +173,6 @@ impl LocatedTables {
             sorted,
             references,
             reference_graphs,
-            zones: Default::default(),
-            reference_zones: Default::default(),
         }
     }
 }
@@ -204,37 +193,75 @@ pub(crate) enum FileCounter {
     LocatedRidScans,
 }
 
-/// The quad table's code columns' zone maps (`s`, `p`, `o`, `g`, by slot),
-/// each read from its zone table on first use ([`ColumnZones::read`]) and
-/// kept with the file; `None` for a column without exact zone bounds. Located
-/// runs over the quad table check them, and a filter of code equalities takes
-/// the zones where every row holds every code from them. A shared handle, as
-/// split tasks hold it past a borrow of the file; a map is read once however
-/// many tasks ask for it at once. Two `u64` per zone of each column read.
+/// A table of a store file whose code columns' zone maps a read may ask for:
+/// the quad table, a copy index's child or a reference index's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileTable {
+    Quads,
+    Posg,
+    Ospg,
+    RefP,
+    RefO,
+}
+
+impl FileTable {
+    /// Every table, in the order [`ZoneMaps`] keeps them.
+    pub(crate) const ALL: [FileTable; 5] = [
+        FileTable::Quads,
+        FileTable::Posg,
+        FileTable::Ospg,
+        FileTable::RefP,
+        FileTable::RefO,
+    ];
+
+    /// The index child holding the table, `None` for the quad table.
+    pub(crate) fn component(self) -> Option<&'static str> {
+        match self {
+            FileTable::Quads => None,
+            FileTable::Posg => Some("index:posg"),
+            FileTable::Ospg => Some("index:ospg"),
+            FileTable::RefP => Some("index:ref-p"),
+            FileTable::RefO => Some("index:ref-o"),
+        }
+    }
+}
+
+/// The zone maps of a store file's code columns, per table ([`FileTable`])
+/// and `(s, p, o, g)` slot, each read from its zone table on first use
+/// ([`ColumnZones::read`]) and kept with the file; `None` for a column the
+/// table lacks (a reference child holds `g` alone) or one without exact zone
+/// bounds. Located runs check them, and a filter of code equalities takes the
+/// zones where every row holds every code from the quad table's. A shared
+/// handle, as split tasks hold it past a borrow of the file. A map is read
+/// once however many readers ask for it at once, and a read that fails is not
+/// kept, for the next reader to retry. Two `u64` per zone of each column
+/// read.
 ///
 /// [`ColumnZones::read`]: crate::io::zone_map::ColumnZones::read
 #[derive(Clone)]
-pub(crate) struct QuadZoneMaps(Arc<QuadZoneMapsInner>);
+pub(crate) struct ZoneMaps(Arc<ZoneMapsInner>);
 
-/// What a [`QuadZoneMaps`] handle shares.
-struct QuadZoneMapsInner {
-    cells: [tokio::sync::OnceCell<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4],
-    /// Each code column's layout, `None` for a column the quad table lacks.
-    columns: [Option<LayoutRef>; 4],
+/// What a [`ZoneMaps`] handle shares.
+struct ZoneMapsInner {
+    cells: [[tokio::sync::OnceCell<Option<Arc<crate::io::zone_map::ColumnZones>>>; 4]; 5],
+    /// Each table's code columns' layouts, `None` for a column it lacks.
+    columns: [[Option<LayoutRef>; 4]; 5],
     source: Arc<dyn vortex_layout::segments::SegmentSource>,
 }
 
-impl QuadZoneMaps {
-    /// Slot `slot`'s zone map, read on first use.
+impl ZoneMaps {
+    /// The zone map of `table`'s column at `slot`, read on first use.
     pub(crate) async fn get(
         &self,
+        table: FileTable,
         slot: usize,
     ) -> crate::error::Result<Option<Arc<crate::io::zone_map::ColumnZones>>> {
         let inner = &*self.0;
-        inner.cells[slot]
+        let at = table as usize;
+        inner.cells[at][slot]
             .get_or_try_init(|| async {
                 crate::observe::observe!(ZoneMapRead);
-                Ok(match &inner.columns[slot] {
+                Ok(match &inner.columns[at][slot] {
                     Some(column) => crate::io::zone_map::ColumnZones::read(column, &inner.source)
                         .await?
                         .map(Arc::new),
@@ -322,7 +349,7 @@ impl NativeStoreFile {
             readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
-            quad_zones: OnceLock::new(),
+            zone_maps: OnceLock::new(),
             quad_chunks: ChunkMemo::default(),
             code_column_chunks: Default::default(),
             component_chunks: ChunkMemo::default(),
@@ -423,12 +450,6 @@ impl NativeStoreFile {
         self.located.get_or_init(build)
     }
 
-    /// The located-run tables' handles, once [`located_tables`](Self::located_tables)
-    /// has built them.
-    pub(crate) fn built_located_tables(&self) -> Option<&LocatedTables> {
-        self.located.get()
-    }
-
     /// The quad table's natural splits, memoized. Shadows the inner file's
     /// `splits()` (which recomputes from the layout tree per call).
     pub(crate) fn splits(&self) -> VortexResult<Arc<[Range<u64>]>> {
@@ -458,15 +479,17 @@ impl NativeStoreFile {
         self.pruning_envelopes.insert(filter, envelope);
     }
 
-    /// The quad table's code columns' zone maps ([`QuadZoneMaps`]), a handle
-    /// a split task keeps.
-    pub(crate) fn quad_zone_maps(&self) -> QuadZoneMaps {
-        self.quad_zones
+    /// The code columns' zone maps of every table of the file
+    /// ([`ZoneMaps`]), a handle a split task keeps.
+    pub(crate) fn zone_maps(&self) -> ZoneMaps {
+        self.zone_maps
             .get_or_init(|| {
-                QuadZoneMaps(Arc::new(QuadZoneMapsInner {
+                ZoneMaps(Arc::new(ZoneMapsInner {
                     cells: Default::default(),
-                    columns: schema::PRIMARY_COLUMNS
-                        .map(|column| self.table_column_layout(None, column)),
+                    columns: FileTable::ALL.map(|table| {
+                        schema::PRIMARY_COLUMNS
+                            .map(|column| self.table_column_layout(table.component(), column))
+                    }),
                     source: self.segment_source(),
                 }))
             })

@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::observe::observe;
 use crate::stats_rules::zones_enabled;
 use crate::store::VortexRdfStore;
-use crate::store::persist::native_file::LocatedTables;
+use crate::store::persist::native_file::{FileTable, LocatedTables};
 use crate::store::schema::PRIMARY_COLUMNS;
 use crate::store::schema::TermCode;
 use std::ops::Range;
@@ -18,12 +18,12 @@ use std::sync::Arc;
 use vortex_session::VortexSession;
 
 /// The sorted tables whose key prefix a pattern's bound slots may be: the
-/// quad table (`None`) and the copy indexes, each with its key order as
+/// quad table and the copy indexes, each with its key order as
 /// `(s, p, o, g)` positions.
-const TABLES: [(Option<&str>, [usize; 4]); 3] = [
-    (None, [0, 1, 2, 3]),
-    (Some("index:posg"), [1, 2, 0, 3]),
-    (Some("index:ospg"), [2, 0, 1, 3]),
+const TABLES: [(FileTable, [usize; 4]); 3] = [
+    (FileTable::Quads, [0, 1, 2, 3]),
+    (FileTable::Posg, [1, 2, 0, 3]),
+    (FileTable::Ospg, [2, 0, 1, 3]),
 ];
 
 impl VortexRdfStore {
@@ -51,8 +51,8 @@ impl VortexRdfStore {
         }
         let tables = file.located_tables(|| {
             LocatedTables::new(
-                TABLES.map(|(component, _)| {
-                    let handle = |column: &str| match component {
+                TABLES.map(|(table, _)| {
+                    let handle = |column: &str| match table.component() {
                         None => file.column_chunks(column),
                         Some(name) => file.component_column_chunks(name, column),
                     };
@@ -63,13 +63,14 @@ impl VortexRdfStore {
                         handle(PRIMARY_COLUMNS[3])?,
                     ])
                 }),
-                REFERENCES.map(|(name, _)| {
+                REFERENCES.map(|(table, _)| {
+                    let name = table.component()?;
                     Some([
                         file.component_column_chunks(name, "val")?,
                         file.component_column_chunks(name, "rid")?,
                     ])
                 }),
-                REFERENCES.map(|(name, _)| file.component_column_chunks(name, "g")),
+                REFERENCES.map(|(table, _)| file.component_column_chunks(table.component()?, "g")),
             )
         });
         let run = |columns: Columns, rows, checked| LocatedRun {
@@ -85,10 +86,10 @@ impl VortexRdfStore {
         // The table whose key order starts with the most bound slots, when
         // none starts with all of them: a bound graph after a free slot.
         let mut gap: Option<(usize, usize)> = None;
-        for (table, ((component, order), columns)) in TABLES.iter().zip(&tables.sorted).enumerate()
+        for (table, ((file_table, order), columns)) in TABLES.iter().zip(&tables.sorted).enumerate()
         {
             let prefix = order.iter().take_while(|&&c| codes[c].is_some()).count();
-            if component.is_none() && !file.quads_sorted() {
+            if *file_table == FileTable::Quads && !file.quads_sorted() {
                 continue;
             }
             let Some(columns) = columns else {
@@ -152,10 +153,7 @@ impl VortexRdfStore {
                 if zones_enabled() && located.len() >= STATISTICS_ROWS {
                     located.pending = Some(PendingStatistics {
                         file: Arc::clone(file),
-                        target: StatisticsTarget::Table {
-                            table,
-                            component: TABLES[table].0,
-                        },
+                        table: TABLES[table].0,
                     });
                     if located.len() > gap_rows() {
                         located.ask_statistics().await?;
@@ -189,7 +187,7 @@ impl VortexRdfStore {
         {
             located.pending = Some(PendingStatistics {
                 file: Arc::clone(file),
-                target: StatisticsTarget::Reference { index },
+                table: REFERENCES[index].0,
             });
             if located.len() > gap_rows() {
                 located.ask_statistics().await?;
@@ -206,7 +204,7 @@ impl VortexRdfStore {
 /// The reference indexes, each `(val, rid)` sorted by `val` then `rid`: a
 /// run of one code's `val` lists, ascending, the quad-table rows holding it
 /// at the `(s, p, o, g)` position given here.
-pub(super) const REFERENCES: [(&str, usize); 2] = [("index:ref-p", 1), ("index:ref-o", 2)];
+pub(super) const REFERENCES: [(FileTable, usize); 2] = [(FileTable::RefP, 1), (FileTable::RefO, 2)];
 
 /// The run of each bound reference slot's code that `wanted` names, in its
 /// reference index's `val`, by [`REFERENCES`] index: `None` where the slot
