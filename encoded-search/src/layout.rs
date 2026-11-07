@@ -584,17 +584,7 @@ impl ColumnChunks {
                         .array()
                         .slice(local)?
                         .execute::<PrimitiveArray>(&mut ctx)?;
-                    // A needle wider than the leaf's values matches none of them.
-                    vortex_array::match_each_unsigned_integer_ptype!(values.ptype(), |T| {
-                        match T::try_from(needle) {
-                            Ok(needle) => values
-                                .as_slice::<T>()
-                                .iter()
-                                .filter(|&&v| v == needle)
-                                .count() as u64,
-                            Err(_) => 0,
-                        }
-                    })
+                    count_decoded_eq(&values, needle, &mut ctx)?
                 }
             };
             at = to;
@@ -844,4 +834,50 @@ fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
         node = node.slot(0).ok().flatten()?;
     }
     Some(node)
+}
+
+/// How many of a decoded leaf's valid `values` equal `needle`, for a leaf
+/// whose encoding declines the probe: a null slot holds a value in its
+/// buffer, which is no value of the column. A needle wider than the values'
+/// type matches none of them.
+fn count_decoded_eq(
+    values: &PrimitiveArray,
+    needle: u64,
+    ctx: &mut vortex_array::ExecutionCtx,
+) -> VortexResult<u64> {
+    let valid = values.validity()?.execute_mask(values.len(), ctx)?;
+    Ok(vortex_array::match_each_unsigned_integer_ptype!(
+        values.ptype(),
+        |T| {
+            match T::try_from(needle) {
+                Ok(needle) => values
+                    .as_slice::<T>()
+                    .iter()
+                    .enumerate()
+                    .filter(|&(row, &v)| v == needle && valid.value(row))
+                    .count() as u64,
+                Err(_) => 0,
+            }
+        }
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A decoded leaf counts only its valid slots: a null slot holds a value
+    /// in its buffer, which is no value of the column.
+    #[test]
+    fn decoded_counts_skip_null_slots() {
+        let session = VortexSession::empty().with::<vortex_array::session::ArraySession>();
+        let mut ctx = session.create_execution_ctx();
+        let values = PrimitiveArray::from_option_iter([Some(5u64), None, Some(5)]);
+        assert_eq!(count_decoded_eq(&values, 5, &mut ctx).unwrap(), 2);
+        assert_eq!(
+            count_decoded_eq(&values, 0, &mut ctx).unwrap(),
+            0,
+            "a null slot is no value"
+        );
+    }
 }
