@@ -267,7 +267,12 @@ impl VortexRdfStore {
         let cut = window_rows(offset, limit, base_live as u64)
             .map(|rows| live.slice(rows.start as usize..rows.end as usize));
         let base_taken = cut.as_ref().map_or(0, LiveRows::len);
-        let tail = self.windowed_tail(offset, limit, base_live, base_taken);
+        let tail = self.windowed_tail(
+            offset,
+            limit,
+            crate::store::read::live::Live::Exact(base_live),
+            base_taken,
+        );
         let quads = match cut {
             Some(cut) => served.narrowed(cut)?,
             None => self

@@ -18,7 +18,7 @@ use vortex_scan::selection::Selection;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{available_parallelism, spawned_splits};
-use crate::io::zone_map::eq_on_bounds;
+use crate::io::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 use crate::observe::observe;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
@@ -217,9 +217,10 @@ fn every_row_step(file: &NativeStoreFile, filter: &PushedFilter) -> Option<Every
 /// every code of a filter of code equalities, `None` for none, beside the
 /// rest of `start` for the filter to evaluate; without the step, `None` and
 /// `start`. A zone qualifies where each equality's column has a zone map
-/// whose bounds there are both its code ([`eq_on_bounds`]): the rule
-/// Vortex's pruning of `col != c` applies, read off the maps the file reads
-/// once ([`QuadZoneMaps`]), only for the split's own zones.
+/// whose bounds there are both its code, the class all of the equalities'
+/// [`ZoneSet`]: the rule Vortex's pruning of `col != c` applies, read off
+/// the maps the file reads once ([`QuadZoneMaps`]), only for the split's own
+/// zones.
 async fn every_row_zones(
     every_row: Option<&EveryRow>,
     range: &Range<u64>,
@@ -231,32 +232,29 @@ async fn every_row_zones(
     if range.is_empty() || start.all_false() {
         return Ok((None, start));
     }
-    let mut maps = Vec::with_capacity(every_row.columns.len());
-    for &(slot, code) in &every_row.columns {
+    let mut checks = Vec::with_capacity(every_row.columns.len());
+    for (bit, &(slot, code)) in every_row.columns.iter().enumerate() {
         let Some(zones) = every_row.maps.get(slot).await? else {
             return Ok((None, start));
         };
-        maps.push((zones, code));
-    }
-    let (zone_len, zones) = (maps[0].0.zone_len(), maps[0].0.zones());
-    if maps
-        .iter()
-        .any(|(map, _)| map.zone_len() != zone_len || map.zones() != zones)
-    {
-        return Ok((None, start));
-    }
-    let mut slices: Vec<(usize, usize)> = Vec::new();
-    for zone in range.start / zone_len..(range.end.div_ceil(zone_len)).min(zones) {
-        let every = maps.iter().all(|(map, code)| {
-            let (min, max) = map.zone_bounds(zone);
-            eq_on_bounds(min, max, *code) == Some(true)
+        checks.push(ZoneCheck {
+            bit: bit as u32,
+            code,
+            zones,
         });
-        if !every {
+    }
+    let Some(set) = ZoneSet::new(checks, 0) else {
+        return Ok((None, start));
+    };
+    let mut slices: Vec<(usize, usize)> = Vec::new();
+    for ZonePart { zone, rows } in set.parts(range.clone()) {
+        // Every row holds every code only where each zone's bounds are its
+        // code alone: a class of all reads no record.
+        if set.class(zone) != ZoneClass::All {
             continue;
         }
-        let rows = maps[0].0.zone_rows(zone);
-        let from = (rows.start.max(range.start) - range.start) as usize;
-        let to = (rows.end.min(range.end) - range.start) as usize;
+        let from = (rows.start - range.start) as usize;
+        let to = (rows.end - range.start) as usize;
         match slices.last_mut() {
             Some(last) if last.1 == from => last.1 = to,
             _ => slices.push((from, to)),

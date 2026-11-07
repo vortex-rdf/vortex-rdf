@@ -23,6 +23,7 @@ use crate::store::array::subject_sorted;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout, StringLayout};
 use crate::store::probes::StructProbes;
+use crate::store::read::live::Live;
 use crate::store::resident::CodeAccess;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
@@ -388,42 +389,21 @@ impl QuadsSource {
 
     /// The `limit` rows after skipping `offset` of a selection held pending
     /// for a window (`IdsNeed::CountOrWindow`), beside the base's live rows
-    /// as far as the window knows them, read without the selection's other
-    /// ids. A residual compare left pending reads only as far as the
-    /// window's last live row: zone by zone where the base keeps zone maps,
-    /// in pieces without them ([`PendingResidual::window`]). A run, with no
-    /// tombstones, has its width as the base's live size and reads its
-    /// window's rows alone ([`LazyRowIds::window_with_live`]): in memory cut,
-    /// before decoding, from a rid column whose rids ascend (a run checked
-    /// against its graph counting its zones only until the window fills,
-    /// its live size then at least `offset + limit`); on file read from the
-    /// window's rows of a located run's rid column. `None` for any other
-    /// view (an exact selection, a run of unknown width or whose rids do not
-    /// ascend, a run under tombstones, a pending file filter), whose window
-    /// comes from its materialized selection.
-    ///
-    /// [`LazyRowIds::window_with_live`]: crate::store::indexes::LazyRowIds::window_with_live
-    /// [`PendingResidual::window`]: crate::store::view::pending::PendingResidual::window
+    /// as far as the window knows them ([`Live`]), read without the
+    /// selection's other ids ([`ViewSelection::window`]). `None` for a view
+    /// with a pending file filter, and for any selection that window does
+    /// not cut, whose window comes from its materialized selection.
     pub(crate) async fn located_window(
         &self,
         offset: usize,
         limit: usize,
-    ) -> Result<Option<(RowSelection, usize)>> {
-        let lazy = match &self.selection {
-            ViewSelection::Residual(residual) => {
-                let (ids, live) = residual.window(offset, limit, self.deleted.as_ref())?;
-                return Ok(Some((RowSelection::from_ids(ids), live)));
-            }
-            ViewSelection::Pending { ids, .. } => ids,
-            ViewSelection::Exact(_) => return Ok(None),
-        };
-        if self.deleted.is_some() || self.has_filter() {
+    ) -> Result<Option<(RowSelection, Live)>> {
+        if self.has_filter() {
             return Ok(None);
         }
-        Ok(lazy
-            .window_with_live(offset, limit)
-            .await?
-            .map(|(ids, live)| (RowSelection::from_ids(ids), live)))
+        self.selection
+            .window(offset, limit, self.deleted.as_ref())
+            .await
     }
 
     /// This source under `selection`, its reads served by `serve`, over

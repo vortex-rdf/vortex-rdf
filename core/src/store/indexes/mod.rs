@@ -44,7 +44,7 @@ pub(crate) use components::{
     ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
     indexes_from_components, known_component,
 };
-pub(crate) use lazy_ids::{ComponentRun, LazyRowIds};
+pub(crate) use lazy_ids::{CheckedRun, ComponentRun, LazyRowIds};
 #[cfg(test)]
 pub(crate) use serve::ServedSpan;
 #[cfg(feature = "file-io")]

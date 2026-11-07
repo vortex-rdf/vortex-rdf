@@ -84,49 +84,6 @@ pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
     }
 }
 
-/// Stamp a code column with its exact smallest and largest code as the
-/// `Stat::Min` and `Stat::Max` array statistics: the whole column's level
-/// of the statistics ladder in memory, read back by [`stamped_bounds`].
-/// Only call it with the column's true bounds: a false stamp settles a
-/// residual wrongly.
-pub(crate) fn stamp_bounds(arr: &ArrayRef, min: u64, max: u64) {
-    let stats = arr.statistics();
-    stats.set(Stat::Min, Precision::Exact(min.into()));
-    stats.set(Stat::Max, Precision::Exact(max.into()));
-}
-
-/// The exact `(min, max)` a code column's array statistics hold
-/// ([`stamp_bounds`]); `None` when either is absent or inexact, or for a
-/// column of any other dtype.
-pub(crate) fn stamped_bounds(arr: &ArrayRef) -> Option<(u64, u64)> {
-    if arr.dtype() != &schema::CODE_DTYPE {
-        return None;
-    }
-    let stats = arr.statistics();
-    let min = stats.get(Stat::Min).as_exact()?;
-    let max = stats.get(Stat::Max).as_exact()?;
-    Some((unsigned_value(&min)?, unsigned_value(&max)?))
-}
-
-/// Stamp each code column of the quad struct `rows` (`s`, `p`, `o`, `g`)
-/// with the exact bounds `bounds` gives for it ([`stamp_bounds`]): a loaded
-/// store's base, `bounds` its file's footer statistics. Columns `bounds`
-/// knows nothing of, and a `rows` that is not a canonical struct, are left
-/// unstamped.
-pub(crate) fn stamp_quad_bounds(rows: &ArrayRef, bounds: impl Fn(&str) -> Option<(u64, u64)>) {
-    let Ok(rows) = rows.clone().try_downcast::<Struct>() else {
-        return;
-    };
-    for name in schema::PRIMARY_COLUMNS {
-        if let Ok(column) = rows.unmasked_field_by_name(name)
-            && column.dtype() == &schema::CODE_DTYPE
-            && let Some((min, max)) = bounds(name)
-        {
-            stamp_bounds(column, min, max);
-        }
-    }
-}
-
 /// Whether a quad struct's `s` column carries the globally sorted stamp: the
 /// provenance a write records in the root's metadata and a reader gates its
 /// subject binary search on. Every producer that stamps yields a canonical

@@ -111,6 +111,9 @@ pub(crate) struct ColumnZones {
     /// Each zone's exact minimum and maximum, in zone order.
     mins: vortex_buffer::Buffer<u64>,
     maxes: vortex_buffer::Buffer<u64>,
+    /// The whole column's exact `(min, max)`, the zones' folded; `None` for
+    /// a column of no rows.
+    bounds: Option<(u64, u64)>,
     /// Each zone's recorded values, `None` for every zone of a column
     /// without the statistic.
     recorded: Option<RecordedZones>,
@@ -141,7 +144,9 @@ impl ColumnZones {
                 maxes.len()
             )));
         }
+        let bounds = mins.iter().min().zip(maxes.iter().max());
         Ok(Self {
+            bounds: bounds.map(|(&min, &max)| (min, max)),
             mins,
             maxes,
             recorded: None,
@@ -164,9 +169,17 @@ impl ColumnZones {
         Ok(self)
     }
 
+    /// The whole column's exact `(min, max)`: the smallest of its zones'
+    /// minimums and the largest of their maximums, folded once when the map
+    /// is made. A residual asks it before the zones ([`eq_on_bounds`]).
+    /// `None` for a column of no rows.
+    pub(crate) fn column_bounds(&self) -> Option<(u64, u64)> {
+        self.bounds
+    }
+
     /// Each zone's `(min, max)`, in zone order.
     #[cfg(test)]
-    pub(crate) fn bounds(&self) -> Vec<(u64, u64)> {
+    pub(crate) fn zone_bounds_list(&self) -> Vec<(u64, u64)> {
         self.mins
             .iter()
             .copied()
@@ -318,6 +331,7 @@ pub(crate) fn eq_on_bounds(min: u64, max: u64, code: u64) -> Option<bool> {
 /// The footer's exact `(min, max)` of `file`'s top-level `u64` column
 /// `column` (a store file's quad table: its footer statistics); `None`
 /// when the file keeps no exact bounds for it.
+#[cfg(feature = "file-io")]
 pub(crate) fn footer_bounds(file: &vortex_file::VortexFile, column: &str) -> Option<(u64, u64)> {
     use vortex_array::expr::stats::Stat;
 

@@ -2,27 +2,25 @@
 //! (each 8,192-row zone's exact bounds) per quad code column, `g`'s with the
 //! graphs each zone recorded (P2's `vortexrdf.value_counts`), as a file store's
 //! located runs read them. A residual equality over a base that no index serves
-//! classes the zones its selection touches against them once
-//! ([`ResidualZones`](crate::store::scan::residual::ResidualZones)): it skips
-//! the zones a bound column's bounds or `g`'s records rule out and compares
-//! only the rest, as the file path's zone-map pruning reads only the zones it
-//! leaves. With zones off it compares the runs of the zones the bounds alone
-//! leave ([`QuadZones::kept_runs`]). A build takes the bounds in the pass that
-//! picks each code column's compression, which reads every code anyway
-//! ([`ZoneBuilder`]), and `g`'s records with Vortex's accumulator; a store
-//! loaded from a file or from bytes reads both from the file's zone tables
-//! ([`QuadZones::read`]). A base with neither has none, and its residual
-//! compares every row.
+//! classes the zones its selection touches against them
+//! ([`ResidualCompare`](crate::store::scan::residual::ResidualCompare)): it
+//! skips the zones a bound column's bounds or `g`'s records rule out and
+//! compares only the rest, as the file path's zone-map pruning reads only the
+//! zones it leaves. With zones off it skips the zones the bounds alone rule
+//! out, compared in pieces. A build takes the bounds, and `g`'s records, in
+//! the pass that picks each code column's compression, which reads every
+//! code anyway ([`ZoneBuilder`]); a store loaded from a file or from bytes
+//! reads both from the file's zone tables ([`QuadZones::read`]). A zone map
+//! also keeps its column's whole bounds, the zones' folded
+//! ([`ColumnZones::column_bounds`]), which a residual asks first. A base with
+//! neither has none, and its residual compares every row.
 
-use std::ops::Range;
 use std::sync::Arc;
 
-use vortex_array::scalar::Scalar;
-
 use crate::error::Result;
-use crate::io::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS, eq_on_bounds};
-use crate::store::array::unsigned_value;
+use crate::io::zone_map::{ColumnZones, ExactZoneMap, RecordedZones, ZONE_ROWS};
 use crate::store::schema::{CODE_DTYPE, PRIMARY_COLUMNS, TermCode};
+use crate::store::value_counts::{Counts, MAX_VALUES};
 
 /// The graph column's slot in `(s, p, o, g)`.
 const GRAPH_SLOT: usize = 3;
@@ -113,50 +111,6 @@ impl QuadZones {
         Ok(zones)
     }
 
-    /// The rows of the zones whose bounds may hold every code `eqs` binds,
-    /// as ascending runs over a base of `rows` rows, adjacent zones joined:
-    /// a zone is left out where a bound column's code lies outside its zone
-    /// bounds ([`eq_on_bounds`]). `None` when no bound column
-    /// has zones, or when the zones left hold more than half the base:
-    /// comparing a whole column then costs less than comparing its runs.
-    /// The residual's route with zones off, bounds only; with zones on it
-    /// classes its zones once
-    /// ([`ResidualZones`](crate::store::scan::residual::ResidualZones)).
-    pub(crate) fn kept_runs(
-        &self,
-        eqs: &[(&str, Scalar)],
-        rows: usize,
-    ) -> Result<Option<Vec<Range<u64>>>> {
-        let mut keep: Option<Vec<bool>> = None;
-        for (field, scalar) in eqs {
-            let (Some(code), Some(zones)) = (unsigned_value(scalar), self.of_column(field)) else {
-                continue;
-            };
-            let keep = keep.get_or_insert_with(|| vec![true; zones.zones() as usize]);
-            for (zone, kept) in keep.iter_mut().enumerate() {
-                let (min, max) = zones.zone_bounds(zone as u64);
-                *kept &= eq_on_bounds(min, max, code) != Some(false);
-            }
-        }
-        let Some(keep) = keep else {
-            return Ok(None);
-        };
-        let kept = keep.iter().filter(|&&kept| kept).count();
-        if kept.saturating_mul(2) > keep.len() {
-            return Ok(None);
-        }
-        let mut runs: Vec<Range<u64>> = Vec::new();
-        for zone in (0..keep.len()).filter(|&zone| keep[zone]) {
-            let start = (zone * ZONE_ROWS) as u64;
-            let end = ((zone + 1) * ZONE_ROWS).min(rows) as u64;
-            match runs.last_mut() {
-                Some(run) if run.end == start => run.end = end,
-                _ => runs.push(start..end),
-            }
-        }
-        Ok(Some(runs))
-    }
-
     /// The columns that have zones, in `(s, p, o, g)` order.
     #[cfg(test)]
     pub(crate) fn columns(&self) -> Vec<String> {
@@ -169,10 +123,13 @@ impl QuadZones {
     }
 }
 
-/// A column's zone bounds gathered in row order, a run of rows at a time,
-/// each run within one zone ([`room`](Self::room)): the pass that compresses
-/// a build's codes reads each zone's smallest and largest code as it goes,
-/// so the bounds cost a few instructions a zone.
+/// A column's zone map gathered in row order, a run of rows at a time, each
+/// run within one zone ([`room`](Self::room)): the pass that compresses a
+/// build's codes reads each zone's smallest and largest code as it goes, so
+/// the bounds cost a few instructions a zone. A graph column's builder
+/// ([`recording`](Self::recording)) counts each zone's graphs with their rows
+/// in the same pass, as the file writer's `vortexrdf.value_counts` records
+/// them ([`Counts`]).
 pub(crate) struct ZoneBuilder {
     mins: Vec<TermCode>,
     maxes: Vec<TermCode>,
@@ -182,9 +139,13 @@ pub(crate) struct ZoneBuilder {
     filled: usize,
     /// Rows seen in all.
     rows: usize,
+    /// The closed zones' recorded values, beside the counts of the zone being
+    /// filled; `None` for a column that records none.
+    records: Option<(RecordedZones, Counts)>,
 }
 
 impl ZoneBuilder {
+    /// A builder of a column's zone bounds alone.
     pub(crate) fn new() -> Self {
         Self {
             mins: Vec::new(),
@@ -193,6 +154,16 @@ impl ZoneBuilder {
             hi: TermCode::MIN,
             filled: 0,
             rows: 0,
+            records: None,
+        }
+    }
+
+    /// A builder of a column's zone bounds and of each zone's values with
+    /// their rows: a graph column's.
+    pub(crate) fn recording() -> Self {
+        Self {
+            records: Some((Vec::new(), Counts::new())),
+            ..Self::new()
         }
     }
 
@@ -201,17 +172,20 @@ impl ZoneBuilder {
         ZONE_ROWS - self.filled
     }
 
-    /// Fold in the next `rows` rows, at most [`room`](Self::room), whose
-    /// codes lie within `lo..=hi`.
-    pub(crate) fn push(&mut self, rows: usize, lo: TermCode, hi: TermCode) {
-        debug_assert!(rows <= self.room(), "a run must end within its zone");
-        if rows == 0 {
+    /// Fold in the next rows' codes `part`, at most [`room`](Self::room) of
+    /// them, which lie within `lo..=hi`.
+    pub(crate) fn push(&mut self, part: &[TermCode], lo: TermCode, hi: TermCode) {
+        debug_assert!(part.len() <= self.room(), "a run must end within its zone");
+        if part.is_empty() {
             return;
+        }
+        if let Some((_, counts)) = &mut self.records {
+            counts.add_all(part, MAX_VALUES);
         }
         self.lo = self.lo.min(lo);
         self.hi = self.hi.max(hi);
-        self.filled += rows;
-        self.rows += rows;
+        self.filled += part.len();
+        self.rows += part.len();
         if self.filled == ZONE_ROWS {
             self.close();
         }
@@ -220,35 +194,17 @@ impl ZoneBuilder {
     fn close(&mut self) {
         self.mins.push(self.lo);
         self.maxes.push(self.hi);
+        if let Some((zones, counts)) = &mut self.records {
+            zones.push(counts.recorded());
+            *counts = Counts::new();
+        }
         (self.lo, self.hi, self.filled) = (TermCode::MAX, TermCode::MIN, 0);
     }
 
-    /// The column's exact `(min, max)`, if the runs folded in cover exactly
-    /// `rows` rows: the smallest and largest code of its zones, the one
-    /// being filled included.
-    pub(crate) fn bounds(&self, rows: usize) -> Option<(TermCode, TermCode)> {
-        if self.rows != rows || rows == 0 {
-            return None;
-        }
-        let open = self.filled > 0;
-        let min = self
-            .mins
-            .iter()
-            .copied()
-            .chain(open.then_some(self.lo))
-            .min()?;
-        let max = self
-            .maxes
-            .iter()
-            .copied()
-            .chain(open.then_some(self.hi))
-            .max()?;
-        Some((min, max))
-    }
-
     /// The column's zone map, if the runs folded in cover exactly `rows`
-    /// rows (a column whose codes were only partly seen has none); the last
-    /// zone is as short as the rows left.
+    /// rows (a column whose codes were only partly seen has none), with each
+    /// zone's recorded values where the builder records them; the last zone
+    /// is as short as the rows left.
     pub(crate) fn finish(mut self, rows: usize) -> Result<Option<ColumnZones>> {
         if self.rows != rows || rows == 0 {
             return Ok(None);
@@ -256,57 +212,17 @@ impl ZoneBuilder {
         if self.filled > 0 {
             self.close();
         }
-        ColumnZones::from_bounds(
+        let zones = ColumnZones::from_bounds(
             self.mins.into(),
             self.maxes.into(),
             ZONE_ROWS as u64,
             rows as u64,
-        )
-        .map(Some)
-    }
-}
-
-/// The graphs each [`ZONE_ROWS`]-row zone of a built graph column holds, with
-/// their rows, as Vortex's accumulator of `vortexrdf.value_counts` records
-/// them in a written zone table: `None` for a zone past its 16 values. The
-/// column is read chunk by chunk, each zone accumulated from slices of the
-/// chunks it spans, so no chunk is copied and the column is never joined
-/// into one array.
-pub(crate) fn graph_records(
-    column: &vortex_array::ArrayRef,
-    ctx: &mut vortex_array::ExecutionCtx,
-) -> Result<RecordedZones> {
-    use crate::store::value_counts::{MAX_VALUES, ValueCounts, ValueCountsOptions, decode_state};
-    use vortex_array::aggregate_fn::{Accumulator, DynAccumulator as _};
-    use vortex_array::arrays::Chunked;
-    use vortex_array::arrays::chunked::ChunkedArrayExt as _;
-
-    let options = ValueCountsOptions {
-        max_values: MAX_VALUES,
-    };
-    let new = || Accumulator::try_new(ValueCounts, options, CODE_DTYPE);
-    let chunks: Vec<vortex_array::ArrayRef> = match column.as_opt::<Chunked>() {
-        Some(chunked) => chunked.chunks(),
-        None => vec![column.clone()],
-    };
-    let mut records = Vec::with_capacity(column.len().div_ceil(ZONE_ROWS));
-    let (mut acc, mut filled) = (new()?, 0usize);
-    for chunk in chunks {
-        let mut at = 0;
-        while at < chunk.len() {
-            let take = (ZONE_ROWS - filled).min(chunk.len() - at);
-            acc.accumulate(&chunk.slice(at..at + take)?, ctx)?;
-            (filled, at) = (filled + take, at + take);
-            if filled == ZONE_ROWS {
-                records.push(decode_state(&acc.finish()?).map(Vec::into_boxed_slice));
-                (acc, filled) = (new()?, 0);
-            }
+        )?;
+        match self.records {
+            Some((records, _)) => zones.with_records(records).map(Some),
+            None => Ok(Some(zones)),
         }
     }
-    if filled > 0 {
-        records.push(decode_state(&acc.finish()?).map(Vec::into_boxed_slice));
-    }
-    Ok(records)
 }
 
 /// Whether `column` is a code column zoned in [`ZONE_ROWS`]-row zones with
@@ -367,7 +283,7 @@ mod tests {
                     let (run, next) = rest.split_at(builder.room().min(rest.len()));
                     let lo = run.iter().copied().min().unwrap();
                     let hi = run.iter().copied().max().unwrap();
-                    builder.push(run.len(), lo, hi);
+                    builder.push(run, lo, hi);
                     rest = next;
                 }
             }
@@ -377,7 +293,18 @@ mod tests {
                 .expect("every row seen")
         };
         for cut in [1, 100, ZONE_ROWS - 1, ZONE_ROWS, ZONE_ROWS + 3, codes.len()] {
-            assert_eq!(built(cut).bounds(), want, "slices of {cut}");
+            let zones = built(cut);
+            assert_eq!(zones.zone_bounds_list(), want, "slices of {cut}");
+            let folded = (
+                want.iter().map(|z| z.0).min(),
+                want.iter().map(|z| z.1).max(),
+            );
+            assert_eq!(
+                zones.column_bounds(),
+                folded.0.zip(folded.1),
+                "the column's, slices of {cut}"
+            );
+            assert!(zones.recorded().is_none(), "bounds alone");
         }
         assert!(ZoneBuilder::new().finish(codes.len()).unwrap().is_none());
         // A table keeps only the columns zoned for the base's row count.
@@ -385,48 +312,100 @@ mod tests {
         zones.set(0, built(codes.len()));
         let short = &codes[..ZONE_ROWS];
         let mut builder = ZoneBuilder::new();
-        builder.push(short.len(), 0, 1);
+        builder.push(short, 0, 1);
         zones.set(2, builder.finish(short.len()).unwrap().unwrap());
         assert_eq!(zones.covering(codes.len()).columns(), ["s"]);
     }
 
-    /// A built graph column's records are each zone's graphs with their rows,
-    /// and none for a zone of more than 16; the same whether the column is
-    /// one array or chunks that zones cross, its short last zone included.
+    /// Each [`ZONE_ROWS`]-row zone's graphs with their rows, as Vortex's
+    /// accumulator of `vortexrdf.value_counts` records them in a written zone
+    /// table (the file writer's records): `None` for a zone past its 16
+    /// values. The oracle the compress pass's records are held to.
+    fn accumulated_records(
+        column: &vortex_array::ArrayRef,
+        ctx: &mut vortex_array::ExecutionCtx,
+    ) -> RecordedZones {
+        use crate::store::value_counts::{
+            MAX_VALUES, ValueCounts, ValueCountsOptions, decode_state,
+        };
+        use vortex_array::aggregate_fn::{Accumulator, DynAccumulator as _};
+
+        let options = ValueCountsOptions {
+            max_values: MAX_VALUES,
+        };
+        let mut records = Vec::new();
+        for start in (0..column.len()).step_by(ZONE_ROWS) {
+            let end = (start + ZONE_ROWS).min(column.len());
+            let mut acc = Accumulator::try_new(ValueCounts, options, CODE_DTYPE).unwrap();
+            acc.accumulate(&column.slice(start..end).unwrap(), ctx)
+                .unwrap();
+            records.push(decode_state(&acc.finish().unwrap()).map(Vec::into_boxed_slice));
+        }
+        records
+    }
+
+    /// The pass that compresses a graph column records each zone's graphs
+    /// with their rows as the file writer's accumulator does over the same
+    /// rows: a zone of 3 graphs, one of 17 (past the 16 the statistic
+    /// records, so none), one of exactly 16, and a short last zone; the same
+    /// whether the column is one array or chunks of 7, 8,192 or 20,000 rows,
+    /// in a base or an index component.
     #[test]
-    fn graph_records_count_each_zones_graphs() {
+    fn one_pass_records_each_zones_graphs() {
         use crate::session::VORTEX_SESSION;
-        use vortex_array::arrays::{ChunkedArray, PrimitiveArray};
+        use crate::store::resident::{CodeTable, with_compressed_int_children};
+        use vortex_array::arrays::{ChunkedArray, PrimitiveArray, StructArray};
+        use vortex_array::validity::Validity;
         use vortex_array::{IntoArray as _, VortexSessionExecute as _};
 
         let mut codes: Vec<TermCode> = (0..ZONE_ROWS as u64).map(|i| 1 + i % 3).collect();
         codes.extend((0..ZONE_ROWS as u64).map(|i| 1 + i % 17));
+        codes.extend((0..ZONE_ROWS as u64).map(|i| 100 + i / 512));
         codes.extend([5, 5, 6]);
+        let column = |rows: usize| -> vortex_array::ArrayRef {
+            let chunks: Vec<vortex_array::ArrayRef> = codes
+                .chunks(rows)
+                .map(|chunk| PrimitiveArray::from_iter(chunk.iter().copied()).into_array())
+                .collect();
+            match chunks.len() {
+                1 => chunks[0].clone(),
+                _ => ChunkedArray::try_new(chunks, CODE_DTYPE)
+                    .unwrap()
+                    .into_array(),
+            }
+        };
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let whole = PrimitiveArray::from_iter(codes.iter().copied()).into_array();
-        let records = graph_records(&whole, &mut ctx).unwrap();
+        let want = accumulated_records(&column(codes.len()), &mut ctx);
         let third = (ZONE_ROWS / 3) as u32;
-        let first = vec![(1, third + 1), (2, third + 1), (3, third)];
-        let last = vec![(5, 2), (6, 1)];
+        let sixteen: Vec<(u64, u32)> = (100..116).map(|graph| (graph, 512)).collect();
         assert_eq!(
-            records,
+            want,
             vec![
-                Some(first.into_boxed_slice()),
+                Some(vec![(1, third + 1), (2, third + 1), (3, third)].into_boxed_slice()),
                 None,
-                Some(last.into_boxed_slice())
-            ]
+                Some(sixteen.into_boxed_slice()),
+                Some(vec![(5, 2), (6, 1)].into_boxed_slice()),
+            ],
+            "the oracle"
         );
-        let chunks: Vec<vortex_array::ArrayRef> = codes
-            .chunks(5_000)
-            .map(|chunk| PrimitiveArray::from_iter(chunk.iter().copied()).into_array())
-            .collect();
-        let chunked = ChunkedArray::try_new(chunks, CODE_DTYPE)
+        for rows in [7, ZONE_ROWS, 20_000, codes.len()] {
+            let quads = StructArray::try_new(
+                ["g"].into(),
+                vec![column(rows)],
+                codes.len(),
+                Validity::NonNullable,
+            )
             .unwrap()
             .into_array();
-        assert_eq!(
-            graph_records(&chunked, &mut ctx).unwrap(),
-            records,
-            "in chunks"
-        );
+            for table in [CodeTable::Base, CodeTable::Component] {
+                let (_, zones) = with_compressed_int_children(quads.clone(), table).unwrap();
+                let graphs = zones.get(GRAPH_SLOT).expect("g's zone map");
+                assert_eq!(
+                    graphs.recorded(),
+                    Some(&want),
+                    "chunks of {rows}, {table:?}"
+                );
+            }
+        }
     }
 }

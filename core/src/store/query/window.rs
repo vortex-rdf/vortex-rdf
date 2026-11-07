@@ -17,6 +17,7 @@ use vortex_buffer::Buffer;
 use crate::debug;
 use crate::error::Result;
 use crate::observe::observe;
+use crate::store::read::live::Live;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, read_plan};
 use crate::store::view::selection::{RowSelection, ViewSelection};
@@ -123,20 +124,25 @@ impl VortexRdfStore {
     }
 
     /// The tail of a window of this view whose base held `base_live` rows
-    /// and gave `base_taken` of them: whatever the base could not fill falls
-    /// to the tail, the offset it did not consume, the limit it did not
-    /// take.
+    /// ([`Live`]) and gave `base_taken` of them: whatever the base could not
+    /// fill falls to the tail, the offset it did not consume, the limit it
+    /// did not take. A base that counted its rows only at least so far
+    /// filled the window, so the tail gives none.
     #[inline]
     pub(in crate::store) fn windowed_tail(
         &self,
         offset: usize,
         limit: usize,
-        base_live: usize,
+        base_live: Live,
         base_taken: usize,
     ) -> Option<Tail> {
+        debug_assert!(
+            matches!(base_live, Live::Exact(_)) || base_taken == limit,
+            "a base window that stopped counting filled the window"
+        );
         self.tail.as_ref().map(|tail| {
             tail.window(
-                offset.saturating_sub(base_live),
+                offset.saturating_sub(base_live.at_least()),
                 limit.saturating_sub(base_taken),
             )
         })
@@ -273,19 +279,20 @@ impl VortexRdfStore {
     }
 
     /// The base's window over its exact `selection`, and the base's live row
-    /// count as far as the window needs it: a position range over the
-    /// selection, stepping over tombstones, with the selection's live row
-    /// count (`live`, when the window's check counted it); or, under a file
-    /// filter, the window of the first matches with their count (at most
-    /// `offset + limit`): a pending filter's evaluated only as far as the
-    /// window reaches, a window's kept masks' read off their bits.
+    /// count as far as the window needs it ([`Live`]): a position range over
+    /// the selection, stepping over tombstones, with the selection's live
+    /// row count (`live`, when the window's check counted it); or, under a
+    /// file filter, the window of the first matches with their count,
+    /// exact when fewer than `offset + limit` and else at least that: a
+    /// pending filter's evaluated only as far as the window reaches, a
+    /// window's kept masks' read off their bits.
     async fn base_window(
         &self,
         selection: &RowSelection,
         offset: usize,
         limit: usize,
         live: Option<usize>,
-    ) -> Result<(RowSelection, usize)> {
+    ) -> Result<(RowSelection, Live)> {
         let base_len = self.quads.base_len();
         let deleted = self.quads.deleted.as_ref();
         #[cfg(feature = "file-io")]
@@ -304,9 +311,9 @@ impl VortexRdfStore {
             };
             if let Some(found) = found {
                 let live = if found.len() < want {
-                    found.len()
+                    Live::Exact(found.len())
                 } else {
-                    want
+                    Live::AtLeast(want)
                 };
                 return Ok((
                     RowSelection::Ids(found).window(offset, limit, None, base_len),
@@ -315,7 +322,10 @@ impl VortexRdfStore {
             }
         }
         let live = live.unwrap_or_else(|| selection.live_len(deleted, base_len));
-        Ok((selection.window(offset, limit, deleted, base_len), live))
+        Ok((
+            selection.window(offset, limit, deleted, base_len),
+            Live::Exact(live),
+        ))
     }
 }
 

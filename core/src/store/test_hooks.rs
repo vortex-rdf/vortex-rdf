@@ -510,7 +510,7 @@ impl VortexRdfStore {
             .iter()
             .find(|c| c.identity.name == name)?
             .graph_zones()
-            .map(|zones| zones.bounds())
+            .map(|zones| zones.zone_bounds_list())
     }
 
     /// The named in-memory component's graph-column recorded graphs, each
@@ -621,24 +621,23 @@ impl VortexRdfStore {
     /// in-memory view; `None` for a column without them or any other view.
     pub(crate) fn debug_zone_bounds(&self, name: &str) -> Option<Vec<(TermCode, TermCode)>> {
         match &self.quads.backend {
-            crate::store::Backend::InMemory(memory) => {
-                memory.zones.of_column(name).map(|zones| zones.bounds())
-            }
+            crate::store::Backend::InMemory(memory) => memory
+                .zones
+                .of_column(name)
+                .map(|zones| zones.zone_bounds_list()),
             #[cfg(feature = "file-io")]
             crate::store::Backend::File(_) => None,
         }
     }
 
-    /// Base column `name`'s exact `(min, max)` array statistics
-    /// ([`stamped_bounds`](crate::store::array::stamped_bounds)), of an
-    /// in-memory view; `None` for a column without them or any other view.
+    /// Base column `name`'s exact `(min, max)`, kept with its zone map
+    /// ([`ColumnZones::column_bounds`](crate::io::zone_map::ColumnZones::column_bounds)),
+    /// of an in-memory view; `None` for a column without a zone map or any
+    /// other view.
     pub(crate) fn debug_column_bounds(&self, name: &str) -> Option<(TermCode, TermCode)> {
         match &self.quads.backend {
             crate::store::Backend::InMemory(memory) => {
-                use vortex_array::arrays::struct_::StructArrayExt as _;
-                let base = crate::store::array::into_struct_array(memory.base.clone()).ok()?;
-                let column = base.unmasked_field_by_name(name).ok()?;
-                crate::store::array::stamped_bounds(column)
+                memory.zones.of_column(name)?.column_bounds()
             }
             #[cfg(feature = "file-io")]
             crate::store::Backend::File(_) => None,

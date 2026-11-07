@@ -269,7 +269,7 @@ The general match, which no located run answers, uses the same statistics.
 On file, a filter of code equalities takes the zones where every row holds
 every code without evaluating itself, and prunes the rest by the zones'
 bounds and recorded graphs. In memory, the residual compare asks the
-columns' array statistics first, then classes the zones it touches once:
+columns' whole bounds first, then classes the zones it touches once:
 it skips the zones that cannot hold its codes, takes the zones that hold
 only them, and compares the rest; a count takes a mixed zone from its
 recorded graphs or the column's encoding, and a window skips the zones

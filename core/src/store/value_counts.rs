@@ -3,7 +3,9 @@
 //! (null past that). Its state is a struct of two lists, `values` (u64,
 //! ascending) and their `counts` (u32), so Vortex's built-in `list_contains`
 //! can test whether a zone holds a value (the store's falsifier of `g = c`).
-//! The store writes it into the zone maps of its graph columns.
+//! The store writes it into the zone maps of its graph columns, and a build
+//! counts an in-memory graph column's zones with the same [`Counts`], in the
+//! pass that compresses the column.
 
 use std::fmt::{self, Display, Formatter};
 
@@ -48,6 +50,11 @@ pub(crate) enum Counts {
 }
 
 impl Counts {
+    /// A zone's counts before its first row.
+    pub(crate) fn new() -> Self {
+        Counts::Values(Vec::new())
+    }
+
     fn add(&mut self, value: u64, n: u64, max: u32) {
         let Counts::Values(values) = self else {
             return;
@@ -62,6 +69,32 @@ impl Counts {
                 }
             }
         }
+    }
+
+    /// Count `values` in, a run of one value at a time (graph columns come
+    /// in runs), at most `max` values recorded.
+    pub(crate) fn add_all(&mut self, values: &[u64], max: u32) {
+        let mut at = 0;
+        while at < values.len() && !matches!(self, Counts::TooMany) {
+            let value = values[at];
+            let run = values[at..].iter().take_while(|&&v| v == value).count();
+            self.add(value, run as u64, max);
+            at += run;
+        }
+    }
+
+    /// The zone's `(value, rows)` pairs, ascending by value, as its state
+    /// records them ([`decode_state`] of the state the aggregate writes):
+    /// `None` past `max_values` values, and for a count past a `u32`'s
+    /// range, more than a state holds.
+    pub(crate) fn recorded(&self) -> Option<Box<[(u64, u32)]>> {
+        let Counts::Values(values) = self else {
+            return None;
+        };
+        values
+            .iter()
+            .map(|&(value, n)| Some((value, u32::try_from(n).ok()?)))
+            .collect()
     }
 }
 
@@ -213,7 +246,7 @@ impl AggregateFnVTable for ValueCounts {
         &self,
         _args: AggregateArgs<'_, Self::Options>,
     ) -> VortexResult<Self::Partial> {
-        Ok(Counts::Values(Vec::new()))
+        Ok(Counts::new())
     }
 
     fn partial_from_scalar(
@@ -253,19 +286,11 @@ impl AggregateFnVTable for ValueCounts {
         _args: AggregateArgs<'_, Self::Options>,
         partial: &Self::Partial,
     ) -> VortexResult<Scalar> {
-        let Counts::Values(recorded) = partial else {
-            return Ok(Scalar::null(state_dtype()));
-        };
-        // A count past a u32's range is more than a state holds: the zone
-        // records nothing, as one past `max_values` does.
-        let Ok(counts) = recorded
-            .iter()
-            .map(|&(_, n)| u32::try_from(n))
-            .collect::<Result<Vec<_>, _>>()
-        else {
+        let Some(recorded) = partial.recorded() else {
             return Ok(Scalar::null(state_dtype()));
         };
         let values: Vec<u64> = recorded.iter().map(|&(value, _)| value).collect();
+        let counts: Vec<u32> = recorded.iter().map(|&(_, n)| n).collect();
         Ok(state_of(&values, &counts))
     }
 
@@ -292,15 +317,7 @@ impl AggregateFnVTable for ValueCounts {
                 None => *partial = Counts::TooMany,
             },
             Columnar::Canonical(Canonical::Primitive(p)) => {
-                let values = p.as_slice::<u64>();
-                // Runs of one value count once: graph columns come in runs.
-                let mut at = 0;
-                while at < values.len() && !matches!(partial, Counts::TooMany) {
-                    let value = values[at];
-                    let run = values[at..].iter().take_while(|&&v| v == value).count();
-                    partial.add(value, run as u64, max);
-                    at += run;
-                }
+                partial.add_all(p.as_slice::<u64>(), max);
             }
             Columnar::Canonical(_) => {
                 vortex_bail!(

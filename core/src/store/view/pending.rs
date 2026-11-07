@@ -1,20 +1,18 @@
-//! A view's selection left pending as a residual compare
-//! ([`PendingResidual`], [`ViewSelection::Residual`]): in memory, the
-//! equalities no prefix search or index answered, over a view built only to
-//! be counted or windowed short of its rows (`IdsNeed::CountOrWindow`),
-//! compared only as far as a count or a window needs. Where the base keeps
-//! zone maps, the selection's zones are classed once and a count or a window
-//! goes zone by zone, from the zones' counts where they settle them
-//! ([`zoned_count`], [`zoned_window`]); without them, the selection is
-//! compared in pieces, a zone's rows first and four times as many each
-//! after. The bindings' ASK (`count_probe` at a limit of one) and `LIMIT`
-//! (`run_probe` with a limit) over a pattern no index serves stop at the
-//! first zone or piece that holds their rows, instead of comparing every row
-//! the pattern's other roles leave.
+//! A view's selection left pending as a residual compare ([`PendingResidual`],
+//! [`ViewSelection::Residual`]): in memory, the equalities no prefix search or
+//! index answered, over a view built only to be counted or windowed short of
+//! its rows (`IdsNeed::CountOrWindow`), compared only as far as a count or a
+//! window needs ([`ResidualCompare`]). Where the base keeps zone maps, a count
+//! or a window goes zone by zone, from the zones' counts where they settle
+//! them; with zones off, or without zone maps, the selection is compared in
+//! pieces, a zone's rows first and four times as many each after. The
+//! bindings' ASK (`count_probe` at a limit of one) and `LIMIT` (`run_probe`
+//! with a limit) over a pattern no index serves stop at the first zone or
+//! piece that holds their rows, instead of comparing every row the pattern's
+//! other roles leave.
 //!
 //! [`ViewSelection::Residual`]: super::selection::ViewSelection::Residual
 
-use std::ops::Range;
 use std::sync::OnceLock;
 
 use vortex_array::scalar::Scalar;
@@ -24,82 +22,73 @@ use vortex_mask::Mask;
 use crate::error::Result;
 use crate::observe::observe;
 use crate::store::MemoryBase;
-use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
-use crate::store::scan::residual::{ResidualZones, residual_rows, zoned_count, zoned_window};
+use crate::store::read::live::Live;
+use crate::store::scan::residual::{Classes, ResidualCompare, ResidualTable};
 use crate::store::schema::RowId;
 use crate::store::view::selection::{RowSelection, SelectedRows, window_rows};
 
 /// A residual compare left pending: the rows of `selection` (of `memory`'s
-/// base) where every equality of `eqs` holds, compared as the eager compare
-/// ([`residual_rows`]) compares them, whole by a consumer that needs every
-/// match ([`materialized`](Self::materialized)), or zone by zone (piece by
-/// piece without zone maps) by a count or a window, only as far as it needs
-/// ([`count_capped`](Self::count_capped), [`window`](Self::window)). The
-/// matches, once every one is known, are kept for every clone of the view
-/// that holds the compare.
+/// base) where every equality of `eqs` holds, walked as `classes` say
+/// ([`ResidualCompare`]): whole by a consumer that needs every match
+/// ([`materialized`](Self::materialized)), or part by part by a count or a
+/// window, only as far as it needs ([`count_capped`](Self::count_capped),
+/// [`window`](Self::window)). The matches, once every one is known, are
+/// kept for every clone of the view that holds the compare.
 pub(crate) struct PendingResidual {
     memory: MemoryBase,
     selection: RowSelection,
     eqs: Vec<(&'static str, Scalar)>,
-    /// The selection's zones classed against `eqs`, once, for every piece.
-    zones: Option<ResidualZones>,
+    classes: Classes,
     ids: OnceLock<Buffer<RowId>>,
-}
-
-/// What the first pieces of a [`PendingResidual`] matched.
-struct ResidualPrefix {
-    /// The matching base rows of the pieces compared, ascending, tombstoned
-    /// rows included.
-    ids: Buffer<RowId>,
-    /// How many of `ids` are live.
-    live: usize,
-    /// Whether every piece was compared, so that `ids` are every match.
-    complete: bool,
-}
-
-impl ResidualPrefix {
-    /// Every match, `ids`, their live rows counted under `deleted`.
-    fn whole(ids: Buffer<RowId>, deleted: Option<&Mask>) -> Self {
-        let live = count_live(&ids, deleted);
-        Self {
-            ids,
-            live,
-            complete: true,
-        }
-    }
-
-    /// The live rows among the matches, in base row order.
-    fn live_ids(&self, deleted: Option<&Mask>) -> Buffer<RowId> {
-        match deleted {
-            None => self.ids.clone(),
-            Some(deleted) => self
-                .ids
-                .iter()
-                .copied()
-                .filter(|&id| !deleted.value(id as usize))
-                .collect(),
-        }
-    }
 }
 
 impl PendingResidual {
     /// The compare of `eqs` over `selection`, of `memory`'s base, left
-    /// pending, with the selection's zones classed against them (`zones`,
-    /// [`ResidualZones`]), if any.
+    /// pending, walked as `classes` say.
     pub(crate) fn new(
         memory: MemoryBase,
         selection: RowSelection,
         eqs: Vec<(&'static str, Scalar)>,
-        zones: Option<ResidualZones>,
+        classes: Classes,
     ) -> Self {
         observe!(ResidualDeferred);
         Self {
             memory,
             selection,
             eqs,
-            zones,
+            classes,
             ids: OnceLock::new(),
         }
+    }
+
+    /// The walk of the compare, `deleted` tombstoned.
+    fn compare<'a>(&'a self, deleted: Option<&'a Mask>) -> ResidualCompare<'a> {
+        ResidualCompare {
+            table: ResidualTable::base(&self.memory),
+            selection: &self.selection,
+            eqs: &self.eqs,
+            classes: &self.classes,
+            deleted,
+            t: None,
+        }
+    }
+
+    /// Whether a count or a window of `want` rows walks pieces that reach
+    /// every selected row: it compares the whole selection at once and
+    /// keeps the matches, as no piece could stop it short.
+    fn reaches_every_row(&self, want: usize) -> bool {
+        matches!(self.classes, Classes::Pieces { .. })
+            && want >= self.selection.len(self.memory.base.len())
+    }
+
+    /// Every match for a count or a window that reaches every selected row
+    /// ([`reaches_every_row`](Self::reaches_every_row)): the whole selection
+    /// compared as one piece, unless the matches are kept.
+    fn every_piece(&self) -> Result<Buffer<RowId>> {
+        if self.ids.get().is_none() {
+            observe!(ResidualPiece(self.selection.len(self.memory.base.len())));
+        }
+        self.materialized()
     }
 
     /// Every match: the whole selection compared at once on first need, the
@@ -108,13 +97,7 @@ impl PendingResidual {
         if let Some(ids) = self.ids.get() {
             return Ok(ids.clone());
         }
-        let matched = residual_rows(
-            &self.memory,
-            self.selection.clone(),
-            &self.eqs,
-            self.zones.as_ref(),
-            None,
-        )?;
+        let matched = self.compare(None).rows()?;
         let ids = match matched.as_rows(self.memory.base.len()) {
             SelectedRows::Run(run) => (run.start as RowId..run.end as RowId).collect(),
             SelectedRows::Ids(ids) => ids.clone(),
@@ -122,83 +105,46 @@ impl PendingResidual {
         Ok(self.ids.get_or_init(|| ids).clone())
     }
 
-    /// How many live rows match (`deleted` tombstoned): with the
-    /// selection's zone classes, zone by zone and with no match materialized
-    /// ([`zoned_count`]); without them, every match compared once and kept.
+    /// How many live rows match (`deleted` tombstoned): by zones, with no
+    /// match materialized; in pieces, every match compared once and kept.
     pub(crate) fn count(&self, deleted: Option<&Mask>) -> Result<usize> {
-        if let Some(ids) = self.ids.get() {
-            return Ok(count_live(ids, deleted));
+        if self.ids.get().is_none() && matches!(self.classes, Classes::Zoned(_)) {
+            return self.compare(deleted).count(None);
         }
-        match &self.zones {
-            Some(zones) => zoned_count(
-                &self.memory,
-                &self.selection,
-                &self.eqs,
-                zones,
-                deleted,
-                usize::MAX,
-            ),
-            None => Ok(count_live(&self.materialized()?, deleted)),
-        }
+        Ok(count_live(&self.materialized()?, deleted))
     }
 
-    /// How many rows match, once every piece has been compared.
+    /// How many rows match, once every one is known.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         self.ids.get().map(Buffer::len)
     }
 
-    /// `min(live matches, limit)`, `deleted` tombstoned: with the
-    /// selection's zone classes, counted zone by zone until `limit` live
-    /// rows are ([`zoned_count`]); without them, the pieces compared only
-    /// until `limit` live rows are found.
+    /// `min(live matches, limit)`, `deleted` tombstoned: walked part by part
+    /// only until `limit` live rows are counted, or from the kept matches.
     pub(crate) fn count_capped(&self, limit: usize, deleted: Option<&Mask>) -> Result<usize> {
-        if self.ids.get().is_none()
-            && let Some(zones) = &self.zones
-        {
-            let counted = zoned_count(
-                &self.memory,
-                &self.selection,
-                &self.eqs,
-                zones,
-                deleted,
-                limit,
-            )?;
-            return Ok(counted.min(limit));
+        if self.ids.get().is_none() && !self.reaches_every_row(limit) {
+            return Ok(self.compare(deleted).count(Some(limit))?.min(limit));
         }
-        Ok(self.prefix(limit, deleted)?.live.min(limit))
+        Ok(count_live(&self.every_piece()?, deleted).min(limit))
     }
 
     /// The live rows `offset..offset + limit` of the matches (`deleted`
     /// tombstoned), in base row order, beside the base's live matches as far
-    /// as they are known: every one once the last is found, else at least
-    /// `offset + limit`. With the selection's zone classes, the zones before
-    /// the window are counted and the window read a zone at a time
-    /// ([`zoned_window`]); without them, the pieces are compared only until
-    /// the window's last row is found.
+    /// as they are known ([`Live`]): walked part by part only until the
+    /// window's last row, or taken from the kept matches.
     pub(crate) fn window(
         &self,
         offset: usize,
         limit: usize,
         deleted: Option<&Mask>,
-    ) -> Result<(Buffer<RowId>, usize)> {
-        if self.ids.get().is_none()
-            && let Some(zones) = &self.zones
-        {
-            return zoned_window(
-                &self.memory,
-                &self.selection,
-                &self.eqs,
-                zones,
-                offset,
-                limit,
-                deleted,
-            );
+    ) -> Result<(Buffer<RowId>, Live)> {
+        if self.ids.get().is_none() && !self.reaches_every_row(offset.saturating_add(limit)) {
+            return self.compare(deleted).window(offset, limit);
         }
-        let prefix = self.prefix(offset.saturating_add(limit), deleted)?;
-        let live = prefix.live_ids(deleted);
+        let live = live_ids(&self.every_piece()?, deleted);
         let rows = window_rows(offset, limit, live.len() as u64)
             .map_or(0..0, |rows| rows.start as usize..rows.end as usize);
-        Ok((live.slice(rows), live.len()))
+        Ok((live.slice(rows), Live::Exact(live.len())))
     }
 
     /// Test-only hook: whether every match has been computed, so a test can
@@ -207,80 +153,17 @@ impl PendingResidual {
     pub(crate) fn debug_materialized(&self) -> bool {
         self.ids.get().is_some()
     }
-
-    /// What the first pieces match, at least `want` live rows under
-    /// `deleted` when there are as many ([`compare_prefix`](Self::compare_prefix));
-    /// every match once they are known, as a prefix that compared every
-    /// piece leaves them.
-    fn prefix(&self, want: usize, deleted: Option<&Mask>) -> Result<ResidualPrefix> {
-        if let Some(ids) = self.ids.get() {
-            return Ok(ResidualPrefix::whole(ids.clone(), deleted));
-        }
-        let prefix = self.compare_prefix(want, deleted)?;
-        if prefix.complete {
-            self.ids.get_or_init(|| prefix.ids.clone());
-        }
-        Ok(prefix)
-    }
-
-    /// The matches of the selection's first pieces ([`growing_pieces`]),
-    /// compared in base row order until at least `want` of them are live
-    /// (not tombstoned in `deleted`) or the selection ends. The first piece
-    /// is a zone's rows, above the typed residual's 4,096-row cap, so every
-    /// piece but a selection's last is compared by the mask scan, never by
-    /// the per-row probe reads the typed loop makes over a probe-bound column
-    /// (a store loaded from a file or from bytes), which cost many times a
-    /// mask scan's row. A selection of no more than `want` rows is one
-    /// piece, as no count or window of `want` rows could stop short of it.
-    fn compare_prefix(&self, want: usize, deleted: Option<&Mask>) -> Result<ResidualPrefix> {
-        let base_len = self.memory.base.len();
-        let rows = self.selection.as_rows(base_len);
-        let total = self.selection.len(base_len);
-        let first = if total <= want {
-            total
-        } else {
-            FIRST_PIECE_ROWS
-        };
-        let mut ids: Vec<RowId> = Vec::new();
-        let mut live = 0;
-        let mut compared = 0;
-        for (_, piece) in growing_pieces(std::iter::once(0..total as u64), first as u64) {
-            if live >= want {
-                break;
-            }
-            let piece = piece.start as usize..piece.end as usize;
-            observe!(ResidualPiece(piece.len()));
-            let matched = residual_rows(
-                &self.memory,
-                rows_at(&rows, piece.clone()),
-                &self.eqs,
-                self.zones.as_ref(),
-                None,
-            )?;
-            let found = ids.len();
-            match matched.as_rows(base_len) {
-                SelectedRows::Run(run) => ids.extend(run.start as RowId..run.end as RowId),
-                SelectedRows::Ids(matches) => ids.extend_from_slice(matches),
-            }
-            live += count_live(&ids[found..], deleted);
-            compared = piece.end;
-        }
-        Ok(ResidualPrefix {
-            ids: Buffer::from(ids),
-            live,
-            complete: compared == total,
-        })
-    }
 }
 
-/// The selected rows at `positions`, their places in the selection's order,
-/// as a selection of their own.
-fn rows_at(rows: &SelectedRows<'_>, positions: Range<usize>) -> RowSelection {
-    match rows {
-        SelectedRows::Run(run) => RowSelection::Range(
-            (run.start + positions.start) as u64..(run.start + positions.end) as u64,
-        ),
-        SelectedRows::Ids(ids) => RowSelection::Ids(ids.slice(positions)),
+/// The live rows among `ids`, in order.
+fn live_ids(ids: &Buffer<RowId>, deleted: Option<&Mask>) -> Buffer<RowId> {
+    match deleted {
+        None => ids.clone(),
+        Some(deleted) => ids
+            .iter()
+            .copied()
+            .filter(|&id| !deleted.value(id as usize))
+            .collect(),
     }
 }
 

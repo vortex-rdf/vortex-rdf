@@ -260,7 +260,7 @@ What the store reads from this structure:
   checks, taken only as the store writes them: as many counts as graphs, the
   graphs strictly ascending, the counts summing to the block's rows. A block
   whose record is otherwise is read as recording none
-  ([`decode_states`](../core/src/io/zone_map.rs#L353));
+  ([`decode_states`](../core/src/io/zone_map.rs#L367));
 - the **chunk leaves** of the `u64` code and row-id columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
@@ -544,9 +544,8 @@ the same statistics of its quad table beside its rows, built once: the zone
 map of each code column (`s`, `p`, `o`, `g`: each zone's `min` and `max`,
 two `u64` per 8,192-row zone), the graph column's recorded graphs per zone
 (up to 16 `(code, rows)` pairs), and each code column's exact smallest and
-largest code as its array statistics (`Stat::Min`, `Stat::Max`). A load reads
-them from the file's zone tables and footer, a build takes them in the pass
-that compresses its codes ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)). A
+largest code, its zones' folded. A load reads them from the file's zone
+tables, a build takes them in the pass that compresses its codes ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)). A
 query computes its residual's zone classes from them and keeps nothing.
 Each index component keeps the zone map of its graph column the same way,
 with the column's recorded graphs (a Dictionary store's; string columns have
@@ -639,7 +638,7 @@ filesystems are unsupported for mapping.
 
 A store in memory holds the same three pieces the file does, in the forms the
 read paths are written against: its source (the selection and tombstones, and
-the in-memory backend, [`MemoryBase`](../core/src/store/view/mod.rs#L74)) and
+the in-memory backend, [`MemoryBase`](../core/src/store/view/mod.rs#L75)) and
 its layout:
 
 | In the file | In memory |
@@ -653,7 +652,7 @@ its layout:
 | — | the source's `selection` and `deleted`, and the base's `serve` — a view's restrictions ([matching.md §1](matching.md#1-what-a-match-produces)) |
 
 A file-backed store (its source's `Backend::File`, a
-[`FileBase`](../core/src/store/view/mod.rs#L107)) holds none of the rows: the
+[`FileBase`](../core/src/store/view/mod.rs#L108)) holds none of the rows: the
 file handle, a pushed-down filter and an optional serve plan, beside the
 source's selection and tombstones. Its index data stays in the index children
 and is reached by chunk probes and pushed-down scans; a `FileBase`
@@ -723,7 +722,7 @@ open rather than being read around.
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`cache.rs`](../core/src/store/layouts/dictionary/file_backed/cache.rs#L22) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L47) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L51) |
-| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes, each run of consecutive rows in one pass (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L630) |
+| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes, each run of consecutive rows in one pass (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L685) |
 | `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L24) |
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L35) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`read_plan.rs`](../core/src/store/scan/read_plan.rs#L30) |

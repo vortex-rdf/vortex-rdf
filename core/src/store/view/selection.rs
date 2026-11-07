@@ -23,6 +23,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::observe::observe;
 use crate::store::indexes::LazyRowIds;
 use crate::store::layouts::OwnedQuadPattern;
+use crate::store::read::live::Live;
 use crate::store::schema::RowId;
 use crate::store::view::pending::PendingResidual;
 
@@ -106,35 +107,89 @@ impl ViewSelection {
         }
     }
 
-    /// The live rows this selection covers out of `base_len`, when known
-    /// without I/O: an exact selection's rows less the `deleted` tombstones;
-    /// a pending run's width while nothing is tombstoned
-    /// ([`LazyRowIds::len_if_known`]); under tombstones, its live ids counted
-    /// without I/O, never sorted ([`LazyRowIds::live_len_without_io`]): a
-    /// file run's only once read. An in-memory
-    /// run's ids are decoded and cached here, the one way this fails, and a
-    /// pending residual's matches are known once every piece was compared,
-    /// and counted here under tombstones ([`PendingResidual::count`]: zone by
-    /// zone where its zones are classed). Passed no tombstones, it counts the
-    /// selection's rows, a bound on its live ones.
+    /// The rows this selection covers out of `base_len`, tombstones not
+    /// applied, when known without reading or counting anything: an exact
+    /// selection's rows; a pending run's width, or a checked run's matches
+    /// once counted ([`LazyRowIds::len_if_known`]); a pending residual's
+    /// matches once compared. A bound on its live rows.
+    pub(crate) fn len_if_known(&self, base_len: usize) -> Option<usize> {
+        match self {
+            ViewSelection::Exact(selection) => Some(selection.len(base_len)),
+            ViewSelection::Pending { ids, .. } => ids.len_if_known(),
+            ViewSelection::Residual(residual) => residual.len_if_known(),
+        }
+    }
+
+    /// The live rows this selection covers out of `base_len`, `deleted`
+    /// tombstoned, counted without I/O: an exact selection's rows less its
+    /// tombstones; a pending run's ids counted while nothing is tombstoned
+    /// ([`LazyRowIds::count`]: its width, or a checked run's matches counted
+    /// zone by zone), under tombstones its live ids, never sorted
+    /// ([`LazyRowIds::live_len_without_io`]: an in-memory run's ids decoded
+    /// and kept, a file run's only once read); a pending residual's matches
+    /// ([`PendingResidual::count`]). `None` for a file run's ids not read
+    /// yet.
     ///
     /// [`PendingResidual::count`]: crate::store::view::pending::PendingResidual::count
-    pub(crate) fn len_if_known(
+    pub(crate) fn count(&self, deleted: Option<&Mask>, base_len: usize) -> Result<Option<usize>> {
+        match (self, deleted) {
+            (ViewSelection::Exact(selection), _) => Ok(Some(selection.live_len(deleted, base_len))),
+            (ViewSelection::Pending { ids, .. }, None) => ids.count(),
+            (ViewSelection::Pending { ids, .. }, Some(deleted)) => ids.live_len_without_io(deleted),
+            (ViewSelection::Residual(residual), _) => residual.count(deleted).map(Some),
+        }
+    }
+
+    /// `min(live rows, limit)` exactly, `deleted` tombstoned, where the
+    /// selection counts only as far as `limit`: a pending residual
+    /// ([`PendingResidual::count_capped`]) and a checked run with nothing
+    /// tombstoned ([`LazyRowIds::count_capped`]). `None` for any other
+    /// selection, whose capped count is its count ([`count`](Self::count)).
+    ///
+    /// [`PendingResidual::count_capped`]: crate::store::view::pending::PendingResidual::count_capped
+    pub(crate) fn count_capped(
         &self,
+        limit: usize,
         deleted: Option<&Mask>,
-        base_len: usize,
     ) -> Result<Option<usize>> {
-        Ok(match (self, deleted) {
-            (ViewSelection::Exact(selection), _) => Some(selection.live_len(deleted, base_len)),
-            (ViewSelection::Pending { ids, .. }, None) => ids.len_if_known(),
-            (ViewSelection::Pending { ids, .. }, Some(deleted)) => {
-                ids.live_len_without_io(deleted)?
+        match (self, deleted) {
+            (ViewSelection::Residual(residual), _) => {
+                residual.count_capped(limit, deleted).map(Some)
             }
-            (ViewSelection::Residual(residual), None) => residual.len_if_known(),
-            (ViewSelection::Residual(residual), Some(deleted)) => {
-                Some(residual.count(Some(deleted))?)
+            (ViewSelection::Pending { ids, .. }, None) => ids.count_capped(limit),
+            _ => Ok(None),
+        }
+    }
+
+    /// The rows `offset..offset + limit` of a pending selection, read
+    /// without its other ids, beside the base's live rows as far as the
+    /// window knows them ([`Live`]): a pending residual compared only as far
+    /// as the window's last live row ([`PendingResidual::window`]); with
+    /// nothing tombstoned, a run whose rids ascend cut by position, before
+    /// its ids are decoded ([`LazyRowIds::window_with_live`]: a checked
+    /// run's zones counted only until the window fills, a located file
+    /// run's window read from its rows). `None` for an exact selection, a
+    /// run under tombstones, or one of unknown width or whose rids do not
+    /// ascend, whose window comes from the materialized selection.
+    ///
+    /// [`PendingResidual::window`]: crate::store::view::pending::PendingResidual::window
+    pub(crate) async fn window(
+        &self,
+        offset: usize,
+        limit: usize,
+        deleted: Option<&Mask>,
+    ) -> Result<Option<(RowSelection, Live)>> {
+        match (self, deleted) {
+            (ViewSelection::Residual(residual), _) => {
+                let (ids, live) = residual.window(offset, limit, deleted)?;
+                Ok(Some((RowSelection::from_ids(ids), live)))
             }
-        })
+            (ViewSelection::Pending { ids, .. }, None) => Ok(ids
+                .window_with_live(offset, limit)
+                .await?
+                .map(|(ids, live)| (RowSelection::from_ids(ids), live))),
+            _ => Ok(None),
+        }
     }
 
     /// The exact selection, for consumers that never meet a pending one: a
