@@ -13,7 +13,9 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use super::components::{ComponentIdentity, IndexComponent};
 use super::graph_check::GraphCheck;
 use super::serve::{InMemoryServePlan, ServeDecode};
-use super::{COL_RID, ComponentRun, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
+use super::{
+    COL_RID, CheckedRun, ComponentRun, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds,
+};
 use crate::error::Result;
 use crate::stats_rules::zones_enabled;
 use crate::store::array::unsigned_value;
@@ -141,27 +143,33 @@ pub(super) fn resolve_in_memory(
         _ => None,
     };
     let graph = check.is_some();
-    let ids = Arc::new(match check {
-        Some(check) => ComponentRun::checked(rids, probe.rids_ascend, check),
-        None => ComponentRun::new(rids, probe.rids_ascend),
-    });
     // The matched quads are the contiguous matched run of the serving
     // component, so a read can slice them straight from it instead of
     // gathering the primary columns at the row ids. The plan shares the run
     // with the lazy ids: its ids decode once for both. A checked run keeps
     // only some of the run's rows, which a plan would over-cover.
-    let serve = probe.serve.filter(|_| !graph).map(|decode| {
-        InMemoryServePlan::new(
-            decode,
-            component.identity.name,
-            rows.clone().into_array(),
-            run,
-            Arc::clone(&ids),
-            component.probes_arc(),
-        )
-    });
+    let (ids, serve) = match check {
+        Some(check) => (
+            LazyRowIds::Checked(Arc::new(CheckedRun::new(rids, probe.rids_ascend, check))),
+            None,
+        ),
+        None => {
+            let ids = Arc::new(ComponentRun::new(rids, probe.rids_ascend));
+            let serve = probe.serve.map(|decode| {
+                InMemoryServePlan::new(
+                    decode,
+                    component.identity.name,
+                    rows.clone().into_array(),
+                    run,
+                    Arc::clone(&ids),
+                    component.probes_arc(),
+                )
+            });
+            (LazyRowIds::Component(ids), serve)
+        }
+    };
     Ok(IndexResolution::Resolved {
-        row_ids: ResolvedRowIds::Lazy(LazyRowIds::Component(ids)),
+        row_ids: ResolvedRowIds::Lazy(ids),
         resolves: probe.resolves,
         serve,
         graph,

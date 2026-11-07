@@ -248,6 +248,91 @@ async fn checked_run_limit_zero_windows_count_nothing() {
     }
 }
 
+/// How many ids a checked run holds is known only once it is counted: before,
+/// its pending length reads nothing (no zone counted, no graph read) and is
+/// unknown; after a count, it is the count.
+#[tokio::test]
+async fn checked_run_lengths_read_nothing_until_counted() {
+    use crate::store::IdsNeed;
+
+    let _zones = ForcedZones::set(true);
+    let store = built_store(
+        zone_quads(Graphs::Alternating),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let view = store
+        .match_pattern_for(
+            None,
+            Some(&iri("type")),
+            None,
+            Some(&numbered_graph(1)),
+            IdsNeed::CountOrWindow { reach: 64 },
+        )
+        .await
+        .unwrap();
+    let rec = Recorder::start();
+    let known = view.debug_pending_len();
+    let read = rec.count_where(|e| {
+        matches!(
+            e,
+            Event::ZoneRecorded(_) | Event::ZoneCounted(_) | Event::ComponentChecked(_)
+        )
+    });
+    drop(rec);
+    assert_eq!(known, Some(None), "unknown before a count");
+    assert_eq!(read, 0, "nothing read for the length");
+    let size = view.size().await.unwrap();
+    assert_eq!(
+        view.debug_pending_len(),
+        Some(Some(size)),
+        "known once counted"
+    );
+}
+
+/// A capped count is exactly `min(size, limit)` on every route a count
+/// takes: a checked run, a residual left pending by zones and in pieces (the
+/// Default layout's strings), and a located file run, at a limit of none,
+/// one, a few, the size and past it.
+#[tokio::test]
+async fn capped_counts_never_exceed_their_limit() {
+    let _zones = ForcedZones::set(true);
+    let quads = zone_quads(Graphs::Alternating);
+    let checked = built_store(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let zoned = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let pieces = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
+    let (_dir, path) = write_store_file(
+        quads,
+        LayoutStrategy::Dictionary,
+        IndexConfig::Reference.types(),
+    )
+    .await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
+    for (label, store) in [
+        ("checked", &checked),
+        ("zoned", &zoned),
+        ("pieces", &pieces),
+        ("file", &file),
+    ] {
+        let size = store.count_probe(&probe).await.unwrap();
+        assert!(size > 7, "{label}: {size} matches");
+        for limit in [0, 1, 7, size, size + 3] {
+            let capped = store
+                .count_probe(&probe.clone().window(0, Some(limit)))
+                .await
+                .unwrap();
+            assert_eq!(capped, size.min(limit), "{label} limit {limit}");
+        }
+    }
+}
+
 /// By reference, the first page of `(? type ? g1)` on `Graphs::Alternating`
 /// and its ASK (a count capped at one) count the run's zones only until the
 /// page fills or the cap is met: the run's part of its first zone, a quarter
