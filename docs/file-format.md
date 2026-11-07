@@ -88,7 +88,7 @@ The writer is limited to three editions:
 A file of the value-counts edition needs a reader that registers the
 aggregate. vortex-rdf 0.14 and earlier refuse it, naming
 `vortexrdf.value_counts`, when they load it into memory (`from_bytes`,
-`from_file_in_memory`); a mapped open (`from_file`, Java `open(path)`)
+`from_file_in_memory`); a mapped open (`from_file`, Java `open(path)`, Python `VortexRdfStore(path)`)
 succeeds, and fails at the first read that prunes by a graph column's zones,
 such as a pattern with a bound graph. Files written before it keep reading; their graph
 columns lack the statistic, and readers skip what it would decide. A store
@@ -151,7 +151,7 @@ Two kinds of child:
 
 ### 3.1 The inventory
 
-The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L194))
+The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L195))
 carried inside the Layout flatbuffer, so it is read with the footer:
 
 ```json
@@ -183,7 +183,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L66) |
 | `version` | the implementation's version, positive; a dictionary or index child above the version a reader reads (`DICT_VERSION`, `INDEX_VERSION`) fails the open ([§3](#3-the-store-root-vortex-rdfstorev2)) |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
-| `sorted` | written `true` for every index child and the dictionary, which are sorted by definition: readers of this version binary-search an index child in its key order whatever the flag says (a writer that leaves one out of order writes a wrong file, [§10](#10-what-a-file-must-satisfy)), and readers of 0.14 and earlier only when it is set; absent decodes as false |
+| `sorted` | written `true` for every index child and the dictionary, which are sorted by definition: readers of this version binary-search an index child in its key order whatever the flag says (a writer that leaves one out of order writes a wrong file, [§10](#10-what-a-file-must-satisfy)), and the term resolvers of 0.14 and earlier only when it is set (their located code runs never read it); absent decodes as false |
 | `bracketed_iris` | dictionary children only: the writer's provenance that every IRI term (every term starting with `<`) is spelled `<`, its text, `>` — a reader may then decide a `STR()` prefix over IRIs by a code range ([§5](#5-the-dictionary-child)); written only when true, absent means false |
 | `fields` | the column shape in a closed vocabulary of non-nullable kinds: `u32`, `u64`, `utf8` |
 
@@ -694,7 +694,8 @@ checks:
    within each chunk; a reference child's order is `(val, rid)`. Readers
    binary-search them without checking, so a writer that writes one out of
    order writes a wrong file and gets wrong matches. Write `sorted: true`:
-   readers of 0.14 and earlier search a child only when it is set.
+   the term resolvers of 0.14 and earlier search a child only when it is
+   set.
 6. Under `Dictionary`: a `dictionary` child with implementation
    `sorted-terms-fsst-v1` (version 1 or 2) holding every code's term at its
    row, sorted and unique; `required: true`.
@@ -705,7 +706,7 @@ checks:
    (under `Dictionary`), its value at each row is the `g` of the quad-table
    row its `rid` names. Readers count and window by these without checking:
    a wrong `g` gives a graph-bound by-reference match wrong rows.
-9. On a graph column (the quad table's `g`, a reference child's `g`), each
+9. On every `g` column (the quad table's and each index child's), each
    zone's `vortexrdf.value_counts` record lists every value the zone holds
    with its rows: values strictly ascending, each count above zero, the
    counts summing to the zone's rows, at most 16 values, and null past them.

@@ -861,7 +861,7 @@ Binary-searches the lead column for the probe run, then — for a `(p, o)` patte
 comparator makes the second column sorted inside each lead run). It returns:
 
 - `Empty` if the probe term is absent from the dictionary, or the run is empty;
-- `Declined` if the component is missing, unsorted, or probe-incompatible;
+- `Declined` if the component is missing or probe-incompatible;
 - otherwise `Resolved` with **`Lazy` row ids** (the rid slice, decoded and
   re-sorted only on demand) and **always a serve plan** over the matched run.
 
@@ -915,12 +915,11 @@ supplies a serve plan**.
 `rid` run: `Lazy` ids, which `sorted_row_ids` puts back in base row order when
 a consumer needs them; a count takes the run's width, and a window cuts its
 own rows out of the run before decoding them (the rows of one value are in row
-id order). Declines when the component is absent, unsorted, or
-probe-incompatible.
+id order). Declines when the component is absent or probe-incompatible.
 
 **On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L32)
-binary-searches the value column's chunk probes (sorted child + integer probe
-required). A located run's ids are `Lazy`
+binary-searches the value column's chunk probes (an integer probe required;
+every index child is sorted by its keys). A located run's ids are `Lazy`
 ([`read_located_rids`](../core/src/store/indexes/rid_reads.rs#L100)): a count
 takes the run's width, a window reads only its own rows, and materialized, a
 run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/rid_reads.rs#L35)

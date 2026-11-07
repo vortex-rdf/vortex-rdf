@@ -237,8 +237,8 @@ async fn test_to_bytes_is_byte_stable() {
 
 /// Index children are sorted by definition: a reader searches and serves
 /// them whatever their descriptor's `sorted` says, and a store writes
-/// `sorted: true` on every index child it writes, so a reader that honors
-/// the flag (0.14 and earlier) keeps routing through them. The file here
+/// `sorted: true` on every index child it writes, so the term resolvers of
+/// 0.14 and earlier, which honor the flag, keep routing through them. The file here
 /// claims `sorted: false` on children that are sorted. An untouched mapped
 /// store hands back its file's bytes as they are, descriptors included.
 #[tokio::test]

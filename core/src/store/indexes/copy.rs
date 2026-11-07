@@ -24,11 +24,11 @@
 //! Dictionary layout, and, like the reference index, are always sorted over
 //! the whole dataset: [`components`] for the in-memory builders, merged
 //! `(sort key, row id)` spill runs for the out-of-core one, lead column
-//! stamped either way. The in-memory resolver requires that global
-//! provenance. The file resolver uses it to locate the matched run by binary
-//! search over the child's cached chunk probes (lead key, then the windowed
-//! second key), and falls back to a pushed-down equality scan when the
-//! probes decline.
+//! stamped either way. Both resolvers rely on that order: the in-memory one
+//! binary-searches the copy, and the file one locates the matched run by
+//! binary search over the child's cached chunk probes (lead key, then the
+//! windowed second key), falling back to a pushed-down equality scan when
+//! the probes decline.
 //!
 //! [`IndexType::SecondaryByCopy`]: super::IndexType::SecondaryByCopy
 //! [`reference`]: super::reference

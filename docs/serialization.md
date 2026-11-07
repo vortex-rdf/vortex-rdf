@@ -417,8 +417,9 @@ is stamped `IsSorted`.
 **Out of core**, the same tables come off the spill-run mergers of
 [§6](#6-pipeline-b--sorted-out-of-core), a chunk at a time.
 
-Both hand the child over with `sorted: true` provenance, because both sorted
-the whole dataset; a reader binary-searches a child on that flag alone
+Both sort the whole dataset, as every index child must be: a reader
+binary-searches a child without consulting its descriptor's `sorted`, which
+the writer sets `true` for the term resolvers of 0.14 and earlier
 ([matching.md §8](matching.md#8-the-index-resolvers)).
 
 ---

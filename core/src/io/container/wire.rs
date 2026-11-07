@@ -137,8 +137,9 @@ pub(crate) struct StoreComponentDescriptor {
     /// merely per chunk. Written `true` for every index child and the
     /// dictionary, which are sorted by definition: this version's readers
     /// search an index child whatever the flag says (a writer that leaves one
-    /// out of order writes a wrong file), while readers of 0.14 and earlier
-    /// search one only when it is set. Absent decodes as `false`.
+    /// out of order writes a wrong file), while the term resolvers of 0.14
+    /// and earlier search one only when it is set (their located code runs
+    /// never read it). Absent decodes as `false`.
     #[serde(default)]
     pub(crate) sorted: bool,
     /// Dictionary children only: whether every IRI term (every term starting

@@ -429,8 +429,9 @@ pub(crate) struct ChildStream {
 impl ChildStream {
     /// This child as a native child write: its descriptor names the
     /// component and its slug, says `sorted: true` (an index child is in its
-    /// key order by definition; readers of 0.14 and earlier search a child
-    /// only when its descriptor says so) and carries the source's dtype, and
+    /// key order by definition; the term resolvers of 0.14 and earlier search
+    /// a child only when its descriptor says so) and carries the source's
+    /// dtype, and
     /// the child is written through [`child_strategy`]. The one spelling of
     /// an index child's descriptor.
     pub(crate) fn into_write(self) -> Result<NativeComponentWrite> {

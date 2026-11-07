@@ -73,11 +73,10 @@ async fn resolve_eager_from_scan(
 /// `probe` resolved against a file's index children: the file counterpart of
 /// `resolve::resolve_in_memory`, reaching the probed child's columns through
 /// their cached chunk probes (the file mirror of the in-memory binary search)
-/// or, failing that, a pushed-down scan, whose filter answers whatever the
-/// child's sortedness.
+/// or, failing that, a pushed-down scan.
 ///
-/// On a globally sorted child the keys' rows are one contiguous run, located
-/// key by key, each search windowed to the run of the keys before it; a
+/// The keys' rows are one contiguous run, as every index child is sorted by
+/// its keys, located key by key, each search windowed to the run of the keys before it; a
 /// located empty run proves the pattern matches nothing. What answers the
 /// row ids then depends on the probe:
 /// - A serving probe's ids are a deferred rid-only scan filtered by its keys,
@@ -181,8 +180,8 @@ enum Located {
     /// A key's term is absent from the dictionary: nothing can match.
     Absent,
     /// The probe applies; `range` is the keys' run when located, `None` when
-    /// the location declined (an unsorted child, a string value column, a
-    /// chunk resolving no probe) and the pushed-down scan answers instead.
+    /// the location declined (a string value column, a chunk resolving no
+    /// probe) and the pushed-down scan answers instead.
     Run {
         child: ChildReader,
         keys: Vec<(&'static str, Scalar)>,
