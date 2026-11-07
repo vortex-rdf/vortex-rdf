@@ -589,6 +589,69 @@ async fn recorded_graphs_settle_zones_without_the_code() {
     }
 }
 
+/// A first page whose graph's rows lie past the run's first block, on a
+/// file written without the statistic (every zone of the run mixed,
+/// [`Graphs::Gapped`]), counts the run's zones on their encoding up to its
+/// graph's, skipping those counted empty unread, and reads that zone alone
+/// after the first block: by copy (the `index:posg` run) and by reference
+/// (`index:ref-p`'s, checked against its own graphs). Its rows are as with
+/// zones off.
+#[tokio::test]
+async fn first_pages_count_the_zones_before_their_first_match() {
+    use crate::CodePattern;
+    use crate::io::zone_map::ZONE_ROWS;
+    use crate::store::test_hooks::{ForcedValueCounts, ForcedZones};
+
+    // The run is rows RUN..2 * RUN of its child, graph 2's rows its rows
+    // 20,000..21,000: they lie in the child's zone from 57,344.
+    let first_match_zone = (RUN + 20_000) / ZONE_ROWS * ZONE_ROWS;
+    for index in [IndexConfig::Copy, IndexConfig::Reference] {
+        let (_dir, path) = {
+            let _statistic = ForcedValueCounts::set(false);
+            write_store_file(
+                zone_quads(Graphs::Gapped),
+                LayoutStrategy::Dictionary,
+                index.types(),
+            )
+            .await
+        };
+        let store = &VortexRdfStore::from_file(&path).await.unwrap();
+        let ty = code_of(store, "<http://example.org/type>").await;
+        let g2 = code_of(store, "<http://example.org/g2>").await;
+        let pattern = CodePattern::new(None, Some(ty), None, Some(g2));
+        let page = || async move {
+            code_rows::<4>(
+                &store
+                    .match_code_pattern(pattern, 0, Some(10))
+                    .await
+                    .unwrap(),
+            )
+        };
+        let want = {
+            let _off = ForcedZones::set(false);
+            page().await
+        };
+        let _on = ForcedZones::set(true);
+        let rec = Recorder::start();
+        let got = page().await;
+        let (counted, read) = zone_work(&rec);
+        drop(rec);
+        let tag = index.name();
+        assert_eq!(got.len(), 10, "{tag}");
+        assert_eq!(got, want, "{tag}: the first page");
+        assert_eq!(
+            read,
+            4_096 + ZONE_ROWS as u64,
+            "{tag}: the first block, then graph 2's zone alone"
+        );
+        assert_eq!(
+            counted,
+            (first_match_zone + ZONE_ROWS - RUN) as u64,
+            "{tag}: the zones up to graph 2's counted on their encoding"
+        );
+    }
+}
+
 /// Level 3: a mixed zone whose one unsettled slot's column records its
 /// values counts that slot's code from its record, when the zone lies whole
 /// within the run. On the alternating graphs' `index:posg` run, which

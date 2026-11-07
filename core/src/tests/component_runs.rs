@@ -291,6 +291,85 @@ async fn checked_run_lengths_read_nothing_until_counted() {
     );
 }
 
+/// A view bound to a graph that a checked run answers reports its rows
+/// exactly in its statistics, as every in-memory view does (interfaces.md
+/// §3): only a count or a window leaves the run pending, uncounted, and a
+/// view built for its rows holds the run's matches; by copy and by
+/// reference.
+#[tokio::test]
+async fn graph_bound_views_report_exact_statistics() {
+    use crate::store::IdsNeed;
+
+    let _zones = ForcedZones::set(true);
+    for index in [IndexConfig::Copy, IndexConfig::Reference] {
+        let store = built_store(
+            zone_quads(Graphs::Alternating),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let (ty, g1) = (iri("type"), numbered_graph(1));
+        let tag = index.name();
+        let counted = store
+            .match_pattern_for(None, Some(&ty), None, Some(&g1), IdsNeed::Count)
+            .await
+            .unwrap();
+        assert_eq!(
+            counted.debug_pending_len(),
+            Some(None),
+            "{tag}: a count's match, a checked run left pending"
+        );
+        let view = store
+            .match_pattern(None, Some(&ty), None, Some(&g1))
+            .await
+            .unwrap();
+        assert_eq!(view.debug_pending_len(), None, "{tag}: the run's matches");
+        assert_eq!(
+            view.view_statistics().unwrap().rows,
+            RowCountHint::exact(view.size().await.unwrap()),
+            "{tag}"
+        );
+    }
+}
+
+/// A checked run's windows on a tailed view, from the base's last match to
+/// past the view's last row (the tail's first row, its second, the end and
+/// past it), each one row or five: each is that slice of every row, as with
+/// zones off, so the run hands the tail the offset its matches leave (Review
+/// Focus 1); by copy and by reference.
+#[tokio::test]
+async fn checked_run_windows_past_the_base_hand_the_tail_its_offset() {
+    for index in [IndexConfig::Copy, IndexConfig::Reference] {
+        let base = built_store(
+            zone_quads(Graphs::Alternating),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let store = tailed(&base).await;
+        let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
+        let (rows, matched) = {
+            let _zones = ForcedZones::set(false);
+            (
+                quads_of(&store.run_probe(&probe).await.unwrap()).await,
+                base.count_probe(&probe).await.unwrap(),
+            )
+        };
+        let count = rows.len();
+        let tag = index.name();
+        assert_eq!(count - matched, 2, "{tag}: graph 1's tail rows");
+        let _zones = ForcedZones::set(true);
+        for offset in [matched - 1, matched, matched + 1, count, count + 1] {
+            for limit in [1, 5] {
+                let window = probe.clone().window(offset, Some(limit));
+                let got = quads_of(&store.run_probe(&window).await.unwrap()).await;
+                let want = &rows[offset.min(count)..(offset + limit).min(count)];
+                assert_eq!(got, want, "{tag}: offset {offset}, limit {limit}");
+            }
+        }
+    }
+}
+
 /// A capped count is exactly `min(size, limit)` on every route a count
 /// takes: a checked run, a residual left pending by zones and in pieces (the
 /// Default layout's strings), and a located file run, at a limit of none,

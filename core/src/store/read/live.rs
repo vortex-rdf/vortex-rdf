@@ -55,9 +55,10 @@ impl<T: Copy> WindowCursor<T> {
         }
     }
 
-    /// Whether a part of `count` matches lies wholly before the window,
-    /// so the walk skips it unread; its matches are then counted. False once
-    /// the window has started, where a part's matches are taken instead.
+    /// Whether a part of `count` matches ends before the window's first
+    /// match, so the walk skips it unread; its matches are then counted. A
+    /// part of no matches ends there too until a part has been taken. False
+    /// for any other part, whose matches are taken instead.
     pub(crate) fn skips(&mut self, count: usize) -> bool {
         if self.seen.saturating_add(count) <= self.offset {
             self.seen += count;
@@ -65,13 +66,6 @@ impl<T: Copy> WindowCursor<T> {
         } else {
             false
         }
-    }
-
-    /// Whether the walk has reached the window's first match, after which
-    /// every part is read (a file's located window asks it).
-    #[cfg(feature = "file-io")]
-    pub(crate) fn started(&self) -> bool {
-        self.seen >= self.offset
     }
 
     /// A part's matches, in order: those in the window kept, all counted.

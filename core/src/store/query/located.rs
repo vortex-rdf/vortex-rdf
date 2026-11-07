@@ -859,15 +859,20 @@ impl LocatedRun {
         let run = &self.positions();
         let parts: Vec<ZonePart> = zones.parts(run.clone()).collect();
         let mut cursor = WindowCursor::new(offset, limit);
+        // Until the zone holding the window's first match, each zone is
+        // counted and skipped by its count, unread: those before the window,
+        // and at its start those counted empty.
+        let mut counting = true;
         let mut at = 0;
         while at < parts.len() && !cursor.is_full() {
             let rows = &parts[at].rows;
-            if !cursor.started() {
+            if counting {
                 let n = self.zone_count(zones, &parts[at]).await?;
                 if cursor.skips(n as usize) {
                     at += 1;
                     continue;
                 }
+                counting = false;
             }
             let kept = match self
                 .block(rows.start - run.start..rows.end - run.start)
