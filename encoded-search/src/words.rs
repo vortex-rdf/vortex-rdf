@@ -12,6 +12,7 @@ pub(crate) enum Words<'a> {
 }
 
 impl Words<'_> {
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         match self {
             Words::U8(s) => s.len(),
@@ -31,6 +32,7 @@ impl Words<'_> {
         }
     }
 
+    #[inline]
     pub(crate) fn get(&self, i: usize) -> u64 {
         match self {
             Words::U8(s) => u64::from(s[i]),
@@ -41,6 +43,7 @@ impl Words<'_> {
     }
 
     /// The words at `start..start + out.len()`, widened, into `out`.
+    #[inline]
     pub(crate) fn read_into(&self, start: usize, out: &mut [u64]) {
         fn widen<T: Copy + Into<u64>>(words: &[T], out: &mut [u64]) {
             for (o, &w) in out.iter_mut().zip(words) {
@@ -88,6 +91,7 @@ impl Words<'_> {
 
     /// First index whose value is `>= needle`, by the native monomorphized
     /// `partition_point`; the length for a needle past the width's maximum.
+    #[inline]
     pub(crate) fn lower_bound(&self, needle: u64) -> usize {
         fn bound<T: Copy + Ord + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
             match T::try_from(needle) {

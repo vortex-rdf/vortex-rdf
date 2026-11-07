@@ -64,11 +64,13 @@ impl<'a> PackedNode<'a> {
         })
     }
 
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     /// The exception values written over the packed ones, if any.
+    #[inline]
     pub(crate) fn patches(&self) -> Option<&PatchProbe<'a>> {
         self.patches.as_ref()
     }
@@ -78,6 +80,7 @@ impl PackedNode<'_> {
     /// Patch-aware logical value at `i`. The sorted invariant of the parent
     /// column holds only for patched values, so bounds search must go through
     /// this accessor, never the raw packed words.
+    #[inline]
     pub(crate) fn value_at(&self, i: usize) -> u64 {
         if let Some(p) = &self.patches
             && let Some(v) = p.lookup(i)
@@ -101,7 +104,9 @@ impl PackedNode<'_> {
     /// patches in range are then written over them
     /// ([`PatchProbe::overwrite`]), where [`Self::value_at`] searches the
     /// patches once per value.
+    #[inline]
     pub(crate) fn read_into(&self, start: usize, out: &mut [u64]) {
+        #[inline]
         fn read<T>(node: &PackedNode<'_>, packed: &[T], start: usize, out: &mut [u64])
         where
             T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Into<u64> + Default,
@@ -182,7 +187,9 @@ impl PackedNode<'_> {
     /// Hands `f` the values at physical positions `first..first + n`, a
     /// chunk part at a time, each with its offset in the window, unpacked as
     /// the read rule takes it ([`unpack_tier`]). A read the rule takes one by
-    /// one in all is read so across its chunks, in one part.
+    /// one in all is read so across its chunks, in one part. Out of line, so
+    /// a short read's path stays small enough to inline into its callers.
+    #[inline(never)]
     fn read_parts<T>(&self, packed: &[T], first: usize, n: usize, mut f: impl FnMut(usize, &[T]))
     where
         T: vortex_array::dtype::NativePType + fastlanes::BitPacking + Default,
