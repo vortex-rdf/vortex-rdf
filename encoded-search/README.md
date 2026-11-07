@@ -4,7 +4,7 @@
 Bounds search and point access over compressed [Vortex](https://github.com/spiraldb/vortex)
 arrays, without decoding them.
 
-Vortex's `search_sorted` is correct for every encoding, but in Vortex 0.90 it
+Vortex's `search_sorted` is correct for every encoding, but in Vortex 0.93 it
 is one bisection over point reads: each read goes through the array's probe
 with an `ExecutionCtx` and comes back as a `Scalar` (the typed
 `SearchSortedPrimitiveArray` compares values as their type but reads them the
@@ -97,7 +97,9 @@ wraps. `NodeKind` reports the resolved tree's shape for tests and
 diagnostics. Bit-packing with a width per block (the `fastlanes.bitpacked.v2`
 wire form) declines: BtrBlocks' bit-packing scheme picks a width per 1,024-value
 block wherever the blocks' best widths differ when its builder allows that form,
-as `empty()` does, and no Vortex core edition includes it.
+as `empty()` does, and no Vortex core edition includes it. Since Vortex 0.93
+its frame-of-reference scheme packs its child the same way when that form is
+allowed, so such a frame of reference declines too.
 A frame of reference per chunk, a sparse array and a run-length array have no
 order-preserving map from a needle to their children, so their bounds searches
 probe the composed values. When its
@@ -186,7 +188,7 @@ cargo bench -p vortex-rdf-encoded-search --bench probe
 
 ## Compatibility
 
-Built against Vortex `0.90`.
+Built against Vortex `0.93`.
 
 Minimum supported Rust version: 1.95 (edition 2024).
 

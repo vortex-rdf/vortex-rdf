@@ -301,7 +301,7 @@ the dtype alone decides the layout ([§4](#4-the-quad-table)).
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage/mod.rs#L37))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L335)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L339)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates

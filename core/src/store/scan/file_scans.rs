@@ -178,7 +178,7 @@ impl RowSelection {
     /// This selection and the `deleted` tombstones applied to a file scan.
     ///
     /// A range sets the scan's row range and an id list its [`Selection`].
-    /// A `RowSelection` never holds both, though Vortex 0.90 would read their
+    /// A `RowSelection` never holds both, though Vortex would read their
     /// intersection. `All` keeps the full row range (every file row is a quad
     /// row).
     ///
@@ -433,7 +433,7 @@ mod tests {
         );
     }
 
-    /// Vortex 0.90 intersects a scan's row range with its row indices, the
+    /// Vortex intersects a scan's row range with its row indices, the
     /// pairing [`RowSelection::restrict_scan`] never builds: of the ids 5, 12,
     /// 30 and 45, a scan of rows `10..40` reads 12 and 30.
     #[tokio::test]
