@@ -484,7 +484,7 @@ fn holds(kinds: &KindRanges, slot: usize, code: TermCode) -> bool {
 }
 
 #[cfg(feature = "file-io")]
-use crate::store::query::zone_decider::ZoneClass;
+use crate::io::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 #[cfg(feature = "file-io")]
 use vortex_rdf_encoded_search::counters;
 
@@ -524,51 +524,14 @@ struct LocatedRun {
     checked: Vec<usize>,
     source: Source,
     session: vortex_session::VortexSession,
-    /// The classes of the zones the run's positions fall in against its
-    /// checked slots, when zone maps decide them ([`run_zones`]); `None`
-    /// checks every row.
-    zones: Option<RunZones>,
+    /// The zone checks of the run's checked slots, each named by its slot
+    /// ([`ZoneSet`]), over the table the run's positions are in, when zone
+    /// maps decide them ([`run_zones`]); `None` checks every row.
+    zones: Option<ZoneSet>,
     /// The file statistics still to ask for the run's checked slots, until a
     /// read needs them ([`ask_statistics`](Self::ask_statistics)); `None`
     /// once asked, or when the run asks none.
     pending: Option<PendingStatistics>,
-}
-
-/// The classes of the zones a run's positions fall in, against the run's
-/// checked slots (the ladder's zone level, see `zone_decider`): zones
-/// `first..first + classes.len()` of the table the run is located in (a
-/// sorted table, or a reference child for its own `g`), `zone_len` rows
-/// each. They live with the run, so a call or a stream holds them, never
-/// the store.
-#[cfg(feature = "file-io")]
-struct RunZones {
-    zone_len: u64,
-    first: u64,
-    classes: Vec<crate::store::query::zone_decider::ZoneClass>,
-    /// Beside each class, the zone's matches as the values its column
-    /// recorded count them (the ladder's third level): for a mixed zone
-    /// lying whole within the run, whose one unsettled slot's column records
-    /// the zone's values; `None` for every other zone.
-    recorded: Vec<Option<u64>>,
-}
-
-#[cfg(feature = "file-io")]
-impl RunZones {
-    /// The class of zone `zone`, one of the run's.
-    fn class(&self, zone: u64) -> crate::store::query::zone_decider::ZoneClass {
-        self.classes[(zone - self.first) as usize]
-    }
-
-    /// Zone `zone`'s matches as its recorded values count them, `None` where
-    /// they don't.
-    fn recorded(&self, zone: u64) -> Option<u64> {
-        self.recorded[(zone - self.first) as usize]
-    }
-
-    /// The zones past the run's last.
-    fn past(&self) -> u64 {
-        self.first + self.classes.len() as u64
-    }
 }
 
 /// Where a run asks its file's statistics when a read needs them
@@ -707,27 +670,23 @@ impl LocatedRun {
                     let every = self
                         .checked
                         .iter()
-                        .fold(0u8, |bits, &slot| bits | 1 << slot);
+                        .fold(0u32, |bits, &slot| bits | 1 << slot);
                     return Ok(Rows::Ids(self.checked_rows(rows, every).await?));
                 };
                 // Zone by zone: none keeps nothing, all keeps every row
                 // unread, a mixed zone checks the slots it leaves unsettled.
                 let mut kept = Vec::new();
-                let mut at = rows.start;
-                while at < rows.end {
-                    let zone = at / zones.zone_len;
-                    let end = ((zone + 1) * zones.zone_len).min(rows.end);
+                for ZonePart { zone, rows } in zones.parts(rows) {
                     match zones.class(zone) {
-                        ZoneClass::None => note(counters::ZONE_NONE, end - at),
+                        ZoneClass::None => note(counters::ZONE_NONE, rows.end - rows.start),
                         ZoneClass::All => {
-                            note(counters::ZONE_ALL, end - at);
-                            kept.extend(at..end);
+                            note(counters::ZONE_ALL, rows.end - rows.start);
+                            kept.extend(rows);
                         }
                         ZoneClass::Mixed { unsettled } => {
-                            kept.extend(self.checked_rows(at..end, unsettled).await?);
+                            kept.extend(self.checked_rows(rows, unsettled).await?);
                         }
                     }
-                    at = end;
                 }
                 Ok(Rows::Ids(kept))
             }
@@ -748,23 +707,17 @@ impl LocatedRun {
                         "a reference child's zones decide its graph alone"
                     );
                     let mut kept = Vec::new();
-                    let mut at = rows.start;
-                    while at < rows.end {
-                        let zone = at / zones.zone_len;
-                        let end = ((zone + 1) * zones.zone_len).min(rows.end);
+                    for ZonePart { zone, rows } in zones.parts(rows) {
                         match zones.class(zone) {
-                            ZoneClass::None => note(counters::ZONE_NONE, end - at),
+                            ZoneClass::None => note(counters::ZONE_NONE, rows.end - rows.start),
                             ZoneClass::All => {
-                                note(counters::ZONE_ALL, end - at);
-                                kept.extend(
-                                    read_codes(rid, at..end, source, session).await?.iter(),
-                                );
+                                note(counters::ZONE_ALL, rows.end - rows.start);
+                                kept.extend(read_codes(rid, rows, source, session).await?.iter());
                             }
                             ZoneClass::Mixed { .. } => {
-                                kept.extend(self.graph_rows(rid, graph, at..end).await?);
+                                kept.extend(self.graph_rows(rid, graph, rows).await?);
                             }
                         }
-                        at = end;
                     }
                     return Ok(Rows::Ids(kept));
                 }
@@ -812,7 +765,7 @@ impl LocatedRun {
     /// slot in `slots` (bits `1 << slot`), checked in [`checked`](Self::checked)
     /// order: the first slot read over the rows, still contiguous, each
     /// other one at the rows the slots before it kept.
-    async fn checked_rows(&self, rows: std::ops::Range<u64>, slots: u8) -> Result<Vec<u64>> {
+    async fn checked_rows(&self, rows: std::ops::Range<u64>, slots: u32) -> Result<Vec<u64>> {
         debug_assert!(
             matches!(self.rows, RunRows::Table(_)),
             "checked rows are a table run's: a reference run lists quad-table rows"
@@ -849,19 +802,18 @@ impl LocatedRun {
         Ok(kept)
     }
 
-    /// The matches of the run's positions in zone `zone` (one of `zones`):
-    /// none for a zone of class none, its rows for one of class all, and for
-    /// a mixed zone with one slot unsettled there its recorded count of the
-    /// slot's code ([`RunZones::recorded`]), else its rows counted on the
-    /// checked column's encoding ([`ColumnChunks::count_eq`]); a mixed zone
-    /// with more slots unsettled (a sorted table's) is checked.
+    /// The matches of the run's positions `part` (a zone's, one of
+    /// `zones`'): none for a zone of class none, its rows for one of class
+    /// all, and for a mixed zone with one slot unsettled there its recorded
+    /// count of the slot's code when the part is the whole zone
+    /// ([`ZoneSet::recorded_in`]), else its rows counted on the checked
+    /// column's encoding ([`ColumnChunks::count_eq`]); a mixed zone with more
+    /// slots unsettled (a sorted table's) is checked.
     ///
     /// [`ColumnChunks::count_eq`]: vortex_rdf_encoded_search::ColumnChunks::count_eq
-    async fn zone_count(&self, zones: &RunZones, zone: u64) -> Result<u64> {
-        let run = &self.positions();
-        let rows =
-            (zone * zones.zone_len).max(run.start)..((zone + 1) * zones.zone_len).min(run.end);
-        Ok(match zones.class(zone) {
+    async fn zone_count(&self, zones: &ZoneSet, part: &ZonePart) -> Result<u64> {
+        let rows = part.rows.clone();
+        Ok(match zones.class(part.zone) {
             ZoneClass::None => {
                 note(counters::ZONE_NONE, rows.end - rows.start);
                 0
@@ -871,7 +823,7 @@ impl LocatedRun {
                 rows.end - rows.start
             }
             ZoneClass::Mixed { unsettled } if unsettled.count_ones() == 1 => {
-                if let Some(matches) = zones.recorded(zone) {
+                if let Some(matches) = zones.recorded_in(unsettled.trailing_zeros(), part) {
                     crate::observe::observe!(ZoneRecorded(rows.end - rows.start));
                     note(counters::ZONE_RECORDED, rows.end - rows.start);
                     return Ok(matches);
@@ -897,29 +849,29 @@ impl LocatedRun {
     /// counts of the zones past it.
     async fn zoned_window(
         &self,
-        zones: &RunZones,
+        zones: &ZoneSet,
         offset: usize,
         limit: Option<usize>,
         whole: bool,
     ) -> Result<(u64, Rows)> {
         let run = &self.positions();
-        let (from, past) = (offset as u64, zones.past());
+        let parts: Vec<ZonePart> = zones.parts(run.clone()).collect();
+        let from = offset as u64;
         let to = limit.map(|limit| from.saturating_add(limit as u64));
-        let (mut zone, mut before) = (zones.first, 0);
+        let (mut at, mut before) = (0, 0);
         if to != Some(from) {
-            while zone < past {
-                let n = self.zone_count(zones, zone).await?;
+            while at < parts.len() {
+                let n = self.zone_count(zones, &parts[at]).await?;
                 if before + n > from {
                     break;
                 }
                 before += n;
-                zone += 1;
+                at += 1;
             }
         }
         let (mut seen, mut window) = (before, Vec::new());
-        while zone < past && to.is_none_or(|to| seen < to) {
-            let rows =
-                (zone * zones.zone_len).max(run.start)..((zone + 1) * zones.zone_len).min(run.end);
+        while at < parts.len() && to.is_none_or(|to| seen < to) {
+            let rows = &parts[at].rows;
             let kept = match self
                 .block(rows.start - run.start..rows.end - run.start)
                 .await?
@@ -934,13 +886,12 @@ impl LocatedRun {
                 window.extend_from_slice(&kept[lo as usize..hi as usize]);
             }
             seen += n;
-            zone += 1;
+            at += 1;
         }
         let mut total = seen;
         if whole {
-            while zone < past {
-                total += self.zone_count(zones, zone).await?;
-                zone += 1;
+            for part in &parts[at..] {
+                total += self.zone_count(zones, part).await?;
             }
         }
         Ok((total, Rows::Ids(window)))
@@ -1349,12 +1300,10 @@ async fn decide_by_statistics(
     Ok(())
 }
 
-/// The zones of `run`, located in `target`, classed against its checked
-/// slots by their columns' zone maps ([`ZoneDecider`]): a sorted table's
-/// checked columns, or a reference child's own `g`. `None` when a checked
-/// column has none, for the run to check every row.
-///
-/// [`ZoneDecider`]: crate::store::query::zone_decider::ZoneDecider
+/// The zone checks of `run`'s checked slots, each named by its slot, over
+/// the table `run` is located in ([`ZoneSet`]): a sorted table's checked
+/// columns, or a reference child's own `g`. `None` when a checked column has
+/// no zone map, for the run to check every row.
 #[cfg(feature = "file-io")]
 async fn run_zones(
     file: &crate::store::persist::native_file::NativeStoreFile,
@@ -1362,11 +1311,8 @@ async fn run_zones(
     target: StatisticsTarget,
     run: &LocatedRun,
     source: &Source,
-) -> Result<Option<RunZones>> {
-    use crate::store::query::zone_decider::{CheckedColumn, ZoneDecider};
-
-    let rows = &run.positions();
-    let mut columns = Vec::with_capacity(run.checked.len());
+) -> Result<Option<ZoneSet>> {
+    let mut checks = Vec::with_capacity(run.checked.len());
     for &slot in &run.checked {
         let zones = match target {
             StatisticsTarget::Table { table, component } => {
@@ -1380,39 +1326,13 @@ async fn run_zones(
         let Some(zones) = zones else {
             return Ok(None);
         };
-        columns.push(CheckedColumn {
-            slot,
+        checks.push(ZoneCheck {
+            bit: slot as u32,
             code: run.codes[slot].expect("a checked slot is bound"),
             zones,
         });
     }
-    let Some(decider) = ZoneDecider::new(columns) else {
-        return Ok(None);
-    };
-    let zone_len = decider.zone_len();
-    let (first, past) = (rows.start / zone_len, rows.end.div_ceil(zone_len));
-    let classes = decider.classify(first..past);
-    // The ladder's third level: a mixed zone with one slot unsettled counts
-    // from its column's record, when the zone lies whole within the run (a
-    // partial zone's record counts rows outside it).
-    let recorded = (first..past)
-        .zip(&classes)
-        .map(|(zone, &class)| match class {
-            ZoneClass::Mixed { unsettled } if unsettled.count_ones() == 1 => {
-                let whole = decider.zone_rows(zone);
-                (rows.start <= whole.start && whole.end <= rows.end)
-                    .then(|| decider.recorded_count(unsettled.trailing_zeros() as usize, zone))
-                    .flatten()
-            }
-            _ => None,
-        })
-        .collect();
-    Ok(Some(RunZones {
-        zone_len,
-        first,
-        classes,
-        recorded,
-    }))
+    Ok(ZoneSet::new(checks, 0))
 }
 
 /// The zone map of reference index `index`'s child's own `g`, with its

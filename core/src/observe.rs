@@ -85,8 +85,8 @@ pub(crate) enum Event {
     /// An in-memory residual took this many rows of its selection from
     /// zones where every row holds its codes, uncompared.
     ResidualZoneTaken(u64),
-    /// A zone decider classed this many zones (a located run's, or an
-    /// in-memory residual's once).
+    /// An in-memory residual's zone checks built, once per residual, over
+    /// the selection's this many zones.
     ZonesClassed(u64),
     /// An in-memory residual settled by its columns' array statistics,
     /// with no row compared: `none` when no row holds a code, else every

@@ -1,16 +1,15 @@
-//! A view's selection left pending as a residual compare
-//! ([`PendingResidual`], [`ViewSelection::Residual`]): in memory, the
-//! equalities no prefix search or index answered, over a view built only to
-//! be counted or windowed short of its rows (`IdsNeed::CountOrWindow`),
-//! compared only as far as a count or a window needs. Where the base keeps
-//! zone maps, the selection's zones are classed once and a count or a window
-//! goes zone by zone, from the zones' counts where they settle them
-//! ([`zoned_count`], [`zoned_window`]); without them, the selection is
-//! compared in pieces, a zone's rows first and four times as many each
-//! after. The bindings' ASK (`count_probe` at a limit of one) and `LIMIT`
-//! (`run_probe` with a limit) over a pattern no index serves stop at the
-//! first zone or piece that holds their rows, instead of comparing every row
-//! the pattern's other roles leave.
+//! A view's selection left pending as a residual compare ([`PendingResidual`],
+//! [`ViewSelection::Residual`]): in memory, the equalities no prefix search or
+//! index answered, over a view built only to be counted or windowed short of
+//! its rows (`IdsNeed::CountOrWindow`), compared only as far as a count or a
+//! window needs. Where the base keeps zone maps, the selection's zones are
+//! classed against them and a count or a window goes zone by zone, from the
+//! zones' counts where they settle them ([`zoned_count`], [`zoned_window`]);
+//! without them, the selection is compared in pieces, a zone's rows first and
+//! four times as many each after. The bindings' ASK (`count_probe` at a limit
+//! of one) and `LIMIT` (`run_probe` with a limit) over a pattern no index
+//! serves stop at the first zone or piece that holds their rows, instead of
+//! comparing every row the pattern's other roles leave.
 //!
 //! [`ViewSelection::Residual`]: super::selection::ViewSelection::Residual
 

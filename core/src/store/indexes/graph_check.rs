@@ -5,8 +5,8 @@
 //! run lists, scattered over the base.
 //!
 //! Each zone the run touches is decided by the component's zone map of its
-//! graph column ([`ColumnZones::eq_holds`]): no row holds the graph, every row
-//! does, or some may. A mixed zone is counted from its recorded graphs when
+//! graph column, the one check of a [`ZoneSet`]: no row holds the graph,
+//! every row does, or some may. A mixed zone is counted from its recorded graphs when
 //! the run holds the whole zone, else on the graph column's encoding
 //! (`count_eq`), else by comparing its graphs; its matching rows are found by
 //! comparing them. A window of a run whose ids ascend skips the zones before
@@ -24,6 +24,7 @@ use super::components::{IndexComponent, run_order_row_ids};
 use super::get_or_try_init;
 use crate::error::Result;
 use crate::io::zone_map::ColumnZones;
+use crate::io::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::schema::{COL_G, RowId};
@@ -36,9 +37,9 @@ pub(crate) struct GraphCheck {
     rows: Range<usize>,
     /// The bound graph's code.
     code: u64,
-    /// The zone map of the component's graph column, with each zone's
-    /// recorded graphs.
-    zones: Arc<ColumnZones>,
+    /// The graph checked against the zone map of the component's graph
+    /// column, with each zone's recorded graphs, as bit 0.
+    zones: ZoneSet,
     /// The run's slice of the component's graph column.
     graphs: ArrayRef,
     /// The component's encoded-search probe over its graph column, when its
@@ -48,16 +49,6 @@ pub(crate) struct GraphCheck {
     /// How many of the run's rows in each zone it touches hold the graph, in
     /// run order, counted once and kept.
     counts: OnceLock<Arc<[usize]>>,
-}
-
-/// What a zone's rows of a checked run hold, by the zone map alone.
-enum Zone {
-    /// No row of the zone holds the graph.
-    None,
-    /// Every row of the zone holds it.
-    All,
-    /// Some rows may.
-    Mixed,
 }
 
 impl GraphCheck {
@@ -75,6 +66,15 @@ impl GraphCheck {
             .rows()?
             .unmasked_field_by_name(COL_G)?
             .slice(rows.clone())?;
+        let zones = ZoneSet::new(
+            vec![ZoneCheck {
+                bit: 0,
+                code,
+                zones,
+            }],
+            0,
+        )
+        .expect("one check is of one geometry");
         Ok(Self {
             rows,
             code,
@@ -88,23 +88,9 @@ impl GraphCheck {
     /// The zones the run touches, in run order, each with the run's rows in
     /// it (component rows).
     fn parts(&self) -> impl Iterator<Item = (u64, Range<usize>)> + '_ {
-        let zone_len = self.zones.zone_len() as usize;
-        let first = self.rows.start / zone_len;
-        let last = (self.rows.end - 1) / zone_len;
-        (first..=last).map(move |zone| {
-            let start = (zone * zone_len).max(self.rows.start);
-            let end = ((zone + 1) * zone_len).min(self.rows.end);
-            (zone as u64, start..end)
-        })
-    }
-
-    /// What zone `zone` holds of the graph, by its bounds and recorded graphs.
-    fn zone(&self, zone: u64) -> Zone {
-        match self.zones.eq_holds(zone, self.code) {
-            Some(false) => Zone::None,
-            Some(true) => Zone::All,
-            None => Zone::Mixed,
-        }
+        self.zones
+            .parts(self.rows.start as u64..self.rows.end as u64)
+            .map(|ZonePart { zone, rows }| (zone, rows.start as usize..rows.end as usize))
     }
 
     /// How many of the run's rows hold the graph.
@@ -145,10 +131,10 @@ impl GraphCheck {
     /// run holds it whole, else on the graph column's encoding, else by
     /// comparing its graphs.
     fn zone_count(&self, zone: u64, part: &Range<usize>) -> Result<usize> {
-        match self.zone(zone) {
-            Zone::None => Ok(0),
-            Zone::All => Ok(part.len()),
-            Zone::Mixed => self.mixed_count(zone, part),
+        match self.zones.class(zone) {
+            ZoneClass::None => Ok(0),
+            ZoneClass::All => Ok(part.len()),
+            ZoneClass::Mixed { .. } => self.mixed_count(zone, part),
         }
     }
 
@@ -156,10 +142,8 @@ impl GraphCheck {
     /// the zone's recorded count when `part` is the whole zone, else counted
     /// on the graph column's encoding, else compared.
     fn mixed_count(&self, zone: u64, part: &Range<usize>) -> Result<usize> {
-        let whole = self.zones.zone_rows(zone);
-        if (whole.start, whole.end) == (part.start as u64, part.end as u64)
-            && let Some(matches) = self.zones.recorded_count(zone, self.code)
-        {
+        let rows = part.start as u64..part.end as u64;
+        if let Some(matches) = self.zones.recorded_in(0, &ZonePart { zone, rows }) {
             observe!(ZoneRecorded(part.len() as u64));
             return Ok(matches as usize);
         }
@@ -207,10 +191,10 @@ impl GraphCheck {
     /// row's in a zone of the graph alone, the compared rows' in a mixed one.
     fn part_ids(&self, rids: &ArrayRef, zone: u64, part: &Range<usize>) -> Result<Buffer<RowId>> {
         let in_run = part.start - self.rows.start..part.end - self.rows.start;
-        match self.zone(zone) {
-            Zone::None => Ok(Buffer::empty()),
-            Zone::All => run_order_row_ids(rids.slice(in_run)?),
-            Zone::Mixed => {
+        match self.zones.class(zone) {
+            ZoneClass::None => Ok(Buffer::empty()),
+            ZoneClass::All => run_order_row_ids(rids.slice(in_run)?),
+            ZoneClass::Mixed { .. } => {
                 let offsets = self.compared(part)?;
                 if offsets.is_empty() {
                     return Ok(Buffer::empty());

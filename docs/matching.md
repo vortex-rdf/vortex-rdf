@@ -274,7 +274,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`memory.rs:50-75`](../core/src/store/query/matching/memory.rs#L50-L75 "MemoryBase") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching/memory.rs#L201), [`search_sorted_bounds`](../core/src/store/array.rs#L276) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`memory.rs:79-149`](../core/src/store/query/matching/memory.rs#L79-L149 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L459), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L810) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`memory.rs:151-165`](../core/src/store/query/matching/memory.rs#L151-L165 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching/memory.rs#L283), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L230), [`mask_for`](../core/src/store/scan/residual.rs#L737) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`memory.rs:167-174`](../core/src/store/query/matching/memory.rs#L167-L174 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -390,7 +390,7 @@ run it located when the probed component keeps a zone map of its graph
 column ([`graph_zones`](../core/src/store/indexes/components.rs#L312): the
 Dictionary layout's components, built or loaded). The run's rows are
 contiguous in the component, so the component's own `g` column decides them
-a zone at a time ([`GraphCheck`](../core/src/store/indexes/graph_check.rs#L34)),
+a zone at a time ([`GraphCheck`](../core/src/store/indexes/graph_check.rs#L35)),
 where stage 3 would compare the graph at the base rows the run lists,
 scattered over the base:
 
@@ -454,7 +454,7 @@ zone maps are taken (below; a loaded store's are its file's footer
 statistics). A constrained column's code outside its bounds leaves the
 selection no row, and bounds that are both the code drop the equality from
 the compare; with none left the selection is the answer, compared nowhere
-([`ask_statistics`](../core/src/store/scan/residual.rs#L68)). This is the
+([`ask_statistics`](../core/src/store/scan/residual.rs#L67)). This is the
 store's one rule for `x = c` on exact bounds, which a file's located runs
 apply too, at its footer and zone by zone
 ([`eq_on_bounds`](../core/src/io/zone_map.rs#L308)): it refutes where
@@ -476,10 +476,10 @@ Vortex's accumulator of `vortexrdf.value_counts`), or read from the zone
 tables of the file a store is loaded from (`from_file_in_memory`,
 `from_bytes`), so no query pays for them. A base without them (the string
 columns of the Default and TypedObject layouts) skips this step. Over a
-selection wider than a zone, the zones it touches are classed once against
-the equalities left, by the same rule on each bound column's zone bounds
+selection wider than a zone, the zones it touches are classed against the
+equalities left, by the same rule on each bound column's zone bounds
 and the graphs `g`'s zones record
-([`ResidualZones`](../core/src/store/scan/residual.rs#L135),
+([`ResidualZones`](../core/src/store/scan/residual.rs#L114),
 [`ColumnZones::eq_holds`](../core/src/io/zone_map.rs#L185)): "none" where a
 code lies outside its zone's bounds or the zone's recorded graphs lack it,
 "all" where every bound column's zone bounds are its code, mixed otherwise
@@ -488,7 +488,7 @@ The selection's rows in "none" zones are skipped, those in "all" zones are
 taken uncompared, and those in a mixed zone are compared on the columns it
 leaves unsettled only, adjacent zones of one treatment as one run, through
 the implementations below
-([`residual_rows`](../core/src/store/scan/residual.rs#L639)). Each run's
+([`residual_rows`](../core/src/store/scan/residual.rs#L566)). Each run's
 compare decides whether to decode its columns on the residual's whole
 selection, not the run's rows, so a residual over every row decodes them once
 for all its runs. When the runs to compare are several and hold more than
@@ -503,7 +503,7 @@ column's code out are left out
 ([`kept_runs`](../core/src/store/zones.rs#L125)), when what is left holds at
 most half the base: a run of rows (every row, or a subject's range) is
 compared zone run by zone run, each a slice of the base through the mask
-scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L783)), and an
+scan below ([`runs_matching`](../core/src/store/scan/residual.rs#L710)), and an
 id list keeps only its ids in those runs before the implementations below
 compare them. A code most zones may hold (a predicate or graph spread over
 every zone) leaves everything to compare.
@@ -551,17 +551,17 @@ windowed (`IdsNeed::CountOrWindow`: `count_probe` with a limit, and
 how many rows it needs, its window's offset and limit. When those are fewer
 than the rows the selection holds, and the selection holds more than one
 8,192-row piece, the compare is left pending
-([`PendingResidual`](../core/src/store/view/pending.rs#L40)) as the view's
+([`PendingResidual`](../core/src/store/view/pending.rs#L39)) as the view's
 selection (`ViewSelection::Residual`), as a deferred index run's ids are.
 With its zone classes, `size_capped` counts the zones in base order until
 the cap, and `window` counts the zones before the window, unread where they
 can be (below), then reads the matches from the zone holding its first to
-its last ([`zoned_window`](../core/src/store/scan/residual.rs#L437)). Without
+its last ([`zoned_window`](../core/src/store/scan/residual.rs#L364)). Without
 them (zones off, or no zone map for its columns), both compare the selection
 in pieces, in base row order, a zone's rows first and four times as many
 each piece after, each through the implementations above, and stop at the
 piece that brings the live rows they need to their count
-([`prefix`](../core/src/store/view/pending.rs#L215)); a selection no wider
+([`prefix`](../core/src/store/view/pending.rs#L214)); a selection no wider
 than that count is one piece, and a compare that runs to the end keeps its
 matches as the view's ids. Any other consumer compares the whole selection
 at once. A window that reaches every row, a probe with keeps and
@@ -572,7 +572,7 @@ above the typed residual's caps, so the mask scan compares it.
 A count without a limit (`IdsNeed::Count`: `size` through `count_probe` and
 `count_code_pattern`) leaves the compare pending too, and counts it zone by
 zone on its zone classes, with no match materialized
-([`zoned_count`](../core/src/store/scan/residual.rs#L334)): a "none" zone
+([`zoned_count`](../core/src/store/scan/residual.rs#L261)): a "none" zone
 counts nothing, an "all" zone its selected live rows, and a mixed zone with
 one column left to compare and no tombstone among its selected rows counts
 from the zone's recorded graphs when the selection holds the whole zone,
@@ -693,7 +693,7 @@ Each stage in the code, and where the details are below:
 | 1 · subject chunk probe and prefix | [`file.rs:43-50`](../core/src/store/query/matching/file.rs#L43-L50 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching/file.rs#L225), [`locate_subject_run`](../core/src/store/scan/subject_runs.rs#L21), [`narrow_subject_run`](../core/src/store/scan/subject_runs.rs#L44) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`file.rs:51-64`](../core/src/store/query/matching/file.rs#L51-L64 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L485) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`file.rs:22-91`](../core/src/store/query/matching/file.rs#L22-L91 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_exprs.rs#L29) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L253), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L804) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`file.rs:70-71`](../core/src/store/query/matching/file.rs#L70-L71 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching/mod.rs#L233) and [`file.rs:155-169`](../core/src/store/query/matching/file.rs#L155-L169 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching/file.rs#L253), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L802) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`file.rs:171-186`](../core/src/store/query/matching/file.rs#L171-L186 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L205) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
@@ -742,7 +742,7 @@ bisects; the column's handle keeps them for later probes
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L804) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L802) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — stopping at the first conjunct that leaves no row (the conjuncts
 after it are never bound), and collapses the surviving mask to its enclosing
@@ -771,7 +771,7 @@ every code without evaluating it: a zone whose bounds in each equality's
 column are both `c` cannot hold a differing row, the rule Vortex's pruning
 of `col != c` applies. Each split reads it off the quad table's zone maps
 for its own zones
-([`every_row_zones`](../core/src/store/scan/file_filter.rs#L223)): the maps
+([`every_row_zones`](../core/src/store/scan/file_filter.rs#L224)): the maps
 the file reads once per column on first use, as located runs read them
 ([`QuadZoneMaps`](../core/src/store/persist/native_file.rs#L217)), shared
 by the splits however many ask at once. The filter is then evaluated only
