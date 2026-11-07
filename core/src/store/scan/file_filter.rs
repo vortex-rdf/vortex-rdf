@@ -21,12 +21,13 @@ use crate::io::read::{available_parallelism, spawned_splits};
 use crate::observe::observe;
 #[cfg(test)]
 use crate::store::persist::native_file::FileCounter;
-use crate::store::persist::native_file::{FileTable, NativeStoreFile, ZoneMaps};
+use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_exprs::{PushedFilter, QUAD_SCOPE};
 use crate::store::scan::file_scans::{ScanDriver, split_window, strict_ids};
 use crate::store::scan::pieces::{FIRST_PIECE_ROWS, growing_pieces};
 use crate::store::schema::{COL_G, COL_O, COL_O_VALUE, COL_P, COL_S, RowId};
 use crate::store::view::selection::RowSelection;
+use crate::zone_stats::file_maps::{FileTable, ZoneMaps};
 use crate::zone_stats::zone_set::{ZoneCheck, ZoneClass, ZonePart, ZoneSet};
 
 /// Split a file view's [`RowSelection`] into the two knobs the per-split filter

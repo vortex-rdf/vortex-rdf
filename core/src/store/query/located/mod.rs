@@ -309,3 +309,6 @@ mod plan;
 mod run;
 #[cfg(feature = "file-io")]
 mod statistics;
+
+#[cfg(feature = "file-io")]
+pub(crate) use plan::LocatedTables;

@@ -8,10 +8,14 @@
 //!   zone walk asks;
 //! - [`quad_zones`]: an in-memory base's zone maps, built in the pass that
 //!   compresses its code columns, or read from a file's zone tables;
+//! - [`file_maps`]: a store file's zone maps by table and slot, read on
+//!   first use and kept with the file;
 //! - [`rules`]: the falsifier Vortex's own pruning applies from the recorded
 //!   values, and the switch that turns the store's zone decisions off
 //!   (`VORTEX_RDF_ZONES=0`).
 
+#[cfg(feature = "file-io")]
+pub(crate) mod file_maps;
 pub(crate) mod quad_zones;
 pub(crate) mod rules;
 pub(crate) mod value_counts;
