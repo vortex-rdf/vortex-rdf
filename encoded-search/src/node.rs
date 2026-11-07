@@ -654,7 +654,11 @@ fn chunk_windows<'n, 'a>(
 /// reaches, in order, each as its offsets in the window and its value: the
 /// first run found once, the rest walked. A run whose end does not pass the
 /// window's position (ends out of order, which only a corrupt file holds)
-/// adds no rows, so no window runs backwards.
+/// adds no rows, so no window runs backwards, and ends that no run carries
+/// to the window's end fail the walk.
+///
+/// # Panics
+/// Panics when the runs end before the window does.
 fn runs_in<'n>(
     ends: &'n Node<'_>,
     values: &'n Node<'_>,
@@ -667,6 +671,12 @@ fn runs_in<'n>(
     let mut at = first;
     std::iter::from_fn(move || {
         (at < last).then(|| {
+            // Ends that stop short of the window's end (a corrupt file's)
+            // would leave `at` short of `last` past the last run.
+            assert!(
+                run < ends.len(),
+                "corrupt run ends: no run reaches the window's end"
+            );
             let end = ends.value_at(run).clamp(at, last);
             // Run positions below `last` fit the window's `usize`.
             let window = (at - first) as usize..(end - first) as usize;
@@ -755,6 +765,23 @@ mod tests {
     /// them; Vortex checks their order in debug builds only) never wrap a
     /// count or a read: a run whose end does not pass the window's position
     /// adds no rows.
+    /// Run ends that never reach the window's end, under nodes that read
+    /// past their length without a bounds check (constant ends and values,
+    /// only a corrupt file holds them), fail the walk instead of looping
+    /// on the same position forever.
+    #[test]
+    #[should_panic(expected = "corrupt run ends")]
+    fn run_ends_short_of_the_window_panic_rather_than_hang() {
+        let n = Node::RunEnd {
+            ends: Box::new(Node::Constant { value: 3, len: 2 }),
+            values: Box::new(Node::Constant { value: 1, len: 2 }),
+            offset: 5,
+            len: 5,
+        };
+        let mut c = crate::search::Count(0);
+        n.eq_into(0, 5, 1, 0, &mut c);
+    }
+
     #[test]
     fn run_ends_out_of_order_count_no_more_than_their_rows() {
         let (ends, values) = ([9u64, 9, 9, 2, 30], [1u64; 5]);
