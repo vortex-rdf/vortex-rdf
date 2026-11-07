@@ -5,12 +5,9 @@
 //! contiguous, instead of comparing the graph at the base rows the run
 //! lists. Their answers are the base compare's.
 
-use super::located_zones::{Graphs, RUN, UNRECORDED_GAP, zone_quads};
-use super::residual_zones::{LAYOUTS, answers, quads_of, tailed, tombstoned};
 use super::*;
 use crate::store::test_hooks::ForcedZones;
 use crate::store::{Keep, QuadColumn};
-use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The probes an index run answers, by graph: `(? type ? g)`,
 /// `(? type Taxon g)` and `(? ? Taxon g)`, for the default graph and graphs
@@ -67,15 +64,7 @@ fn component_probes() -> Vec<(String, Probe)> {
 /// `store`'s answers to every index-run probe, with zones on and off, equal.
 async fn assert_runs_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
     for (shape, probe) in component_probes() {
-        let off = {
-            let _zones = ForcedZones::set(false);
-            answers(store, &probe).await
-        };
-        let on = {
-            let _zones = ForcedZones::set(true);
-            answers(store, &probe).await
-        };
-        assert_eq!(on, off, "{tag} {shape}");
+        zones_agree(&format!("{tag} {shape}"), || probe_answers(store, &probe)).await;
     }
 }
 
@@ -84,10 +73,14 @@ async fn assert_runs_answer_as_rows_do(tag: &str, store: &VortexRdfStore) {
 /// zone and with a tail: zones on or off, every index-run probe answers the
 /// same.
 async fn assert_component_runs_answer_as_rows_do(index: IndexConfig) {
-    for graphs in LAYOUTS {
-        let quads = zone_quads(graphs);
-        let built = built_store(quads.clone(), LayoutStrategy::Dictionary, index.types()).await;
-        let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, index.types()).await;
+    for graphs in ZONE_GRAPHS {
+        let built = built_store(
+            zone_quads(graphs),
+            LayoutStrategy::Dictionary,
+            index.types(),
+        )
+        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
         let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
@@ -113,11 +106,6 @@ async fn component_runs_answer_as_rows_do_by_copy() {
 #[tokio::test]
 async fn component_runs_answer_as_rows_do_by_reference() {
     assert_component_runs_answer_as_rows_do(IndexConfig::Reference).await;
-}
-
-/// The rows `rec` saw an event of `pick` name, summed.
-fn rows_of(rec: &Recorder, pick: impl Fn(&Event) -> Option<u64>) -> u64 {
-    rec.picked(pick).iter().sum()
 }
 
 /// `(? type ? g1)` on `Graphs::Alternating`, by copy and by reference, in
@@ -151,18 +139,18 @@ async fn component_counts_read_no_ids() {
             "{name}: no base row compared"
         );
         assert_eq!(
-            rows_of(&rec, |e| match e {
+            rec.rows(|e| match e {
                 Event::ComponentChecked(rows) => Some(*rows),
                 _ => None,
             }),
             0,
             "{name}: no graph read"
         );
-        let recorded = rows_of(&rec, |e| match e {
+        let recorded = rec.rows(|e| match e {
             Event::ZoneRecorded(rows) => Some(*rows),
             _ => None,
         });
-        let counted = rows_of(&rec, |e| match e {
+        let counted = rec.rows(|e| match e {
             Event::ZoneCounted(rows) => Some(*rows),
             _ => None,
         });
@@ -195,16 +183,10 @@ async fn component_windows_jump_by_zone_counts() {
         limit: Some(64),
         ..Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)))
     };
-    let off = {
-        let _zones = ForcedZones::set(false);
-        quads_of(&store.run_probe(&window).await.unwrap()).await
-    };
-    let _zones = ForcedZones::set(true);
-    let rec = Recorder::start();
-    let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
-    assert_eq!(on.len(), 64);
-    assert_eq!(on, off, "the window, as with zones off");
-    let checked = rows_of(&rec, |e| match e {
+    let read = || async { quads_of(&store.run_probe(&window).await.unwrap()).await };
+    let (rows, rec) = zones_agree("the window", read).await;
+    assert_eq!(rows.len(), 64);
+    let checked = rec.rows(|e| match e {
         Event::ComponentChecked(rows) => Some(*rows),
         _ => None,
     });
@@ -385,13 +367,8 @@ async fn capped_counts_never_exceed_their_limit() {
     )
     .await;
     let zoned = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let pieces = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
-    let (_dir, path) = write_store_file(
-        quads,
-        LayoutStrategy::Dictionary,
-        IndexConfig::Reference.types(),
-    )
-    .await;
+    let pieces = built_store(quads, LayoutStrategy::Default, vec![]).await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference)).await;
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
     for (label, store) in [
@@ -428,32 +405,26 @@ async fn component_first_pages_count_their_first_zone_alone() {
     let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
     let page = probe.clone().window(0, Some(64));
     let ask = probe.clone().window(0, Some(1));
-    let off = {
-        let _zones = ForcedZones::set(false);
-        let page = quads_of(&store.run_probe(&page).await.unwrap()).await;
-        (page, store.count_probe(&ask).await.unwrap())
-    };
-    let _zones = ForcedZones::set(true);
     let counted = |rec: &Recorder| {
-        rows_of(rec, |e| match e {
+        rec.rows(|e| match e {
             Event::ZoneCounted(rows) | Event::ZoneRecorded(rows) => Some(*rows),
             _ => None,
         })
     };
     // The `type` run is `index:ref-p`'s rows `RUN..2 * RUN`.
     let first = (RUN.next_multiple_of(ZONE_ROWS) - RUN) as u64;
-    let rec = Recorder::start();
-    let on = quads_of(&store.run_probe(&page).await.unwrap()).await;
-    assert_eq!(on.len(), 64);
-    assert_eq!(on, off.0, "the page, as with zones off");
+    let read = || async { quads_of(&store.run_probe(&page).await.unwrap()).await };
+    let (rows, rec) = zones_agree("the page", read).await;
+    assert_eq!(rows.len(), 64);
     assert_eq!(
         counted(&rec),
         first,
         "the page: the first zone's part counted alone"
     );
-    let rec = Recorder::start();
-    assert_eq!(store.count_probe(&ask).await.unwrap(), off.1);
-    assert_eq!(off.1, 1, "ASK: capped at one");
+    drop(rec);
+    let count = || async { store.count_probe(&ask).await.unwrap() };
+    let (count, rec) = zones_agree("ASK", count).await;
+    assert_eq!(count, 1, "ASK: capped at one");
     assert_eq!(
         counted(&rec),
         first,
@@ -478,29 +449,19 @@ async fn component_runs_skip_zones_counted_empty() {
     let probe = Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)));
     // The matches before the gap's zone and 64 past it.
     let window = probe.clone().window(0, Some(UNRECORDED_GAP.start + 64));
-    let off = {
-        let _zones = ForcedZones::set(false);
-        let window = quads_of(&store.run_probe(&window).await.unwrap()).await;
-        (
-            window,
-            quads_of(&store.run_probe(&probe).await.unwrap()).await,
-        )
-    };
-    let _zones = ForcedZones::set(true);
-    let rec = Recorder::start();
-    let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
-    assert_eq!(on.len(), UNRECORDED_GAP.start + 64);
-    assert_eq!(on, off.0, "the window, as with zones off");
+    let read = || async { quads_of(&store.run_probe(&window).await.unwrap()).await };
+    let (rows, rec) = zones_agree("the window", read).await;
+    assert_eq!(rows.len(), UNRECORDED_GAP.start + 64);
     assert_eq!(
         rec.count_where(|e| matches!(e, Event::ComponentChecked(_))),
         0,
         "no graph read inside the component: the zones before and after the gap are \
          graph 1's alone, the gap's counted empty"
     );
-    let rec = Recorder::start();
-    let rows = quads_of(&store.run_probe(&probe).await.unwrap()).await;
+    drop(rec);
+    let read = || async { quads_of(&store.run_probe(&probe).await.unwrap()).await };
+    let (rows, rec) = zones_agree("every row", read).await;
     assert_eq!(rows.len(), RUN - ZONE_ROWS);
-    assert_eq!(rows, off.1, "every row, as with zones off");
     assert_eq!(
         rids_decoded(&rec),
         RUN - ZONE_ROWS,
@@ -540,7 +501,7 @@ async fn copy_pg_answers_in_base_order() {
         let (store, probe, wide, kept) = (&store, &probe, &wide, &kept);
         async move {
             let _zones = ForcedZones::set(on);
-            let answered = answers(store, probe).await;
+            let answered = probe_answers(store, probe).await;
             // Each read, and how many zones it checked inside the component.
             let mut rec = Recorder::start();
             let mut reads = Vec::new();
@@ -633,15 +594,9 @@ async fn copy_windows_leave_the_graph_to_the_residual() {
         limit: Some(64),
         ..Probe::new(None, Some(iri("type")), None, Some(numbered_graph(1)))
     };
-    let off = {
-        let _zones = ForcedZones::set(false);
-        quads_of(&store.run_probe(&window).await.unwrap()).await
-    };
-    let _zones = ForcedZones::set(true);
-    let rec = Recorder::start();
-    let on = quads_of(&store.run_probe(&window).await.unwrap()).await;
-    assert_eq!(on.len(), 64);
-    assert_eq!(on, off, "the window, as with zones off");
+    let read = || async { quads_of(&store.run_probe(&window).await.unwrap()).await };
+    let (rows, rec) = zones_agree("the window", read).await;
+    assert_eq!(rows.len(), 64);
     assert_eq!(
         rec.count_where(|e| matches!(e, Event::ComponentChecked(_))),
         0,

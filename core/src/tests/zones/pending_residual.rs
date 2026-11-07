@@ -5,7 +5,7 @@
 //! first and four times as many each after, only until the count or the
 //! window has its live rows: the pins of those pieces run with zones off.
 //! With zones on it counts and windows by its zone classes
-//! (`tests::residual_zones`). Its answers are the eager compare's, over
+//! (`tests::zones::residual`). Its answers are the eager compare's, over
 //! every kind of selection, under tombstones and with a tail, either way; a
 //! capped count or a window that reaches every row, and every other use of a
 //! match, compares eagerly.
@@ -13,7 +13,6 @@
 use super::*;
 use crate::store::scan::pieces::FIRST_PIECE_ROWS;
 use crate::store::test_hooks::ForcedZones;
-use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The rows of each piece of a pending residual `rec` saw compared since its
 /// last take, in order.

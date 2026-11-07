@@ -59,19 +59,10 @@ async fn column_zones_absent_without_zone_maps() {
 /// zone's.
 #[tokio::test]
 async fn column_zones_read_recorded_counts() {
-    use crate::store::test_hooks::ForcedValueCounts;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
-
     for recorded in [true, false] {
-        let (_dir, path) = {
-            let _statistic = ForcedValueCounts::set(recorded);
-            write_store_file(
-                zone_quads(Graphs::Stretches),
-                LayoutStrategy::Dictionary,
-                IndexConfig::Copy.types(),
-            )
-            .await
-        };
+        let (_dir, path) =
+            zone_file(ZoneFile::new(Graphs::Stretches, IndexConfig::Copy).value_counts(recorded))
+                .await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let native = open_mapped(&path).await;
         let column = native
@@ -109,297 +100,11 @@ async fn column_zones_read_recorded_counts() {
     }
 }
 
-/// Rows of each run of a [`zone_quads`] store.
-pub(super) const RUN: usize = 40_000;
-
-/// The rows of [`Graphs::UnrecordedGap`]'s seventeen graphs: zone 6 of
-/// `index:ref-p`, whose `type` run is its rows `RUN..2 * RUN`.
-pub(super) const UNRECORDED_GAP: std::ops::Range<usize> = 6 * crate::zone_stats::zone_map::ZONE_ROWS
-    - RUN
-    ..7 * crate::zone_stats::zone_map::ZONE_ROWS - RUN;
-
-/// How a run's rows fall into graphs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Graphs {
-    /// One graph only.
-    One,
-    /// Two graphs, each a half of the run.
-    Long,
-    /// Four graphs in turn, 1,000 rows each time.
-    Stretches,
-    /// Four graphs in turn, row by row.
-    Alternating,
-    /// Graph 1 on even rows and graph 3 on odd ones, but graph 2 on rows
-    /// 20,000..21,000: every zone's bounds hold graph 2's code, one zone
-    /// holds its rows.
-    Gapped,
-    /// Seventeen graphs in turn, row by row: every zone holds more graphs
-    /// than `vortexrdf.value_counts` records.
-    Seventeen,
-    /// The default graph on even rows, graph 3 on odd ones.
-    DefaultAndThree,
-    /// The default graph on the first half of the run, graph 3 on the
-    /// second.
-    DefaultThenThree,
-    /// Graph 1, but seventeen other graphs in turn on [`UNRECORDED_GAP`]:
-    /// one zone of `index:ref-p`'s `type` run recording nothing, its bounds
-    /// holding graph 1's code but none of its rows.
-    UnrecordedGap,
-    /// By turns of 8,192 rows: seventeen graphs in turn (past what the
-    /// statistic records), then graphs 1, 3 and 18 in turn (recorded).
-    RecordedByTurns,
-}
-
-impl Graphs {
-    const ALL: [Graphs; 4] = [
-        Graphs::One,
-        Graphs::Long,
-        Graphs::Stretches,
-        Graphs::Alternating,
-    ];
-
-    /// The graph number of row `i` of a run.
-    fn of(self, i: usize) -> usize {
-        match self {
-            Graphs::One => 1,
-            Graphs::Long => 1 + i / (RUN / 2),
-            Graphs::Stretches => 1 + (i / 1000) % 4,
-            Graphs::Alternating => 1 + i % 4,
-            Graphs::Gapped if (20_000..21_000).contains(&i) => 2,
-            Graphs::Gapped => 1 + 2 * (i % 2),
-            Graphs::Seventeen => 1 + i % 17,
-            Graphs::DefaultAndThree => 3 * (i % 2),
-            Graphs::DefaultThenThree => 3 * (i / (RUN / 2)),
-            // The default graph, then graphs 2 to 17.
-            Graphs::UnrecordedGap if UNRECORDED_GAP.contains(&i) => match i % 17 {
-                0 => 0,
-                k => k + 1,
-            },
-            Graphs::UnrecordedGap => 1,
-            Graphs::RecordedByTurns if (i / 8_192).is_multiple_of(2) => 1 + i % 17,
-            Graphs::RecordedByTurns => [1, 3, 18][i % 3],
-        }
-    }
-
-    /// The last graph number a run holds.
-    fn last(self) -> usize {
-        match self {
-            Graphs::One => 1,
-            Graphs::Long => 2,
-            Graphs::Gapped | Graphs::DefaultAndThree | Graphs::DefaultThenThree => 3,
-            Graphs::Seventeen | Graphs::UnrecordedGap => 17,
-            Graphs::RecordedByTurns => 18,
-            Graphs::Stretches | Graphs::Alternating => 4,
-        }
-    }
-}
-
-/// [`RUN`] quads `(s{i}, type, "Taxon", g(i))`, an `index:posg` run, and
-/// [`RUN`] quads `(hub, link, "o{i}", g(i))`, a quad-table run of `hub`.
-pub(super) fn zone_quads(graphs: Graphs) -> Vec<Quad> {
-    let taxa = (0..RUN).map(|i| {
-        make_quad(
-            &format!("http://example.org/s{i:05}"),
-            "http://example.org/type",
-            "Taxon",
-            numbered_graph(graphs.of(i)),
-        )
-    });
-    let links = (0..RUN).map(|i| {
-        make_quad(
-            "http://example.org/hub",
-            "http://example.org/link",
-            &format!("o{i:05}"),
-            numbered_graph(graphs.of(i)),
-        )
-    });
-    taxa.chain(links).collect()
-}
-
-/// A store under test, its tag and its file's guard.
-struct ZoneStore {
-    tag: String,
-    graphs: Graphs,
-    index: IndexConfig,
-    store: VortexRdfStore,
-    _dir: tempfile::TempDir,
-}
-
-/// Each [`Graphs`] layout written without indexes, with the copy index and
-/// with the reference index, and the 1,000-row stretches in seven-row
-/// leaves, which have no zone maps.
-async fn zone_stores() -> Vec<ZoneStore> {
-    let mut stores = Vec::new();
-    for graphs in Graphs::ALL {
-        for index in [
-            IndexConfig::NoIndex,
-            IndexConfig::Copy,
-            IndexConfig::Reference,
-        ] {
-            let (dir, path) = write_store_file(
-                zone_quads(graphs),
-                LayoutStrategy::Dictionary,
-                index.types(),
-            )
-            .await;
-            stores.push(ZoneStore {
-                tag: format!("{graphs:?}/{}", index.name()),
-                graphs,
-                index,
-                store: VortexRdfStore::from_file(&path).await.unwrap(),
-                _dir: dir,
-            });
-        }
-    }
-    let (dir, path) = write_chunked_store_file(&zone_quads(Graphs::Stretches), 7).await;
-    stores.push(ZoneStore {
-        tag: "Stretches/seven-row-leaves".to_string(),
-        graphs: Graphs::Stretches,
-        index: IndexConfig::NoIndex,
-        store: VortexRdfStore::from_file(&path).await.unwrap(),
-        _dir: dir,
-    });
-    stores
-}
-
-/// The code of `term` (its N-Triples spelling) in `store`'s dictionary.
-pub(super) async fn code_of(store: &VortexRdfStore, term: &str) -> TermCode {
-    store
-        .dict_reader()
-        .unwrap()
-        .encode(term)
-        .await
-        .unwrap()
-        .unwrap_or_else(|| panic!("{term} is in the dictionary"))
-}
-
-/// The patterns checked on `store` for graph `g`: the `index:posg` run, the
-/// quad table's `(hub, link)` run, `hub`'s run checked at two slots, and
-/// `(? type ? g)` and `(? ? Taxon g)`, by reference the runs of `index:ref-p`
-/// and `index:ref-o` checked against the graph alone.
-async fn zone_patterns(store: &VortexRdfStore, g: usize) -> Vec<crate::CodePattern> {
-    use crate::CodePattern;
-    let graph = code_of(store, &format!("<http://example.org/g{g}>")).await;
-    let ty = code_of(store, "<http://example.org/type>").await;
-    let taxon = code_of(store, "\"Taxon\"").await;
-    let hub = code_of(store, "<http://example.org/hub>").await;
-    let link = code_of(store, "<http://example.org/link>").await;
-    let mut patterns = vec![
-        CodePattern::new(None, Some(ty), Some(taxon), Some(graph)),
-        CodePattern::new(Some(hub), Some(link), None, Some(graph)),
-    ];
-    for i in [0, RUN / 2] {
-        let o = code_of(store, &format!("\"o{i:05}\"")).await;
-        patterns.push(CodePattern::new(Some(hub), None, Some(o), Some(graph)));
-    }
-    patterns.push(CodePattern::new(None, Some(ty), None, Some(graph)));
-    patterns.push(CodePattern::new(None, None, Some(taxon), Some(graph)));
-    patterns
-}
-
-/// The rows `pattern` streams in chunks of `batch` rows, in order.
-async fn streamed(
-    store: &VortexRdfStore,
-    pattern: crate::CodePattern,
-    batch: usize,
-) -> Vec<[TermCode; 4]> {
-    let chunks: Vec<Vec<vortex_buffer::Buffer<TermCode>>> = store
-        .match_code_chunks(pattern, batch)
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    chunks
-        .iter()
-        .flat_map(|chunk| code_rows::<4>(chunk))
-        .collect()
-}
-
-/// What a pattern answers: its count, its windows, its streams, and its
-/// located windows with their totals.
-type Answers = (
-    u64,
-    Vec<Vec<[TermCode; 4]>>,
-    Vec<Vec<[TermCode; 4]>>,
-    Vec<(u64, Vec<[TermCode; 4]>)>,
-);
-
-/// What `pattern` answers on `store`: its count, its windows (pages of 1,
-/// 3 and 64 at the run's ends and middle, and 32 one-row reads spread over
-/// it), its streams (chunks of 999 and 4,096 rows), and the pages again
-/// through `locate_codes`, each with the run's count beside it.
-async fn answers(store: &VortexRdfStore, pattern: crate::CodePattern) -> Answers {
-    let total = store.count_code_pattern(pattern).await.unwrap();
-    if let Some(located) = store.locate_codes(pattern, 0, Some(0)).await.unwrap() {
-        assert_eq!(located.total, total, "{pattern:?}: the located count");
-    }
-    let t = total as usize;
-    let mut reads: Vec<(usize, usize)> = Vec::new();
-    for limit in [1, 3, 64] {
-        for offset in [0, 1, t / 2, t.saturating_sub(1), t] {
-            reads.push((offset, limit));
-        }
-    }
-    let mut located = Vec::new();
-    for &(offset, limit) in &reads {
-        if let Some(found) = store
-            .locate_codes(pattern, offset, Some(limit))
-            .await
-            .unwrap()
-        {
-            assert_eq!(found.total, total, "{pattern:?}: a located page's count");
-            located.push((found.total, code_rows::<4>(&found.columns)));
-        }
-    }
-    reads.extend((0..32).map(|k| (k * t / 32, 1)));
-    let mut windows = Vec::new();
-    for (offset, limit) in reads {
-        let columns = store
-            .match_code_pattern(pattern, offset, Some(limit))
-            .await
-            .unwrap();
-        windows.push(code_rows::<4>(&columns));
-    }
-    let mut streams = Vec::new();
-    for batch in [999, 4096] {
-        streams.push(streamed(store, pattern, batch).await);
-    }
-    (total, windows, streams, located)
-}
-
-/// The term path's rows of `pattern`: its codes spelled out and matched.
-async fn term_rows(store: &VortexRdfStore, pattern: crate::CodePattern) -> Vec<[TermCode; 4]> {
-    let dict = store.dict_reader().unwrap();
-    let mut spelled: [Option<String>; 4] = Default::default();
-    let slots = [
-        pattern.subject,
-        pattern.predicate,
-        pattern.object,
-        pattern.graph,
-    ];
-    for (spelling, code) in spelled.iter_mut().zip(slots) {
-        if let Some(code) = code {
-            *spelling = dict.decode(code).await.unwrap();
-        }
-    }
-    let probe = crate::Probe::parse(
-        spelled[0].as_deref(),
-        spelled[1].as_deref(),
-        spelled[2].as_deref(),
-        spelled[3].as_deref(),
-    )
-    .unwrap();
-    sorted_rows(&store.run_probe(&probe).await.unwrap()).await
-}
-
 /// Every pattern of every store answers the same with zones and without:
 /// counts, windows and streams, row for row and in order, and as the term
 /// path does.
 #[tokio::test]
 async fn zoned_runs_answer_as_rows_do() {
-    use crate::store::test_hooks::ForcedZones;
-
     for fixture in zone_stores().await {
         let store = &fixture.store;
         let mut graphs = vec![1, fixture.graphs.last()];
@@ -417,50 +122,20 @@ async fn zoned_runs_answer_as_rows_do() {
                     continue;
                 }
                 let label = format!("{} g{g} {pattern:?}", fixture.tag);
-                let zoned = {
-                    let _on = ForcedZones::set(true);
-                    answers(store, pattern).await
-                };
-                let rows = {
-                    let _off = ForcedZones::set(false);
-                    answers(store, pattern).await
-                };
-                assert!(zoned == rows, "{label}: zones and rows answer alike");
+                let (zoned, _) = zones_agree(&label, || code_answers(store, pattern)).await;
                 let want = term_rows(store, pattern).await;
-                assert_eq!(zoned.0, want.len() as u64, "{label}: the count");
+                assert_eq!(zoned.count, want.len() as u64, "{label}: the count");
                 let unwindowed =
                     code_rows::<4>(&store.match_code_pattern(pattern, 0, None).await.unwrap());
                 let mut sorted = unwindowed.clone();
                 sorted.sort_unstable();
                 assert_eq!(sorted, want, "{label}: the rows");
-                for stream in &zoned.2 {
+                for stream in &zoned.streams {
                     assert_eq!(stream, &unwindowed, "{label}: a stream");
                 }
             }
         }
     }
-}
-
-/// Rows `rec` saw counted on a mixed zone's encoding, and read to check.
-fn zone_work(rec: &Recorder) -> (u64, u64) {
-    let counted = rec.picked(|e| match e {
-        Event::ZoneCounted(rows) => Some(*rows),
-        _ => None,
-    });
-    let read = rec.picked(|e| match e {
-        Event::CheckRead(rows) => Some(*rows),
-        _ => None,
-    });
-    (counted.iter().sum(), read.iter().sum())
-}
-
-/// Rows of each mixed zone `rec` saw counted from its recorded values, in
-/// order.
-fn zone_recorded(rec: &Recorder) -> Vec<u64> {
-    rec.picked(|e| match e {
-        Event::ZoneRecorded(rows) => Some(*rows),
-        _ => None,
-    })
 }
 
 /// With zones, a count reads no checked rows: a zone of the graph alone
@@ -517,13 +192,10 @@ async fn zoned_runs_skip_settled_zones() {
             (_, _, true) => {
                 let rec = Recorder::start();
                 assert_eq!(store.count_code_pattern(links).await.unwrap(), 10_000);
-                let blocks: u64 = rec
-                    .picked(|e| match e {
-                        Event::LocatedBlock(rows) => Some(*rows),
-                        _ => None,
-                    })
-                    .iter()
-                    .sum();
+                let blocks: u64 = rec.rows(|e| match e {
+                    Event::LocatedBlock(rows) => Some(*rows),
+                    _ => None,
+                });
                 assert_eq!(blocks, RUN as u64, "{}: the run read", fixture.tag);
                 assert_eq!(
                     zone_work(&rec).0,
@@ -546,30 +218,18 @@ async fn zoned_runs_skip_settled_zones() {
 /// (Review Focus 4).
 #[tokio::test]
 async fn recorded_graphs_settle_zones_without_the_code() {
-    use crate::store::test_hooks::{ForcedValueCounts, ForcedZones};
-    use crate::zone_stats::zone_map::ZONE_ROWS;
-
     for recorded in [true, false] {
-        let (_dir, path) = {
-            let _statistic = ForcedValueCounts::set(recorded);
-            write_store_file(
-                zone_quads(Graphs::Gapped),
-                LayoutStrategy::Dictionary,
-                IndexConfig::Copy.types(),
-            )
-            .await
-        };
+        let (_dir, path) =
+            zone_file(ZoneFile::new(Graphs::Gapped, IndexConfig::Copy).value_counts(recorded))
+                .await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let taxa = zone_patterns(store, 2).await[0];
         let want = term_rows(store, taxa).await.len() as u64;
         assert_eq!(want, 1_000, "graph 2's rows");
-        let rows = {
-            let _off = ForcedZones::set(false);
-            answers(store, taxa).await
-        };
-        let _on = ForcedZones::set(true);
-        let rec = Recorder::start();
-        assert_eq!(store.count_code_pattern(taxa).await.unwrap(), want);
+        let tag = format!("recorded {recorded}");
+        let count = || async { store.count_code_pattern(taxa).await.unwrap() };
+        let (count, rec) = zones_agree(&tag, count).await;
+        assert_eq!(count, want, "{tag}");
         // Graph 2's rows lie in one zone, whole within the run, which
         // counts from its record.
         let (counted, from_records) = match recorded {
@@ -583,10 +243,7 @@ async fn recorded_graphs_settle_zones_without_the_code() {
         );
         assert_eq!(zone_recorded(&rec), from_records, "recorded {recorded}");
         drop(rec);
-        assert!(
-            answers(store, taxa).await == rows,
-            "recorded {recorded}: zones and rows answer alike"
-        );
+        zones_agree(&tag, || code_answers(store, taxa)).await;
     }
 }
 
@@ -600,22 +257,13 @@ async fn recorded_graphs_settle_zones_without_the_code() {
 #[tokio::test]
 async fn first_pages_count_the_zones_before_their_first_match() {
     use crate::CodePattern;
-    use crate::store::test_hooks::{ForcedValueCounts, ForcedZones};
-    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     // The run is rows RUN..2 * RUN of its child, graph 2's rows its rows
     // 20,000..21,000: they lie in the child's zone from 57,344.
     let first_match_zone = (RUN + 20_000) / ZONE_ROWS * ZONE_ROWS;
     for index in [IndexConfig::Copy, IndexConfig::Reference] {
-        let (_dir, path) = {
-            let _statistic = ForcedValueCounts::set(false);
-            write_store_file(
-                zone_quads(Graphs::Gapped),
-                LayoutStrategy::Dictionary,
-                index.types(),
-            )
-            .await
-        };
+        let (_dir, path) =
+            zone_file(ZoneFile::new(Graphs::Gapped, index).value_counts(false)).await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let ty = code_of(store, "<http://example.org/type>").await;
         let g2 = code_of(store, "<http://example.org/g2>").await;
@@ -628,18 +276,11 @@ async fn first_pages_count_the_zones_before_their_first_match() {
                     .unwrap(),
             )
         };
-        let want = {
-            let _off = ForcedZones::set(false);
-            page().await
-        };
-        let _on = ForcedZones::set(true);
-        let rec = Recorder::start();
-        let got = page().await;
+        let tag = index.name();
+        let (got, rec) = zones_agree(tag, page).await;
         let (counted, read) = zone_work(&rec);
         drop(rec);
-        let tag = index.name();
         assert_eq!(got.len(), 10, "{tag}");
-        assert_eq!(got, want, "{tag}: the first page");
         assert_eq!(
             read,
             4_096 + ZONE_ROWS as u64,
@@ -663,15 +304,9 @@ async fn first_pages_count_the_zones_before_their_first_match() {
 #[tokio::test]
 async fn recorded_counts_answer_mixed_zones() {
     use crate::store::test_hooks::ForcedZones;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let taxa = zone_patterns(store, 1).await[0];
     // index:posg holds the quad table's rows in (p, o, s, g) order.
@@ -712,12 +347,7 @@ async fn zones_past_max_values_count_their_encoding() {
     use crate::store::test_hooks::ForcedZones;
 
     let _on = ForcedZones::set(true);
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Seventeen),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Seventeen, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let native = store.debug_native_file().unwrap();
     let column = native.table_column_layout(Some("index:posg"), "g").unwrap();
@@ -757,15 +387,10 @@ async fn zones_past_max_values_count_their_encoding() {
 async fn recorded_and_unrecorded_zones_by_turns() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
     use std::collections::BTreeSet;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::RecordedByTurns),
-        LayoutStrategy::Dictionary,
-        IndexConfig::NoIndex.types(),
-    )
-    .await;
+    let (_dir, path) =
+        zone_file(ZoneFile::new(Graphs::RecordedByTurns, IndexConfig::NoIndex)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let native = store.debug_native_file().unwrap();
     let column = native.table_column_layout(None, "g").unwrap();
@@ -835,12 +460,7 @@ async fn recorded_and_unrecorded_zones_by_turns() {
             "graph {g}: the unrecorded zones, on their encoding"
         );
         drop(rec);
-        let zoned = answers(store, pattern).await;
-        let rows = {
-            let _off = ForcedZones::set(false);
-            answers(store, pattern).await
-        };
-        assert!(zoned == rows, "graph {g}: zones and rows answer alike");
+        zones_agree(&format!("graph {g}"), || code_answers(store, pattern)).await;
     }
 }
 
@@ -852,15 +472,9 @@ async fn recorded_and_unrecorded_zones_by_turns() {
 async fn default_graph_counts_from_records() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::DefaultAndThree),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::DefaultAndThree, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     // The default graph's spelling is the empty one.
     let default = code_of(store, "").await;
@@ -896,15 +510,15 @@ async fn default_graph_counts_from_records() {
 /// (`ReferenceGraphRead`), and the quad table's at its rows (`CheckTaken` of
 /// slot 3).
 fn reference_graph_reads(rec: &Recorder) -> (u64, u64) {
-    let own = rec.picked(|e| match e {
+    let own = rec.rows(|e| match e {
         Event::ReferenceGraphRead(rows) => Some(*rows),
         _ => None,
     });
-    let taken = rec.picked(|e| match e {
+    let taken = rec.rows(|e| match e {
         Event::CheckTaken { slot: 3, rows } => Some(*rows),
         _ => None,
     });
-    (own.iter().sum(), taken.iter().sum())
+    (own, taken)
 }
 
 /// A by-reference run checked against the graph alone is decided zone by
@@ -920,7 +534,6 @@ fn reference_graph_reads(rec: &Recorder) -> (u64, u64) {
 async fn reference_runs_skip_settled_zones() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
-    use crate::zone_stats::zone_map::ZONE_ROWS;
 
     let _on = ForcedZones::set(true);
     let zone = ZONE_ROWS as u64;
@@ -931,12 +544,7 @@ async fn reference_runs_skip_settled_zones() {
         Graphs::DefaultAndThree,
         Graphs::DefaultThenThree,
     ] {
-        let (_dir, path) = write_store_file(
-            zone_quads(graphs),
-            LayoutStrategy::Dictionary,
-            IndexConfig::Reference.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(graphs, IndexConfig::Reference)).await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let rows = row_list(store).await;
         let ty = code_of(store, "<http://example.org/type>").await;
@@ -1033,19 +641,14 @@ async fn reference_runs_skip_settled_zones() {
 #[tokio::test]
 async fn reference_cap_only_where_zones_cannot_decide() {
     use crate::CodePattern;
-    use crate::store::test_hooks::{ForcedGapRows, ForcedReferenceGraphs, ForcedZones};
+    use crate::store::test_hooks::{ForcedGapRows, ForcedZones};
 
     let _on = ForcedZones::set(true);
     for graphs in [true, false] {
-        let (_dir, path) = {
-            let _hook = ForcedReferenceGraphs::set(graphs);
-            write_store_file(
-                zone_quads(Graphs::Alternating),
-                LayoutStrategy::Dictionary,
-                IndexConfig::Reference.types(),
-            )
-            .await
-        };
+        let (_dir, path) = zone_file(
+            ZoneFile::new(Graphs::Alternating, IndexConfig::Reference).reference_graphs(graphs),
+        )
+        .await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let rows = row_list(store).await;
         let ty = code_of(store, "<http://example.org/type>").await;
@@ -1088,7 +691,7 @@ async fn reference_runs_without_zone_maps_check_rows() {
 
     let _on = ForcedZones::set(true);
     let (_dir, path) =
-        write_chunked_reference_store_file(&zone_quads(Graphs::Alternating), 7).await;
+        zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference).leaves(7)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let rows = row_list(store).await;
     let ty = code_of(store, "<http://example.org/type>").await;
@@ -1135,14 +738,8 @@ async fn reference_runs_without_zone_maps_check_rows() {
 #[tokio::test]
 async fn reference_first_page_reads_the_first_block_before_statistics() {
     use crate::CodePattern;
-    use crate::store::test_hooks::ForcedZones;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Reference.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
     let g1 = code_of(store, "<http://example.org/g1>").await;
@@ -1155,27 +752,15 @@ async fn reference_first_page_reads_the_first_block_before_statistics() {
                 .unwrap(),
         )
     };
-    let want = {
-        let _off = ForcedZones::set(false);
-        (page(0).await, page(64).await)
-    };
-    let _on = ForcedZones::set(true);
-    let rec = Recorder::start();
-    assert_eq!(page(0).await, want.0, "the first page");
+    let (_, rec) = zones_agree("the first page", || page(0)).await;
     assert_eq!(statistics_asked(&rec), 0, "none asked");
     drop(rec);
-    let rec = Recorder::start();
-    assert_eq!(page(64).await, want.1, "the second page");
+    let (_, rec) = zones_agree("the second page", || page(64)).await;
     assert_eq!(statistics_asked(&rec), 1, "a later page asks");
     drop(rec);
-    let rec = Recorder::start();
-    store.count_code_pattern(pattern).await.unwrap();
+    let count = || async { store.count_code_pattern(pattern).await.unwrap() };
+    let (_, rec) = zones_agree("a count", count).await;
     assert_eq!(statistics_asked(&rec), 1, "a count asks");
-}
-
-/// Zone maps `rec` saw read from a file.
-fn zone_maps_read(rec: &Recorder) -> usize {
-    rec.count(&Event::ZoneMapRead)
 }
 
 /// Each zone map a file's reads ask for is read once per file and column,
@@ -1192,31 +777,24 @@ async fn each_zone_map_reads_once_per_file() {
 
     for index in [IndexConfig::Copy, IndexConfig::Reference] {
         let tag = index.name();
-        let (_dir, path) = write_store_file(
-            zone_quads(Graphs::Alternating),
-            LayoutStrategy::Dictionary,
-            index.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, index)).await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let ty = code_of(&store, "<http://example.org/type>").await;
         let g1 = code_of(&store, "<http://example.org/g1>").await;
         let pattern = CodePattern::new(None, Some(ty), None, Some(g1));
-        let want = {
-            let _off = ForcedZones::set(false);
-            store.count_code_pattern(pattern).await.unwrap()
-        };
-        let _on = ForcedZones::set(true);
-        for read in [1, 0] {
-            let rec = Recorder::start();
-            assert_eq!(
-                store.count_code_pattern(pattern).await.unwrap(),
-                want,
-                "{tag}"
-            );
-            assert_eq!(zone_maps_read(&rec), read, "{tag}: maps read by this count");
-        }
+        let count = || async { store.count_code_pattern(pattern).await.unwrap() };
+        let (want, rec) = zones_agree(tag, count).await;
+        assert_eq!(
+            zone_maps_read(&rec),
+            1,
+            "{tag}: the first count reads the map"
+        );
+        drop(rec);
+        let (_, rec) = zones_agree(tag, count).await;
+        assert_eq!(zone_maps_read(&rec), 0, "{tag}: a second count reads none");
+        drop(rec);
         let fresh = VortexRdfStore::from_file(&path).await.unwrap();
+        let _on = ForcedZones::set(true);
         let rec = Recorder::start();
         let (first, second) = futures::join!(
             fresh.count_code_pattern(pattern),
@@ -1229,31 +807,17 @@ async fn each_zone_map_reads_once_per_file() {
             "{tag}: joined counts read the map once"
         );
     }
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::NoIndex.types(),
-    )
-    .await;
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let hub = code_of(&store, "<http://example.org/hub>").await;
-    let g1 = code_of(&store, "<http://example.org/g1>").await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::NoIndex)).await;
+    let store = &VortexRdfStore::from_file(&path).await.unwrap();
+    let hub = code_of(store, "<http://example.org/hub>").await;
+    let g1 = code_of(store, "<http://example.org/g1>").await;
     let every_row = CodePattern::new(None, None, None, Some(g1));
     let gap = CodePattern::new(Some(hub), None, None, Some(g1));
-    let want = {
-        let _off = ForcedZones::set(false);
-        (
-            store.count_code_pattern(every_row).await.unwrap(),
-            store.count_code_pattern(gap).await.unwrap(),
-        )
-    };
-    let _on = ForcedZones::set(true);
-    let rec = Recorder::start();
-    assert_eq!(store.count_code_pattern(every_row).await.unwrap(), want.0);
+    let count = |pattern| async move { store.count_code_pattern(pattern).await.unwrap() };
+    let (_, rec) = zones_agree("the every-row step", || count(every_row)).await;
     assert_eq!(zone_maps_read(&rec), 1, "the every-row step reads g's map");
     drop(rec);
-    let rec = Recorder::start();
-    assert_eq!(store.count_code_pattern(gap).await.unwrap(), want.1);
+    let (_, rec) = zones_agree("the gap run", || count(gap)).await;
     assert_eq!(zone_maps_read(&rec), 0, "the gap run shares it");
 }
 
@@ -1265,36 +829,23 @@ async fn each_zone_map_reads_once_per_file() {
 #[tokio::test]
 async fn reference_runs_check_their_graph_in_place_and_the_rest_by_id() {
     use crate::CodePattern;
-    use crate::store::test_hooks::ForcedZones;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Reference.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
     let taxon = code_of(store, "\"Taxon\"").await;
     let g1 = code_of(store, "<http://example.org/g1>").await;
     let pattern = CodePattern::new(None, Some(ty), Some(taxon), Some(g1));
     let want = term_rows(store, pattern).await.len() as u64;
-    let off = {
-        let _off = ForcedZones::set(false);
-        answers(store, pattern).await
-    };
-    let _on = ForcedZones::set(true);
-    let rec = Recorder::start();
-    assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
+    let count = || async { store.count_code_pattern(pattern).await.unwrap() };
+    let (count, rec) = zones_agree("the count", count).await;
+    assert_eq!(count, want);
     let (own, taken) = reference_graph_reads(&rec);
     assert_eq!(own, RUN as u64, "the graph read in place at every position");
     assert_eq!(taken, 0, "never taken by id");
     assert_eq!(statistics_asked(&rec), 0, "a check by id asks none");
     drop(rec);
-    assert!(
-        answers(store, pattern).await == off,
-        "zones on and off answer alike"
-    );
+    zones_agree("the answers", || code_answers(store, pattern)).await;
 }
 
 /// By reference, on a one-graph store, the footer settles `(? type ? g1)`'s
@@ -1304,35 +855,20 @@ async fn reference_runs_check_their_graph_in_place_and_the_rest_by_id() {
 #[tokio::test]
 async fn one_graph_reference_runs_read_row_ids_only() {
     use crate::CodePattern;
-    use crate::store::test_hooks::ForcedZones;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::One),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Reference.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::One, IndexConfig::Reference)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
     let g1 = code_of(store, "<http://example.org/g1>").await;
     let pattern = CodePattern::new(None, Some(ty), None, Some(g1));
-    let want = {
-        let _off = ForcedZones::set(false);
-        streamed(store, pattern, 4096).await
-    };
-    assert_eq!(want.len(), RUN, "every type row");
-    let _on = ForcedZones::set(true);
-    let rec = Recorder::start();
-    assert_eq!(streamed(store, pattern, 4096).await, want);
+    let (rows, rec) = zones_agree("the stream", || streamed(store, pattern, 4096)).await;
+    assert_eq!(rows.len(), RUN, "every type row");
     assert_eq!(reference_graph_reads(&rec), (0, 0), "no graph read");
     assert_eq!(zone_maps_read(&rec), 0, "no zone map read");
-    let blocks: u64 = rec
-        .picked(|e| match e {
-            Event::LocatedBlock(rows) => Some(*rows),
-            _ => None,
-        })
-        .iter()
-        .sum();
+    let blocks: u64 = rec.rows(|e| match e {
+        Event::LocatedBlock(rows) => Some(*rows),
+        _ => None,
+    });
     assert_eq!(blocks, RUN as u64, "every position, once");
 }
 
@@ -1347,12 +883,7 @@ async fn runs_without_checks_ask_no_statistics() {
 
     for index in [IndexConfig::Copy, IndexConfig::Reference] {
         let tag = index.name();
-        let (_dir, path) = write_store_file(
-            zone_quads(Graphs::Alternating),
-            LayoutStrategy::Dictionary,
-            index.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, index)).await;
         let store = &VortexRdfStore::from_file(&path).await.unwrap();
         let ty = code_of(store, "<http://example.org/type>").await;
         let pattern = CodePattern::new(None, Some(ty), None, None);
@@ -1382,12 +913,7 @@ async fn streams_ask_statistics_once() {
     use crate::CodePattern;
     use crate::store::test_hooks::ForcedZones;
 
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
     let store = &VortexRdfStore::from_file(&path).await.unwrap();
     let ty = code_of(store, "<http://example.org/type>").await;
     let g1 = code_of(store, "<http://example.org/g1>").await;
@@ -1532,9 +1058,7 @@ async fn zone_counters_count_decisions() {
         return;
     }
     let _on = ForcedZones::set(true);
-    let quads = zone_quads(Graphs::Long);
-    let (_dir, path) =
-        write_store_file(quads, LayoutStrategy::Dictionary, IndexConfig::Copy.types()).await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Long, IndexConfig::Copy)).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let taxa = zone_patterns(&store, 1).await[0];
     let before = snapshot();
@@ -1545,12 +1069,7 @@ async fn zone_counters_count_decisions() {
     }
     // Alternating graphs mix every zone: the whole ones count from their
     // records.
-    let (_dir, path) = write_store_file(
-        zone_quads(Graphs::Alternating),
-        LayoutStrategy::Dictionary,
-        IndexConfig::Copy.types(),
-    )
-    .await;
+    let (_dir, path) = zone_file(ZoneFile::new(Graphs::Alternating, IndexConfig::Copy)).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let taxa = zone_patterns(&store, 1).await[0];
     let before = snapshot();
@@ -1565,48 +1084,27 @@ async fn zone_counters_count_decisions() {
 #[tokio::test]
 async fn short_runs_check_rows_without_statistics() {
     use crate::CodePattern;
-    use crate::store::test_hooks::ForcedZones;
 
     for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
-        let (_dir, path) = write_store_file(
-            zone_quads(Graphs::Long),
-            LayoutStrategy::Dictionary,
-            index.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(Graphs::Long, index)).await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let ty = code_of(&store, "<http://example.org/type>").await;
         let g1 = code_of(&store, "<http://example.org/g1>").await;
         for (i, want) in [(5, 1), (30_000, 0)] {
             let s = code_of(&store, &format!("<http://example.org/s{i:05}>")).await;
             let pattern = CodePattern::new(Some(s), Some(ty), None, Some(g1));
-            let rows = {
-                let _off = ForcedZones::set(false);
-                code_rows::<4>(&store.match_code_pattern(pattern, 0, None).await.unwrap())
+            let tag = format!("{} s{i}", index.name());
+            let read = || async {
+                let count = store.count_code_pattern(pattern).await.unwrap();
+                let rows = store.match_code_pattern(pattern, 0, None).await.unwrap();
+                (count, code_rows::<4>(&rows))
             };
-            let _on = ForcedZones::set(true);
-            let rec = Recorder::start();
-            assert_eq!(store.count_code_pattern(pattern).await.unwrap(), want);
-            let got = code_rows::<4>(&store.match_code_pattern(pattern, 0, None).await.unwrap());
-            assert_eq!(got, rows, "{} s{i}", index.name());
-            assert_eq!(
-                zone_maps_read(&rec),
-                0,
-                "{} s{i}: no zone map",
-                index.name()
-            );
-            assert!(
-                zone_work(&rec).1 > 0,
-                "{} s{i}: its rows checked",
-                index.name()
-            );
+            let ((count, _), rec) = zones_agree(&tag, read).await;
+            assert_eq!(count, want, "{tag}");
+            assert_eq!(zone_maps_read(&rec), 0, "{tag}: no zone map");
+            assert!(zone_work(&rec).1 > 0, "{tag}: its rows checked");
         }
     }
-}
-
-/// Statistics `rec` saw a located run ask of its file.
-fn statistics_asked(rec: &Recorder) -> usize {
-    rec.count(&Event::StatisticsAsked)
 }
 
 /// A first page that a long checked run's first block fills is read from
@@ -1617,16 +1115,9 @@ fn statistics_asked(rec: &Recorder) -> usize {
 /// is the rows' own.
 #[tokio::test]
 async fn first_page_reads_the_first_block_before_statistics() {
-    use crate::store::test_hooks::ForcedZones;
-
     for index in [IndexConfig::NoIndex, IndexConfig::Copy] {
         for (graphs, g, fills) in [(Graphs::Alternating, 1, true), (Graphs::Long, 2, false)] {
-            let (_dir, path) = write_store_file(
-                zone_quads(graphs),
-                LayoutStrategy::Dictionary,
-                index.types(),
-            )
-            .await;
+            let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
             let store = &VortexRdfStore::from_file(&path).await.unwrap();
             let patterns = zone_patterns(store, g).await;
             // The quad table's (hub, link) run, and on a copy store the
@@ -1645,15 +1136,8 @@ async fn first_page_reads_the_first_block_before_statistics() {
                             .unwrap(),
                     )
                 };
-                let want = {
-                    let _off = ForcedZones::set(false);
-                    (page(0).await, page(64).await)
-                };
-                let _on = ForcedZones::set(true);
-                let rec = Recorder::start();
-                let first = page(0).await;
+                let (first, rec) = zones_agree(&tag, || page(0)).await;
                 assert_eq!(first.len(), 64, "{tag}");
-                assert_eq!(first, want.0, "{tag}: the first page");
                 if fills {
                     assert_eq!(statistics_asked(&rec), 0, "{tag}: none asked");
                     assert_eq!(zone_work(&rec), (0, 4096), "{tag}: the first block");
@@ -1661,12 +1145,11 @@ async fn first_page_reads_the_first_block_before_statistics() {
                     assert_eq!(statistics_asked(&rec), 1, "{tag}: the block fell short");
                 }
                 drop(rec);
-                let rec = Recorder::start();
-                assert_eq!(page(64).await, want.1, "{tag}: the second page");
+                let (_, rec) = zones_agree(&tag, || page(64)).await;
                 assert_eq!(statistics_asked(&rec), 1, "{tag}: a later page asks");
                 drop(rec);
-                let rec = Recorder::start();
-                store.count_code_pattern(pattern).await.unwrap();
+                let count = || async { store.count_code_pattern(pattern).await.unwrap() };
+                let (_, rec) = zones_agree(&tag, count).await;
                 assert_eq!(statistics_asked(&rec), 1, "{tag}: a count asks");
             }
         }

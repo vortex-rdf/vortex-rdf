@@ -3,12 +3,10 @@
 //! does, taken while a build compresses the component or read from the
 //! child's zone table at load.
 
-use super::located_zones::{Graphs, RUN, zone_quads};
 use super::*;
-use crate::zone_stats::zone_map::ZONE_ROWS;
 
 /// The components of an index configuration.
-fn component_names(index: IndexConfig) -> &'static [&'static str] {
+fn zone_components(index: IndexConfig) -> &'static [&'static str] {
     match index {
         IndexConfig::NoIndex => &[],
         IndexConfig::Copy => &["index:posg", "index:ospg"],
@@ -40,15 +38,18 @@ fn component_graphs(name: &str, rows: &[[TermCode; 4]]) -> Vec<TermCode> {
 async fn component_graph_zones_match_the_files() {
     for graphs in [Graphs::Stretches, Graphs::RecordedByTurns] {
         for index in [IndexConfig::Copy, IndexConfig::Reference] {
-            let quads = zone_quads(graphs);
-            let built = built_store(quads.clone(), LayoutStrategy::Dictionary, index.types()).await;
-            let (_dir, path) =
-                write_store_file(quads, LayoutStrategy::Dictionary, index.types()).await;
+            let built = built_store(
+                zone_quads(graphs),
+                LayoutStrategy::Dictionary,
+                index.types(),
+            )
+            .await;
+            let (_dir, path) = zone_file(ZoneFile::new(graphs, index)).await;
             let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
             let bytes = std::fs::read(&path).unwrap();
             let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
             let rows = row_list(&built).await;
-            for &name in component_names(index) {
+            for &name in zone_components(index) {
                 let tag = format!("{graphs:?} {name}");
                 let column = component_graphs(name, &rows);
                 let want: Vec<(TermCode, TermCode)> = column
@@ -107,15 +108,10 @@ async fn component_graph_zones_match_the_files() {
 #[tokio::test]
 async fn adopted_components_stay_deferred() {
     for index in [IndexConfig::Copy, IndexConfig::Reference] {
-        let (_dir, path) = write_store_file(
-            zone_quads(Graphs::Stretches),
-            LayoutStrategy::Dictionary,
-            index.types(),
-        )
-        .await;
+        let (_dir, path) = zone_file(ZoneFile::new(Graphs::Stretches, index)).await;
         let bytes = std::fs::read(&path).unwrap();
         let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-        for &name in component_names(index) {
+        for &name in zone_components(index) {
             assert!(
                 adopted.debug_component_zone_bounds(name).is_some(),
                 "{name}: a zone map at adoption"
@@ -134,7 +130,7 @@ async fn adopted_components_stay_deferred() {
             .unwrap();
         assert_eq!(view.size().await.unwrap(), RUN, "{}", index.name());
         assert!(
-            component_names(index)
+            zone_components(index)
                 .iter()
                 .any(|name| adopted.debug_index_component_materialized(name) == Some(true)),
             "{}: the probed component materializes on use",
@@ -149,9 +145,15 @@ async fn adopted_components_stay_deferred() {
 #[tokio::test]
 async fn string_components_have_no_zone_maps() {
     for index in [IndexConfig::Copy, IndexConfig::Reference] {
-        let quads = zone_quads(Graphs::Stretches);
-        let built = built_store(quads.clone(), LayoutStrategy::Default, index.types()).await;
-        let (_dir, path) = write_store_file(quads, LayoutStrategy::Default, index.types()).await;
+        let built = built_store(
+            zone_quads(Graphs::Stretches),
+            LayoutStrategy::Default,
+            index.types(),
+        )
+        .await;
+        let (_dir, path) =
+            zone_file(ZoneFile::new(Graphs::Stretches, index).layout(LayoutStrategy::Default))
+                .await;
         let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
@@ -160,7 +162,7 @@ async fn string_components_have_no_zone_maps() {
             ("loaded", &loaded),
             ("adopted", &adopted),
         ] {
-            for &name in component_names(index) {
+            for &name in zone_components(index) {
                 assert!(
                     store.debug_index_component_materialized(name).is_some(),
                     "{label} {name}: the component exists"

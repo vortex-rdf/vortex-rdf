@@ -683,14 +683,11 @@ mod tests {
         let run = |selection: &RowSelection, piece_rows: usize| {
             let rec = Recorder::start();
             keep_by_pieces(col, probe, selection, &test, ROWS, piece_rows).unwrap();
-            let probed = rec.picked(|e| match e {
+            let probed: usize = rec.rows(|e| match e {
                 Event::KeepRowsProbed(rows) => Some(*rows),
                 _ => None,
             });
-            (
-                rec.count(&Event::KeepPieceDecoded),
-                probed.iter().sum::<usize>(),
-            )
+            (rec.count(&Event::KeepPieceDecoded), probed)
         };
         let ids = |admit: &dyn Fn(u64) -> bool| -> Vec<u64> {
             (0..ROWS as u64).filter(|&i| admit(i)).collect()
