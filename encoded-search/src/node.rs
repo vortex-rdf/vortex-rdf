@@ -18,10 +18,6 @@ use std::ops::Range;
 /// of a run-length array's value offsets.
 pub(crate) const FL_CHUNK: usize = vortex_fastlanes::FL_CHUNK_SIZE;
 
-/// Values a dictionary may hold for [`Node::eq_into`] to scan them for a
-/// needle's codes; a larger one is counted by reading.
-const DICT_SCAN: usize = 4_096;
-
 /// One resolved chunk of a [`Node::Chunked`] tree, never empty, with its
 /// logical start row. Its last value is read when a bounds search first
 /// probes the chunk, then kept, so resolution stays downcast-only and a
@@ -308,7 +304,7 @@ impl Node<'_> {
     /// the offsets `base + k` of the values at `start + k`, ascending: found
     /// on the encoding where it allows (a constant at once, a sequence by
     /// arithmetic, run ends by their runs, a frame of reference against the
-    /// shifted needle, a small dictionary's codes against the needle's code,
+    /// shifted needle, a dictionary's codes against the needle's code,
     /// unpatched bit-packed values a 1024-value chunk at a time, words as
     /// they are), and read otherwise ([`Self::eq_into_read`]). Requires
     /// `start + len <= self.len()` but no sortedness.
@@ -369,17 +365,19 @@ impl Node<'_> {
                     node.eq_into(from, take, needle, base + done, sink);
                 }
             }
-            // A dictionary small enough to scan maps the needle to its code
-            // once, then searches its codes for that code; a needle under
-            // several codes reads the window, which keeps the offsets
-            // ascending.
-            Node::Dict { codes, values } if values.len() <= DICT_SCAN => {
-                let mut matching =
-                    (0..values.len()).filter(|&code| values.value_at(code) == needle);
-                match (matching.next(), matching.next()) {
-                    (None, _) => {}
-                    (Some(code), None) => codes.eq_into(start, len, code as u64, base, sink),
-                    (Some(_), Some(_)) => self.eq_into_read(start, len, needle, base, sink),
+            // A dictionary holding no more values than the window maps the
+            // needle to its code once, searching its values with this same
+            // search, then searches its codes for that code. A larger one, or
+            // a needle under several codes, reads the window: the first would
+            // search more values than the window holds, the second would
+            // interleave its codes' offsets.
+            Node::Dict { codes, values } if values.len() <= len => {
+                let mut code = CodeOf::None;
+                values.eq_into(0, values.len(), needle, 0, &mut code);
+                match code {
+                    CodeOf::None => {}
+                    CodeOf::One(code) => codes.eq_into(start, len, code as u64, base, sink),
+                    CodeOf::Several => self.eq_into_read(start, len, needle, base, sink),
                 }
             }
             Node::BitPacked(p) if p.patches().is_none() => {
@@ -596,6 +594,38 @@ fn chunked_for_value_at(references: &Node<'_>, offset: usize, child: &Node<'_>, 
     child
         .value_at(i)
         .wrapping_add(references.value_at((offset + i) / FL_CHUNK))
+}
+
+/// The codes a dictionary holds a needle under, as an equality search over
+/// its values finds them: none, one, or several.
+enum CodeOf {
+    None,
+    One(usize),
+    Several,
+}
+
+impl CodeOf {
+    fn add(&mut self, code: usize) {
+        *self = match self {
+            CodeOf::None => CodeOf::One(code),
+            _ => CodeOf::Several,
+        };
+    }
+}
+
+impl EqSink for CodeOf {
+    fn run(&mut self, codes: Range<usize>) {
+        // Two codes settle it.
+        for code in codes.take(2) {
+            self.add(code);
+        }
+    }
+
+    fn matching<T: Copy + PartialEq>(&mut self, at: usize, values: &[T], needle: T) {
+        for (k, _) in values.iter().enumerate().filter(|&(_, &v)| v == needle) {
+            self.add(at + k);
+        }
+    }
 }
 
 /// The chunks of a [`Node::Chunked`] that the window `start..start + len`

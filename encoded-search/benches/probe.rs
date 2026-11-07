@@ -268,7 +268,7 @@ static DICT_FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
                 .into_array();
             let probe = SortedProbe::resolve(&encoded)
                 .unwrap_or_else(|| panic!("{name}: resolve declined ({})", encoded.encoding_id()));
-            assert!(probe.is_dictionary(), "{name}: {:?}", probe.node_kinds());
+            assert_eq!(probe.node_kinds()[0], NodeKind::Dict, "{name}");
             Fixture {
                 name,
                 data,
