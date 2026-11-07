@@ -49,6 +49,7 @@ fn dict_strategy<C: LayoutStrategy, V: LayoutStrategy>(
                 max_len,
                 ..Default::default()
             },
+            ..Default::default()
         },
         compressor,
     )

@@ -9,7 +9,7 @@ use vortex_array::dtype::DType;
 use vortex_error::{VortexResult, vortex_ensure_eq};
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{
-    Layout, LayoutChildType, LayoutDeserializeArgs, LayoutEncoding, LayoutId, LayoutReaderContext,
+    Layout, LayoutChildType, LayoutDeserializeArgs, LayoutId, LayoutPlugin, LayoutReaderContext,
     LayoutReaderRef, LayoutRef, VTable,
 };
 use vortex_session::VortexSession;
@@ -124,7 +124,7 @@ impl VTable for RdfStoreLayoutVTable {
 pub(crate) fn register(session: &VortexSession) {
     use vortex_layout::session::LayoutSessionExt;
     static LAYOUT: RdfStoreLayoutVTable = RdfStoreLayoutVTable;
-    session.layouts().register(&LAYOUT as &dyn LayoutEncoding);
+    session.layouts().register(&LAYOUT as &dyn LayoutPlugin);
 }
 
 /// The id of the root layout of `bytes` when it is the root of a newer

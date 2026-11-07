@@ -6,6 +6,7 @@
 use vortex_array::ArrayRef;
 use vortex_array::arrays::chunked::ChunkedArrayExt as _;
 use vortex_array::arrays::dict::DictSlots;
+use vortex_array::arrays::runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_array::arrays::slice::SliceSlots;
 use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Slice};
 use vortex_array::dtype::PType;
@@ -15,7 +16,6 @@ use vortex_fastlanes::{
     DeltaSlots, FoR, FoRArrayExt as _, FoRReferences, FoRSlots, RLE, RLESlots,
 };
 use vortex_layout::arrays::shared::{Shared, SharedSlots};
-use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
 use vortex_sparse::{Sparse, SparseSlots};
 

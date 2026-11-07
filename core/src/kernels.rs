@@ -10,6 +10,7 @@
 //! covers its case.
 
 use crate::observe::observe;
+use vortex_array::arrays::runend::{RunEnd, RunEndArrayExt as _, RunEndArraySlotsExt as _};
 use vortex_array::arrays::scalar_fn::{ExactScalarFn, ScalarFnArrayView};
 use vortex_array::arrays::slice::{SliceArraySlotsExt as _, SliceKernel as _};
 use vortex_array::arrays::{Filter, PrimitiveArray, Slice};
@@ -26,7 +27,6 @@ use vortex_buffer::{BitBuffer, BufferMut};
 use vortex_error::VortexResult;
 use vortex_fastlanes::{BitPacked, BitPackedArrayExt as _};
 use vortex_mask::Mask;
-use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndArraySlotsExt as _};
 use vortex_session::VortexSession;
 
 /// Registers the store's kernels with `session`, before the default
@@ -213,6 +213,7 @@ pub(crate) enum Kernel {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::arrays::RunEnd;
     use vortex_array::arrays::bool::BoolArrayExt as _;
     use vortex_array::arrays::{BoolArray, ConstantArray, PrimitiveArray, Slice};
     use vortex_array::builtins::ArrayBuiltins as _;
@@ -222,7 +223,6 @@ mod tests {
     use vortex_fastlanes::BitPackedArrayExt as _;
     use vortex_fastlanes::bitpack_compress::bitpack_encode;
     use vortex_mask::Mask;
-    use vortex_runend::RunEnd;
 
     use super::{Kernel, kept_run_ends};
     use crate::observe::{Event, Recorder};
@@ -369,13 +369,15 @@ mod tests {
             let skip = rng.below(13) as usize;
             let bits = BitBuffer::from_iter((0..skip + len).map(|_| rng.below(100) < density));
             let mask = bits.slice(skip..skip + len);
-            let (want_ends, want_runs) = vortex_runend::_benchmarking::filter_run_end_primitive(
-                &ends,
-                offset as u64,
-                len as u64,
-                &mask,
-            )
-            .unwrap();
+            let (want_ends, want_runs) =
+                vortex_array::arrays::runend::_benchmarking::filter_run_end_primitive(
+                    &ends,
+                    offset as u64,
+                    len as u64,
+                    &mask,
+                    vortex_buffer::BufferAllocatorRef::static_ref(),
+                )
+                .unwrap();
             let mut got_ends = Vec::new();
             let got_runs = kept_run_ends(
                 ends.len(),

@@ -338,6 +338,7 @@ pub(crate) fn footer_bounds(file: &vortex_file::VortexFile, column: &str) -> Opt
     let stats = file.file_stats()?;
     let index = file.dtype().as_struct_fields_opt()?.find(column)?;
     let (set, dtype) = stats.get(index);
+    let set = set.to_stats_set();
     if !dtype.is_unsigned_int() {
         return None;
     }
@@ -465,6 +466,7 @@ mod tests {
     }
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_array::expr::{eq, lit, root};
+    use vortex_expr::stats::rewrite::BoundExpressionPruneExt as _;
 
     /// Vortex's own zone map of zones with exact bounds `bounds`, `zone_len`
     /// rows each but the last, `row_count` rows in all: the map its scans

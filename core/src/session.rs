@@ -94,6 +94,7 @@ const VALUE_COUNTS_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 11, 0)
 static VALUE_COUNTS_DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: VALUE_COUNTS_EDITION,
+        immutable: true,
         min_library_version: None,
     },
     added: &[EditionMember::aggregate(
@@ -104,6 +105,7 @@ static VALUE_COUNTS_DECLARATION: EditionDeclaration = EditionDeclaration {
 static STORE_DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: STORE_EDITION,
+        immutable: true,
         min_library_version: None,
     },
     added: &[EditionMember::layout(

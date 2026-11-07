@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::future::BoxFuture;
 use futures::{FutureExt as _, StreamExt, future, stream};
-use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{BoundExpression, Expression, get_item, root};
 use vortex_array::{ArrayRef, ExecutionCtx, MaskFuture, VortexSessionExecute as _};
 use vortex_buffer::Buffer;
+use vortex_expr::forms::conjuncts;
 use vortex_layout::LayoutReader;
 use vortex_mask::{AllOr, Mask};
 use vortex_scan::selection::Selection;
