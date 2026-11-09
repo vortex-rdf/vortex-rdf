@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 use vortex_rdf_core::VortexRdfError as CoreError;
 
 pyo3::create_exception!(
-    _native,
+    vortex_rdf._native,
     VortexRdfError,
     pyo3::exceptions::PyException,
     "Raised when a Vortex-RDF store operation fails."
