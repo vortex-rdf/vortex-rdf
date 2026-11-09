@@ -2,12 +2,12 @@ use std::path::PathBuf;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use vortex_rdf_core::common::formats::{detect_format, format_from_name, supported_format_names};
+use vortex_rdf_core::common::formats::{detect_format, format_from_name};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::io::quads_stream_to_vortex_file;
-use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfError as CoreError};
+use vortex_rdf_core::{IndexType, LayoutStrategy};
 
-use crate::{RUNTIME, parse_err, store_err};
+use crate::{detached, py_err};
 
 /// Serialize an RDF file into a `.vortex` store file.
 ///
@@ -38,19 +38,14 @@ pub fn serialize_rdf(
     layout: &str,
     indexes: Vec<String>,
 ) -> PyResult<()> {
-    let layout: LayoutStrategy = layout.parse().map_err(parse_err)?;
+    let layout: LayoutStrategy = layout.parse().map_err(py_err)?;
     let indexes = indexes
         .iter()
         .map(|name| name.parse::<IndexType>())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(parse_err)?;
+        .map_err(py_err)?;
     let format = match format {
-        Some(name) => format_from_name(name).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "unknown RDF format {name:?}; expected one of: {}",
-                supported_format_names().join(", ")
-            ))
-        })?,
+        Some(name) => format_from_name(name).map_err(py_err)?,
         None => detect_format(Some(input_path.as_path())).ok_or_else(|| {
             PyValueError::new_err(
                 "could not detect RDF format from the input file extension; pass format=",
@@ -58,15 +53,9 @@ pub fn serialize_rdf(
         })?,
     };
 
-    py.detach(|| -> Result<(), CoreError> {
+    detached(py, || async {
         let file = std::fs::File::open(&input_path)?;
         let quads = parse_quads_from_reader(file, format);
-        RUNTIME.block_on(quads_stream_to_vortex_file(
-            quads,
-            &output_path,
-            layout,
-            indexes,
-        ))
+        quads_stream_to_vortex_file(quads, &output_path, layout, indexes).await
     })
-    .map_err(store_err)
 }

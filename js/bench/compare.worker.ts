@@ -2,21 +2,28 @@
 // Process-level isolation, not just in-process dispose+gc: a crash in one adapter
 // can't take down the whole run, and each adapter gets a clean, uncontaminated
 // peak-memory reading (see shared.ts's `peakRssMb`) instead of one polluted by
-// whatever every earlier adapter left resident.
-import { Bench, type BenchOptions } from 'tinybench';
+// whatever every earlier adapter left resident. The `memory` role is one of an
+// adapter's memory runs, each in a process of its own too (see runMemory).
+import { Bench, type BenchOptions, type Fn, type FnOptions } from 'tinybench';
 import { writeFileSync } from 'node:fs';
+
+import type { Quad } from '@rdfjs/types';
 
 import {
     ADAPTERS, MUT_ADAPTERS, N_TRIPLES, GRAPHS, MUT_BATCH,
-    genDataset, genFresh, genDatasetPrefix, datasetProbes, moduli,
+    genDataset, flattenTerms, genFresh, genDatasetPrefix, datasetProbes, moduli,
     FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
-    reclaim, collect, unsupportedRow, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
+    reclaim, collect, timeoutRow, unsupportedRow, peakRssMb, heapUsedBytes, holdJsHeap, settle,
     type Row, type Pat, type StoreAdapter, type WorkerOutput,
 } from './shared.js';
+import {
+    checkCounter, errorText, fmtNs, making, makingLast, memoryRunFigures, onFresh,
+    type JsMemoryRun, type StoreReadings,
+} from './util.js';
 
 const [, , slug, role, outFile] = process.argv;
 if (!slug || !role || !outFile) {
-    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate> <out-file>');
+    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate|memory> <out-file>');
     process.exit(1);
 }
 
@@ -42,7 +49,7 @@ async function bench(
         await b.run();
         collect(b, rows, regime);
     } catch (e) {
-        const error = e instanceof Error ? e.message : String(e);
+        const error = errorText(e);
         console.error(`  !! phase '${phase}' failed: ${error}`);
         failures.push({ phase, error });
     }
@@ -53,83 +60,119 @@ async function bench(
  *  its match count. */
 const matched: Record<string, number> = {};
 
-/** A phase whose single execution already exceeds this runs ONCE, not the
- *  full repetition count; `0` disables the rule.
+/** The time limit for query cells, the same for every library: a match or
+ *  count cell, warm or cold, the full scan included, whose one probing run
+ *  takes longer than this is not measured, and reads "timeout", with that
+ *  run's time as its tooltip. `0` disables the limit. Builds, opens and
+ *  mutations are always measured.
  *
- *  Repetitions exist to average out noise that is small relative to the
- *  measurement — on a cell that takes tens of seconds, the noise the extra
- *  runs would remove is three orders of magnitude below the reading, while
- *  the runs themselves cost minutes (a 34 s cell at 10 iterations + 5 warmups
- *  is 8½ minutes for one number). The reduced count is reported honestly:
- *  the row's `samples` field says `1`, exactly as the page displays it. */
-const SLOW_PHASE_MS = Number(process.env.BENCH_SLOW_PHASE_MS ?? 30_000);
+ *  Every query cell runs once before it is measured (see `measure`), so the
+ *  limit costs a timed-out cell one run, never its repetitions: a 34 s cell at
+ *  10 iterations + 5 warmups would be 8½ minutes for one number, three orders
+ *  of magnitude slower than the rest of its column. */
+const TIMEOUT_MS = Number(process.env.BENCH_TIMEOUT_MS ?? 30_000);
 
-/** The repetition plan for a slow phase: one measured run, no warmup. Warmup
- *  is not lost — every pattern measured this way already executed once in the
- *  count pre-pass, so its caches are as warm as one run makes them. */
-const ONE_SHOT: BenchOptions = {
-    time: 0, iterations: 1, warmup: false, warmupIterations: 0, throws: true,
-};
+/** One run's result, and why it is a timeout when it took longer than the limit. */
+interface Probe<T> { value: T; late?: string }
 
-/** Split probes by what the count pre-pass measured: patterns under the cutoff
- *  keep the full repetition plan, patterns over it run once. A pattern with no
- *  pre-pass timing failed its count — benching it again would fail again, and
- *  under `throws: true` would take the whole group's surviving tasks with it. */
-function splitBySpeed(pats: Pat[], costMs: Record<string, number>): { fast: Pat[]; slow: Pat[] } {
-    const fast: Pat[] = [];
-    const slow: Pat[] = [];
-    for (const p of pats) {
-        const c = costMs[p.name];
-        if (c === undefined) continue;
-        if (SLOW_PHASE_MS > 0 && c > SLOW_PHASE_MS) {
-            console.log(`  [${p.name}] one run took ${(c / 1000).toFixed(0)}s — measuring 1 sample (BENCH_SLOW_PHASE_MS)`);
-            slow.push(p);
-        } else {
-            fast.push(p);
-        }
-    }
-    return { fast, slow };
+/** Run `run` once, timed against [`TIMEOUT_MS`]. */
+async function timeOnce<T>(run: () => Promise<T> | T): Promise<Probe<T>> {
+    const t0 = performance.now();
+    const value = await run();
+    const ms = performance.now() - t0;
+    return TIMEOUT_MS > 0 && ms > TIMEOUT_MS
+        ? { value, late: `not measured: one run took ${fmtNs(ms * 1e6)}, past the ${TIMEOUT_MS / 1000} s limit` }
+        : { value };
 }
 
-/** What building the store cost, over and above the input `Quad[]`. */
-const storeFootprint: Record<string, number | null> = {};
-
-/** `wasm` is Vortex's linear memory specifically — oxigraph has its own module
- *  this cannot see, and rdf-stores has none — so it is only read for Vortex
- *  adapters and reported as null elsewhere (a 0 would misreport it). */
-async function memSnapshot(isVortex: boolean): Promise<{ rss: number | null; js: number; wasm: number | null }> {
-    // jsHeapMb forces a collection first, so the RSS read after it is post-GC too.
-    const js = jsHeapMb();
-    return { rss: rssMb(), js, wasm: isVortex ? await wasmHeapMb() : null };
+/** `ids` as query cells that timed out in `regime`. */
+function timeouts(ids: string[], reason: string, regime: 'warm' | 'cold'): Row[] {
+    console.log(`  [${ids.join(', ')}] timeout — ${reason}`);
+    return ids.map((id) => ({ ...timeoutRow(id, reason), regime }));
 }
 
-const delta = (a: number | null, b: number | null) => (a === null || b === null ? null : a - b);
+/** How a phase reaches its store: `probe` runs one call on it, timed against
+ *  the limit, and `task` makes the benchmark task that repeats the call. */
+interface Access {
+    regime: 'warm' | 'cold';
+    probe<T>(run: (h: unknown) => Promise<T> | T): Promise<Probe<T>>;
+    task(run: (h: unknown) => unknown): [Fn, FnOptions?];
+}
 
-/** Count every probe once (the cross-adapter agreement check), timing each —
- *  the timings drive [`splitBySpeed`]. A probe that cannot be counted is
- *  recorded as a failure and excluded from the benches; the worker carries
- *  on. This pre-pass runs the same consume the benches run, so it is also
- *  where a consume-budget breach surfaces first. */
-async function countAll(a: StoreAdapter, h: unknown, pats: Pat[]): Promise<Record<string, number>> {
-    const costMs: Record<string, number> = {};
+/** The warm regime: every call on the one open store `h`. */
+function warmAccess(h: unknown): Access {
+    return {
+        regime: 'warm',
+        probe: <T>(run: (h: unknown) => Promise<T> | T) => timeOnce(() => run(h)),
+        task: (run) => [async () => { await run(h); }],
+    };
+}
+
+/** The cold regime: every call on a store freshly adopted from `snap`, the
+ *  adoption untimed and the store disposed after. */
+function coldAccess(a: StoreAdapter, snap: unknown): Access {
+    const open = () => a.open!(snap);
+    const dispose = (h: unknown) => a.dispose?.(h);
+    return {
+        regime: 'cold',
+        probe: async <T>(run: (h: unknown) => Promise<T> | T) => {
+            const h = await open();
+            try {
+                return await timeOnce(() => run(h));
+            } finally {
+                dispose(h);
+            }
+        },
+        task: (run) => onFresh(open, run, dispose),
+    };
+}
+
+/**
+ * Measure `pats` through `access`: probe every pattern once, then benchmark
+ * each cell that came in under the time limit with `opts`, a benchmark of its
+ * own, so a cell that fails takes no other with it.
+ *
+ * The probe is the cross-adapter count check and the time limit at once. The
+ * count-only run goes first, since a count past the limit times out both of
+ * the pattern's cells (materializing does the same work and more), while a
+ * materialized run past it times out that cell alone. A pattern that fails
+ * its probe is recorded as a failure and benchmarked in neither unit. The
+ * probe runs the same consume the benches run, so it is also where a
+ * consume-budget breach surfaces first. Failures are named as the page keys
+ * the cell: its id after the slug, `#cold` in the cold regime.
+ */
+async function measure(a: StoreAdapter, pats: Pat[], access: Access, opts: BenchOptions, rows: Row[]): Promise<void> {
+    const { regime } = access;
+    const key = (cell: string) => (regime === 'cold' ? `${cell}#cold` : cell);
+    const cells: { name: string; run: (h: unknown) => unknown }[] = [];
     for (const p of pats) {
-        const t0 = performance.now();
+        const id = `${a.slug}::${p.name}`;
         try {
-            matched[p.name] = await a.countMatch(h, p);
-            costMs[p.name] = performance.now() - t0;
+            const count = await access.probe((h) => a.countOnly(h, p));
+            matched[p.name] = count.value;
+            if (count.late) {
+                rows.push(...timeouts([id, `${id}::count`], count.late, regime));
+                continue;
+            }
+            const match = await access.probe((h) => a.countMatch(h, p));
+            matched[p.name] = match.value;
             // A count path that resolves differently must fail loudly here,
             // not time the wrong work in the benches below.
-            const c = await a.countOnly(h, p);
-            if (c !== matched[p.name]) {
-                throw new Error(`countOnly disagrees: ${c} vs ${matched[p.name]}`);
+            if (count.value !== match.value) {
+                throw new Error(`countOnly disagrees: ${count.value} vs ${match.value}`);
             }
+            if (match.late) rows.push(...timeouts([id], match.late, regime));
+            else cells.push({ name: p.name, run: (h) => a.countMatch(h, p) });
+            cells.push({ name: `${p.name}::count`, run: (h) => a.countOnly(h, p) });
         } catch (e) {
-            const error = e instanceof Error ? e.message : String(e);
-            console.error(`  !! count '${p.name}' failed: ${error}`);
-            failures.push({ phase: `count:${p.name}`, error });
+            const error = errorText(e);
+            console.error(`  !! probe '${p.name}' failed: ${error}`);
+            failures.push({ phase: key(p.name), error });
         }
     }
-    return costMs;
+    for (const { name, run } of cells) {
+        await bench(key(name), rows, opts, (b) => { b.add(`${a.slug}::${name}`, ...access.task(run)); }, regime);
+    }
 }
 
 /** The dataset options a store gets: the graph-bearing dataset where its model
@@ -147,74 +190,48 @@ function probesFor(a: StoreAdapter): Pat[] {
     return a.quadsUnsupported ? probes.triples : [...probes.triples, ...probes.quads];
 }
 
+/** The graph probes' rows for a store whose model has no graphs, `reason`
+ *  saying so per probe, so the cells read as unsupported, not as benchmarks
+ *  nobody ran. Such a store answers the triple patterns on the projection of
+ *  the same rows. */
+function graphProbesUnsupported(slug: string, reason: string, regime: 'warm' | 'cold'): Row[] {
+    return datasetProbes(N_TRIPLES, { graphs: GRAPHS }).quads.flatMap((p) =>
+        [`${slug}::${p.name}`, `${slug}::${p.name}::count`].map((id) => ({ ...unsupportedRow(id, reason), regime })));
+}
+
+/** The dataset for `a`, its strings flattened once so that no timed build pays
+ *  V8's rope flattening. */
+function inputFor(a: StoreAdapter): Quad[] {
+    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    flattenTerms(triples);
+    return triples;
+}
+
 async function runQuery(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     const pats = probesFor(a);
-    const qProbes = datasetProbes(N_TRIPLES, { graphs: GRAPHS });
 
     console.log(`[${a.label}] query…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
-    // Measure across the build only. The input array is ~a gigabyte of JS objects
-    // and is identical for every adapter, so a delta isolates the store's own
-    // footprint far better than any absolute reading — and unlike dropping the
-    // array it does not force us to regenerate it for the ingest phase.
-    const isVortex = a.slug.startsWith('vortex');
-    const before = await memSnapshot(isVortex);
-    let th: unknown = await a.build(triples);
-    const after = await memSnapshot(isVortex);
-    Object.assign(storeFootprint, {
-        rssMb: delta(after.rss, before.rss),
-        jsHeapMb: after.js - before.js,
-        wasmHeapMb: delta(after.wasm, before.wasm),
-    });
+    const triples = inputFor(a);
+    let th: unknown;
+    if (a.ingestUnsupported) {
+        rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
+        th = await a.build(triples); // hdt opens its file, untimed
+    } else {
+        // Three timed builds; the last one is the store the probes query.
+        console.log(`[${a.label}] ingest…`);
+        const builds = makingLast(() => a.build(triples), (h) => reclaim(a, h));
+        await bench('ingest', rows, HEAVY_OPTS, (b) => {
+            b.add(`ingest::${a.slug}`, ...builds.task);
+        });
+        th = builds.last() ?? await a.build(triples);
+    }
 
-    const tCost = await countAll(a, th, pats);
-    const tSplit = splitBySpeed(pats, tCost);
-    if (tSplit.fast.length) {
-        await bench('query_triples', rows, QUERY_OPTS, (b) => {
-            for (const p of tSplit.fast) {
-                b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
-                b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(th, p); });
-            }
-        }, 'warm');
-    }
-    if (tSplit.slow.length) {
-        await bench('query_triples_slow', rows, ONE_SHOT, (b) => {
-            for (const p of tSplit.slow) {
-                b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
-                b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(th, p); });
-            }
-        }, 'warm');
-    }
+    await measure(a, pats, warmAccess(th), QUERY_OPTS, rows);
     reclaim(a, th);
     th = null;
 
-    if (a.quadsUnsupported) {
-        // No graph in the model at all — say so per probe, so the cells
-        // read as unsupported, not as benchmarks nobody ran. This store answered the
-        // triple patterns above, on the projection of the same rows.
-        for (const p of qProbes.quads) {
-            for (const id of [`${a.slug}::${p.name}`, `${a.slug}::${p.name}::count`]) {
-                const r = unsupportedRow(id, a.quadsUnsupported);
-                r.regime = 'warm';
-                rows.push(r);
-            }
-        }
-    }
-
-    if (a.ingestUnsupported) {
-        rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
-    } else {
-        console.log(`[${a.label}] ingest…`);
-        await bench('ingest', rows, HEAVY_OPTS, (b) => {
-            // Dispose in `afterEach` (untimed), so freeing the previous store
-            // never pollutes the measured ingest cost.
-            let h: unknown;
-            b.add(`ingest::${a.slug}`, async () => { h = await a.build(triples); }, {
-                afterEach: () => { reclaim(a, h); h = undefined; },
-            });
-        });
-    }
+    if (a.quadsUnsupported) rows.push(...graphProbesUnsupported(a.slug, a.quadsUnsupported, 'warm'));
 
     return rows;
 }
@@ -250,28 +267,10 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
         return rows;
     }
 
-    // One dataset's cold pass: adopt per iteration (untimed), query (timed).
-    const coldPass = async (
-        phase: string, snap: unknown, probes: Pat[],
-    ): Promise<void> => {
-        await bench(phase, rows, COLD_QUERY_OPTS, (b) => {
-            for (const p of probes) {
-                let h: unknown;
-                b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(h, p); }, {
-                    beforeEach: async () => { h = await a.open!(snap); },
-                    afterEach: () => { a.dispose?.(h); h = undefined; },
-                });
-                let hc: unknown;
-                b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(hc, p); }, {
-                    beforeEach: async () => { hc = await a.open!(snap); },
-                    afterEach: () => { a.dispose?.(hc); hc = undefined; },
-                });
-            }
-        }, 'cold');
-    };
+    const dispose = (h: unknown) => a.dispose?.(h);
 
     console.log(`[${a.label}] query cold…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    const triples = inputFor(a);
     const pats = probesFor(a);
     let th: unknown = await a.build(triples);
     const tSnap = await a.snapshot(th);
@@ -283,23 +282,13 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     // it the cold column's context — how much of a cold start is the open — is
     // not on the page.
     await bench('open', rows, HEAVY_OPTS, (b) => {
-        let h: unknown;
-        b.add(`open::${a.slug}`, async () => { h = await a.open!(tSnap); }, {
-            afterEach: () => { a.dispose?.(h); h = undefined; },
-        });
+        b.add(`open::${a.slug}`, ...making(() => a.open!(tSnap), dispose));
     });
 
-    await coldPass('query_cold', tSnap, pats);
+    // Adopt per iteration (untimed), query (timed).
+    await measure(a, pats, coldAccess(a, tSnap), COLD_QUERY_OPTS, rows);
 
-    if (a.quadsUnsupported) {
-        for (const p of datasetProbes(N_TRIPLES, { graphs: GRAPHS }).quads) {
-            for (const id of [`${a.slug}::${p.name}`, `${a.slug}::${p.name}::count`]) {
-                const r = unsupportedRow(id, a.quadsUnsupported);
-                r.regime = 'cold';
-                rows.push(r);
-            }
-        }
-    }
+    if (a.quadsUnsupported) rows.push(...graphProbesUnsupported(a.slug, a.quadsUnsupported, 'cold'));
 
     return rows;
 }
@@ -321,55 +310,14 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
 async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     console.log(`[${a.label}] full scan…`);
-    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    const triples = inputFor(a);
     let h: unknown = await a.build(triples);
-    // Record what the scan matches, as the pattern probes do — the strongest
-    // cross-adapter check there is: every store must return the whole dataset.
-    //
-    // Guarded: this pre-pass runs the same consume the benches below run, so a
-    // store that cannot scan at all — a trap, or the consume budget — fails
-    // HERE, once, and the benches are skipped; they would otherwise fail three
-    // more times. Its timing also picks the repetition plan.
-    let preMs: number | null = null;
-    try {
-        const t0 = performance.now();
-        matched.full = await a.countMatch(h, FULL_SCAN_PATTERN);
-        preMs = performance.now() - t0;
-    } catch (e) {
-        const error = e instanceof Error ? e.message : String(e);
-        console.error(`  !! full scan failed: ${error}`);
-        failures.push({ phase: 'full', error });
-    }
-    if (preMs !== null) {
-        const opts = SLOW_PHASE_MS > 0 && preMs > SLOW_PHASE_MS ? ONE_SHOT : FULL_SCAN_OPTS;
-        if (opts === ONE_SHOT) {
-            console.log(`  [full] one scan took ${(preMs / 1000).toFixed(0)}s — measuring 1 sample (BENCH_SLOW_PHASE_MS)`);
-        }
-        await bench('full', rows, opts, (b) => {
-            b.add(`${a.slug}::full`, async () => { await a.countMatch(h, FULL_SCAN_PATTERN); });
-        }, 'warm');
-        // The count twin gets its own repetition plan: a store with a real
-        // count path answers orders of magnitude below the consuming scan.
-        await bench('full_count', rows, FULL_SCAN_OPTS, (b) => {
-            b.add(`${a.slug}::full::count`, async () => { await a.countOnly(h, FULL_SCAN_PATTERN); });
-        }, 'warm');
-        if (a.snapshot && a.open) {
-            const snap = await a.snapshot(h);
-            await bench('full_cold', rows, opts, (b) => {
-                let fresh: unknown;
-                b.add(`${a.slug}::full`, async () => { await a.countMatch(fresh, FULL_SCAN_PATTERN); }, {
-                    beforeEach: async () => { fresh = await a.open!(snap); },
-                    afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
-                });
-            }, 'cold');
-            await bench('full_count_cold', rows, FULL_SCAN_OPTS, (b) => {
-                let fresh: unknown;
-                b.add(`${a.slug}::full::count`, async () => { await a.countOnly(fresh, FULL_SCAN_PATTERN); }, {
-                    beforeEach: async () => { fresh = await a.open!(snap); },
-                    afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
-                });
-            }, 'cold');
-        }
+    // Its probes record what the scan matches, as the pattern probes do — the
+    // strongest cross-adapter check there is: every store must return the
+    // whole dataset.
+    await measure(a, [FULL_SCAN_PATTERN], warmAccess(h), FULL_SCAN_OPTS, rows);
+    if (a.snapshot && a.open) {
+        await measure(a, [FULL_SCAN_PATTERN], coldAccess(a, await a.snapshot(h)), FULL_SCAN_OPTS, rows);
     }
     reclaim(a, h);
     h = null;
@@ -382,31 +330,117 @@ async function runMutate(a: StoreAdapter): Promise<Row[]> {
     const delSlice = genDatasetPrefix(N_TRIPLES, MUT_BATCH);
 
     console.log(`\n[${a.label}] add (${MUT_BATCH})…`);
+    const dispose = (h: unknown) => reclaim(a, h);
     await bench('add', rows, HEAVY_OPTS, (b) => {
-        let h: unknown;
-        b.add(`add::${a.slug}`, async () => {
-            h = await a.newEmpty();
-            await a.addAll(h, fresh);
-        }, { afterEach: () => { reclaim(a, h); h = undefined; } });
+        b.add(`add::${a.slug}`, ...making(() => a.newEmpty(), dispose, (h) => a.addAll(h, fresh)));
         if (a.addBatch) {
-            let hb: unknown;
-            b.add(`add_batch::${a.slug}`, async () => {
-                hb = await a.newEmpty();
-                await a.addBatch!(hb, fresh);
-            }, { afterEach: () => { reclaim(a, hb); hb = undefined; } });
+            b.add(`add_batch::${a.slug}`, ...making(() => a.newEmpty(), dispose, (h) => a.addBatch!(h, fresh)));
         }
     });
 
     console.log(`[${a.label}] delete (${MUT_BATCH})…`);
-    let dh: unknown = null;
     await bench('delete', rows, HEAVY_OPTS, (b) => {
-        b.add(`delete::${a.slug}`, async () => { await a.deleteAll(dh, delSlice); }, {
-            beforeEach: async () => { dh = await a.build(delSlice); },
-            afterEach: () => { reclaim(a, dh); dh = null; },
-        });
+        b.add(`delete::${a.slug}`, ...onFresh(() => a.build(delSlice), (h) => a.deleteAll(h, delSlice), dispose));
     });
 
     return rows;
+}
+
+/** A collected read's result, kept reachable at module scope until the run
+ *  has read the live bytes it holds. */
+let held: unknown = null;
+
+/**
+ * One memory run: the store alone, in a process of its own, run
+ * BENCH_MEMORY_RUNS times per adapter by compare.bench.ts.
+ *
+ * Live bytes are the store module's wasm counter plus the JS heap's
+ * `heapUsed` after a collection; rdf-stores has no wasm module, so the JS heap
+ * alone. Both counters must first see an 8 MiB block held, or the run throws
+ * and the worker exits 1. The store is obtained as `a.obtained` says (built
+ * from the flattened dataset, which is passed inline so nothing keeps it
+ * alive, or hdt's file loaded), measured and freed before any read; a second
+ * store obtained the same way is then read once per probe and full scan, the
+ * counts recorded, and freed. Each reading is taken after `settle(live)`,
+ * whose rounds of collection and an event-loop turn repeat until one frees
+ * less than 1 MiB, so the finalizers a free or a read left behind have run. A
+ * built store with a persistent form (Vortex) is also measured as `fromBytes`
+ * loads it, from the bytes `toBytes()` gave before the second store was
+ * freed, then loaded again and given the same reads, whose counts must be the
+ * built store's. A failed free, or a loaded store that counts other rows,
+ * throws as a failed self-check does.
+ *
+ * - Store: live bytes right after the store is obtained minus those after its
+ *   free, on a store no read has touched, so it leaves out the caches reads
+ *   fill (Vortex's term cache, and a built Vortex store's decoded code
+ *   columns).
+ * - Peak: per probe, the counter's peak reset, the read, a collection, then
+ *   the counter's peak plus `heapUsed`; the highest above the baseline. A
+ *   collected result (oxigraph) is held until that reading; a streaming
+ *   read's current chunk cannot be seen.
+ */
+async function runMemory(a: StoreAdapter): Promise<JsMemoryRun> {
+    console.log(`[${a.label}] memory…`);
+    const counter = (await a.counter?.()) ?? null;
+    counter?.setCounting(true);
+    if (counter) checkCounter(`${counter.name} wasm`, () => counter.stats().liveBytes, counter.hold);
+    checkCounter('JS heap (heapUsed)', heapUsedBytes, holdJsHeap);
+    const live = () => heapUsedBytes() + (counter?.stats().liveBytes ?? 0);
+    await settle(live);
+    const baseline = live();
+    // Store: a store of its own, obtained and freed before any read, so it
+    // holds no cache a read fills. Not through `reclaim`, which swallows a
+    // failed free(): that would leave Store at about 0, so it fails the run.
+    let h: unknown = await a.build(inputFor(a)); // built, or hdt's file loaded
+    await settle(live);
+    const opened = live();
+    a.dispose?.(h);
+    h = null;
+    await settle(live);
+    const first: StoreReadings = { opened, disposed: live() };
+    // The reads, on a second store obtained the same way.
+    h = await a.build(inputFor(a));
+    await settle(live);
+    const probeTotals: number[] = [];
+    for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) {
+        await settle(live);
+        counter?.resetPeak();
+        const read = a.matchHeld ? a.matchHeld(h, p) : { rows: await a.countMatch(h, p), result: null };
+        held = read.result;
+        matched[p.name] = read.rows;
+        probeTotals.push(heapUsedBytes() + (counter?.stats().peakLiveBytes ?? 0));
+        held = null;
+    }
+    await settle(live);
+    const loads = a.obtained === 'built' && !!a.snapshot && !!a.open; // Vortex
+    let bytes: unknown = loads ? await a.snapshot!(h) : null; // before the free
+    a.dispose?.(h);
+    h = null;
+    await settle(live);
+    let loaded: StoreReadings | null = a.obtained === 'loaded' ? first : null;
+    if (loads) {
+        // The loaded store as `fromBytes` gives it, measured before any read.
+        let l: unknown = await a.open!(bytes);
+        await settle(live);
+        const lOpened = live();
+        a.dispose?.(l);
+        l = null;
+        await settle(live);
+        loaded = { opened: lOpened, disposed: live() };
+        // Then the same reads, which must count the built store's rows.
+        l = await a.open!(bytes);
+        bytes = null;
+        for (const p of [...probesFor(a), FULL_SCAN_PATTERN]) {
+            const rows = await a.countMatch(l, p);
+            if (rows !== matched[p.name]) {
+                throw new Error(
+                    `the store loaded from the snapshot matched ${rows} rows for '${p.name}', `
+                    + `the built store ${matched[p.name]}`);
+            }
+        }
+        a.dispose?.(l);
+    }
+    return memoryRunFigures({ baseline, built: a.obtained === 'built' ? first : null, loaded, probeTotals });
 }
 
 async function main(): Promise<void> {
@@ -416,18 +450,24 @@ async function main(): Promise<void> {
         console.error(`unknown adapter slug '${slug}' for role '${role}'`);
         process.exit(1);
     }
+    // Untimed, before any phase: no timed build pays the module's compile.
+    await a.init?.();
 
-    const rows = role === 'query' ? await runQuery(a)
-        : role === 'querycold' ? await runQueryCold(a)
-            : role === 'fullscan' ? await runFullScan(a)
-                : await runMutate(a);
+    // A memory run that fails, its self-check included, throws out of here:
+    // the worker exits 1 with the reason, and writes nothing.
+    const memoryRun = role === 'memory' ? await runMemory(a) : undefined;
+    const rows = role === 'memory' ? []
+        : role === 'query' ? await runQuery(a)
+            : role === 'querycold' ? await runQueryCold(a)
+                : role === 'fullscan' ? await runFullScan(a)
+                    : await runMutate(a);
     const out: WorkerOutput = {
         rows,
         peakRssMb: peakRssMb(),
-        storeFootprint,
         matched,
         failures,
         cardinality: role === 'query' ? moduli(N_TRIPLES, { graphs: GRAPHS }) : undefined,
+        memoryRun,
     };
     writeFileSync(outFile, JSON.stringify(out));
 }

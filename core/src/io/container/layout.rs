@@ -1,6 +1,6 @@
 //! The store root layout vtable and its read-side inspection: recognizing a
 //! native root, delegating its scan to the transparent quad-source child, and
-//! addressing the auxiliary components by name.
+//! addressing the auxiliary components by their slot in the inventory.
 
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use super::wire::{StoreComponentDescriptor, decode_store_metadata, encode_store_metadata};
-use super::{QUAD_SOURCE_CHILD, QUAD_SOURCE_NAME, STORE_LAYOUT_ID};
+use super::{QUAD_SOURCE_CHILD, QUAD_SOURCE_NAME, STORE_LAYOUT_FAMILY, STORE_LAYOUT_ID};
 
 /// VTable of the native store root layout.
 #[derive(Clone, Debug)]
@@ -24,10 +24,15 @@ pub(crate) struct RdfStoreLayoutVTable;
 
 pub(super) type RdfStoreLayout = Layout<RdfStoreLayoutVTable>;
 
+/// The root's persisted state.
 #[derive(Clone, Debug)]
 pub(crate) struct RdfStoreLayoutData {
-    pub(super) quads_sorted: bool,
-    pub(super) components: Arc<[StoreComponentDescriptor]>,
+    /// Whether the quad rows are in global `(s, p, o, g)` order, the writer's
+    /// provenance (`WireMetadata::quads_sorted`); a materialized read restores
+    /// the subject sorted stamp from it.
+    pub(crate) quads_sorted: bool,
+    /// The component inventory, in child order.
+    pub(crate) components: Arc<[StoreComponentDescriptor]>,
 }
 
 impl VTable for RdfStoreLayoutVTable {
@@ -108,30 +113,70 @@ impl VTable for RdfStoreLayoutVTable {
         session: &VortexSession,
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
-        // The root's scan IS the quad-source scan; auxiliary components stay
-        // independently addressable through `store_component`.
-        layout
-            .slot(QUAD_SOURCE_CHILD)?
-            .ok_or_else(|| {
-                vortex_error::vortex_err!("store root is missing its quad-source child")
-            })?
-            .new_reader(name, segment_source, session, ctx)
+        // The root's scan is the quad-source scan; the components stay
+        // addressable through `component_child`.
+        quad_source(layout)?.new_reader(name, segment_source, session, ctx)
     }
 }
 
-/// Whether the quad rows are recorded in global `(s, p, o, g)` order (the
-/// meaning is defined on `WireMetadata::quads_sorted`); a materialized read
-/// restores the subject sorted stamp from it.
-pub(crate) fn quads_sorted(layout: &RdfStoreLayout) -> bool {
-    layout.data().quads_sorted
-}
-
 /// Register the store layout in a session. Called once from the
-/// `VORTEX_SESSION` initializer on every target — reading requires it.
+/// `VORTEX_SESSION` initializer on every target: reading requires it.
 pub(crate) fn register(session: &VortexSession) {
     use vortex_layout::session::LayoutSessionExt;
     static LAYOUT: RdfStoreLayoutVTable = RdfStoreLayoutVTable;
     session.layouts().register(&LAYOUT as &dyn LayoutEncoding);
+}
+
+/// The id of the root layout of `bytes` when it is the root of a newer
+/// vortex-rdf: a `vortex-rdf.store.` id whose version number is above the
+/// current root's. The store session cannot open such a file (its registry has
+/// no entry for the id), so the root is named through a session that reads an
+/// unknown layout as a placeholder.
+pub(crate) fn newer_root_id(bytes: &vortex_buffer::ByteBuffer) -> Option<String> {
+    use vortex_file::OpenOptionsSessionExt as _;
+    let file = crate::session::FOREIGN_LAYOUT_SESSION
+        .open_options()
+        .open_buffer(bytes.clone())
+        .ok()?;
+    newer_root_id_of(&file)
+}
+
+/// [`newer_root_id`] for the file at `path`, whose footer is read through
+/// positioned reads: nothing is mapped.
+#[cfg(feature = "file-io")]
+pub(crate) async fn newer_root_id_at(path: &std::path::Path) -> Option<String> {
+    use vortex_file::OpenOptionsSessionExt as _;
+    let file = crate::session::FOREIGN_LAYOUT_SESSION
+        .open_options()
+        .open_path(path)
+        .await
+        .ok()?;
+    newer_root_id_of(&file)
+}
+
+/// The root layout id of `file` when it is the root of a newer vortex-rdf
+/// (see `is_newer_root_id`).
+fn newer_root_id_of(file: &vortex_file::VortexFile) -> Option<String> {
+    let id = file.footer().layout().encoding_id().to_string();
+    is_newer_root_id(&id).then_some(id)
+}
+
+/// Whether `id` is the root layout id of a newer vortex-rdf: a
+/// `vortex-rdf.store.v<N>` id whose `N`, plain decimal digits with no sign and
+/// no leading zero, is above the current root's. A lower or an equal number, a
+/// number spelled any other way, and every other id are not newer.
+fn is_newer_root_id(id: &str) -> bool {
+    let version = |id: &str| -> Option<u32> {
+        let digits = id.strip_prefix(STORE_LAYOUT_FAMILY)?.strip_prefix('v')?;
+        if digits.starts_with('0') || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    matches!(
+        (version(id), version(STORE_LAYOUT_ID)),
+        (Some(found), Some(current)) if found > current
+    )
 }
 
 pub(super) fn is_native_root(layout: &LayoutRef) -> bool {
@@ -142,29 +187,55 @@ pub(crate) fn is_native_file(file: &vortex_file::VortexFile) -> bool {
     is_native_root(file.footer().layout())
 }
 
-/// The persisted component inventory of a native root.
-pub(crate) fn store_components(layout: &RdfStoreLayout) -> &[StoreComponentDescriptor] {
-    &layout.data().components
+/// The quad table of a native root: its transparent quad-source child.
+pub(crate) fn quad_source(root: &RdfStoreLayout) -> VortexResult<LayoutRef> {
+    root.slot(QUAD_SOURCE_CHILD)?
+        .ok_or_else(|| vortex_error::vortex_err!("store root is missing its quad-source child"))
 }
 
-/// A named auxiliary child of a native root, with its descriptor.
-pub(crate) fn store_component(
-    layout: &RdfStoreLayout,
-    name: &str,
-) -> VortexResult<Option<(StoreComponentDescriptor, LayoutRef)>> {
-    let Some(index) = layout.data().components.iter().position(|c| c.name == name) else {
-        return Ok(None);
-    };
-    let descriptor = layout.data().components[index].clone();
-    let child = layout.slot(index + 1)?.ok_or_else(|| {
-        vortex_error::vortex_err!("store component {name} is missing its child layout")
-    })?;
-    Ok(Some((descriptor, child)))
+/// The child layout of the component in `slot` of a native root's inventory,
+/// whose descriptor is `components[slot]`: the root's child after the quad
+/// source's and the `slot` components' before it.
+pub(crate) fn component_child(root: &RdfStoreLayout, slot: usize) -> VortexResult<LayoutRef> {
+    root.slot(QUAD_SOURCE_CHILD + 1 + slot)?
+        .ok_or_else(|| vortex_error::vortex_err!("store root has no component child {slot}"))
 }
 
-/// Test-only: the decoded root metadata of serialized store bytes — the
+/// The layout of field `name` of a table's struct layout (the quad table's,
+/// or an index child's): `None` when the table has no such field, or is not
+/// a struct.
+pub(crate) fn struct_field(table: &LayoutRef, name: &str) -> Option<LayoutRef> {
+    use vortex_layout::LayoutChildType;
+
+    (0..table.nslots()).find_map(|slot| match table.slot_type(slot) {
+        Some(LayoutChildType::Field(field)) if field.as_ref() == name => {
+            table.slot(slot).ok().flatten()
+        }
+        _ => None,
+    })
+}
+
+/// A reader of the component in `slot` of a native store file's inventory
+/// ([`component_child`]), named as its descriptor names it and reading the
+/// file's own segments: the one construction of a component reader, which
+/// the native handle caches and the in-memory open adopts. `file` must be
+/// a native store file (its roster read, `ComponentRoster::of`).
+pub(crate) fn component_reader(
+    file: &vortex_file::VortexFile,
+    slot: usize,
+) -> VortexResult<LayoutReaderRef> {
+    let root = file.footer().layout().as_::<RdfStoreLayoutVTable>();
+    component_child(root, slot)?.new_reader(
+        root.data().components[slot].name.as_str().into(),
+        file.segment_source(),
+        file.session(),
+        &Default::default(),
+    )
+}
+
+/// Test-only: the decoded root metadata of serialized store bytes, the
 /// `quads_sorted` bit and the component inventory.
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponentDescriptor>) {
     use vortex_file::OpenOptionsSessionExt as _;
     let file = crate::session::VORTEX_SESSION
@@ -173,13 +244,13 @@ pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponent
         .expect("valid Vortex bytes");
     assert!(is_native_file(&file), "not a native store file");
     let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
-    (quads_sorted(typed), typed.data().components.to_vec())
+    (typed.data().quads_sorted, typed.data().components.to_vec())
 }
 
 /// On-disk byte size of a layout subtree: the sum of its segments' lengths
-/// across all descendants, resolved through the footer's segment map. This
-/// is the residency-threshold input for auxiliary components.
-#[cfg(feature = "file-io")]
+/// across all descendants, resolved through the footer's segment map. What a
+/// component occupies on disk (a test inspection).
+#[cfg(test)]
 pub(crate) fn subtree_bytes(
     layout: &LayoutRef,
     segment_map: &[vortex_file::SegmentSpec],
@@ -200,4 +271,38 @@ pub(crate) fn subtree_bytes(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_newer_root_id;
+
+    /// Only a `vortex-rdf.store.v<N>` id with `N` above the current root's is
+    /// newer: a lower or an equal number, a number spelled with anything but
+    /// plain decimal digits (a sign, a leading zero, trailing text), and every
+    /// other id are not.
+    #[test]
+    fn only_a_higher_version_number_is_a_newer_root() {
+        for (id, newer) in [
+            ("vortex-rdf.store.v3", true),
+            ("vortex-rdf.store.v9", true),
+            ("vortex-rdf.store.v10", true),
+            ("vortex-rdf.store.v100", true),
+            ("vortex-rdf.store.v0", false),
+            ("vortex-rdf.store.v1", false),
+            ("vortex-rdf.store.v2", false),
+            ("vortex-rdf.store.vx", false),
+            ("vortex-rdf.store.v", false),
+            ("vortex-rdf.store.v3x", false),
+            ("vortex-rdf.store.v+3", false),
+            ("vortex-rdf.store.v03", false),
+            ("vortex-rdf.store.w3", false),
+            ("vortex-rdf.storage.v3", false),
+            ("vortex-rdf.stare.v3", false),
+            ("other.family.v9", false),
+            ("", false),
+        ] {
+            assert_eq!(is_newer_root_id(id), newer, "{id:?}");
+        }
+    }
 }

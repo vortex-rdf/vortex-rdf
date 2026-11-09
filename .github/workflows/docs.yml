@@ -1,0 +1,23 @@
+name: Docs
+
+# The doc-anchor check, on every pull request and every push to main: no path
+# filter, since a doc-only change (which ci.yml skips) is the one most likely
+# to break an anchor. The release workflow calls it too.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: Doc anchors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check doc anchors
+        run: scripts/ci-check.sh docs

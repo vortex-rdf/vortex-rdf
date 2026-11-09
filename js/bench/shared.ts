@@ -21,8 +21,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
-import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
-import { fmtNs, consumeQuads, consumeStrings } from './util.js';
+import { VortexRdfStore, vortexCounter, vortexWasm, type BuildOptions } from './vortex.js';
+import {
+    fmtNs, consumeQuads, consumeStream, consumeStrings, errorText, settleRounds, wasmCounter,
+    type JsMemoryRun, type WasmCounter,
+} from './util.js';
 import { df, moduli, type Pat } from './datasets.js';
 import {
     RdfStore,
@@ -30,9 +33,13 @@ import {
     TermDictionaryQuotedIndexed,
     TermDictionaryNumberRecordFullTerms,
 } from 'rdf-stores';
-import { Store as OxiStore } from 'oxigraph';
+import type { Store as OxiStore } from './oxigraph-pkg/web.js';
 
 export * from './datasets.js';
+
+/** js/bench, beside which the bench's own wasm builds sit (oxigraph-pkg,
+ *  hdt-pkg). */
+const here = dirname(fileURLToPath(import.meta.url));
 
 // ─── Config (env-tunable) ────────────────────────────────────────────────────
 //
@@ -55,15 +62,36 @@ export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete 
 // instrumented CodSpeed suite can import it too — and is re-exported above.
 
 // ─── Adapter interface ───────────────────────────────────────────────────────
+
+/** How a store is obtained, the vocabulary every tab's memory entries share:
+ *  mapped from a file, loaded from a file into memory, built from the triples,
+ *  or opened from an on-disk database. */
+export type Obtained = 'mapped' | 'loaded' | 'built' | 'opened';
+
 export interface StoreAdapter<H = unknown> {
     slug: string; // dashboard id segment
     label: string; // display name
+    /** How `build` obtains the store the timed cells and the memory runs'
+     *  peak use. */
+    obtained: Obtained;
+    /** Load the library's wasm module, untimed; the worker calls it before
+     *  any phase, so no timed build pays its compile. */
+    init?(): Promise<void>;
+    /** The live-byte counter of the library's wasm module, which the memory
+     *  runs read beside the JS heap. Absent for a pure-JS library, whose
+     *  memory is all JS heap. */
+    counter?(): Promise<WasmCounter>;
+    /** A read that collects its whole result (oxigraph's `match()` returns an
+     *  array): the rows it matched, and the result itself, which the memory
+     *  run keeps reachable until it has read the live bytes. A streaming
+     *  read's `countMatch` keeps nothing past its end. */
+    matchHeld?(h: H, p: Pat): { rows: number; result: unknown };
     build(quads: Quad[]): Promise<H> | H; // ingest (idiomatic bulk API per lib)
     newEmpty(): Promise<H> | H; // empty store (add phase)
     addAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad add loop
     addBatch?(h: H, quads: Quad[]): Promise<void> | void; // optional batch add (Vortex)
     deleteAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad delete loop
-    countMatch(h: H, p: Pat): Promise<number> | number; // count by consuming — every result term is read (consumeQuads)
+    countMatch(h: H, p: Pat): Promise<number> | number; // count by consuming — every result term is read (consumeStream, consumeQuads)
     /** Resolve the pattern and return only the match count — no term value is
      *  read. Each store's cheapest correct count path (a count API where one
      *  exists, the result set's length otherwise): the COUNT/ASK shape. */
@@ -87,7 +115,8 @@ export interface StoreAdapter<H = unknown> {
     ingestUnsupported?: string;
     quadsUnsupported?: string;
     mutationUnsupported?: string;
-    // Both Vortex and oxigraph are wasm-bindgen: `.free()` deterministically drops
+    // Both Vortex and oxigraph (the bench's own build of its JS binding,
+    // bench/oxigraph-pkg) are wasm-bindgen: `.free()` deterministically drops
     // the WASM-side allocation. The generated FinalizationRegistry is a fallback
     // only — V8 has no visibility into WASM linear-memory pressure, so it can defer
     // running finalizers arbitrarily long, letting dozens of multi-million-quad
@@ -112,7 +141,7 @@ export function reclaim(a: StoreAdapter, h: unknown): void {
     try {
         a.dispose?.(h);
     } catch (e) {
-        console.error(`  !! ${a.label}: dispose failed (${e instanceof Error ? e.message : e})`);
+        console.error(`  !! ${a.label}: dispose failed (${errorText(e)})`);
     }
     global.gc?.();
 }
@@ -129,20 +158,22 @@ export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptio
     { slug: 'vortex_default_bycopy', label: 'Vortex Default+ByCopy', options: { layout: 'default', indexes: ['secondary-by-copy'] } },
 ];
 
-// Result sets are counted by consuming them — `consumeQuads` / `consumeStrings`
-// in util.ts read every term value, so materialization is measured work on
+// Result sets are counted by consuming them — `consumeStream` / `consumeQuads` /
+// `consumeStrings` in util.ts read every term value, so materialization is measured work on
 // every store.
 
 export function vortexAdapter(variant: { slug: string; label: string; options: BuildOptions }): StoreAdapter<VortexRdfStore> {
     return {
         slug: variant.slug,
         label: variant.label,
+        obtained: 'built',
+        counter: async () => vortexCounter(),
         build: (quads) => VortexRdfStore.fromQuads(quads, variant.options),
         newEmpty: () => VortexRdfStore.empty(),
         addAll: async (h, quads) => { for (const q of quads) await h.addQuad(q); },
         addBatch: (h, quads) => h.addQuads(quads),
         deleteAll: async (h, quads) => { for (const q of quads) await h.deleteQuad(q); },
-        countMatch: async (h, p) => consumeQuads(await h.getQuads(p.s, p.p, p.o, p.g)),
+        countMatch: (h, p) => consumeStream(h.match(p.s, p.p, p.o, p.g)),
         countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
         snapshot: (h) => h.toBytes(),
         open: (bytes) => VortexRdfStore.fromBytes(bytes as Uint8Array),
@@ -171,28 +202,77 @@ export function rdfStoresAdapter(kind: 'default' | 'single', label: string): Sto
     return {
         slug: kind === 'default' ? 'rdfstores_default' : 'rdfstores_single',
         label,
+        // No counter: a pure-JS store's memory is all JS heap.
+        obtained: 'built',
         build: (quads) => { const s = newRdfStore(kind); for (const q of quads) s.addQuad(q); return s; },
         newEmpty: () => newRdfStore(kind),
         addAll: (h, quads) => { for (const q of quads) h.addQuad(q); },
         deleteAll: (h, quads) => { for (const q of quads) h.removeQuad(q); },
-        countMatch: (h, p) => consumeQuads(h.getQuads(p.s, p.p, p.o, p.g)), // synchronous array
+        countMatch: (h, p) => consumeStream(h.match(p.s, p.p, p.o, p.g)),
         countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
     };
+}
+
+// ─── oxigraph (wasm) ─────────────────────────────────────────────────────────
+//
+// oxigraph's official JS binding, though not its npm package, which has no
+// counter: the bench's own build of the binding, from oxigraph's GitHub source
+// at the version the Rust comparison pins (bench-compare/Cargo.lock), with the
+// bench's live-byte counter patched in. `npm run build:oxigraph-wasm` →
+// bench/oxigraph-pkg (see bench/oxigraph-wasm/build.sh); compare.bench.ts
+// checks the build's version against the pin before anything runs.
+
+type Oxigraph = {
+    mod: typeof import('./oxigraph-pkg/web.js');
+    wasm: import('./oxigraph-pkg/web.js').InitOutput;
+};
+let oxigraphLoad: Promise<Oxigraph> | undefined;
+/** The module once loaded, which the adapter's constructors read. */
+let oxigraph: Oxigraph | undefined;
+
+/** oxigraph's module and the exports of its wasm instance, loaded once, the
+ *  way hdtMod loads hdt's. */
+export function loadOxigraph(): Promise<Oxigraph> {
+    oxigraphLoad ??= (async () => {
+        const mod = await import('./oxigraph-pkg/web.js');
+        const wasm = await mod.default({ module_or_path: readFileSync(resolve(here, 'oxigraph-pkg/web_bg.wasm')) });
+        oxigraph = { mod, wasm };
+        return oxigraph;
+    })();
+    return oxigraphLoad;
+}
+
+/** A Store from the loaded module, built from `quads` if given. Synchronous,
+ *  so the adapter's timed build and newEmpty stay a bare constructor call. */
+function newOxiStore(quads?: Quad[]): OxiStore {
+    if (!oxigraph) throw new Error("oxigraph is not loaded: call the adapter's init() first");
+    return new oxigraph.mod.Store(quads as unknown as Iterable<never> | undefined);
 }
 
 export function oxigraphAdapter(): StoreAdapter<OxiStore> {
     return {
         slug: 'oxigraph',
         label: 'oxigraph',
-        build: (quads) => new OxiStore(quads as unknown as Iterable<never>), // bulk via constructor
-        newEmpty: () => new OxiStore(),
+        obtained: 'built',
+        init: async () => { await loadOxigraph(); },
+        counter: async () => {
+            const { mod, wasm } = await loadOxigraph();
+            return wasmCounter('oxigraph', mod, wasm);
+        },
+        build: (quads) => newOxiStore(quads), // bulk via constructor
+        newEmpty: () => newOxiStore(),
         addAll: (h, quads) => { for (const q of quads) h.add(q as never); },
         deleteAll: (h, quads) => { for (const q of quads) h.delete(q as never); },
         countMatch: (h, p) => consumeQuads(h.match(p.s as never, p.p as never, p.o as never, p.g as never)),
+        matchHeld: (h, p) => {
+            const result = h.match(p.s as never, p.p as never, p.o as never, p.g as never);
+            return { rows: consumeQuads(result), result };
+        },
         // No count API: match() materializes its result array either way, so
         // walking its length is this store's floor for a count.
         countOnly: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
-        // oxigraph's shipped `.d.ts` does not declare the wasm-bindgen `free()`.
+        // Our build's `web.d.ts` declares Store from oxigraph's own TypeScript
+        // section, which leaves out the wasm-bindgen `free()`.
         dispose: (h) => (h as unknown as { free(): void }).free(),
     };
 }
@@ -201,29 +281,32 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
 //
 // The hdt crate's wasm surface is read-only: HDT *construction* (`read_nt`)
 // spawns OS threads and uses rayon, which trap on wasm32, so the artifact is
-// built natively and only opened here. The Rust comparative bench writes one
-// from the same shared dataset as part of its run (`cargo bench --bench
-// compare`, at BENCH_SIZE = this tab's D³) — point `HDT_FILE` elsewhere to
+// built natively and only opened here. scripts/refresh.sh's js stage builds it
+// before the suite runs (see its `hdt_artifact`): this run's dataset, as
+// triples, converted by the hdt crate's own CLI — point `HDT_FILE` elsewhere to
 // override. The wasm module itself is the bench's own build of the crate's
 // bindings: `npm run build:hdt-wasm` → bench/hdt-pkg (see bench/hdt-wasm).
 
-const here = dirname(fileURLToPath(import.meta.url));
 export const HDT_FILE = process.env.HDT_FILE
-    ?? resolve(here, '../../target/bench_compare/hdt/data.hdt');
+    ?? resolve(here, '../../target/bench_js/data.hdt');
 
-type HdtModule = typeof import('./hdt-pkg/hdt_wasm_bench.js');
+type HdtWasm = {
+    mod: typeof import('./hdt-pkg/hdt_wasm_bench.js');
+    wasm: import('./hdt-pkg/hdt_wasm_bench.js').InitOutput;
+};
 type Hdt = import('./hdt-pkg/hdt_wasm_bench.js').Hdt;
-let hdtModule: HdtModule | null = null;
-async function hdtMod(): Promise<HdtModule> {
-    if (!hdtModule) {
+let hdtLoaded: HdtWasm | null = null;
+/** hdt-wasm's module and the exports of its wasm instance, loaded once. */
+async function hdtMod(): Promise<HdtWasm> {
+    if (!hdtLoaded) {
         // Same init path as entry/node.js: hand `init` the wasm bytes directly,
         // because Node's fetch does not speak file: URLs.
         const mod = await import('./hdt-pkg/hdt_wasm_bench.js');
         const wasmPath = resolve(here, 'hdt-pkg/hdt_wasm_bench_bg.wasm');
-        await mod.default({ module_or_path: readFileSync(wasmPath) });
-        hdtModule = mod;
+        const wasm = await mod.default({ module_or_path: readFileSync(wasmPath) });
+        hdtLoaded = { mod, wasm };
     }
-    return hdtModule;
+    return hdtLoaded;
 }
 
 /** A probe term in HDT dictionary spelling: IRIs bare, literals with their
@@ -249,9 +332,14 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
         // Not "(file)": the wasm bindings parse the artifact's bytes into wasm
         // linear memory, so this store answers from memory like the others.
         label: 'hdt',
+        obtained: 'loaded',
+        counter: async () => {
+            const { mod, wasm } = await hdtMod();
+            return wasmCounter('hdt-wasm', mod, wasm);
+        },
         ingestUnsupported:
             'the wasm bindings are read-only — the artifact is built natively '
-            + '(the Rust comparative bench writes it) and only opened here',
+            + '(by the hdt crate\'s own CLI) and only opened here',
         quadsUnsupported: 'the HDT format has no named graphs — triples only',
         mutationUnsupported: 'an HDT file is immutable once built',
         // `build` opens the pre-built artifact; the quads argument is only the
@@ -261,17 +349,18 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
         build: async (quads) => {
             if (!existsSync(HDT_FILE)) {
                 throw new Error(
-                    `no HDT artifact at ${HDT_FILE} — the Rust comparative bench builds it `
-                    + '(cargo bench --bench compare), or point HDT_FILE at one');
+                    `no HDT artifact at ${HDT_FILE} — scripts/refresh.sh --only js builds it, `
+                    + 'or point HDT_FILE at one');
             }
-            const mod = await hdtMod();
+            const { mod } = await hdtMod();
             const h = new mod.Hdt(readFileSync(HDT_FILE));
             const n = hdtNumTriples(h);
             if (n !== quads.length) {
                 h.free();
                 throw new Error(
                     `HDT artifact at ${HDT_FILE} holds ${n} triples but this run's dataset has `
-                    + `${quads.length} — rebuild it: BENCH_SIZE=${quads.length} cargo bench --bench compare`);
+                    + `${quads.length} — rebuild it: BENCH_SIZE=${quads.length} `
+                    + 'scripts/refresh.sh --only js');
             }
             return h;
         },
@@ -294,7 +383,7 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
         // bytes, open parses them — the same reopen the other tabs measure.
         snapshot: async () => readFileSync(HDT_FILE),
         open: async (bytes) => {
-            const mod = await hdtMod();
+            const { mod } = await hdtMod();
             return new mod.Hdt(bytes as Uint8Array);
         },
         dispose: (h) => h.free(),
@@ -336,6 +425,9 @@ export interface Row {
     regime?: 'cold' | 'warm';
     /** An operation this store cannot perform, as opposed to a slow one. */
     unsupported?: boolean;
+    /** A query cell whose one probing run took longer than the suite's time
+     *  limit, so it was not measured (see TIMEOUT_MS in compare.worker.ts). */
+    timeout?: boolean;
     /** Why, shown as the cell's tooltip. */
     reason?: string;
 }
@@ -345,13 +437,12 @@ export interface Row {
 export interface WorkerOutput {
     rows: Row[];
     peakRssMb: number | null;
-    /** What building the store cost over and above the shared input `Quad[]`.
-     *  `wasmHeapMb` is Vortex-only and null for the other adapters. */
-    storeFootprint: Record<string, number | null>;
     /** Rows each probe matched, by pattern name. */
     matched: Record<string, number>;
     failures: { phase: string; error: string }[];
     cardinality?: ReturnType<typeof moduli>;
+    /** The `memory` role's figures. */
+    memoryRun?: JsMemoryRun;
 }
 
 /** What dict-memory.worker.ts writes for one cardinality point, and what
@@ -371,22 +462,31 @@ export interface DictMemoryPoint {
     fullRows: number; firstQueryRows: number; decodedChars: number;
 }
 
-/** A row the dashboard renders as 'unsupported' rather than as a missing cell.
- *
- *  Mirrors `unsupported_row` in python/bench/worker.py, down to the null
- *  `median_ns` that keeps the row out of its column's best/ratio arithmetic:
- *  an operation a store cannot perform is not a slow result, and a blank cell
- *  reads as a benchmark nobody ran. */
-export function unsupportedRow(id: string, reason: string): Row {
+/** A row with no measurement, whose cell reads `word` with `reason` as its
+ *  tooltip rather than rendering as a missing cell, which reads as a benchmark
+ *  nobody ran. Its null `median_ns` keeps it out of its column's best/ratio
+ *  arithmetic. */
+function unmeasuredRow(id: string, word: string, reason: string): Row {
     const [group, variant] = id.split('::');
     return {
-        group, variant: variant ?? null, id,
-        unsupported: true, reason,
-        fastest: 'unsupported', slowest: 'unsupported',
-        median: 'unsupported', mean: 'unsupported',
+        group, variant: variant ?? null, id, reason,
+        fastest: word, slowest: word, median: word, mean: word,
         fastest_ns: null, slowest_ns: null, median_ns: null, mean_ns: null,
         samples: '0',
     };
+}
+
+/** A row the dashboard renders as 'unsupported'. Mirrors `unsupported_row` in
+ *  python/bench/worker.py: an operation a store cannot perform is not a slow
+ *  result. */
+export function unsupportedRow(id: string, reason: string): Row {
+    return { ...unmeasuredRow(id, 'unsupported', reason), unsupported: true };
+}
+
+/** A row the dashboard renders as 'timeout': a query cell whose one probing
+ *  run took longer than the suite's time limit. */
+export function timeoutRow(id: string, reason: string): Row {
+    return { ...unmeasuredRow(id, 'timeout', reason), timeout: true };
 }
 
 export function collect(bench: Bench, results: Row[], regime?: 'cold' | 'warm'): void {
@@ -473,18 +573,46 @@ export function jsHeapMb(): number {
     return Math.round(process.memoryUsage().heapUsed / 1048576);
 }
 
-/** Vortex's wasm linear memory, in MB.
- *
- * `__wbg_init` short-circuits and returns the exports when the module is already
- * initialized (`entry/node.js` does that at import time), so re-invoking it is
- * just how one gets at the namespace. Linear memory only ever grows, so this is
+/** Vortex's wasm linear memory, in MB: the bench build's, which ./vortex.ts
+ * initialized at import. Linear memory only ever grows, so this is
  * simultaneously the current and the peak figure. */
-export async function wasmHeapMb(): Promise<number | null> {
-    try {
-        const mod = await import('../pkg/web/vortex_rdf.js');
-        const wasm = await mod.default();
-        return Math.round((wasm as { memory: WebAssembly.Memory }).memory.buffer.byteLength / 1048576);
-    } catch {
-        return null;
-    }
+export async function wasmHeapMb(): Promise<number> {
+    return Math.round(vortexWasm.memory.buffer.byteLength / 1048576);
+}
+
+// ─── Memory runs: the JS heap ────────────────────────────────────────────────
+//
+// The memory role reads live bytes: a store's wasm counter (WasmCounter in
+// util.ts) plus the JS heap's. These need `--expose-gc`, which every worker
+// spawn passes, and fail loudly without it.
+
+/** The JS heap's live bytes: `heapUsed`, after a full collection. */
+export function heapUsedBytes(): number {
+    global.gc!();
+    return process.memoryUsage().heapUsed;
+}
+
+/** Hold at least `bytes` of JS heap until the returned function is called:
+ *  an array of doubles 64 KiB larger than `bytes`, so the readings' own
+ *  garbage cannot pull the rise below `bytes`. Not a typed array, whose
+ *  memory is external, outside `heapUsed`. */
+export function holdJsHeap(bytes: number): () => void {
+    let block: number[] | null = new Array(Math.ceil(bytes / 8) + 8192).fill(0.5);
+    return () => { block = null; };
+}
+
+/** Let the process settle before a reading of `live`, the run's live bytes.
+ *  A round collects, gives the event loop a 50 ms turn so FinalizationRegistry
+ *  callbacks run (a freed Vortex store's term dictionary is released by one,
+ *  and so is each oxigraph quad or term a read left unfreed), then collects
+ *  what they released. One turn does not always let them all run: V8 runs one
+ *  registry's callbacks per task, and after a large read they take seconds.
+ *  So rounds repeat until one frees less than 1 MiB, 10 at most
+ *  (`settleRounds` in util.ts). */
+export async function settle(live: () => number): Promise<void> {
+    await settleRounds(async () => {
+        global.gc!();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        global.gc!();
+    }, live);
 }

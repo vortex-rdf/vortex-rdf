@@ -12,7 +12,10 @@ publish = false
 # The compiled module is imported as `vortex_rdf._native` (see
 # `[tool.maturin] module-name` in pyproject.toml). `test = false` keeps
 # `cargo test --workspace` from producing a test binary that would need to
-# link libpython — the crate's behavior is covered by the pytest suite.
+# link libpython — the crate's behavior is covered by the pytest suite, apart
+# from the bounded batch driver (`src/batch.rs`) and the cancellable pull
+# (`src/cancel.rs`), both free of Python types, which `tests/batch.rs` and
+# `tests/cancel.rs` compile on their own.
 [lib]
 name = "_native"
 crate-type = ["cdylib"]
@@ -21,8 +24,9 @@ doctest = false
 
 [dependencies]
 vortex-rdf-core = {workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
+futures = { workspace = true }
 vortex-buffer.workspace = true
 arrow-pyarrow = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true }
@@ -37,3 +41,6 @@ arrow = [
     "dep:arrow-cast",
     "vortex-rdf-core/arrow",
 ]
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"

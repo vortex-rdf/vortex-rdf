@@ -17,7 +17,13 @@ crate-type = ["cdylib", "rlib"]
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ['-O1']
 
+[features]
+# Bench builds only (js/pkg/bench): installs the counting global allocator.
+# Never enabled for the published package.
+memory-stats = ["dep:bench-memory-stats"]
+
 [dependencies]
+bench-memory-stats = { path = "bench/memory-stats", features = ["wasm"], optional = true }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures = "0.4.76"
 js-sys.workspace = true
@@ -31,7 +37,6 @@ console_error_panic_hook.workspace = true
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 oxrdf.workspace = true
-oxrdfio.workspace = true
 
 # The core dependency is target-conditional so that the crate builds on both
 # targets it is checked against. WebAssembly has no filesystem, so the wasm

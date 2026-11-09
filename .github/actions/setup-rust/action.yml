@@ -1,0 +1,31 @@
+name: Setup Rust
+description: >-
+  Installs the Rust toolchain every workflow builds with. Its version is pinned
+  here and nowhere else: a tool that installs its own toolchain, such as
+  maturin-action, takes the version from the `toolchain` output.
+
+inputs:
+  components:
+    description: Extra rustup components, comma-separated (for example "rustfmt, clippy")
+    required: false
+    default: ""
+  targets:
+    description: Extra rustup targets, comma-separated (for example "wasm32-unknown-unknown")
+    required: false
+    default: ""
+
+outputs:
+  toolchain:
+    description: Rustup's name for the pinned toolchain, the version number dtolnay/rust-toolchain reports
+    value: ${{ steps.toolchain.outputs.name }}
+
+runs:
+  using: composite
+  steps:
+    # The action's ref is the toolchain: dtolnay/rust-toolchain keeps one ref
+    # per Rust release, and installs it as the job's default toolchain.
+    - id: toolchain
+      uses: dtolnay/rust-toolchain@1.99.1
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}

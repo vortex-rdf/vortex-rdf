@@ -2,30 +2,33 @@
 [![Crates.io](https://img.shields.io/crates/v/vortex-rdf-core.svg)](https://crates.io/crates/vortex-rdf-core)
 [![npm](https://img.shields.io/npm/v/@vortex-rdf/vortex-rdf-store.svg)](https://www.npmjs.com/package/@vortex-rdf/vortex-rdf-store)
 [![PyPI](https://img.shields.io/pypi/v/vortex-rdf.svg)](https://pypi.org/project/vortex-rdf/)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.vortex-rdf/vortex-rdf.svg)](https://central.sonatype.com/artifact/io.github.vortex-rdf/vortex-rdf)
 [![docs.rs](https://img.shields.io/docsrs/vortex-rdf-core)](https://docs.rs/vortex-rdf-core)
+[![javadoc](https://javadoc.io/badge2/io.github.vortex-rdf/vortex-rdf/javadoc.svg)](https://javadoc.io/doc/io.github.vortex-rdf/vortex-rdf)
 [![License](https://img.shields.io/crates/l/vortex-rdf-core)](https://github.com/vortex-rdf/vortex-rdf/blob/main/LICENSE)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/vortex-rdf/vortex-rdf?utm_source=badge)
 [![CI](https://github.com/vortex-rdf/vortex-rdf/actions/workflows/ci.yml/badge.svg)](https://github.com/vortex-rdf/vortex-rdf/actions/workflows/ci.yml)
 
-Vortex-RDF is a columnar RDF serialization and a queryable quad store built on the [Vortex](https://docs.vortex.dev) data format. It converts any RDF syntax [`oxrdfio`](https://docs.rs/oxrdfio/latest/oxrdfio/) reads into a compact, self-describing `.vortex` file (or the same bytes in memory) and queries it in place — zero-copy, without decompressing what a pattern does not touch — from Rust, a CLI, JavaScript/WebAssembly and Python.
+Vortex-RDF is a columnar RDF serialization and a queryable quad store built on the [Vortex](https://docs.vortex.dev) data format. It converts any RDF syntax [`oxrdfio`](https://docs.rs/oxrdfio/latest/oxrdfio/) reads into a compact, self-describing `.vortex` file (or the same bytes in memory) and queries it in place — zero-copy, without decompressing what a pattern does not touch — from Rust, a CLI, JavaScript/WebAssembly, Python and Java.
 
 ## Key features
 
 - 📊 **Columnar storage**: quads are [Vortex](https://docs.vortex.dev/specs/file-format) arrays, on disk and in memory alike, with the same layout in both.
-- ♻️ **Zero-copy reads**: opening a file is lazy, and pattern filters are pushed down into the scan so only the touched chunks are read.
+- ♻️ **Zero-copy reads**: opening a file memory-maps it and reads only its footer (and, under the Dictionary layout, the dictionary's window bounds), and pattern filters are pushed down into the scan so only the touched chunks are read.
 - 📦 **Adaptive compression**: Vortex picks per-column encodings (FSST, dictionary, run-length, bit-packing, …) and decompresses just in time.
 - ☄️ **Streaming, out-of-core ingestion**: datasets larger than RAM are globally sorted through an external merge sort with bounded memory.
 - 🍀 **RDF 1.1 quads**: named graphs `(s, p, o, g)`, blank nodes, language-tagged and typed literals.
-- 🌍 **Cross-platform**: one Rust core behind a CLI, WebAssembly bindings for Node.js and browsers, and Python bindings.
+- 🌍 **Cross-platform**: one Rust core behind a CLI, WebAssembly bindings for Node.js and browsers, and Python and Java bindings.
 
 ## Install
 
 | Surface | Install | Notes |
 |---|---|---|
-| Rust | `cargo add vortex-rdf-core` | the default `file-io` feature adds path-based file reading/writing on Tokio; add `--no-default-features` on wasm, where stores are exchanged as bytes |
+| Rust | `cargo add vortex-rdf-core` | native builds need the default `file-io` feature (path-based file reading/writing on Tokio); add `--no-default-features` on wasm32, where stores are exchanged as bytes |
 | CLI | `cargo install vortex-rdf-cli` | |
 | JavaScript | `npm install @vortex-rdf/vortex-rdf-store` | [js/README.md](js/README.md) |
 | Python | `pip install vortex-rdf` | [python/README.md](python/README.md); [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) builds an rdflib integration on it |
+| Java | `io.github.vortex-rdf:vortex-rdf` on Maven Central, from 0.14.0 (before it, build from source) | [java/README.md](java/README.md); a JNI library and the `org.vortexrdf` API, for any JVM program |
 
 ## Quick start
 
@@ -34,6 +37,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 ```rust no_run
 use oxrdf::NamedNode;
 use oxrdfio::RdfFormat;
+use std::io::{BufWriter, Write};
 use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore, export_rdf};
 use vortex_rdf_core::{common::terms::parse_quads_from_reader, io::quads_stream_to_vortex_file};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,7 +48,7 @@ let quads = parse_quads_from_reader(std::fs::File::open("data.ttl")?, RdfFormat:
 let indexes = vec![IndexType::SecondaryByReference];
 quads_stream_to_vortex_file(quads, "data.vortex".as_ref(), LayoutStrategy::Dictionary, indexes).await?;
 
-// Open it lazily: nothing is read until a query runs
+// Open it memory-mapped: a query reads only the pages it touches
 let store = VortexRdfStore::from_file("data.vortex").await?;
 
 // Match a pattern; the filter is pushed down into the file scan
@@ -52,8 +56,10 @@ let knows = NamedNode::new("http://xmlns.com/foaf/0.1/knows")?;
 let matched = store.match_pattern(None, Some(&knows), None, None).await?;
 println!("{} matches", matched.size().await?);
 
-// Export the matches back to textual RDF
-export_rdf(matched, std::fs::File::create("knows.nq")?, RdfFormat::NQuads).await?;
+// Export the matches back to textual RDF; the writer is the caller's to buffer and flush
+let mut out = BufWriter::new(std::fs::File::create("knows.nq")?);
+export_rdf(matched, &mut out, RdfFormat::NQuads).await?;
+out.flush()?;
 # Ok::<(), Box<dyn std::error::Error>>(()) })?; Ok(()) }
 ```
 
@@ -124,14 +130,31 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 }
 ```
 
+**Java** (`io.github.vortex-rdf:vortex-rdf` on Maven Central from 0.14.0; see [java/README.md](java/README.md#install)):
+
+```java
+import java.nio.file.Paths;
+import org.vortexrdf.VortexRdfStore;
+
+try (VortexRdfStore store = VortexRdfStore.open(Paths.get("data.vortex"))) {   // memory-mapped, layout auto-detected
+    store.size();                                                         // number of quads
+    store.count(null, "<http://xmlns.com/foaf/0.1/name>", null, null);    // match count, no terms materialized
+    for (String[] quad : store.quads(null, "<http://xmlns.com/foaf/0.1/name>", null, null)) {
+        System.out.println(quad[0] + " " + quad[2]);                      // {s, p, o, g}
+    }
+}
+```
+
 ## Main concepts overview
 
-- **Column layouts** — `Default` stores the four terms as N-Triples strings; `TypedObject` splits the object into kind/value/datatype/language columns; `Dictionary` stores `u32` codes into one sorted term dictionary, held as the file's `dictionary` child and point-read through its chunk leaves when it stays file-backed. See [docs/file-format.md §4–5](docs/file-format.md#4-the-quad-table).
+- **Column layouts** — `Default` stores the four terms as N-Triples strings; `TypedObject` splits the object into kind/value/datatype/language columns; `Dictionary` stores `u64` codes into one sorted term dictionary of at most `i32::MAX` terms, held as the file's `dictionary` child and read in place from the mapped file, one FSST window at a time. See [docs/file-format.md §4–5](docs/file-format.md#4-the-quad-table).
 - **Secondary indexes** — `SecondaryByCopy` keeps two extra copies of the quads sorted by `(p, o, s, g)` and `(o, s, p, g)`; `SecondaryByReference` keeps sorted `{val, rid}` pairs for predicates and objects. In memory they are binary-searched; in a file, a run is located by a chunk-probe binary search, then range-scanned or point-read. See [docs/file-format.md §6](docs/file-format.md#6-the-index-children) and [docs/matching.md §8](docs/matching.md#8-the-index-resolvers).
-- **Builders** — every build sorts globally by `(s, p, o, g)`: in memory on wasm, out of core (spilling sorted runs to disk) everywhere a filesystem exists. See [docs/serialization.md](docs/serialization.md).
-- **The store** — a base (array or lazily scanned file) plus a view: a row selection, tombstone masks and an append tail; `match_pattern` routes each bound position to the cheapest path (subject prefix probe, index, pushed-down filter, mask scan) and matches the tail independently. See [docs/matching.md](docs/matching.md).
-- **Mutations & compaction** — additions are accumulated in the `Tail`, deletions are `Tombstone` rows, nothing is rewritten until a compaction rebuilds one sorted, indexed base (automatically once the tail outgrows its thresholds). See [docs/mutations.md](docs/mutations.md).
-- **The `.vortex` container** — one self-describing Vortex file: the quad table, the `dictionary` child and the index children under a `vortex-rdf.store.v1` root, also the byte-exchange format of the bindings. See [docs/file-format.md](docs/file-format.md).
+- **Builders** — every build sorts globally by `(s, p, o, g)`: in memory on wasm, out of core (spilling sorted runs to disk) everywhere a filesystem exists. A built store holds each quad once and each term once, in its canonical spelling. See [docs/serialization.md](docs/serialization.md).
+- **The store** — a base (array or memory-mapped file) plus a view: a row selection, tombstone masks and an append tail; `match_pattern` routes each bound position to the cheapest path (subject prefix probe, index, pushed-down filter, mask scan) and matches the tail independently. See [docs/matching.md](docs/matching.md).
+- **Narrowing beyond a pattern** — `keep` restricts a view to a code set or range per column (a `VALUES` block, a term predicate's codes, a namespace) inside the store; `window`/`size_capped`/`exists` stop a filtered file scan at the first block that fills a `LIMIT` or answers an `ASK`; `match_many` batches probes; `DictReader` serves the dictionary — read in place from a memory-mapped file, or held in memory — with `prefix_range`, candidate `filter_codes` (FILTER predicates over the codes a query produced, including `regex`, `contains`, `strstarts`, `strends`) and a spelling-tolerant `encode`. See [docs/matching.md §16](docs/matching.md#16-narrowing-beyond-a-pattern).
+- **Interfaces for a query engine** — `row_chunks`/`code_chunks` stream a view's columns without Arrow (`UInt64` codes under the Dictionary layout); `view_statistics`, `partitions`, `generation` and `dictionary_id` tell a planner what a view holds and when its codes stop applying; vortex's own reader opens a store file as its quad table through `vortex_session()`. See [docs/interfaces.md](docs/interfaces.md).
+- **Mutations & compaction** — additions are accumulated in the `Tail`, deletions set tombstone bits, nothing is rewritten until a compaction rebuilds one sorted, indexed base (automatically once the tail outgrows its thresholds). See [docs/mutations.md](docs/mutations.md).
+- **The `.vortex` container** — one self-describing Vortex file: the quad table, the `dictionary` child and the index children under a `vortex-rdf.store.v2` root, also the byte-exchange format of the bindings. See [docs/file-format.md](docs/file-format.md).
 
 ## Read more
 
@@ -141,8 +164,10 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 | [docs/matching.md](docs/matching.md) | how a quad pattern is resolved on each backend, and what each path costs |
 | [docs/serialization.md](docs/serialization.md) | how a store is built and written: both sort pipelines, columns per layout, index builds |
 | [docs/mutations.md](docs/mutations.md) | the merge-on-read model: tail, tombstones, compaction and auto-compaction |
+| [docs/interfaces.md](docs/interfaces.md) | the contract an external query engine reads the store through: chunk streams, runtimes, view statistics, native narrowing, snapshots, a store file through vortex's reader |
 | [js/README.md](js/README.md) | the JavaScript/WebAssembly bindings |
 | [python/README.md](python/README.md) | the Python bindings |
+| [java/README.md](java/README.md) | the Java bindings |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | git hooks, the local CI mirror, doc-anchor checks, changelog generation |
 | [CHANGELOG.md](CHANGELOG.md) | release history |
 

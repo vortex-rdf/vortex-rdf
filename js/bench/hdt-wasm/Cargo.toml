@@ -10,13 +10,16 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
-# The same version the Rust comparative bench uses (core dev-dependency), so
-# the two tabs' hdt rows measure the same implementation.
+# The same version the Rust comparative bench uses (bench-compare/Cargo.toml),
+# so the two tabs' hdt rows measure the same implementation, and the version of
+# the CLI that builds the file this reads (HDT_CLI_VERSION in scripts/refresh.sh).
 hdt = "0.7"
 wasm-bindgen = "0.2"
 # Transitive dependency of hdt; on wasm32 it must be told its randomness source
 # explicitly. Enabling the feature here unifies it into the whole build.
 uuid = { version = "1", features = ["js"] }
+# The counting allocator and its memoryStats exports; always linked here.
+bench-memory-stats = { path = "../memory-stats", features = ["wasm"] }
 
 # Standalone: deliberately NOT a member of the repo's cargo workspace. Only
 # `npm run build:hdt-wasm` builds it, for the wasm32 target, and its dependency

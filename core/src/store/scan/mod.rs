@@ -1,23 +1,39 @@
-//! The store's query-execution tier: turning a view (a selection plus
-//! residual constraints) into the concrete rows that match it.
+//! Executing a view against a backend: a selection plus residual constraints
+//! turned into the rows that match. In memory, `typed_eq` holds the typed
+//! residual-equality paths (slice compares over canonical code columns,
+//! encoded-search point reads otherwise, view compares for strings),
+//! `residual` the residual compare that tries them before its mask scan, and
+//! `gather` the tombstone-aware gather of a selection's rows. On file,
+//! `file_exprs` builds the pushed-down filters, `file_scans` drives row scans
+//! and maps a [`RowSelection`] onto vortex's scan knobs, `file_filter`
+//! evaluates a filter split by split and computes statistics-only pruning
+//! envelopes, `subject_runs` locates runs of the sorted subject column,
+//! `read_plan` chooses how an exact selection's rows are read, and
+//! `file_reads` reads them by id through the file's cached chunk probes,
+//! and `column_reads` one chunked column's codes at positions. A
+//! fold that may stop at its first matches, on either side, cuts its rows
+//! into the growing pieces of `pieces`. The
+//! point-read paths on both sides decline above a selection width to the
+//! vectorized pipeline. The row-set algebra itself is in
+//! [`selection`](super::view::selection).
 //!
-//! `typed_eq` is the in-memory half — typed residual-equality fast paths over
-//! a base's columns: slice compares where a code column is canonical,
-//! encoded-search point reads where it is not, view-level compares for string
-//! columns. `file_scan` is the file-backed half — per-split filter evaluation,
-//! statistics-only pruning envelopes, pushed-down filter construction, row and
-//! component gathers through the file's cached column-chunk probes, and the
-//! translation of a [`RowSelection`] onto vortex's scan knobs. `gather` turns
-//! a selection into rows out of an in-memory base (tombstone-aware, with the
-//! point-read path small selections take). The point-read
-//! paths on both sides are gated on selection width, declining to the
-//! vectorized mask pipeline above it. The row-set algebra itself stays in
-//! [`selection`](super::selection); what lives here is its execution against
-//! a backend.
-//!
-//! [`RowSelection`]: super::selection::RowSelection
+//! [`RowSelection`]: super::view::selection::RowSelection
 
 #[cfg(feature = "file-io")]
-pub(crate) mod file_scan;
+pub(crate) mod column_reads;
+#[cfg(feature = "file-io")]
+pub(crate) mod file_exprs;
+#[cfg(feature = "file-io")]
+pub(crate) mod file_filter;
+#[cfg(feature = "file-io")]
+pub(crate) mod file_reads;
+#[cfg(feature = "file-io")]
+pub(crate) mod file_scans;
 pub(crate) mod gather;
+pub(crate) mod pieces;
+#[cfg(feature = "file-io")]
+pub(crate) mod read_plan;
+pub(crate) mod residual;
+#[cfg(feature = "file-io")]
+pub(crate) mod subject_runs;
 pub(crate) mod typed_eq;

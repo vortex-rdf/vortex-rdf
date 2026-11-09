@@ -4,16 +4,23 @@
 Bounds search and point access over compressed [Vortex](https://github.com/spiraldb/vortex)
 arrays, without decoding them.
 
-Vortex's generic `search_sorted` is correct for every encoding, but it goes
-through the compute kernel machinery: an `ExecutionCtx`, scalar boxing, and —
-for encodings without a specialised kernel — canonicalization of the array
-being searched. When the column is a sorted, non-nullable unsigned integer
-column (a dictionary code column, a row-id column, an index key), that adds significan overhead to answer  queries like "where does value `v` start and end".
+Vortex's `search_sorted` is correct for every encoding, but in Vortex 0.90 it
+is one bisection over point reads: each read goes through the array's probe
+with an `ExecutionCtx` and comes back as a `Scalar` (the typed
+`SearchSortedPrimitiveArray` compares values as their type but reads them the
+same way), and the encoding answers every read on its own: a run-end array
+bisects its run ends on each one, a delta array decodes a 1,024-value block.
+When the column is a sorted, non-nullable unsigned integer column (a
+dictionary code column, a row-id column, an index key), that adds significant
+overhead to queries like "where does value `v` start and end".
 
 This crate resolves such an array once into a borrowed tree of typed probe
 nodes, then answers queries against the compressed representation directly:
-slice reads, integer arithmetic, and single bit-packed word extraction. No
-`ExecutionCtx`, no scalars, no canonicalization, no allocation per query.
+slice reads, integer arithmetic, and bit-packed extraction (one word for a
+point read, the covered parts of a 1,024-value chunk for a bulk read), with
+the search pushed into the encoding where it allows (a frame of reference
+shifts the needle, a run-end column bisects its run ends once). No
+`ExecutionCtx`, no scalars, no allocation per query.
 
 It is not RDF-specific: it is independent from
 [vortex-rdf](https://github.com/vortex-rdf/vortex-rdf), which uses it to probe
@@ -27,6 +34,7 @@ use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex_btrblocks::schemes::integer::{RunEndScheme, SequenceScheme};
 use vortex_rdf_encoded_search::SortedProbe;
 use vortex_session::VortexSession;
 
@@ -34,11 +42,15 @@ let session = VortexSession::empty()
     .with::<ArraySession>()
     .with::<ScalarFnSession>();
 let mut ctx = session.create_execution_ctx();
-let compressor = BtrBlocksCompressorBuilder::default().build();
+let compressor = BtrBlocksCompressorBuilder::empty()
+    .with_new_scheme(&RunEndScheme)
+    .with_new_scheme(&SequenceScheme)
+    .build();
 
-// A sorted column with 11-row runs, compressed into whatever encoding
-// BtrBlocks picks for it (here: run-end, over frame-of-reference
-// bit-packed values and a sequence of run ends).
+// A sorted column with 11-row runs, compressed into whatever encoding the
+// cascade picks for it (here: run-end, with its values a sequence and its
+// run ends left plain: the last run holds only two rows, so the ends are no
+// sequence).
 let data: Vec<u32> = (0..2_097_152).map(|i| (i / 11) as u32).collect();
 let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
 let encoded = compressor.compress(&canonical, &mut ctx)?;
@@ -48,6 +60,12 @@ let probe = SortedProbe::resolve(&encoded).expect("supported encoding tree");
 
 assert_eq!(probe.bounds(1_000), (11_000, 11_011));
 assert_eq!(probe.value_at(11_000), 1_000);
+
+// Read a range in one pass: the run-end node finds the range's first run
+// once and walks the runs from there.
+let mut values = [0; 4];
+probe.read_into(10_999, &mut values);
+assert_eq!(values, [999, 1_000, 1_000, 1_000]);
 
 // Restrict a search to a window — useful when a column is sorted only
 // within the run of a preceding key.
@@ -62,14 +80,34 @@ search path. Supporting a new encoding is therefore always additive.
 
 If the probe must outlive the borrow of the array (caching it beside the data,
 for instance), `OwnedSortedProbe` holds the `ArrayRef` and the probe tree
-together in one self-referential value.
+together in one self-referential value; its `probe()` is the `SortedProbe`
+every query goes through.
 
 ## Supported encodings
 
-`Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR`, `BitPacked` (including
-its patches), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the
-transparent `Shared` wrapper resolves to whatever it wraps. `NodeKind` reports
-the resolved tree's shape for tests and diagnostics.
+`Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR` (with one reference for
+the whole array, or one per 1,024-value chunk: the `fastlanes.for.v2` wire
+form), `BitPacked` (with one bit width, including its patches), `Delta`
+(FastLanes delta, decoded one 1,024-value block at a time on first touch),
+`Slice`, `Chunked`, `Dict`, `Sparse` (a fill value with patches) and FastLanes
+run-length (`fastlanes.rle`: per 1,024-value chunk, run values and an index
+per position into them), composed arbitrarily; the transparent `Shared`
+wrapper (which Vortex keeps in `vortex-layout`) resolves to whatever it
+wraps. `NodeKind` reports the resolved tree's shape for tests and
+diagnostics. Bit-packing with a width per block (the `fastlanes.bitpacked.v2`
+wire form) declines: BtrBlocks' bit-packing scheme picks a width per 1,024-value
+block wherever the blocks' best widths differ when its builder allows that form,
+as `empty()` does, and no Vortex core edition includes it.
+A frame of reference per chunk, a sparse array and a run-length array have no
+order-preserving map from a needle to their children, so their bounds searches
+probe the composed values. When its
+builder allows `fastlanes.for.v2`, BtrBlocks' frame-of-reference scheme
+computes a reference per chunk, and an array whose chunk minima differ keeps
+them (one whose references come out constant is still single-reference
+`fastlanes.for`). `empty()` allows every wire form; `from_session` allows those
+both registered in the session and included in an edition it enables, and no
+Vortex core edition includes `fastlanes.for.v2`: files written before the
+writer was limited to an edition can still hold it.
 
 ## The sortedness contract
 
@@ -77,19 +115,40 @@ the resolved tree's shape for tests and diagnostics.
 ascending. This is a caller contract, exactly as it is for
 `slice::partition_point`: an unsorted array yields an unspecified — but never
 panicking, never unsound — answer. `bounds_in` requires only its window to be
-sorted, and never reads a row outside it. `value_at` is exact regardless of
-order.
+sorted, and never reads a row outside it. `value_at`, and `read_into` and
+`read_at` (a range, or a list of indices, each run of consecutive indices read
+in one pass: a run-end node's first run found once, a bit-packed node's
+1024-value chunks unpacked whole where the run takes more than a measured
+crossover of them and its patches searched once, a delta node's decoded blocks
+copied), are exact regardless of order.
+
+Searches over ascending codes in a run-end node's values, and a `bounds_in`
+window's lower bound, interpolate: once a probe has landed on each side of the
+needle, a few splits go where an even spread between the two values puts it,
+and the rest of the window is bisected. The answer is the bisection's; codes
+spread about evenly cost a few reads instead of one per halving, while
+plateaus and windows of 16 values or fewer cost what bisection does. A
+`bounds_in` window's upper bound is then bisected for between its lower bound
+and the nearest row the lower search found past the needle: a few rows when
+the needle's rows are few. A bit-packed node's `bounds`, and a frame of
+reference's over one (the needle less the reference), search the same way.
 
 ## The `layout` feature
 
 Off by default. With it, `ColumnChunks` extends the same treatment to a column
 inside a written Vortex file: it locates one field's flat chunk leaves in a
-layout tree, then answers global bounds queries and point reads by fetching
-only the chunks a binary search over chunk extremes actually touches. Each
-fetched chunk is reconstructed in its wire encoding (`SerializedArray::decode`
-rebuilds metadata over the segment buffers — it does not decompress), resolved
-into a probe once, and cached, so repeated queries against a hot file do no
-further I/O.
+layout tree, then answers global lower bounds, bounds queries, point reads and
+takes at ascending rows by fetching only the chunks a binary search over the
+chunks' last values, or the rows, actually touch; a take has each leaf take its
+rows from its array. A `bounds_in` window is searched inside the leaf holding
+its lower bound, which the leaves' last values pick, and `leaf_rows` hands
+back a window inside one leaf as a `LeafRows`, whose bounds searches and point
+reads go through that leaf's probe without finding the leaf again. `values_at`
+reads any list of rows, finding each leaf once for the rows that follow one
+another in it and reading each run of consecutive rows in one pass. Each fetched chunk is reconstructed in its wire encoding
+(`SerializedArray::decode` rebuilds metadata over the segment buffers — it does
+not decompress), resolved into a probe once, and cached, so repeated queries
+against a hot file do no further I/O.
 
 A column the writer dictionary-encoded at the layout level (a `vortex.dict`
 node — a values leaf beside a codes subtree, possibly one of a chunked run of
@@ -98,29 +157,28 @@ the dictionary's values, fetched once and shared, into a dictionary array the
 probe resolves like any other. Because the probe's dictionary node bisects the
 decoded values, the order the writer assigned codes in never matters.
 
+The walk and the fetch beneath `ColumnChunks` serve columns of any dtype:
+`flat_leaves` lists the flat leaves holding a column's rows (a `FlatLeaf` is
+the leaf, its first row, and the values leaf of the dictionary whose codes it
+holds, if any), and `fetch_flat` reads one leaf's array in its wire encoding.
+
 ```console
 cargo add vortex-rdf-encoded-search --features layout
 ```
 
 ## Performance
 
-Measured against Vortex 0.85 with [`benches/probe.rs`](./benches/probe.rs) (fastest of 100
-samples, Intel Core Ultra 7 155H, 2026-08). One two-sided `bounds` query on a
-2M-row column, by fixture:
+[`benches/probe.rs`](./benches/probe.rs) times two-sided `bounds` queries on
+a 2M-row column per fixture (`runend_2m`, `for_bitpacked_2m`, `dict_2m`)
+against Vortex's `search_sorted` (typed and by `Scalar`) and a
+`partition_point` over the decoded column, plus the one-time cost of resolving
+a probe. One query, on a 4-core VM:
 
-| Fixture | `SortedProbe::bounds` | Vortex `search_sorted` | Decoded `Vec<u32>` (`partition_point`) |
-|---|---|---|---|
-| `runend_2m` | 0.69 µs | 249 µs | 0.08 µs |
-| `for_bitpacked_2m` | 0.39 µs | 14.4 µs | 0.07 µs |
-| `dict_2m` | 0.31 µs | 13.2 µs | 0.07 µs |
-
-The gap against the generic kernel is widest on `runend_2m` (~360×), where
-Vortex has no specialised `search_sorted` kernel and canonicalizes all 2M rows
-on every call; where a kernel does exist it is ~40×. Either way the probe stays
-within 4–9× of a fully decoded binary search while leaving the column
-compressed, and resolving one costs 130–240 ns, once. The figures are refreshed on every new release.
-
-Reproduce with:
+| Fixture | Probe | Vortex, typed | Vortex, `Scalar` | `partition_point` on decoded values |
+|---|---|---|---|---|
+| `runend_2m` | 0.04 µs | 4.7 ms | 4.8 ms | 0.21 µs |
+| `for_bitpacked_2m` | 0.25 µs | 268 µs | 270 µs | 0.19 µs |
+| `dict_2m` | 0.47 µs | 9.2 µs | 7.7 µs | 0.17 µs |
 
 ```console
 cargo bench -p vortex-rdf-encoded-search --bench probe
@@ -128,8 +186,7 @@ cargo bench -p vortex-rdf-encoded-search --bench probe
 
 ## Compatibility
 
-Each release tracks Vortex new releases. This release is built
-against Vortex `0.85`.
+Built against Vortex `0.90`.
 
 Minimum supported Rust version: 1.95 (edition 2024).
 

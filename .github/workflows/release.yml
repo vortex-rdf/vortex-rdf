@@ -11,10 +11,12 @@ name: Release
 #              members and orders deps)
 #   npm        @vortex-rdf/vortex-rdf-store      (js/, wasm-pack build)
 #   PyPI       vortex-rdf                        (python/, maturin abi3 wheels)
+#   Maven      io.github.vortex-rdf:vortex-rdf   (java/, one jar holding the
+#   Central                                       JNI library of five platforms)
 #
-# All three use GitHub OIDC trusted publishing — no long-lived tokens. Each
-# registry must be configured once to trust this repo, this workflow file
-# (release.yml) and the "release" GitHub environment:
+# crates.io, npm and PyPI use GitHub OIDC trusted publishing — no long-lived
+# tokens. Each of them must be configured once to trust this repo, this
+# workflow file (release.yml) and the "release" GitHub environment:
 #   crates.io: crate Settings -> Trusted Publishing
 #   npm:       package Settings -> Trusted publisher
 #   PyPI:      project publishing settings (pending publisher for vortex-rdf)
@@ -26,8 +28,17 @@ name: Release
 # and only then let a tag drive it — otherwise `cargo publish --workspace`
 # fails on that member and takes the whole crates.io job with it.
 #
+# Maven Central has no trusted publishing: the maven job signs every file with
+# a GPG key and uploads with a Central Portal user token, four secrets of the
+# "release" environment: MAVEN_GPG_KEY (the armored private key, whose primary
+# key signs), MAVEN_GPG_PASSPHRASE, and MAVEN_CENTRAL_USERNAME and
+# MAVEN_CENTRAL_PASSWORD (the token's two halves). The io.github.vortex-rdf
+# namespace is verified on the Central Portal. A version published to Central
+# can never be changed or removed.
+#
 # dry_run builds everything and runs the registries' dry-run modes without
-# publishing (PyPI has no dry run: its publish job is skipped instead).
+# publishing (PyPI has no dry run: its publish job is skipped instead; Maven
+# builds and signs the jar and uploads nothing).
 
 on:
   push:
@@ -47,6 +58,10 @@ on:
         description: "Publish vortex-rdf to PyPI"
         type: boolean
         default: false
+      maven:
+        description: "Publish io.github.vortex-rdf:vortex-rdf to Maven Central"
+        type: boolean
+        default: false
       dry_run:
         description: "Build and validate only; publish nothing"
         type: boolean
@@ -56,23 +71,30 @@ permissions:
   contents: read
 
 jobs:
-  # The full CI suite runs against the exact ref being released; every
-  # publish job is gated on it. Dispatching from a commit whose CI was
-  # skipped (docs-only path filters) or never ran is therefore still safe.
+  # The full CI suite and the doc-anchor check run against the exact ref
+  # being released; every publish job is gated on both. Dispatching from a
+  # commit whose CI was skipped (docs-only path filters) or never ran is
+  # therefore still safe.
   ci:
     name: CI
     uses: ./.github/workflows/ci.yml
 
-  # The three registries carry independently declared versions. This job fails
-  # before any of them is touched when they disagree with the tag being pushed
-  # (or, on workflow_dispatch, with each other).
+  docs:
+    name: Docs
+    uses: ./.github/workflows/docs.yml
+
+  # Three files declare the version: the workspace Cargo.toml (which the PyPI
+  # package inherits through maturin's dynamic version), js/package.json and
+  # java/pom.xml.
+  # This job fails before any registry is touched when they disagree with the
+  # tag being pushed (or, on workflow_dispatch, with each other).
   verify-versions:
     name: Verify versions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
       - name: Compare declared versions
         run: |
           set -euo pipefail
@@ -80,10 +102,7 @@ jobs:
           cargo_version="$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "vortex-rdf-core") | .version')"
           npm_version="$(node -p "require('./js/package.json').version")"
-          # [project].version is optional: with maturin's dynamic versioning the
-          # PyPI version is inherited from the workspace Cargo.toml, so the cargo
-          # check below already covers it.
-          pypi_version="$(python3 -c "import tomllib; print(tomllib.load(open('python/pyproject.toml','rb'))['project'].get('version', ''))")"
+          java_version="$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' java/pom.xml | head -n 1)"
 
           if [ "${{ github.event_name }}" = "push" ]; then
             expected="${GITHUB_REF_NAME#v}"
@@ -103,11 +122,7 @@ jobs:
           }
           check "Cargo.toml (workspace)" "$cargo_version"
           check "js/package.json" "$npm_version"
-          if [ -n "$pypi_version" ]; then
-            check "python/pyproject.toml" "$pypi_version"
-          else
-            echo "  python/pyproject.toml: inherited from Cargo.toml"
-          fi
+          check "java/pom.xml" "$java_version"
           exit "$fail"
 
   # A tag push publishes everywhere: the inputs.* context is empty on push
@@ -115,7 +130,7 @@ jobs:
   # gate ORs in the event check.
   crates:
     name: crates.io
-    needs: [ci, verify-versions]
+    needs: [ci, docs, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.crates }}
     runs-on: ubuntu-latest
     environment: release
@@ -124,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
       - name: Authenticate with crates.io
         if: ${{ !inputs.dry_run }}
         id: auth
@@ -136,7 +151,7 @@ jobs:
 
   npm:
     name: npm
-    needs: [ci, verify-versions]
+    needs: [ci, docs, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.npm }}
     runs-on: ubuntu-latest
     environment: release
@@ -150,7 +165,7 @@ jobs:
           node-version-file: .tool-versions
           registry-url: "https://registry.npmjs.org"
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-unknown-unknown
       # wasm-pack is a pinned npm devDependency; `npm ci` installs it and npm
@@ -164,7 +179,7 @@ jobs:
 
   pypi-wheels:
     name: PyPI wheel (${{ matrix.platform.name }})
-    needs: [ci, verify-versions]
+    needs: [ci, docs, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.pypi }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -173,24 +188,33 @@ jobs:
         platform:
           - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64 }
           - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64 }
-          - { name: macos-arm64, runner: macos-14, target: aarch64 }
+          # macos-15, Apple Silicon: GitHub retired macos-14 on 2026-11-02, and
+          # its jobs are cancelled before they start (v0.15.0's tag run).
+          - { name: macos-arm64, runner: macos-15, target: aarch64 }
           # GitHub retired the Intel macos-13 runner (jobs queue forever), so
           # the x86_64 wheel is cross-compiled on Apple Silicon: maturin-action
           # installs the x86_64-apple-darwin Rust target, and bindgen picks the
           # arch up from $TARGET. The transitional macos-15-intel runner would
           # build natively but sunsets in 2027.
-          - { name: macos-x86_64, runner: macos-14, target: x86_64 }
+          - { name: macos-x86_64, runner: macos-15, target: x86_64 }
           - { name: windows-x64, runner: windows-latest, target: x64 }
     steps:
       - uses: actions/checkout@v7
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15"
+      # maturin-action installs the toolchain it builds with itself: inside the
+      # manylinux container on Linux, on the runner on macOS and Windows. Its
+      # rust-toolchain input takes the pinned version from setup-rust's output.
+      - name: Setup Rust toolchain
+        id: rust
+        uses: ./.github/actions/setup-rust
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
+          rust-toolchain: ${{ steps.rust.outputs.toolchain }}
           args: --release --strip --out dist --manifest-path python/Cargo.toml
           # vortex-io's custom-labels build-dep runs bindgen, which needs
           # libclang inside the build container. The manylinux2014 image that
@@ -206,7 +230,7 @@ jobs:
 
   pypi-sdist:
     name: PyPI sdist
-    needs: [ci, verify-versions]
+    needs: [ci, docs, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.pypi }}
     runs-on: ubuntu-latest
     steps:
@@ -230,11 +254,155 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # Its own artifacts only: the run also holds the Java jobs' libraries.
       - uses: actions/download-artifact@v8
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: dist
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+
+  # The JNI library the Java jar carries, one per platform. Linux builds in the
+  # manylinux_2_28 image the PyPI wheels use, so the library needs glibc 2.28
+  # or later, with clang installed for bindgen as there.
+  jni-linux:
+    name: JNI library (${{ matrix.platform }})
+    needs: [ci, docs, verify-versions]
+    if: ${{ github.event_name == 'push' || inputs.maven }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, runner: ubuntu-latest, image: quay.io/pypa/manylinux_2_28_x86_64 }
+          - { platform: linux-aarch64, runner: ubuntu-24.04-arm, image: quay.io/pypa/manylinux_2_28_aarch64 }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install clang (bindgen)
+        run: dnf install -y clang-devel
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Build the JNI library
+        run: cargo build --release --locked -p vortex-rdf-java
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jni-${{ matrix.platform }}
+          path: target/release/libvortex_rdf_jni.so
+          if-no-files-found: error
+
+  # macOS (Intel cross-compiled on Apple Silicon, as for the wheels, on the
+  # same macos-15 runner) and Windows.
+  jni-macos-windows:
+    name: JNI library (${{ matrix.platform }})
+    needs: [ci, docs, verify-versions]
+    if: ${{ github.event_name == 'push' || inputs.maven }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: macos-aarch64, runner: macos-15, target: aarch64-apple-darwin, file: libvortex_rdf_jni.dylib }
+          - { platform: macos-x86_64, runner: macos-15, target: x86_64-apple-darwin, file: libvortex_rdf_jni.dylib }
+          - { platform: windows-x86_64, runner: windows-latest, target: x86_64-pc-windows-msvc, file: vortex_rdf_jni.dll }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build the JNI library
+        run: cargo build --release --locked -p vortex-rdf-java --target ${{ matrix.target }}
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jni-${{ matrix.platform }}
+          path: target/${{ matrix.target }}/release/${{ matrix.file }}
+          if-no-files-found: error
+
+  # One jar holding the five libraries (java/pom.xml's release profile stops
+  # the build if one is missing), with sources and javadoc jars, every file
+  # signed. Before anything is uploaded, a JVM loads the jar's linux-x86_64
+  # library from the jar alone. Then deploy uploads to Maven Central and waits
+  # until the release is published; a dry run stops before it. Tests are
+  # skipped: the ci job ran them on this commit.
+  maven:
+    name: Maven Central
+    needs: [ci, docs, verify-versions, jni-linux, jni-macos-windows]
+    if: ${{ github.event_name == 'push' || inputs.maven }}
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: java/pom.xml
+          server-id: central
+          server-username-env-var: MAVEN_CENTRAL_USERNAME
+          server-password-env-var: MAVEN_CENTRAL_PASSWORD
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: jni-*
+          path: natives
+      - name: Stage the libraries where the jar carries them
+        run: |
+          set -euo pipefail
+          for dir in natives/jni-*/; do
+            platform=$(basename "$dir")
+            platform=${platform#jni-}
+            mkdir -p "java/target/natives/org/vortexrdf/native/$platform"
+            cp "$dir"* "java/target/natives/org/vortexrdf/native/$platform/"
+          done
+          find java/target/natives -type f
+      - name: Build and sign
+        working-directory: java
+        run: mvn -B -P release -DskipTests verify
+        env:
+          MAVEN_GPG_KEY: ${{ secrets.MAVEN_GPG_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+      - name: Load the jar's own library
+        working-directory: java
+        run: |
+          set -euo pipefail
+          jar=$(ls target/vortex-rdf-*.jar | grep -v -e '-sources\.jar$' -e '-javadoc\.jar$')
+          cat > "$RUNNER_TEMP/LoadNative.java" <<'EOF'
+          import java.lang.reflect.Method;
+
+          // Loads the native library with only the jar on the class path, and checks it is the jar's copy.
+          public class LoadNative {
+              public static void main(String[] args) throws Exception {
+                  Class.forName("org.vortexrdf.Native");
+                  Method source = Class.forName("org.vortexrdf.NativeLibrary").getDeclaredMethod("source");
+                  source.setAccessible(true);
+                  Object from = source.invoke(null);
+                  if (!"BUNDLED".equals(String.valueOf(from))) {
+                      throw new AssertionError("the library came from " + from + ", not the jar");
+                  }
+                  System.out.println("loaded the jar's own native library");
+              }
+          }
+          EOF
+          java -cp "$jar" "$RUNNER_TEMP/LoadNative.java"
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        working-directory: java
+        run: mvn -B -P release -DskipTests deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_KEY: ${{ secrets.MAVEN_GPG_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}

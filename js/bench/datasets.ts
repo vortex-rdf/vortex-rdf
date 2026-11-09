@@ -140,6 +140,23 @@ export function genDataset(n: number, opts: DatasetOpts = {}): Quad[] {
     return out;
 }
 
+/** Flatten every string of `quads` in place, by encoding it once.
+ *
+ *  The generator's template strings are V8 ropes, and the first build to encode
+ *  them flattened them all. That cost +165 MB of live JS heap at 2^20 rows and
+ *  2.4x that build's time. Running the encoder here, the same call `packQuads`
+ *  makes, moves that cost out of every timed build. */
+export function flattenTerms(quads: readonly Quad[]): void {
+    const enc = new TextEncoder();
+    const scratch = new Uint8Array(4096);
+    for (const q of quads) {
+        for (const t of [q.subject, q.predicate, q.object, q.graph]) {
+            enc.encodeInto(t.value, scratch);
+            if (t.termType === 'Literal') enc.encodeInto(t.datatype.value, scratch);
+        }
+    }
+}
+
 /** The first `take` quads `genDataset(n, opts)` would produce, without building
  *  the full array — the mutation worker needs only a MUT_BATCH-sized slice for
  *  the delete phase, and `n` can be a couple of million. */
@@ -188,9 +205,6 @@ export function datasetProbes(n: number, opts: DatasetOpts = {}): {
 } {
     const o = datasetOpts(opts);
     const m = moduli(n, opts);
-    const s0 = subjectTerm(0);
-    const p0 = predicateTerm(0);
-    const o0 = objectTerm(0, o.literalFrac);
     // A single-graph dataset has no graph term to bind, which would quietly
     // turn `G` into a second full scan and `SPOG` into `SPO` -- two probes
     // measuring something other than what their names claim. Return no quad
@@ -198,19 +212,28 @@ export function datasetProbes(n: number, opts: DatasetOpts = {}): {
     // nothing rather than plausible-looking wrong rows.
     const g0 = m.nGraph === 1 ? null : graphTerm(0);
     return {
-        triples: [
-            { name: 'S', s: s0, p: null, o: null, g: null },
-            { name: 'P', s: null, p: p0, o: null, g: null },
-            { name: 'O', s: null, p: null, o: o0, g: null },
-            { name: 'SP', s: s0, p: p0, o: null, g: null },
-            { name: 'PO', s: null, p: p0, o: o0, g: null },
-            { name: 'SPO', s: s0, p: p0, o: o0, g: null },
-        ],
-        quads: g0 === null ? [] : [
-            { name: 'G', s: null, p: null, o: null, g: g0 },
-            { name: 'SPOG', s: s0, p: p0, o: o0, g: g0 },
-        ],
+        ...routingProbes(subjectTerm(0), predicateTerm(0), objectTerm(0, o.literalFrac), g0),
         full: FULL_SCAN_PATTERN,
+    };
+}
+
+/** The routing classes the resolver branches on, bound to the terms `s`, `p`,
+ *  `o` and `g`: S/P/O/SP/PO/SPO, and G/SPOG unless there is no graph term to
+ *  bind (`g` null). */
+export function routingProbes(s: Term, p: Term, o: Term, g: Term | null): { triples: Pat[]; quads: Pat[] } {
+    return {
+        triples: [
+            { name: 'S', s, p: null, o: null, g: null },
+            { name: 'P', s: null, p, o: null, g: null },
+            { name: 'O', s: null, p: null, o, g: null },
+            { name: 'SP', s, p, o: null, g: null },
+            { name: 'PO', s: null, p, o, g: null },
+            { name: 'SPO', s, p, o, g: null },
+        ],
+        quads: g === null ? [] : [
+            { name: 'G', s: null, p: null, o: null, g },
+            { name: 'SPOG', s, p, o, g },
+        ],
     };
 }
 

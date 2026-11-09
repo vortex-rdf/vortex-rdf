@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use oxrdfio::RdfFormat;
 use std::path::PathBuf;
 
-use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
+use vortex_rdf_core::common::formats::format_from_name;
 use vortex_rdf_core::{IndexType, LayoutStrategy};
 
 mod commands;
@@ -49,7 +49,7 @@ struct SerializeArgs {
 
     /// RDF format name, e.g. "ttl" or "nquads" (auto-detected from the input
     /// file extension if not provided)
-    #[arg(short, long, value_parser = parse_format)]
+    #[arg(short, long, value_parser = format_from_name)]
     format: Option<RdfFormat>,
 }
 
@@ -65,7 +65,7 @@ struct DeserializeArgs {
 
     /// RDF format name, e.g. "ttl" or "nquads" (auto-detected from the
     /// output file extension if not provided, falling back to N-Quads)
-    #[arg(short, long, value_parser = parse_format)]
+    #[arg(short, long, value_parser = format_from_name)]
     format: Option<RdfFormat>,
 }
 
@@ -81,12 +81,12 @@ struct MatchArgs {
 
     /// RDF format of a non-Vortex input (auto-detected from the input file
     /// extension if not provided; ignored for .vortex inputs)
-    #[arg(long, value_parser = parse_format)]
+    #[arg(long, value_parser = format_from_name)]
     input_format: Option<RdfFormat>,
 
     /// RDF format for the exported matches (auto-detected from the output
     /// file extension if not provided, falling back to N-Quads)
-    #[arg(long, value_parser = parse_format)]
+    #[arg(long, value_parser = format_from_name)]
     output_format: Option<RdfFormat>,
 
     /// Subject pattern
@@ -106,18 +106,6 @@ struct MatchArgs {
     graph: Option<String>,
 }
 
-/// clap value parser over core's format-name table, so the CLI accepts the
-/// same spellings as every other binding ("ttl"/"turtle", "xml"/"rdfxml", …)
-/// and its rejection message quotes the same list the parser accepts.
-fn parse_format(name: &str) -> Result<RdfFormat, String> {
-    format_from_name(name).ok_or_else(|| {
-        format!(
-            "unknown RDF format {name:?}; expected one of: {}",
-            supported_format_names().join(", ")
-        )
-    })
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -127,5 +115,41 @@ async fn main() -> Result<()> {
         Action::Serialize(args) => commands::serialize::run(args).await,
         Action::Deserialize(args) => commands::deserialize::run(args).await,
         Action::Match(args) => commands::matching::run(args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    /// Every format flag reads core's format names, in any case, and refuses
+    /// an unknown one with core's message, which lists the accepted names.
+    #[test]
+    fn format_flags_take_core_format_names() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("vortex-rdf-cli").chain(args.iter().copied()))
+        };
+        for args in [
+            &["serialize", "-o", "out.vortex", "-f", "nope"][..],
+            &["deserialize", "-f", "nope"],
+            &["match", "-i", "in.vortex", "--input-format", "nope"],
+            &["match", "-i", "in.vortex", "--output-format", "nope"],
+        ] {
+            let error = parse(args)
+                .err()
+                .expect("an unknown format name is refused");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{args:?}");
+            assert!(
+                error.to_string().contains(
+                    "Invalid input: unknown RDF format \"nope\"; expected one of: ntriples, nt,"
+                ),
+                "{args:?}: {error}"
+            );
+        }
+        let Action::Deserialize(args) = parse(&["deserialize", "-f", "TTL"]).unwrap().action else {
+            panic!("not the deserialize action");
+        };
+        assert_eq!(args.format, Some(RdfFormat::Turtle));
     }
 }

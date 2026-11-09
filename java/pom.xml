@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- The project's Maven Central namespace; the Java package is org.vortexrdf. -->
+  <groupId>io.github.vortex-rdf</groupId>
+  <artifactId>vortex-rdf</artifactId>
+  <!-- The workspace version (Cargo.toml): the jar and the native library it loads are released together. -->
+  <version>0.15.0</version>
+  <packaging>jar</packaging>
+
+  <name>Vortex-RDF</name>
+  <description>Java bindings for Vortex-RDF, a columnar RDF store format built on Vortex</description>
+  <url>https://github.com/vortex-rdf/vortex-rdf</url>
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+    </license>
+  </licenses>
+  <developers>
+    <developer>
+      <id>vortex-rdf</id>
+      <name>The Vortex-RDF authors</name>
+      <url>https://github.com/vortex-rdf</url>
+    </developer>
+  </developers>
+  <scm>
+    <url>https://github.com/vortex-rdf/vortex-rdf</url>
+    <connection>scm:git:https://github.com/vortex-rdf/vortex-rdf.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/vortex-rdf/vortex-rdf.git</developerConnection>
+  </scm>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <junit.version>6.1.3</junit.version>
+    <!-- The tests' inputs: the native library, and the stores and oracle that the `fixtures` example of the
+         vortex-rdf-java crate writes (scripts/ci-check.sh java-tests builds both). -->
+    <vortexrdf.library>${project.basedir}/../target/debug/libvortex_rdf_jni.so</vortexrdf.library>
+    <vortexrdf.fixtures>${project.basedir}/target/fixtures</vortexrdf.fixtures>
+    <!-- True makes BundledLibraryTest fail, not skip, when no library is staged under target/natives
+         (scripts/ci-check.sh java-tests stages this machine's). -->
+    <vortexrdf.bundled.required>false</vortexrdf.bundled.required>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.16.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>-Xlint:all</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.5.1</version>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <!-- A stable module name on the module path, the one Java 24's native-access flag names. -->
+              <Automatic-Module-Name>org.vortexrdf</Automatic-Module-Name>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.6.1</version>
+        <executions>
+          <!-- Every test but BundledLibraryTest, with the library vortexrdf.library names. -->
+          <execution>
+            <id>default-test</id>
+            <configuration>
+              <excludes>
+                <exclude>**/BundledLibraryTest.java</exclude>
+              </excludes>
+              <systemPropertyVariables>
+                <vortexrdf.library>${vortexrdf.library}</vortexrdf.library>
+                <vortexrdf.fixtures>${vortexrdf.fixtures}</vortexrdf.fixtures>
+              </systemPropertyVariables>
+            </configuration>
+          </execution>
+          <!-- BundledLibraryTest alone, in a JVM of its own: target/natives is on the class path, as the jar's
+               libraries would be, and nothing names a library (no -D property reaches it, VORTEX_RDF_JNI_LIB is
+               removed). Set in the POM, <test> keeps a command-line -Dtest from redirecting it. -->
+          <execution>
+            <id>bundled-library</id>
+            <goals>
+              <goal>test</goal>
+            </goals>
+            <configuration>
+              <test>BundledLibraryTest</test>
+              <additionalClasspathElements>
+                <additionalClasspathElement>${project.build.directory}/natives</additionalClasspathElement>
+              </additionalClasspathElements>
+              <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+              <systemPropertyVariables>
+                <vortexrdf.fixtures>${vortexrdf.fixtures}</vortexrdf.fixtures>
+                <vortexrdf.bundled.required>${vortexrdf.bundled.required}</vortexrdf.bundled.required>
+              </systemPropertyVariables>
+              <excludedEnvironmentVariables>
+                <excludedEnvironmentVariable>VORTEX_RDF_JNI_LIB</excludedEnvironmentVariable>
+              </excludedEnvironmentVariables>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <!-- Bound to no phase here: the release profile attaches the javadoc jar, and scripts/ci-check.sh java-tests
+           runs `mvn javadoc:javadoc` so that a javadoc warning fails CI, not only the next release. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.12.0</version>
+        <configuration>
+          <failOnWarnings>true</failOnWarnings>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- The native library's file name where it is not Linux's. -->
+    <profile>
+      <id>macos</id>
+      <activation>
+        <os>
+          <family>mac</family>
+        </os>
+      </activation>
+      <properties>
+        <vortexrdf.library>${project.basedir}/../target/debug/libvortex_rdf_jni.dylib</vortexrdf.library>
+      </properties>
+    </profile>
+    <profile>
+      <id>windows</id>
+      <activation>
+        <os>
+          <family>windows</family>
+        </os>
+      </activation>
+      <properties>
+        <vortexrdf.library>${project.basedir}/../target/debug/vortex_rdf_jni.dll</vortexrdf.library>
+      </properties>
+    </profile>
+    <!-- Java 24 and later warn when a native library loads unless native access is enabled. -->
+    <profile>
+      <id>native-access</id>
+      <activation>
+        <jdk>[24,)</jdk>
+      </activation>
+      <properties>
+        <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+      </properties>
+    </profile>
+    <!-- The release build (.github/workflows/release.yml): the jar carries the native library of each platform,
+         staged under target/natives/org/vortexrdf/native/<platform>/ (all five, or the build stops), beside sources and
+         javadoc jars; every file is signed with the key in MAVEN_GPG_KEY (passphrase MAVEN_GPG_PASSPHRASE), and
+         `deploy` uploads to Maven Central with the credentials of server `central` and publishes. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <version>3.7.0</version>
+            <executions>
+              <execution>
+                <id>natives-staged</id>
+                <phase>validate</phase>
+                <goals>
+                  <goal>enforce</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <requireFilesExist>
+                      <files>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/linux-x86_64/libvortex_rdf_jni.so</file>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/linux-aarch64/libvortex_rdf_jni.so</file>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/macos-x86_64/libvortex_rdf_jni.dylib</file>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/macos-aarch64/libvortex_rdf_jni.dylib</file>
+                        <file>${project.build.directory}/natives/org/vortexrdf/native/windows-x86_64/vortex_rdf_jni.dll</file>
+                      </files>
+                      <message>The release jar carries every platform's native library: stage them under target/natives/org/vortexrdf/native/</message>
+                    </requireFilesExist>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.6.2</version>
+            <executions>
+              <execution>
+                <id>natives</id>
+                <phase>generate-resources</phase>
+                <goals>
+                  <goal>add-resource</goal>
+                </goals>
+                <configuration>
+                  <resources>
+                    <resource>
+                      <directory>${project.build.directory}/natives</directory>
+                    </resource>
+                  </resources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.4.0</version>
+            <configuration>
+              <!-- The resources are the native libraries: the sources jar holds the Java sources only. -->
+              <excludeResources>true</excludeResources>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <!-- Its version and configuration are the main build's. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.8</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <!-- Bouncy Castle: no gpg binary; the key and passphrase come from the environment. -->
+                  <signer>bc</signer>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.12.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

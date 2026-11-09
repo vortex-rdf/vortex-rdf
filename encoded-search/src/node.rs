@@ -1,78 +1,30 @@
-//! The resolved probe tree and its search/access operations.
-//!
-//! A [`Node`] mirrors one encoded array node, borrowing its buffers; every
-//! operation is a slice read, integer arithmetic, or a single bit-packed word
-//! extraction — no `ExecutionCtx`, no decoding, no allocation.
+//! The resolved probe tree. A [`Node`] mirrors one encoded array node,
+//! borrowing its buffers; every operation is a slice read, integer
+//! arithmetic or a bit-packed extraction (of one word, or of a 1024-value
+//! chunk onto the stack), with no `ExecutionCtx`, no decode and no
+//! allocation. The exception is [`DeltaNode`], whose values
+//! are running sums: it decodes a 1024-value block the first time one of its
+//! values is read, and keeps it. The leaves' word buffers are in
+//! [`crate::words`], bit-packed nodes and their unpacking in
+//! [`crate::bitpacked`], and the searches the nodes run in [`crate::search`].
 
-/// Typed borrow of a canonical primitive buffer, one variant per unsigned width.
-pub(crate) enum Words<'a> {
-    U8(&'a [u8]),
-    U16(&'a [u16]),
-    U32(&'a [u32]),
-    U64(&'a [u64]),
-}
+use crate::bitpacked::PackedNode;
+use crate::delta::DeltaNode;
+use crate::search::{EqSink, partition, search_ascending, search_ascending_capped};
+use crate::words::Words;
+use std::ops::Range;
 
-impl Words<'_> {
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Words::U8(s) => s.len(),
-            Words::U16(s) => s.len(),
-            Words::U32(s) => s.len(),
-            Words::U64(s) => s.len(),
-        }
-    }
+/// Values per FastLanes chunk: the stride of a chunked FoR's references and
+/// of a run-length array's value offsets.
+pub(crate) const FL_CHUNK: usize = vortex_fastlanes::FL_CHUNK_SIZE;
 
-    pub(crate) fn get(&self, i: usize) -> u64 {
-        match self {
-            Words::U8(s) => u64::from(s[i]),
-            Words::U16(s) => u64::from(s[i]),
-            Words::U32(s) => u64::from(s[i]),
-            Words::U64(s) => s[i],
-        }
-    }
-
-    /// First index whose value is `>= needle`, via the native monomorphized
-    /// `partition_point`. A needle above the width's maximum finds nothing.
-    fn lower_bound(&self, needle: u64) -> usize {
-        fn bound<T: Copy + Ord + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
-            match T::try_from(needle) {
-                Ok(n) => s.partition_point(|&v| v < n),
-                Err(_) => s.len(),
-            }
-        }
-        match self {
-            Words::U8(s) => bound(s, needle),
-            Words::U16(s) => bound(s, needle),
-            Words::U32(s) => bound(s, needle),
-            Words::U64(s) => bound(s, needle),
-        }
-    }
-
-    /// First index whose value is `> needle`.
-    fn upper_bound(&self, needle: u64) -> usize {
-        fn bound<T: Copy + Ord + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
-            match T::try_from(needle) {
-                Ok(n) => s.partition_point(|&v| v <= n),
-                Err(_) => s.len(),
-            }
-        }
-        match self {
-            Words::U8(s) => bound(s, needle),
-            Words::U16(s) => bound(s, needle),
-            Words::U32(s) => bound(s, needle),
-            Words::U64(s) => bound(s, needle),
-        }
-    }
-}
-
-/// One resolved chunk of a [`Node::Chunked`] tree, with its logical start
-/// row. Chunk extremes are read on demand during bounds searches and then
-/// memoized — resolving stays downcast-only (a borrowed probe is resolved
-/// per call), while a long-lived owned probe pays each extreme once.
+/// One resolved chunk of a [`Node::Chunked`] tree, never empty, with its
+/// logical start row. Its last value is read when a bounds search first
+/// probes the chunk, then kept, so resolution stays downcast-only and a
+/// long-lived owned probe pays the read once.
 pub(crate) struct Chunk<'a> {
     pub(crate) start: usize,
     pub(crate) node: Node<'a>,
-    first: std::sync::OnceLock<u64>,
     last: std::sync::OnceLock<u64>,
 }
 
@@ -81,14 +33,8 @@ impl<'a> Chunk<'a> {
         Self {
             start,
             node,
-            first: std::sync::OnceLock::new(),
             last: std::sync::OnceLock::new(),
         }
-    }
-
-    /// The chunk's first value, read once.
-    fn first(&self) -> u64 {
-        *self.first.get_or_init(|| self.node.value_at(0))
     }
 
     /// The chunk's last value, read once.
@@ -116,70 +62,29 @@ impl PatchProbe<'_> {
         (at < self.indices.len() && self.indices.value_at(at) == key)
             .then(|| self.values.value_at(at))
     }
-}
 
-/// Bit-packed words plus the packing parameters needed for point extraction.
-pub(crate) struct PackedNode<'a> {
-    pub(crate) packed: Words<'a>,
-    pub(crate) bit_width: usize,
-    pub(crate) offset: usize,
-    pub(crate) len: usize,
-    pub(crate) patches: Option<PatchProbe<'a>>,
-}
-
-impl PackedNode<'_> {
-    /// Patch-aware logical value at `i`. The sorted invariant of the parent
-    /// column holds only for patched values, so bounds search must go through
-    /// this accessor, never the raw packed words.
-    pub(crate) fn value_at(&self, i: usize) -> u64 {
-        if let Some(p) = &self.patches
-            && let Some(v) = p.lookup(i)
-        {
-            return v;
-        }
-        if self.bit_width == 0 {
-            return 0;
-        }
-        // SAFETY: the packed buffer length is pinned to
-        // `(len + offset).div_ceil(1024) * 128 * bit_width` words at array
-        // construction, and callers keep `i < len`, so `i + offset` is within
-        // the length the buffer was packed for.
-        match &self.packed {
-            Words::U8(s) => u64::from(unsafe {
-                vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<u8>(
-                    s,
-                    self.bit_width,
-                    i + self.offset,
-                )
-            }),
-            Words::U16(s) => u64::from(unsafe {
-                vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<u16>(
-                    s,
-                    self.bit_width,
-                    i + self.offset,
-                )
-            }),
-            Words::U32(s) => u64::from(unsafe {
-                vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<u32>(
-                    s,
-                    self.bit_width,
-                    i + self.offset,
-                )
-            }),
-            Words::U64(s) => unsafe {
-                vortex_fastlanes::bitpack_decompress::unpack_single_primitive::<u64>(
-                    s,
-                    self.bit_width,
-                    i + self.offset,
-                )
-            },
+    /// Write the replacement value of every patched position among the
+    /// logical indices `start..start + out.len()` into its place in `out`:
+    /// the first patch in range found by one search, the rest walked.
+    pub(crate) fn overwrite(&self, start: usize, out: &mut [u64]) {
+        let first = (start + self.offset) as u64;
+        let end = first + out.len() as u64;
+        let mut at = self.indices.lower_bound(first);
+        while at < self.indices.len() {
+            let key = self.indices.value_at(at);
+            if key >= end {
+                break;
+            }
+            out[(key - first) as usize] = self.values.value_at(at);
+            at += 1;
         }
     }
 }
 
-/// One node of the resolved probe tree. Variants mirror the supported
-/// encodings; children are resolved recursively at [`crate::SortedProbe::resolve`]
-/// time so every operation below is non-fallible.
+/// One node of the resolved probe tree, a variant per supported encoding.
+/// Children are resolved with their parent
+/// ([`crate::SortedProbe::resolve`]), so every operation below is
+/// infallible.
 pub(crate) enum Node<'a> {
     Primitive(Words<'a>),
     Constant {
@@ -203,6 +108,16 @@ pub(crate) enum Node<'a> {
         reference: u64,
         child: Box<Node<'a>>,
     },
+    /// Frame of reference with one reference per 1024-value FastLanes chunk
+    /// (`fastlanes.for.v2`): `value_at(i) = child.value_at(i) +
+    /// references.value_at((offset + i) / 1024)`, wrapping. A needle maps to
+    /// a different encoded value in every chunk, so searches probe the
+    /// composed values.
+    ChunkedFoR {
+        references: Box<Node<'a>>,
+        offset: usize,
+        child: Box<Node<'a>>,
+    },
     BitPacked(PackedNode<'a>),
     Slice {
         child: Box<Node<'a>>,
@@ -220,20 +135,28 @@ pub(crate) enum Node<'a> {
         codes: Box<Node<'a>>,
         values: Box<Node<'a>>,
     },
-}
-
-/// `partition_point` over a virtual index range, probing through a closure.
-pub(crate) fn partition(n: usize, mut below: impl FnMut(usize) -> bool) -> usize {
-    let (mut lo, mut hi) = (0usize, n);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if below(mid) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
+    /// FastLanes delta encoding, decoded one 1024-value block at a time on
+    /// first touch (see [`DeltaNode`]).
+    Delta(DeltaNode<'a>),
+    /// `vortex.sparse`: `fill` everywhere except the patched positions.
+    Sparse {
+        fill: u64,
+        patches: PatchProbe<'a>,
+        len: usize,
+    },
+    /// FastLanes run-length (`fastlanes.rle`): each 1024-value chunk keeps
+    /// its run values in `values`, from `value_offsets.value_at(chunk) -
+    /// base`, and one index per position into them, so `value_at(i) =
+    /// values.value_at(value_offsets.value_at(c) - base +
+    /// indices.value_at(offset + i))` with `c = (offset + i) / 1024`.
+    Rle {
+        values: Box<Node<'a>>,
+        indices: Box<Node<'a>>,
+        value_offsets: Box<Node<'a>>,
+        base: u64,
+        offset: usize,
+        len: usize,
+    },
 }
 
 impl Node<'_> {
@@ -244,10 +167,13 @@ impl Node<'_> {
             | Node::Sequence { len, .. }
             | Node::RunEnd { len, .. }
             | Node::Slice { len, .. }
-            | Node::Chunked { len, .. } => *len,
-            Node::FoR { child, .. } => child.len(),
-            Node::BitPacked(p) => p.len,
+            | Node::Chunked { len, .. }
+            | Node::Sparse { len, .. }
+            | Node::Rle { len, .. } => *len,
+            Node::FoR { child, .. } | Node::ChunkedFoR { child, .. } => child.len(),
+            Node::BitPacked(p) => p.len(),
             Node::Dict { codes, .. } => codes.len(),
+            Node::Delta(d) => d.len(),
         }
     }
 
@@ -270,17 +196,220 @@ impl Node<'_> {
                 values.value_at(run)
             }
             Node::FoR { reference, child } => reference.saturating_add(child.value_at(i)),
+            Node::ChunkedFoR {
+                references,
+                offset,
+                child,
+            } => chunked_for_value_at(references, *offset, child, i),
             Node::BitPacked(p) => p.value_at(i),
             Node::Slice { child, start, .. } => child.value_at(start + i),
             Node::Chunked { chunks, .. } => {
                 let c = partition(chunks.len(), |c| chunks[c].start <= i) - 1;
                 chunks[c].node.value_at(i - chunks[c].start)
             }
+            // A code is below the values' length (a construction invariant),
+            // so it fits a `usize`.
             Node::Dict { codes, values } => values.value_at(codes.value_at(i) as usize),
+            Node::Delta(d) => d.value_at(i),
+            Node::Sparse { fill, patches, .. } => patches.lookup(i).unwrap_or(*fill),
+            // Offsets and indices point inside `values` (a construction
+            // invariant, as for a dictionary's codes).
+            Node::Rle {
+                values,
+                indices,
+                value_offsets,
+                base,
+                offset,
+                ..
+            } => {
+                let pos = offset + i;
+                let first = value_offsets.value_at(pos / FL_CHUNK) - base;
+                values.value_at((first + indices.value_at(pos)) as usize)
+            }
         }
     }
 
-    /// First index whose value is `>= needle`; requires ascending order.
+    /// The exact values at `start..start + out.len()`, into `out`: what
+    /// [`Self::value_at`] reads at each, with the work the indices share done
+    /// once. A run-end node finds the first run once and walks the runs, a
+    /// bit-packed node searches its patches once, a delta node copies from
+    /// its decoded blocks, a chunked node finds each chunk once, and the
+    /// nodes over a child (frame of reference, slice, dictionary codes) read
+    /// the child's range whole. Requires `start + out.len() <= self.len()`
+    /// but no sortedness.
+    pub(crate) fn read_into(&self, start: usize, out: &mut [u64]) {
+        if out.is_empty() {
+            return;
+        }
+        match self {
+            Node::Primitive(w) => w.read_into(start, out),
+            Node::Constant { value, .. } => out.fill(*value),
+            Node::RunEnd {
+                ends,
+                values,
+                offset,
+                ..
+            } => {
+                for (run, value) in runs_in(ends, values, *offset, start, out.len()) {
+                    out[run].fill(value);
+                }
+            }
+            Node::FoR { reference, child } => {
+                child.read_into(start, out);
+                for o in out.iter_mut() {
+                    *o = reference.saturating_add(*o);
+                }
+            }
+            Node::ChunkedFoR {
+                references,
+                offset,
+                child,
+            } => {
+                child.read_into(start, out);
+                for (k, o) in out.iter_mut().enumerate() {
+                    *o = o.wrapping_add(references.value_at((offset + start + k) / FL_CHUNK));
+                }
+            }
+            Node::BitPacked(p) => p.read_into(start, out),
+            Node::Slice {
+                child, start: at, ..
+            } => child.read_into(at + start, out),
+            Node::Chunked { chunks, .. } => {
+                for (node, from, take, done) in chunk_windows(chunks, start, out.len()) {
+                    node.read_into(from, &mut out[done..done + take]);
+                }
+            }
+            // A code is below the values' length (a construction invariant),
+            // so it fits a `usize`.
+            Node::Dict { codes, values } => {
+                codes.read_into(start, out);
+                for o in out.iter_mut() {
+                    *o = values.value_at(*o as usize);
+                }
+            }
+            Node::Delta(d) => d.read_into(start, out),
+            Node::Sparse { fill, patches, .. } => {
+                out.fill(*fill);
+                patches.overwrite(start, out);
+            }
+            Node::Sequence { .. } | Node::Rle { .. } => {
+                for (k, o) in out.iter_mut().enumerate() {
+                    *o = self.value_at(start + k);
+                }
+            }
+        }
+    }
+
+    /// The values at `start..start + len` equal to `needle`, into `sink` as
+    /// the offsets `base + k` of the values at `start + k`, ascending: found
+    /// on the encoding where it allows (a constant at once, a sequence by
+    /// arithmetic, run ends by their runs, a frame of reference against the
+    /// shifted needle, a dictionary's codes against the needle's code,
+    /// unpatched bit-packed values a 1024-value chunk at a time, words as
+    /// they are), and read otherwise ([`Self::eq_into_read`]). Requires
+    /// `start + len <= self.len()` but no sortedness.
+    pub(crate) fn eq_into<S: EqSink>(
+        &self,
+        start: usize,
+        len: usize,
+        needle: u64,
+        base: usize,
+        sink: &mut S,
+    ) {
+        if len == 0 {
+            return;
+        }
+        match self {
+            Node::Primitive(w) => w.eq_into(start, len, needle, base, sink),
+            Node::Constant { value, .. } => {
+                if *value == needle {
+                    sink.run(base..base + len);
+                }
+            }
+            Node::Sequence {
+                base: first,
+                multiplier,
+                ..
+            } => {
+                if let Some(step) = needle.checked_sub(*first)
+                    && step % multiplier == 0
+                    && let Ok(at) = usize::try_from(step / multiplier)
+                    && (start..start + len).contains(&at)
+                {
+                    let at = base + at - start;
+                    sink.run(at..at + 1);
+                }
+            }
+            Node::RunEnd {
+                ends,
+                values,
+                offset,
+                ..
+            } => {
+                for (run, value) in runs_in(ends, values, *offset, start, len) {
+                    if value == needle {
+                        sink.run(base + run.start..base + run.end);
+                    }
+                }
+            }
+            Node::FoR { reference, child } => {
+                if let Some(shifted) = needle.checked_sub(*reference) {
+                    child.eq_into(start, len, shifted, base, sink);
+                }
+            }
+            Node::Slice {
+                child, start: at, ..
+            } => child.eq_into(at + start, len, needle, base, sink),
+            Node::Chunked { chunks, .. } => {
+                for (node, from, take, done) in chunk_windows(chunks, start, len) {
+                    node.eq_into(from, take, needle, base + done, sink);
+                }
+            }
+            // A dictionary holding no more values than the window maps the
+            // needle to its code once, searching its values with this same
+            // search, then searches its codes for that code. A larger one, or
+            // a needle under several codes, reads the window: the first would
+            // search more values than the window holds, the second would
+            // interleave its codes' offsets.
+            Node::Dict { codes, values } if values.len() <= len => {
+                let mut code = CodeOf::None;
+                values.eq_into(0, values.len(), needle, 0, &mut code);
+                match code {
+                    CodeOf::None => {}
+                    CodeOf::One(code) => codes.eq_into(start, len, code as u64, base, sink),
+                    CodeOf::Several => self.eq_into_read(start, len, needle, base, sink),
+                }
+            }
+            Node::BitPacked(p) if p.patches().is_none() => {
+                p.eq_into(start, len, needle, base, sink)
+            }
+            _ => self.eq_into_read(start, len, needle, base, sink),
+        }
+    }
+
+    /// [`Self::eq_into`] by reading the window a 1024-value block at a time.
+    /// Out of line, so the block is reserved only by the searches that read.
+    #[inline(never)]
+    fn eq_into_read<S: EqSink>(
+        &self,
+        start: usize,
+        len: usize,
+        needle: u64,
+        base: usize,
+        sink: &mut S,
+    ) {
+        let mut block = [0u64; FL_CHUNK];
+        let (mut at, end) = (start, start + len);
+        while at < end {
+            let n = (end - at).min(FL_CHUNK);
+            self.read_into(at, &mut block[..n]);
+            sink.matching(base + at - start, &block[..n], needle);
+            at += n;
+        }
+    }
+
+    /// First index whose value is `>= needle`, the length when every value is
+    /// below it; requires ascending order.
     pub(crate) fn lower_bound(&self, needle: u64) -> usize {
         match self {
             Node::Primitive(w) => w.lower_bound(needle),
@@ -299,7 +428,7 @@ impl Node<'_> {
                 if needle <= *base {
                     0
                 } else {
-                    ((needle - *base).div_ceil(*multiplier) as usize).min(*len)
+                    clamp_to_len((needle - *base).div_ceil(*multiplier), *len)
                 }
             }
             Node::RunEnd {
@@ -309,7 +438,7 @@ impl Node<'_> {
                 len,
             } => {
                 let (first, span) = window_runs(ends, *offset, *len);
-                let k = partition(span, |k| values.value_at(first + k) < needle);
+                let k = search_ascending(span, |k| values.value_at(first + k), needle);
                 run_start(ends, first + k, *offset, *len)
             }
             Node::FoR { reference, child } => {
@@ -320,7 +449,7 @@ impl Node<'_> {
                     child.lower_bound(needle - *reference)
                 }
             }
-            Node::BitPacked(p) => partition(p.len, |i| p.value_at(i) < needle),
+            Node::BitPacked(p) => search_ascending(p.len(), |i| p.value_at(i), needle),
             // Sortedness is asserted for the window only, so the search reads
             // through the window, never the child's own order.
             Node::Slice { child, start, len } => {
@@ -339,66 +468,53 @@ impl Node<'_> {
             Node::Dict { codes, values } => partition(codes.len(), |i| {
                 values.value_at(codes.value_at(i) as usize) < needle
             }),
+            // A bisection touches O(log blocks) blocks, each decoded once.
+            Node::Delta(d) => partition(d.len(), |i| d.value_at(i) < needle),
+            Node::ChunkedFoR { .. } | Node::Sparse { .. } | Node::Rle { .. } => {
+                partition(self.len(), |i| self.value_at(i) < needle)
+            }
         }
     }
 
-    /// First index whose value is `> needle`; requires ascending order.
+    /// First index whose value is `> needle`: values are integers, so it is
+    /// the lower bound of `needle + 1`, and the length when `needle` is
+    /// `u64::MAX`. Requires ascending order.
     pub(crate) fn upper_bound(&self, needle: u64) -> usize {
+        needle
+            .checked_add(1)
+            .map_or(self.len(), |next| self.lower_bound(next))
+    }
+
+    /// `(lower_bound, upper_bound)` of `needle`; requires ascending order. A
+    /// RunEnd node finds the needle's run once and reads both ends of it from
+    /// `ends`, where the two bounds would each search the runs again. A
+    /// frame of reference takes its child's bounds of the needle less the
+    /// reference, and a bit-packed node searches once: the lower bound's
+    /// probes cap the needle's rows at the first value they read above it,
+    /// and the upper bound is searched below that cap only.
+    #[inline]
+    pub(crate) fn bounds(&self, needle: u64) -> (usize, usize) {
         match self {
-            Node::Primitive(w) => w.upper_bound(needle),
-            Node::Constant { value, len } => {
-                if *value <= needle {
-                    *len
-                } else {
-                    0
-                }
-            }
-            Node::Sequence {
-                base,
-                multiplier,
-                len,
-            } => {
-                if needle < *base {
-                    0
-                } else {
-                    (((needle - *base) / *multiplier) as usize)
-                        .saturating_add(1)
-                        .min(*len)
-                }
-            }
             Node::RunEnd {
                 ends,
                 values,
                 offset,
                 len,
-            } => {
-                let (first, span) = window_runs(ends, *offset, *len);
-                let k = partition(span, |k| values.value_at(first + k) <= needle);
-                run_start(ends, first + k, *offset, *len)
+            } => runend_bounds(ends, values, *offset, *len, needle),
+            // Every stored value is `reference + encoded`, so none lies below
+            // the reference.
+            Node::FoR { reference, child } => match needle.checked_sub(*reference) {
+                Some(encoded) => child.bounds(encoded),
+                None => (0, 0),
+            },
+            Node::BitPacked(p) => {
+                let (lo, past) = search_ascending_capped(p.len(), |i| p.value_at(i), needle);
+                (
+                    lo,
+                    lo + partition(past - lo, |i| p.value_at(lo + i) <= needle),
+                )
             }
-            Node::FoR { reference, child } => {
-                if needle < *reference {
-                    0
-                } else {
-                    child.upper_bound(needle - *reference)
-                }
-            }
-            Node::BitPacked(p) => partition(p.len, |i| p.value_at(i) <= needle),
-            // Window-only search; see `lower_bound`.
-            Node::Slice { child, start, len } => {
-                partition(*len, |i| child.value_at(*start + i) <= needle)
-            }
-            Node::Chunked { chunks, .. } => {
-                let c = partition(chunks.len(), |c| chunks[c].first() <= needle);
-                if c == 0 {
-                    0
-                } else {
-                    chunks[c - 1].start + chunks[c - 1].node.upper_bound(needle)
-                }
-            }
-            Node::Dict { codes, values } => partition(codes.len(), |i| {
-                values.value_at(codes.value_at(i) as usize) <= needle
-            }),
+            _ => (self.lower_bound(needle), self.upper_bound(needle)),
         }
     }
 
@@ -417,9 +533,32 @@ impl Node<'_> {
                 out.push(K::FoR);
                 child.collect_kinds(out);
             }
+            Node::ChunkedFoR {
+                references, child, ..
+            } => {
+                out.push(K::FoR);
+                child.collect_kinds(out);
+                references.collect_kinds(out);
+            }
+            Node::Sparse { patches, .. } => {
+                out.push(K::Sparse);
+                patches.indices.collect_kinds(out);
+                patches.values.collect_kinds(out);
+            }
+            Node::Rle {
+                values,
+                indices,
+                value_offsets,
+                ..
+            } => {
+                out.push(K::Rle);
+                values.collect_kinds(out);
+                indices.collect_kinds(out);
+                value_offsets.collect_kinds(out);
+            }
             Node::BitPacked(p) => {
                 out.push(K::BitPacked);
-                if let Some(patches) = &p.patches {
+                if let Some(patches) = p.patches() {
                     out.push(K::Patches);
                     patches.indices.collect_kinds(out);
                     patches.values.collect_kinds(out);
@@ -440,19 +579,166 @@ impl Node<'_> {
                 codes.collect_kinds(out);
                 values.collect_kinds(out);
             }
+            Node::Delta(d) => d.collect_kinds(out),
         }
     }
 }
 
+/// [`Node::value_at`] of a [`Node::ChunkedFoR`]: the child's value plus the
+/// reference of its FastLanes chunk. Out of line on purpose: written in
+/// `value_at`'s match, the sum of two recursive reads lets the compiler turn
+/// the recursion into a loop carrying an accumulator, which every node visit
+/// then pays for (a stack slot zeroed on entry, a load and an add on return).
+#[inline(never)]
+fn chunked_for_value_at(references: &Node<'_>, offset: usize, child: &Node<'_>, i: usize) -> u64 {
+    child
+        .value_at(i)
+        .wrapping_add(references.value_at((offset + i) / FL_CHUNK))
+}
+
+/// The codes a dictionary holds a needle under, as an equality search over
+/// its values finds them: none, one, or several.
+enum CodeOf {
+    None,
+    One(usize),
+    Several,
+}
+
+impl CodeOf {
+    fn add(&mut self, code: usize) {
+        *self = match self {
+            CodeOf::None => CodeOf::One(code),
+            _ => CodeOf::Several,
+        };
+    }
+}
+
+impl EqSink for CodeOf {
+    fn run(&mut self, codes: Range<usize>) {
+        // Two codes settle it.
+        for code in codes.take(2) {
+            self.add(code);
+        }
+    }
+
+    fn matching<T: Copy + PartialEq>(&mut self, at: usize, values: &[T], needle: T) {
+        for (k, _) in values.iter().enumerate().filter(|&(_, &v)| v == needle) {
+            self.add(at + k);
+        }
+    }
+}
+
+/// The chunks of a [`Node::Chunked`] that the window `start..start + len`
+/// reaches, in order, each as `(node, from, take, done)`: the window's
+/// `take` values from the chunk's `from`, after the `done` values before
+/// them. Requires `0 < len` and `start + len <= ` the chunks' length.
+fn chunk_windows<'n, 'a>(
+    chunks: &'n [Chunk<'a>],
+    start: usize,
+    len: usize,
+) -> impl Iterator<Item = (&'n Node<'a>, usize, usize, usize)> {
+    let first = partition(chunks.len(), |c| chunks[c].start <= start) - 1;
+    let mut done = 0;
+    chunks[first..].iter().map_while(move |chunk| {
+        (done < len).then(|| {
+            let from = start + done - chunk.start;
+            let take = (chunk.node.len() - from).min(len - done);
+            let window = (&chunk.node, from, take, done);
+            done += take;
+            window
+        })
+    })
+}
+
+/// The runs of a [`Node::RunEnd`] that the window `start..start + len`
+/// reaches, in order, each as its offsets in the window and its value: the
+/// first run found once, the rest walked. A run whose end does not pass the
+/// window's position (ends out of order, which only a corrupt file holds)
+/// adds no rows, so no window runs backwards, and ends that no run carries
+/// to the window's end fail the walk.
+///
+/// # Panics
+/// Panics when the runs end before the window does.
+fn runs_in<'n>(
+    ends: &'n Node<'_>,
+    values: &'n Node<'_>,
+    offset: usize,
+    start: usize,
+    len: usize,
+) -> impl Iterator<Item = (Range<usize>, u64)> + 'n {
+    let (first, last) = ((start + offset) as u64, (start + offset + len) as u64);
+    let mut run = partition(ends.len(), |r| ends.value_at(r) <= first);
+    let mut at = first;
+    std::iter::from_fn(move || {
+        (at < last).then(|| {
+            // Ends that stop short of the window's end (a corrupt file's)
+            // would leave `at` short of `last` past the last run.
+            assert!(
+                run < ends.len(),
+                "corrupt run ends: no run reaches the window's end"
+            );
+            let end = ends.value_at(run).clamp(at, last);
+            // Run positions below `last` fit the window's `usize`.
+            let window = (at - first) as usize..(end - first) as usize;
+            let item = (window, values.value_at(run));
+            at = end;
+            run += 1;
+            item
+        })
+    })
+}
+
+/// Position `q` among `len` positions, clamped to `len`. A quotient the index
+/// type cannot hold lies past every position: on a 32-bit target a `u64`
+/// quotient above `u32::MAX` clamps rather than wrapping to its low bits.
+/// Generic over the index type so a 64-bit host can test the narrow case.
+fn clamp_to_len<I: TryFrom<u64> + Ord + Copy>(q: u64, len: I) -> I {
+    I::try_from(q).map_or(len, |n| n.min(len))
+}
+
+/// [`Node::bounds`] of a RunEnd node: the needle's first run by one search of
+/// the window's run values, both bounds from `ends`.
+fn runend_bounds(
+    ends: &Node<'_>,
+    values: &Node<'_>,
+    offset: usize,
+    len: usize,
+    needle: u64,
+) -> (usize, usize) {
+    let (first, span) = window_runs(ends, offset, len);
+    let k = search_ascending(span, |k| values.value_at(first + k), needle);
+    // Adjacent runs may repeat a value, so the run past the needle's is
+    // searched for unless the next run already holds a larger value.
+    let past = if k == span || values.value_at(first + k) != needle {
+        k
+    } else if k + 1 == span || values.value_at(first + k + 1) > needle {
+        k + 1
+    } else {
+        k + 1
+            + partition(span - k - 1, |j| {
+                values.value_at(first + k + 1 + j) <= needle
+            })
+    };
+    (
+        run_start(ends, first + k, offset, len),
+        run_start(ends, first + past, offset, len),
+    )
+}
+
 /// The runs overlapping the window `[offset, offset + len)`, as
 /// `(first_run, run_count)`. Sortedness is asserted for the window only, so
-/// run searches must stay inside these runs — a sliced RunEnd keeps its full
+/// run searches must stay inside these runs: a sliced RunEnd keeps its full
 /// children, whose out-of-window values are in unspecified order.
 fn window_runs(ends: &Node<'_>, offset: usize, len: usize) -> (usize, usize) {
     if len == 0 {
         return (0, 0);
     }
     let nruns = ends.len();
+    // An unsliced node: its last run ends at its length, so every run lies in
+    // the window (the ends ascend).
+    if offset == 0 && nruns > 0 && ends.value_at(nruns - 1) == len as u64 {
+        return (0, nruns);
+    }
     let first = partition(nruns, |r| ends.value_at(r) <= offset as u64);
     let last = partition(nruns, |r| ends.value_at(r) <= (offset + len - 1) as u64);
     (first, (last + 1).min(nruns) - first)
@@ -474,6 +760,44 @@ fn run_start(ends: &Node<'_>, run: usize, offset: usize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run ends that do not ascend (only a corrupt or crafted file holds
+    /// them; Vortex checks their order in debug builds only) never wrap a
+    /// count or a read: a run whose end does not pass the window's position
+    /// adds no rows.
+    /// Run ends that never reach the window's end, under nodes that read
+    /// past their length without a bounds check (constant ends and values,
+    /// only a corrupt file holds them), fail the walk instead of looping
+    /// on the same position forever.
+    #[test]
+    #[should_panic(expected = "corrupt run ends")]
+    fn run_ends_short_of_the_window_panic_rather_than_hang() {
+        let n = Node::RunEnd {
+            ends: Box::new(Node::Constant { value: 3, len: 2 }),
+            values: Box::new(Node::Constant { value: 1, len: 2 }),
+            offset: 5,
+            len: 5,
+        };
+        let mut c = crate::search::Count(0);
+        n.eq_into(0, 5, 1, 0, &mut c);
+    }
+
+    #[test]
+    fn run_ends_out_of_order_count_no_more_than_their_rows() {
+        let (ends, values) = ([9u64, 9, 9, 2, 30], [1u64; 5]);
+        let n = Node::RunEnd {
+            ends: Box::new(Node::Primitive(Words::U64(&ends))),
+            values: Box::new(Node::Primitive(Words::U64(&values))),
+            offset: 5,
+            len: 10,
+        };
+        let mut c = crate::search::Count(0);
+        n.eq_into(0, 10, 1, 0, &mut c);
+        assert_eq!(c.0, 10);
+        let mut out = [0u64; 10];
+        n.read_into(0, &mut out);
+        assert_eq!(out, [1; 10]);
+    }
 
     fn seq(base: u64, multiplier: u64, len: usize) -> Node<'static> {
         Node::Sequence {
@@ -502,6 +826,21 @@ mod tests {
             assert_eq!(n.upper_bound(needle), hi, "upper({needle})");
         }
         assert_eq!(n.value_at(2), 11);
+    }
+
+    #[test]
+    fn quotients_past_the_index_width_clamp_to_len() {
+        // u32 stands in for a 32-bit target's usize: a quotient past
+        // u32::MAX is past every position, never its low bits.
+        let len = 10u32;
+        for q in [1u64 << 32, (1 << 32) + 3, (1 << 33) + 9, u64::MAX] {
+            assert_eq!(clamp_to_len(q, len), len, "q = {q}");
+        }
+        assert_eq!(clamp_to_len(3, len), 3);
+        assert_eq!(clamp_to_len(u64::from(u32::MAX), len), len);
+        // The native width.
+        assert_eq!(clamp_to_len(u64::MAX, 7usize), 7);
+        assert_eq!(clamp_to_len(4, 7usize), 4);
     }
 
     #[test]
@@ -567,6 +906,51 @@ mod tests {
         assert_eq!(n.value_at(0), 2);
         assert_eq!(n.value_at(2), 5);
         assert_eq!(n.value_at(5), 5);
+    }
+
+    #[test]
+    fn runend_bounds_search_once_and_cross_repeated_values() {
+        // ends [2, 3, 6, 7, 9, 12] over values [1, 4, 4, 4, 7, 9]: adjacent
+        // runs repeat 4, which a RunEnd may hold although a writer merges
+        // them. Logical rows: [1, 1, 4, 4, 4, 4, 4, 7, 7, 9, 9, 9].
+        let ends = [2u64, 3, 6, 7, 9, 12];
+        let values = [1u64, 4, 4, 4, 7, 9];
+        let rows: Vec<u64> = values
+            .iter()
+            .zip(ends.iter())
+            .scan(0u64, |start, (&v, &end)| {
+                let run = (*start..end).map(move |_| v);
+                *start = end;
+                Some(run)
+            })
+            .flatten()
+            .collect();
+        // Unsliced, then three windows (one a single run, one ending mid-run).
+        for (offset, len) in [(0usize, 12usize), (2, 6), (3, 4), (8, 1), (5, 0)] {
+            let n = Node::RunEnd {
+                ends: Box::new(Node::Primitive(Words::U64(&ends))),
+                values: Box::new(Node::Primitive(Words::U64(&values))),
+                offset,
+                len,
+            };
+            let window = &rows[offset..offset + len];
+            for needle in (0..=10).chain([u64::MAX]) {
+                let want = (
+                    window.partition_point(|&v| v < needle),
+                    window.partition_point(|&v| v <= needle),
+                );
+                assert_eq!(
+                    n.bounds(needle),
+                    want,
+                    "offset {offset} len {len} needle {needle}"
+                );
+                assert_eq!(
+                    (n.lower_bound(needle), n.upper_bound(needle)),
+                    want,
+                    "offset {offset} len {len} needle {needle}"
+                );
+            }
+        }
     }
 
     #[test]

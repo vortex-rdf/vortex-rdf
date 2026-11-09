@@ -1,25 +1,28 @@
-//! Resolution of an encoded array into a probe tree.
-//!
-//! Resolution is downcasts and metadata reads only — no child is decoded and
-//! no `ExecutionCtx` is created. Any node outside the supported set, any
-//! nullable or non-unsigned-integer dtype, and any non-host buffer declines
-//! the whole tree.
+//! Resolution of an encoded array into a probe tree: downcasts and metadata
+//! reads only, with no child decoded and no `ExecutionCtx` created. Any node
+//! outside the supported set, any nullable or non-unsigned-integer dtype,
+//! and any non-host buffer declines the whole tree.
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::chunked::ChunkedArrayExt as _;
 use vortex_array::arrays::dict::DictSlots;
-use vortex_array::arrays::shared::SharedSlots;
 use vortex_array::arrays::slice::SliceSlots;
-use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Shared, Slice};
+use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Slice};
 use vortex_array::dtype::PType;
 use vortex_array::scalar::PValue;
 use vortex_fastlanes::{
-    BitPacked, BitPackedArrayExt as _, BitPackedSlots, FoR, FoRArrayExt as _, FoRSlots,
+    BitPacked, BitPackedArrayExt as _, BitPackedSlots, BitWidthsView, Delta, DeltaArrayExt as _,
+    DeltaSlots, FoR, FoRArrayExt as _, FoRReferences, FoRSlots, RLE, RLESlots,
 };
+use vortex_layout::arrays::shared::{Shared, SharedSlots};
 use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
+use vortex_sparse::{Sparse, SparseSlots};
 
-use crate::node::{Chunk, Node, PackedNode, PatchProbe, Words};
+use crate::bitpacked::PackedNode;
+use crate::delta::{DeltaNode, DeltaWidth};
+use crate::node::{Chunk, Node, PatchProbe};
+use crate::words::Words;
 
 /// Child array at a fixed slot index, `'a`-borrowed from the erased slots.
 fn slot(slots: &[Option<ArrayRef>], idx: usize) -> Option<&ArrayRef> {
@@ -83,15 +86,70 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
     }
 
     if let Some(view) = arr.as_opt::<FoR>() {
-        let reference = u64::try_from(view.reference_scalar()).ok()?;
-        let child = resolve_node(slot(view.slots(), FoRSlots::ENCODED)?)?;
-        return Some(Node::FoR {
-            reference,
-            child: Box::new(child),
+        let child = Box::new(resolve_node(slot(view.slots(), FoRSlots::ENCODED)?)?);
+        // One reference for the whole array, held in its metadata (the
+        // `fastlanes.for` wire form), or one per 1024-value chunk, a child
+        // (`fastlanes.for.v2`) read through the slots, which borrow from
+        // `arr` rather than from this view.
+        return Some(match view.references() {
+            FoRReferences::Global(reference) => Node::FoR {
+                reference: u64::try_from(reference).ok()?,
+                child,
+            },
+            FoRReferences::Blocked(_) => Node::ChunkedFoR {
+                references: Box::new(resolve_node(slot(
+                    view.slots(),
+                    FoRSlots::BLOCKED_REFERENCES,
+                )?)?),
+                offset: usize::from(view.offset()),
+                child,
+            },
+        });
+    }
+
+    if let Some(view) = arr.as_opt::<Sparse>() {
+        // The fill value everywhere but at the patched positions; the
+        // chunk-offsets slot only accelerates a lookup and needs no handling.
+        let data = view.data();
+        let slots = view.slots();
+        return Some(Node::Sparse {
+            fill: u64::try_from(data.fill_scalar()).ok()?,
+            patches: PatchProbe {
+                indices: Box::new(resolve_node(slot(slots, SparseSlots::PATCH_INDICES)?)?),
+                values: Box::new(resolve_node(slot(slots, SparseSlots::PATCH_VALUES)?)?),
+                offset: data.offset(),
+            },
+            len: arr.len(),
+        });
+    }
+
+    if let Some(view) = arr.as_opt::<RLE>() {
+        // Value offsets are absolute; a slice keeps the ones of its chunks,
+        // so the first is the base its value indices count from.
+        let slots = view.slots();
+        let value_offsets = resolve_node(slot(slots, RLESlots::VALUES_IDX_OFFSETS)?)?;
+        let base = if value_offsets.len() == 0 {
+            0
+        } else {
+            value_offsets.value_at(0)
+        };
+        return Some(Node::Rle {
+            values: Box::new(resolve_node(slot(slots, RLESlots::VALUES)?)?),
+            indices: Box::new(resolve_node(slot(slots, RLESlots::INDICES)?)?),
+            value_offsets: Box::new(value_offsets),
+            base,
+            offset: view.data().offset(),
+            len: arr.len(),
         });
     }
 
     if let Some(view) = arr.as_opt::<BitPacked>() {
+        // One bit width for every block; per-block widths (the
+        // `fastlanes.bitpacked.v2` wire form) decline, since a block's words
+        // no longer sit at a fixed stride.
+        let BitWidthsView::Global(bit_width) = view.bit_widths() else {
+            return None;
+        };
         let data = view.data();
         let packed = match dtype.as_ptype() {
             PType::U8 => Words::U8(data.packed_slice::<u8>()),
@@ -117,13 +175,30 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
             }),
             _ => return None,
         };
-        return Some(Node::BitPacked(PackedNode {
+        return PackedNode::new(
             packed,
-            bit_width: usize::from(data.bit_width()),
-            offset: usize::from(data.offset()),
-            len: arr.len(),
+            usize::from(bit_width),
+            usize::from(data.offset()),
+            arr.len(),
             patches,
-        }));
+        )
+        .map(Node::BitPacked);
+    }
+
+    if let Some(view) = arr.as_opt::<Delta>() {
+        // The deltas child carries the validity, so a nullable one declines
+        // through its own resolution; the bases are a plain lane table.
+        let slots = view.slots();
+        let bases = resolve_node(slot(slots, DeltaSlots::BASES)?)?;
+        let deltas = resolve_node(slot(slots, DeltaSlots::DELTAS)?)?;
+        let width = match dtype.as_ptype() {
+            PType::U8 => DeltaWidth::U8,
+            PType::U16 => DeltaWidth::U16,
+            PType::U32 => DeltaWidth::U32,
+            PType::U64 => DeltaWidth::U64,
+            _ => return None,
+        };
+        return DeltaNode::new(bases, deltas, width, view.offset(), arr.len()).map(Node::Delta);
     }
 
     if let Some(view) = arr.as_opt::<Slice>() {
@@ -223,12 +298,21 @@ fn as_slice_parts(arr: &ArrayRef) -> Option<(&ArrayRef, std::ops::Range<usize>)>
     Some((parent, view.data().slice_range().clone()))
 }
 
+/// A non-negative integer `PValue` as `u64`; `None` for negatives and
+/// non-integers. A sequence's multiplier is stored signed whatever the
+/// array's own type (a step of `1` arrives as `1i64`), so the signed arms
+/// matter: a negative step would make the run descend, which the sortedness
+/// contract excludes, so it declines.
 fn pvalue_u64(value: PValue) -> Option<u64> {
     match value {
         PValue::U8(v) => Some(u64::from(v)),
         PValue::U16(v) => Some(u64::from(v)),
         PValue::U32(v) => Some(u64::from(v)),
         PValue::U64(v) => Some(v),
+        PValue::I8(v) => u64::try_from(v).ok(),
+        PValue::I16(v) => u64::try_from(v).ok(),
+        PValue::I32(v) => u64::try_from(v).ok(),
+        PValue::I64(v) => u64::try_from(v).ok(),
         _ => None,
     }
 }

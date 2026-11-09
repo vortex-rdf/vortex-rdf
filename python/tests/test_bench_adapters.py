@@ -12,21 +12,16 @@ this environment (see `bench/adapters.py` on why each gets its own virtualenv).
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-BENCH_DIR = Path(__file__).resolve().parents[1] / "bench"
-sys.path.insert(0, str(BENCH_DIR))
-
-from adapters import VORTEX_SLUGS, build_adapter, split_term  # noqa: E402
-from datasets import FULL_SCAN_PATTERN, Pat  # noqa: E402
+from adapters import ALL_SLUGS, VORTEX_SLUGS, build_adapter, split_term
+from conftest import NAME
+from datasets import FULL_SCAN_PATTERN, Pat
 
 #: The fixture holds two `foaf:name` triples on IRI subjects plus one on a
 #: blank node; a bound predicate is the pattern that routes through a secondary
 #: index when the variant has one, so it covers the indexed cells too.
-NAME_PATTERN = Pat("P", None, "<http://xmlns.com/foaf/0.1/name>", None, None)
+NAME_PATTERN = Pat("P", None, NAME, None, None)
 
 
 @pytest.mark.parametrize("slug", VORTEX_SLUGS)
@@ -75,3 +70,35 @@ def test_split_term(term, parts):
 def test_split_term_rejects_garbage(garbage):
     with pytest.raises(ValueError):
         split_term(garbage)
+
+
+class Recorder:
+    """A store whose attribute lookups are recorded."""
+
+    def __init__(self, store):
+        self.store, self.names = store, []
+
+    def __getattr__(self, name):
+        self.names.append(name)
+        return getattr(self.store, name)
+
+
+def test_vortex_count_streams_through_iter_quads(fixture_nt_path, tmp_path):
+    adapter, src = build_adapter("vortex_dict"), str(fixture_nt_path)
+    store = Recorder(adapter.build(src, adapter.artifact_path(str(tmp_path), src)))
+    assert adapter.count(store, adapter.prepare(FULL_SCAN_PATTERN)) == 5
+    assert store.names == ["iter_quads"]
+
+
+def test_every_adapter_says_how_its_store_is_obtained():
+    assert {slug: build_adapter(slug).obtained for slug in ALL_SLUGS} == {
+        "vortex_dict": "mapped",
+        "vortex_dict_mem": "loaded",
+        "vortex_dict_bycopy": "mapped",
+        "vortex_dict_bycopy_mem": "loaded",
+        "vortex_dict_byref": "mapped",
+        "vortex_dict_byref_mem": "loaded",
+        "pyoxigraph": "built",
+        "pycottas": "opened",
+        "rdflib": "built",
+    }

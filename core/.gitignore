@@ -1,2 +1,0 @@
-# Written by `cargo bench --bench compare`; feeds the dashboard, not committed
-/bench/results*.json

@@ -19,7 +19,7 @@ use vortex_rdf_core::{
 };
 
 // The dataset shape — moduli, term spellings, probe patterns — lives on its own
-// so `compare.rs` can include just that file (`#[path = "support/dataset.rs"]`)
+// so `bench-compare/benches/compare.rs` can include just that file by `#[path]`
 // without the store-building machinery it has no use for.
 pub mod dataset;
 pub use dataset::{PATTERNS, Pattern, terms_for};
@@ -160,7 +160,7 @@ pub fn materialize_quads(size: usize) -> Vec<RawQuad> {
 
 /// Run a quad stream's ingest to the builder's `BuiltArray`: the quad array
 /// plus whatever travels beside it — under the Dictionary layout the array
-/// holds only u32 codes and the term dictionary rides alongside; `from_built`
+/// holds only term codes and the term dictionary rides alongside; `from_built`
 /// is the one constructor that accepts that pair.
 fn ingest(
     quads: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
@@ -383,8 +383,9 @@ pub fn bench_moduli() -> dataset::Moduli {
     *M.get_or_init(|| dataset::moduli(bench_size(), dataset::WANT_GRAPHS))
 }
 
-/// Generate the bench dataset as a stream of quads — the rows `compare.rs`'s
-/// `ensure_quads_dataset` writes, built in process.
+/// Generate the bench dataset as a stream of quads: the rows
+/// `bench-compare/benches/compare.rs`'s `ensure_quads_dataset` writes, built
+/// in process.
 pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
     let m = dataset::moduli(size, dataset::WANT_GRAPHS);
 

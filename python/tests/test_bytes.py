@@ -5,7 +5,7 @@ import pytest
 
 from vortex_rdf import VortexRdfError, VortexRdfStore
 
-NAME = "<http://xmlns.com/foaf/0.1/name>"
+from conftest import NAME
 
 
 def test_bytes_round_trip(vortex_files, layout):

@@ -1,0 +1,587 @@
+//! A resident [`TermDictionary`]'s terms: how they are held
+//! ([`ResidentChunks`]) and read (single-term reads and cursors), built
+//! (FSST-compressed in windows) or adopted from a written term column, and
+//! written as the `dictionary` child with its windows' zone-map bounds.
+
+use std::sync::Arc;
+
+use vortex_array::arrays::primitive::PrimitiveArrayExt as _;
+use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+use vortex_array::dtype::PType;
+use vortex_array::match_each_integer_ptype;
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
+
+use vortex_buffer::Buffer;
+
+use crate::debug;
+use crate::error::{Result, VortexRdfError};
+use crate::io::read::scan_reader_chunks;
+use crate::observe::observe;
+use crate::session::VORTEX_SESSION;
+use crate::store::array::{StrColReader, trusted_str};
+
+use super::term_dict::{TermDictionary, lower_bound_by};
+
+/// The `dictionary` child's single column: non-nullable utf8, row i the term
+/// with code i, globally sorted. Wire contract, owned here per the rule in
+/// [`crate::store::schema`].
+pub(crate) const COL_DICT_TERM: &str = "_dict_term";
+
+/// Terms per FSST window of a built dictionary ([`TermDictionary::compress`]):
+/// the granularity of the child's leaves, of a file-backed read and of a
+/// chunk-by-chunk lift. Small enough that one leaf is a bounded slice of the
+/// column, large enough to amortize the symbol table every window carries.
+const DICT_CHUNK_ROWS: usize = 64 * 1024;
+
+/// A dictionary's sorted terms in memory: one or more chunks (a built
+/// dictionary's FSST windows, or a written child's chunks as read back) and
+/// the start table mapping a global term index to (chunk, local index).
+/// Always at least one chunk; an empty column is one empty chunk. A chunk
+/// that arrives FSST stays FSST; any other encoding a writer chose is
+/// canonicalized to plaintext.
+pub(super) struct ResidentChunks {
+    chunks: Vec<TermChunk>,
+    /// `starts[i]` = global index of chunk i's first term; ascending.
+    starts: Vec<usize>,
+    len: usize,
+}
+
+/// One chunk of a term column, in the encoding it is held in.
+pub(super) enum TermChunk {
+    /// Plaintext terms; a read borrows the array's bytes.
+    Canonical(VarBinViewArray),
+    /// FSST-compressed terms; every read decodes one term.
+    Fsst(FsstTerms),
+}
+
+impl TermChunk {
+    /// Adopt a wire chunk: FSST stays FSST, any other encoding is
+    /// canonicalized to plaintext.
+    pub(super) fn from_wire(chunk: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
+        match chunk.try_downcast::<FSST>() {
+            Ok(fsst) => Ok(TermChunk::Fsst(FsstTerms::new(fsst)?)),
+            Err(other) => Ok(TermChunk::Canonical(other.execute::<VarBinViewArray>(ctx)?)),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        match self {
+            TermChunk::Canonical(a) => a.len(),
+            TermChunk::Fsst(f) => f.len(),
+        }
+    }
+
+    /// Term `local`'s bytes: borrowed from a canonical chunk, or decoded into
+    /// `scratch` from an FSST one. Unlike a [`cursor`](Self::cursor), the
+    /// scratch is the caller's, so one scratch serves every chunk it reads.
+    pub(super) fn bytes_into<'a>(&'a self, local: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        match self {
+            TermChunk::Canonical(a) => StrColReader::new(a).bytes_at(local),
+            TermChunk::Fsst(f) => f.decode_into(local, scratch),
+        }
+    }
+
+    /// The chunk as an array, in its stored encoding.
+    fn array(&self) -> ArrayRef {
+        match self {
+            TermChunk::Canonical(a) => a.clone().into_array(),
+            TermChunk::Fsst(f) => f.array.clone().into_array(),
+        }
+    }
+
+    /// What a window cache charges for this chunk. An FSST chunk is charged
+    /// its code offsets (4 bytes per term, plus 4), whether they view the
+    /// leaf's buffer or are a converted copy, but not the code bytes it only
+    /// references. A canonical chunk is charged its array's `nbytes()`,
+    /// which counts buffers sliced from a map too.
+    #[cfg(feature = "file-io")]
+    pub(super) fn heap_bytes(&self) -> usize {
+        match self {
+            TermChunk::Canonical(a) => usize::try_from(a.nbytes()).unwrap_or(usize::MAX),
+            TermChunk::Fsst(f) => f.offsets.len() * size_of::<u32>(),
+        }
+    }
+
+    /// A cursor over this chunk's terms. An FSST cursor's scratch starts
+    /// empty and grows to the terms it decodes, so a read allocates only for
+    /// the chunks it touches.
+    pub(super) fn cursor(&self) -> ChunkCursor<'_> {
+        match self {
+            TermChunk::Canonical(a) => ChunkCursor::Canonical(StrColReader::new(a)),
+            TermChunk::Fsst(f) => ChunkCursor::Fsst {
+                terms: f,
+                scratch: Vec::new(),
+            },
+        }
+    }
+}
+
+/// The chunk holding global index `i` of chunks starting at `starts`
+/// (ascending, `starts[0] == 0`), and `i` local to that chunk.
+pub(super) fn chunk_of(starts: &[usize], i: usize) -> (usize, usize) {
+    let chunk = starts.partition_point(|&s| s <= i) - 1;
+    (chunk, i - starts[chunk])
+}
+
+/// Whether every IRI of the sorted terms `plain` (the run of terms starting
+/// with `<`) is spelled `<`, its text, `>`: what lets a `STR()` prefix over
+/// IRIs be decided by a code range ([`TermDictionary::filter_codes`]). Two
+/// binary searches find the run, and only its terms' ends are looked at.
+fn iris_bracketed(plain: &VarBinViewArray) -> bool {
+    let terms = StrColReader::new(plain);
+    let len = plain.len();
+    let lo = lower_bound_by(0..len, |i| terms.bytes_at(i) < b"<".as_slice());
+    // `=` is the byte after `<`: from `lo`, the terms below it start with `<`.
+    let hi = lower_bound_by(lo..len, |i| terms.bytes_at(i) < b"=".as_slice());
+    // Each starts with `<`, so one ending with `>` is two bytes at least.
+    (lo..hi).all(|i| terms.bytes_at(i).ends_with(b">"))
+}
+
+impl ResidentChunks {
+    /// The column `chunks` concatenate to; at least one chunk.
+    fn new(chunks: Vec<TermChunk>) -> Self {
+        debug_assert!(!chunks.is_empty(), "a term column holds at least one chunk");
+        let mut starts = Vec::with_capacity(chunks.len());
+        let mut len = 0usize;
+        for chunk in &chunks {
+            starts.push(len);
+            len += chunk.len();
+        }
+        Self {
+            chunks,
+            starts,
+            len,
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The chunk holding global index `i`, and `i` local to it. A
+    /// one-chunk column answers without searching the start table.
+    #[inline]
+    fn locate(&self, i: usize) -> (&TermChunk, usize) {
+        match self.chunks.as_slice() {
+            [only] => (only, i),
+            chunks => {
+                let (chunk, local) = chunk_of(&self.starts, i);
+                (&chunks[chunk], local)
+            }
+        }
+    }
+
+    /// Term `i`'s bytes: borrowed from a canonical chunk, or decoded into
+    /// `scratch` from an FSST one. A single-term read passes one scratch
+    /// through all its probes, where a cursor holds one per chunk.
+    pub(super) fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        observe!(ScratchRead);
+        let (chunk, local) = self.locate(i);
+        chunk.bytes_into(local, scratch)
+    }
+
+    /// A cursor over the terms: one chunk cursor per chunk, each with its own
+    /// scratch; a one-chunk column's cursor builds only the first.
+    pub(super) fn cursor(&self) -> DictCursor<'_> {
+        let (first, rest) = self
+            .chunks
+            .split_first()
+            .expect("a term column holds at least one chunk");
+        DictCursor {
+            store: self,
+            first: first.cursor(),
+            rest: if rest.is_empty() {
+                Vec::new()
+            } else {
+                rest.iter().map(TermChunk::cursor).collect()
+            },
+        }
+    }
+}
+
+impl TermDictionary {
+    /// A dictionary of no terms, held canonical: there is nothing to train
+    /// FSST on. With no IRI, every IRI is bracketed.
+    pub(crate) fn empty() -> Self {
+        Self::new(
+            ResidentChunks::new(vec![TermChunk::Canonical(VarBinViewArray::from_iter_str(
+                std::iter::empty::<&str>(),
+            ))]),
+            true,
+        )
+    }
+
+    /// A dictionary of `plain`'s sorted unique terms, FSST-compressed in
+    /// windows ([`compress`](Self::compress)), recording whether its IRIs
+    /// are bracketed ([`iris_bracketed`]); a `Serialization` error past
+    /// `i32::MAX` terms.
+    pub(crate) fn from_sorted_column(plain: VarBinViewArray) -> Result<Self> {
+        // A conservative cap, not a format limit: nothing in the format needs
+        // the count to fit an `i32` (the column's length is a `usize`, codes
+        // are `u64`, and each FSST window's offsets span `DICT_CHUNK_ROWS`
+        // terms), but no larger dictionary is tested, and this build holds
+        // every term in memory.
+        if plain.len() > i32::MAX as usize {
+            return Err(VortexRdfError::Serialization(format!(
+                "Dictionary of {} unique terms exceeds the supported maximum ({})",
+                plain.len(),
+                i32::MAX
+            )));
+        }
+        Self::compress(plain)
+    }
+
+    /// The dictionary of a term column's `chunks`, each adopted through
+    /// [`TermChunk::from_wire`], its IRIs bracketed as `bracketed_iris` says
+    /// (the provenance of the child they were read from); empty chunks are
+    /// dropped.
+    fn from_term_chunks(
+        chunks: Vec<ArrayRef>,
+        ctx: &mut vortex_array::ExecutionCtx,
+        bracketed_iris: bool,
+    ) -> Result<Self> {
+        let mut adopted = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            if chunk.is_empty() {
+                continue;
+            }
+            adopted.push(TermChunk::from_wire(chunk, ctx)?);
+        }
+        if adopted.is_empty() {
+            return Ok(Self::empty());
+        }
+        Ok(Self::new(ResidentChunks::new(adopted), bracketed_iris))
+    }
+
+    /// `plain` FSST-compressed in windows of [`DICT_CHUNK_ROWS`] terms: one
+    /// symbol table trained on the whole column, each window compressed with
+    /// it into a self-contained array. The writer writes each window verbatim
+    /// as one flat leaf (no re-encoding, no parent buffers dragged along),
+    /// and those leaves are what a file-backed dictionary reads. An empty
+    /// column stays canonical: there is nothing to train a symbol table on.
+    fn compress(plain: VarBinViewArray) -> Result<Self> {
+        Self::compress_windowed(plain, DICT_CHUNK_ROWS)
+    }
+
+    /// [`compress`](Self::compress) in windows of `window` terms, so tests
+    /// reach the multi-window path with few terms.
+    pub(super) fn compress_windowed(plain: VarBinViewArray, window: usize) -> Result<Self> {
+        let bracketed_iris = iris_bracketed(&plain);
+        if plain.is_empty() {
+            return Ok(Self::new(
+                ResidentChunks::new(vec![TermChunk::Canonical(plain)]),
+                bracketed_iris,
+            ));
+        }
+        let start = debug::timer();
+        let len = plain.len();
+        let array = plain.into_array();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let compressor = fsst_train_compressor(&array, &mut ctx)?;
+        let chunks = if len <= window {
+            // One window: the column compresses as it is, unsliced.
+            let fsst = fsst_compress(&array, &compressor, &mut ctx)?;
+            vec![TermChunk::Fsst(FsstTerms::new(fsst)?)]
+        } else {
+            let mut chunks = Vec::with_capacity(len.div_ceil(window));
+            let mut at = 0usize;
+            while at < len {
+                let end = (at + window).min(len);
+                // `fsst_compress` takes a VarBinView, not the lazy slice. The
+                // executed view shares the parent's data buffers: only the
+                // window's view headers are copied, not its terms.
+                let piece = array
+                    .slice(at..end)?
+                    .execute::<VarBinViewArray>(&mut ctx)?
+                    .into_array();
+                let fsst = fsst_compress(&piece, &compressor, &mut ctx)?;
+                chunks.push(TermChunk::Fsst(FsstTerms::new(fsst)?));
+                at = end;
+            }
+            chunks
+        };
+        log::debug!(
+            "[Dictionary] FSST-compressed {} terms in {:?} (windows: {})",
+            len,
+            debug::elapsed(start),
+            chunks.len()
+        );
+        Ok(Self::new(ResidentChunks::new(chunks), bracketed_iris))
+    }
+}
+
+/// Bytes one FSST code expands to at most.
+const FSST_SYMBOL_LEN: usize = 8;
+
+/// Output headroom that keeps `decompress_into` on its 8-symbols-at-a-time
+/// path, which runs only while `8 * FSST_SYMBOL_LEN` bytes of room are left:
+/// a buffer sized exactly to a term's expanded codes falls back to the
+/// byte-at-a-time loop.
+const FSST_DECODE_HEADROOM: usize = 8 * FSST_SYMBOL_LEN;
+
+/// The room a decode first allocates a scratch with: a term of up to 120 FSST
+/// codes, so the probes of a search over usual terms never grow it.
+const SCRATCH_SEED_BYTES: usize = 1024;
+
+/// FSST-compressed sorted terms, with the code offsets unpacked for per-row
+/// reads.
+pub(super) struct FsstTerms {
+    /// Kept whole, so the dictionary serializes without recompressing.
+    array: FSSTArray,
+    /// Code offsets as `u32`, so a per-row read is a slice index: 32-bit
+    /// offsets (`u32` or `i32`) are viewed in place, any other width is
+    /// converted into a copy.
+    offsets: Buffer<u32>,
+}
+
+impl FsstTerms {
+    /// The chunk `array`, its code offsets unpacked. Offsets of another width
+    /// are converted, and one a `u32` cannot hold (past 4 GiB of codes, or
+    /// negative) is a `Deserialization` error naming it. 32-bit ones are
+    /// viewed as written: store files are trusted, and a negative `i32`
+    /// offset, which no writer produces, panics its term's read at the
+    /// slice's bounds check.
+    fn new(array: FSSTArray) -> Result<Self> {
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let offsets = array
+            .codes_offsets()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        let refused = |offset: &dyn std::fmt::Display| {
+            VortexRdfError::Deserialization(format!(
+                "an FSST term chunk's code offset {offset} does not fit a u32"
+            ))
+        };
+        // A foreign writer may store the offsets in any integer width. The
+        // macro covers every width, so the conversion cannot fail in its
+        // narrower arms and is the identity in its `u32` arm (never reached).
+        #[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
+        let offsets: Buffer<u32> = match offsets.ptype() {
+            PType::U32 => offsets.to_buffer::<u32>(),
+            PType::I32 => offsets.reinterpret_cast(PType::U32).to_buffer::<u32>(),
+            ptype => match_each_integer_ptype!(ptype, |O| {
+                offsets
+                    .as_slice::<O>()
+                    .iter()
+                    .map(|&o| u32::try_from(o).map_err(|_| refused(&o)))
+                    .collect::<Result<_>>()?
+            }),
+        };
+        Ok(Self { array, offsets })
+    }
+
+    fn len(&self) -> usize {
+        self.array.len()
+    }
+
+    /// Term `i` decoded into `scratch`, whose bytes it returns. The scratch is
+    /// first grown to the term's codes expanded at [`FSST_SYMBOL_LEN`] bytes
+    /// each plus [`FSST_DECODE_HEADROOM`], and to at least
+    /// [`SCRATCH_SEED_BYTES`].
+    fn decode_into<'a>(&self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        let (start, end) = (self.offsets[i] as usize, self.offsets[i + 1] as usize);
+        let codes = &self.array.codes_bytes()[start..end];
+        scratch.clear();
+        let needed = codes.len() * FSST_SYMBOL_LEN + FSST_DECODE_HEADROOM;
+        observe!(
+            when scratch.capacity() < needed,
+            ScratchGrown {
+                fresh: scratch.capacity() == 0
+            }
+        );
+        scratch.reserve(needed.max(SCRATCH_SEED_BYTES));
+        let n = self
+            .array
+            .decompressor()
+            .decompress_into(codes, scratch.spare_capacity_mut());
+        // SAFETY: `decompress_into` initialized the first `n` bytes.
+        unsafe {
+            scratch.set_len(n);
+        }
+        &scratch[..n]
+    }
+}
+
+/// A cursor over a dictionary's terms. A read borrows from the cursor, not
+/// the dictionary, because an FSST read decodes into the cursor's scratch:
+/// the borrow ends at the next read, so holding several terms at once (a
+/// quad's four roles) takes one cursor each.
+pub(super) struct DictCursor<'a> {
+    store: &'a ResidentChunks,
+    /// The first chunk's cursor, held inline, so a one-chunk column's cursor
+    /// allocates nothing until a read grows its scratch.
+    first: ChunkCursor<'a>,
+    /// One cursor per further chunk, each with its own scratch.
+    rest: Vec<ChunkCursor<'a>>,
+}
+
+/// A cursor over one [`TermChunk`].
+pub(super) enum ChunkCursor<'a> {
+    Canonical(StrColReader<'a>),
+    Fsst {
+        terms: &'a FsstTerms,
+        scratch: Vec<u8>,
+    },
+}
+
+impl ChunkCursor<'_> {
+    /// Term `local` as a `&str`, borrowed like [`bytes_at`](Self::bytes_at)
+    /// and read unchecked ([`trusted_str`]): the chunk must be a Utf8 column
+    /// of a store this crate wrote or the caller trusts.
+    #[cfg(feature = "file-io")]
+    #[inline]
+    pub(super) fn str_at(&mut self, local: usize) -> &str {
+        trusted_str(self.bytes_at(local))
+    }
+
+    /// Term `local`'s bytes, borrowed from the cursor until the next read.
+    #[inline]
+    pub(super) fn bytes_at(&mut self, local: usize) -> &[u8] {
+        match self {
+            ChunkCursor::Canonical(r) => r.bytes_at(local),
+            ChunkCursor::Fsst { terms, scratch } => terms.decode_into(local, scratch),
+        }
+    }
+}
+
+impl DictCursor<'_> {
+    /// Term `i`'s bytes, borrowed from the cursor until the next read.
+    #[inline]
+    pub(super) fn bytes_at(&mut self, i: usize) -> &[u8] {
+        if self.rest.is_empty() {
+            return self.first.bytes_at(i);
+        }
+        let (chunk, local) = chunk_of(&self.store.starts, i);
+        let cursor = match chunk {
+            0 => &mut self.first,
+            k => &mut self.rest[k - 1],
+        };
+        cursor.bytes_at(local)
+    }
+
+    /// Term `i` as a `&str`, borrowed like [`bytes_at`](Self::bytes_at) and
+    /// read unchecked ([`trusted_str`]): the terms must come from a store this
+    /// crate wrote or the caller trusts.
+    #[inline]
+    pub(super) fn str_at(&mut self, i: usize) -> &str {
+        trusted_str(self.bytes_at(i))
+    }
+}
+
+impl TermDictionary {
+    /// The resident dictionary of a `dictionary` child's whole term column,
+    /// each scan chunk adopted as one chunk ([`TermChunk::from_wire`]), its
+    /// IRIs bracketed as the child's descriptor records (`bracketed_iris`).
+    /// The scan runs inline ([`scan_reader_chunks`]), with no runtime
+    /// handle, so it serves every open path, wasm's included.
+    pub(crate) async fn from_child_reader(
+        reader: vortex_layout::LayoutReaderRef,
+        bracketed_iris: bool,
+    ) -> Result<Self> {
+        if reader.row_count() == 0 {
+            return Ok(Self::empty());
+        }
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let mut chunks = Vec::new();
+        for chunk in scan_reader_chunks(reader).await? {
+            let struct_arr = chunk.execute::<StructArray>(&mut ctx)?;
+            chunks.push(struct_arr.unmasked_field_by_name(COL_DICT_TERM)?.clone());
+        }
+        Self::from_term_chunks(chunks, &mut ctx, bracketed_iris)
+    }
+}
+
+#[cfg(test)]
+impl TermDictionary {
+    /// The held term chunks as arrays, each in its stored encoding.
+    pub(crate) fn term_chunks(&self) -> Vec<ArrayRef> {
+        self.terms.chunks.iter().map(TermChunk::array).collect()
+    }
+}
+
+#[cfg(test)]
+impl TermChunk {
+    /// The address of an FSST chunk's code offsets, for tests that pin
+    /// whether they view the leaf's own buffer.
+    #[cfg(test)]
+    pub(super) fn offsets_addr(&self) -> Option<usize> {
+        match self {
+            TermChunk::Canonical(_) => None,
+            TermChunk::Fsst(f) => Some(f.offsets.as_ptr() as usize),
+        }
+    }
+}
+
+impl TermDictionary {
+    /// This dictionary as the root's required `dictionary` component: the
+    /// chunks of [`child_chunks`](Self::child_chunks), each written verbatim
+    /// as one flat leaf, with one zone per window when the windows are
+    /// uniform ([`uniform_window`](Self::uniform_window)).
+    pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
+        use crate::io::container::{
+            self, BufferedComponentSource, DICT_COMPONENT_NAME, NativeComponentWrite,
+            StoreComponentDescriptor, StoreComponentRole,
+        };
+        let chunks = self.child_chunks()?;
+        let dtype = chunks[0].dtype().clone();
+        NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: DICT_COMPONENT_NAME.into(),
+                role: StoreComponentRole::Dictionary,
+                implementation: container::DICT_IMPLEMENTATION.into(),
+                version: container::DICT_VERSION,
+                required: true,
+                sorted: true,
+                bracketed_iris: self.bracketed_iris(),
+                dtype,
+            },
+            Arc::new(BufferedComponentSource::try_new(chunks)?),
+            container::dict_child_strategy(self.uniform_window()),
+        )
+        .map_err(VortexRdfError::Vortex)
+    }
+
+    /// The component's body: one `{_dict_term: utf8}` struct per held chunk,
+    /// in its stored encoding, row i of the concatenation the term with code
+    /// i. Each chunk is written as one flat leaf, so the windows survive as
+    /// the child's leaves. At least one chunk, possibly empty: the child
+    /// strategy needs one to write a schema-complete component.
+    pub(crate) fn child_chunks(&self) -> Result<Vec<ArrayRef>> {
+        let wrap = |terms: ArrayRef| -> Result<ArrayRef> {
+            let rows = terms.len();
+            StructArray::try_new(
+                [COL_DICT_TERM].into(),
+                vec![terms],
+                rows,
+                Validity::NonNullable,
+            )
+            .map_err(VortexRdfError::Vortex)
+            .map(|a| a.into_array())
+        };
+        self.terms
+            .chunks
+            .iter()
+            .map(|chunk| wrap(chunk.array()))
+            .collect()
+    }
+
+    /// The length every held chunk but the last fills, and the last at most:
+    /// the zone length the child is written with, one zone per leaf. `None`
+    /// for chunks of uneven length (adopted from a foreign file), which are
+    /// written without a zone map. A single chunk is its own window; an empty
+    /// dictionary has none.
+    pub(crate) fn uniform_window(&self) -> Option<std::num::NonZeroUsize> {
+        let (last, rest) = self.terms.chunks.split_last()?;
+        let window = rest.first().map_or(last.len(), TermChunk::len);
+        let uniform = rest.iter().all(|chunk| chunk.len() == window) && last.len() <= window;
+        uniform
+            .then(|| std::num::NonZeroUsize::new(window))
+            .flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests;

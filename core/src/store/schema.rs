@@ -1,21 +1,81 @@
-//! The column names that define the serialized format.
+//! The names and widths that define the serialized format: the four primary
+//! quad columns, the TypedObject layout's split object columns, and the code
+//! and row-id types. A name change here changes what a written file means, so
+//! a child that carries a primary column (the copy index families) uses these
+//! constants for its name. A name owned by one subsystem lives with it: the
+//! `rid` column of every index child in the index hub ([`indexes::COL_RID`]),
+//! the reference index's `val` in [`reference`], and the dictionary child's
+//! `_dict_term` in [`storage`](crate::store::layouts::dictionary::storage).
 //!
-//! These are contract, not policy: a name change here changes what a written
-//! file means, so they live in one place. Column names owned by a single
-//! subsystem live with that subsystem instead: each index child's column
-//! names in its index module ([`secondary_by_copy::CopyFamily`],
-//! [`secondary_by_reference`]), the dictionary child's `_dict_term` in
-//! [`term_dict`](crate::store::layouts::dictionary::term_dict), and the
-//! TypedObject layout's split object columns in [`typed_object`].
-//!
-//! [`secondary_by_copy::CopyFamily`]: crate::store::indexes::secondary_by_copy::CopyFamily
-//! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
-//! [`typed_object`]: crate::store::layouts::typed_object
+//! [`indexes::COL_RID`]: crate::store::indexes::COL_RID
+//! [`reference`]: crate::store::indexes::reference
 
-/// The subject column — first in every layout. Whether its rows are globally
+use vortex_array::dtype::{DType, Nullability, PType};
+
+/// A term code: a term's rank in a Dictionary-layout store's sorted term
+/// dictionary, the value of every code column (the quad table's `s`, `p`,
+/// `o`, `g` and the index children's code columns) and of every code a
+/// binding hands across. 64 bits wide, so a dictionary may hold more terms
+/// than a `u32` can count.
+pub type TermCode = u64;
+
+/// The primitive type of a code column on the wire: non-nullable `u64`
+/// ([`TermCode`]). A Dictionary-layout quad table is recognized by its `s`
+/// column having this type; a code column of any other integer width is a
+/// file this crate never wrote and is refused at open.
+pub(crate) const CODE_PTYPE: PType = PType::U64;
+
+/// The dtype of a code column as this crate writes one: non-nullable
+/// [`CODE_PTYPE`].
+pub(crate) const CODE_DTYPE: DType = DType::Primitive(CODE_PTYPE, Nullability::NonNullable);
+
+/// A row id: a quad's position in the quad table, the value of every index
+/// child's `rid` column (how an index names the rows it matched) and the
+/// currency a match's row selection, tombstones and further matches share
+/// without renumbering anything. 64 bits wide, so a store with secondary
+/// indexes may hold more quads than a `u32` can count.
+pub type RowId = u64;
+
+/// The primitive type of a row-id column on the wire: non-nullable `u64`
+/// ([`RowId`]). An index child whose `rid` column is an integer of any other
+/// width is a file this crate never wrote and is refused at open.
+pub(crate) const ROW_ID_PTYPE: PType = PType::U64;
+
+/// Whether a column named `name` holds term codes where it is an integer:
+/// the quad table's and the copy index children's `s`, `p`, `o`, `g`, and
+/// the reference index children's `val`. Under the string layouts the same
+/// names hold term strings.
+pub(crate) fn is_code_column_name(name: &str) -> bool {
+    PRIMARY_COLUMNS.contains(&name) || name == crate::store::indexes::reference::COL_VAL
+}
+
+/// Whether the field `name: dtype` is a term-code column as this crate
+/// writes one: a code column name ([`is_code_column_name`]) holding
+/// non-nullable [`CODE_PTYPE`] values.
+pub(crate) fn is_code_field(name: &str, dtype: &DType) -> bool {
+    is_code_column_name(name)
+        && matches!(dtype, DType::Primitive(ptype, Nullability::NonNullable) if *ptype == CODE_PTYPE)
+}
+
+/// Whether the field `name: dtype` is a row-id column as this crate writes
+/// one: an index child's `rid` holding non-nullable [`ROW_ID_PTYPE`] values.
+pub(crate) fn is_row_id_field(name: &str, dtype: &DType) -> bool {
+    name == crate::store::indexes::COL_RID
+        && matches!(dtype, DType::Primitive(ptype, Nullability::NonNullable) if *ptype == ROW_ID_PTYPE)
+}
+
+/// Whether the field `name: dtype` is an id column: a term-code column
+/// ([`is_code_field`]) or a row-id column ([`is_row_id_field`]): the `u64`
+/// columns whose leaf size the writer sets
+/// ([`child_strategy`](crate::io::container::child_strategy)).
+pub(crate) fn is_id_field(name: &str, dtype: &DType) -> bool {
+    is_code_field(name, dtype) || is_row_id_field(name, dtype)
+}
+
+/// The subject column, first in every layout. Whether its rows are globally
 /// sorted is per-store provenance
-/// ([`quads_sorted`](crate::io::container::layout::quads_sorted)), not a
-/// property of the name.
+/// ([`quads_sorted`](crate::io::container::layout::RdfStoreLayoutData::quads_sorted)),
+/// not a property of the name.
 pub(crate) const COL_S: &str = "s";
 /// The predicate column.
 pub(crate) const COL_P: &str = "p";
@@ -26,3 +86,67 @@ pub(crate) const COL_G: &str = "g";
 
 /// The four primary columns in emission order.
 pub(crate) const PRIMARY_COLUMNS: [&str; 4] = [COL_S, COL_P, COL_O, COL_G];
+
+/// The graph column's slot in `(s, p, o, g)`: [`QuadColumn::G`]'s index.
+pub(crate) const GRAPH_SLOT: usize = QuadColumn::G as usize;
+
+/// The slot of the primary column named `name` in `(s, p, o, g)`: `s` is 0,
+/// `g` is 3; `None` for any other name.
+pub(crate) fn primary_slot(name: &str) -> Option<usize> {
+    QuadColumn::from_name(name).map(QuadColumn::index)
+}
+
+/// TypedObject: the term kind tag; its presence in a schema marks the layout.
+pub(crate) const COL_O_KIND: &str = "o_kind";
+/// TypedObject: the object's lexical value: IRI string, blank node id, or
+/// literal value.
+pub(crate) const COL_O_VALUE: &str = "o_value";
+/// TypedObject: the literal datatype IRI; null unless the object is a typed
+/// literal.
+pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
+/// TypedObject: the literal language tag; null unless the object is a
+/// language-tagged literal.
+pub(crate) const COL_O_LANG: &str = "o_lang";
+
+/// One of the four primary quad columns, by role: how the narrowing surface
+/// ([`keep`](crate::store::VortexRdfStore::keep)) and the code payloads name
+/// a column. The discriminant is the column's position in `(s, p, o, g)`
+/// order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum QuadColumn {
+    /// The subject.
+    S = 0,
+    /// The predicate.
+    P = 1,
+    /// The object.
+    O = 2,
+    /// The graph name.
+    G = 3,
+}
+
+impl QuadColumn {
+    /// The four columns in `(s, p, o, g)` order: the schema's column order and
+    /// every code payload's.
+    pub const ALL: [QuadColumn; 4] = [QuadColumn::S, QuadColumn::P, QuadColumn::O, QuadColumn::G];
+
+    /// The column's name in the serialized schema.
+    pub fn name(self) -> &'static str {
+        PRIMARY_COLUMNS[self.index()]
+    }
+
+    /// The column's position in `(s, p, o, g)` order.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The column at `index` in `(s, p, o, g)` order, `None` past the fourth.
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    /// The column named `name` (`s`, `p`, `o` or `g`), `None` for any other.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == name)
+    }
+}

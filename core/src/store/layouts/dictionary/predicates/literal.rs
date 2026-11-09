@@ -1,0 +1,119 @@
+//! A spelling taken apart: its kind from the first byte ([`kind_of`]), a
+//! literal's lexical form (its escapes decoded [strictly](Escapes::Strict)),
+//! language tag and datatype ([`LiteralView`]), and the `langMatches` rule
+//! they are read with.
+
+use std::borrow::Cow;
+
+use crate::common::terms::{Escapes, LiteralForm, split_literal, unescape};
+use crate::common::vocab::{RDF_LANG_STRING, XSD_STRING};
+
+use super::Verdict;
+
+/// A literal spelling split into its parts, borrowed from the spelling.
+pub(super) struct LiteralView<'a> {
+    /// The lexical form as spelled (N-Triples escapes intact).
+    raw_lexical: &'a str,
+    /// The language tag, as stored.
+    pub(super) lang: Option<&'a str>,
+    /// The datatype IRI without angle brackets, as spelled.
+    pub(super) datatype: Option<&'a str>,
+}
+
+impl<'a> LiteralView<'a> {
+    /// Split `"lex"`, `"lex"@tag` or `"lex"^^<dt>` through the escape-aware
+    /// reading the decode path uses; `None` for anything else.
+    pub(super) fn parse(spelling: &'a str) -> Option<Self> {
+        Some(match split_literal(spelling)? {
+            LiteralForm::Simple { value } => Self {
+                raw_lexical: value,
+                lang: None,
+                datatype: None,
+            },
+            LiteralForm::Language { value, lang } => Self {
+                raw_lexical: value,
+                lang: Some(lang),
+                datatype: None,
+            },
+            LiteralForm::Typed { value, datatype } => Self {
+                raw_lexical: value,
+                lang: None,
+                datatype: Some(datatype.strip_prefix('<')?.strip_suffix('>')?),
+            },
+        })
+    }
+
+    /// The lexical form: escapes decoded, `None` for a malformed escape
+    /// ([`Escapes::Strict`]), which no two readers agree on.
+    pub(super) fn lexical(&self) -> Option<Cow<'a, str>> {
+        unescape(self.raw_lexical, Escapes::Strict)
+    }
+
+    /// The datatype the SPARQL `datatype()` function reports.
+    pub(super) fn effective_datatype(&self) -> &str {
+        match (self.lang, self.datatype) {
+            (Some(_), _) => RDF_LANG_STRING,
+            (None, Some(dt)) => dt,
+            (None, None) => XSD_STRING,
+        }
+    }
+
+    /// Whether the literal is string-like: plain, language-tagged, or typed
+    /// `xsd:string` (which the ingest never writes, but a foreign file may).
+    pub(super) fn is_string_like(&self) -> bool {
+        self.lang.is_some() || self.datatype.is_none_or(|dt| dt == XSD_STRING)
+    }
+}
+
+/// The kind of a term, from its spelling's first byte: the byte the kind
+/// ranges split the sorted dictionary on, so a code's range gives the same
+/// kind before its spelling is read
+/// ([`KindRanges::kind_of_code`](super::KindRanges::kind_of_code)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Literal,
+    Iri,
+    Blank,
+    /// The default graph's empty spelling, or a spelling no dictionary of
+    /// this crate holds (a foreign writer's, in the gaps between the
+    /// ranges).
+    Other,
+}
+
+/// The kind `spelling`'s first byte gives it.
+pub(super) fn kind_of(spelling: &str) -> Kind {
+    match spelling.as_bytes().first() {
+        Some(b'"') => Kind::Literal,
+        Some(b'<') => Kind::Iri,
+        Some(b'_') => Kind::Blank,
+        // The default graph's `""`, or a foreign spelling.
+        _ => Kind::Other,
+    }
+}
+
+/// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`,
+/// decided for `*` and for a range of ASCII letters, digits and hyphens,
+/// where it and rdflib's `_lang_range_check` agree. rdflib may read any
+/// other range differently (a `*` in any subtag is a wildcard, `en-*`
+/// matching `en-gb`; whitespace around the range is stripped; Python
+/// lower-cases it, the Kelvin sign to `k`), so such a range is `Unknown`
+/// even where rdflib happens to agree (`en_gb`). So is a tag outside the
+/// alphabet, which only a foreign writer's file can hold (the N-Triples
+/// ingest rejects one).
+pub(super) fn lang_matches(tag: &str, range: &str) -> Verdict {
+    let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if range == "*" {
+        return Verdict::from(!tag.is_empty());
+    }
+    if !plain(range) || !plain(tag) {
+        return Verdict::Unknown;
+    }
+    // Both are ASCII here, so comparing them ignoring ASCII case is
+    // comparing them lower-cased, with no lower-cased copy made.
+    let (tag, range) = (tag.as_bytes(), range.as_bytes());
+    Verdict::from(
+        tag.len() >= range.len()
+            && tag[..range.len()].eq_ignore_ascii_case(range)
+            && tag.get(range.len()).is_none_or(|&b| b == b'-'),
+    )
+}

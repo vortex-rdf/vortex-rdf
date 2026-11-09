@@ -12,8 +12,7 @@ libraries accept:
 
   * The output is a serialized N-Triples/N-Quads *file*, not an array of term
     objects. Every library under test ingests from a file (`serialize_rdf`,
-    `bulk_load`, `rdf2cottas`, `Graph.parse`), and lightrdf has no store at all
-    -- a file is the only input all five share.
+    `bulk_load`, `rdf2cottas`, `Graph.parse`) -- the one input all four share.
   * Generation streams to disk. Materializing the dataset as Python objects
     first would cost more memory than any store under test, and this module
     runs in the same process as the adapter whose peak RSS is being attributed.

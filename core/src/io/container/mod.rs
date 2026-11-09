@@ -1,72 +1,82 @@
-//! The native store container: the `vortex-rdf.store.v1` grammar, as a
-//! custom Vortex layout root.
+//! The native store container: the `vortex-rdf.store.v2` grammar, a custom
+//! Vortex layout root. Child 0 is the *transparent* `quad-source`, the quad
+//! table the root delegates its dtype, row count and scan to; every further
+//! child is an *auxiliary* component (the term dictionary, the secondary
+//! indexes' sorted tables) with its own rows and schema, written through the
+//! same segment sink and addressed by name. A session with this layout
+//! registered scans the file like a plain quad table; the components never
+//! appear in its columns.
 //!
-//! A store file's root layout is `vortex-rdf.store.v1`: child 0 is the
-//! *transparent* `quad-source` — the quad table itself, to which the root
-//! delegates its dtype, row count, and scan — and every further child is an
-//! *auxiliary* component (the term dictionary, the secondary indexes' own
-//! sorted tables, and future additions such as change sets) with its own
-//! rows and schema, written through the same segment sink and addressable by
-//! name. A session that has this layout registered scans the file exactly
-//! like a plain quad table; the components never appear in its columns.
-//!
-//! One concern per module: [`wire`] is the persisted metadata codec
-//! (component descriptors and their JSON stamp), [`layout`] the root layout
-//! vtable and its read-side inspection, [`sources`] the always-compiled
-//! component producers builders construct on every target, and [`write`] the
-//! write strategy, gated like `io::ser`. `ser` assembles a store's parts and drives
-//! [`write::write_store`]; `read` reads the bytes back.
+//! [`wire`] is the persisted metadata codec (component descriptors and their
+//! JSON stamp), [`layout`] the root layout vtable and its read-side
+//! inspection, [`sources`] the component producers builders construct, and
+//! [`write`](mod@write) the container's write strategy, which
+//! `crate::io::write` drives.
 
 pub(crate) mod layout;
-// The write strategy is the sole consumer of the sources' write hooks
-// (`buffered_bytes`, the per-child strategy), so native no-file-io builds —
-// which compile the sources but no serializer — see those as dead. One
-// allowance here at the boundary, not per item.
-#[cfg_attr(
-    not(any(feature = "file-io", target_arch = "wasm32")),
-    allow(dead_code)
-)]
 pub(crate) mod sources;
 pub(crate) mod wire;
-/// Write strategy; gated like `io::ser`.
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) mod write;
 
 /// Stable identity of the store root layout. Changing the container grammar
 /// (`wire`, `layout`) means a new versioned id, not a silent
 /// reinterpretation.
-pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v1";
+///
+/// Readers of `v2` rely on two guarantees its writers give and nothing checks
+/// at open: each quad is stored once, and a reference index's children are in
+/// `(val, rid)` order.
+pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v2";
+/// What every store root layout id starts with, this version's and any other's.
+pub(crate) const STORE_LAYOUT_FAMILY: &str = "vortex-rdf.store.";
 /// The transparent quad table is always child 0.
-const QUAD_SOURCE_CHILD: usize = 0;
-const QUAD_SOURCE_NAME: &str = "quad-source";
+pub(crate) const QUAD_SOURCE_CHILD: usize = 0;
+pub(crate) const QUAD_SOURCE_NAME: &str = "quad-source";
 /// Component name of the term dictionary child.
 pub(crate) const DICT_COMPONENT_NAME: &str = "dictionary";
 /// Implementation slug of the dictionary child: the lexicographically sorted
 /// term column, FSST-compressed as held.
 pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
+/// Version of the dictionary child: the one this crate writes and the newest
+/// it reads. Its term column carries exact per-window
+/// `vortex.min()`/`vortex.max()` zone maps exactly when the windows are
+/// uniform (chunks of uneven length, adopted from a foreign file, have no
+/// uniform zone); without them, as in a version-1 child, readers read a
+/// window's bounds from its leaf. A child of a newer version is refused at
+/// open (`classify_component`): a newer writer may lay it out in a way this
+/// reader would misread without noticing.
+pub(crate) const DICT_VERSION: u32 = 2;
+/// Version of an index child: the one this crate writes and the newest it
+/// reads. A child of a newer version is refused at open
+/// (`classify_component`), like a newer dictionary child.
+pub(crate) const INDEX_VERSION: u32 = 1;
 
-#[cfg(all(test, feature = "file-io"))]
-pub(crate) use layout::store_metadata_of_bytes;
 #[cfg(feature = "file-io")]
+pub(crate) use layout::newer_root_id_at;
+pub(crate) use layout::quad_source;
+#[cfg(test)]
+pub(crate) use layout::store_metadata_of_bytes;
+#[cfg(test)]
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
-    RdfStoreLayoutVTable, is_native_file, quads_sorted, register, store_component, store_components,
+    RdfStoreLayoutVTable, component_child, component_reader, is_native_file, newer_root_id,
+    register, struct_field,
 };
-pub(crate) use sources::{NativeComponentWrite, default_child_strategy};
-// Consumed only by the write side (`ser` and `IndexComponent::to_write`),
-// gated the same way.
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) use sources::BufferedComponentSource;
+#[cfg(test)]
+pub(crate) use sources::default_child_strategy;
+pub(crate) use sources::{
+    BufferedComponentSource, NativeComponentWrite, child_strategy, dict_child_strategy,
+};
+#[cfg(test)]
+pub(crate) use sources::{ONE_MEG, child_strategy_with, id_fields};
 pub(crate) use wire::{StoreComponentDescriptor, StoreComponentRole};
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) use write::{dict_child_strategy, write_store};
+pub(crate) use write::write_store;
 
 #[cfg(test)]
 mod tests {
     use super::wire::{decode_store_metadata, encode_store_metadata};
     use super::*;
     use crate::session::VORTEX_SESSION;
-    use crate::store::layouts::dictionary::term_dict::COL_DICT_TERM;
+    use crate::store::layouts::dictionary::storage::COL_DICT_TERM;
     use vortex_array::IntoArray;
     use vortex_array::arrays::{StructArray, VarBinViewArray};
     use vortex_array::dtype::{DType, Nullability};
@@ -102,9 +112,10 @@ mod tests {
             name: DICT_COMPONENT_NAME.into(),
             role: StoreComponentRole::Dictionary,
             implementation: DICT_IMPLEMENTATION.into(),
-            version: 1,
+            version: DICT_VERSION,
             required: true,
             sorted: true,
+            bracketed_iris: false,
             dtype,
         }
     }
@@ -114,6 +125,9 @@ mod tests {
         use vortex_layout::session::LayoutSessionExt;
         let id = <RdfStoreLayoutVTable as VTable>::id(&RdfStoreLayoutVTable);
         assert_eq!(id.as_ref(), STORE_LAYOUT_ID);
+        // Pinned to the spelling, so the constant cannot move unnoticed: a
+        // new id is a new grammar.
+        assert_eq!(STORE_LAYOUT_ID, "vortex-rdf.store.v2");
         assert!(VORTEX_SESSION.layouts().registry().get(&id).is_some());
     }
 
@@ -124,9 +138,10 @@ mod tests {
             name: "index:posg".into(),
             role: StoreComponentRole::Index,
             implementation: "secondary-by-copy/posg".into(),
-            version: 1,
+            version: INDEX_VERSION,
             required: false,
             sorted: true,
+            bracketed_iris: false,
             dtype: quad_chunk(0, 1).dtype().clone(),
         };
         let bytes = encode_store_metadata(true, &[dict.clone(), index.clone()]).unwrap();
@@ -135,6 +150,94 @@ mod tests {
 
         let dup = encode_store_metadata(false, &[dict.clone(), dict]).unwrap();
         assert!(decode_store_metadata(&dup).is_err());
+    }
+
+    /// The exact root metadata bytes of a store with a dictionary and a copy
+    /// index child, and of a bare store: every reader depends on them. A
+    /// component without `sorted`, under a root without `quads_sorted`,
+    /// decodes both as `false`. A dictionary's `bracketed_iris` is written
+    /// only when set, and decodes as `false` when absent.
+    #[test]
+    fn metadata_json_is_pinned() {
+        use crate::store::indexes::COL_RID;
+        use crate::store::schema::{CODE_PTYPE, PRIMARY_COLUMNS, ROW_ID_PTYPE};
+        use vortex_array::dtype::StructFields;
+
+        let dict = dict_descriptor(dict_chunk(&["a"]).dtype().clone());
+        let code = DType::Primitive(CODE_PTYPE, Nullability::NonNullable);
+        let row_id = DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable);
+        let index = StoreComponentDescriptor {
+            name: "index:posg".into(),
+            role: StoreComponentRole::Index,
+            implementation: "secondary-by-copy/posg".into(),
+            version: INDEX_VERSION,
+            required: false,
+            sorted: true,
+            bracketed_iris: false,
+            dtype: DType::Struct(
+                StructFields::new(
+                    PRIMARY_COLUMNS
+                        .iter()
+                        .copied()
+                        .chain([COL_RID])
+                        .collect::<Vec<_>>()
+                        .into(),
+                    vec![code.clone(), code.clone(), code.clone(), code, row_id],
+                ),
+                Nullability::NonNullable,
+            ),
+        };
+        let bytes = encode_store_metadata(true, &[dict.clone(), index]).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            concat!(
+                r#"{"version":1,"quads_sorted":true,"components":["#,
+                r#"{"name":"dictionary","role":"dictionary","implementation":"sorted-terms-fsst-v1","#,
+                r#""version":2,"required":true,"sorted":true,"#,
+                r#""fields":[{"name":"_dict_term","kind":"utf8"}]},"#,
+                r#"{"name":"index:posg","role":"index","implementation":"secondary-by-copy/posg","#,
+                r#""version":1,"required":false,"sorted":true,"#,
+                r#""fields":[{"name":"s","kind":"u64"},{"name":"p","kind":"u64"},"#,
+                r#"{"name":"o","kind":"u64"},{"name":"g","kind":"u64"},"#,
+                r#"{"name":"rid","kind":"u64"}]}]}"#,
+            )
+        );
+        assert_eq!(
+            std::str::from_utf8(&encode_store_metadata(false, &[]).unwrap()).unwrap(),
+            r#"{"version":1,"quads_sorted":false,"components":[]}"#
+        );
+        let bracketed = StoreComponentDescriptor {
+            bracketed_iris: true,
+            ..dict.clone()
+        };
+        let bytes = encode_store_metadata(true, std::slice::from_ref(&bracketed)).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            concat!(
+                r#"{"version":1,"quads_sorted":true,"components":["#,
+                r#"{"name":"dictionary","role":"dictionary","implementation":"sorted-terms-fsst-v1","#,
+                r#""version":2,"required":true,"sorted":true,"bracketed_iris":true,"#,
+                r#""fields":[{"name":"_dict_term","kind":"utf8"}]}]}"#,
+            )
+        );
+        assert_eq!(
+            decode_store_metadata(&bytes).unwrap(),
+            (true, vec![bracketed])
+        );
+
+        let unstamped = concat!(
+            r#"{"version":1,"components":[{"name":"dictionary","role":"dictionary","#,
+            r#""implementation":"sorted-terms-fsst-v1","version":2,"required":true,"#,
+            r#""fields":[{"name":"_dict_term","kind":"utf8"}]}]}"#,
+        );
+        let unsorted_dict = StoreComponentDescriptor {
+            sorted: false,
+            ..dict
+        };
+        assert_eq!(
+            decode_store_metadata(unstamped.as_bytes()).unwrap(),
+            (false, vec![unsorted_dict])
+        );
     }
 
     #[test]
@@ -210,21 +313,7 @@ mod tests {
         );
     }
 
-    /// A pull-backed source hands out its stream once; a second open is an
-    /// error.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    #[test]
-    fn pull_source_replays_once() {
-        use sources::{NativeComponentSource as _, PullComponentSource};
-        let dtype = dict_chunk(&["a"]).dtype().clone();
-        let source = PullComponentSource::new(dtype, 1, Box::new(|_| Ok(None)));
-        assert!(source.open().is_ok());
-        assert!(source.open().is_err());
-    }
-
-    /// The write-side round trips, compiled only where a store can be
-    /// written (natively behind `file-io`, and on wasm).
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+    /// The write-side round trips.
     mod write_tests {
         use std::sync::Arc;
 
@@ -328,9 +417,9 @@ mod tests {
 
             // …while the dictionary child scans independently.
             let typed = root.as_::<RdfStoreLayoutVTable>();
-            let (descriptor, child) = store_component(typed, DICT_COMPONENT_NAME)
-                .unwrap()
-                .unwrap();
+            let descriptor = &typed.data().components[0];
+            let child = component_child(typed, 0).unwrap();
+            assert_eq!(descriptor.name, DICT_COMPONENT_NAME);
             assert_eq!(descriptor.role, StoreComponentRole::Dictionary);
             assert_eq!(child.row_count(), 3);
             assert_eq!(child.dtype(), &dict_dtype);

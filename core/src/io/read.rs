@@ -1,86 +1,140 @@
-//! Read-side access to native store files: opening them, requiring the
-//! native root, and materializing whole files or auxiliary children on any
-//! target. The opened-store runtime handle the store's file-backed query
-//! paths drive lives store-side, in
-//! [`store::native_file`](crate::store::native_file), beside the scan
-//! machinery that defines its memo semantics; the wire format itself (layout
-//! VTable, descriptors, write strategy) lives in
-//! [`container`](super::container).
+//! Read-side access to native store files: the open errors, and the scan
+//! drivers that run a scan's splits inline or spawned and materialize a whole
+//! reader, on any target. Opening a file at a path, mapped or read, is
+//! `file`'s, behind `file-io`.
 
 use std::future::Future;
 
 use futures::StreamExt as _;
 use vortex_array::ArrayRef;
 use vortex_error::VortexResult;
+use vortex_layout::scan::scan_builder::ScanBuilder;
 
 use crate::error::{Result, VortexRdfError};
-use crate::store::array::chunked_or_single;
-
-/// The host's available parallelism, read once; 1 on targets that cannot
-/// answer (wasm). Read by [`collect_chunks`] for its in-flight split count and
-/// exposed through [`available_parallelism`] to the store's scan and serve
-/// split loops.
-static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-});
-
-/// The host's available parallelism — how many workers a scan's per-split
-/// tasks can spread over.
 #[cfg(feature = "file-io")]
+use crate::observe::observe;
+
+/// The host's available parallelism, as Vortex reads it once for its own
+/// scans; 1 where the target cannot answer (wasm): how many workers a scan's
+/// per-split tasks can spread over, and the in-flight split count of
+/// [`inline_splits`] and of the store's scan and serve split loops.
 pub(crate) fn available_parallelism() -> usize {
-    *AVAILABLE_PARALLELISM
+    vortex::utils::parallelism::get_available_parallelism().unwrap_or(1)
 }
 
-/// Drive a scan's per-split futures inline and collect the chunks in split
-/// (row) order — the shared tail of [`scan_all`], [`scan_all_reader`] and
-/// [`scan_reader_chunks`].
-///
-/// The futures are polled through a `buffered` window — several in flight on
-/// this same task, still no runtime handle — so one split's I/O overlaps
-/// another's decode.
-async fn collect_chunks<F>(tasks: Vec<F>) -> Result<Vec<ArrayRef>>
+/// Per-split futures (a scan's, or any other split loop's) driven inline:
+/// polled on the calling task, a `buffered` window of the host's parallelism
+/// in flight (so one split's I/O overlaps another's decode, with no runtime
+/// handle), their results in split (row) order.
+pub(crate) fn inline_splits<F, T>(tasks: Vec<F>) -> impl futures::Stream<Item = T> + Unpin
+where
+    F: Future<Output = T>,
+{
+    futures::stream::iter(tasks).buffered(available_parallelism())
+}
+
+/// The chunks of a stream of per-split results, in stream order, the splits
+/// that keep no rows left out.
+fn kept<S>(results: S) -> impl futures::Stream<Item = VortexResult<ArrayRef>>
+where
+    S: futures::Stream<Item = VortexResult<Option<ArrayRef>>>,
+{
+    use futures::TryStreamExt as _;
+    results.try_filter_map(|chunk| futures::future::ready(Ok(chunk)))
+}
+
+/// A scan's per-split futures driven inline ([`inline_splits`]) and their
+/// chunks read into one array of `dtype` in split (row) order by Vortex's
+/// [`read_all`](vortex_array::stream::ArrayStreamExt::read_all): the one
+/// chunk itself, or a chunked array of the chunks, empty for none.
+pub(crate) async fn collect_scan<F>(
+    dtype: vortex_array::dtype::DType,
+    tasks: Vec<F>,
+) -> Result<ArrayRef>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
-    let mut results = futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM);
-    let mut chunks = Vec::new();
-    while let Some(chunk) = results.next().await {
-        if let Some(chunk) = chunk.map_err(VortexRdfError::Vortex)? {
-            chunks.push(chunk);
-        }
-    }
-    Ok(chunks)
+    use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt as _};
+    Ok(ArrayStreamAdapter::new(dtype, kept(inline_splits(tasks)))
+        .read_all()
+        .await?)
 }
 
-/// [`collect_chunks`] assembled into one array of `dtype`.
-async fn collect_scan<F>(dtype: vortex_array::dtype::DType, tasks: Vec<F>) -> Result<ArrayRef>
-where
-    F: Future<Output = VortexResult<Option<ArrayRef>>>,
-{
-    chunked_or_single(collect_chunks(tasks).await?, dtype)
+/// `scan` planned and run to completion inline ([`collect_scan`]) into one
+/// array.
+pub(crate) async fn collect_whole_scan(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
+    let dtype = scan.dtype()?;
+    collect_scan(dtype, scan.build()?).await
 }
 
-/// Materialize a whole file by driving its scan's per-split futures inline.
+/// Per-split futures (a scan's, or any other split loop's) each spawned onto
+/// the session's runtime as the stream is polled, `window` of them in flight,
+/// their results in split order as [`inline_splits`] yields them. Dropping
+/// the stream aborts the spawned splits it still holds. Spawning needs a
+/// tokio runtime on the polling thread: [`ScanDriver::for_row_scan`] picks
+/// this driver only where there is one.
 ///
-/// `ScanBuilder::into_array_stream` spawns onto the session's runtime handle;
-/// this drives `ScanBuilder::build`'s futures directly instead, so it needs no
-/// handle at all — which is what lets buffer-backed files (whose segment reads
-/// resolve synchronously) be read on wasm and in no-file-io builds.
-pub(crate) async fn scan_all(file: &vortex_file::VortexFile) -> Result<ArrayRef> {
-    let dtype = file.dtype().clone();
-    let scan = file.scan().map_err(VortexRdfError::Vortex)?;
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
-    collect_scan(dtype, tasks).await
+/// [`ScanDriver::for_row_scan`]: crate::store::scan::file_scans::ScanDriver::for_row_scan
+#[cfg(feature = "file-io")]
+pub(crate) fn spawned_splits<F, T>(
+    tasks: Vec<F>,
+    window: usize,
+) -> impl futures::Stream<Item = T> + Unpin + Send + 'static
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    use vortex_io::session::RuntimeSessionExt as _;
+
+    let handle = crate::session::VORTEX_SESSION.handle();
+    futures::stream::iter(tasks)
+        .map(move |task| {
+            observe!(SplitSpawned);
+            handle.spawn(task)
+        })
+        .buffered(window)
 }
 
-/// [`scan_all`] over an arbitrary layout reader — how the native store root's
-/// auxiliary children (dictionary, index copies) are materialized from a
-/// buffer-backed file on every target, runtime handle included or not.
+/// [`collect_scan`] with each split future spawned onto the session's runtime
+/// ([`spawned_splits`]), `window` of them in flight. The chunks come back in
+/// split order, as the inline driver returns them. Needs a tokio runtime on
+/// the polling thread, as [`spawned_splits`] does.
+#[cfg(feature = "file-io")]
+pub(crate) async fn collect_scan_spawned<F>(
+    dtype: vortex_array::dtype::DType,
+    tasks: Vec<F>,
+    window: usize,
+) -> Result<ArrayRef>
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
+{
+    use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt as _};
+    Ok(
+        ArrayStreamAdapter::new(dtype, kept(spawned_splits(tasks, window)))
+            .read_all()
+            .await?,
+    )
+}
+
+/// Materialize a whole layout reader (a file's root, or one of the store
+/// root's auxiliary children) by driving its scan's per-split futures inline.
+/// It needs no runtime handle, which is what lets a buffer-backed file (whose
+/// segment reads resolve synchronously) be read on wasm.
 pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
-    let dtype = reader.dtype().clone();
-    chunked_or_single(scan_reader_chunks(reader).await?, dtype)
+    collect_whole_scan(reader_scan(reader)).await
+}
+
+/// [`scan_all_reader`] completed on its first poll, for a reader that must sit
+/// over a buffer-backed segment source: its segment reads resolve
+/// synchronously, the invariant every handle-free `from_bytes` open relies on.
+pub(crate) fn scan_all_reader_sync(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
+    use futures::FutureExt as _;
+    scan_all_reader(reader).now_or_never().unwrap_or_else(|| {
+        unreachable!(
+            "a synchronous scan only ever reads a buffer-backed segment source, whose reads \
+             resolve without pending"
+        )
+    })
 }
 
 /// [`scan_all_reader`] before assembly: the reader's scan chunks in split
@@ -88,15 +142,19 @@ pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> R
 pub(crate) async fn scan_reader_chunks(
     reader: vortex_layout::LayoutReaderRef,
 ) -> Result<Vec<ArrayRef>> {
-    let scan = vortex_layout::scan::scan_builder::ScanBuilder::new(
-        crate::session::VORTEX_SESSION.clone(),
-        reader,
-    );
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
-    collect_chunks(tasks).await
+    use futures::TryStreamExt as _;
+    Ok(kept(inline_splits(reader_scan(reader).build()?))
+        .try_collect()
+        .await?)
 }
 
-/// The actionable error for a file whose root is not the native store layout.
+/// A scan of every row and column of `reader`, on the crate's session.
+fn reader_scan(reader: vortex_layout::LayoutReaderRef) -> ScanBuilder<ArrayRef> {
+    ScanBuilder::new(crate::session::VORTEX_SESSION.clone(), reader)
+}
+
+/// The error for a file whose root is not the native store layout: the layout
+/// it expected and the one it found.
 pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRdfError {
     VortexRdfError::Deserialization(format!(
         "not a vortex-rdf store file: expected the {} root layout, found {}",
@@ -105,21 +163,232 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
     ))
 }
 
-/// Open a Vortex file lazily — no data is read until the returned `VortexFile`
-/// is scanned.
-///
-/// The layout reader is cached on the file handle: every scan and pruning
-/// evaluation over the store shares one reader tree, so zone-map stats tables
-/// are read and decoded once and per-expression pruning masks are reused across data access calls.
-#[cfg(feature = "file-io")]
-pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
-    path: P,
+/// `bytes` opened as a Vortex file, a failure naming a newer vortex-rdf when
+/// one wrote them ([`open_failure`]): how a store's bytes are opened, whether
+/// handed over or mapped from a file.
+pub(crate) fn open_store_buffer(
+    bytes: vortex_buffer::ByteBuffer,
 ) -> Result<vortex_file::VortexFile> {
-    use vortex_file::OpenOptionsSessionExt;
+    use vortex_file::OpenOptionsSessionExt as _;
+
     crate::session::VORTEX_SESSION
         .open_options()
-        .with_layout_reader_cache()
-        .open_path(path)
+        .open_buffer(bytes.clone())
+        .map_err(|error| open_failure(error, super::container::newer_root_id(&bytes)))
+}
+
+/// The error for a file Vortex could not open: the one that says a newer
+/// vortex-rdf wrote it when `newer_root` names its root layout
+/// ([`newer_root_id`](super::container::newer_root_id)), Vortex's own
+/// otherwise.
+pub(crate) fn open_failure(
+    error: vortex_error::VortexError,
+    newer_root: Option<String>,
+) -> VortexRdfError {
+    match newer_root {
+        Some(id) => VortexRdfError::Deserialization(format!(
+            "this store was written by a newer vortex-rdf (root layout {id}), which this \
+             version cannot read; open it with a newer version of vortex-rdf"
+        )),
+        None => VortexRdfError::Vortex(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::{Event, Recorder};
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::dtype::{DType, Nullability, PType};
+    use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+    /// A whole scan of no split is an empty array of the scan's dtype, one of a
+    /// single split is that split's array itself (callers rely on the unwrap),
+    /// and splits that keep no rows are left out.
+    #[tokio::test]
+    async fn whole_scans_unwrap_one_chunk_and_type_an_empty_one() {
+        use futures::future::{Ready, ready};
+
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let none: Vec<Ready<VortexResult<Option<ArrayRef>>>> = Vec::new();
+        let empty = collect_scan(dtype.clone(), none).await.unwrap();
+        assert_eq!((empty.len(), empty.dtype()), (0, &dtype), "an empty scan");
+        let chunk = PrimitiveArray::from_iter([7u64, 8]).into_array();
+        let one = collect_scan(
+            dtype.clone(),
+            vec![ready(Ok(None)), ready(Ok(Some(chunk.clone())))],
+        )
         .await
-        .map_err(VortexRdfError::Vortex)
+        .unwrap();
+        assert_eq!(one.addr(), chunk.addr(), "one chunk comes back as it is");
+        let two = collect_scan(
+            dtype,
+            vec![
+                ready(Ok(Some(chunk.clone()))),
+                ready(Ok(None)),
+                ready(Ok(Some(chunk.clone()))),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(two.len(), 4, "two chunks, the empty split left out");
+        assert!(two.is::<vortex_array::arrays::Chunked>());
+    }
+
+    /// The spawned collector returns the chunks in split order when the splits
+    /// finish in reverse: split `i` yields to the scheduler `splits - 1 - i`
+    /// times, then answers, so on this single-threaded runtime the last split
+    /// finishes first.
+    #[tokio::test]
+    async fn spawned_scan_collects_in_split_order_whatever_the_finishing_order() {
+        let splits = 6u64;
+        let tasks: Vec<_> = (0..splits)
+            .map(|i| async move {
+                for _ in 0..splits - 1 - i {
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, vortex_error::VortexError>(Some(
+                    PrimitiveArray::from_iter([i]).into_array(),
+                ))
+            })
+            .collect();
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let mut spawned = Recorder::start();
+        let array = collect_scan_spawned(dtype, tasks, splits as usize)
+            .await
+            .unwrap();
+        assert_eq!(
+            spawned.take_count(&Event::SplitSpawned),
+            splits as usize,
+            "every split ran spawned, none inline"
+        );
+
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let values = array.execute::<PrimitiveArray>(&mut ctx).unwrap();
+        assert_eq!(values.as_slice::<u64>(), (0..splits).collect::<Vec<_>>());
+    }
+
+    /// A failing split fails the scan: its error comes out of the spawned
+    /// collector.
+    #[tokio::test]
+    async fn spawned_scan_propagates_a_split_error() {
+        let splits = 4u64;
+        let tasks: Vec<_> = (0..splits)
+            .map(|i| async move {
+                if i == 2 {
+                    return Err(vortex_error::vortex_err!("split {i} failed"));
+                }
+                Ok::<_, vortex_error::VortexError>(Some(
+                    PrimitiveArray::from_iter([i]).into_array(),
+                ))
+            })
+            .collect();
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let mut spawned = Recorder::start();
+        let error = collect_scan_spawned(dtype, tasks, splits as usize)
+            .await
+            .expect_err("the failing split fails the scan");
+        assert!(error.to_string().contains("split 2 failed"), "{error}");
+        assert_eq!(
+            spawned.take_count(&Event::SplitSpawned),
+            splits as usize,
+            "every split ran spawned, none inline"
+        );
+    }
+
+    /// A panicking split panics the awaiting scan, as it would inline.
+    #[tokio::test]
+    async fn spawned_scan_re_raises_a_split_panic() {
+        use futures::FutureExt as _;
+
+        let splits = 4u64;
+        let tasks: Vec<_> = (0..splits)
+            .map(|i| async move {
+                if i == 2 {
+                    panic!("split 2 panicked");
+                }
+                Ok::<_, vortex_error::VortexError>(Some(
+                    PrimitiveArray::from_iter([i]).into_array(),
+                ))
+            })
+            .collect();
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let mut spawned = Recorder::start();
+        let outcome =
+            std::panic::AssertUnwindSafe(collect_scan_spawned(dtype, tasks, splits as usize))
+                .catch_unwind()
+                .await;
+
+        let payload = outcome.expect_err("the panic reaches the awaiting scan");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or_default();
+        assert!(message.contains("split 2 panicked"), "{message}");
+        assert_eq!(
+            spawned.take_count(&Event::SplitSpawned),
+            splits as usize,
+            "every split ran spawned, none inline"
+        );
+    }
+
+    /// Dropping the scan aborts the splits it spawned: a split that never
+    /// finishes is dropped with its task, not left running.
+    #[tokio::test]
+    async fn dropping_the_spawned_scan_cancels_its_splits() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Counts the split futures that are dropped.
+        struct Dropped(Arc<AtomicUsize>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let splits = 4usize;
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..splits)
+            .map(|_| {
+                let (started, guard) = (started.clone(), Dropped(dropped.clone()));
+                async move {
+                    let _guard = guard;
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    Ok::<Option<ArrayRef>, vortex_error::VortexError>(None)
+                }
+            })
+            .collect();
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let mut spawned = Recorder::start();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            collect_scan_spawned(dtype, tasks, splits),
+        )
+        .await
+        .expect_err("a scan of splits that never finish is still running when it is dropped");
+
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            splits,
+            "the splits were running"
+        );
+        assert_eq!(spawned.take_count(&Event::SplitSpawned), splits);
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) == splits {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            splits,
+            "the dropped scan left its splits running"
+        );
+    }
 }

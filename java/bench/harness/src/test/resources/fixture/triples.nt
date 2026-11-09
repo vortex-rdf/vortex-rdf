@@ -1,0 +1,512 @@
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0000> "descriptive object value number 000000000" .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0001> "descriptive object value number 000000001" .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0002> "descriptive object value number 000000002" .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0003> "descriptive object value number 000000003" .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000004> .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000005> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000006> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000007> .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000008> .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0009> <http://data.example.org/resource/2026/object/000000009> .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0010> "descriptive object value number 000000010" .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0011> "descriptive object value number 000000011" .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0012> "descriptive object value number 000000012" .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0013> "descriptive object value number 000000013" .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000014> .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000015> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000016> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000017> .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000018> .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0019> <http://data.example.org/resource/2026/object/000000019> .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0020> "descriptive object value number 000000020" .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0021> "descriptive object value number 000000021" .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0022> "descriptive object value number 000000022" .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0023> "descriptive object value number 000000023" .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000024> .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000025> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000026> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000027> .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000028> .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0029> <http://data.example.org/resource/2026/object/000000029> .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0030> "descriptive object value number 000000030" .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0031> "descriptive object value number 000000031" .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0000> "descriptive object value number 000000032" .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0001> "descriptive object value number 000000033" .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000034> .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000035> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000036> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000037> .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000038> .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000039> .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0008> "descriptive object value number 000000040" .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0009> "descriptive object value number 000000041" .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0010> "descriptive object value number 000000042" .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0011> "descriptive object value number 000000043" .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000044> .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000045> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000046> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000047> .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000048> .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000049> .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0018> "descriptive object value number 000000050" .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0019> "descriptive object value number 000000051" .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0020> "descriptive object value number 000000052" .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0021> "descriptive object value number 000000053" .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000054> .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000055> .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000056> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000057> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000058> .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000059> .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0028> "descriptive object value number 000000060" .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0029> "descriptive object value number 000000061" .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0030> "descriptive object value number 000000062" .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0031> "descriptive object value number 000000063" .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0000> <http://data.example.org/resource/2026/object/000000064> .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0001> <http://data.example.org/resource/2026/object/000000065> .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000066> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000067> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000068> .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000069> .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0006> "descriptive object value number 000000070" .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0007> "descriptive object value number 000000071" .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0008> "descriptive object value number 000000072" .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0009> "descriptive object value number 000000073" .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0010> <http://data.example.org/resource/2026/object/000000074> .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0011> <http://data.example.org/resource/2026/object/000000075> .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000076> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000077> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000078> .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000079> .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0016> "descriptive object value number 000000080" .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0017> "descriptive object value number 000000081" .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0018> "descriptive object value number 000000082" .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0019> "descriptive object value number 000000083" .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0020> <http://data.example.org/resource/2026/object/000000084> .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0021> <http://data.example.org/resource/2026/object/000000085> .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000086> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000087> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000088> .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000089> .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0026> "descriptive object value number 000000090" .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0027> "descriptive object value number 000000091" .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0028> "descriptive object value number 000000092" .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0029> "descriptive object value number 000000093" .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0030> <http://data.example.org/resource/2026/object/000000094> .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0031> <http://data.example.org/resource/2026/object/000000095> .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0000> <http://data.example.org/resource/2026/object/000000096> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0001> <http://data.example.org/resource/2026/object/000000097> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000098> .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000099> .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0004> "descriptive object value number 000000100" .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0005> "descriptive object value number 000000101" .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0006> "descriptive object value number 000000102" .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0007> "descriptive object value number 000000103" .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000104> .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0009> <http://data.example.org/resource/2026/object/000000105> .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0010> <http://data.example.org/resource/2026/object/000000106> .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0011> <http://data.example.org/resource/2026/object/000000107> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000108> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000109> .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0014> "descriptive object value number 000000110" .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0015> "descriptive object value number 000000111" .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0016> "descriptive object value number 000000112" .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0017> "descriptive object value number 000000113" .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000114> .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0019> <http://data.example.org/resource/2026/object/000000115> .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0020> <http://data.example.org/resource/2026/object/000000116> .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0021> <http://data.example.org/resource/2026/object/000000117> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000118> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000119> .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0024> "descriptive object value number 000000120" .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0025> "descriptive object value number 000000121" .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0026> "descriptive object value number 000000122" .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0027> "descriptive object value number 000000123" .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000124> .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0029> <http://data.example.org/resource/2026/object/000000125> .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0030> <http://data.example.org/resource/2026/object/000000126> .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0031> <http://data.example.org/resource/2026/object/000000127> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0000> <http://data.example.org/resource/2026/object/000000128> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0001> <http://data.example.org/resource/2026/object/000000129> .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0002> "descriptive object value number 000000130" .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0003> "descriptive object value number 000000131" .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0004> "descriptive object value number 000000132" .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0005> "descriptive object value number 000000133" .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000134> .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000135> .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000136> .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0009> <http://data.example.org/resource/2026/object/000000137> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0010> <http://data.example.org/resource/2026/object/000000138> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0011> <http://data.example.org/resource/2026/object/000000139> .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0012> "descriptive object value number 000000140" .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0013> "descriptive object value number 000000141" .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0014> "descriptive object value number 000000142" .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0015> "descriptive object value number 000000143" .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000144> .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000145> .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000146> .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0019> <http://data.example.org/resource/2026/object/000000147> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0020> <http://data.example.org/resource/2026/object/000000148> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0021> <http://data.example.org/resource/2026/object/000000149> .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0022> "descriptive object value number 000000150" .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0023> "descriptive object value number 000000151" .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0024> "descriptive object value number 000000152" .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0025> "descriptive object value number 000000153" .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000154> .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000155> .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000156> .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0029> <http://data.example.org/resource/2026/object/000000157> .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0030> <http://data.example.org/resource/2026/object/000000158> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0031> <http://data.example.org/resource/2026/object/000000159> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0000> "descriptive object value number 000000160" .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0001> "descriptive object value number 000000161" .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0002> "descriptive object value number 000000162" .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0003> "descriptive object value number 000000163" .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000164> .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000165> .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000166> .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000167> .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000168> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0009> <http://data.example.org/resource/2026/object/000000169> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0010> "descriptive object value number 000000170" .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0011> "descriptive object value number 000000171" .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0012> "descriptive object value number 000000172" .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0013> "descriptive object value number 000000173" .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000174> .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000175> .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000176> .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000177> .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000178> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0019> <http://data.example.org/resource/2026/object/000000179> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0020> "descriptive object value number 000000180" .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0021> "descriptive object value number 000000181" .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0022> "descriptive object value number 000000182" .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0023> "descriptive object value number 000000183" .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000184> .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000185> .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000186> .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000187> .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000188> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0029> <http://data.example.org/resource/2026/object/000000189> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0030> "descriptive object value number 000000190" .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0031> "descriptive object value number 000000191" .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0000> "descriptive object value number 000000192" .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0001> "descriptive object value number 000000193" .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000194> .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000195> .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000196> .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000197> .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000198> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000199> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0008> "descriptive object value number 000000200" .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0009> "descriptive object value number 000000201" .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0010> "descriptive object value number 000000202" .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0011> "descriptive object value number 000000203" .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000204> .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000205> .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000206> .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000207> .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000208> .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000209> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0018> "descriptive object value number 000000210" .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0019> "descriptive object value number 000000211" .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0020> "descriptive object value number 000000212" .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0021> "descriptive object value number 000000213" .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000214> .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000215> .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000216> .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000217> .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000218> .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000219> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0028> "descriptive object value number 000000220" .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0029> "descriptive object value number 000000221" .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0030> "descriptive object value number 000000222" .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0031> "descriptive object value number 000000223" .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0000> <http://data.example.org/resource/2026/object/000000224> .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0001> <http://data.example.org/resource/2026/object/000000225> .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000226> .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000227> .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000228> .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000229> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0006> "descriptive object value number 000000230" .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0007> "descriptive object value number 000000231" .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0008> "descriptive object value number 000000232" .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0009> "descriptive object value number 000000233" .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0010> <http://data.example.org/resource/2026/object/000000234> .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0011> <http://data.example.org/resource/2026/object/000000235> .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000236> .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000237> .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000238> .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000239> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0016> "descriptive object value number 000000240" .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0017> "descriptive object value number 000000241" .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0018> "descriptive object value number 000000242" .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0019> "descriptive object value number 000000243" .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0020> <http://data.example.org/resource/2026/object/000000244> .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0021> <http://data.example.org/resource/2026/object/000000245> .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000246> .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000247> .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000248> .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000249> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0026> "descriptive object value number 000000250" .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0027> "descriptive object value number 000000251" .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0028> "descriptive object value number 000000252" .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0029> "descriptive object value number 000000253" .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0030> <http://data.example.org/resource/2026/object/000000254> .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0031> <http://data.example.org/resource/2026/object/000000255> .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0000> <http://data.example.org/resource/2026/object/000000256> .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0001> "descriptive object value number 000000000" .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0002> "descriptive object value number 000000001" .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0003> "descriptive object value number 000000002" .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0004> "descriptive object value number 000000003" .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000004> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000005> .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000006> .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000007> .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0009> <http://data.example.org/resource/2026/object/000000008> .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0010> <http://data.example.org/resource/2026/object/000000009> .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0011> "descriptive object value number 000000010" .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0012> "descriptive object value number 000000011" .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0013> "descriptive object value number 000000012" .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0014> "descriptive object value number 000000013" .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000014> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000015> .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000016> .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000017> .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0019> <http://data.example.org/resource/2026/object/000000018> .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0020> <http://data.example.org/resource/2026/object/000000019> .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0021> "descriptive object value number 000000020" .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0022> "descriptive object value number 000000021" .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0023> "descriptive object value number 000000022" .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0024> "descriptive object value number 000000023" .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000024> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000025> .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000026> .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000027> .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0029> <http://data.example.org/resource/2026/object/000000028> .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0030> <http://data.example.org/resource/2026/object/000000029> .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0031> "descriptive object value number 000000030" .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0000> "descriptive object value number 000000031" .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0001> "descriptive object value number 000000032" .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0002> "descriptive object value number 000000033" .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000034> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000035> .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000036> .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000037> .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000038> .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000039> .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0009> "descriptive object value number 000000040" .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0010> "descriptive object value number 000000041" .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0011> "descriptive object value number 000000042" .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0012> "descriptive object value number 000000043" .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000044> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000045> .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000046> .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000047> .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000048> .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000049> .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0019> "descriptive object value number 000000050" .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0020> "descriptive object value number 000000051" .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0021> "descriptive object value number 000000052" .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0022> "descriptive object value number 000000053" .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000054> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000055> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000056> .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000057> .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000058> .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000059> .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0029> "descriptive object value number 000000060" .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0030> "descriptive object value number 000000061" .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0031> "descriptive object value number 000000062" .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0000> "descriptive object value number 000000063" .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0001> <http://data.example.org/resource/2026/object/000000064> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000065> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000066> .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000067> .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000068> .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000069> .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0007> "descriptive object value number 000000070" .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0008> "descriptive object value number 000000071" .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0009> "descriptive object value number 000000072" .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0010> "descriptive object value number 000000073" .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0011> <http://data.example.org/resource/2026/object/000000074> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000075> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000076> .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000077> .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000078> .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000079> .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0017> "descriptive object value number 000000080" .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0018> "descriptive object value number 000000081" .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0019> "descriptive object value number 000000082" .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0020> "descriptive object value number 000000083" .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0021> <http://data.example.org/resource/2026/object/000000084> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000085> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000086> .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000087> .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000088> .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000089> .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0027> "descriptive object value number 000000090" .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0028> "descriptive object value number 000000091" .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0029> "descriptive object value number 000000092" .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0030> "descriptive object value number 000000093" .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0031> <http://data.example.org/resource/2026/object/000000094> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0000> <http://data.example.org/resource/2026/object/000000095> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0001> <http://data.example.org/resource/2026/object/000000096> .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000097> .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000098> .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000099> .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0005> "descriptive object value number 000000100" .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0006> "descriptive object value number 000000101" .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0007> "descriptive object value number 000000102" .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0008> "descriptive object value number 000000103" .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0009> <http://data.example.org/resource/2026/object/000000104> .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0010> <http://data.example.org/resource/2026/object/000000105> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0011> <http://data.example.org/resource/2026/object/000000106> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000107> .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000108> .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000109> .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0015> "descriptive object value number 000000110" .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0016> "descriptive object value number 000000111" .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0017> "descriptive object value number 000000112" .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0018> "descriptive object value number 000000113" .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0019> <http://data.example.org/resource/2026/object/000000114> .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0020> <http://data.example.org/resource/2026/object/000000115> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0021> <http://data.example.org/resource/2026/object/000000116> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000117> .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000118> .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000119> .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0025> "descriptive object value number 000000120" .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0026> "descriptive object value number 000000121" .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0027> "descriptive object value number 000000122" .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0028> "descriptive object value number 000000123" .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0029> <http://data.example.org/resource/2026/object/000000124> .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0030> <http://data.example.org/resource/2026/object/000000125> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0031> <http://data.example.org/resource/2026/object/000000126> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0000> <http://data.example.org/resource/2026/object/000000127> .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0001> <http://data.example.org/resource/2026/object/000000128> .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000129> .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0003> "descriptive object value number 000000130" .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0004> "descriptive object value number 000000131" .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0005> "descriptive object value number 000000132" .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0006> "descriptive object value number 000000133" .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000134> .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000135> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0009> <http://data.example.org/resource/2026/object/000000136> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0010> <http://data.example.org/resource/2026/object/000000137> .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0011> <http://data.example.org/resource/2026/object/000000138> .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000139> .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0013> "descriptive object value number 000000140" .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0014> "descriptive object value number 000000141" .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0015> "descriptive object value number 000000142" .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0016> "descriptive object value number 000000143" .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000144> .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000145> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0019> <http://data.example.org/resource/2026/object/000000146> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0020> <http://data.example.org/resource/2026/object/000000147> .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0021> <http://data.example.org/resource/2026/object/000000148> .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000149> .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0023> "descriptive object value number 000000150" .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0024> "descriptive object value number 000000151" .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0025> "descriptive object value number 000000152" .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0026> "descriptive object value number 000000153" .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000154> .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000155> .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0029> <http://data.example.org/resource/2026/object/000000156> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0030> <http://data.example.org/resource/2026/object/000000157> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0031> <http://data.example.org/resource/2026/object/000000158> .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0000> <http://data.example.org/resource/2026/object/000000159> .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0001> "descriptive object value number 000000160" .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0002> "descriptive object value number 000000161" .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0003> "descriptive object value number 000000162" .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0004> "descriptive object value number 000000163" .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000164> .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000165> .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000166> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000167> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0009> <http://data.example.org/resource/2026/object/000000168> .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0010> <http://data.example.org/resource/2026/object/000000169> .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0011> "descriptive object value number 000000170" .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0012> "descriptive object value number 000000171" .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0013> "descriptive object value number 000000172" .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0014> "descriptive object value number 000000173" .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000174> .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000175> .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000176> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000177> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0019> <http://data.example.org/resource/2026/object/000000178> .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0020> <http://data.example.org/resource/2026/object/000000179> .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0021> "descriptive object value number 000000180" .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0022> "descriptive object value number 000000181" .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0023> "descriptive object value number 000000182" .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0024> "descriptive object value number 000000183" .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000184> .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000185> .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000186> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000187> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0029> <http://data.example.org/resource/2026/object/000000188> .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0030> <http://data.example.org/resource/2026/object/000000189> .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0031> "descriptive object value number 000000190" .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0000> "descriptive object value number 000000191" .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0001> "descriptive object value number 000000192" .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0002> "descriptive object value number 000000193" .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000194> .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000195> .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000196> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000197> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0007> <http://data.example.org/resource/2026/object/000000198> .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0008> <http://data.example.org/resource/2026/object/000000199> .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0009> "descriptive object value number 000000200" .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0010> "descriptive object value number 000000201" .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0011> "descriptive object value number 000000202" .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0012> "descriptive object value number 000000203" .
+<http://data.example.org/resource/2026/subject/000000002> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000204> .
+<http://data.example.org/resource/2026/subject/000000003> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000205> .
+<http://data.example.org/resource/2026/subject/000000004> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000206> .
+<http://data.example.org/resource/2026/subject/000000005> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000207> .
+<http://data.example.org/resource/2026/subject/000000006> <http://data.example.org/ontology/2026/property/0017> <http://data.example.org/resource/2026/object/000000208> .
+<http://data.example.org/resource/2026/subject/000000007> <http://data.example.org/ontology/2026/property/0018> <http://data.example.org/resource/2026/object/000000209> .
+<http://data.example.org/resource/2026/subject/000000008> <http://data.example.org/ontology/2026/property/0019> "descriptive object value number 000000210" .
+<http://data.example.org/resource/2026/subject/000000009> <http://data.example.org/ontology/2026/property/0020> "descriptive object value number 000000211" .
+<http://data.example.org/resource/2026/subject/000000010> <http://data.example.org/ontology/2026/property/0021> "descriptive object value number 000000212" .
+<http://data.example.org/resource/2026/subject/000000011> <http://data.example.org/ontology/2026/property/0022> "descriptive object value number 000000213" .
+<http://data.example.org/resource/2026/subject/000000012> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000214> .
+<http://data.example.org/resource/2026/subject/000000013> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000215> .
+<http://data.example.org/resource/2026/subject/000000014> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000216> .
+<http://data.example.org/resource/2026/subject/000000015> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000217> .
+<http://data.example.org/resource/2026/subject/000000016> <http://data.example.org/ontology/2026/property/0027> <http://data.example.org/resource/2026/object/000000218> .
+<http://data.example.org/resource/2026/subject/000000017> <http://data.example.org/ontology/2026/property/0028> <http://data.example.org/resource/2026/object/000000219> .
+<http://data.example.org/resource/2026/subject/000000018> <http://data.example.org/ontology/2026/property/0029> "descriptive object value number 000000220" .
+<http://data.example.org/resource/2026/subject/000000019> <http://data.example.org/ontology/2026/property/0030> "descriptive object value number 000000221" .
+<http://data.example.org/resource/2026/subject/000000020> <http://data.example.org/ontology/2026/property/0031> "descriptive object value number 000000222" .
+<http://data.example.org/resource/2026/subject/000000021> <http://data.example.org/ontology/2026/property/0000> "descriptive object value number 000000223" .
+<http://data.example.org/resource/2026/subject/000000022> <http://data.example.org/ontology/2026/property/0001> <http://data.example.org/resource/2026/object/000000224> .
+<http://data.example.org/resource/2026/subject/000000023> <http://data.example.org/ontology/2026/property/0002> <http://data.example.org/resource/2026/object/000000225> .
+<http://data.example.org/resource/2026/subject/000000024> <http://data.example.org/ontology/2026/property/0003> <http://data.example.org/resource/2026/object/000000226> .
+<http://data.example.org/resource/2026/subject/000000025> <http://data.example.org/ontology/2026/property/0004> <http://data.example.org/resource/2026/object/000000227> .
+<http://data.example.org/resource/2026/subject/000000026> <http://data.example.org/ontology/2026/property/0005> <http://data.example.org/resource/2026/object/000000228> .
+<http://data.example.org/resource/2026/subject/000000027> <http://data.example.org/ontology/2026/property/0006> <http://data.example.org/resource/2026/object/000000229> .
+<http://data.example.org/resource/2026/subject/000000028> <http://data.example.org/ontology/2026/property/0007> "descriptive object value number 000000230" .
+<http://data.example.org/resource/2026/subject/000000029> <http://data.example.org/ontology/2026/property/0008> "descriptive object value number 000000231" .
+<http://data.example.org/resource/2026/subject/000000030> <http://data.example.org/ontology/2026/property/0009> "descriptive object value number 000000232" .
+<http://data.example.org/resource/2026/subject/000000031> <http://data.example.org/ontology/2026/property/0010> "descriptive object value number 000000233" .
+<http://data.example.org/resource/2026/subject/000000032> <http://data.example.org/ontology/2026/property/0011> <http://data.example.org/resource/2026/object/000000234> .
+<http://data.example.org/resource/2026/subject/000000033> <http://data.example.org/ontology/2026/property/0012> <http://data.example.org/resource/2026/object/000000235> .
+<http://data.example.org/resource/2026/subject/000000034> <http://data.example.org/ontology/2026/property/0013> <http://data.example.org/resource/2026/object/000000236> .
+<http://data.example.org/resource/2026/subject/000000035> <http://data.example.org/ontology/2026/property/0014> <http://data.example.org/resource/2026/object/000000237> .
+<http://data.example.org/resource/2026/subject/000000036> <http://data.example.org/ontology/2026/property/0015> <http://data.example.org/resource/2026/object/000000238> .
+<http://data.example.org/resource/2026/subject/000000037> <http://data.example.org/ontology/2026/property/0016> <http://data.example.org/resource/2026/object/000000239> .
+<http://data.example.org/resource/2026/subject/000000038> <http://data.example.org/ontology/2026/property/0017> "descriptive object value number 000000240" .
+<http://data.example.org/resource/2026/subject/000000039> <http://data.example.org/ontology/2026/property/0018> "descriptive object value number 000000241" .
+<http://data.example.org/resource/2026/subject/000000040> <http://data.example.org/ontology/2026/property/0019> "descriptive object value number 000000242" .
+<http://data.example.org/resource/2026/subject/000000041> <http://data.example.org/ontology/2026/property/0020> "descriptive object value number 000000243" .
+<http://data.example.org/resource/2026/subject/000000042> <http://data.example.org/ontology/2026/property/0021> <http://data.example.org/resource/2026/object/000000244> .
+<http://data.example.org/resource/2026/subject/000000043> <http://data.example.org/ontology/2026/property/0022> <http://data.example.org/resource/2026/object/000000245> .
+<http://data.example.org/resource/2026/subject/000000044> <http://data.example.org/ontology/2026/property/0023> <http://data.example.org/resource/2026/object/000000246> .
+<http://data.example.org/resource/2026/subject/000000045> <http://data.example.org/ontology/2026/property/0024> <http://data.example.org/resource/2026/object/000000247> .
+<http://data.example.org/resource/2026/subject/000000046> <http://data.example.org/ontology/2026/property/0025> <http://data.example.org/resource/2026/object/000000248> .
+<http://data.example.org/resource/2026/subject/000000047> <http://data.example.org/ontology/2026/property/0026> <http://data.example.org/resource/2026/object/000000249> .
+<http://data.example.org/resource/2026/subject/000000048> <http://data.example.org/ontology/2026/property/0027> "descriptive object value number 000000250" .
+<http://data.example.org/resource/2026/subject/000000049> <http://data.example.org/ontology/2026/property/0028> "descriptive object value number 000000251" .
+<http://data.example.org/resource/2026/subject/000000050> <http://data.example.org/ontology/2026/property/0029> "descriptive object value number 000000252" .
+<http://data.example.org/resource/2026/subject/000000000> <http://data.example.org/ontology/2026/property/0030> "descriptive object value number 000000253" .
+<http://data.example.org/resource/2026/subject/000000001> <http://data.example.org/ontology/2026/property/0031> <http://data.example.org/resource/2026/object/000000254> .

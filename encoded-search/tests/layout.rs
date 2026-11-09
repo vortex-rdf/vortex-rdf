@@ -3,14 +3,17 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
-use common::{canonical_bounds, writer_session};
-use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::stream::ArrayStreamAdapter;
-use vortex_array::validity::Validity;
+use common::{
+    canonical_bounds, data_node, struct_chunk, struct_of, taken_u32, write_file, writer_session,
+};
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::{ArrayRef, IntoArray};
-use vortex_file::{OpenOptionsSessionExt as _, WriteOptionsSessionExt as _};
+use vortex_error::VortexResult;
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
 use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex_layout::layouts::dict::Dict as DictLayout;
@@ -20,72 +23,11 @@ use vortex_layout::layouts::dict::writer::{
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
 use vortex_layout::layouts::struct_::StructStrategy;
-use vortex_layout::{LayoutChildType, LayoutRef, LayoutStrategy};
-use vortex_rdf_encoded_search::ColumnChunks;
+use vortex_layout::segments::{SegmentFuture, SegmentId, SegmentSinkRef, SegmentSource};
+use vortex_layout::sequence::{SendableSequentialStream, SequencePointer};
+use vortex_layout::{LayoutRef, LayoutStrategy, LayoutWriterContext};
+use vortex_rdf_encoded_search::{ColumnChunks, NodeKind, SortedProbe, fetch_flat, flat_leaves};
 use vortex_session::VortexSession;
-
-/// A struct chunk over the given arrays, all of one length.
-fn struct_of(columns: Vec<(&str, ArrayRef)>) -> ArrayRef {
-    let len = columns[0].1.len();
-    let (names, arrays): (Vec<&str>, Vec<ArrayRef>) = columns.into_iter().unzip();
-    StructArray::try_new(names.into(), arrays, len, Validity::NonNullable)
-        .unwrap()
-        .into_array()
-}
-
-/// A struct chunk over non-nullable `u32` columns.
-fn struct_chunk(columns: &[(&str, &[u32])]) -> ArrayRef {
-    struct_of(
-        columns
-            .iter()
-            .map(|(name, data)| {
-                (
-                    *name,
-                    PrimitiveArray::from_iter(data.iter().copied()).into_array(),
-                )
-            })
-            .collect(),
-    )
-}
-
-/// Writes `chunks` as one file (through `strategy` when given) and returns
-/// the opened file.
-async fn write_file(
-    session: &VortexSession,
-    chunks: Vec<ArrayRef>,
-    strategy: Option<Arc<dyn LayoutStrategy>>,
-) -> vortex_file::VortexFile {
-    let dtype = chunks[0].dtype().clone();
-    let mut options = session.write_options();
-    if let Some(strategy) = strategy {
-        options = options.with_strategy(strategy);
-    }
-    let mut bytes = Vec::new();
-    options
-        .write(
-            &mut bytes,
-            ArrayStreamAdapter::new(dtype, futures::stream::iter(chunks.into_iter().map(Ok))),
-        )
-        .await
-        .unwrap();
-    session.open_options().open_buffer(bytes).unwrap()
-}
-
-/// A field's data node beneath its zoned wrappers, for shape assertions.
-fn data_node(root: &LayoutRef, field: &str) -> LayoutRef {
-    use vortex_layout::layouts::zoned::Zoned;
-    let mut node = (0..root.nslots())
-        .find_map(|i| {
-            matches!(root.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == field)
-                .then(|| root.slot(i).ok().flatten())
-                .flatten()
-        })
-        .expect("field present");
-    while node.is::<Zoned>() {
-        node = node.slot(0).unwrap().unwrap();
-    }
-    node
-}
 
 /// A dictionary strategy with the given codes and values strategies and a
 /// `max_len`-bounded dictionary.
@@ -97,7 +39,7 @@ fn dict_strategy<C: LayoutStrategy, V: LayoutStrategy>(
     use vortex_btrblocks::BtrBlocksCompressorBuilder;
     use vortex_layout::layouts::compressed::CompressorPlugin;
     let compressor: Arc<dyn CompressorPlugin> =
-        Arc::new(BtrBlocksCompressorBuilder::default().build());
+        Arc::new(BtrBlocksCompressorBuilder::from_session(&common::session()).build());
     DictStrategy::new(
         codes,
         values,
@@ -117,6 +59,82 @@ fn struct_strategy<S: LayoutStrategy>(field: S) -> Arc<dyn LayoutStrategy> {
         Arc::new(FlatLayoutStrategy::default()),
         Arc::new(field),
     ))
+}
+
+/// A segment source that forwards each request to `inner`, counting the
+/// requests made for every segment.
+struct CountingSource {
+    inner: Arc<dyn SegmentSource>,
+    requests: Mutex<HashMap<SegmentId, usize>>,
+}
+
+impl CountingSource {
+    fn new(inner: Arc<dyn SegmentSource>) -> Self {
+        Self {
+            inner,
+            requests: Mutex::default(),
+        }
+    }
+
+    /// The requests made for `id` so far.
+    fn requests(&self, id: SegmentId) -> usize {
+        self.requests.lock().unwrap().get(&id).copied().unwrap_or(0)
+    }
+}
+
+impl SegmentSource for CountingSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        *self.requests.lock().unwrap().entry(id).or_default() += 1;
+        self.inner.request(id)
+    }
+}
+
+/// A strategy handing its inner one the column's chunks with a zero-row
+/// chunk after the first. The file writer drops empty input chunks before
+/// any strategy sees them, so only a strategy beneath it can pass one on;
+/// vortex's chunked writer then keeps it as a zero-row child.
+struct EmptyChunkAfterFirst<S>(S);
+
+impl<S: LayoutStrategy> LayoutStrategy for EmptyChunkAfterFirst<S> {
+    fn write_stream<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        ctx: LayoutWriterContext,
+        segment_sink: SegmentSinkRef,
+        stream: SendableSequentialStream,
+        eof: SequencePointer,
+        session: &'life1 VortexSession,
+    ) -> Pin<Box<dyn Future<Output = VortexResult<LayoutRef>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        use futures::StreamExt as _;
+        use vortex_layout::sequence::{
+            SequentialStream as _, SequentialStreamAdapter, SequentialStreamExt as _,
+        };
+
+        let dtype = stream.dtype().clone();
+        let mut first = true;
+        let stream = stream.flat_map(move |item| {
+            let items = match item {
+                Ok((id, chunk)) if std::mem::take(&mut first) => {
+                    let mut ids = id.descend();
+                    let (chunk_id, empty_id) = (ids.advance(), ids.advance());
+                    let empty = chunk.slice(0..0).map(|empty| (empty_id, empty));
+                    vec![Ok((chunk_id, chunk)), empty]
+                }
+                other => vec![other],
+            };
+            futures::stream::iter(items)
+        });
+        let stream = SequentialStreamAdapter::new(dtype, stream).sendable();
+        Box::pin(async move {
+            self.0
+                .write_stream(ctx, segment_sink, stream, eof, session)
+                .await
+        })
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -164,6 +182,11 @@ async fn column_chunks_match_canonical() {
             .unwrap()
             .expect("all chunks are probeable");
         assert_eq!(got, canonical_bounds(&data, needle), "needle {needle}");
+        assert_eq!(
+            column.lower_bound(needle, &source, &session).await.unwrap(),
+            Some(got.start),
+            "lower bound of {needle}"
+        );
     }
 
     // Point reads across chunk interiors and boundaries need no sort order
@@ -177,6 +200,43 @@ async fn column_chunks_match_canonical() {
             .unwrap()
             .expect("all chunks are probeable");
         assert_eq!(got, u64::from(data[row as usize]), "row {row}");
+    }
+
+    // Bulk reads agree with the point reads: runs of consecutive rows inside
+    // a leaf and across the input-chunk boundaries, scattered rows, and rows
+    // out of order.
+    let rows: Vec<u64> = (199_990..200_010)
+        .chain(5..9)
+        .chain((0..data.len() as u64).step_by(9973))
+        .chain([400_000, 3, 399_999, 400_001])
+        .chain([9, 11, 13, 13, 14])
+        .collect();
+    let got = column
+        .values_at(&rows, &source, &session)
+        .await
+        .unwrap()
+        .expect("all chunks are probeable");
+    let want: Vec<u64> = rows
+        .iter()
+        .map(|&row| u64::from(data[row as usize]))
+        .collect();
+    assert_eq!(got, want, "values_at");
+
+    // Equality counts over the whole column, across a leaf boundary, inside
+    // a leaf and across the second input-chunk boundary, for needles inside
+    // and past the data.
+    for rows in [0..600_000u64, 199_990..200_010, 5..9, 399_999..400_001] {
+        for needle in [0, max / 2, max, max + 1] {
+            let got = column
+                .count_eq(rows.clone(), needle, &source, &session)
+                .await
+                .unwrap();
+            let want = data[rows.start as usize..rows.end as usize]
+                .iter()
+                .filter(|&&v| u64::from(v) == needle)
+                .count() as u64;
+            assert_eq!(got, want, "count_eq({rows:?}, {needle})");
+        }
     }
 
     // Windowed bounds: search inside sub-ranges (including ones spanning a
@@ -197,6 +257,87 @@ async fn column_chunks_match_canonical() {
             );
         }
     }
+    // Windows crossing the flat leaves' own boundaries, with needles whose
+    // run crosses them: the lower bound lies in one leaf and the run goes on
+    // into the next. A window inside one leaf reads through `leaf_rows`; one
+    // across a boundary has no single leaf.
+    let starts: Vec<u64> = flat_leaves(&node)
+        .expect("the column's leaves")
+        .iter()
+        .map(|leaf| leaf.row_offset)
+        .filter(|&start| start > 0)
+        .collect();
+    assert!(!starts.is_empty(), "fixture must have a leaf boundary");
+    let len = data.len() as u64;
+    for &b in &starts {
+        let around: Vec<u64> = (b - 2..b + 2)
+            .map(|r| u64::from(data[r as usize]))
+            .collect();
+        for window in [b - 30..b + 30, b - 1..b + 1, 0..len, b - 11..len, 0..b + 11] {
+            let wdata = &data[window.start as usize..window.end as usize];
+            for needle in around.iter().copied().chain([0, max, u64::MAX]) {
+                let got = column
+                    .bounds_in(window.clone(), needle, &source, &session)
+                    .await
+                    .unwrap()
+                    .expect("all chunks are probeable");
+                let want = canonical_bounds(wdata, needle);
+                assert_eq!(
+                    got,
+                    window.start + want.start..window.start + want.end,
+                    "boundary {b} window {window:?} needle {needle}"
+                );
+            }
+        }
+        let inside = column
+            .leaf_rows(b - 20..b, &source, &session)
+            .await
+            .unwrap()
+            .expect("a window inside one leaf");
+        assert_eq!(inside.rows(), b - 20..b);
+        for row in b - 20..b {
+            assert_eq!(
+                inside.value_at(row),
+                u64::from(data[row as usize]),
+                "row {row}"
+            );
+        }
+        let value = |row: u64| u64::from(data[row as usize]);
+        let mut run = vec![0; 20];
+        inside.read_into(b - 20, &mut run);
+        assert_eq!(run, (b - 20..b).map(value).collect::<Vec<_>>(), "leaf run");
+        let scattered = [b - 20, b - 19, b - 9, b - 7, b - 7, b - 6, b - 5, b - 1];
+        let mut out = vec![0; scattered.len()];
+        inside.values_at(&scattered, &mut out);
+        assert_eq!(out, scattered.map(value), "leaf rows");
+        let needle = u64::from(data[(b - 5) as usize]);
+        let want = canonical_bounds(&data[(b - 20) as usize..b as usize], needle);
+        assert_eq!(
+            inside.bounds(needle),
+            b - 20 + want.start..b - 20 + want.end
+        );
+        assert!(
+            column
+                .leaf_rows(b - 1..b + 1, &source, &session)
+                .await
+                .unwrap()
+                .is_none(),
+            "a window across leaf boundary {b}"
+        );
+    }
+
+    // A reversed window holds no row: at `u64::MAX` too, its bounds are
+    // empty at its start.
+    #[allow(clippy::reversed_empty_ranges)]
+    let reversed = 9..5;
+    assert_eq!(
+        column
+            .bounds_in(reversed, u64::MAX, &source, &session)
+            .await
+            .unwrap(),
+        Some(9..9),
+        "reversed window at u64::MAX"
+    );
 }
 
 /// Only non-nullable unsigned-integer fields of the struct resolve.
@@ -228,6 +369,107 @@ async fn column_chunks_decline_unsupported_fields() {
     assert!(ColumnChunks::from_struct_layout(&root, "absent").is_none());
 }
 
+/// A column reports the flat leaves it is cut into and how many a probe has
+/// fetched, and its `Debug` prints the same two numbers. A zero-row chunk is
+/// no leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_count_their_leaves() {
+    let session = writer_session();
+    let data: Vec<u32> = (0..600_000).map(|i| (i / 11) as u32).collect();
+    let chunks: Vec<ArrayRef> = data
+        .chunks(200_000)
+        .map(|c| struct_chunk(&[("s", c)]))
+        .collect();
+    let file = write_file(&session, chunks.clone(), None).await;
+    let root = file.footer().layout().clone();
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("the shape must resolve");
+    let leaves = column.chunk_count();
+    assert!(
+        leaves >= 3,
+        "the fixture must span several leaves: {leaves}"
+    );
+    assert_eq!(
+        column.fetched_chunks(),
+        0,
+        "nothing is fetched at construction"
+    );
+
+    let source = file.segment_source();
+    column.value_at(0, &source, &session).await.unwrap();
+    assert_eq!(column.fetched_chunks(), 1);
+    column.value_at(1, &source, &session).await.unwrap();
+    assert_eq!(column.fetched_chunks(), 1, "a leaf is fetched once");
+    column
+        .value_at(data.len() as u64 - 1, &source, &session)
+        .await
+        .unwrap();
+    assert_eq!(column.fetched_chunks(), 2);
+    assert_eq!(column.chunk_count(), leaves);
+
+    let debug = format!("{column:?}");
+    assert!(
+        debug.contains(&format!("chunks: {leaves}")) && debug.contains("fetched: 2"),
+        "{debug}"
+    );
+
+    // The same leaves tile the column in row order, and a fetched leaf holds
+    // exactly its own rows.
+    let flat = flat_leaves(&data_node(&root, "s")).expect("the shape resolves");
+    assert_eq!(flat.len(), leaves);
+    let mut next = 0;
+    for leaf in &flat {
+        assert_eq!((leaf.row_offset, leaf.dict_values.is_none()), (next, true));
+        next += leaf.layout.row_count();
+    }
+    assert_eq!(next, data.len() as u64);
+    let last = flat.last().unwrap();
+    let rows = fetch_flat(&last.layout, &source, &session).await.unwrap();
+    assert_eq!(taken_u32(rows, &session), &data[last.row_offset as usize..]);
+
+    // A chunked layout holding a zero-row chunk, which vortex's chunked
+    // writer keeps when a strategy hands it one: the empty chunk has no leaf,
+    // the leaves still tile the column, and its bounds and point reads are
+    // exact.
+    let empty_after_first =
+        EmptyChunkAfterFirst(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()));
+    let file = write_file(&session, chunks, Some(struct_strategy(empty_after_first))).await;
+    let root = file.footer().layout().clone();
+    let node = data_node(&root, "s");
+    let chunk_rows: Vec<u64> = (0..node.nslots())
+        .map(|i| node.slot(i).unwrap().unwrap().row_count())
+        .collect();
+    assert!(
+        node.is::<ChunkedLayout>() && chunk_rows.contains(&0),
+        "the fixture must keep a zero-row chunk: {}",
+        node.display_tree()
+    );
+    let flat = flat_leaves(&node).expect("the shape resolves");
+    assert_eq!(flat.len(), node.nslots() - 1, "the empty chunk has no leaf");
+    let mut next = 0;
+    for leaf in &flat {
+        assert_eq!(leaf.row_offset, next);
+        next += leaf.layout.row_count();
+    }
+    assert_eq!(next, data.len() as u64);
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("the shape resolves");
+    assert_eq!(column.chunk_count(), flat.len());
+    let source = file.segment_source();
+    for needle in [0u64, 1, 18_181, 36_363, u64::MAX] {
+        assert_eq!(
+            column.bounds(needle, &source, &session).await.unwrap(),
+            Some(canonical_bounds(&data, needle)),
+            "needle {needle}"
+        );
+    }
+    for row in [0, 199_999, 200_000, data.len() as u64 - 1] {
+        assert_eq!(
+            column.value_at(row, &source, &session).await.unwrap(),
+            Some(u64::from(data[row as usize])),
+            "row {row}"
+        );
+    }
+}
+
 /// A zero-row column resolves to a column with no leaves and answers empty
 /// bounds without fetching.
 #[tokio::test(flavor = "multi_thread")]
@@ -248,28 +490,33 @@ async fn column_chunks_empty_column() {
     );
 }
 
-/// A leaf whose wire encoding the probe does not support (delta) declines
-/// with `Ok(None)` at query time, while the column itself still resolves.
+/// A leaf whose wire encoding the probe does not support (pcodec) declines
+/// its searches and point reads with `Ok(None)` at query time, while the
+/// column itself still resolves and a take reads the leaf all the same.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_decline_unsupported_leaf() {
+    if !vortex_rdf_encoded_search::encoded_search_enabled() {
+        return; // VORTEX_RDF_ENCODED_SEARCH=0 decodes the leaf first, so it is searched, not declined
+    }
     use vortex_array::VortexSessionExecute as _;
-    use vortex_fastlanes::Delta;
+    use vortex_pco::Pco;
 
     let session = writer_session();
     let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
-    let primitive = PrimitiveArray::from_iter(data.iter().copied());
-    let delta = Delta::try_from_primitive_array(&primitive, &mut session.create_execution_ctx())
-        .unwrap()
-        .into_array();
-    assert_eq!(delta.encoding_id().as_str(), "fastlanes.delta");
+    // Non-decreasing data, so only the encoding — not the data — is what
+    // the probe declines.
+    let pco = Pco::from_primitive(
+        PrimitiveArray::from_iter(data.clone()).as_view(),
+        3,
+        0,
+        &mut session.create_execution_ctx(),
+    )
+    .unwrap()
+    .into_array();
+    assert_eq!(pco.encoding_id().as_str(), "vortex.pco");
     // The flat strategy writes the chunk in the encoding it arrives in.
     let strategy = struct_strategy(FlatLayoutStrategy::default());
-    let file = write_file(
-        &session,
-        vec![struct_of(vec![("s", delta)])],
-        Some(strategy),
-    )
-    .await;
+    let file = write_file(&session, vec![struct_of(vec![("s", pco)])], Some(strategy)).await;
     let root = file.footer().layout().clone();
 
     let column = ColumnChunks::from_struct_layout(&root, "s").expect("a flat leaf resolves");
@@ -284,6 +531,57 @@ async fn column_chunks_decline_unsupported_leaf() {
             .unwrap(),
         None
     );
+    // A leaf whose encoding declined was fetched all the same.
+    assert_eq!((column.chunk_count(), column.fetched_chunks()), (1, 1));
+    let rows = [0, 7, 2_048, 4_095];
+    let taken = column.take(&rows, &source, &session).await.unwrap();
+    let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
+    assert_eq!(taken_u32(taken, &session), want);
+}
+
+/// A FastLanes run-length leaf, a wire form of the store's writer edition,
+/// read back from a file answers every probe as the canonical data does.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_probe_run_length_leaf() {
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_fastlanes::RLEData;
+
+    let session = writer_session();
+    let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
+    let rle = RLEData::encode(
+        PrimitiveArray::from_iter(data.clone()).as_view(),
+        &mut session.create_execution_ctx(),
+    )
+    .unwrap()
+    .into_array();
+    let strategy = struct_strategy(FlatLayoutStrategy::default());
+    let file = write_file(&session, vec![struct_of(vec![("s", rle)])], Some(strategy)).await;
+    let root = file.footer().layout().clone();
+
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("a flat leaf resolves");
+    let source = file.segment_source();
+    for needle in [0u64, 7, 400, 818, 819, 820, 5_000] {
+        let want = canonical_bounds(&data[1_000..3_000], needle);
+        assert_eq!(
+            column.bounds(needle, &source, &session).await.unwrap(),
+            Some(canonical_bounds(&data, needle)),
+            "bounds({needle})"
+        );
+        assert_eq!(
+            column
+                .bounds_in(1_000..3_000, needle, &source, &session)
+                .await
+                .unwrap(),
+            Some(1_000 + want.start..1_000 + want.end),
+            "bounds_in({needle})"
+        );
+    }
+    for row in [0u64, 1_023, 1_024, 4_095] {
+        assert_eq!(
+            column.value_at(row, &source, &session).await.unwrap(),
+            Some(u64::from(data[row as usize]))
+        );
+    }
 }
 
 /// Dictionary layouts whose shape the probe does not support decline at
@@ -410,7 +708,8 @@ async fn column_chunks_probe_dictionary_coded_columns() {
 
 /// A column whose dictionary outgrows its constraints becomes a chunked run
 /// of dictionary layouts, each with its own values leaf and chunked codes;
-/// probes address rows across dictionary boundaries exactly.
+/// probes address rows across dictionary boundaries exactly, fetching each
+/// dictionary's values once for all its codes leaves.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_probe_run_of_dictionaries() {
     let session = writer_session();
@@ -438,11 +737,67 @@ async fn column_chunks_probe_run_of_dictionaries() {
     for i in 0..node.nslots() {
         assert!(node.slot(i).unwrap().unwrap().is::<DictLayout>());
     }
+    // Every leaf holds codes, and each dictionary's leaves are adjacent and
+    // name its one values leaf.
+    let leaves = flat_leaves(&node).expect("a run of dictionaries resolves");
+    let mut values = Vec::new();
+    for leaf in &leaves {
+        values.push(
+            leaf.dict_values
+                .as_ref()
+                .expect("a codes leaf")
+                .segment_id(),
+        );
+    }
+    values.dedup();
+    assert_eq!(values.len(), 3);
+    assert!(
+        leaves.len() > values.len(),
+        "a dictionary spans several codes leaves"
+    );
+
+    // Probing every codes leaf requests each one's segment once, and each
+    // dictionary's values segment once, shared by its codes leaves.
+    let counting = Arc::new(CountingSource::new(file.segment_source()));
+    let counted: Arc<dyn SegmentSource> = counting.clone();
+    let probed =
+        ColumnChunks::from_struct_layout(&root, "s").expect("a run of dictionaries resolves");
+    for leaf in &leaves {
+        assert_eq!(
+            probed
+                .value_at(leaf.row_offset, &counted, &session)
+                .await
+                .unwrap(),
+            Some(u64::from(data[leaf.row_offset as usize]))
+        );
+    }
+    for leaf in &leaves {
+        assert_eq!(counting.requests(leaf.layout.segment_id()), 1);
+    }
+    for id in values {
+        assert_eq!(counting.requests(id), 1, "values segment {id:?}");
+    }
 
     let source = file.segment_source();
     let column =
         ColumnChunks::from_struct_layout(&root, "s").expect("a run of dictionaries resolves");
     assert_eq!(column.row_count(), 20_000);
+
+    // Equality counts over the dictionaries' codes leaves: the whole column,
+    // across an input chunk (and dictionary) boundary, and one row.
+    for rows in [0..20_000u64, 4_990..5_010, 12_345..12_346] {
+        for needle in (0..=40u64).chain([100, u64::MAX]) {
+            let got = column
+                .count_eq(rows.clone(), needle, &source, &session)
+                .await
+                .unwrap();
+            let want = data[rows.start as usize..rows.end as usize]
+                .iter()
+                .filter(|&&v| u64::from(v) == needle)
+                .count() as u64;
+            assert_eq!(got, want, "count_eq({rows:?}, {needle})");
+        }
+    }
 
     for needle in (0..=40u64).chain([100, u64::MAX]) {
         let got = column
@@ -482,6 +837,104 @@ async fn column_chunks_probe_run_of_dictionaries() {
                 window.start + want.start..window.start + want.end,
                 "window {window:?} needle {needle}"
             );
+        }
+    }
+}
+
+/// A take at ascending rows answers exactly the values at those rows, each
+/// leaf taking its own — across leaf boundaries, from run-end and
+/// dictionary-coded columns alike; no row, an empty array.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_take_rows_across_leaves() {
+    let session = writer_session();
+    let data: Vec<u32> = (0..600_000).map(|i| (i / 11) as u32).collect();
+    let chunks: Vec<ArrayRef> = data
+        .chunks(200_000)
+        .map(|c| struct_chunk(&[("s", c)]))
+        .collect();
+    let file = write_file(&session, chunks, None).await;
+    let root = file.footer().layout().clone();
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("the shape resolves");
+    let source = file.segment_source();
+    let mut rows: Vec<u64> = (0..data.len() as u64).step_by(7919).collect();
+    rows.extend([199_999, 200_000, 399_999, 400_000, data.len() as u64 - 1]);
+    rows.sort_unstable();
+    rows.dedup();
+    let taken = column.take(&rows, &source, &session).await.unwrap();
+    let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
+    assert_eq!(taken_u32(taken, &session), want);
+    let none = column.take(&[], &source, &session).await.unwrap();
+    assert_eq!(none.len(), 0);
+
+    let p: Vec<u32> = (0..9_000).map(|i| (i / 3_000) as u32).collect();
+    let o: Vec<u32> = (0..9_000).map(|i| ((i % 3_000) / 300) as u32).collect();
+    let file = write_file(&session, vec![struct_chunk(&[("p", &p), ("o", &o)])], None).await;
+    let root = file.footer().layout().clone();
+    let source = file.segment_source();
+    let rows: Vec<u64> = (0..9_000u64).step_by(37).chain([8_999]).collect();
+    for (field, data) in [("p", &p), ("o", &o)] {
+        let column =
+            ColumnChunks::from_struct_layout(&root, field).expect("a dict layout resolves");
+        let taken = column.take(&rows, &source, &session).await.unwrap();
+        let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
+        assert_eq!(taken_u32(taken, &session), want, "{field}");
+    }
+}
+
+/// Leaves that are dictionaries of 2,000 values, past the 1,024 at which
+/// counts once went through Vortex's compare: counts over the whole column,
+/// one leaf, three rows and a leaf boundary agree with a plain count, for
+/// needles present, absent inside the values' range, and wider than the
+/// values.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_dictionaries_count_on_their_probe() {
+    let session = writer_session();
+    // 2,000 distinct values, ten rows each, spread across the column, in
+    // four leaves that each hold the whole dictionary.
+    let values: Vec<u32> = (0..2_000u32).map(|v| 1_000 + 3 * v).collect();
+    let codes: Vec<u16> = (0..20_000u32).map(|i| ((i * 7) % 2_000) as u16).collect();
+    let data: Vec<u32> = codes.iter().map(|&c| values[usize::from(c)]).collect();
+    let chunks: Vec<ArrayRef> = codes
+        .chunks(5_000)
+        .map(|leaf| {
+            let dict = vortex_array::arrays::DictArray::try_new(
+                PrimitiveArray::from_iter(leaf.iter().copied()).into_array(),
+                PrimitiveArray::from_iter(values.iter().copied()).into_array(),
+            )
+            .unwrap()
+            .into_array();
+            struct_of(vec![("s", dict)])
+        })
+        .collect();
+    let leaves = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
+    let file = write_file(&session, chunks, Some(struct_strategy(leaves))).await;
+    let root = file.footer().layout().clone();
+    let source = file.segment_source();
+    for leaf in flat_leaves(&data_node(&root, "s")).expect("flat leaves") {
+        let array = fetch_flat(&leaf.layout, &source, &session).await.unwrap();
+        let kinds = SortedProbe::resolve(&array)
+            .expect("a leaf resolves")
+            .node_kinds();
+        assert_eq!(
+            kinds[0],
+            NodeKind::Dict,
+            "each leaf a dictionary: {kinds:?}"
+        );
+    }
+    let source = file.segment_source();
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("a dictionary resolves");
+    let needles = [u64::from(data[0]), u64::from(data[7_001]), 1_001, u64::MAX];
+    for rows in [0..20_000u64, 5_000..10_000, 7_000..7_003, 4_990..5_010] {
+        for needle in needles {
+            let got = column
+                .count_eq(rows.clone(), needle, &source, &session)
+                .await
+                .unwrap();
+            let want = data[rows.start as usize..rows.end as usize]
+                .iter()
+                .filter(|&&v| u64::from(v) == needle)
+                .count() as u64;
+            assert_eq!(got, want, "count_eq({rows:?}, {needle})");
         }
     }
 }

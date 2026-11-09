@@ -1,6 +1,6 @@
 {
     "name": "@vortex-rdf/vortex-rdf-store",
-    "version": "0.10.0",
+    "version": "0.15.0",
     "description": "High-performance, zero-copy columnar RDF serialization format",
     "type": "module",
     "repository": {
@@ -32,6 +32,7 @@
     "files": [
         "entry/node.js",
         "entry/browser.js",
+        "entry/pin.js",
         "entry/types.d.ts",
         "pkg/web/vortex_rdf.js",
         "pkg/web/vortex_rdf.d.ts",
@@ -42,8 +43,11 @@
     "scripts": {
         "build:wasm": "wasm-pack build --target web --out-dir pkg/web --no-pack",
         "build:wasm:fast": "wasm-pack build --target web --out-dir pkg/web --no-pack --no-opt",
-        "build:hdt-wasm": "RUSTFLAGS='-C target-feature=+simd128' wasm-pack build bench/hdt-wasm --target web --out-dir ../hdt-pkg --no-pack && npm run build:hdt-clean-generated",
+        "build:bench-wasm": "node -e \"require('fs').rmSync('pkg/bench',{recursive:true,force:true})\" && wasm-pack build --target web --out-dir pkg/bench --no-pack -- --features memory-stats && node -e \"const fs=require('fs');for (const f of ['pkg/bench/package.json','pkg/bench/.gitignore']) fs.rmSync(f,{force:true})\"",
+        "build:bench-wasm:fast": "node -e \"require('fs').rmSync('pkg/bench',{recursive:true,force:true})\" && wasm-pack build --target web --out-dir pkg/bench --no-pack --no-opt -- --features memory-stats && node -e \"const fs=require('fs');for (const f of ['pkg/bench/package.json','pkg/bench/.gitignore']) fs.rmSync(f,{force:true})\"",
+        "build:hdt-wasm": "wasm-pack build bench/hdt-wasm --target web --out-dir ../hdt-pkg --no-pack && npm run build:hdt-clean-generated",
         "build:hdt-clean-generated": "node -e \"require('fs').rmSync('bench/hdt-pkg/.gitignore',{force:true})\"",
+        "build:oxigraph-wasm": "bash bench/oxigraph-wasm/build.sh",
         "build:reset": "node -e \"require('fs').rmSync('pkg/web',{recursive:true,force:true})\"",
         "build:clean-generated": "node -e \"const fs=require('fs');for (const f of ['pkg/web/package.json','pkg/web/.gitignore']) fs.rmSync(f,{force:true})\"",
         "build": "npm run build:reset && npm run build:wasm && npm run build:clean-generated",
@@ -52,7 +56,7 @@
         "test": "vitest run",
         "typecheck": "tsc -p tsconfig.json && tsc -p bench/tsconfig.json",
         "bench": "tsx --expose-gc --max-old-space-size=8192 bench/compare.bench.ts",
-        "bench:build": "npm run build && npm run bench",
+        "bench:build": "npm run build:bench-wasm && npm run bench",
         "bench:codspeed": "node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts",
         "bench:dict-memory": "tsx --expose-gc bench/dict-memory.bench.ts"
     },
@@ -67,15 +71,14 @@
     "author": "Julián Rojas",
     "license": "MIT",
     "devDependencies": {
-        "@codspeed/tinybench-plugin": "^5.7.1",
+        "@codspeed/tinybench-plugin": "^6.1.0",
         "@types/node": "^26.1.2",
-        "oxigraph": "^0.5.9",
         "rdf-data-factory": "^2.0.2",
         "rdf-stores": "^2.2.0",
         "tinybench": "^6.1.2",
         "tsx": "^4.23.4",
         "typescript": "^7.0.2",
-        "vitest": "^4.1.10",
+        "vitest": "^5.0.5",
         "wasm-pack": "^0.15.0"
     },
     "dependencies": {

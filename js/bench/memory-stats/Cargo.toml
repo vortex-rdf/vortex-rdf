@@ -1,0 +1,16 @@
+[package]
+name = "bench-memory-stats"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "Bench-only counting global allocator: live and peak heap bytes, for the dashboard's memory panels"
+
+[features]
+# wasm-bindgen exports (setMemoryCounting, memoryStats, resetMemoryPeak).
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+
+[dependencies]
+wasm-bindgen = { version = "0.2.100", optional = true }
+js-sys = { version = "0.3.77", optional = true }

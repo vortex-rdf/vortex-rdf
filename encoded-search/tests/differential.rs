@@ -9,55 +9,56 @@
 
 mod common;
 
-use common::session;
+use common::{
+    BITPACKING, FOR, assert_bulk_reads, canonical_index_bounds, compress_array_with,
+    compress_default, compress_with, session,
+};
 use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, SliceArray};
 use vortex_array::scalar::Scalar;
-use vortex_array::search_sorted::{SearchSorted, SearchSortedSide};
+use vortex_array::search_sorted::{SearchSorted, SearchSortedArray, SearchSortedSide};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
-use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme};
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 use vortex_sequence::Sequence;
 
 /// Top-level encoding ids the probe resolves; a declined array with one of
-/// these at its root is a resolver bug, not an unsupported shape.
+/// these at its root is a resolver bug, not an unsupported shape. Every
+/// frame-of-reference array reports `fastlanes.for.v2` in memory, and every
+/// bit-packed array `fastlanes.bitpacked.v2`; the session's edition keeps the
+/// compressor's on a single reference and a single bit width.
 const SUPPORTED_ENCODINGS: &[&str] = &[
     "vortex.primitive",
     "vortex.constant",
     "vortex.sequence",
     "vortex.runend",
-    "fastlanes.for",
-    "fastlanes.bitpacked",
+    "fastlanes.for.v2",
+    "fastlanes.bitpacked.v2",
+    "fastlanes.delta",
     "vortex.slice",
     "vortex.chunked",
     "vortex.dict",
     "vortex.shared",
+    "vortex.sparse",
+    "fastlanes.rle",
 ];
 
 /// Most generic-oracle calls a single fixture makes. Fixtures with fewer
 /// needles than this check every one of them; larger ones are stride-sampled.
-const GENERIC_ORACLE_NEEDLES: usize = 2000;
+const GENERIC_ORACLE_NEEDLES: usize = 256;
+
+/// The generic-oracle budget per default-cascade fixture. The cascade picks
+/// delta for most of them, and an encoding without a native `search_sorted`
+/// kernel (delta) answers the generic oracle through per-element point reads
+/// that each decode a block; every needle still meets the canonical oracle.
+const CASCADE_ORACLE_NEEDLES: usize = 64;
 
 fn ctx() -> ExecutionCtx {
     session().create_execution_ctx()
 }
 
-fn compress_with(schemes: &[&'static dyn Scheme], data: &[u32]) -> ArrayRef {
-    let mut builder = BtrBlocksCompressorBuilder::empty();
-    for scheme in schemes {
-        builder = builder.with_new_scheme(*scheme);
-    }
-    let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
-    builder.build().compress(&canonical, &mut ctx()).unwrap()
-}
-
-fn compress_default(data: &[u32]) -> ArrayRef {
-    let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
-    BtrBlocksCompressorBuilder::default()
-        .build()
-        .compress(&canonical, &mut ctx())
-        .unwrap()
-}
+/// The delta scheme at a zero ratio, which makes the cascade pick Delta
+/// whenever it applies.
+static DELTA: integer::DeltaScheme = integer::DeltaScheme::new(0.0);
 
 /// Needle set exercising every boundary of `data`: each distinct value and its
 /// neighbors, domain extremes, and values beyond the array's ptype.
@@ -72,11 +73,6 @@ fn needles_for(data: &[u32]) -> Vec<u64> {
     needles
 }
 
-fn canonical_bounds(data: &[u32], needle: u64) -> (usize, usize) {
-    let range = common::canonical_bounds(data, needle);
-    (range.start as usize, range.end as usize)
-}
-
 /// Sorted 11-row runs whose RunEnd children both land on Sequence.
 fn runend_sequence_22k() -> (Vec<u32>, ArrayRef) {
     let data: Vec<u32> = (0..22_000u32).map(|i| i / 11).collect();
@@ -86,22 +82,32 @@ fn runend_sequence_22k() -> (Vec<u32>, ArrayRef) {
 
 fn bitpacked_4k() -> (Vec<u32>, ArrayRef) {
     let data: Vec<u32> = (0..4096u32).map(|i| i / 7).collect();
-    let arr = compress_with(&[&integer::BitPackingScheme], &data);
+    let arr = compress_with(&[&BITPACKING], &data);
     (data, arr)
 }
 
 fn for_bitpacked_4k() -> (Vec<u32>, ArrayRef) {
     let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i / 3).collect();
-    let arr = compress_with(&[&integer::FoRScheme, &integer::BitPackingScheme], &data);
+    let arr = compress_with(&[&FOR, &BITPACKING], &data);
     (data, arr)
 }
 
-/// Asserts a default-cascade fixture either probes exactly or declined
-/// because its root encoding is outside the supported set; returns whether
-/// it resolved.
-fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32]) -> bool {
+/// A sorted column with uneven steps, delta-encoded over bit-packed deltas
+/// — the shape the default cascade now gives a sorted code column — at a
+/// length that pads the last 1024-value block.
+fn delta_bitpacked_5k() -> (Vec<u32>, ArrayRef) {
+    let data = sorted_random(11, 5_000, 40);
+    let arr = compress_with(&[&DELTA, &BITPACKING], &data);
+    (data, arr)
+}
+
+/// Asserts a default-cascade fixture either probes exactly, its probe holding
+/// `expect_kinds`, or declined because its root encoding is outside the
+/// supported set while no kinds are expected of it; returns whether it
+/// resolved.
+fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) -> bool {
     if SortedProbe::resolve(arr).is_some() {
-        assert_probe(arr, data, &[]);
+        assert_probe_with_budget(arr, data, expect_kinds, CASCADE_ORACLE_NEEDLES);
         true
     } else {
         let id = arr.encoding_id();
@@ -109,26 +115,44 @@ fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32]) -> bool {
             !SUPPORTED_ENCODINGS.contains(&id.as_str()),
             "a supported root encoding ({id}) declined"
         );
+        assert!(
+            expect_kinds.is_empty(),
+            "declined ({id}), but its probe must hold {expect_kinds:?}"
+        );
         false
     }
 }
 
-fn generic_bounds(arr: &ArrayRef, needle: u32) -> (usize, usize) {
-    let probe = Scalar::from(needle);
-    let lo = arr
+/// The generic kernel's bounds of `needle` in `arr`, the needle cast to the
+/// array's type; `None` for a needle that type cannot hold.
+fn generic_bounds(arr: &ArrayRef, needle: u32) -> Option<(usize, usize)> {
+    let probe = Scalar::from(needle).cast(arr.dtype()).ok()?;
+    let mut ctx = ctx();
+    let sorted = SearchSortedArray::new(arr, &mut ctx);
+    let lo = sorted
         .search_sorted(&probe, SearchSortedSide::Left)
         .unwrap()
         .to_index();
-    let hi = arr
+    let hi = sorted
         .search_sorted(&probe, SearchSortedSide::Right)
         .unwrap()
         .to_index();
-    (lo, hi)
+    Some((lo, hi))
 }
 
 /// Three-way agreement on bounds plus exact point access, with an optional
 /// coverage assertion on the resolved probe tree.
 fn assert_probe(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) {
+    assert_probe_with_budget(arr, data, expect_kinds, GENERIC_ORACLE_NEEDLES);
+}
+
+/// [`assert_probe`] with an explicit cap on generic-oracle calls.
+fn assert_probe_with_budget(
+    arr: &ArrayRef,
+    data: &[u32],
+    expect_kinds: &[NodeKind],
+    generic_budget: usize,
+) {
     let probe = SortedProbe::resolve(arr)
         .unwrap_or_else(|| panic!("resolve declined ({})", arr.encoding_id()));
     let kinds = probe.node_kinds();
@@ -141,28 +165,26 @@ fn assert_probe(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) {
     assert_eq!(probe.len(), data.len());
 
     let needles = needles_for(data);
-    let generic_stride = needles.len().div_ceil(GENERIC_ORACLE_NEEDLES);
+    let generic_stride = needles.len().div_ceil(generic_budget);
     for (i, needle) in needles.iter().copied().enumerate() {
         let got = probe.bounds(needle);
         assert_eq!(
             got,
-            canonical_bounds(data, needle),
+            canonical_index_bounds(data, needle),
             "canonical oracle, needle {needle}"
         );
         // A generic `search_sorted` call costs orders of magnitude more than
         // the canonical floor, so a high-cardinality fixture is stride-sampled
-        // down to `GENERIC_ORACLE_NEEDLES` of them. Index 0 and the ptype's
-        // upper edge are always taken, and every needle still meets the
-        // canonical oracle above.
+        // down to `generic_budget` of them. Index 0 and the ptype's upper
+        // edge are always taken, and every needle still meets the canonical
+        // oracle above.
         if i % generic_stride != 0 && needle != u64::from(u32::MAX) {
             continue;
         }
-        if let Ok(narrow) = u32::try_from(needle) {
-            assert_eq!(
-                got,
-                generic_bounds(arr, narrow),
-                "generic oracle, needle {needle}"
-            );
+        if let Ok(narrow) = u32::try_from(needle)
+            && let Some(generic) = generic_bounds(arr, narrow)
+        {
+            assert_eq!(got, generic, "generic oracle, needle {needle}");
         }
     }
 
@@ -173,6 +195,7 @@ fn assert_probe(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) {
     if let Some(last) = data.len().checked_sub(1) {
         assert_eq!(probe.value_at(last), u64::from(data[last]));
     }
+    assert_bulk_reads(&probe, data);
 }
 
 /// Deterministic generator for the randomized sweeps.
@@ -220,6 +243,59 @@ fn probes_bitpacked_zero_width() {
     assert_probe(&packed, &data, &[NodeKind::BitPacked]);
 }
 
+/// Bit-packed columns of every stored word width, with values past the packed
+/// width carried as patches: every bulk read (`read_into`, `read_at`,
+/// `count_eq`, `eq_offsets`) answers as the values do, the patches written
+/// over the values unpacked around them, whole and sliced to start inside a
+/// chunk.
+#[test]
+fn bulk_reads_of_bitpacked_words_with_patches() {
+    use vortex_array::arrays::slice::SliceKernel;
+
+    fn check<T>(outliers: [u64; 3])
+    where
+        T: vortex_array::dtype::NativePType + Into<u64> + TryFrom<u64>,
+        <T as TryFrom<u64>>::Error: std::fmt::Debug,
+    {
+        let mut data: Vec<T> = (0..5000u64)
+            .map(|i| T::try_from(i % 100).unwrap())
+            .collect();
+        for (at, outlier) in [17, 1500, 4999].into_iter().zip(outliers) {
+            data[at] = T::try_from(outlier).unwrap();
+        }
+        let canonical = PrimitiveArray::from_iter(data.iter().copied());
+        let packed =
+            vortex_fastlanes::bitpack_compress::bitpack_encode(&canonical, 7, None, &mut ctx())
+                .unwrap()
+                .into_array();
+        let probe = SortedProbe::resolve(&packed).expect("a bit-packed column resolves");
+        assert!(
+            probe.node_kinds().contains(&NodeKind::Patches),
+            "{:?}: the outliers are patches",
+            T::PTYPE
+        );
+        common::assert_bulk_reads(&probe, &data);
+        // Sliced, the node reads from an offset into its first chunk: one
+        // inside the chunk, one across chunks into the patched tail, and a
+        // single patched row.
+        for range in [1..5000usize, 1000..4100, 3000..5000, 1500..1501] {
+            let sliced = <vortex_fastlanes::BitPacked as SliceKernel>::slice(
+                packed.as_::<vortex_fastlanes::BitPacked>(),
+                range.clone(),
+                &mut ctx(),
+            )
+            .unwrap()
+            .unwrap();
+            let probe = SortedProbe::resolve(&sliced).expect("a sliced bit-packed column resolves");
+            common::assert_bulk_reads(&probe, &data[range]);
+        }
+    }
+    check::<u8>([200, 255, 129]);
+    check::<u16>([40_000, 65_535, 1_000]);
+    check::<u32>([1 << 30, u32::MAX as u64, 5_000]);
+    check::<u64>([1 << 40, u64::MAX, 12_345]);
+}
+
 #[test]
 fn probes_bitpacked_with_patches() {
     use vortex_array::arrays::slice::SliceKernel;
@@ -246,12 +322,54 @@ fn probes_bitpacked_with_patches() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(sliced.encoding_id().as_str(), "fastlanes.bitpacked");
+        assert!(sliced.is::<vortex_fastlanes::BitPacked>(), "{range:?}");
         assert_probe(
             &sliced,
             &data[range],
             &[NodeKind::BitPacked, NodeKind::Patches],
         );
+    }
+}
+
+#[test]
+fn probes_delta_bitpacked() {
+    let (data, arr) = delta_bitpacked_5k();
+    assert_probe(&arr, &data, &[NodeKind::Delta, NodeKind::BitPacked]);
+
+    // The narrower lane widths, whose blocks carry more bases: u8 (128 lanes)
+    // and u16 (64), each sorted and padding its last block. Every needle meets
+    // the canonical oracle; the generic one, which delta answers by a block
+    // decode per element, takes the cascade's sample.
+    let bytes: Vec<u8> = (0..3_000u32).map(|i| (i * 255 / 2_999) as u8).collect();
+    let words: Vec<u16> = sorted_random(13, 3_000, 20)
+        .into_iter()
+        .map(|v| u16::try_from(v).unwrap())
+        .collect();
+    for (data, canonical) in [
+        (
+            bytes.iter().map(|&v| u32::from(v)).collect::<Vec<_>>(),
+            PrimitiveArray::from_iter(bytes.iter().copied()).into_array(),
+        ),
+        (
+            words.iter().map(|&v| u32::from(v)).collect(),
+            PrimitiveArray::from_iter(words.iter().copied()).into_array(),
+        ),
+    ] {
+        let arr = compress_array_with(&[&DELTA, &BITPACKING], canonical);
+        assert_probe_with_budget(&arr, &data, &[NodeKind::Delta], CASCADE_ORACLE_NEEDLES);
+    }
+}
+
+/// A sliced delta array starts inside a block (a physical offset) and ends
+/// inside another; every value and bound still comes from the right block.
+#[test]
+fn probes_delta_sliced_within_blocks() {
+    let (data, arr) = delta_bitpacked_5k();
+    let sliced = arr.slice(1_030..4_100).unwrap();
+    assert_probe(&sliced, &data[1_030..4_100], &[NodeKind::Delta]);
+    let probe = SortedProbe::resolve(&sliced).expect("a sliced delta array resolves");
+    for (i, &v) in data[1_030..4_100].iter().enumerate().step_by(97) {
+        assert_eq!(probe.value_at(i), u64::from(v), "value at {i}");
     }
 }
 
@@ -323,6 +441,19 @@ fn probes_sequence() {
             .unwrap()
             .into_array();
     assert_probe(&direct, &data, &[NodeKind::Sequence]);
+
+    // A negative step (the multiplier is stored signed) makes the run
+    // descend, which the sorted contract excludes: it declines.
+    let descending = Sequence::try_new(
+        vortex_array::scalar::PValue::U32(100),
+        vortex_array::scalar::PValue::I64(-1),
+        vortex_array::dtype::PType::U32,
+        vortex_array::dtype::Nullability::NonNullable,
+        10,
+    )
+    .unwrap()
+    .into_array();
+    assert!(SortedProbe::resolve(&descending).is_none());
 }
 
 #[test]
@@ -432,8 +563,8 @@ fn probes_chunked_mixed_encodings() {
     let chunks: Vec<ArrayRef> = vec![
         compress_with(&[&integer::RunEndScheme, &integer::SequenceScheme], &c1),
         PrimitiveArray::from_iter(std::iter::empty::<u32>()).into_array(),
-        compress_with(&[&integer::BitPackingScheme], &c2),
-        compress_with(&[&integer::FoRScheme, &integer::SequenceScheme], &c3),
+        compress_with(&[&BITPACKING], &c2),
+        compress_with(&[&FOR, &integer::SequenceScheme], &c3),
     ];
     let dtype = chunks[0].dtype().clone();
     let arr = ChunkedArray::try_new(chunks, dtype).unwrap().into_array();
@@ -445,25 +576,41 @@ fn probes_chunked_mixed_encodings() {
     );
 }
 
+/// A default-cascade shape: the seed base, length and largest step of its
+/// sorted values, and the salts it runs, each beside the node kinds its probe
+/// must hold.
+type CascadeShape = (u64, usize, u64, &'static [(u64, &'static [NodeKind])]);
+
+/// Each shape runs one salt per encoding tree the cascade picks for it: one
+/// tree for every salt of a shape, but the u16-crossing steps, where salt 5's
+/// step of 2^16 adds patches under the bit-packed deltas. That probe, the
+/// suite's one patched delta, must hold both kinds, so a cascade that stops
+/// picking the tree fails here instead of dropping the case.
 #[test]
 fn probes_default_cascade_random() {
-    let shapes: &[(u64, usize, u64)] = &[
-        (1, 5000, 0),      // constant
-        (2, 5000, 1),      // slow ramp, long runs
-        (3, 5000, 3),      // short runs
-        (4, 5000, 1000),   // wide spread
-        (5, 20_000, 7),    // longer, moderate runs
-        (6, 333, 1 << 20), // short, huge steps
-        (7, 5000, 65_536), // u16-crossing steps
-        (8, 1, 5),         // single element
+    let shapes: &[CascadeShape] = &[
+        (1, 5000, 0, &[(0, &[])]),      // constant
+        (2, 5000, 1, &[(0, &[])]),      // slow ramp, long runs
+        (3, 5000, 3, &[(0, &[])]),      // short runs
+        (4, 5000, 1000, &[(0, &[])]),   // wide spread
+        (5, 20_000, 7, &[(0, &[])]),    // longer, moderate runs
+        (6, 333, 1 << 20, &[(0, &[])]), // short, huge steps
+        // u16-crossing steps
+        (
+            7,
+            5000,
+            65_536,
+            &[(0, &[]), (5, &[NodeKind::Delta, NodeKind::Patches])],
+        ),
+        (8, 1, 5, &[(0, &[])]), // single element
     ];
     let mut resolved = 0usize;
     let mut declined = Vec::new();
-    for &(seed_base, len, max_step) in shapes {
-        for salt in 0..8u64 {
+    for &(seed_base, len, max_step, salts) in shapes {
+        for &(salt, kinds) in salts {
             let data = sorted_random(seed_base * 1000 + salt, len, max_step);
             let arr = compress_default(&data);
-            if assert_probe_or_unsupported(&arr, &data) {
+            if assert_probe_or_unsupported(&arr, &data, kinds) {
                 resolved += 1;
             } else {
                 declined.push(arr.encoding_id().to_string());
@@ -476,21 +623,101 @@ fn probes_default_cascade_random() {
     );
 }
 
+/// A nullable column, a signed dtype and a float dtype each decline.
 #[test]
-fn declines_nullable() {
-    let arr = PrimitiveArray::from_option_iter([Some(1u32), None, Some(3)]).into_array();
-    assert!(SortedProbe::resolve(&arr).is_none());
+fn declines_unsupported_dtypes() {
+    for (dtype, arr) in [
+        (
+            "nullable u32",
+            PrimitiveArray::from_option_iter([Some(1u32), None, Some(3)]).into_array(),
+        ),
+        ("i32", PrimitiveArray::from_iter([1i32, 2, 3]).into_array()),
+        ("f32", PrimitiveArray::from_iter([1.0f32, 2.0]).into_array()),
+    ] {
+        assert!(SortedProbe::resolve(&arr).is_none(), "{dtype}");
+    }
 }
 
 #[test]
-fn declines_signed_dtype() {
-    let arr = PrimitiveArray::from_iter([1i32, 2, 3]).into_array();
-    assert!(SortedProbe::resolve(&arr).is_none());
+fn probes_per_chunk_for_references() {
+    // One reference per 1,024-value chunk (the `fastlanes.for.v2` wire
+    // form): searches probe the composed values, since a needle maps to a
+    // different encoded value in every chunk.
+    use vortex_fastlanes::{FoR, FoRArrayExt as _};
+    let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i * 3).collect();
+    let arr = FoR::encode_chunked(PrimitiveArray::from_iter(data.clone()), &mut ctx())
+        .unwrap()
+        .into_array();
+    let view = arr.as_opt::<FoR>().unwrap();
+    assert!(
+        !view.references().is_global(),
+        "fixture must carry per-chunk references"
+    );
+    assert_probe_with_budget(&arr, &data, &[NodeKind::FoR], GENERIC_ORACLE_NEEDLES);
 }
 
 #[test]
-fn declines_float_dtype() {
-    let arr = PrimitiveArray::from_iter([1.0f32, 2.0]).into_array();
+fn probes_fastlanes_run_length() {
+    // Runs of 1 to 2,000 values, so runs cross 1,024-value chunk boundaries
+    // and a chunk may hold a single run; slices start mid-chunk, which the
+    // array keeps as an offset into its first chunk, and past the first, so
+    // value offsets count from a base above zero.
+    use vortex_array::arrays::slice::SliceKernel as _;
+    use vortex_fastlanes::{RLE, RLEData};
+    let mut rng = Lcg(7);
+    let mut data: Vec<u32> = Vec::with_capacity(10_000);
+    let mut value = 0u32;
+    while data.len() < 10_000 {
+        let run = [1, 3, 40, 2_000][rng.next() as usize % 4];
+        data.extend(std::iter::repeat_n(value, run));
+        value += 1 + (rng.next() % 5) as u32;
+    }
+    data.truncate(10_000);
+    let arr = RLEData::encode(
+        PrimitiveArray::from_iter(data.clone()).as_view(),
+        &mut ctx(),
+    )
+    .unwrap()
+    .into_array();
+    assert_eq!(arr.encoding_id().as_str(), "fastlanes.rle");
+    assert_probe(&arr, &data, &[NodeKind::Rle]);
+    for range in [
+        5..1000usize,
+        1030..2050,
+        1023..1025,
+        3..9_999,
+        4_096..10_000,
+        777..777,
+    ] {
+        // `ArrayRef::slice` wraps; RLE's slice kernel, run when that wrapper
+        // executes, pushes the window into the array.
+        let wrapped = arr.slice(range.clone()).unwrap();
+        assert_probe(&wrapped, &data[range.clone()], &[]);
+        let pushed = RLE::slice(arr.as_opt::<RLE>().unwrap(), range.clone(), &mut ctx())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pushed.encoding_id().as_str(), "fastlanes.rle");
+        assert_probe(&pushed, &data[range], &[NodeKind::Rle]);
+    }
+}
+
+#[test]
+fn declines_blocked_bit_widths() {
+    // A bit width per 1,024-value block: each block's words sit at its own
+    // stride.
+    use vortex_fastlanes::{BitPacked, BitPackedArrayExt as _, BitPackedData};
+    let data: Vec<u32> = (0..2048u32)
+        .map(|i| if i < 1024 { i / 256 } else { 1000 + i })
+        .collect();
+    let canonical = PrimitiveArray::from_iter(data).into_array();
+    let arr = BitPackedData::encode_blocked(&canonical, &[2, 12], &mut ctx())
+        .unwrap()
+        .into_array();
+    let view = arr.as_opt::<BitPacked>().unwrap();
+    assert!(
+        !view.bit_widths().is_global(),
+        "fixture must carry per-block widths"
+    );
     assert!(SortedProbe::resolve(&arr).is_none());
 }
 
@@ -522,6 +749,28 @@ fn probes_dict_permuted_values() {
     assert_probe(&arr, &data, &[NodeKind::Dict, NodeKind::Primitive]);
 }
 
+/// A dictionary holding a value under two codes, as a dictionary array may:
+/// `count_eq` and `eq_offsets` of that value read the values (one code's
+/// scan would miss the other's rows), and of every other value scan its one
+/// code, all answering as the values do.
+#[test]
+fn bulk_reads_of_a_dictionary_with_a_repeated_value() {
+    let values: Vec<u32> = vec![10, 20, 20, 30];
+    let codes: Vec<u16> = (0..5000usize)
+        .map(|i| [0, 1, 2, 1, 3, 2, 2][i % 7])
+        .collect();
+    let data: Vec<u32> = codes.iter().map(|&c| values[usize::from(c)]).collect();
+    let arr = vortex_array::arrays::DictArray::try_new(
+        PrimitiveArray::from_iter(codes).into_array(),
+        PrimitiveArray::from_iter(values).into_array(),
+    )
+    .unwrap()
+    .into_array();
+    let probe = SortedProbe::resolve(&arr).expect("a dictionary resolves");
+    assert!(probe.node_kinds().contains(&NodeKind::Dict));
+    common::assert_bulk_reads(&probe, &data);
+}
+
 #[test]
 fn probes_through_shared_wrapper() {
     // The writer wraps a values child shared between chunks in a `Shared`
@@ -531,7 +780,7 @@ fn probes_through_shared_wrapper() {
     let codes: Vec<u16> = vec![0, 0, 1, 2, 2, 2, 3, 4];
     let data: Vec<u32> = codes.iter().map(|&c| values[c as usize]).collect();
     let shared =
-        vortex_array::arrays::SharedArray::new(PrimitiveArray::from_iter(values).into_array())
+        vortex_layout::arrays::shared::Shared::new(PrimitiveArray::from_iter(values).into_array())
             .into_array();
     assert_eq!(shared.encoding_id().as_str(), "vortex.shared");
     let arr = vortex_array::arrays::DictArray::try_new(
@@ -557,7 +806,7 @@ fn bounds_all_equal() {
     let data = vec![42u32; 9000];
     let arr = compress_default(&data);
     assert!(
-        assert_probe_or_unsupported(&arr, &data),
+        assert_probe_or_unsupported(&arr, &data, &[]),
         "an all-equal column must resolve; root encoding {}",
         arr.encoding_id()
     );
@@ -582,8 +831,8 @@ fn probes_slice_of_piecewise_sorted() {
         data.extend((0..run_len as u32).map(|i| i / 3 + (run % 5) * 40));
     }
     let encodings = [
-        compress_with(&[&integer::RunEndScheme, &integer::BitPackingScheme], &data),
-        compress_with(&[&integer::BitPackingScheme], &data),
+        compress_with(&[&integer::RunEndScheme, &BITPACKING], &data),
+        compress_with(&[&BITPACKING], &data),
         compress_with(&[&integer::IntDictScheme], &data),
     ];
     for arr in &encodings {
@@ -600,7 +849,7 @@ fn probes_slice_of_piecewise_sorted() {
             let probe = SortedProbe::resolve(arr).unwrap();
             for needle in needles_for(wdata) {
                 let (lo, hi) = probe.bounds_in(window.clone(), needle);
-                let (clo, chi) = canonical_bounds(wdata, needle);
+                let (clo, chi) = canonical_index_bounds(wdata, needle);
                 assert_eq!(
                     (lo - wstart, hi - wstart),
                     (clo, chi),
@@ -624,4 +873,54 @@ fn bounds_in_edge_windows() {
         probe.bounds(100),
         "full-window bounds_in must equal bounds"
     );
+}
+
+/// Dictionaries of 4, 2,000 and 10,000 values over bit-packed, run-end and
+/// plain codes: reads, counts and finds over windows shorter and longer than
+/// the dictionary answer as a plain scan.
+#[test]
+fn dictionary_counts_and_finds() {
+    for distinct in [4u16, 2_000, 10_000] {
+        let values: Vec<u32> = (0..u32::from(distinct)).map(|v| 1_000 + 7 * v).collect();
+        let spread: Vec<u16> = (0..20_000u32)
+            .map(|i| ((i * 7_919) % u32::from(distinct)) as u16)
+            .collect();
+        let runs: Vec<u16> = (0..20_000u32)
+            .map(|i| ((i / 50) % u32::from(distinct)) as u16)
+            .collect();
+        let shapes = [
+            (
+                compress_with(&[&BITPACKING], &spread),
+                &spread,
+                NodeKind::BitPacked,
+            ),
+            (
+                compress_with(&[&integer::RunEndScheme], &runs),
+                &runs,
+                NodeKind::RunEnd,
+            ),
+            (
+                PrimitiveArray::from_iter(spread.clone()).into_array(),
+                &spread,
+                NodeKind::Primitive,
+            ),
+        ];
+        for (codes, plain, kind) in shapes {
+            let data: Vec<u32> = plain.iter().map(|&c| values[usize::from(c)]).collect();
+            let arr = vortex_array::arrays::DictArray::try_new(
+                codes,
+                PrimitiveArray::from_iter(values.clone()).into_array(),
+            )
+            .unwrap()
+            .into_array();
+            let probe = SortedProbe::resolve(&arr).expect("a dictionary resolves");
+            let kinds = probe.node_kinds();
+            assert_eq!(
+                kinds[..2],
+                [NodeKind::Dict, kind],
+                "{distinct} values: {kinds:?}"
+            );
+            common::assert_bulk_reads(&probe, &data);
+        }
+    }
 }

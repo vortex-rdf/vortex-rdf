@@ -17,7 +17,8 @@ Where the two suites cannot correspond:
 
 * `mutate::*` has no Python counterpart — the bindings expose no add/delete.
 * `readback::toRdf_*` has none — there is no export API.
-* `readpath::match_stream` has none — there is no streaming read.
+* `readpath::match_stream` has none — the bindings stream code chunks
+  (`test_pushdown_chunks`), not quads.
 * Building takes a *file*, so every `build::*` task is parse-and-build. That
   makes it the analogue of the JS suite's `build::fromString_nquads` as much as
   of its `fromQuads` variants, and the two are not comparable in absolute
@@ -253,7 +254,7 @@ def test_readpath(benchmark, stores, op):
     """The read entry points on the unindexed store for one selective pattern
     (S), isolating the boundary cost each carries.
 
-    `match_codes` is the lazy one — u32 columns, no term strings — so it is the
+    `match_codes` is the lazy one — u64 columns, no term strings — so it is the
     Python analogue of the JS suite's `readpath::matchCodes`. The other two
     materialize terms, which in JS is `readpath::getQuads_decoded`; the
     bindings have no lazy quad object, so there is no undecoded `get_quads`.
@@ -289,10 +290,10 @@ def test_readpath_full_decoded_literals(benchmark, stores):
 
 # ─── decode::<shape> (Python-only) ──────────────────────────────────────────
 #
-# No JavaScript counterpart: these guard `TermDict::decode_slice`'s sharing of
-# one Python string across repeats of a code. The three shapes are not
-# variations on one workload — each is a different way a column can repeat, and
-# the sharing covers them unequally:
+# No JavaScript counterpart: these guard `decode_slice`'s (python/src/dict.rs)
+# sharing of one Python string across repeats of a code. The three shapes are
+# not variations on one workload — each is a different way a column can repeat,
+# and the sharing covers them unequally:
 #
 #   constant  — a bound position, one code for every row.
 #   distinct  — no repetition at all, where sharing can only cost.
@@ -352,7 +353,7 @@ def test_decode_many(benchmark, stores, shape):
     dictionary = store.term_dict()
     p = next(x for x in dataset_probes(DIM**3)["triples"] if x.name == "P")
     columns = store.match_codes(p.s, p.p, p.o, p.g)
-    codes = array("I", memoryview(columns[1 if shape == "constant" else 0]).cast("I"))
+    codes = array("Q", memoryview(columns[1 if shape == "constant" else 0]).cast("Q"))
     _assert_shape(shape, codes)
     benchmark(lambda: dictionary.decode_many(codes))
 
@@ -360,7 +361,7 @@ def test_decode_many(benchmark, stores, shape):
 @pytest.mark.benchmark
 def test_decode_many_scattered(benchmark, scattered_store):
     codes = array(
-        "I", memoryview(scattered_store.match_codes(None, RDF_TYPE, None, None)[2]).cast("I")
+        "Q", memoryview(scattered_store.match_codes(None, RDF_TYPE, None, None)[2]).cast("Q")
     )
     _assert_shape("scattered", codes)
     benchmark(lambda: scattered_store.term_dict().decode_many(codes))
@@ -391,3 +392,163 @@ def test_readback_open(benchmark, tmp_path_factory, data):
     """
     out = _build(data["cube"], tmp_path_factory.mktemp("open") / "out.vortex", "dict_bycopy")
     benchmark(lambda: VortexRdfStore(out))
+
+
+# ─── pushdown::<op> (Python-only) ───────────────────────────────────────────
+#
+# The native primitives a query layer pushes below a pattern — a `keep`
+# applied inside the store, a windowed match, a batch of probes, a term
+# predicate over the dictionary, and the column kernels — on the unindexed
+# Dictionary store, so the cost of each primitive is read against the plain
+# `match_codes` of `readpath`.
+
+
+@pytest.mark.benchmark
+def test_pushdown_keep(benchmark, stores):
+    """A P match narrowed to the first half of the subjects by a code range on
+    `s` — what a FILTER on a namespace or a VALUES block becomes."""
+    store = stores["triples::dict"]
+    dictionary = store.term_dict()
+    p = TRIPLE_PATTERNS[1]  # P
+    lo, hi = dictionary.prefix_range("<")
+    keep = {"s": range(lo, lo + (hi - lo) // 2)}
+    benchmark(lambda: store.match_codes(p.s, p.p, p.o, p.g, keep=keep))
+
+
+@pytest.mark.benchmark
+def test_pushdown_limit(benchmark, stores):
+    """`LIMIT 64` over a P match: the filtered scan stops at the first block
+    that fills the window."""
+    store = stores["triples::dict"]
+    p = TRIPLE_PATTERNS[1]  # P
+    benchmark(lambda: store.match_codes(p.s, p.p, p.o, p.g, limit=64))
+
+
+@pytest.mark.benchmark
+def test_pushdown_exists(benchmark, stores):
+    """An ASK over a P match: `count_quads(limit=1)` reads up to the first
+    matching block."""
+    store = stores["triples::dict"]
+    p = TRIPLE_PATTERNS[1]  # P
+    benchmark(lambda: store.count_quads(p.s, p.p, p.o, p.g, limit=1))
+
+
+@pytest.mark.benchmark
+def test_pushdown_many(benchmark, stores):
+    """64 subject probes through one `match_codes_many`, consumed whole — a
+    nested-loop join's probe batch, answered through the bounded window."""
+    store = stores["triples::dict"]
+    probes = [(nn(i * 7 % DIM), None, None, None) for i in range(64)]
+    benchmark(lambda: list(store.match_codes_many(probes)))
+
+
+@pytest.mark.benchmark
+def test_pushdown_many_scans(benchmark, stores):
+    """64 object probes through one `match_codes_many`, consumed whole: on
+    the store without indexes each probe is a scan of the whole store, so
+    this is the batch the bounded window keeps from running all at once."""
+    store = stores["triples::dict"]
+    probes = [(None, None, nn(i % DIM), None) for i in range(64)]
+    benchmark(lambda: list(store.match_codes_many(probes)))
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize(
+    "residency, batch_rows",
+    [("file", None), ("memory", None), ("file", 64), ("memory", 64)],
+    ids=["file", "memory", "file-64", "memory-64"],
+)
+def test_pushdown_chunks(benchmark, stores, store_paths, residency, batch_rows):
+    """A P match streamed whole through `match_code_chunks`, over the mapped
+    file and over the same store loaded whole. At the default chunk size the
+    match (DIM**2 rows) is one chunk, the chunked twin of
+    `readpath[match_codes]`; at 64 rows a chunk it is DIM**2 / 64 pulls (16
+    at the default DIM), so the per-chunk path is what is measured."""
+    if residency == "file":
+        store = stores["triples::dict"]
+    else:
+        store = VortexRdfStore(store_paths["triples::dict"], in_memory=True)
+    p = TRIPLE_PATTERNS[1]  # P
+    options = {} if batch_rows is None else {"batch_rows": batch_rows}
+
+    def stream():
+        for _ in store.match_code_chunks(p.s, p.p, p.o, p.g, **options):
+            pass
+
+    benchmark(stream)
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("kind", ["is_iri", "str_prefix"])
+def test_pushdown_filter_codes(benchmark, store_paths, kind):
+    """A term predicate over candidate codes spread across the dictionary —
+    the per-query FILTER evaluation: a kind test reads nothing, and so does a
+    string prefix over `STR()` of an IRI (an IRI is a text only there), which
+    its code range decides since the build records the IRIs bracketed; the
+    candidates neither decides are read."""
+    from vortex_rdf import U64Column
+
+    term_dict = VortexRdfStore(store_paths["triples::dict"]).term_dict()
+    arg = "http://" if kind == "str_prefix" else ""
+    options = {"as_str": True} if kind == "str_prefix" else {}
+    codes = U64Column(range(0, len(term_dict), max(1, len(term_dict) // 4096)))
+    benchmark(lambda: term_dict.filter_codes(kind, arg, codes, **options))
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize(
+    "op",
+    ["distinct", "value_counts", "join_indices", "join_count", "groups_join", "groups_gather"],
+)
+def test_pushdown_kernels(benchmark, stores, op):
+    """The column kernels over a P match's subject column (the joins join it
+    with itself: the self-join shape of a star query). `join_count` counts
+    that join's pairs without building them, and `groups_join` probes the
+    column's groups, built once outside the measurement, as a join over
+    slices of a large left column does for each slice; `groups_gather`
+    fills that join's subject and object columns of both sides instead of
+    its pair indices."""
+    store = stores["triples::dict"]
+    p = TRIPLE_PATTERNS[1]  # P
+    subjects, _, objects, _ = store.match_codes(p.s, p.p, p.o, p.g)
+    if op == "join_indices":
+        benchmark(lambda: subjects.join_indices(subjects))
+    elif op == "join_count":
+        benchmark(lambda: subjects.join_count(subjects))
+    elif op == "groups_join":
+        groups = subjects.groups()
+        benchmark(lambda: groups.join(subjects))
+    elif op == "groups_gather":
+        groups = subjects.groups()
+        both = [subjects, objects]
+        benchmark(lambda: groups.gather(subjects, both, both))
+    else:
+        benchmark(getattr(subjects, op))
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("right", ["one_code", "every_code", "sparse"])
+def test_pushdown_join_hashed(benchmark, stores, right):
+    """`join_indices` on its hash path, which `pushdown_kernels[join_indices]`
+    never takes: its column is ascending, so that self-join merges. Here the
+    left column is a full match's predicate column, which is not ascending,
+    joined with one predicate code from the middle of its range, with every
+    predicate code (a `GROUP BY ?p` gathering its groups), and with those
+    codes among 4,096 spread too far apart for a table, so the right side is
+    hashed. Over the cardinality-realistic store, whose predicate codes sit
+    well above 0, as a large store's do."""
+    from vortex_rdf import U64Column
+
+    f = FULL_SCAN_PATTERN
+    predicates = stores["realistic"].match_codes(f.s, f.p, f.o, f.g)[1]
+    values = memoryview(predicates).cast("Q")
+    assert any(a > b for a, b in zip(values, values[1:])), "the column is ascending: it merges"
+    codes = sorted(set(values))
+    if right == "one_code":
+        other = U64Column([codes[len(codes) // 2]])
+    elif right == "every_code":
+        other = U64Column(codes)
+    else:
+        spread = [(1 << 40) + (i << 24) for i in range(4096 - len(codes))]
+        other = U64Column(spread + codes)
+    benchmark(lambda: predicates.join_indices(other))

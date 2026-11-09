@@ -1,0 +1,470 @@
+//! Writing a store file is all-or-nothing: the bytes land in a sibling temp
+//! file that is renamed over the target only once it is complete, so a write
+//! that fails leaves no partial file and the previous store byte-identical,
+//! and a successful one replaces the old file by rename (the old inode stays
+//! alive for anything that has it mapped; `tests/replace_mapped_store.rs`
+//! pins that against a live mapping in a process of its own).
+
+use super::*;
+use oxrdfio::RdfFormat;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Two valid triples, then a line no N-Triples parser accepts: the stream
+/// fails after quads were already ingested.
+const VALID_THEN_MALFORMED: &str = "\
+<http://example.org/s1> <http://example.org/p> \"one\" .\n\
+<http://example.org/s2> <http://example.org/p> \"two\" .\n\
+<http://example.org/s3> <http://example.org/p> not-a-term .\n";
+
+fn malformed_stream()
+-> impl futures::Stream<Item = crate::error::Result<crate::store::RawQuad>> + Unpin + Send + 'static
+{
+    crate::common::terms::parse_quads_from_reader(
+        Cursor::new(VALID_THEN_MALFORMED.as_bytes()),
+        RdfFormat::NTriples,
+    )
+}
+
+/// The directory's entries, sorted: what a test compares to say nothing but
+/// the expected files is there.
+fn entries(dir: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// Write a store file all-or-nothing in one call, the protocol every writer
+/// runs: `PendingStore::create`, then `PendingStore::write` with `write`
+/// filling the temp file.
+async fn write_store_atomically<F, Fut>(path: &Path, write: F) -> crate::error::Result<()>
+where
+    F: FnOnce(tokio::fs::File) -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<()>>,
+{
+    crate::io::pending::PendingStore::create(path)
+        .await?
+        .write(write)
+        .await
+}
+
+/// A build whose input fails mid-stream — after valid quads — writes nothing
+/// at a fresh path, under every layout, with and without indexes: no store
+/// file and no temp file.
+#[tokio::test]
+async fn test_failed_build_leaves_nothing_at_a_fresh_path() {
+    for layout in LAYOUTS {
+        for indexes in [vec![], ALL_INDEX_TYPES.to_vec()] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store.vortex");
+            let error = crate::io::quads_stream_to_vortex_file(
+                malformed_stream(),
+                &path,
+                layout,
+                indexes.clone(),
+            )
+            .await
+            .expect_err("a malformed line must fail the write");
+            assert!(
+                matches!(error, VortexRdfError::Deserialization(_)),
+                "{layout:?}/{indexes:?}: {error}"
+            );
+            assert_eq!(
+                entries(dir.path()),
+                Vec::<PathBuf>::new(),
+                "{layout:?}/{indexes:?}: a failed write must leave no store file and no temp file"
+            );
+        }
+    }
+}
+
+/// When `path` already holds a store, a write that fails leaves that store
+/// byte-identical, still openable, with no sibling beside it.
+#[tokio::test]
+async fn test_failed_build_keeps_the_existing_store_byte_identical() {
+    let (dir, path) = write_store_file(
+        modular_quads(12, 3, 4),
+        LayoutStrategy::Dictionary,
+        ALL_INDEX_TYPES.to_vec(),
+    )
+    .await;
+    let before = std::fs::read(&path).unwrap();
+
+    crate::io::quads_stream_to_vortex_file(
+        malformed_stream(),
+        &path,
+        LayoutStrategy::Default,
+        vec![],
+    )
+    .await
+    .expect_err("a malformed line must fail the write");
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the previous store must survive a failed rebuild untouched"
+    );
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(reopened.size().await.unwrap(), 12);
+    assert_eq!(reopened.layout(), LayoutStrategy::Dictionary);
+}
+
+/// A successful write over an existing store replaces it whole — new layout,
+/// new rows, new indexes — and leaves only the store file in the directory.
+#[tokio::test]
+async fn test_successful_write_replaces_the_existing_store() {
+    let (dir, path) = write_store_file(
+        modular_quads(12, 3, 4),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+
+    let replacement = graph_modular_quads(5, 3, 2, 2, &[GraphName::DefaultGraph, iri_graph("g")]);
+    crate::io::quads_stream_to_vortex_file(
+        quad_stream(replacement.clone()),
+        &path,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(reopened.layout(), LayoutStrategy::Dictionary);
+    assert_eq!(reopened.indexes(), &[IndexType::SecondaryByReference]);
+    assert_eq!(view_strings(&reopened).await, quad_strings(&replacement));
+}
+
+/// An input that records whether anyone read it: an empty stream that flips
+/// the flag the first time it is polled.
+fn recording_stream(
+    polled: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = crate::error::Result<crate::store::RawQuad>> + Unpin + Send + 'static
+{
+    futures::stream::poll_fn(move |_| {
+        polled.store(true, Ordering::SeqCst);
+        std::task::Poll::Ready(None)
+    })
+}
+
+/// A path that cannot take a store is reported before the input is read: a
+/// missing directory, or a regular file where a directory should be, fails at
+/// once with an error naming the path, not after the whole ingest, sort and
+/// dictionary have run, and creates nothing.
+#[tokio::test]
+async fn test_a_missing_directory_fails_before_the_input_is_read() {
+    use std::io::ErrorKind;
+
+    for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
+        for (parent, name, parent_is_a_file, kind) in [
+            ("missing", "store.vortex", false, ErrorKind::NotFound),
+            ("a_file", "out.vortex", true, ErrorKind::NotADirectory),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            if parent_is_a_file {
+                std::fs::write(dir.path().join(parent), b"not a directory").unwrap();
+            }
+            let before = entries(dir.path());
+            let path = dir.path().join(parent).join(name);
+            let polled = Arc::new(AtomicBool::new(false));
+
+            let error = crate::io::quads_stream_to_vortex_file(
+                recording_stream(polled.clone()),
+                &path,
+                layout,
+                vec![],
+            )
+            .await
+            .expect_err("there is nowhere to put the store");
+
+            let tag = format!("{layout:?} {parent}/{name}");
+            assert!(
+                matches!(&error, VortexRdfError::Io(e) if e.kind() == kind),
+                "{tag}: {error}"
+            );
+            assert!(
+                error.to_string().contains(&format!("{path:?}")),
+                "{tag}: the error names the path: {error}"
+            );
+            assert!(
+                !polled.load(Ordering::SeqCst),
+                "{tag}: the input was read before the output path was known to take a store"
+            );
+            assert_eq!(entries(dir.path()), before, "{tag}");
+        }
+    }
+}
+
+/// A directory at `path` is refused up front too (it could only fail at the
+/// rename, after the build), and is left exactly as it was.
+#[tokio::test]
+async fn test_a_directory_at_the_path_is_refused_before_the_input_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("keep.txt"), b"keep").unwrap();
+    let polled = Arc::new(AtomicBool::new(false));
+
+    let error = crate::io::quads_stream_to_vortex_file(
+        recording_stream(polled.clone()),
+        &path,
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .expect_err("a directory cannot be replaced by a file");
+
+    assert!(
+        matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::IsADirectory),
+        "{error}"
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "the input was read although the path is a directory"
+    );
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    assert_eq!(entries(&path), vec![path.join("keep.txt")]);
+}
+
+/// A rename that fails after the whole store was written — the path became a
+/// directory meanwhile, which the up-front check could not know — leaves the
+/// directory untouched and removes the temp file.
+#[tokio::test]
+async fn test_a_rename_failing_after_the_write_removes_the_temp_file() {
+    use vortex_io::VortexWrite as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    let appears = path.clone();
+
+    let error = write_store_atomically(&path, |mut writer| async move {
+        writer.write_all(b"a whole store".to_vec()).await?;
+        std::fs::create_dir(&appears).unwrap();
+        std::fs::write(appears.join("keep.txt"), b"keep").unwrap();
+        Ok(())
+    })
+    .await
+    .expect_err("a directory cannot be replaced by a file");
+    assert!(matches!(error, VortexRdfError::Io(_)), "{error}");
+
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    assert_eq!(entries(&path), vec![path.join("keep.txt")]);
+}
+
+// ─── The shared writer: failure after the temp file exists ─────────────
+
+/// A write that fails once the temp file holds bytes — at a fresh path, and
+/// over an existing store — removes the temp file and leaves `path` as it
+/// was: absent, or the previous store's exact bytes.
+#[tokio::test]
+async fn test_write_failing_after_the_temp_file_exists_removes_it() {
+    use vortex_io::VortexWrite as _;
+
+    for existing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.vortex");
+        if existing {
+            std::fs::write(&path, b"the previous store").unwrap();
+        }
+        let before = entries(dir.path());
+        let watched = dir.path().to_path_buf();
+        let expected_before = before.clone();
+
+        let error = write_store_atomically(&path, |mut writer| async move {
+            writer.write_all(b"half a store".to_vec()).await?;
+            // The temp file is a sibling of `path`, and it is there now.
+            let during = entries(&watched);
+            assert_eq!(during.len(), before.len() + 1, "{during:?}");
+            let temp = during.iter().find(|p| !before.contains(p)).unwrap();
+            assert!(
+                temp.extension().is_some_and(|e| e == "tmp"),
+                "a temp file must not look like a store: {temp:?}"
+            );
+            Err(VortexRdfError::Serialization("the write failed".into()))
+        })
+        .await
+        .expect_err("the closure's error must come back");
+        assert!(matches!(error, VortexRdfError::Serialization(_)), "{error}");
+
+        assert_eq!(entries(dir.path()), expected_before, "existing={existing}");
+        if existing {
+            assert_eq!(std::fs::read(&path).unwrap(), b"the previous store");
+        }
+    }
+}
+
+/// Dropping the write while it is in flight — a cancelled task, a timeout —
+/// removes the temp file too, and `path` is untouched. The temp file is seen
+/// to exist while the write is stalled, so the cleanup is what removed it.
+#[tokio::test]
+async fn test_dropping_the_write_removes_the_temp_file() {
+    use vortex_io::VortexWrite as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    std::fs::write(&path, b"the previous store").unwrap();
+    let watched = dir.path().to_path_buf();
+    let temp_existed = Arc::new(AtomicBool::new(false));
+    let seen = temp_existed.clone();
+
+    let stalled = write_store_atomically(&path, |mut writer| async move {
+        writer.write_all(b"half a store".to_vec()).await?;
+        seen.store(entries(&watched).len() == 2, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        Ok(())
+    });
+    tokio::time::timeout(std::time::Duration::from_millis(300), stalled)
+        .await
+        .expect_err("the stalled write must still be running when it is dropped");
+
+    assert!(
+        temp_existed.load(Ordering::SeqCst),
+        "the temp file was not there when the write was dropped"
+    );
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    assert_eq!(std::fs::read(&path).unwrap(), b"the previous store");
+}
+
+/// A panic inside the write, caught by the caller, removes the temp file
+/// and leaves the previous store as it was.
+#[tokio::test]
+async fn test_a_panic_in_the_write_removes_the_temp_file() {
+    use futures::FutureExt as _;
+    use vortex_io::VortexWrite as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    std::fs::write(&path, b"the previous store").unwrap();
+    let watched = dir.path().to_path_buf();
+    let temp_existed = Arc::new(AtomicBool::new(false));
+    let seen = temp_existed.clone();
+
+    let outcome =
+        std::panic::AssertUnwindSafe(write_store_atomically(&path, |mut writer| async move {
+            writer.write_all(b"half a store".to_vec()).await?;
+            seen.store(entries(&watched).len() == 2, Ordering::SeqCst);
+            panic!("the write panicked");
+        }))
+        .catch_unwind()
+        .await;
+
+    let payload = outcome.expect_err("the panic reaches the caller");
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"the write panicked"),
+        "the panic payload"
+    );
+    assert!(
+        temp_existed.load(Ordering::SeqCst),
+        "the temp file was not there when the write panicked"
+    );
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    assert_eq!(std::fs::read(&path).unwrap(), b"the previous store");
+}
+
+/// The temp file is created in `path`'s directory under a name that cannot
+/// be mistaken for a store, and a successful write leaves only `path`.
+#[tokio::test]
+async fn test_temp_file_is_a_sibling_and_gone_after_success() {
+    use vortex_io::VortexWrite as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    let watched = dir.path().to_path_buf();
+
+    write_store_atomically(&path, |mut writer| async move {
+        writer.write_all(b"a store".to_vec()).await?;
+        writer.shutdown().await?;
+        let during = entries(&watched);
+        assert_eq!(during.len(), 1, "{during:?}");
+        assert_eq!(during[0].parent(), Some(watched.as_path()));
+        assert_ne!(during[0].file_name(), Some("store.vortex".as_ref()));
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    assert_eq!(std::fs::read(&path).unwrap(), b"a store");
+}
+
+/// Dropping the creation of a pending store at any of its steps, up to the
+/// one that completes it, leaves no temp file behind. Each poll starts one
+/// filesystem call and the sleep lets it finish, so every drop lands on a
+/// call that has been made and not yet seen by the future; the check then
+/// waits up to a second for the directory to hold only the store.
+#[tokio::test]
+async fn test_dropping_the_creation_at_any_step_leaves_no_temp_file() {
+    use crate::io::pending::PendingStore;
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+
+    for existing in [false, true] {
+        for steps in 1..=12 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store.vortex");
+            if existing {
+                std::fs::write(&path, b"the previous store").unwrap();
+            }
+            let mut create = Box::pin(PendingStore::create(&path));
+            let mut completed = false;
+            for _ in 0..steps {
+                match futures::poll!(create.as_mut()) {
+                    Poll::Ready(_) => {
+                        completed = true;
+                        break;
+                    }
+                    Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            drop(create);
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let leftovers = loop {
+                let leftovers: Vec<PathBuf> = entries(dir.path())
+                    .into_iter()
+                    .filter(|entry| entry != &path)
+                    .collect();
+                if leftovers.is_empty() || Instant::now() >= deadline {
+                    break leftovers;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(
+                leftovers.is_empty(),
+                "existing={existing}, dropped after {steps} steps: {leftovers:?}"
+            );
+            // Every larger step count replays the completed creation.
+            if completed {
+                break;
+            }
+        }
+    }
+}
+
+// ─── Links and permissions (Unix) ──────────────────────────────────────
+
+/// Replacing a store keeps what the old file was set up as: a symbolic link
+/// at the path (a `current -> versions/v3.vortex` setup) still points at the
+/// replaced file, and the permission bits carry over. Owner, ACLs and
+/// extended attributes are not preserved. A store the process cannot write
+/// (a read-only `0444` file) is never replaced: a read-only store signals
+/// that it should not be overwritten.
+#[cfg(unix)]
+mod links_and_permissions;
+
+// ─── Targets that are not regular files (Unix) ─────────────────────────
+
+/// A path that names a character device or a pipe is written through in
+/// place: a store is never renamed over one. Any other kind of file is
+/// refused, untouched.
+#[cfg(unix)]
+mod special_targets;

@@ -11,13 +11,12 @@ folded into a sink -- the same rule the Rust and JavaScript harnesses apply --
 so what a cell times is producing results, not walking index entries. Each
 library still delivers its own natural result form (Vortex N-Triples strings
 built in Rust, pyoxigraph Quad objects whose `.value` reads build the Python
-strings, rdflib str-subclass terms, pycottas/lightrdf tuples of strings);
+strings, rdflib str-subclass terms, pycottas tuples of strings);
 producing that form for every matched row is exactly the measured work.
 
 On a triple pattern the result widths differ, and that is not normalized away:
 Vortex, pyoxigraph and rdflib all deliver quads (four terms per row), while
-pycottas returns 3-tuples and lightrdf, reading the triples projection, has no
-graph to return.
+pycottas returns 3-tuples.
 
 `count_only` is the COUNT/ASK twin: resolve the same pattern and return only
 how many rows matched, reading nothing else -- each library's cheapest correct
@@ -27,8 +26,8 @@ a term; the others walk their iterators or result lists unread.
 TERM SPELLING. The canonical form throughout the harness is N-Triples
 (`<iri>`, `"literal"`) -- what `datasets.py` writes and what the generated file
 contains. Adapters convert inward through `prepare`, once per pattern and
-outside the timed region: Vortex and lightrdf accept that form directly;
-pyoxigraph, rdflib, and pycottas need parsed term objects.
+outside the timed region: Vortex accepts that form directly; pyoxigraph,
+rdflib and pycottas need parsed term objects.
 """
 
 from __future__ import annotations
@@ -115,6 +114,19 @@ class Adapter:
     #: source file every process start; those get no Open measurement, because
     #: the re-parse is what the Build column already reports.
     has_distinct_open: bool = True
+    #: How `open` gets the store, one of four words for the memory panel:
+    #: `mapped` (a memory-mapped file), `loaded` (a file read into memory),
+    #: `built` (built from the triples) or `opened` (an on-disk database).
+    obtained: str = ""
+    def unseen_live_bytes(self) -> int:
+        """Live bytes the library holds where `live_bytes` cannot see them, by
+        the library's own count. The base holds none."""
+        return 0
+
+    def import_library(self) -> None:
+        """Import the library under test, so its import-time allocations are
+        in a memory run's baseline and not in the store's reads. The base does
+        nothing."""
 
     def artifact_path(self, workdir: str, src: str) -> str:
         raise NotImplementedError
@@ -194,6 +206,10 @@ class VortexAdapter(Adapter):
         #: rdflib are in-memory stores, so the comparison is only interpretable
         #: with both Vortex modes on the page.
         self.in_memory = in_memory
+        self.obtained = "loaded" if in_memory else "mapped"
+
+    def import_library(self) -> None:
+        import vortex_rdf  # noqa: F401
 
     def artifact_path(self, workdir: str, src: str) -> str:
         # Keyed by source stem so the triples and quads artifacts never collide.
@@ -214,11 +230,11 @@ class VortexAdapter(Adapter):
         return VortexRdfStore(artifact, in_memory=self.in_memory)
 
     def count(self, handle: Any, pat: Pat) -> int:
-        # `get_quads` is the idiomatic read, and it materializes four terms per
+        # `iter_quads` streams the read a chunk at a time, still four terms a
         # row. On a triple pattern the libraries whose result is a triple build
         # three, so Vortex is doing strictly more work per row here, not less.
         acc = rows = 0
-        for s, p, o, g in handle.get_quads(pat.s, pat.p, pat.o, pat.g):
+        for s, p, o, g in handle.iter_quads(pat.s, pat.p, pat.o, pat.g):
             acc += len(s) + len(p) + len(o) + len(g)
             rows += 1
         consume(acc)
@@ -242,6 +258,10 @@ class PyoxigraphAdapter(Adapter):
 
     slug, label = "pyoxigraph", "pyoxigraph"
     has_distinct_open = False
+    obtained = "built"
+
+    def import_library(self) -> None:
+        import pyoxigraph  # noqa: F401
 
     def _term(self, t: Optional[str]):
         if t is None:
@@ -322,6 +342,22 @@ class PycottasAdapter(Adapter):
 
     slug, label = "pycottas", "pycottas"
     mutation_unsupported = "COTTASStore raises: 'The COTTAS store is read only!'"
+    # `opened`, not `mapped` or `loaded`: DuckDB reads the Parquet file per query.
+    obtained = "opened"
+
+    def unseen_live_bytes(self) -> int:
+        # DuckDB allocates through its own allocator, which mallinfo2 cannot
+        # see; its tracked memory is the part mallinfo2 misses. The
+        # module-level `duckdb.execute` runs on the default connection that
+        # pycottas queries through.
+        import duckdb
+
+        return duckdb.execute(
+            "SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()"
+        ).fetchone()[0]
+
+    def import_library(self) -> None:
+        import pycottas  # noqa: F401
 
     def artifact_path(self, workdir: str, src: str) -> str:
         stem = os.path.splitext(os.path.basename(src))[0]
@@ -361,56 +397,6 @@ class PycottasAdapter(Adapter):
         return len(handle.search(query))
 
 
-# ─── lightrdf ───────────────────────────────────────────────────────────────
-
-
-class LightrdfAdapter(Adapter):
-    """A streaming pattern-filtered parser, not a store.
-
-    `RDFDocument.search_triples` re-parses the entire source file on every
-    call -- there is no index and no build step, so this adapter is the
-    no-index baseline: what every pattern costs when nothing is precomputed.
-
-    supports_quads is False: `search_triples(s, p, o)` takes no graph argument.
-    mutation_unsupported: there is nothing to mutate. Opening is distinct from
-    building: it wraps the path and parses nothing.
-    """
-
-    slug, label = "lightrdf", "lightrdf"
-    supports_quads = False
-    mutation_unsupported = "a streaming parser, with no store to mutate"
-
-    def artifact_path(self, workdir: str, src: str) -> str:
-        return src  # its "artifact" is the source file itself
-
-    def build(self, src: str, artifact: str) -> Any:
-        # No store to construct. The honest ingest-equivalent is one full parse
-        # of the source, which is what every other adapter's build must also do
-        # before it can index anything.
-        import lightrdf
-
-        doc = lightrdf.RDFDocument(src)
-        for _ in doc.search_triples(None, None, None):
-            pass
-        return doc
-
-    def open(self, artifact: str, src: str) -> Any:
-        import lightrdf
-
-        return lightrdf.RDFDocument(src)
-
-    def count(self, handle: Any, pat: Pat) -> int:
-        acc = rows = 0
-        for s, p, o in handle.search_triples(pat.s, pat.p, pat.o):
-            acc += len(s) + len(p) + len(o)
-            rows += 1
-        consume(acc)
-        return rows
-
-    def count_only(self, handle: Any, pat: Pat) -> int:
-        return sum(1 for _ in handle.search_triples(pat.s, pat.p, pat.o))
-
-
 # ─── rdflib ─────────────────────────────────────────────────────────────────
 
 
@@ -423,6 +409,10 @@ class RdflibAdapter(Adapter):
 
     slug, label = "rdflib", "rdflib"
     has_distinct_open = False
+    obtained = "built"
+
+    def import_library(self) -> None:
+        import rdflib  # noqa: F401
 
     def artifact_path(self, workdir: str, src: str) -> str:
         return ""
@@ -499,11 +489,12 @@ class VortexVariant:
 
 
 #: Vortex build variants: the same secondary index x residency matrix as the
-#: Rust compare tab (core/benches/compare.rs), so the two tabs' Vortex rows line
-#: up one for one. The JS tab has no file residency. Every variant is a row in
-#: the cross-library panels -- Dictionary is the only layout here, because the
-#: layout axis belongs to the instrumented suite and a variant the dashboard
-#: does not list costs a whole process to measure and then discards the rows.
+#: Rust compare tab (bench-compare/benches/compare.rs), so the two tabs' Vortex
+#: rows line up one for one. The JS tab has no file residency. Every variant is
+#: a row in the cross-library panels -- Dictionary is the only layout here,
+#: because the layout axis belongs to the instrumented suite and a variant the
+#: dashboard does not list costs a whole process to measure and then discards
+#: the rows.
 VORTEX_VARIANTS = [
     VortexVariant("vortex_dict", "Vortex Dict", "dictionary", (), False),
     VortexVariant("vortex_dict_mem", "Vortex Dict (in-memory)", "dictionary", (), True),
@@ -519,33 +510,30 @@ VORTEX_VARIANTS = [
 
 VORTEX_SLUGS = [v.slug for v in VORTEX_VARIANTS]
 
+#: The other libraries' adapters, in dashboard row order, each named by its
+#: class's `slug`.
+LIBRARY_ADAPTERS = (PyoxigraphAdapter, PycottasAdapter, RdflibAdapter)
+
 
 def build_adapter(slug: str) -> Adapter:
     """Construct one adapter by slug, importing only that library."""
     for v in VORTEX_VARIANTS:
         if slug == v.slug:
             return VortexAdapter(v.slug, v.label, v.layout, list(v.indexes), v.in_memory)
-    if slug == "pyoxigraph":
-        return PyoxigraphAdapter()
-    if slug == "pycottas":
-        return PycottasAdapter()
-    if slug == "lightrdf":
-        return LightrdfAdapter()
-    if slug == "rdflib":
-        return RdflibAdapter()
+    for library in LIBRARY_ADAPTERS:
+        if slug == library.slug:
+            return library()
     raise KeyError(f"unknown adapter slug: {slug}")
 
 
 #: Every adapter a full run measures, in dashboard row order: each Vortex
 #: variant is a row in the cross-library panels alongside the other libraries,
 #: not a footnote to them.
-ALL_SLUGS = VORTEX_SLUGS + ["pyoxigraph", "pycottas", "rdflib", "lightrdf"]
+ALL_SLUGS = VORTEX_SLUGS + [library.slug for library in LIBRARY_ADAPTERS]
 
-#: Which virtualenv each adapter needs. Vortex variants share one.
+#: Which virtualenv each adapter needs. Vortex variants share one; every other
+#: library has its own, named after it.
 VENV_FOR = {
     **{slug: "vortex" for slug in VORTEX_SLUGS},
-    "pyoxigraph": "pyoxigraph",
-    "pycottas": "pycottas",
-    "rdflib": "rdflib",
-    "lightrdf": "lightrdf",
+    **{library.slug: library.slug for library in LIBRARY_ADAPTERS},
 }

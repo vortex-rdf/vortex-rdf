@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.vortexrdf.bench</groupId>
+    <artifactId>bench</artifactId>
+    <version>0-SNAPSHOT</version>
+  </parent>
+
+  <!-- vortex-rdf's Java bindings, compiled from this tree's java/src/main/java
+       rather than taken from a released jar, so the bench always measures the
+       working tree. The native library and the CLI they need are this tree's
+       release builds, passed in as -Dvortexrdf.library and -Dvortexrdf.cli. -->
+  <artifactId>vortex</artifactId>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.vortexrdf.bench</groupId>
+      <artifactId>harness</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.vortexrdf.bench</groupId>
+      <artifactId>harness</artifactId>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>bindings-sources</id>
+            <phase>generate-sources</phase>
+            <goals>
+              <goal>add-source</goal>
+            </goals>
+            <configuration>
+              <sources>
+                <source>${project.basedir}/../../src/main/java</source>
+              </sources>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

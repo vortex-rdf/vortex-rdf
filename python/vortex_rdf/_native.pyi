@@ -1,58 +1,382 @@
 """Type stubs for the private native extension module."""
 
 import os
-from typing import List, Optional, Sequence, Tuple, Union
-from pyarrow 
+import sys
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+if sys.version_info >= (3, 12):
+    from collections.abc import Buffer
+else:
+    from typing_extensions import Buffer
 
 __version__: str
 
 # Path arguments are `PathBuf` on the Rust side, so any `os.PathLike[str]` is
 # accepted alongside `str`.
 _StrPath = Union[str, "os.PathLike[str]"]
+# Codes or indices: a U64Column, a buffer of u64 (or non-negative int64)
+# items (``memoryview``, ``array``, a NumPy array, the raw byte view a
+# U64Column exports), or any sequence of ints from 0 to 2**64 - 1. A buffer of
+# other items (a ``cast("I")`` view, a u32 array) raises ``ValueError``.
+_U64s = Union["U64Column", Sequence[int], Buffer]
+# A keep per position: a code set (U64Column, u64 buffer, or a list of ints)
+# or a code range (``range`` with step 1, or a 2-tuple ``(lo, hi)``, the
+# half-open codes ``lo <= code < hi``). A 2-tuple is always a range, never a
+# set: pass ``list(codes)``, not ``tuple(codes)``, for a set.
+_KeepSpec = Dict[Union[str, int], Union[_U64s, range, Tuple[int, int]]]
+# A probe of the batch calls: ``(s, p, o, g)`` or a dict with keys s, p, o,
+# g, keep, limit, offset.
+_Probe = Union[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]], Dict[str, Any]]
 
 class VortexRdfError(Exception):
-    """Raised when a Vortex-RDF store operation fails."""
+    """Raised when a Vortex-RDF store operation fails: a store that does not
+    read, an operation the store refuses. An invalid argument raises
+    ``ValueError`` instead, and an I/O failure ``OSError``."""
+
+class JoinTooLarge(VortexRdfError):
+    """Raised when a join would make more row pairs than its ``max_pairs``
+    allows, before any pair is built. ``pairs`` is the join's pair count;
+    ``args`` is ``(message, pairs)``, the message naming the count and the
+    cap."""
+
+    @property
+    def pairs(self) -> int:
+        """The join's pair count (``args[1]``)."""
+        ...
+
+class Cancelled(VortexRdfError):
+    """Raised by a call or a pull whose `CancelToken` was cancelled before it
+    completed: the work it had in flight is dropped, and an iterator that
+    raises it stops."""
 
 class TermDict:
     def decode(self, code: int) -> Optional[str]:
         """The N-Triples string for `code`, or None when the code is out of
-        this dictionary's range."""
+        this dictionary's range. A code is an int from 0 to 2**64 - 1: a
+        negative one, or one of 2**64 or more, raises ``OverflowError``."""
         ...
     def encode(self, term: str) -> Optional[int]:
-        """The code of the N-Triples term `term`, or None when the dictionary
-        does not hold it; the inverse of `decode`."""
+        """The code of the term `term`, or None when the dictionary does not
+        hold it; the inverse of `decode`.
+
+        Tolerant of spelling: an IRI with or without angle brackets, a
+        literal with escape variants or an explicit ``xsd:string`` type, an
+        upper-case language tag, and the default graph as ``""``,
+        ``default`` or ``[]`` resolve to the stored form's code. A malformed
+        term raises ``ValueError``."""
         ...
-    def decode_many(
+    def encode_many(self, terms: Sequence[str]) -> List[Optional[int]]:
+        """`encode` over a sequence of terms, in order, in one GIL-released
+        call; a malformed term raises ``ValueError``."""
+        ...
+    def filter_codes(
         self,
-        codes: Union[Sequence[int], memoryview, bytes, bytearray],
-    ) -> List[Optional[str]]:
+        kind: str,
+        arg: str,
+        codes: _U64s,
+        *,
+        flags: str = "",
+        case: Optional[str] = None,
+        as_str: bool = False,
+    ) -> Tuple[U64Column, U64Column]:
+        r"""`kind` over the candidate `codes`: ``(passed, undecided)``, both
+        ascending subsets of `codes`; a candidate in neither fails, and no
+        candidates give two empty columns. `codes` must be sorted, unique and
+        inside the dictionary, else ``ValueError`` (a code past the end
+        included).
+
+        String kinds (``str_prefix``, ``contains``, ``strstarts``,
+        ``strends``, ``regex``) test a term's text. By default that is
+        rdflib's ``string()`` of the term (string literals only: an IRI or a
+        blank node fails); with `as_str` it is SPARQL ``STR()`` (an IRI's
+        string, a literal's lexical form; a blank node, or a literal whose
+        datatype rdflib normalizes, is undecided). `case` (``"lower"`` or
+        ``"upper"``) then wraps that text, so ``contains`` with ``as_str=True,
+        case="lower"`` is ``CONTAINS(LCASE(STR(?x)), c)``: ``STR()`` is read
+        first and the case wrapper applies to its result (``LCASE`` of an IRI
+        itself raises in SPARQL, which is why the order matters). The wrapper
+        is Python's ``str.lower()``/``str.upper()``, decided on ASCII text
+        only; a non-ASCII text is undecided.
+
+        `arg` is the raw prefix for ``str_prefix``. For ``contains``,
+        ``strstarts`` and ``strends`` it is the constant's strict N-Triples
+        spelling (``"text"``, ``"text"@tag``, ``"text"^^<datatype>``,
+        ``<iri>`` or ``_:label``): a malformed spelling raises
+        ``ValueError``, a language-tagged constant needs the same tag on the
+        text (compared as written), and a constant that is no string literal
+        matches nothing. For ``regex`` it is the pattern as written, and
+        `flags` (the one kind that takes them) are the SPARQL flags: as in
+        rdflib, ``i``, ``s`` and ``m`` apply and any other letter is ignored,
+        and the test is Python's ``re.search``.
+
+        Only a subset of patterns is evaluated natively: literals, ``.``,
+        classes (``[a-z]``, ``[^...]``), the shorthands ``\d \w \s \D \W \S
+        \b \B``, the anchors ``^``, ``$`` and ``\A``, groups ``(...)`` and
+        ``(?:...)``, alternation, and the quantifiers ``* + ? {n} {n,}
+        {n,m}`` with their lazy forms. Any other pattern (backreferences,
+        lookaround, inline flags, named groups, other escapes, whatever
+        Python rejects or reads differently from the native engine, and any
+        pattern whose compiled program is large, such as counted repetitions
+        that multiply) leaves every text undecided, as does flag ``i`` on a
+        pattern with a non-ASCII character. A pattern using the shorthands,
+        ``\b``/``\B`` or flag ``i`` decides ASCII texts only; a pattern with
+        ``$`` and without flag ``m`` leaves a text ending in a newline
+        undecided; a pattern with ``\B`` leaves the empty text undecided.
+
+        The numeric kinds ``num_lt``, ``num_le``, ``num_gt``, ``num_ge``,
+        ``num_eq`` and ``num_ne`` follow SPARQL 1.1. `arg` is an N-Triples
+        numeric literal (``"5"^^<http://www.w3.org/2001/XMLSchema#integer>``)
+        or a bare number typed by its syntax (``5`` an integer, ``1.5`` a
+        decimal, ``1e3`` a double). A number compares by value after XPath's
+        type promotion: an integer or a decimal meets an ``xsd:float``, a
+        single-precision value, as a float and an ``xsd:double`` as a
+        double, and a float meets a double as a double. Ordering a literal
+        without a numeric value (a string, a language-tagged literal,
+        another datatype, or a lexical form its numeric datatype's grammar
+        rejects) is a type error, so it fails, and so does ``num_eq``,
+        which Oxigraph answers false; ``num_ne`` leaves such a literal
+        undecided, where Oxigraph answers true. A non-literal fails every
+        numeric kind but ``num_ne``, which it passes.
+
+        A value an engine may hold apart from the spec is undecided under
+        every numeric kind: one outside its integer type's range, an integer
+        past 64 bits, a decimal past 18 fractional digits or of magnitude
+        about 1.7e20 or more (Oxigraph's limits), a special float (``INF``,
+        ``NaN``, and spellings such as ``inf``), and a float lexical form
+        past its type's range. So is an integer (or a decimal without a
+        fraction) from 2**53 on against a float or a double, a decimal with
+        a fraction and more than 15 significant digits against one, and a
+        decimal against a float where rounding it once (as the spec does)
+        and through a double (as Oxigraph does) give different verdicts. A
+        constant past 64 bits or 18 fractional digits leaves every number
+        undecided; one past 128 bits, or no value of its datatype (such as
+        ``"300"^^xsd:byte`` or ``"INF"^^xsd:double``), raises ``ValueError``.
+        Every definite verdict is the one Oxigraph gives.
+
+        Other kinds: ``is_literal``, ``is_iri``, ``is_blank``, ``datatype``,
+        ``lang``, ``lang_matches``. ``lang_matches`` is BCP 47 basic
+        filtering, decided for ``*`` and for a range of ASCII letters, digits
+        and hyphens (``en``, ``en-GB``); any other range, which rdflib may
+        read differently (``en-*``, padding whitespace), leaves the
+        language-tagged literals undecided. An unknown kind, an invalid
+        argument or an option that does not apply to the kind raises
+        ``ValueError``. No verdict is memoized."""
+        ...
+    def prefix_range(self, prefix: str) -> Tuple[int, int]:
+        """The half-open code range ``(lo, hi)`` of the terms whose
+        N-Triples spelling starts with `prefix`: codes rank spellings in
+        byte order, so a term kind (``"``, ``<``, ``_:``) and an IRI
+        namespace are each one range."""
+        ...
+    def lower_bound(self, term: str) -> int:
+        """The code of the first term not below `term` in byte order: a
+        present term's own code, where an absent one would sort, or
+        ``len(self)`` when every term is below it."""
+        ...
+    @property
+    def file_backed(self) -> bool:
+        """Whether terms are read from the store's file on demand rather
+        than held in memory. A read of the file that fails raises
+        ``VortexRdfError`` (``OSError`` for an I/O failure)."""
+        ...
+    def decode_many(self, codes: _U64s) -> List[Optional[str]]:
         """Decode a batch of codes in one GIL-released call.
 
-        A u32 buffer (``memoryview(col).cast("I")``, ``array("I", ...)``, a
-        uint32 NumPy array) or the raw byte view a `U32Column` exports is read
-        in one copy; any int sequence works element by element. Repeated codes
-        share one string object."""
+        A `U64Column` is shared, not copied. A u64 buffer
+        (``memoryview(col).cast("Q")``, ``array("Q", ...)``, a uint64 NumPy
+        array), a non-negative int64 buffer or the raw byte view a
+        `U64Column` exports is read in one copy; a buffer of other items (a
+        ``cast("I")`` view, a u32 array) raises ``ValueError``. Any int
+        sequence works element by element.
+        A repeated code usually shares one string object: a small cache of
+        recently decoded codes serves repeats, and a code it has dropped is
+        decoded again as an equal, separate string."""
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
 
-class U32Column:
-    """Read-only u32 column; supports the buffer protocol
-    (``memoryview(col).cast("I")`` is a zero-copy view)."""
+class U64Column:
+    """Read-only u64 column of term codes, row indices or counts; supports
+    the buffer protocol (``memoryview(col).cast("Q")`` is a zero-copy view)."""
 
+    def __init__(self, values: _U64s) -> None:
+        """A column holding `values`: another column (shared), a buffer of
+        u64 or non-negative int64 items or a raw byte view (one copy), or any
+        sequence of ints from 0 to 2**64 - 1 (an int outside that range raises
+        ``OverflowError``). A buffer of other items raises ``ValueError``."""
+        ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
+    def slice(self, start: int, stop: int) -> "U64Column":
+        """The values from `start` up to, not including, `stop`, sharing
+        this column's memory rather than copying it; ``IndexError`` when
+        `start` is past `stop` or `stop` past the end."""
+        ...
+    def distinct(self) -> "U64Column":
+        """The distinct values, each at its first occurrence, in that
+        order."""
+        ...
+    def value_counts(self) -> Tuple["U64Column", "U64Column"]:
+        """``(values, counts)``: the distinct values in first-seen order and
+        how often each occurs."""
+        ...
+    def take(self, indices: _U64s) -> "U64Column":
+        """The values at `indices`, in that order; an index past the end
+        raises ``IndexError``."""
+        ...
+    def run_starts(self, *others: _U64s) -> "U64Column":
+        """The rows where a run of equal rows starts across this column and
+        `others` (each as long as it): row 0 and every row differing from
+        the row before in some column. Taken with `take`, they keep one row
+        of each run — the distinct triples of a match over every graph,
+        whose rows of one triple are adjacent. Unequal lengths raise
+        ``ValueError``."""
+        ...
+    def join_count(self, other: _U64s) -> int:
+        """The number of row pairs `join_indices` makes with `other`, counted
+        without building them."""
+        ...
+    def join_indices(
+        self, other: _U64s, *, max_pairs: Optional[int] = None
+    ) -> Tuple["U64Column", "U64Column"]:
+        """``(left_indices, right_indices)`` of the rows where this column's
+        value equals `other`'s — an equi-join on the two as keys, in
+        nested-loop order (this column's rows in order, each with its matches
+        in `other` in their original order). Gather joined columns with
+        `take`. A join of more than `max_pairs` pairs raises `JoinTooLarge`
+        before any pair is built."""
+        ...
+    def groups(self) -> "CodeGroups":
+        """This column's rows grouped by value: the right side of
+        `join_indices`, built once and joined with any number of left
+        columns."""
+        ...
     # The buffer protocol is implemented natively (`__getbuffer__`);
     # `__buffer__` is the Python 3.12+ spelling `memoryview()` reports for it.
     def __buffer__(self, flags: int, /) -> memoryview: ...
 
-class VortexRdfStore:
-    def __init__(
+class CodeGroups:
+    """A column's rows grouped by value (`U64Column.groups`): the right side
+    of an equi-join, built once and joined with any number of left columns,
+    so a join too large for one call runs as a loop over slices of its left
+    column (`U64Column.slice`). It holds one u64 per grouped row, plus a slot
+    per value of the column's span or per distinct value, until it is
+    dropped."""
+
+    def __len__(self) -> int: ...
+    def count(self, column: _U64s) -> int:
+        """The number of row pairs `join` makes with `column`, counted
+        without building them."""
+        ...
+    def join(
+        self, column: _U64s, *, max_pairs: Optional[int] = None
+    ) -> Tuple[U64Column, U64Column]:
+        """``(left_indices, right_indices)`` of the rows where `column`'s
+        value equals a grouped row's, in nested-loop order (`column`'s rows
+        in order, each with its grouped rows in their column's order). The
+        left indices count from `column`'s first row, so the joins of
+        consecutive slices of a left column, each offset by its slice's
+        start, concatenate to `U64Column.join_indices` of the whole column.
+        A join of more than `max_pairs` pairs raises `JoinTooLarge` before
+        any pair is built."""
+        ...
+    def gather(
         self,
-        path: _StrPath,
-        max_resident_bytes: Optional[int] = None,
-        in_memory: bool = False,
-    ) -> None: ...
+        column: _U64s,
+        left_columns: Sequence[_U64s],
+        right_columns: Sequence[_U64s],
+        *,
+        max_pairs: Optional[int] = None,
+    ) -> Tuple[U64Column, ...]:
+        """The columns the join of `column` with the grouped rows gathers,
+        filled while the pairs are found instead of through `join`'s
+        indices: for each pair in nested-loop order, each of `left_columns`
+        (parallel to `column`) at the pair's left row, then each of
+        `right_columns` (parallel to the grouped column) at its right row,
+        one `U64Column` per column in that order. Each equals
+        `U64Column.take` of its column at the matching index column of
+        `join`. A column of the wrong length raises ``ValueError``, and a
+        join of more than `max_pairs` pairs raises `JoinTooLarge` before any
+        output is built."""
+        ...
+
+class ProbeAnswers:
+    """The answers of `VortexRdfStore.match_codes_many`, one per probe in
+    input order: its four code columns ``(s, p, o, g)``, or None where the
+    code path does not apply. Each `__next__` waits, with the GIL released,
+    for the next answer; the probes run from the call on, at most 2 ×
+    `lookahead` of them running or answered but not yet pulled. The first
+    failing probe, or a pull whose `CancelToken` is cancelled
+    (`Cancelled`), raises at its position and ends the iteration; dropping
+    the iterator aborts the probes still in flight."""
+
+    def __iter__(self) -> "ProbeAnswers": ...
+    def __next__(self) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]: ...
+    def __len__(self) -> int:
+        """The number of probes, answered or not."""
+        ...
+
+class CodeChunks:
+    """The chunks of `VortexRdfStore.match_code_chunks`: a match's code
+    columns in chunks of at most `batch_rows` rows, in the match's order. Each
+    `__next__` pulls one chunk with the GIL released and returns one
+    zero-copy `U64Column` per name in `columns`, in that order. The end of
+    the match, an error or a cancelled `CancelToken` (`Cancelled`) ends the
+    iteration; every later `__next__` raises ``StopIteration``."""
+
+    def __iter__(self) -> "CodeChunks": ...
+    def __next__(self) -> Tuple[U64Column, ...]: ...
+    @property
+    def columns(self) -> Tuple[str, ...]:
+        """The names of the columns each chunk holds, in order."""
+        ...
+    @property
+    def batch_rows(self) -> int:
+        """The most rows a chunk holds."""
+        ...
+
+class QuadIterator:
+    """The quads of `VortexRdfStore.iter_quads`: `get_quads`' rows, in its order and spelling, read a
+    chunk of at most `batch_rows` rows at a time. A `__next__` that has used up its chunk pulls the next
+    with the GIL released. The end of the match, an error or a cancelled `CancelToken` (`Cancelled`)
+    ends the iteration; every later `__next__` raises ``StopIteration``. Pull it from one thread at a
+    time: a `__next__` while another's runs raises ``RuntimeError``."""
+
+    def __iter__(self) -> "QuadIterator": ...
+    def __next__(self) -> Tuple[str, str, str, str]: ...
+
+class CancelToken:
+    """A cancel token for one query's long calls: passed as ``cancel=`` to
+    `VortexRdfStore.match_codes`, `count_quads`, `match_codes_many`,
+    `count_quads_many`, `match_code_chunks` and `iter_quads`, it stops them from any
+    thread. A call or pull still in progress when the token is cancelled
+    stops at its next wait for data (on file, the next split boundary) and
+    raises `Cancelled`; one that finishes without waiting again (in memory,
+    a chunk's or a probe's gather) returns its result, and the next call or
+    pull given the token raises `Cancelled`. Cancelling is final. Without a
+    token those calls run on the calling thread, unraced."""
+
+    def __init__(self) -> None: ...
+    def cancel(self) -> None:
+        """Cancel the token, from any thread; cancelling it again does
+        nothing."""
+        ...
+    @property
+    def cancelled(self) -> bool:
+        """Whether the token has been cancelled."""
+        ...
+
+class VortexRdfStore:
+    def __init__(self, path: _StrPath, *, in_memory: bool = False) -> None:
+        """Open a `.vortex` file memory-mapped, or load it whole with
+        ``in_memory=True``. A file store is memory-mapped: replace its file by
+        renaming a new one over it, never by truncating or rewriting it in
+        place (a reader of the mapping would be killed with SIGBUS);
+        ``serialize_rdf`` already writes that way (on Windows it fails until
+        the store mapping the file, and every `TermDict` and `U64Column` taken
+        from it, is dropped). The mapping lives as long as the store or any
+        `TermDict` or `U64Column` taken from it."""
+        ...
     @staticmethod
     def from_pyarrow(data:"pyarrow.RecordBatchReader") -> "VortexRdfStore"
     @staticmethod
@@ -65,14 +389,107 @@ class VortexRdfStore:
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
-    def term_dict(self) -> Optional[TermDict]: ...
+    def term_dict(self) -> Optional[TermDict]:
+        """The store's term dictionary, or None when the code path does not
+        apply (a non-Dictionary layout). A dictionary left in the file is
+        served by reading it on demand (`TermDict.file_backed`)."""
+        ...
     def match_codes(
         self,
         s: Optional[str] = None,
         p: Optional[str] = None,
         o: Optional[str] = None,
         g: Optional[str] = None,
-    ) -> Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]: ...
+        *,
+        keep: Optional[_KeepSpec] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        cancel: Optional[CancelToken] = None,
+    ) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]:
+        """The matching rows as four zero-copy u64 code columns ``(s, p, o,
+        g)`` decodable through `term_dict`, or None when the code path does
+        not apply.
+
+        `keep` narrows the match inside the store: a dict from position
+        (``"s"``, ``"p"``, ``"o"``, ``"g"`` or 0-3) to the codes to keep
+        there, a code set (`U64Column`, a u64 buffer or a list of ints) or a
+        code range (a ``range`` with step 1, or a 2-tuple ``(lo, hi)``, the
+        half-open codes ``lo <= code < hi``; a 2-tuple is never a set).
+        `offset` and `limit` window the rows: a window that cuts rows takes
+        them in the match's order (a `secondary-by-copy` index's for a
+        pattern it serves, else base order), and a filtered file scan stops at
+        the first block that fills it, while a `limit` that cannot cut a row
+        (no `offset`, and at least the match's row count, or a bound on it,
+        known without reading its rows: an index-served file match of unknown
+        width reads its rows once to know it) returns the match's rows in the
+        order the call without a limit returns. With no `offset`, a `limit` that a
+        filtered file match's rows turn out to fall short of returns the match
+        as it is too, read from the window's evaluation of the filter, which a
+        match whose reads evaluate the filter before reading a row makes even
+        when its bound fits the limit. With a `cancel` token the match races
+        it (`CancelToken`)."""
+        ...
+    def match_code_chunks(
+        self,
+        s: Optional[str] = None,
+        p: Optional[str] = None,
+        o: Optional[str] = None,
+        g: Optional[str] = None,
+        *,
+        keep: Optional[_KeepSpec] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        columns: Sequence[str] = ("s", "p", "o", "g"),
+        batch_rows: int = 65536,
+        cancel: Optional[CancelToken] = None,
+    ) -> Optional[CodeChunks]:
+        """`match_codes` in chunks: an iterator (`CodeChunks`) of at most
+        `batch_rows` rows a chunk, in `match_codes`' order, each chunk one
+        zero-copy `U64Column` per name in `columns` (``"s"``, ``"p"``,
+        ``"o"``, ``"g"``, in the order given), or None when the code path
+        does not apply. `keep`, `limit` and `offset` narrow the match as for
+        `match_codes`; this call resolves the narrowed match. In memory each
+        chunk is sliced or gathered when it is pulled; on file a scan reads a
+        bounded window of splits ahead of the pulls. With a `cancel` token
+        this call and every pull race it (`CancelToken`). ``batch_rows=0``,
+        no column or an unknown name raises ``ValueError``."""
+        ...
+    def match_codes_many(
+        self,
+        probes: Sequence[_Probe],
+        *,
+        lookahead: Optional[int] = None,
+        cancel: Optional[CancelToken] = None,
+    ) -> ProbeAnswers:
+        """`match_codes` for a batch of probes, answered in input order by an
+        iterator (`ProbeAnswers`). A probe is an ``(s, p, o, g)`` tuple of
+        optional term strings or a dict with keys ``s``, ``p``, ``o``,
+        ``g``, ``keep``, ``limit``, ``offset``. Every probe is parsed before
+        any is evaluated (``ValueError`` first). The probes run concurrently
+        from the call on, whether or not the iterator is pulled: at most 2 ×
+        `lookahead` of them running or answered but not yet pulled.
+        `lookahead` is by default twice the machine's parallelism and at
+        least 64; ``0`` raises ``ValueError``; an explicit value is used as
+        given. The first failing probe in input order raises at its position
+        and the probes after it are aborted, as are the probes in flight
+        when the iterator is dropped. With a `cancel` token every pull races
+        it (`CancelToken`): a cancelled pull raises `Cancelled` at its
+        position and aborts the probes in flight. On a store whose rows have
+        no codes every answer is None and no probe runs."""
+        ...
+    def count_quads_many(
+        self,
+        probes: Sequence[_Probe],
+        *,
+        lookahead: Optional[int] = None,
+        cancel: Optional[CancelToken] = None,
+    ) -> List[int]:
+        """`count_quads` for a batch of probes (see `match_codes_many`), in
+        input order, in one GIL-released call through the same bounded
+        window. The call raises the error of the first failing probe in
+        input order and aborts the probes after it. With a `cancel` token
+        the whole batch races it (`CancelToken`)."""
+        ...
     def get_quads(
         self,
         s: Optional[str] = None,
@@ -83,15 +500,40 @@ class VortexRdfStore:
         """Matching quads as (subject, predicate, object, graph) N-Triples
         strings; the default graph is the empty string."""
         ...
+    def iter_quads(
+        self,
+        s: Optional[str] = None,
+        p: Optional[str] = None,
+        o: Optional[str] = None,
+        g: Optional[str] = None,
+        *,
+        batch_rows: int = 65536,
+        cancel: Optional[CancelToken] = None,
+    ) -> QuadIterator:
+        """`get_quads` as an iterator (`QuadIterator`): the same rows, order and spelling, read
+        `batch_rows` rows at a time, so it holds about one chunk's terms. This call matches the
+        pattern; each chunk is read when the iteration reaches it. With a `cancel` token this call and
+        every chunk pull race it (`CancelToken`). ``batch_rows=0`` or a malformed term raises ``ValueError``."""
+        ...
     def count_quads(
         self,
         s: Optional[str] = None,
         p: Optional[str] = None,
         o: Optional[str] = None,
         g: Optional[str] = None,
+        *,
+        keep: Optional[_KeepSpec] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        cancel: Optional[CancelToken] = None,
     ) -> int:
         """Number of quads matching the pattern, counted from the row
-        selection; no term is materialized."""
+        selection; no term is materialized. `keep` narrows as for
+        `match_codes` (Dictionary layout only). `offset` and `limit` window
+        the rows as `match_codes` does: `offset` skips that many matched
+        rows, and `limit` caps the count and stops the read once that many
+        rows are known to exist. With a `cancel` token the count races it
+        (`CancelToken`)."""
         ...
     def match_columns(
         self,
@@ -102,6 +544,16 @@ class VortexRdfStore:
     ) -> Tuple[List[str], List[str], List[str], List[str]]:
         """The same rows as `get_quads`, as four parallel columns."""
         ...
+
+def engine_counters() -> Dict[str, int]:
+    """The work counters, by name, cumulative since the process started.
+
+    They count only with ``VORTEX_RDF_COUNTERS=1`` set when the process starts (one relaxed atomic
+    load per site otherwise, and every value stays 0): leaves searched encoded or decoded, resident
+    probes, gathers, shared canonical decodes and equality-scan binds, and a located run's zone
+    decisions, each with the values it covered.
+    """
+    ...
 
 def serialize_rdf(
     input_path: _StrPath,
@@ -115,6 +567,9 @@ def serialize_rdf(
 
     The options after the two paths are keyword-only. `format` is detected
     from the input file extension when omitted; `layout` defaults to
-    `"dictionary"`, the default shared by the JS bindings and the CLI.
+    `"dictionary"`, the default shared by the JS bindings and the CLI. An
+    unknown format, layout or index name raises ``ValueError``, a failed read
+    or write ``OSError``, and an input that does not parse
+    ``VortexRdfError``.
     """
     ...

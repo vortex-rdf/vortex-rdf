@@ -1,35 +1,26 @@
 //! Low-level helpers over Vortex arrays: string-array construction, canonical
-//! string-column access, sortedness statistics, sorted-column binary search,
-//! the encoding of a store's integer children and the canonical accessors
-//! that read them back, and mask conversion.
-//!
-//! The integer-children helpers are the two ends of the compressed-resident
-//! form: [`with_compressed_int_children`] encodes a built store's code
-//! columns into probe-supported encodings, [`with_searchable_int_children`]
-//! keeps an adopted store's encodings wherever a probe binds them, and
-//! [`shared_u32_primitive`] / [`cached_u32_primitive`] hand back the
-//! canonical primitive a slice-bound read path needs — decoding into the
-//! shared wrapper's cache, or only if some earlier read already did.
+//! string-column access, sortedness statistics, chunk and struct assembly
+//! and slicing, sorted-column binary search, and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
+use crate::observe::observe;
 use crate::session::VORTEX_SESSION;
 use crate::store::schema;
+use std::ops::Range;
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
-use vortex_array::arrays::{BoolArray, ChunkedArray, Struct, StructArray, VarBinViewArray};
-use vortex_array::dtype::DType;
+use vortex_array::arrays::{BoolArray, Struct, StructArray, VarBinViewArray};
+use vortex_array::dtype::FieldName;
 use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
+use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, Executable, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
-/// Zero-cost row access into a canonical `VarBinView` string column: the
-/// 16-byte views slice and the data buffers are resolved once, and each row's
-/// bytes are then an inline read or a plain slice of the referenced buffer.
-///
-/// Rows are read directly from the views slice and the referenced data
-/// buffers, so a loop over the column allocates and refcounts nothing per
-/// row.
+/// Row access into a canonical `VarBinView` string column: the views slice is
+/// resolved once, and each row's bytes are an inline read or a slice of the
+/// referenced data buffer, so a loop over the column allocates and refcounts
+/// nothing per row.
 pub(crate) struct StrColReader<'a> {
     arr: &'a VarBinViewArray,
     views: &'a [BinaryView],
@@ -54,35 +45,26 @@ impl<'a> StrColReader<'a> {
         }
     }
 
-    /// Row `i` as a `&str` view borrowed straight from the column buffers
-    /// (zero-copy); a decoder's oxrdf constructors make the single owned
+    /// Row `i` as a `&str` borrowed from the column buffers, unchecked
+    /// ([`trusted_str`]); a decoder's oxrdf constructors make the single owned
     /// copy.
     #[inline]
-    pub(crate) fn str_at(&self, i: usize) -> Result<&'a str> {
-        buf_as_str(self.bytes_at(i))
+    pub(crate) fn str_at(&self, i: usize) -> &'a str {
+        trusted_str(self.bytes_at(i))
     }
 }
 
-/// Build a Vortex string array (`VarBinView<Utf8>`, non-nullable) from string refs.
-///
-/// Values are copied once, directly into the array's buffer — no intermediate
-/// owned `String` per value.
+/// A non-nullable `VarBinView<Utf8>` array of `values`, each copied once,
+/// straight into the array's buffer.
 pub(crate) fn make_string_array(values: impl IntoIterator<Item = impl AsRef<str>>) -> ArrayRef {
     VarBinViewArray::from_iter_str(values).into_array()
-}
-
-/// Build a nullable Vortex string array for optional fields (e.g. o_datatype, o_lang).
-pub(crate) fn make_nullable_string_array(
-    values: impl IntoIterator<Item = Option<String>>,
-) -> ArrayRef {
-    VarBinViewArray::from_iter_nullable_str(values).into_array()
 }
 
 /// Stamp the exact `IsSorted` statistic on an array.
 ///
 /// On a base's `s` column the stamp asserts more than that column's order: it
-/// is the witness that the whole base is in global `(s, p, o, g)` order — the
-/// order every writer of this crate produces — and `match_pattern` trusts it
+/// is the witness that the whole base is in global `(s, p, o, g)` order (the
+/// order every writer of this crate produces), and `match_pattern` trusts it
 /// to binary-search each bound role inside the run the previous one bounded.
 /// Only call it on rows sorted that way by construction: a false stamp
 /// corrupts query results.
@@ -92,9 +74,9 @@ pub(crate) fn stamp_is_sorted(arr: &ArrayRef) {
 }
 
 /// Read back the `IsSorted` statistic written by [`stamp_is_sorted`]. An
-/// absent stat counts as unsorted — order is never assumed, only trusted
-/// when explicitly recorded. On a base's `s` column, `true` licenses the
-/// prefix probe over the whole `(s, p, o, g)` order.
+/// absent stat counts as unsorted: order is never assumed, only trusted when
+/// recorded. On a base's `s` column, `true` licenses the prefix probe over
+/// the whole `(s, p, o, g)` order.
 pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
     match arr.statistics().get(Stat::IsSorted) {
         Precision::Exact(sc) | Precision::Inexact(sc) => bool::try_from(&sc).unwrap_or(false),
@@ -102,10 +84,10 @@ pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
     }
 }
 
-/// Whether a quad struct's `s` column carries the globally-sorted stamp —
-/// the provenance a write records in the root's metadata and a reader gates
-/// its subject binary search on. Every producer that stamps yields a
-/// canonical `StructArray`, so anything that is not one reads as unsorted.
+/// Whether a quad struct's `s` column carries the globally sorted stamp: the
+/// provenance a write records in the root's metadata and a reader gates its
+/// subject binary search on. Every producer that stamps yields a canonical
+/// `StructArray`, so anything that is not one reads as unsorted.
 pub(crate) fn subject_sorted(rows: &ArrayRef) -> bool {
     rows.clone()
         .try_downcast::<Struct>()
@@ -134,14 +116,62 @@ pub(crate) fn with_subject_stamp(rows: ArrayRef, sorted: bool) -> Result<ArrayRe
 
 /// Assemble per-chunk arrays into one array of `dtype`: an empty
 /// `ChunkedArray` for no chunks, the chunk itself for exactly one, a
-/// `ChunkedArray` otherwise.
-pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Result<ArrayRef> {
+/// `ChunkedArray` otherwise. For chunks already in hand; a stream of them is
+/// read by Vortex's `read_all`.
+#[cfg(any(test, feature = "file-io"))]
+pub(crate) fn chunked_or_single(
+    mut chunks: Vec<ArrayRef>,
+    dtype: vortex_array::dtype::DType,
+) -> Result<ArrayRef> {
+    use vortex_array::arrays::ChunkedArray;
     match chunks.len() {
         1 => Ok(chunks.pop().expect("length checked above")),
-        _ => Ok(ChunkedArray::try_new(chunks, dtype)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array()),
+        _ => Ok(ChunkedArray::try_new(chunks, dtype)?.into_array()),
     }
+}
+
+/// The ranges `len` rows are cut into, at most `batch_rows` (> 0) each, in
+/// row order; none for no rows.
+pub(crate) fn batch_ranges(
+    len: usize,
+    batch_rows: usize,
+) -> impl Iterator<Item = Range<usize>> + Clone + Send + 'static {
+    (0..len)
+        .step_by(batch_rows)
+        .map(move |start| start..start.saturating_add(batch_rows).min(len))
+}
+
+/// `rows` cut into slices of at most `batch_rows` (> 0) rows, in row order,
+/// each cut when the iterator reaches it: the array itself when it fits, no
+/// slice for an empty array.
+pub(crate) fn rechunk(
+    rows: ArrayRef,
+    batch_rows: usize,
+) -> impl Iterator<Item = Result<ArrayRef>> + Send + 'static {
+    let fits = rows.len() <= batch_rows;
+    batch_ranges(rows.len(), batch_rows).map(move |range| {
+        if fits {
+            return Ok(rows.clone());
+        }
+        observe!(RechunkCut);
+        #[cfg(test)]
+        crate::store::test_hooks::rechunk_cut()?;
+        rows.slice(range).map_err(VortexRdfError::Vortex)
+    })
+}
+
+/// A non-nullable struct of `columns` under `names`, `columns[i]` named
+/// `names[i]`, every column `len` rows long: the one construction of the
+/// crate's named struct chunks, from a layout's primary columns to an index
+/// child's rows and a point read's.
+pub(crate) fn named_struct(
+    names: &[&str],
+    columns: Vec<ArrayRef>,
+    len: usize,
+) -> Result<StructArray> {
+    let names: Vec<FieldName> = names.iter().map(|&n| FieldName::from(n)).collect();
+    StructArray::try_new(names.into(), columns, len, Validity::NonNullable)
+        .map_err(VortexRdfError::Vortex)
 }
 
 /// `arr` as a `StructArray`: a plain downcast when it already is one, else
@@ -165,372 +195,227 @@ pub(crate) fn field_as<T: Executable>(
     ctx: &mut ExecutionCtx,
 ) -> Result<T> {
     struct_arr
-        .unmasked_field_by_name(name)
-        .map_err(VortexRdfError::Vortex)?
+        .unmasked_field_by_name(name)?
         .clone()
         .execute::<T>(ctx)
         .map_err(VortexRdfError::Vortex)
 }
 
+/// `arr` decoded to a primitive array, for the `VORTEX_RDF_ENCODED_SEARCH=0` ablation: the search then reads
+/// decoded values (see `vortex_rdf_encoded_search::encoded_search_enabled`).
+pub(crate) fn decoded_for_search(arr: &ArrayRef) -> Result<ArrayRef> {
+    if !arr.dtype().is_unsigned_int() || arr.dtype().is_nullable() {
+        return Ok(arr.clone()); // only code columns are searched
+    }
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    Ok(arr
+        .clone()
+        .execute::<vortex_array::arrays::PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?
+        .into_array())
+}
+
+/// `scalar` as a `u64` when it is a non-null unsigned integer; `None` for
+/// any other scalar, decided on its type before any conversion is tried. A
+/// failed conversion builds an error, and an error captures a backtrace when
+/// `RUST_BACKTRACE` is set: tried on every probe of a string layout, that
+/// made a warm in-memory Default-layout match cost several times its work.
+pub(crate) fn unsigned_value(scalar: &vortex_array::scalar::Scalar) -> Option<u64> {
+    if !scalar.dtype().is_unsigned_int() || scalar.is_null() {
+        return None;
+    }
+    u64::try_from(scalar).ok()
+}
+
 /// Binary-search a sorted column for the `[lo, hi)` run of rows equal to
-/// `probe` (`lo == hi` means the value is absent). Only meaningful on
-/// columns [`column_is_sorted`] reports as sorted.
+/// `probe` (empty, at the insertion point, when the value is absent). Only
+/// meaningful on columns [`column_is_sorted`] reports as sorted.
 pub(crate) fn search_sorted_bounds(
     arr: &ArrayRef,
     probe: &vortex_array::scalar::Scalar,
 ) -> Result<(usize, usize)> {
-    use vortex_array::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
+    use vortex_array::search_sorted::{
+        SearchResult, SearchSorted, SearchSortedArray, SearchSortedSide,
+    };
+
+    let index_of = |result: SearchResult| match result {
+        SearchResult::Found(i) | SearchResult::NotFound(i) => i,
+    };
 
     // Encoded fast path: probe the column's representation directly, canonical
     // or wire-encoded (`from_bytes` adoption, sliced index runs), without
     // decoding it; declines fall through to the generic kernel.
     if arr.dtype().is_unsigned_int()
         && !arr.dtype().is_nullable()
-        && let Ok(needle) = u64::try_from(probe)
-        && let Some(encoded) = vortex_rdf_encoded_search::SortedProbe::resolve(arr)
+        && let Some(needle) = unsigned_value(probe)
     {
-        return Ok(encoded.bounds(needle));
+        // VORTEX_RDF_ENCODED_SEARCH=0: the column is decoded first and its decoded values searched.
+        let decoded;
+        let searched = if vortex_rdf_encoded_search::encoded_search_enabled() {
+            arr
+        } else {
+            decoded = decoded_for_search(arr)?;
+            &decoded
+        };
+        if let Some(encoded) = vortex_rdf_encoded_search::SortedProbe::resolve(searched) {
+            return Ok(encoded.bounds(needle));
+        }
+        // An encoding the probe declines (per-block bit widths, say) is
+        // searched typed, by Vortex's primitive search, whatever the needle's
+        // own width; a needle past the column's type is past every value.
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        return vortex_array::match_each_unsigned_integer_ptype!(arr.dtype().as_ptype(), |T| {
+            match T::try_from(needle) {
+                Ok(needle) => {
+                    let sorted = vortex_array::search_sorted::SearchSortedPrimitiveArray::<T>::new(
+                        arr, &mut ctx,
+                    );
+                    let lo = sorted.search_sorted(&needle, SearchSortedSide::Left)?;
+                    let hi = sorted.search_sorted(&needle, SearchSortedSide::Right)?;
+                    Ok((index_of(lo), index_of(hi)))
+                }
+                Err(_) => Ok((arr.len(), arr.len())),
+            }
+        });
     }
 
-    let index_of = |result: SearchResult| match result {
-        SearchResult::Found(i) | SearchResult::NotFound(i) => i,
-    };
-    let lo = arr
-        .search_sorted(probe, SearchSortedSide::Left)
-        .map_err(VortexRdfError::Vortex)?;
-    let hi = arr
-        .search_sorted(probe, SearchSortedSide::Right)
-        .map_err(VortexRdfError::Vortex)?;
+    // One probe and one execution context serve both searches.
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let sorted = SearchSortedArray::new(arr, &mut ctx);
+    let lo = sorted.search_sorted(probe, SearchSortedSide::Left)?;
+    let hi = sorted.search_sorted(probe, SearchSortedSide::Right)?;
     Ok((index_of(lo), index_of(hi)))
 }
 
-/// Keep a base struct's integer children (the Dictionary layout's term
-/// codes, TypedObject's kind column) in their compressed form wherever the
-/// match fast paths can bind them, decoding only the remainder to canonical
-/// primitives — preserving each child's `IsSorted` stamp across any
-/// re-encoding.
-///
-/// The per-row match fast paths — [`search_sorted_bounds`]' probes and the
-/// typed residual loops — bind canonical primitives and any encoding an
-/// encoded search probe resolves, so those children stay compressed at
-/// adoption. A child outside the probe's supported set (e.g. dictionary
-/// encoding) would pay a per-call fallback through the generic per-scalar
-/// kernel on every match; decoding it once here keeps every fast path fast
-/// for the store's lifetime. String children keep their encoded form: their
-/// canonical `VarBinView` costs real memory, and the mask scan handles them
-/// at selection cost. Serialization re-compresses every child through the
-/// default write strategy, so the wire format is unaffected.
-///
-/// A nullable struct passes through untouched — the base schema is
-/// non-nullable, and rebuilding a struct with validity is not this helper's
-/// business.
-pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{PrimitiveArray, StructArray};
-    use vortex_array::validity::Validity;
-
-    if rows.dtype().is_nullable() {
-        return Ok(rows);
-    }
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = rows
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let names = struct_arr.names().clone();
-    let mut children = Vec::with_capacity(names.len());
-    let mut changed = false;
-    for name in names.iter() {
-        let child = struct_arr
-            .unmasked_field_by_name(name.as_ref())
-            .map_err(VortexRdfError::Vortex)?;
-        let decode = child.dtype().is_int()
-            && !child.dtype().is_nullable()
-            && vortex_rdf_encoded_search::SortedProbe::resolve(child).is_none();
-        if !decode {
-            children.push(child.clone());
-            continue;
-        }
-        let sorted = column_is_sorted(child);
-        let canonical = child
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array();
-        if sorted {
-            stamp_is_sorted(&canonical);
-        }
-        children.push(canonical);
-        changed = true;
-    }
-    if !changed {
-        return Ok(struct_arr.into_array());
-    }
-    let len = struct_arr.len();
-    Ok(
-        StructArray::try_new(names, children, len, Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array(),
-    )
-}
-
-/// Compress a built struct's u32 code columns into probe-supported
-/// encodings, in place of the canonical primitives the builders emit —
-/// the construction half of the store's compressed-resident form (the
-/// adoption half is [`with_searchable_int_children`]).
-///
-/// Every encoding chosen here is one an encoded search probe resolves, so
-/// the match fast paths keep binding the column; the choice is made from
-/// bounds the construction already knows (Constant for single-valued, RunEnd
-/// for sorted with few runs, BitPacked at the observed width).
-/// Sortedness stamps carry across; non-u32 and nullable children pass
-/// through untouched. A chunked column is compressed chunk by chunk (see
-/// [`compress_u32_child`]) — the builders assemble anything over
-/// `DEFAULT_CHUNK_ROWS` rows into a `ChunkedArray`, so without that every
-/// build past one chunk would keep the canonical form.
-///
-/// `payload_lazy` wraps each compressed column in a `vortex.shared` lazy
-/// wrapper: the match fast paths probe the compressed source through the
-/// wrapper, while the code-column payload path materializes the canonical
-/// primitive once into the wrapper's cache (`shared_u32_primitive`) and is
-/// zero-copy on every later call. Pass it for the primary base — the only
-/// array the payload path reads; components never serve payloads and skip
-/// the wrapper.
-pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -> Result<ArrayRef> {
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{Primitive, SharedArray, StructArray};
-    use vortex_array::validity::Validity;
-
-    if rows.dtype().is_nullable() {
-        return Ok(rows);
-    }
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = rows
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let names = struct_arr.names().clone();
-    let mut children = Vec::with_capacity(names.len());
-    for name in names.iter() {
-        let child = struct_arr
-            .unmasked_field_by_name(name.as_ref())
-            .map_err(VortexRdfError::Vortex)?;
-        let sorted = column_is_sorted(child);
-        let Some(mut encoded) = compress_u32_child(child, sorted, &mut ctx)? else {
-            children.push(child.clone());
-            continue;
-        };
-        if payload_lazy && !encoded.is::<Primitive>() {
-            encoded = SharedArray::new(encoded).into_array();
-        }
-        if sorted {
-            stamp_is_sorted(&encoded);
-        }
-        children.push(encoded);
-    }
-    let len = struct_arr.len();
-    Ok(
-        StructArray::try_new(names, children, len, Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array(),
-    )
-}
-
-/// A base child as a canonical non-nullable u32 primitive, zero-copy where
-/// one exists: a canonical column directly, a `vortex.shared` wrapper via its
-/// one-way cache — the first call decodes the compressed source into the
-/// cache, every later call is a refcount bump shared by all views over the
-/// base. `None` for any other encoding (callers fall back to the gather
-/// pipeline).
-///
-/// Decoding into the cache is one pass over the whole column, so callers that
-/// only read a few rows take [`cached_u32_primitive`] instead.
-pub(crate) fn shared_u32_primitive(
-    child: &ArrayRef,
-) -> Option<vortex_array::arrays::PrimitiveArray> {
-    use vortex_array::Canonical;
-    use vortex_array::arrays::shared::SharedArrayExt as _;
-    use vortex_array::arrays::{Primitive, PrimitiveArray, Shared};
-
-    if let Some(prim) = canonical_u32(child) {
-        return Some(prim);
-    }
-    let shared = child.as_opt::<Shared>()?;
-    let cached = shared
-        .get_or_compute(|source| {
-            let mut ctx = VORTEX_SESSION.create_execution_ctx();
-            source
-                .clone()
-                .execute::<PrimitiveArray>(&mut ctx)
-                .map(Canonical::Primitive)
-        })
-        .ok()?;
-    let prim = cached.try_downcast::<Primitive>().ok()?;
-    (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
-}
-
-/// The non-decoding half of [`shared_u32_primitive`]: a base child's canonical
-/// non-nullable u32 primitive when one already exists — the column itself, or
-/// a `vortex.shared` wrapper whose one-way cache some earlier read already
-/// filled. `None` when producing one would mean decoding the compressed
-/// source, so a caller reading a handful of rows can prefer per-row point
-/// reads over a whole-column pass.
-pub(crate) fn cached_u32_primitive(
-    child: &ArrayRef,
-) -> Option<vortex_array::arrays::PrimitiveArray> {
-    use vortex_array::arrays::Shared;
-    use vortex_array::arrays::shared::SharedArrayExt as _;
-
-    if let Some(prim) = canonical_u32(child) {
-        return Some(prim);
-    }
-    let shared = child.as_opt::<Shared>()?;
-    canonical_u32(shared.current_array_ref())
-}
-
-/// A non-nullable canonical u32 primitive, or `None` for anything else — the
-/// shape both `*_u32_primitive` accessors hand back.
-fn canonical_u32(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray> {
-    use vortex_array::arrays::Primitive;
-
-    if !arr.dtype().is_unsigned_int() || arr.dtype().is_nullable() {
-        return None;
-    }
-    let prim = arr.clone().try_downcast::<Primitive>().ok()?;
-    (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
-}
-
-/// One child column's compressed form, or `None` for a column this helper
-/// leaves alone (non-u32, nullable, or an encoding that is already not a
-/// canonical primitive).
-///
-/// A chunked column is compressed chunk by chunk and reassembled, which is
-/// what makes the compressed-resident form reach builds above
-/// `DEFAULT_CHUNK_ROWS` rows at all: the builders assemble anything larger
-/// into a `ChunkedArray`, and a downcast straight to `Primitive` sees only
-/// the wrapper. Per-chunk is also the natural granularity — the bounds pass
-/// that picks the encoding is per-chunk regardless, and a chunk of a globally
-/// sorted column is itself sorted, so the RunEnd choice stays valid.
-fn compress_u32_child(
-    child: &ArrayRef,
-    sorted: bool,
-    ctx: &mut vortex_array::ExecutionCtx,
-) -> Result<Option<ArrayRef>> {
-    use vortex_array::arrays::chunked::ChunkedArrayExt as _;
-    use vortex_array::arrays::{Chunked, ChunkedArray, Primitive};
-
-    if child.dtype().is_nullable() || !child.dtype().is_unsigned_int() {
-        return Ok(None);
-    }
-    if let Some(chunked) = child.as_opt::<Chunked>() {
-        let mut out = Vec::with_capacity(chunked.nchunks());
-        let mut compressed_any = false;
-        for chunk in chunked.chunks() {
-            match compress_u32_child(&chunk, sorted, ctx)? {
-                Some(encoded) => {
-                    if sorted {
-                        stamp_is_sorted(&encoded);
-                    }
-                    out.push(encoded);
-                    compressed_any = true;
-                }
-                None => out.push(chunk),
-            }
-        }
-        if !compressed_any {
-            return Ok(None);
-        }
-        return Ok(Some(
-            ChunkedArray::try_new(out, child.dtype().clone())
-                .map_err(VortexRdfError::Vortex)?
-                .into_array(),
-        ));
-    }
-    let Ok(prim) = child.clone().try_downcast::<Primitive>() else {
-        return Ok(None);
-    };
-    if prim.ptype() != vortex_array::dtype::PType::U32 {
-        return Ok(None);
-    }
-    Ok(Some(compress_u32_column(&prim, sorted, ctx)?))
-}
-
-/// One column's encoding choice; see [`with_compressed_int_children`].
-fn compress_u32_column(
-    prim: &vortex_array::arrays::PrimitiveArray,
-    sorted: bool,
-    ctx: &mut vortex_array::ExecutionCtx,
-) -> Result<ArrayRef> {
-    use vortex::encodings::fastlanes::BitPacked;
-    use vortex::encodings::runend::RunEnd;
-    use vortex_array::arrays::ConstantArray;
-
-    let values = prim.as_slice::<u32>();
-    if values.is_empty() {
-        return Ok(prim.clone().into_array());
-    }
-    let mut max = values[0];
-    let mut min = values[0];
-    let mut runs = 1usize;
-    let mut prev = values[0];
-    for &v in &values[1..] {
-        if v > max {
-            max = v;
-        }
-        if v < min {
-            min = v;
-        }
-        if v != prev {
-            runs += 1;
-            prev = v;
-        }
-    }
-    if min == max {
-        return Ok(ConstantArray::new(min, values.len()).into_array());
-    }
-    if sorted && runs * 4 <= values.len() {
-        let re = RunEnd::encode(prim.clone().into_array(), ctx).map_err(VortexRdfError::Vortex)?;
-        return Ok(re.into_array());
-    }
-    let bit_width = (u32::BITS - max.leading_zeros()).max(1) as u8;
-    if bit_width >= 32 {
-        return Ok(prim.clone().into_array());
-    }
-    let packed = BitPacked::encode(&prim.clone().into_array(), bit_width, ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    Ok(packed.into_array())
-}
-
-/// Convert a boolean ArrayRef into a `vortex_mask::Mask` for use with `ArrayRef::filter`.
+/// A boolean array as a [`Mask`] for `ArrayRef::filter`: canonicalized, then
+/// its packed bit buffer taken as the mask (no per-bit loop).
 pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
-    // Canonicalize to a concrete boolean array, then reinterpret its packed
-    // bit buffer directly as a Mask (no per-bit conversion loop).
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let bool_arr = arr
-        .execute::<BoolArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let bool_arr = arr.execute::<BoolArray>(&mut ctx)?;
     Ok(Mask::from_buffer(bool_arr.into_bit_buffer()))
 }
 
-/// Borrow the bytes of a UTF-8 string column value as `&str` without copying.
+/// The bytes of a string column value as `&str`, borrowed and unchecked.
 ///
-/// **Trusted-input decode path**, the same argument as
-/// [`parse_named_node`](crate::common::terms::parse_named_node):
-/// every caller reads a column whose dtype is `Utf8`, and vortex validates that
-/// invariant when the array is constructed — `VarBinViewData::validate` runs a
-/// `from_utf8` over every view on IPC decode, and the file reader validates on
-/// its own construction path. Re-validating here would walk each term's bytes
-/// a second time on every decoded row.
-///
-/// The check is kept as a `debug_assert`, so the test suite (which runs debug)
-/// still fails loudly if a non-UTF-8 column ever reaches this, while release
-/// builds skip the second walk. The `Result` is retained so the decode call
-/// sites — which `?` on genuinely fallible neighbours — stay uniform.
+/// **Trusted-input decode path**, as
+/// [`Trust::Stored`](crate::common::terms::Trust::Stored): `buf` must be a
+/// value of a `Utf8` column of a store this crate wrote or the caller trusts.
+/// Vortex does not validate every path to such bytes (an FSST chunk read from
+/// a file is canonicalized unchecked), so a corrupt or crafted file is outside
+/// this contract. Release builds skip the check, which would walk every
+/// decoded term's bytes; debug builds keep it as a `debug_assert`, so the test
+/// suite fails loudly if non-UTF-8 bytes ever reach it.
 #[inline]
-pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
+pub(crate) fn trusted_str(buf: &[u8]) -> &str {
     debug_assert!(
         std::str::from_utf8(buf).is_ok(),
         "string column value is not valid UTF-8, but its dtype claims Utf8"
     );
-    // SAFETY: `buf` is the bytes of a value in a `Utf8`-dtyped vortex column,
-    // which vortex validates as UTF-8 when the array is constructed (see above).
-    Ok(unsafe { std::str::from_utf8_unchecked(buf) })
+    // SAFETY: the caller's precondition above: `buf` is a value of a `Utf8`
+    // column of a store this crate wrote or the caller trusts.
+    unsafe { std::str::from_utf8_unchecked(buf) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsigned_value;
+    use vortex_array::dtype::{DType, Nullability, PType};
+    use vortex_array::scalar::Scalar;
+
+    /// An unsigned integer of every width converts, a valid nullable one
+    /// too; a string, a signed integer and a null are refused on their type.
+    #[test]
+    fn unsigned_value_takes_only_unsigned_integers() {
+        assert_eq!(unsigned_value(&Scalar::from(7u8)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(7u16)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(7u32)), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from(u64::MAX)), Some(u64::MAX));
+        assert_eq!(unsigned_value(&Scalar::from(7u64).into_nullable()), Some(7));
+        assert_eq!(unsigned_value(&Scalar::from("7")), None);
+        assert_eq!(unsigned_value(&Scalar::from(7i64)), None);
+        let null = Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable));
+        assert_eq!(unsigned_value(&null), None);
+    }
+
+    /// A sorted `u64` column bit-packed with a width per block, which the
+    /// encoded probe declines, is searched by the fallback: the bounds of
+    /// every value, of values between and past them, of 0 and of `u64::MAX`
+    /// are the `partition_point`s of its values, for a needle of the column's
+    /// width or a narrower one.
+    #[test]
+    fn declined_unsigned_columns_search_typed() {
+        use vortex::encodings::fastlanes::BitPackedData;
+        use vortex_array::arrays::PrimitiveArray;
+        use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+        let data: Vec<u64> = (0..2048u64)
+            .map(|i| if i < 1024 { i / 256 } else { 1000 + 2 * i })
+            .collect();
+        let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let arr = BitPackedData::encode_blocked(&canonical, &[2, 13], &mut ctx)
+            .unwrap()
+            .into_array();
+        assert!(
+            vortex_rdf_encoded_search::SortedProbe::resolve(&arr).is_none(),
+            "the probe declines per-block widths"
+        );
+        let mut needles = data.clone();
+        needles.dedup();
+        needles.extend([0, 5, 1001, 3049, 6000, u64::MAX]);
+        for needle in needles {
+            let want = (
+                data.partition_point(|&v| v < needle),
+                data.partition_point(|&v| v <= needle),
+            );
+            assert_eq!(
+                super::search_sorted_bounds(&arr, &Scalar::from(needle)).unwrap(),
+                want,
+                "needle {needle}"
+            );
+        }
+        assert_eq!(
+            super::search_sorted_bounds(&arr, &Scalar::from(3u8)).unwrap(),
+            (768, 1024),
+            "a narrower needle"
+        );
+    }
+
+    /// A sorted `u32` column bit-packed with a width per block, ending at
+    /// `u32::MAX`, answers `u64` needles by its own type: the needle at the
+    /// type's maximum finds its last row, and needles past it, which no
+    /// `u32` holds, fall past every row.
+    #[test]
+    fn declined_narrow_columns_answer_needles_past_their_type() {
+        use vortex::encodings::fastlanes::BitPackedData;
+        use vortex_array::arrays::PrimitiveArray;
+        use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+        let mut data: Vec<u32> = (0..2048u32)
+            .map(|i| if i < 1024 { i / 256 } else { 1000 + 2 * i })
+            .collect();
+        *data.last_mut().unwrap() = u32::MAX;
+        let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let arr = BitPackedData::encode_blocked(&canonical, &[2, 32], &mut ctx)
+            .unwrap()
+            .into_array();
+        assert!(
+            vortex_rdf_encoded_search::SortedProbe::resolve(&arr).is_none(),
+            "the probe declines per-block widths"
+        );
+        let len = data.len();
+        for (needle, want) in [
+            (u64::from(u32::MAX), (len - 1, len)),
+            (u64::from(u32::MAX) + 1, (len, len)),
+            (u64::MAX, (len, len)),
+            (3, (768, 1024)),
+        ] {
+            assert_eq!(
+                super::search_sorted_bounds(&arr, &Scalar::from(needle)).unwrap(),
+                want,
+                "needle {needle}"
+            );
+        }
+    }
 }

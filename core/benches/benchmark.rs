@@ -11,7 +11,7 @@
 //!   write-path cross-products measure the same code, so we fix a baseline and
 //!   vary one axis at a time, adding back only the interactions that genuinely
 //!   change behaviour (e.g. Dictionary × index, where the index columns hold
-//!   u32 codes rather than term strings).
+//!   term codes rather than term strings).
 //! * **Match (Group 2)** is a full 18-cell layout × index × source factorial
 //!   (× 8 routing patterns × 2 cache regimes), plus a chained-view pair. Some
 //!   cells are redundant on paper — a bound subject
@@ -25,7 +25,7 @@
 //!   needed: a cold-only suite cannot see caching work at all, and reports an
 //!   improvement that only a resolved probe cache delivers as noise. Opening is
 //!   never inside either measurement — it is its own benchmark (`open_file`).
-//! * **Decode/load (Group 3) and dictionary residency (Group 4)** sweep only
+//! * **Decode/load (Group 3) and dictionary access (Group 4)** sweep only
 //!   the axis each path actually branches on.
 //! * **Mutate (Group 5)** sweeps a star of the same three axes, because an
 //!   append's presence check and a delete's pattern resolution both route
@@ -66,10 +66,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use futures::stream;
+use futures::{StreamExt, stream};
 use oxrdf::{NamedNode, NamedOrBlankNode};
 
-use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore, io};
+use vortex_rdf_core::{LayoutStrategy, Probe, QuadColumn, VortexRdfError, VortexRdfStore, io};
 
 // The module is shared with `match_lazy.rs` and compiled per-target; items
 // only the other target uses are dead here by design.
@@ -77,6 +77,8 @@ use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore, io};
 #[macro_use]
 mod support;
 use support::*;
+
+mod located;
 
 fn main() {
     // Stamp what this run generated; the dashboard reads the line, divan
@@ -158,6 +160,47 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
                 black_box(buf.len())
             })
         });
+}
+
+/// The out-of-core build over quads in no order: `serialize` of the
+/// Dictionary layout with no index, its input in a fixed shuffle, so the
+/// spill sorts its run from scratch (the `serialize` cells above feed the
+/// dataset in order, which a sort passes over).
+#[divan::bench(sample_count = HEAVY_SAMPLES)]
+fn serialize_shuffled(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| {
+            let mut quads = materialize_quads(bench_size());
+            shuffle(&mut quads);
+            quads
+        })
+        .bench_values(|quads| {
+            rt().block_on(async move {
+                let mut buf = Vec::new();
+                let stream = stream::iter(quads.into_iter().map(Ok::<_, VortexRdfError>));
+                io::quads_stream_to_vortex_writer(
+                    stream,
+                    &mut buf,
+                    LayoutStrategy::Dictionary,
+                    vec![],
+                )
+                .await
+                .expect("serialize failed");
+                black_box(buf.len())
+            })
+        });
+}
+
+/// `items` in a fixed pseudo-random order: a Fisher-Yates shuffle driven by
+/// a xorshift sequence from a constant seed, the same order every run.
+fn shuffle<T>(items: &mut [T]) {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for i in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        items.swap(i, (state % (i as u64 + 1)) as usize);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -282,6 +325,42 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
         });
 }
 
+/// Decode every quad in the store as shared-term rows (`shared_quads_vec()`
+/// → `Vec`), the read the bindings' term columns go through: one string per
+/// distinct term of a chunk under the Dictionary layout, one per run of rows
+/// repeating a term under the string layouts.
+#[divan::bench(args = DECODE_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn decode_all_shared(bencher: divan::Bencher, cfg: &DecodeCfg) {
+    let cfg = *cfg;
+    bencher
+        .with_inputs(|| make_store(cfg.source, cfg.layout, Index::None, bench_size()))
+        .bench_refs(|store| {
+            rt().block_on(async {
+                let quads = store.shared_quads_vec().await.expect("decode all shared");
+                black_box(quads.len())
+            })
+        });
+}
+
+/// Export every quad as N-Quads into a `Vec` (`export_rdf`, behind the
+/// CLI's `deserialize` and the bindings' `toRdf`): each stored term written
+/// verbatim into its line.
+#[divan::bench(args = DECODE_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn export_nquads(bencher: divan::Bencher, cfg: &DecodeCfg) {
+    let cfg = *cfg;
+    bencher
+        .with_inputs(|| make_store(cfg.source, cfg.layout, Index::None, bench_size()))
+        .bench_values(|store| {
+            rt().block_on(async {
+                let mut out = Vec::new();
+                vortex_rdf_core::export_rdf(store, &mut out, oxrdfio::RdfFormat::NQuads)
+                    .await
+                    .expect("export");
+                black_box(out.len())
+            })
+        });
+}
+
 /// [`decode_all`] over a literal-bearing dataset. The main dataset's literals
 /// are plain and escape-free, so this is the one benchmark whose decode reaches
 /// the language-tag, datatype and unescape paths.
@@ -297,10 +376,8 @@ fn decode_all_literals(bencher: divan::Bencher) {
         });
 }
 
-/// Open a file-backed store. Default and TypedObject read the footer only;
-/// Dictionary also lifts its term dictionary resident when it is under the
-/// residency threshold (the default for a file this size), so the layouts are
-/// worth distinguishing.
+/// Open a file-backed store: the footer (and, under Dictionary, the
+/// dictionary's window bounds), memory-mapped.
 #[divan::bench(args = [Layout::Default, Layout::TypedObject, Layout::Dictionary], sample_count = HEAVY_SAMPLES)]
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
@@ -329,15 +406,13 @@ fn from_bytes(bencher: divan::Bencher) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Group 4 — DICTIONARY RESIDENCY (file-backed vs resident term dictionary)
+// Group 4 — DICTIONARY ACCESS (memory-mapped file vs whole-store load)
 //
-// A Dictionary file's term dictionary can be lifted resident at open or left
-// in its dictionary child and reached by scans through the bounded reader
-// (`from_file_with_dict_residency`, byte threshold). The residency axis moves
-// cost between phases: resident pays one contiguous child read at open and
-// then probes/decodes from memory; file-backed opens on footer metadata alone
-// but pays a pruned child scan per cold term probe and a row-index scan per
-// decoded chunk.
+// A Dictionary file opened with `from_file` is memory-mapped: the term
+// dictionary stays in its child and every probe or decode reads the mapped
+// leaves it touches. `from_file_in_memory` loads the whole store, the
+// dictionary lifted into memory (still FSST). The bench ids keep their
+// `resident`/`file_backed` names so the dashboard's history lines up.
 // ══════════════════════════════════════════════════════════════════════════
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -347,12 +422,13 @@ enum DictResidency {
 }
 
 impl DictResidency {
-    /// The `max_resident_bytes` value that forces this residency.
-    fn threshold(self) -> u64 {
+    /// Open the store at `path` under this access mode.
+    async fn open(self, path: &std::path::Path) -> VortexRdfStore {
         match self {
-            Self::Resident => u64::MAX,
-            Self::FileBacked => 0,
+            Self::Resident => VortexRdfStore::from_file_in_memory(path).await,
+            Self::FileBacked => VortexRdfStore::from_file(path).await,
         }
+        .expect("open dictionary store")
     }
 
     fn short(self) -> &'static str {
@@ -399,36 +475,41 @@ fn cached_writer_file(size: usize) -> PathBuf {
 
 fn open_dict_store(residency: DictResidency, size: usize) -> VortexRdfStore {
     let path = cached_writer_file(size);
-    rt().block_on(async {
-        VortexRdfStore::from_file_with_dict_residency(&path, residency.threshold())
-            .await
-            .expect("open dictionary store")
-    })
+    rt().block_on(residency.open(&path))
 }
 
-/// Open cost across the residency axis: resident pays the child read and
-/// dictionary lift, file-backed only the footer reads.
+/// Open cost across the access axis: the load pays every read at open, the
+/// mapped open only the footer and the window bounds.
 #[divan::bench(args = DICT_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
     bencher
-        .with_inputs(|| (cached_writer_file(bench_size()), residency.threshold()))
-        .bench_refs(|(path, threshold)| {
+        .with_inputs(|| cached_writer_file(bench_size()))
+        .bench_refs(|path| {
             rt().block_on(async {
-                let store = VortexRdfStore::from_file_with_dict_residency(&*path, *threshold)
-                    .await
-                    .expect("open");
+                let store = residency.open(path).await;
                 black_box(store.layout())
             })
         });
 }
 
+/// `to_bytes` of a store opened from its file and left as it is, the
+/// bindings' serialization of an opened store: the mapped open copies its
+/// file, and the loaded one, held in memory, writes its rows, dictionary and
+/// indexes again.
+#[divan::bench(args = DICT_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn dict_to_bytes(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    bencher.bench(|| {
+        rt().block_on(async { black_box(store.to_bytes().await.expect("to_bytes").len()) })
+    });
+}
+
 /// Cold term → code probes: a fully bound pattern (four dictionary probes) on a
-/// store opened fresh each iteration, so neither the probe memo nor the
-/// file-backed dictionary's chunk cache carries anything over. Resident
-/// probes are in-memory binary searches; file-backed ones binary-search the
-/// term column through chunk leaves fetched on demand, so this cell prices
-/// those first fetches rather than the search over them.
+/// store opened fresh each iteration, so nothing the store holds carries over
+/// (the operating system's page cache does). Resident probes are in-memory
+/// binary searches; file-backed ones pick a window by its bounds and
+/// binary-search its leaf, rebuilt over the mapped segment.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
@@ -448,11 +529,9 @@ fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// The same fully bound pattern on one shared store — the steady state of
-/// repeated lookups for the *same* terms. After the first iteration the probe
-/// memo answers every term on both arms, so this cell prices the match
-/// machinery around the dictionary rather than the dictionary itself. The
-/// residency axis shows in [`dict_probe_cold`], which pays the chunk fetches,
-/// and to a much smaller degree in [`dict_probe_distinct`] — not here.
+/// repeated lookups for the *same* terms. No lookup result is kept, so every
+/// iteration searches the dictionary again: in memory on one arm, through the
+/// same windows of the mapped child, their pages warm, on the other.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -469,14 +548,11 @@ fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
-/// Term→ID probes that always miss the memo: one shared store, so its chunk
-/// cache stays warm, probed with a different subject every iteration. This is
-/// the steady state of a query workload over a large term set — distinct
-/// lookups against a store that has been open a while — and the cell that
-/// prices the search itself: the memo cannot answer it and the chunk fetches
-/// are already paid, so what is left is what residency costs a warm binary
-/// search. The term is built outside the timed closure, as the other probe
-/// cells do.
+/// Term→ID probes for a different subject every iteration, on one shared
+/// store: the steady state of a query workload over a large term set —
+/// distinct lookups against a store that has been open a while — and the cell
+/// that prices the search across windows. The term is built outside the timed
+/// closure, as the other probe cells do.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -503,11 +579,9 @@ fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// Reconstruction of a point result (subject-bound, the ten-odd rows describing
-/// one resource): the chunk's handful of distinct codes stays under the
-/// point-read cap, so a file-backed dictionary resolves them by reading exactly
-/// those rows out of its cached wire chunks instead of scanning. The bound term
-/// is memoized after the first iteration, so this cell prices the decode, not
-/// the probe.
+/// one resource), the subject's probe included: a file-backed dictionary
+/// groups the chunk's handful of distinct codes by window and takes exactly
+/// those rows out of each window it rebuilds.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -527,10 +601,9 @@ fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
 
 /// Reconstruction of a wide matched subset (predicate-bound, one 32nd of the
 /// rows — the predicate vocabulary is 32 terms): resident decodes codes against
-/// the in-memory dictionary. The matched chunk holds far more distinct codes
-/// than the point-read cap admits, so a file-backed dictionary resolves them
-/// with one row-index scan — the bulk path, whose whole-leaf decode is what
-/// wins at this width. [`dict_decode_point`] covers the other side of the cap.
+/// the in-memory dictionary; a file-backed dictionary takes each chunk's many
+/// distinct codes out of the windows holding them. [`dict_decode_point`]
+/// covers a point result.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -546,6 +619,871 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
             black_box(quads.len())
         })
     });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4b — NARROWING (keep / window / predicates / batches)
+//
+// The restrictions a query engine pushes below a pattern, on the Group 4
+// file (both dictionary residencies where the dictionary is what answers):
+// a `keep` applied inside a predicate-bound file view, a `LIMIT` window and
+// an `ASK` over the same filtered view, a term predicate partitioning the
+// dictionary, and a batch of subject probes.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// A predicate-bound file view narrowed by a `keep` on its subject column:
+/// the namespace range of the first half of the subjects — on this sorted
+/// file one run, located in the mapped subject column and intersected with
+/// the view's rows, with the predicate filter left pending beside it — the
+/// shape a `VALUES`/`FILTER` pushdown takes on a file. Priced with the gather
+/// of the surviving code columns, which is where the pending filter is
+/// evaluated, so the number is what a consumer waits for.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_keep_range(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::Keep;
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
+    let keep = rt().block_on(async {
+        let dict = store.dict_reader().expect("dictionary handle");
+        let half = bench_moduli().n_subj / 2;
+        let lo = dict
+            .lower_bound(&format!("<{}", dataset::subject_iri(0)))
+            .await
+            .unwrap();
+        let hi = dict
+            .lower_bound(&format!("<{}", dataset::subject_iri(half)))
+            .await
+            .unwrap();
+        Keep::range(lo..hi)
+    });
+    bencher.bench(|| {
+        rt().block_on(async {
+            let narrowed = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P")
+                .keep(QuadColumn::S, &keep)
+                .await
+                .expect("keep");
+            let columns = narrowed.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
+/// A `VALUES` list on the object position over the whole store: every row
+/// kept to 256 object codes spread over the dataset's objects, no pattern
+/// bound, then gathered. On file one pass over the object column, each code
+/// tested against the set; resident, a pass over the in-memory column.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_keep_object_set(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::Keep;
+    let store = open_dict_store(*residency, bench_size());
+    let keep = rt().block_on(async {
+        let dict = store.dict_reader().expect("dictionary handle");
+        let objects = bench_moduli().n_obj;
+        let mut codes = Vec::new();
+        for i in (0..objects).step_by((objects / 256).max(1)).take(256) {
+            let term = dataset::object_term(i).to_ntriples();
+            codes.extend(dict.encode(&term).await.unwrap());
+        }
+        assert!(!codes.is_empty(), "no object code found");
+        Keep::set(codes)
+    });
+    bencher.bench(|| {
+        rt().block_on(async {
+            let kept = store.keep(QuadColumn::O, &keep).await.expect("keep");
+            let columns = kept.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
+/// `FILTER(isLiteral(?o))` under a predicate-bound pattern: the view kept to
+/// the dictionary's literal codes, one range, then gathered. On file the
+/// pending predicate filter is evaluated in the same pass that reads and
+/// tests the object column.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_keep_literal_objects(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::Keep;
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
+    let keep = rt().block_on(async {
+        let dict = store.dict_reader().expect("dictionary handle");
+        let (lo, hi) = dict.prefix_range("\"").await.unwrap();
+        Keep::range(lo..hi)
+    });
+    bencher.bench(|| {
+        rt().block_on(async {
+            let kept = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P")
+                .keep(QuadColumn::O, &keep)
+                .await
+                .expect("keep");
+            let columns = kept.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
+/// `LIMIT 64` over a predicate-bound file view: the filter's splits are
+/// evaluated in file order and the window stops at the first that fills —
+/// against the full match's gather, this is what `LIMIT` saves.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_window(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let windowed = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P")
+                .window(0, 64)
+                .await
+                .expect("window");
+            let columns = windowed.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
+/// `ASK` over a predicate-bound file view: `exists` reads the filter up to
+/// its first matching split.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_exists(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let matched = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P");
+            black_box(matched.exists().await.expect("exists"))
+        })
+    });
+}
+
+/// The store of `residency` beside the predicate-bound probe the probe
+/// benches run, cut to `limit` rows.
+fn predicate_probe(residency: DictResidency, limit: Option<usize>) -> (VortexRdfStore, Probe) {
+    let store = open_dict_store(residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let mut probe = Probe::new(None, p, None, None);
+    probe.limit = limit;
+    (store, probe)
+}
+
+/// `ASK` through the probe API the bindings call: `count_probe` of a
+/// predicate-bound pattern with a limit of one.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn probe_exists(bencher: divan::Bencher, residency: &DictResidency) {
+    let (store, probe) = predicate_probe(*residency, Some(1));
+    bencher.bench(|| {
+        rt().block_on(async { black_box(store.count_probe(&probe).await.expect("count_probe")) })
+    });
+}
+
+/// `COUNT` through the probe API: `count_probe` of a predicate-bound pattern
+/// with no limit, every matching row counted; on file, the pattern's filter
+/// evaluated over every split of the file.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn probe_count(bencher: divan::Bencher, residency: &DictResidency) {
+    let (store, probe) = predicate_probe(*residency, None);
+    bencher.bench(|| {
+        rt().block_on(async { black_box(store.count_probe(&probe).await.expect("count_probe")) })
+    });
+}
+
+/// `LIMIT 64` through the probe API: `run_probe` of a predicate-bound
+/// pattern windowed to 64 rows, its codes gathered.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn probe_window(bencher: divan::Bencher, residency: &DictResidency) {
+    let (store, probe) = predicate_probe(*residency, Some(64));
+    bencher.bench(|| {
+        rt().block_on(async {
+            let view = store.run_probe(&probe).await.expect("run_probe");
+            let columns = view.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
+/// A term predicate over 4,096 candidate codes spread across the dictionary:
+/// the per-query FILTER evaluation (resident: a cursor read per code read;
+/// file-backed: the windows holding them).
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_filter_codes(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::{TermPredicate, TextOptions};
+    let store = open_dict_store(*residency, bench_size());
+    // Over `STR()`: an IRI is a text only there. The build records its IRIs
+    // bracketed, so their candidates are decided by the prefix's code range
+    // and only the literals' are read.
+    let options = TextOptions {
+        as_str: true,
+        ..TextOptions::default()
+    };
+    let predicate = TermPredicate::parse_with("str_prefix", "http://", &options).unwrap();
+    let dict = store.dict_reader().expect("dictionary handle");
+    let step = (dict.len() / 4_096).max(1);
+    let codes: Vec<vortex_rdf_core::TermCode> = (0..dict.len() as vortex_rdf_core::TermCode)
+        .step_by(step)
+        .take(4_096)
+        .collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let (passed, undecided) = dict.filter_codes(&predicate, &codes).await.expect("filter");
+            black_box((passed.len(), undecided.len()))
+        })
+    });
+}
+
+/// A language range and a case-folded text test over 4,096 candidate codes
+/// of the literal store's in-memory dictionary, most of them literals:
+/// `lang_matches` compares the tag of every tagged literal it reads,
+/// `contains_lower` the lower-cased text of every string literal.
+#[divan::bench(args = ["lang_matches", "contains_lower"], sample_count = QUERY_SAMPLES)]
+fn narrow_filter_codes_text(bencher: divan::Bencher, kind: &str) {
+    use vortex_rdf_core::{CaseMap, TermPredicate, TextOptions};
+    let store = cached_literal_store(bench_size());
+    let predicate = match kind {
+        "lang_matches" => TermPredicate::parse("lang_matches", "EN").unwrap(),
+        _ => {
+            let options = TextOptions {
+                case: Some(CaseMap::Lower),
+                ..TextOptions::default()
+            };
+            TermPredicate::parse_with("contains", "\"value\"", &options).unwrap()
+        }
+    };
+    let dict = store.dict_reader().expect("dictionary handle");
+    let step = (dict.len() / 4_096).max(1);
+    let codes: Vec<vortex_rdf_core::TermCode> = (0..dict.len() as vortex_rdf_core::TermCode)
+        .step_by(step)
+        .take(4_096)
+        .collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let (passed, undecided) = dict.filter_codes(&predicate, &codes).await.expect("filter");
+            black_box((passed.len(), undecided.len()))
+        })
+    });
+}
+
+/// 256 subject IRIs spread across the dictionary encoded in one
+/// `encode_many`: the batch lookup a query engine runs over a `VALUES` block
+/// or a join's bound side.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_encode_many(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let dict = store.dict_reader().expect("dictionary handle");
+    let subjects = bench_moduli().n_subj;
+    let terms: Vec<String> = (0..256)
+        .map(|i| format!("<{}>", dataset::subject_iri((i * 7919) % subjects)))
+        .collect();
+    let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let codes = dict.encode_many(&terms).await.expect("encode_many");
+            black_box(codes.iter().flatten().count())
+        })
+    });
+}
+
+/// A batch of 64 subject probes in one `match_many`, gathered: the
+/// nested-loop join's shape, where a file-backed store overlaps the probes'
+/// reads.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_match_many(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let subjects = bench_moduli().n_subj;
+    let probes: Vec<Probe> = (0..64)
+        .map(|i| {
+            let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(
+                (i * 7919) % subjects,
+            )));
+            Probe::new(Some(s), None, None, None)
+        })
+        .collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let views = store.match_many(&probes).await.expect("match_many");
+            let mut rows = 0usize;
+            for view in &views {
+                rows += view
+                    .code_columns_gathered()
+                    .await
+                    .expect("gather")
+                    .map_or(0, |c| c[0].len());
+            }
+            black_box(rows)
+        })
+    });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4c — LIMIT PAIRS (the code reads, plain and windowed)
+//
+// The reads behind the bindings' `match_codes` / `matchCodes` (`run_probe`, then
+// `code_columns_gathered`) and Python's `match_code_chunks` (`run_probe`, then
+// every chunk of `code_chunks`), timed twice per shape on one warm Dictionary
+// store: `*_plain_*` as it is, `*_limit_*` windowed to a `limit` above the
+// shape's own rows, so the window cannot cut one. Both cells of a pair return
+// the same rows; the gap between them is what the window route costs, or saves,
+// for that shape and read.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// A shape of the limit pairs: a pattern's bound roles (Subject, Predicate,
+/// Object, Graph), each at term index 0. `SPG` leaves the object free, and `PG`
+/// binds the predicate and the graph alone, which no [`Pattern`] does: two
+/// equalities whose matches spread over every split of the file.
+// Each variant names the bound roles by letter, as `Pattern`'s do, so `SPG`
+// is consistent with its siblings, not a word to re-case.
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Copy, Clone, Debug)]
+enum LimitShape {
+    S,
+    SP,
+    SPO,
+    SPG,
+    P,
+    PO,
+    O,
+    G,
+    PG,
+}
+
+impl LimitShape {
+    /// This shape's probe, with no window.
+    fn probe(self) -> Probe {
+        let (s, p, o, g) = match self {
+            Self::S => terms_for(Pattern::S),
+            Self::SP => terms_for(Pattern::SP),
+            Self::SPO => terms_for(Pattern::SPO),
+            Self::SPG => {
+                let (s, p, _, g) = terms_for(Pattern::SPOG);
+                (s, p, None, g)
+            }
+            Self::P => terms_for(Pattern::P),
+            Self::PO => terms_for(Pattern::PO),
+            Self::O => terms_for(Pattern::O),
+            Self::G => terms_for(Pattern::G),
+            Self::PG => {
+                let (_, p, _, g) = terms_for(Pattern::SPOG);
+                (None, p, None, g)
+            }
+        };
+        Probe::new(s, p, o, g)
+    }
+}
+
+/// How a limit-pair cell reads its view once `run_probe` has matched it.
+#[derive(Copy, Clone)]
+enum PairRead {
+    /// `code_columns_gathered`, the one-shot read: the bindings'
+    /// `match_codes`.
+    Gathered,
+    /// Every chunk of `code_chunks` over the four columns, 65,536 rows a
+    /// chunk: Python's `match_code_chunks` at its default batch.
+    Chunks,
+}
+
+/// Which cell of a limit pair a benchmark times.
+#[derive(Copy, Clone)]
+enum PairSide {
+    /// The probe as it is.
+    Plain,
+    /// The probe windowed to a limit that cannot cut a row.
+    Limited,
+}
+
+/// The limit vortex-rdflib's `triples()` probes a pattern's size with.
+const PROBING_LIMIT: usize = 65_537;
+
+/// The rows a chunk holds at the Python binding's default batch.
+const PYTHON_BATCH: usize = 65_536;
+
+/// The rows of `view`'s code columns, gathered: the bindings' `match_codes`.
+async fn gathered_rows(view: &VortexRdfStore) -> usize {
+    let columns = view.code_columns_gathered().await.expect("gather");
+    columns.expect("a Dictionary view has code columns")[0].len()
+}
+
+/// The rows of `view`'s code chunks of `columns`, drained `batch` rows a chunk.
+async fn drain_code_chunks(view: &VortexRdfStore, columns: &[QuadColumn], batch: usize) -> usize {
+    let mut chunks = view.code_chunks(columns, batch).expect("code_chunks");
+    let mut rows = 0;
+    while let Some(chunk) = chunks.next().await {
+        rows += chunk.expect("code chunk")[0].len();
+    }
+    rows
+}
+
+/// One cell of a limit pair: `shape` matched on a Dictionary store of the given
+/// `source` and `index` (opened once, before timing) and read as the bindings
+/// read it, `run_probe` then `how`. The [`Plain`](PairSide::Plain) cell times
+/// the probe as it is; the [`Limited`](PairSide::Limited) one times it windowed
+/// to a limit that cannot cut a row: one above the shape's rows, and at least
+/// [`PROBING_LIMIT`], so that on a store of more rows than that the limit is
+/// also below the store's own size. The setup reads both ways once and panics,
+/// naming `cell` and the shape, unless their row counts agree.
+fn run_limit_pair(
+    bencher: divan::Bencher,
+    cell: &str,
+    source: Source,
+    index: Index,
+    how: PairRead,
+    shape: LimitShape,
+    side: PairSide,
+) {
+    let store = make_store(source, Layout::Dictionary, index, bench_size());
+    let read = |probe: &Probe| {
+        rt().block_on(async {
+            let view = store.run_probe(probe).await.expect("run_probe");
+            match how {
+                PairRead::Gathered => gathered_rows(&view).await,
+                PairRead::Chunks => drain_code_chunks(&view, &QuadColumn::ALL, PYTHON_BATCH).await,
+            }
+        })
+    };
+    let plain = shape.probe();
+    let rows = read(&plain);
+    assert!(rows > 0, "{cell}/{shape:?}: the match is empty");
+    let limit = (rows + 1).max(PROBING_LIMIT);
+    let windowed = plain.clone().window(0, Some(limit));
+    assert_eq!(
+        read(&windowed),
+        rows,
+        "{cell}/{shape:?}: a limit of {limit} changed the row count (left: windowed, right: plain)"
+    );
+    let probe = match side {
+        PairSide::Plain => plain,
+        PairSide::Limited => windowed,
+    };
+    bencher.bench(|| black_box(read(&probe)));
+}
+
+/// The limit-pair cells: one `read (index, source, [shapes]) => plain / limit`
+/// row per config, `read` a [`PairRead`], naming the config's two benchmark
+/// functions, each swept over the row's shapes.
+macro_rules! limit_pairs {
+    ($($read:ident ($index:expr, $source:expr, [$($shape:ident),+]) => $plain:ident / $limit:ident,)*) => {
+        $(
+            #[divan::bench(args = [$(LimitShape::$shape),+], sample_count = QUERY_SAMPLES)]
+            fn $plain(bencher: divan::Bencher, shape: &LimitShape) {
+                let (read, side) = (PairRead::$read, PairSide::Plain);
+                run_limit_pair(bencher, stringify!($plain), $source, $index, read, *shape, side);
+            }
+
+            #[divan::bench(args = [$(LimitShape::$shape),+], sample_count = QUERY_SAMPLES)]
+            fn $limit(bencher: divan::Bencher, shape: &LimitShape) {
+                let (read, side) = (PairRead::$read, PairSide::Limited);
+                run_limit_pair(bencher, stringify!($limit), $source, $index, read, *shape, side);
+            }
+        )*
+    };
+}
+
+limit_pairs!(
+    // The one-shot read, file stores.
+    Gathered (Index::None, Source::File, [S, SP, SPO, SPG, P, PO, O, G, PG]) => match_codes_plain_dict_noindex_file / match_codes_limit_dict_noindex_file,
+    Gathered (Index::ByCopy, Source::File, [P, PO, O]) => match_codes_plain_dict_bycopy_file / match_codes_limit_dict_bycopy_file,
+    Gathered (Index::ByReference, Source::File, [P, PO]) => match_codes_plain_dict_byref_file / match_codes_limit_dict_byref_file,
+    // The one-shot read, in-memory stores.
+    Gathered (Index::None, Source::InMemory, [SPG, P, PO]) => match_codes_plain_dict_noindex_mem / match_codes_limit_dict_noindex_mem,
+    Gathered (Index::ByCopy, Source::InMemory, [P, PO]) => match_codes_plain_dict_bycopy_mem / match_codes_limit_dict_bycopy_mem,
+    // The chunk stream, the no-index file store.
+    Chunks (Index::None, Source::File, [P, PO, O, G]) => chunks_codes_plain_dict_noindex_file / chunks_codes_limit_dict_noindex_file,
+    // The chunk stream, the by-copy file store: P, PO and O are index-served runs.
+    Chunks (Index::ByCopy, Source::File, [P, PO, O]) => chunks_codes_plain_dict_bycopy_file / chunks_codes_limit_dict_bycopy_file,
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4d — CHUNK READS (code chunks)
+//
+// The stream a query engine reads an in-memory view through, on the Group 2
+// in-memory Dictionary store (`from_built`, the store `from_quads` and the JS
+// `fromString`/`fromQuads` build): a predicate-bound view's code chunks, each
+// a window of its row ids gathered from the base's code columns, for one
+// column and for all four.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// The columns a code-chunk read asks for.
+#[derive(Copy, Clone)]
+enum ChunkColumns {
+    /// `o` alone.
+    O,
+    /// All four, in `(s, p, o, g)` order.
+    Spog,
+}
+
+impl ChunkColumns {
+    fn columns(self) -> &'static [QuadColumn] {
+        match self {
+            Self::O => &[QuadColumn::O],
+            Self::Spog => &QuadColumn::ALL,
+        }
+    }
+}
+
+impl fmt::Debug for ChunkColumns {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::O => "o",
+            Self::Spog => "spog",
+        })
+    }
+}
+
+const CHUNK_COLUMNS: &[ChunkColumns] = &[ChunkColumns::O, ChunkColumns::Spog];
+
+/// `code_chunks` over a predicate-bound view of the in-memory store (a 32nd
+/// of its rows, an id list), drained at the Python binding's default of
+/// 65,536 rows a chunk: `o` alone, and all four columns. The match, and a
+/// first drain that materializes the base's shared code columns, are
+/// untimed.
+#[divan::bench(args = CHUNK_COLUMNS, sample_count = QUERY_SAMPLES)]
+fn chunks_codes(bencher: divan::Bencher, columns: &ChunkColumns) {
+    let columns = columns.columns();
+    let store = cached_store(Layout::Dictionary, Index::None, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let view = rt()
+        .block_on(store.match_pattern(None, p.as_ref(), None, None))
+        .expect("match P");
+    let drain = || rt().block_on(drain_code_chunks(&view, columns, PYTHON_BATCH));
+    assert!(drain() > 0, "the predicate-bound view has rows");
+    bencher.bench(|| black_box(drain()));
+}
+
+/// [`chunks_codes`] on a store just built, each sample its own: the drain
+/// also decodes the base's compressed code columns it reads into their
+/// shared caches, `o` alone its one column, all four every column. The build
+/// and the match are untimed.
+#[divan::bench(args = CHUNK_COLUMNS, sample_count = QUERY_SAMPLES)]
+fn chunks_codes_cold(bencher: divan::Bencher, columns: &ChunkColumns) {
+    let columns = columns.columns();
+    let (_, p, ..) = terms_for(Pattern::P);
+    bencher
+        .with_inputs(|| {
+            let store = cached_store(Layout::Dictionary, Index::None, bench_size());
+            rt().block_on(store.match_pattern(None, p.as_ref(), None, None))
+                .expect("match P")
+        })
+        .bench_values(|view| {
+            black_box(rt().block_on(drain_code_chunks(&view, columns, PYTHON_BATCH)))
+        });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4e — SERVED READS (a run of a by-copy index)
+//
+// The reads a query engine makes of a view a by-copy index serves: the
+// predicate-bound (`P`) view of the Group 2 by-copy Dictionary store, whose
+// rows are one run of `index:posg`. Each cell is one read of that view: a
+// window near its start and a deep one, a keep of a sparse and of a dense set
+// of objects, the sparse keep's count, four partitions, the code-chunk stream
+// at the Python binding's default batch and at a small one, and (reused only)
+// the decoded quads. Every view a read returns is gathered
+// (`code_columns_gathered`), as the bindings' `match_codes` reads it.
+//
+// Two regimes per source: `served_fresh_*` matches the view inside the
+// measurement, as a query runs one read on a view it has just matched;
+// `served_reused_*` matches once, untimed, and times the read alone, as an
+// engine paging through one view does.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// One read of a served view: an argument of the served-read cells.
+#[derive(Copy, Clone)]
+enum ServedRead {
+    /// `window(10, 100)`, a page near the start.
+    CutWindow,
+    /// `window(n / 2, n / 4)`, a quarter of the view's `n` rows from its middle.
+    DeepWindow,
+    /// `keep` of every 16th distinct object.
+    KeepSparse,
+    /// `keep` of the lower half of the objects' code range.
+    KeepDense,
+    /// The sparse keep's `size`.
+    CountKeep,
+    /// `partitions(4)`, each gathered.
+    Partitions,
+    /// Every chunk of `code_chunks` over the four columns, 65,536 rows a chunk.
+    Chunks,
+    /// Every chunk of `code_chunks` over the four columns, 64 rows a chunk.
+    ChunksSmall,
+    /// `quads_vec`.
+    Quads,
+}
+
+impl fmt::Debug for ServedRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CutWindow => "cut_window",
+            Self::DeepWindow => "deep_window",
+            Self::KeepSparse => "keep_sparse",
+            Self::KeepDense => "keep_dense",
+            Self::CountKeep => "count_keep",
+            Self::Partitions => "partitions",
+            Self::Chunks => "chunks",
+            Self::ChunksSmall => "chunks_small",
+            Self::Quads => "quads",
+        })
+    }
+}
+
+/// The reads timed on a reused view: every [`ServedRead`], [`ServedRead::Quads`]
+/// last.
+const SERVED_REUSED_READS: &[ServedRead] = &[
+    ServedRead::CutWindow,
+    ServedRead::DeepWindow,
+    ServedRead::KeepSparse,
+    ServedRead::KeepDense,
+    ServedRead::CountKeep,
+    ServedRead::Partitions,
+    ServedRead::Chunks,
+    ServedRead::ChunksSmall,
+    ServedRead::Quads,
+];
+
+/// The reads timed on a fresh match each: all but the last, [`ServedRead::Quads`],
+/// which `match_cold_*` and `match_warm_*` already time with the match.
+const SERVED_FRESH_READS: &[ServedRead] = SERVED_REUSED_READS.split_last().unwrap().1;
+
+/// When a served-read cell matches its view.
+#[derive(Copy, Clone)]
+enum ServedMatch {
+    /// Inside the measurement, once per iteration.
+    Fresh,
+    /// Once, before the measurement.
+    Reused,
+}
+
+/// What a served read needs besides its view, derived once, untimed, from the
+/// view: its row count and the two keeps.
+struct ServedInputs {
+    rows: usize,
+    sparse: vortex_rdf_core::Keep,
+    dense: vortex_rdf_core::Keep,
+}
+
+/// `view` kept to the rows whose object `keep` admits.
+async fn kept_objects(view: &VortexRdfStore, keep: &vortex_rdf_core::Keep) -> VortexRdfStore {
+    view.keep(QuadColumn::O, keep).await.expect("keep")
+}
+
+impl ServedRead {
+    /// This read of `view`, as the rows it returns.
+    async fn rows(self, view: &VortexRdfStore, inputs: &ServedInputs) -> usize {
+        match self {
+            Self::CutWindow => gathered_rows(&view.window(10, 100).await.expect("window")).await,
+            Self::DeepWindow => {
+                let (offset, limit) = (inputs.rows / 2, inputs.rows / 4);
+                gathered_rows(&view.window(offset, limit).await.expect("window")).await
+            }
+            Self::KeepSparse => gathered_rows(&kept_objects(view, &inputs.sparse).await).await,
+            Self::KeepDense => gathered_rows(&kept_objects(view, &inputs.dense).await).await,
+            Self::CountKeep => {
+                let kept = kept_objects(view, &inputs.sparse).await;
+                kept.size().await.expect("size")
+            }
+            Self::Partitions => {
+                let four = std::num::NonZeroUsize::new(4).expect("four is not zero");
+                let parts = view.partitions(four).await.expect("partitions");
+                let mut rows = 0;
+                for part in &parts {
+                    rows += gathered_rows(part).await;
+                }
+                rows
+            }
+            Self::Chunks => drain_code_chunks(view, &QuadColumn::ALL, PYTHON_BATCH).await,
+            Self::ChunksSmall => drain_code_chunks(view, &QuadColumn::ALL, 64).await,
+            Self::Quads => view.quads_vec().await.expect("quads").len(),
+        }
+    }
+}
+
+/// One served-read cell: `read` of the `P` view of the by-copy Dictionary store
+/// of `source` (opened untimed), matched as `matched` says. The setup derives
+/// the read's inputs from one match and reads it once, and panics, naming
+/// `cell` and the read, unless it returns rows.
+fn served_read(
+    bencher: divan::Bencher,
+    cell: &str,
+    source: Source,
+    matched: ServedMatch,
+    read: ServedRead,
+) {
+    use vortex_rdf_core::{Keep, TermCode};
+
+    let store = make_store(source, Layout::Dictionary, Index::ByCopy, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let (store, p) = (&store, p.as_ref());
+    let view_of = move || async move {
+        store
+            .match_pattern(None, p, None, None)
+            .await
+            .expect("match P")
+    };
+    let view = rt().block_on(view_of());
+    let inputs = rt().block_on(async {
+        let columns = view.code_columns_gathered().await.expect("gather");
+        let columns = columns.expect("a Dictionary view has code columns");
+        let mut objects: Vec<TermCode> = columns[2].iter().copied().collect();
+        objects.sort_unstable();
+        objects.dedup();
+        ServedInputs {
+            rows: view.size().await.expect("size"),
+            sparse: Keep::set(objects.iter().step_by((objects.len() / 16).max(1)).copied()),
+            dense: Keep::range(objects[0]..objects[objects.len() / 2]),
+        }
+    });
+    let rows = rt().block_on(read.rows(&view, &inputs));
+    assert!(rows > 0, "{cell}/{read:?}: the read returned no rows");
+    match matched {
+        ServedMatch::Fresh => {
+            drop(view);
+            bencher.bench(|| {
+                black_box(rt().block_on(async {
+                    let view = view_of().await;
+                    read.rows(&view, &inputs).await
+                }))
+            });
+        }
+        ServedMatch::Reused => {
+            bencher.bench(|| black_box(rt().block_on(read.rows(&view, &inputs))))
+        }
+    }
+}
+
+/// The served-read cells: one `name (source, match, reads)` row per benchmark
+/// function, a [`Source`] and a [`ServedMatch`], each swept over its reads.
+macro_rules! served_reads {
+    ($($name:ident ($source:ident, $matched:ident, $reads:ident),)*) => {
+        $(
+            #[divan::bench(args = $reads, sample_count = QUERY_SAMPLES)]
+            fn $name(bencher: divan::Bencher, read: &ServedRead) {
+                let (source, matched) = (Source::$source, ServedMatch::$matched);
+                served_read(bencher, stringify!($name), source, matched, *read);
+            }
+        )*
+    };
+}
+
+served_reads!(
+    served_fresh_file(File, Fresh, SERVED_FRESH_READS),
+    served_fresh_mem(InMemory, Fresh, SERVED_FRESH_READS),
+    served_reused_file(File, Reused, SERVED_REUSED_READS),
+    served_reused_mem(InMemory, Reused, SERVED_REUSED_READS),
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Groups 4f-4j — LOCATED READS (checked runs and graph-bound general matches)
+//
+// One parameterized group, its cells listed and documented in `located/`: a
+// checked run's code reads (`countCodes`, `matchCodes`, `matchCodeChunks`) on
+// a mapped file, by copy or by reference, where a located run answers them,
+// and on the file loaded in memory, where the index run is checked inside its
+// component; and a graph-bound general match's counts, rows and middle page
+// over zones that each hold a few graphs, or one graph whole.
+// ══════════════════════════════════════════════════════════════════════════
+
+#[divan::bench(args = located::cells(), sample_count = QUERY_SAMPLES)]
+fn located(bencher: divan::Bencher, cell: &located::Cell) {
+    located::time(bencher, *cell);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4k — SERVED STRING READS (narrowed reads of a string-layout run)
+//
+// Group 4e's served view on a file whose columns hold strings: the `P` view of
+// the Group 2 by-copy Default-layout store, one run of `index:posg`. A
+// narrowed view of it reads its positions in the child, and no probe reads a
+// string column, so every read below scans the child for its rows. Each cell
+// times one read of the view matched once before timing, as an engine paging
+// through it does: a window near its start and a deep one, and four
+// partitions, each read as quads.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// One narrowed read of a served string-layout view: an argument of the
+/// served-string cells.
+#[derive(Copy, Clone)]
+enum StringRead {
+    /// `window(10, 100)`, a page near the start.
+    CutWindow,
+    /// `window(n / 2, n / 4)`, a quarter of the view's `n` rows from its middle.
+    DeepWindow,
+    /// `partitions(4)`, each read.
+    Partitions,
+}
+
+impl fmt::Debug for StringRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CutWindow => "cut_window",
+            Self::DeepWindow => "deep_window",
+            Self::Partitions => "partitions",
+        })
+    }
+}
+
+/// The reads timed on the served string-layout view.
+const STRING_READS: &[StringRead] = &[
+    StringRead::CutWindow,
+    StringRead::DeepWindow,
+    StringRead::Partitions,
+];
+
+impl StringRead {
+    /// This read of `view`, of `rows` rows, as the quads it returns.
+    async fn rows(self, view: &VortexRdfStore, rows: usize) -> usize {
+        let quads =
+            |view: VortexRdfStore| async move { view.quads_vec().await.expect("quads").len() };
+        match self {
+            Self::CutWindow => quads(view.window(10, 100).await.expect("window")).await,
+            Self::DeepWindow => {
+                let window = view.window(rows / 2, rows / 4).await.expect("window");
+                quads(window).await
+            }
+            Self::Partitions => {
+                let four = std::num::NonZeroUsize::new(4).expect("four is not zero");
+                let mut read = 0;
+                for part in view.partitions(four).await.expect("partitions") {
+                    read += quads(part).await;
+                }
+                read
+            }
+        }
+    }
+}
+
+/// One served-string cell: `read` of the `P` view of the by-copy Default-layout
+/// file store, matched once before timing. The setup panics, naming `cell` and
+/// the read, unless the read returns rows.
+fn served_strings(bencher: divan::Bencher, cell: &str, read: StringRead) {
+    let store = make_store(Source::File, Layout::Default, Index::ByCopy, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let view = rt().block_on(async {
+        store
+            .match_pattern(None, p.as_ref(), None, None)
+            .await
+            .expect("match P")
+    });
+    let rows = rt().block_on(view.size()).expect("size");
+    let read_rows = rt().block_on(read.rows(&view, rows));
+    assert!(read_rows > 0, "{cell}/{read:?}: the read returned no rows");
+    bencher.bench(|| black_box(rt().block_on(read.rows(&view, rows))));
+}
+
+#[divan::bench(args = STRING_READS, sample_count = QUERY_SAMPLES)]
+fn served_strings_file(bencher: divan::Bencher, read: &StringRead) {
+    served_strings(bencher, "served_strings_file", *read);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -576,8 +1514,9 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
 /// floor folds the tail into the base, which is a rebuild rather than an append
 /// — `mutate_compact` times that — and for a file-backed store the fold rewrites
 /// its source file in place, which is the shared artifact every other file
-/// benchmark here opens. The comparative suite's `MUT_BATCH` (`compare.rs`) is
-/// not clamped: its add row deliberately includes the auto-compaction.
+/// benchmark here opens. The comparative suite's `MUT_BATCH`
+/// (`bench-compare/benches/compare.rs`) is not clamped: its add row
+/// deliberately includes the auto-compaction.
 fn mut_batch() -> usize {
     /// One below `AUTO_COMPACT_TAIL_FLOOR`, the smallest tail the store will
     /// fold (the ratio trigger only raises that bar).

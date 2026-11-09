@@ -15,6 +15,7 @@
     --border-strong: rgba(11,11,11,0.18);
     --accent:      #2a78d6;
     --good:        #0ca30c;
+    --bad:         #c62828;
     --c1: #2a78d6;
     --c2: #008300;
     --c3: #e87ba4;
@@ -36,6 +37,7 @@
       --border-strong: rgba(255,255,255,0.18);
       --accent:      #3987e5;
       --good:        #0ca30c;
+      --bad:         #ef6461;
       --c1: #3987e5;
       --c2: #008300;
       --c3: #d55181;
@@ -57,6 +59,7 @@
     --border-strong: rgba(255,255,255,0.18);
     --accent:      #3987e5;
     --good:        #0ca30c;
+    --bad:         #ef6461;
     --c1: #3987e5;
     --c2: #008300;
     --c3: #d55181;
@@ -69,7 +72,7 @@
     --ink:#0b0b0b; --ink-2:#52514e; --ink-muted:#898781;
     --grid:#e1e0d9; --baseline:#c3c2b7; --border:rgba(11,11,11,0.10);
     --border-strong: rgba(11,11,11,0.18);
-    --accent:#2a78d6; --good:#0ca30c;
+    --accent:#2a78d6; --good:#0ca30c; --bad:#c62828;
     --c1:#2a78d6; --c2:#008300; --c3:#e87ba4; --c4:#eda100;
     --focus:#2a78d6;
   }
@@ -212,6 +215,8 @@
   .matrix-table td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
   .matrix-table td.num .ratio { color:var(--ink-muted); font-size:10.5px; margin-left:5px; }
   .matrix-table td.num.best { color:var(--good); font-weight:700; }
+  .spread { color:var(--ink-muted); cursor:help; }
+  .matrix-table td.num .spread { margin-left:4px; }
   /* The note's own word for the winning cell, shown in the colour it names. */
   .panel .note .best-key { color:var(--good); font-weight:700; }
   /* An operation the library has no API for. Deliberately not styled like a
@@ -220,6 +225,13 @@
     color:var(--ink-muted); font-style:italic; font-size:11px;
     font-family:inherit; font-variant-numeric:normal;
   }
+  /* A phase the store attempted and could not complete: a result, in the
+     failure colour, never styled like the absence of one. */
+  .matrix-table td.num.failed {
+    color:var(--bad); font-weight:600; font-size:11px;
+    font-family:inherit; font-variant-numeric:normal;
+  }
+  .lede .failed { color:var(--bad); font-weight:600; }
   .matrix-table tbody tr.group-break td { border-top:1px solid var(--border-strong); }
   /* Two-level header (pattern spanning its cold/warm leaves). The pattern name
      is centred over its own leaves and each group is fenced on the left, so a
@@ -288,6 +300,7 @@
         <button class="tab" data-tab="rust" role="tab" type="button">Rust · core</button>
         <button class="tab" data-tab="js" role="tab" type="button">JavaScript · WASM</button>
         <button class="tab" data-tab="py" role="tab" type="button">Python · bindings</button>
+        <button class="tab" data-tab="java" role="tab" type="button">Java · bindings</button>
       </nav>
       <div class="theme-switch" role="radiogroup" aria-label="Color theme">
         <label title="Light">
@@ -359,6 +372,9 @@
       <strong>oxigraph</strong> enters twice — its in-memory store and its RocksDB-backed
       one, the same library across the residency axis the Vortex (file, memory) pairs
       cross; <strong>sophia</strong> only holds its data in memory.
+      A query (a match or count, the full scan included) whose first run takes longer
+      than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
+      tooltip.
     </p>
     <p class="lede mono" id="compare-provenance"></p>
     <div class="panel-grid" id="compare-ingest-panels"></div>
@@ -403,14 +419,21 @@
   <section id="compare-footprint" class="group">
     <div class="group-head">
       <span class="chan-tag mono">FOOTPRINT</span>
-      <h2>Peak memory &amp; on-disk size</h2>
+      <h2>Store memory &amp; on-disk size</h2>
     </div>
     <p class="group-desc">
-      Each library runs in its own process, so peak RSS is the kernel-tracked high-water mark
-      (<span class="mono">VmHWM</span>) for one library alone — build, open and every pattern in
-      that process. On-disk size is the artifact the build produced, listed only for the
-      libraries that write one — a store that lives only in memory has no artifact to size.
-      Lower is better in both tables.
+      The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
+      (3 by default) fresh processes per library, after the timed runs. Each run first opens the store
+      and disposes it before any read: <em>Store</em> is the live memory that dispose released, so it leaves out the caches reads fill. The run then opens the store again, the same way, and reads every pattern once as the timed cells do. The two Peak columns are <span class="mono">RssAnon</span> (process memory) and <span class="mono">RssFile</span>
+      (mapped pages) at the highest 2 ms sample during the reads, above the baseline taken before
+      the first open. The reads run on the second store, so a peak can include memory the allocator kept from the first. A file-backed store's pages show under mapped pages. A store held in memory shows only the program's own code pages that the open and reads first touched, which also count as mapped pages: a few MB
+      to a few tens of MB depending on the library, the same for a library's file and in-memory
+      rows, so a pair's gap is the file's own pages. Live memory is counted by a counting allocator around mimalloc, plus glibc's <span class="mono">mallinfo2</span> for C/C++ allocations such as
+      RocksDB's. oxigraph (memory) and sophia rebuild from the N-Quads file inside each memory
+      process, so their peaks include memory the allocator kept from the builds. The query runs'
+      peak RSS is no longer shown, but stays in the results file. On-disk size is the artifact the
+      build produced, listed only for the libraries that write one — a store that lives only in
+      memory has no artifact to size. Lower is better in both tables.
     </p>
     <div class="panel-grid" id="compare-footprint-panels"></div>
   </section>
@@ -499,10 +522,15 @@
       <a href="https://github.com/KonradHoeffner/hdt#web-assembly">hdt-wasm</a> (the Rust crate's read-only
       wasm bindings), on a
       synthetic dataset generated in-process of named-graph quads (triples for hdt), across build, open, query in both cache regimes, full scan, add and delete.
+      A query (a match or count, the full scan included) whose first run takes longer
+      than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
+      tooltip.
+      A phase the store could not complete reads <span class="mono">failed</span>, with its error as the tooltip, and is listed under the count check.
     </p>
     <div class="kpi-row" id="js-kpi-row"></div>
     <p class="lede mono" id="js-matched-rows"></p>
     <p class="lede" id="js-count-warnings"></p>
+    <p class="lede" id="js-failures"></p>
   </section>
 
   <section id="js-ingest" class="group">
@@ -547,14 +575,19 @@
   <section id="js-memory" class="group">
     <div class="group-head">
       <span class="chan-tag mono">FOOTPRINT</span>
-      <h2>Peak memory</h2>
+      <h2>Store memory</h2>
     </div>
     <p class="group-desc">
-      Each adapter runs in its own process per phase — query, cold query, full scan and
-      mutation are four separate processes. The
-      query process covers build, query and ingest. Peak
-      resident-set size per adapter, the kernel-tracked high-water mark
-      (<span class="mono">VmHWM</span>), not a point-in-time sample. Lower is better.
+      The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
+      (3 by default) fresh processes per adapter, after the timed runs. Each run first builds or loads the store
+      and frees it before any read: <em>Store</em> is the live memory that free released, so it leaves out
+      the caches reads fill. The run then builds or loads the store again, the same way, and reads every
+      pattern once as the timed cells do.
+      There is one Store column per method, so each compares like with like: built (Vortex,
+      oxigraph, rdf-stores) and loaded (Vortex <span class="mono">fromBytes</span>, hdt). The Peak column counts live bytes, not RSS, because wasm memory never shrinks: the module's counter (compiled into the benchmark's builds only) plus the JS heap after GC, above the baseline taken before the first store is built or loaded. It is measured after each pattern's read, on the store the timed cells use, and leaves out a streaming read's current chunk. oxigraph's binding has
+      no streaming read (<span class="mono">match()</span> returns an array), so its peak holds a
+      whole result. There is no mapped-pages column, because no JS store maps a file. The query
+      runs' peak RSS is no longer shown, but stays in the results file. Lower is better.
     </p>
     <div class="panel-grid" id="js-memory-panels"></div>
   </section>
@@ -601,12 +634,14 @@
     <p class="lede">
       One <code>python/bench/run.py</code> run — the <code>vortex_rdf</code> bindings compared
       against <a href="https://pypi.org/project/pyoxigraph/">pyoxigraph</a>,
-      <a href="https://pypi.org/project/pycottas/">pycottas</a>,
-      <a href="https://pypi.org/project/rdflib/">rdflib</a>, and
-      <a href="https://pypi.org/project/lightrdf/">lightrdf</a> (does not support graphs), across
+      <a href="https://pypi.org/project/pycottas/">pycottas</a> and
+      <a href="https://pypi.org/project/rdflib/">rdflib</a>, across
       build, open, query in both cache regimes, full scan, add and delete.
       Vortex appears with variant build configurations, all using the <em>Dictionary</em>
       layout and different source and indexes.
+      A query (a match or count, the full scan included) whose first run takes longer
+      than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
+      tooltip.
     </p>
     <div class="kpi-row" id="py-kpi-row"></div>
     <p class="lede mono" id="py-matched-rows"></p>
@@ -621,13 +656,10 @@
     <p class="group-desc">
       <strong>Build</strong> is each library's idiomatic path from a shared N-Quads file
       to a queryable store (<code>serialize_rdf</code>, <code>bulk_load</code>,
-      <code>rdf2cottas</code>, <code>Dataset.parse</code>) — lightrdf reads the triples
-      projection instead. <strong>Open</strong> is what a fresh
+      <code>rdf2cottas</code>, <code>Dataset.parse</code>). <strong>Open</strong> is what a fresh
       process pays to query an already-built artifact. pyoxigraph and rdflib hold their store
       in memory and have no artifact to open, so those cells read
       <span class="mono">unsupported</span>.
-      lightrdf builds nothing; its “build” is one full parse, the same pass every other
-      library must do before it can index anything.
     </p>
     <div class="panel-grid" id="py-ingest-panels"></div>
   </section>
@@ -644,13 +676,11 @@
       <strong>Materialized</strong> delivers the results by
       iterating its matches in Python and reading every term's string 
       so each library pays for delivering its results (Vortex builds N-Triples strings in Rust,
-      pyoxigraph's <span class="mono">.value</span> reads built Python strings, pycottas and
-      lightrdf yield tuples of strings). <strong>Count-only</strong> skips the reads entirely:
+      pyoxigraph's <span class="mono">.value</span> reads built Python strings, pycottas
+      yields tuples of strings). <strong>Count-only</strong> skips the reads entirely:
       the same pattern resolved, only how many rows matched. Residency differs
       too: the Vortex <em>(file)</em> rows and pycottas read from disk per query, while the
       Vortex <em>(memory)</em>, pyoxigraph and rdflib answer from memory.
-      <strong>lightrdf is the no-index baseline</strong>: it has no store, so every pattern
-      re-parses the whole source file and costs about the same regardless of selectivity.
     </p>
     <div class="panel-grid" id="py-query-panels"></div>
   </section>
@@ -661,10 +691,9 @@
       <h2>Add &amp; delete</h2>
     </div>
     <p class="group-desc">
-      Per-quad addition and deletion of a fixed batch. Only two of the five libraries support mutations: 
-      the Vortex <em>Python</em> bindings expose no mutation API so far, pycottas's store raises
-      <span class="mono">“The COTTAS store is read only!”</span>, and lightrdf is a parser with
-      no store to mutate.
+      Per-quad addition and deletion of a fixed batch. Only two of the four libraries support mutations:
+      the Vortex <em>Python</em> bindings expose no mutation API so far, and pycottas's store raises
+      <span class="mono">“The COTTAS store is read only!”</span>.
     </p>
     <div class="panel-grid" id="py-mut-panels"></div>
   </section>
@@ -672,14 +701,32 @@
   <section id="py-footprint" class="group">
     <div class="group-head">
       <span class="chan-tag mono">FOOTPRINT</span>
-      <h2>Peak memory &amp; on-disk size</h2>
+      <h2>Store memory &amp; on-disk size</h2>
     </div>
     <p class="group-desc">
-      Each adapter runs in its own process <em>and its own virtualenv</em>, so peak RSS is the
-      kernel-tracked high-water mark (<span class="mono">VmHWM</span>) for one library alone.
-      On-disk size is the artifact the build produced, listed only for the libraries that write
-      one — a store that lives only in memory has no artifact to size, and for lightrdf it is
-      the triples projection it re-reads. Lower is better in both tables.
+      The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
+      (3 by default) fresh processes per adapter, each in that adapter's own <em>virtualenv</em>, after the
+      timed runs. Each run first opens the store and disposes it before any read: <em>Store</em> is the
+      live memory that dispose released, so it leaves out the caches reads fill. The run then opens the
+      store again, the same way, and reads every pattern once as the timed cells do. The two Peak columns are <span class="mono">RssAnon</span> (process
+      memory) and <span class="mono">RssFile</span> (mapped pages) at the highest 2 ms sample
+      during the reads, above the baseline taken before the first open. The reads run on the second store, so a peak can include memory the allocator kept from the first. A file-backed store's pages show
+      under mapped pages. A store held in memory shows only the program's own code pages that the open
+      and reads first touched, which also count as mapped pages: a few MB to a few tens of MB depending on the
+      library, the same for a library's file and in-memory rows, so a pair's gap is the file's own
+      pages. The memory processes run with <span class="mono">PYTHONMALLOC=malloc</span> and read
+      <span class="mono">mallinfo2</span>, so Python objects and native extensions are both
+      counted; rdflib therefore carries glibc's per-allocation overhead instead of pymalloc's.
+      pycottas's Store adds DuckDB's own count of the memory it tracks, read before the open and right
+      after it: DuckDB allocates through its own allocator, which <span class="mono">mallinfo2</span>
+      cannot see, and its caches outlive the store.
+      pycottas reads through <span class="mono">search()</span>, which collects every match, so its
+      peak holds whole results. pyoxigraph and rdflib rebuild from the N-Quads file inside each
+      memory process, so their peaks include memory the allocator kept from the builds.
+      The query runs' peak RSS is no longer shown, but stays in the
+      results file and still drives the memory-pressure warning. On-disk size is the artifact the
+      build produced, listed only for the libraries that write one — a store that lives only in
+      memory has no artifact to size. Lower is better in both tables.
     </p>
     <div class="panel-grid" id="py-footprint-panels"></div>
   </section>
@@ -711,6 +758,144 @@
 
   <footer class="prov mono" id="py-provenance"></footer>
   </div><!-- /tab-py -->
+
+  <div id="tab-java" class="tabpane">
+  <nav class="seclinks">
+    <a href="#java-overview">Overview</a>
+    <a href="#java-ingest">Build &amp; open</a>
+    <a href="#java-query">Query</a>
+    <a href="#java-mutations">Mutations</a>
+    <a href="#java-footprint">Footprint</a>
+    <a href="#java-data">Raw data</a>
+  </nav>
+
+  <section id="java-overview" class="group">
+    <p class="lede">
+      One <code>java/bench/run.py</code> run — the <code>org.vortexrdf</code> Java bindings compared
+      against <a href="https://github.com/rdfhdt/hdt-java">hdt-java</a>,
+      <a href="https://github.com/the-qa-company/qEndpoint">qEndpoint</a>'s HDT library,
+      <a href="https://jena.apache.org/">Apache Jena</a> (its in-memory dataset and TDB2) and
+      <a href="https://rdf4j.org/">Eclipse RDF4J</a> (MemoryStore and LMDB), across
+      build, open, query in both cache regimes, full scan, add and delete.
+      Vortex appears with the Python tab's six build configurations, all using the <em>Dictionary</em>
+      layout. Each adapter runs in its own JVM, on its own library's classpath.
+      A query (a match or count, the full scan included) whose first run takes longer
+      than 30 s is not measured, and reads <span class="mono">timeout</span>, that run's time as its
+      tooltip.
+    </p>
+    <div class="kpi-row" id="java-kpi-row"></div>
+    <p class="lede mono" id="java-matched-rows"></p>
+    <p class="lede" id="java-count-warnings"></p>
+    <p class="lede" id="java-failures"></p>
+  </section>
+
+  <section id="java-ingest" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">BUILD</span>
+      <h2>Build &amp; open</h2>
+    </div>
+    <p class="group-desc">
+      <strong>Build</strong> is each library's idiomatic path from a shared N-Quads file
+      to a queryable store: <code>vortex-rdf-cli serialize</code> for Vortex, whose Java bindings
+      only read; HDT generation, then its index, for the two HDT libraries (hdt-java from the triples
+      projection, since its HDT has no graphs); Jena's TDB2 bulk loader, or a parse into its in-memory
+      dataset; an RDF4J connection's <code>add</code> in one transaction. <strong>Open</strong> is what
+      a fresh process pays to query an already-built artifact. Jena's in-memory dataset and RDF4J's
+      MemoryStore hold their store in memory and have no artifact to open, so those cells read
+      <span class="mono">unsupported</span>.
+    </p>
+    <div class="panel-grid" id="java-ingest-panels"></div>
+  </section>
+
+  <section id="java-query" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">QUERY</span>
+      <h2>Match — cross-library</h2>
+    </div>
+    <p class="group-desc">
+      Resolving each pattern:
+      <span class="mono">S</span>/<span class="mono">P</span>/<span class="mono">O</span>/<span class="mono">G</span>/<span class="mono">SP</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">SPOG</span>/<span class="mono">full</span>,
+      all on the one dataset — in two units per cache regime.
+      <strong>Materialized</strong> iterates the matches in each library's own result form and reads
+      every term as a Java <code>String</code> (Vortex's N-Triples spellings built in Rust, HDT's term
+      strings, Jena's nodes, RDF4J's values). <strong>Count-only</strong> resolves the same pattern and
+      counts the rows without reading a term. Before any pattern is timed, every pattern runs for a fixed
+      warm-up budget, discarded, so each library is measured with its query path JIT-compiled.
+      Residency differs too: the Vortex <em>(file)</em> rows, both HDT files, TDB2 and LMDB read from
+      disk, while the Vortex <em>(memory)</em> rows, Jena's in-memory dataset and the MemoryStore answer
+      from memory. RDF4J's LMDB store carries the spoc, posc, ospc and cspo indexes, so object- and
+      graph-bound patterns are served from an index, as in every other store here. hdt-java has no graphs, so its <span class="mono">G</span> and
+      <span class="mono">SPOG</span> cells read <span class="mono">unsupported</span>.
+    </p>
+    <div class="panel-grid" id="java-query-panels"></div>
+  </section>
+
+  <section id="java-mutations" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">MUTATE</span>
+      <h2>Add &amp; delete</h2>
+    </div>
+    <p class="group-desc">
+      Per-quad addition and deletion of a fixed batch, the batch in one transaction, each store
+      committing with its library's default durability: TDB2's commits are durable, RDF4J's LMDB store
+      does not force a sync at commit, and Jena's in-memory dataset and the MemoryStore keep nothing on
+      disk. Four of the seven stores support mutations: the Vortex <em>Java</em> bindings are
+      read-only, and an HDT file cannot change — qEndpoint's updates live in its store layer, which this
+      tab does not measure.
+    </p>
+    <div class="panel-grid" id="java-mut-panels"></div>
+  </section>
+
+  <section id="java-footprint" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">FOOTPRINT</span>
+      <h2>Store memory &amp; on-disk size</h2>
+    </div>
+    <p class="group-desc">
+      The memory figures come from separate memory runs: <span class="mono">BENCH_MEMORY_RUNS</span>
+      (3 by default) fresh JVMs per adapter, each on that adapter's own <em>classpath</em>, after the timed
+      runs.
+      Each run first opens the store and disposes it before any read: <em>Store</em> is the live memory that dispose released, so it leaves out the caches reads fill. The run then opens the store again, the same way, and reads every pattern once as the timed cells do. For Java, Store is the heap used after a full collection, plus glibc's bytes in use, minus the JVM's own allocations as Native Memory Tracking reports them. A store held in the heap has a process-memory peak that follows the heap limit (the provenance line lists it) and the collector, so Store is the figure to compare. The two Peak columns are <span class="mono">RssAnon</span> (process memory) and <span class="mono">RssFile</span>
+      (mapped pages) at the highest 2 ms sample during the reads, above the baseline taken before
+      the first open. The reads run on the second store, so a peak can include memory the allocator kept from the first. HDT, LMDB and TDB2 files count as mapped pages. A store held in memory shows only the program's own code pages that the open and reads first touched, which also count as mapped pages: a few MB to a
+      few tens of MB depending on the library, the same for a library's file and in-memory rows, so
+      a pair's gap is the file's own pages. Jena TIM and RDF4J's MemoryStore rebuild from the
+      N-Quads file inside each memory process, so their peaks include memory the JVM kept from the
+      builds. The query runs' peak RSS is no longer shown, but stays
+      in the results file and still drives the memory-pressure warning. On-disk size is the artifact
+      the build left, counted in allocated blocks, listed only for the stores that write one. Lower
+      is better in both tables.
+    </p>
+    <div class="panel-grid" id="java-footprint-panels"></div>
+  </section>
+
+  <section id="java-data" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DATA</span>
+      <h2>Every measured configuration</h2>
+    </div>
+    <p class="group-desc">Every leaf benchmark from this run. Click a column to sort.</p>
+    <div class="table-toolbar">
+      <input id="java-table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
+      <span class="count" id="java-table-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="java-data-table">
+        <thead><tr>
+          <th data-key="id" tabindex="0" role="button" aria-label="Sort by benchmark name">Benchmark</th>
+          <th data-key="fastest_ns" tabindex="0" role="button" aria-label="Sort by fastest">Fastest</th>
+          <th data-key="slowest_ns" tabindex="0" role="button" aria-label="Sort by slowest">Slowest</th>
+          <th data-key="median_ns" tabindex="0" role="button" aria-label="Sort by median">Median</th>
+          <th data-key="mean_ns" tabindex="0" role="button" aria-label="Sort by mean">Mean</th>
+          <th data-key="samples" tabindex="0" role="button" aria-label="Sort by sample count">Samples</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="prov mono" id="java-provenance"></footer>
+  </div><!-- /tab-java -->
 </main>
 
 <script>
@@ -731,6 +916,12 @@ const PY_MEMORY = __PY_MEMORY_DATA__;
 const PY_SIZES = __PY_SIZE_DATA__;
 const PY_CONFIG = __PY_CONFIG_DATA__;
 const PY_PROVENANCE = __PY_PROVENANCE__;
+const JAVA_DATA = __JAVA_BENCH_DATA__;
+const JAVA_MEMORY = __JAVA_MEMORY_DATA__;
+const JAVA_SIZES = __JAVA_SIZE_DATA__;
+const JAVA_CONFIG = __JAVA_CONFIG_DATA__;
+const JAVA_PROVENANCE = __JAVA_PROVENANCE__;
+const JAVA_FAILURES = __JAVA_FAILURE_DATA__;
 // Cold and warm measurements of one pattern share an id and differ only by
 // `regime`, so the key carries it. The Rust tab needs no suffix: its regimes are
 // separate bench groups (match_cold_* / match_warm_*), so its ids already differ.
@@ -739,40 +930,144 @@ const rustById = new Map(RUST_DATA.map(d => [d.id, d]));
 const jsById = new Map(JS_DATA.map(d => [byKey(d), d]));
   // A phase the harness attempted and the store could not survive is a result,
   // not a gap: render it as its own labelled cell, with the error as the
-  // tooltip. Without this, oxigraph trapping on the materialized full scan
-  // would look like a benchmark nobody ran.
-  for (const f of JS_FAILURES ?? []){
-    const id = `${f.slug}::${f.phase}`;
-    if (!jsById.has(id))
-      jsById.set(id, { median:"failed", median_ns:null, unsupported:true,
-        reason:`could not complete this phase: ${f.error}` });
+  // tooltip. Without this, a store trapping mid-phase would look like a
+  // benchmark nobody ran.
+  for (const f of JS_FAILURES){
+    // A pattern's cell is `<slug>::<phase>`; an operation's is `<phase>::<slug>`.
+    for (const id of [`${f.slug}::${f.phase}`, `${f.phase}::${f.slug}`]){
+      if (!jsById.has(id))
+        jsById.set(id, { median:"failed", median_ns:null, unsupported:true, failed:true,
+          reason:`could not complete this phase: ${f.error}` });
+    }
   }
-// Reshaped to the same {median, median_ns} shape renderMatrixPanel already
-// reads, so the memory panels reuse the same renderer instead of a parallel
-// one just for a different unit (MB peak RSS in place of a time duration).
-const jsMemById = new Map(JS_MEMORY.map(m => [`${m.slug}::${m.role}`, {
-  median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
-}]));
-
-const pyById = new Map(PY_DATA.map(d => [byKey(d), d]));
-const pyMemById = new Map(PY_MEMORY.map(m => [`${m.slug}::${m.role}`, {
-  median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
-}]));
-// On-disk artifact size, reshaped into the same {median, median_ns} contract so
-// the size table is the same renderer as every other panel. A library that
-// writes no file carries a null size, which keeps it out of the table entirely
-// (see the panel) and, wherever a null does render, out of the "smallest"
-// comparison rather than at the top of it.
-const pySizeById = new Map(PY_SIZES.map(s => [`${s.slug}::size`,
-  s.bytes == null
-    ? { median: "unsupported", median_ns: null, reason: "this library writes no artifact of its own" }
-    : { median: fmtBytes(s.bytes), median_ns: s.bytes }]));
-
+/** Escape `& < > "` so a string is safe in HTML text and in a quoted attribute. */
+function escHtml(s){
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 function fmtBytes(n){
   if (n < 1024) return `${n} B`;
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
   return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
+
+// ---- Store memory panel ----
+// The memory runs write one entry per adapter: {slug, label, role:"memory",
+// obtained, runs:[{...figures in MiB, null where one does not apply}]}. The
+// page shows each figure's median over the runs, with the range as a tooltip.
+const STORE_COLUMNS = [
+  { key:"storeMb",    label:"Store" },
+  { key:"peakAnonMb", label:"Peak: process memory" },
+  { key:"peakFileMb", label:"Peak: mapped pages" },
+];
+// A column's `obtained` overrides its entry's, so the two JS Store columns each
+// name their own method.
+const JS_STORE_COLUMNS = [
+  { key:"storeBuiltMb",  label:"Store: built from the triples", obtained:"built" },
+  { key:"storeLoadedMb", label:"Store: loaded from a file",     obtained:"loaded" },
+  { key:"peakLiveMb",    label:"Peak: live memory" },
+];
+const OBTAINED = {
+  mapped:"memory-mapped from its file",
+  loaded:"loaded from a file into memory",
+  built:"built from the triples",
+  opened:"opened from an on-disk database",
+};
+
+function medianOf(values){
+  const v = [...values].sort((a, b) => a - b);
+  const mid = v.length >> 1;
+  return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+}
+
+// null and a missing key are alike: no number, no run.
+function figureStats(entry, key){
+  const v = (entry.runs ?? []).map(r => r?.[key]).filter(Number.isFinite);
+  return v.length ? { median: medianOf(v), min: Math.min(...v), max: Math.max(...v), runs: v.length } : null;
+}
+
+// A file / in-memory pair is a tie when its medians differ by less than the
+// wider of the two min-max ranges.
+function withinSpread(a, b){
+  return Math.abs(a.median - b.median) < Math.max(a.max - a.min, b.max - b.min);
+}
+
+function fmtMb(mb){
+  return mb < 1 ? "&lt; 1 MB" : `${mb.toFixed(1)} MB`;
+}
+
+// Reshaped to the {median, median_ns} shape renderMatrixPanel reads. median_ns
+// holds megabytes here, floored at 1 so a 0 never becomes the ratio's divisor.
+function memoryFigure(stats, obtained, spreadTip){
+  if (!stats)
+    return { median:"—", median_ns:null, unsupported:true,
+      reason:"no figure: it does not apply to this store, or its memory runs recorded none" };
+  const { median, min, max, runs } = stats;
+  const how = OBTAINED[obtained] ? `; store ${OBTAINED[obtained]}` : "";
+  return {
+    median: fmtMb(median) + (spreadTip ? `<span class="spread" title="${spreadTip}">≈</span>` : ""),
+    median_ns: Math.max(median, 1),
+    title: `median of ${runs} run${runs === 1 ? "" : "s"}, range ${min.toFixed(1)}–${max.toFixed(1)} MB${how}`,
+  };
+}
+
+function storeMemoryById(memory, columns){
+  const entries = (memory ?? []).filter(m => m.role === "memory");
+  const bySlug = new Map(entries.map(m => [m.slug, m]));
+  const map = new Map();
+  for (const m of entries){
+    // The pair X / X_mem: the same artifact, opened mapped and loaded.
+    const twin = m.slug.endsWith("_mem") ? bySlug.get(m.slug.slice(0, -4)) : bySlug.get(`${m.slug}_mem`);
+    for (const c of columns){
+      const stats = figureStats(m, c.key);
+      const other = twin && figureStats(twin, c.key);
+      let tip = null;
+      if (stats && other && withinSpread(stats, other)){
+        const diff = Math.abs(stats.median - other.median);
+        const range = Math.max(stats.max - stats.min, other.max - other.min);
+        tip = `within run-to-run spread: the file and in-memory medians differ by ${diff.toFixed(1)} MB, less than the wider min–max range (${range.toFixed(1)} MB)`;
+      }
+      map.set(`${m.slug}::${c.key}`, memoryFigure(stats, c.obtained ?? m.obtained, tip));
+    }
+  }
+  return map;
+}
+
+// A results file with no memory runs (it predates them, or BENCH_MEMORY_RUNS=0)
+// still carries each query process's peak. A missing peak reads — and is left
+// out of the ranking: `?? 0` ranked it first and made every other cell ∞×.
+const LEGACY_PEAK_NOTE = `This results file has no memory runs (it predates them, or was made with <code>BENCH_MEMORY_RUNS=0</code>), so this is each adapter's query process's peak resident set size: build, open and every pattern. Smallest first; <span class="best-key">green</span> = smallest, the multiplier is vs it.`;
+
+function legacyPeakById(memory){
+  const map = new Map();
+  for (const m of memory ?? []){
+    const v = m.peakRssMb;
+    map.set(`${m.slug}::${m.role}`, Number.isFinite(v)
+      ? { median:`${v} MB`, median_ns:v }
+      : { median:"—", median_ns:null, unsupported:true, reason:"no peak was recorded for this process" });
+  }
+  return map;
+}
+
+function renderStoreMemoryPanel(host, memory, adapters, columns, rowHeader){
+  if (!(memory ?? []).some(m => m.role === "memory")){
+    renderMatrixPanel(host, {
+      title:"Query phase — peak RSS", note:LEGACY_PEAK_NOTE, rowHeaders:[rowHeader],
+      columns:["Peak RSS"], sortByColumn:0,
+      rows: adapters.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
+    }, legacyPeakById(memory));
+    return;
+  }
+  const byId = storeMemoryById(memory, columns);
+  const rows = adapters
+    .filter(a => byId.has(`${a.slug}::${columns[0].key}`))
+    .map(a => ({ labels:[a.label], ids:columns.map(c => `${a.slug}::${c.key}`) }));
+  const paired = (memory ?? []).some(m => m.role === "memory" && m.slug.endsWith("_mem"));
+  const note = `Each cell is the median of the memory runs; hover it for their range, how many ran and how the store was obtained. — means no figure for this store. <span class="best-key">Green</span> = smallest in each column, the multiplier is vs it; a figure under 1 MB reads &lt; 1 MB and ranks as 1 MB.` +
+    (paired ? ` <span class="spread">≈</span> marks a file / in-memory pair whose medians differ by less than the wider of their two ranges: within run-to-run spread.` : "");
+  renderMatrixPanel(host, {
+    title:"Store memory", note, rowHeaders:[rowHeader], columns:columns.map(c => c.label), rows,
+  }, byId);
 }
 
 const RUST_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG"];
@@ -894,18 +1189,21 @@ function renderMatrixPanel(container, cfg, map){
         // the library has no API for, an artifact it never writes, or one it
         // has nothing to reopen. It is already out of `best` (the ?? Infinity
         // above); printing a ratio against the winner would imply it lost a
-        // race it never entered. Every such cell reads "unsupported" and
-        // carries its own reason as the tooltip: one word for every absence,
-        // so a reader never has to work out which kind of blank this is.
+        // race it never entered. Every such cell reads one word, its row's own
+        // ("unsupported"; "failed" for a phase the store could not survive;
+        // "timeout" for one whose first run took longer than the time limit),
+        // and carries its reason as the tooltip, so a reader never has to work
+        // out which kind of blank this is.
         if (rec.unsupported || rec.median_ns == null) {
-          const why = (rec.reason || "not supported by this library").replace(/"/g, "&quot;");
-          return `<td class="num unsup${sep}" title="${why}">${rec.median ?? "unsupported"}</td>`;
+          const why = escHtml(rec.reason || "not supported by this library");
+          return `<td class="num ${rec.failed ? "failed" : "unsup"}${sep}" title="${why}">${rec.median ?? "unsupported"}</td>`;
         }
         const isBest = rec.median_ns === best[i];
         const mult = rec.median_ns / best[i];
         const multStr = mult >= 100 ? Math.round(mult).toLocaleString() : mult.toFixed(1);
         const ratio = isBest ? "" : `<span class="ratio">${multStr}×</span>`;
-        return `<td class="num${isBest ? " best" : ""}${sep}">${rec.median}${ratio}</td>`;
+        const tip = rec.title ? ` title="${escHtml(rec.title)}"` : "";
+        return `<td class="num${isBest ? " best" : ""}${sep}"${tip}>${rec.median}${ratio}</td>`;
       }).join("");
     tbody.appendChild(tr);
   }
@@ -1114,10 +1412,9 @@ function renderRust(){
 
   // Read-side headline KPIs, computed from the run itself. The Vortex lookup is
   // the fastest fully-selective probe in the whole match matrix; the full scan
-  // is `decode_all`, this suite's whole-store read.
-  // Null only if the render could not determine the size at all; showing that
-  // beats a stale literal, and beats a throw that would blank the whole tab.
-  const RUST_QUADS = RUST_CONFIG.benchSize ?? 0;
+  // is `decode_all`, this suite's whole-store read. The size is the run's own
+  // `#dataset` stamp, which the render requires.
+  const RUST_QUADS = RUST_CONFIG.benchSize;
   const vortexPoints = MATCH_INDEXES.flatMap(([ixLabel, ix]) =>
     MATCH_LAYOUTS.map(v => ({ id:`${v.group(ix, "warm")}::S`,
       desc:`${v.labels[0]} · ${v.labels[1]} · ${ixLabel.toLowerCase()}` })));
@@ -1154,7 +1451,7 @@ function renderRust(){
       sub:"Dictionary layout, index × residency" },
     { label:"Benchmarks", value:String(RUST_DATA.length + RC_DATA.length),
       sub:"leaf measurements" },
-    { label:"Quads", value:RUST_QUADS ? RUST_QUADS.toLocaleString() : "unknown",
+    { label:"Quads", value:RUST_QUADS.toLocaleString(),
       sub:RC_CONFIG.graphCount
         ? `one dataset, ${RC_CONFIG.graphCount} named graphs`
         : "generated quads" },
@@ -1174,25 +1471,24 @@ function renderRust(){
   // the suite no longer generates — which is exactly how the previous version
   // came to explain an i%100 predicate long after that generator was gone. The
   // bench targets print what they built; RUST_CONFIG.dataset carries it here.
-  const DS = RUST_CONFIG.dataset || null;
+  const DS = RUST_CONFIG.dataset;
   const setText = (id, text) => {
     const el = document.getElementById(id);
     if (el) el.textContent = text;
   };
-  const shape = DS
-    ? `${DS.subjects.toLocaleString()} subjects · ${DS.predicates} predicates · ` +
-      `${DS.objects.toLocaleString()} objects · ${DS.graphs} graphs · ` +
-      `${DS.terms.toLocaleString()} distinct terms`
-    : "dataset shape unavailable";
+  const shape =
+    `${DS.subjects.toLocaleString()} subjects · ${DS.predicates} predicates · ` +
+    `${DS.objects.toLocaleString()} objects · ${DS.graphs} graphs · ` +
+    `${DS.terms.toLocaleString()} distinct terms`;
   setText("ds-shape", shape);
   setText("ds-shape-internals", shape);
-  renderMatchedRows(DS ? DS.matched : null, "internals-matched-rows");
+  renderMatchedRows(DS.matched, "internals-matched-rows");
   makeTable(RUST_DATA, "#data-table", "#table-filter", "#table-count");
   document.getElementById("provenance").textContent = RUST_PROVENANCE;
   renderRustCompare();
 }
 
-// ---- Rust tab: cross-library comparison (core/benches/compare.rs) ----
+// ---- Rust tab: cross-library comparison (bench-compare/benches/compare.rs) ----
 // Deliberately the same panel shapes as the Python tab's comparison: the two
 // measure the same file at the same scale, so a reader moving between the tabs
 // should not also have to re-learn the layout.
@@ -1217,7 +1513,7 @@ function renderRustCompare(){
     // The comparative suite is a separate, slower target than the instrumented
     // one; a Rust tab rendered without it should say so rather than show a gap.
     host.innerHTML = '<p class="note">No cross-library results in this run — ' +
-      'produce them with <span class="mono">cargo bench --bench compare</span>.</p>';
+      'produce them with <span class="mono">cargo bench --manifest-path bench-compare/Cargo.toml</span>.</p>';
     return;
   }
   const rcById = new Map(RC_DATA.map(d => [byKey(d), d]));
@@ -1265,15 +1561,7 @@ function renderRustCompare(){
 
   // Footprint: the same pair of panels the Python tab carries, in the same order.
   const rcFoot = document.getElementById("compare-footprint-panels");
-  const rcMemById = new Map((RC_MEMORY || []).map(m => [`${m.slug}::${m.role}`, {
-    median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
-  }]));
-  renderMatrixPanel(rcFoot, {
-    title:"Query phase — peak RSS",
-    note:"Peak resident set size of each library's own process: build + open + every pattern, all in one process. Smallest first; <span class=\"best-key\">green</span> = smallest footprint.",
-    rowHeaders:["Library"], columns:["Peak RSS"], sortByColumn:0,
-    rows: RC_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
-  }, rcMemById);
+  renderStoreMemoryPanel(rcFoot, RC_MEMORY, RC_ADAPTERS, STORE_COLUMNS, "Library");
   renderMatrixPanel(rcFoot, {
     title:"On-disk artifact size",
     note:"Bytes the build wrote. Only the libraries that write an artifact are listed. Smallest first.",
@@ -1328,7 +1616,7 @@ function renderJs(){
   // Ingest — every adapter, fastest first
   renderMatrixPanel(document.getElementById("js-ingest-panels"), {
     title:"Build and open",
-    note:"<b>hdt has no Build cell</b>: HDT wasm bindings are read-only. Its artifact is built <em>natively</em> by the Rust tab's comparative bench from this same dataset, and this adapter only opens it — checking the triple count matches. <b>Open</b> here is adopting an already-built store's bytes — <b>rdf-stores and oxigraph</b> cannot hand theirs out as bytes, so there is nothing to adopt and a fresh process just builds again. <span class=\"best-key\">Green</span> = fastest per column.",
+    note:"<b>hdt has no Build cell</b>: HDT wasm bindings are read-only. Its artifact is built <em>natively</em>, by the hdt crate's own converter, from this same dataset, and this adapter only opens it — checking the triple count matches. <b>Open</b> here is adopting an already-built store's bytes — <b>rdf-stores and oxigraph</b> cannot hand theirs out as bytes, so there is nothing to adopt and a fresh process just builds again. <span class=\"best-key\">Green</span> = fastest per column.",
     rowHeaders:["Store"], columns:["Build","Open"], sortByColumn:0,
     rows: JS_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
   }, jsById);
@@ -1356,15 +1644,8 @@ function renderJs(){
     ],
   }, jsById);
 
-  // Memory — peak RSS per adapter's own process (see JS_MEMORY / jsMemById
-  // above), one table per phase, smallest footprint first
-  const memHost = document.getElementById("js-memory-panels");
-  renderMatrixPanel(memHost, {
-    title:"Query phase — peak RSS",
-    note:"Peak resident set size of each adapter's own process: build + query + ingest, all in one process. Smallest first; <span class=\"best-key\">green</span> = smallest footprint, the multiplier is vs it.",
-    rowHeaders:["Store"], columns:["Peak RSS"], sortByColumn:0,
-    rows: JS_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
-  }, jsMemById);
+  // Memory: each adapter's store, from the separate memory runs.
+  renderStoreMemoryPanel(document.getElementById("js-memory-panels"), JS_MEMORY, JS_ADAPTERS, JS_STORE_COLUMNS, "Store");
 
   renderKpis("#js-kpi-row", [
     { label:"Libraries", value:String(JS_LIBRARIES.length), sub:JS_LIBRARIES.join(" · ") },
@@ -1399,6 +1680,12 @@ function renderJs(){
         " — timings for those patterns are not comparable across libraries."
       : `<span class="mono">✓ All libraries returned identical row counts for every pattern.</span>`;
   }
+  const jsFailHost = document.getElementById("js-failures");
+  if (jsFailHost && JS_FAILURES.length){
+    jsFailHost.innerHTML = `<strong>⚠ ${JS_FAILURES.length} phase(s) could not complete:</strong> ` +
+      JS_FAILURES.map(f => `<span class="mono">${escHtml(f.label)} · ${escHtml(f.role)} · ${escHtml(f.phase)}: ${escHtml(f.error)}</span>`).join("; ") +
+      ` — each one's cell reads <span class="failed">failed</span>, with the error as its tooltip; a worker that did not finish leaves its cells empty.`;
+  }
   makeTable(JS_DATA, "#js-data-table", "#js-table-filter", "#js-table-count");
   // Iteration counts are run metadata rather than a headline, so they ride the
   // provenance line here, as they already do under the cross-library panels.
@@ -1406,6 +1693,151 @@ function renderJs(){
     ? `${JS_PROVENANCE} · ${JS_CONFIG.queryIterations}/${JS_CONFIG.heavyIterations ?? "?"} iterations (query/heavy)`
     : JS_PROVENANCE;
 }
+
+// ---- binding tabs (Python, Java) ----
+// One renderer for the tabs that measure a language's bindings against that
+// language's libraries: the same panels, each tab with its own rows and words.
+// t: { key (the pane's id prefix), data, memory, sizes, config, provenance,
+//      failures, vortex / others / libraries: [{slug, label}], libraryCount,
+//      librariesSub, emptyLabel, emptyHint, notes: { size } }
+function renderBindingsTab(t){
+  const byId = new Map(t.data.map(d => [byKey(d), d]));
+  // A phase a worker attempted and could not complete is a result, not a gap:
+  // its cells read "failed", with the error as the tooltip, as on the JS tab.
+  for (const f of t.failures){
+    for (const id of f.keys ?? []){
+      if (!byId.has(id))
+        byId.set(id, { median:"failed", median_ns:null, unsupported:true, failed:true,
+          reason:`could not complete this phase: ${f.error}` });
+    }
+  }
+  // On-disk artifact size, reshaped into the same {median, median_ns} contract so
+  // the size table is the same renderer as every other panel. A library that
+  // writes no file carries a null size, which keeps it out of the table entirely
+  // (see the panel) and, wherever a null does render, out of the "smallest"
+  // comparison rather than at the top of it.
+  const sizeById = new Map(t.sizes.map(s => [`${s.slug}::size`,
+    s.bytes == null
+      ? { median: "unsupported", median_ns: null, reason: "this library writes no artifact of its own" }
+      : { median: fmtBytes(s.bytes), median_ns: s.bytes }]));
+  const adapters = [...t.vortex, ...t.others];
+  const pane = id => document.getElementById(`${t.key}-${id}`);
+
+  if (!t.data.length){
+    pane("kpi-row").innerHTML =
+      `<div class="kpi"><span class="label">${t.emptyLabel}</span><span class="value">—</span><span class="sub mono">${t.emptyHint}</span></div>`;
+    return;
+  }
+
+  // Build & open — the two costs of getting a library queryable. Every Vortex
+  // variant is its own row here and in the panels below: the build knobs move
+  // these numbers as much as the choice of library does, so a single "vortex"
+  // row would be picking one configuration and calling it the library.
+  renderMatrixPanel(pane("ingest-panels"), {
+    title:"Build and open",
+    note:"<b>Build</b>: the shared N-Quads file to a queryable store, each library's idiomatic path. <b>Open</b>: what a fresh process pays to query an artifact the build already wrote. <span class=\"best-key\">Green</span> = fastest per column.",
+    rowHeaders:["Configuration"], columns:["Build","Open"],
+    rows: adapters.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
+  }, byId);
+
+  // Query — every configuration against every routing shape.
+  renderMatrixPanel(pane("query-panels"), {
+    title:"Match by pattern and cache regime",
+    wide:true, rowHeaders:["Configuration"], columns:BINDING_PATTERNS, subColumns:["cold","warm"],
+    subSubColumns:["count-only","materialized"],
+    note:"Median time to resolve each pattern (and materialize the results). <b>Warm</b> is a repeat query on an open store; <b>cold</b> is the first query on a freshly reopened artifact. <span class=\"best-key\">Green</span> = fastest configuration in each leaf column.",
+    rows: adapters.map(a => ({ labels:[a.label], ids:patternCellIds(a.slug, BINDING_PATTERNS) })),
+  }, byId);
+
+  // Mutations — one row per library, not per configuration: whether an
+  // add/delete API exists is a property of the bindings, so every Vortex build
+  // reports the same absence.
+  renderMatrixPanel(pane("mut-panels"), {
+    title:"Mutations: add & delete",
+    note:`Per-quad add and delete of ${(t.config.mutBatch||0).toLocaleString()} quads.`,
+    rowHeaders:["Library"], columns:["Add","Delete"],
+    rows: t.libraries.map(a => ({ labels:[a.label], ids:[`add::${a.slug}`, `delete::${a.slug}`] })),
+  }, byId);
+
+  // Footprint — each store's memory, then on-disk artifact size.
+  const footHost = pane("footprint-panels");
+  renderStoreMemoryPanel(footHost, t.memory, adapters, STORE_COLUMNS, "Configuration");
+  // A peak RSS that approached the memory the machine actually had free means
+  // that library was measured under swap pressure, so its *timings* are partly
+  // a property of this machine. Say so next to the numbers rather than letting
+  // them be read as clean measurements.
+  const availMb = t.config.availableMemoryMb;
+  if (availMb){
+    const strained = t.memory.filter(m => m.peakRssMb != null && m.peakRssMb > availMb * 0.8);
+    if (strained.length){
+      const p = document.createElement("p");
+      p.className = "note";
+      p.innerHTML = `<strong>⚠ Measured under memory pressure:</strong> ` +
+        strained.map(m => `${m.label} peaked at ${m.peakRssMb.toLocaleString()} MB`).join("; ") +
+        `, against ${availMb.toLocaleString()} MB available when the run started. ` +
+        `Those libraries' timings include paging and should be read as an upper bound.`;
+      footHost.appendChild(p);
+    }
+  }
+
+  renderMatrixPanel(footHost, {
+    title:"On-disk artifact size",
+    note:t.notes.size,
+    rowHeaders:["Configuration"], columns:["Size"], sortByColumn:0,
+    rows: adapters
+      .filter(a => !a.slug.endsWith("_mem")
+        && sizeById.get(`${a.slug}::size`)?.median_ns != null)
+      .map(a => ({ labels:[a.label], ids:[`${a.slug}::size`] })),
+  }, sizeById);
+
+  renderKpis(`#${t.key}-kpi-row`, [
+    { label:"Libraries", value:String(t.libraryCount), sub:t.librariesSub },
+    { label:"Vortex variants", value:String(t.vortex.length), sub:"Dictionary layout, index × residency" },
+    { label:"Benchmarks", value:String(t.data.length), sub:"leaf measurements" },
+    { label:"Quads", value:(t.config.triplesCount||0).toLocaleString(),
+      sub:`one dataset, ${t.config.cardinality?.n_graph ?? "?"} named graphs` },
+    { label:"Distinct terms", value:(t.config.cardinality?.terms||0).toLocaleString(),
+      sub:"in the dataset every store builds from" },
+    ...fastestPointTile(byId, adapters.map(a => ({ id:`${a.slug}::S`, desc:a.label }))),
+    ...fastestVortexTile(byId, t.vortex.map(a => ({ id:`${a.slug}::S`, desc:a.label }))),
+    // As on the other tabs: the `full` pattern, over the rows the run reports it
+    // matched rather than an assumed dataset size.
+    ...fullScanTile(byId, t.vortex.map(a => ({ id:`${a.slug}::full`, desc:a.label })),
+      t.config.matchedRows?.full ?? t.config.triplesCount, "full"),
+    ...fileOpenTile(byId, t.vortex.map(a => ({ id:`open::${a.slug}`, desc:a.label })), "open"),
+  ]);
+  renderMatchedRows(t.config.matchedRows, `${t.key}-matched-rows`);
+
+  // The harness cross-checks every library's matched-row counts against the
+  // others; a disagreement means at least one was queried wrongly and its
+  // timings measure the wrong work. Surface that on the page rather than
+  // leaving it in the run log.
+  const warnHost = pane("count-warnings");
+  const warnings = t.config.countWarnings || [];
+  if (warnings.length){
+    warnHost.innerHTML = `<strong>⚠ ${warnings.length} pattern count disagreement(s):</strong> ` +
+      warnings.map(w => `<span class="mono">${w}</span>`).join("; ") +
+      ` — timings for those patterns are not comparable across libraries.`;
+  } else {
+    warnHost.innerHTML = `<span class="mono">✓ All libraries returned identical row counts for every pattern.</span>`;
+  }
+  // A worker that died names no cells; say which ones, beside the count check.
+  const crashHost = pane("failures");
+  const crashes = t.failures.filter(f => !(f.keys ?? []).length);
+  if (crashHost && crashes.length){
+    crashHost.innerHTML = `<strong>⚠ ${crashes.length} worker(s) did not finish:</strong> ` +
+      crashes.map(f => `<span class="mono">${f.label} (${f.role}): ${f.error}</span>`).join("; ") +
+      ` — their cells are empty.`;
+  }
+
+  makeTable(t.data, `#${t.key}-data-table`, `#${t.key}-table-filter`, `#${t.key}-table-count`);
+  // Only from a run that recorded them: stating a repetition count the run did
+  // not report is how the Rust tab came to claim a stale one.
+  pane("provenance").textContent = t.config.queryIterations
+    ? `${t.provenance} · ${t.config.queryIterations}/${t.config.heavyIterations ?? "?"} iterations (query/heavy)`
+    : t.provenance;
+}
+const BINDING_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG","full"];
 
 // ---- Python tab ----
 // Mirrors python/bench/adapters.py's registry. The first Vortex entry is the
@@ -1421,138 +1853,57 @@ const PY_VORTEX = [
   { slug:"vortex_dict_byref",      label:"vortex-rdf Dict+ByRef (file)" },
   { slug:"vortex_dict_byref_mem",  label:"vortex-rdf Dict+ByRef (memory)" },
 ];
-// The four libraries Vortex is measured against.
+// The three libraries Vortex is measured against.
 const PY_OTHER_LIBS = [
   { slug:"pyoxigraph", label:"pyoxigraph (memory)" },
   { slug:"pycottas",   label:"pycottas (file)" },
   { slug:"rdflib",     label:"rdflib (memory)" },
-  { slug:"lightrdf",   label:"lightrdf (no index)" },
 ];
-// Every measured configuration — what the timing and footprint panels render.
-const PY_ADAPTERS = [...PY_VORTEX, ...PY_OTHER_LIBS];
 // One row per library, for the facts that are about a library rather than a
 // build: whether it has a mutation API, and how many libraries there are.
 const PY_LIBRARIES = [{ slug:PY_VORTEX[0].slug, label:"vortex-rdf" }, ...PY_OTHER_LIBS];
-const PY_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG","full"];
+const PY_TAB = {
+  key:"py", data:PY_DATA, memory:PY_MEMORY, sizes:PY_SIZES, config:PY_CONFIG, provenance:PY_PROVENANCE,
+  failures:[], vortex:PY_VORTEX, others:PY_OTHER_LIBS, libraries:PY_LIBRARIES,
+  libraryCount:PY_LIBRARIES.length, librariesSub:"vortex · pyoxigraph · pycottas · rdflib",
+  emptyLabel:"No Python results",
+  emptyHint:"run <code>python3 python/bench/run.py</code>, then re-render with <code>--python</code>",
+  notes:{
+    size:"Bytes the build wrote. Only the libraries that write an artifact are listed — a store that lives only in memory has none. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
+  },
+};
 
-function renderPy(){
-  if (!PY_DATA.length){
-    document.getElementById("py-kpi-row").innerHTML =
-      `<div class="kpi"><span class="label">No Python results</span><span class="value">—</span><span class="sub mono">run <code>python3 python/bench/run.py</code>, then re-render with <code>--python</code></span></div>`;
-    return;
-  }
-
-  // Build & open — the two costs of getting a library queryable. Every Vortex
-  // variant is its own row here and in the panels below: the build knobs move
-  // these numbers as much as the choice of library does, so a single "vortex"
-  // row would be picking one configuration and calling it the library.
-  renderMatrixPanel(document.getElementById("py-ingest-panels"), {
-    title:"Build and open",
-    note:"<b>Build</b>: the shared N-Quads file to a queryable store, each library's idiomatic path. <b>Open</b>: what a fresh process pays to query an artifact the build already wrote. <span class=\"best-key\">Green</span> = fastest per column.",
-    rowHeaders:["Configuration"], columns:["Build","Open"],
-    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
-  }, pyById);
-
-  // Query — every configuration against every routing shape.
-  renderMatrixPanel(document.getElementById("py-query-panels"), {
-    title:"Match by pattern and cache regime",
-    wide:true, rowHeaders:["Configuration"], columns:PY_PATTERNS, subColumns:["cold","warm"],
-    subSubColumns:["count-only","materialized"],
-    note:"Median time to resolve each pattern (and materialize the results). <b>Warm</b> is a repeat query on an open store; <b>cold</b> is the first query on a freshly reopened artifact. <span class=\"best-key\">Green</span> = fastest configuration in each leaf column.",
-    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:patternCellIds(a.slug, PY_PATTERNS) })),
-  }, pyById);
-
-  // Mutations — two of the five libraries can do this at all. One row per
-  // library, not per configuration: whether an add/delete API exists is a
-  // property of the bindings, so every Vortex build reports the same absence.
-  renderMatrixPanel(document.getElementById("py-mut-panels"), {
-    title:"Mutations: add & delete",
-    note:`Per-quad add and delete of ${(PY_CONFIG.mutBatch||0).toLocaleString()} quads.`,
-    rowHeaders:["Library"], columns:["Add","Delete"],
-    rows: PY_LIBRARIES.map(a => ({ labels:[a.label], ids:[`add::${a.slug}`, `delete::${a.slug}`] })),
-  }, pyById);
-
-  // Footprint — peak RSS per phase, then on-disk artifact size.
-  const footHost = document.getElementById("py-footprint-panels");
-  renderMatrixPanel(footHost, {
-    title:"Query phase — peak RSS",
-    note:"Peak resident set size of each adapter's own process and virtualenv: build + open + every pattern. Smallest first; <span class=\"best-key\">green</span> = smallest footprint, the multiplier is vs it.",
-    rowHeaders:["Configuration"], columns:["Peak RSS"], sortByColumn:0,
-    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
-  }, pyMemById);
-  // A peak RSS that approached the memory the machine actually had free means
-  // that library was measured under swap pressure, so its *timings* are partly
-  // a property of this machine. Say so next to the numbers rather than letting
-  // them be read as clean measurements.
-  const availMb = PY_CONFIG.availableMemoryMb;
-  if (availMb){
-    const strained = PY_MEMORY.filter(m => m.peakRssMb != null && m.peakRssMb > availMb * 0.8);
-    if (strained.length){
-      const p = document.createElement("p");
-      p.className = "note";
-      p.innerHTML = `<strong>⚠ Measured under memory pressure:</strong> ` +
-        strained.map(m => `${m.label} peaked at ${m.peakRssMb.toLocaleString()} MB`).join("; ") +
-        `, against ${availMb.toLocaleString()} MB available when the run started. ` +
-        `Those libraries' timings include paging and should be read as an upper bound.`;
-      footHost.appendChild(p);
-    }
-  }
-
-  renderMatrixPanel(footHost, {
-    title:"On-disk artifact size",
-    note:"Bytes the build wrote. Only the libraries that write an artifact are listed — a store that lives only in memory has none; for lightrdf it is the triples projection it re-reads, since that re-read is its query path. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
-    rowHeaders:["Configuration"], columns:["Size"], sortByColumn:0,
-    rows: PY_ADAPTERS
-      .filter(a => !a.slug.endsWith("_mem")
-        && pySizeById.get(`${a.slug}::size`)?.median_ns != null)
-      .map(a => ({ labels:[a.label], ids:[`${a.slug}::size`] })),
-  }, pySizeById);
-
-  renderKpis("#py-kpi-row", [
-    { label:"Libraries", value:String(PY_LIBRARIES.length), sub:"vortex · pyoxigraph · pycottas · rdflib · lightrdf" },
-    { label:"Vortex variants", value:String(PY_VORTEX.length), sub:"Dictionary layout, index × residency" },
-    { label:"Benchmarks", value:String(PY_DATA.length), sub:"leaf measurements" },
-    { label:"Quads", value:(PY_CONFIG.triplesCount||0).toLocaleString(),
-      sub:`one dataset, ${PY_CONFIG.cardinality?.n_graph ?? "?"} named graphs` },
-    { label:"Distinct terms", value:(PY_CONFIG.cardinality?.terms||0).toLocaleString(),
-      sub:"in the dataset every store builds from" },
-    ...fastestPointTile(pyById, PY_ADAPTERS.map(a => ({ id:`${a.slug}::S`, desc:a.label }))),
-    ...fastestVortexTile(pyById, PY_VORTEX.map(a => ({ id:`${a.slug}::S`, desc:a.label }))),
-    // As on the other tabs: the `full` pattern, over the rows the run reports it
-    // matched rather than an assumed dataset size.
-    ...fullScanTile(pyById, PY_VORTEX.map(a => ({ id:`${a.slug}::full`, desc:a.label })),
-      PY_CONFIG.matchedRows?.full ?? PY_CONFIG.triplesCount, "full"),
-    ...fileOpenTile(pyById, PY_VORTEX.map(a => ({ id:`open::${a.slug}`, desc:a.label })), "open"),
-  ]);
-  renderMatchedRows(PY_CONFIG.matchedRows, "py-matched-rows");
-
-  // The harness cross-checks every library's matched-row counts against the
-  // others; a disagreement means at least one was queried wrongly and its
-  // timings measure the wrong work. Surface that on the page rather than
-  // leaving it in the run log.
-  const warnHost = document.getElementById("py-count-warnings");
-  const warnings = PY_CONFIG.countWarnings || [];
-  if (warnings.length){
-    warnHost.innerHTML = `<strong>⚠ ${warnings.length} pattern count disagreement(s):</strong> ` +
-      warnings.map(w => `<span class="mono">${w}</span>`).join("; ") +
-      ` — timings for those patterns are not comparable across libraries.`;
-  } else {
-    warnHost.innerHTML = `<span class="mono">✓ All libraries returned identical row counts for every pattern.</span>`;
-  }
-
-  makeTable(PY_DATA, "#py-data-table", "#py-table-filter", "#py-table-count");
-  // Only from a run that recorded them: stating a repetition count the run did
-  // not report is how the Rust tab came to claim a stale one.
-  document.getElementById("py-provenance").textContent = PY_CONFIG.queryIterations
-    ? `${PY_PROVENANCE} · ${PY_CONFIG.queryIterations}/${PY_CONFIG.heavyIterations ?? "?"} iterations (query/heavy)`
-    : PY_PROVENANCE;
-}
+// ---- Java tab ----
+// Mirrors java/bench/run.py's ADAPTERS: the Python tab's six Vortex builds,
+// under the same slugs so a Vortex row reads the same on both tabs, then the
+// Java stores Vortex is measured against.
+const JAVA_OTHER_LIBS = [
+  { slug:"hdt_java",      label:"hdt-java (file)" },
+  { slug:"qendpoint_hdt", label:"qEndpoint HDT (file)" },
+  { slug:"jena_tim",      label:"Jena TIM (memory)" },
+  { slug:"jena_tdb2",     label:"Jena TDB2 (file)" },
+  { slug:"rdf4j_memory",  label:"RDF4J MemoryStore (memory)" },
+  { slug:"rdf4j_lmdb",    label:"RDF4J LMDB (file)" },
+];
+const JAVA_TAB = {
+  key:"java", data:JAVA_DATA, memory:JAVA_MEMORY, sizes:JAVA_SIZES, config:JAVA_CONFIG,
+  provenance:JAVA_PROVENANCE, failures:JAVA_FAILURES, vortex:PY_VORTEX, others:JAVA_OTHER_LIBS,
+  // One row per store for the mutation panel: each Java store is its own library here.
+  libraries:[{ slug:PY_VORTEX[0].slug, label:"vortex-rdf" }, ...JAVA_OTHER_LIBS],
+  libraryCount:5, librariesSub:"vortex · hdt-java · qEndpoint · Jena · RDF4J",
+  emptyLabel:"No Java results",
+  emptyHint:"run <code>scripts/refresh.sh --only java,render</code>",
+  notes:{
+    size:"Bytes the build left on disk, counted in allocated blocks, so a store's sparse preallocated files count what they hold. Only the stores that write an artifact are listed — one that lives only in memory has none. One row per build: residency is an open-time choice over the same artifact, so a (file, memory) pair has one size between them. Smallest first.",
+  },
+};
 
 // ---- tabs ----
 const panes = {
   rust: document.getElementById("tab-rust"),
   js: document.getElementById("tab-js"),
   py: document.getElementById("tab-py"),
+  java: document.getElementById("tab-java"),
 };
 const tabButtons = document.querySelectorAll(".tab");
 function showTab(name){
@@ -1601,6 +1952,7 @@ applyTheme(document.documentElement.dataset.theme || "auto");
 // ---- render every tab (hidden panes still populate their DOM) ----
 renderRust();
 renderJs();
-renderPy();
+renderBindingsTab(PY_TAB);
+renderBindingsTab(JAVA_TAB);
 showTab(location.hash.replace("#", "") || "rust");
 </script>

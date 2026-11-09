@@ -1,27 +1,11 @@
 //! Build-time options: resolving the JS `BuildOptions` object into core
-//! strategies, the RDF format-name table, and the single place the builder is
-//! monomorphized.
+//! strategies.
 
-use futures::Stream;
 use js_sys::Reflect;
-use oxrdfio::RdfFormat;
-use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
-use vortex_rdf_core::{
-    BuiltArray, IndexType, Indexes, LayoutStrategy, RawQuad, Result as CoreResult,
-    SortedInMemoryBuilder, VortexArrayBuilder,
-};
+use vortex_rdf_core::{IndexType, Indexes, LayoutStrategy};
 use wasm_bindgen::prelude::*;
 
-use crate::error::{js_err, js_err_ctx};
-
-pub(crate) fn parse_format(format_name: &str) -> Result<RdfFormat, JsValue> {
-    format_from_name(format_name).ok_or_else(|| {
-        js_err(format!(
-            "unknown RDF format {format_name:?}; expected one of: {}",
-            supported_format_names().join(", ")
-        ))
-    })
-}
+use crate::error::js_err;
 
 /// Build-time configuration resolved from the JS `BuildOptions` object.
 pub(crate) struct BuildConfig {
@@ -40,41 +24,27 @@ impl Default for BuildConfig {
     }
 }
 
-/// Run the quad stream through the builder.
-///
-/// Every entry point (`fromString`, `fromQuads`, `serializeRdf`) builds
-/// through here. WebAssembly has no filesystem for the out-of-core strategy's
-/// spill runs, so the in-memory sort is the one builder compiled in.
-pub(crate) async fn build_array(
-    quads: impl Stream<Item = CoreResult<RawQuad>> + Unpin + Send + 'static,
-    config: BuildConfig,
-) -> Result<BuiltArray, JsValue> {
-    let BuildConfig { layout, indexes } = config;
-    SortedInMemoryBuilder::build_vortex_array(Box::new(quads), layout, indexes)
-        .await
-        .map_err(|e| js_err_ctx("Vortex build error", e))
-}
-
 /// Resolve the optional JS build options. Accepts `undefined`/`null` (all
 /// defaults) or a `BuildOptions` object. The strategy vocabularies live on
 /// core's `FromStr` impls (the canonical kebab-case names shared by every
 /// frontend); parse failures become JS exceptions.
 pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsValue> {
-    if options.is_null() || options.is_undefined() {
-        return Ok(BuildConfig::default());
-    }
-
     let mut config = BuildConfig::default();
-    if let Some(name) = get_string_option(&options, "layout")? {
+    if options.is_null_or_undefined() {
+        return Ok(config);
+    }
+    if let Some(layout) = option(&options, "layout")? {
+        let name = layout
+            .as_string()
+            .ok_or_else(|| js_err("Option 'layout' must be a string"))?;
         config.layout = name.parse().map_err(js_err)?;
     }
-    let indexes = Reflect::get(&options, &"indexes".into())
-        .map_err(|_| js_err("Could not read the 'indexes' option"))?;
-    if !indexes.is_null() && !indexes.is_undefined() {
+    if let Some(indexes) = option(&options, "indexes")? {
         if !js_sys::Array::is_array(&indexes) {
             return Err(js_err("Option 'indexes' must be an array"));
         }
-        config.indexes = js_sys::Array::from(&indexes)
+        config.indexes = indexes
+            .unchecked_ref::<js_sys::Array>()
             .iter()
             .map(|value| match value.as_string() {
                 Some(name) => name.parse::<IndexType>().map_err(js_err),
@@ -85,15 +55,9 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
     Ok(config)
 }
 
-/// Read an optional string field, erroring if present but not a string.
-fn get_string_option(options: &JsValue, key: &str) -> Result<Option<String>, JsValue> {
+/// The option `key` of `options`, `None` when it is `undefined` or `null`.
+fn option(options: &JsValue, key: &str) -> Result<Option<JsValue>, JsValue> {
     let value = Reflect::get(options, &key.into())
-        .map_err(|_| js_err(format!("Could not read the '{}' option", key)))?;
-    if value.is_null() || value.is_undefined() {
-        return Ok(None);
-    }
-    match value.as_string() {
-        Some(name) => Ok(Some(name)),
-        None => Err(js_err(format!("Option '{}' must be a string", key))),
-    }
+        .map_err(|_| js_err(format!("Could not read the '{key}' option")))?;
+    Ok((!value.is_null_or_undefined()).then_some(value))
 }
