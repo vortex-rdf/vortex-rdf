@@ -21,9 +21,8 @@ pub(crate) mod write;
 #[cfg(feature = "arrow")]
 pub use builders::ArrowBuilder;
 pub use builders::{
-    BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
+    BuiltArray, SortedInMemoryBuilder, VortexArrayBuilder,
 };
-pub use export::export_rdf;
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `builders`).
 // The out-of-core builder needs a filesystem to spill to.

@@ -295,13 +295,14 @@ pub(crate) struct InterningQuadBuilder {
     quads: Vec<[TermCode; 4]>,
 }
 
+#[cfg(feature = "arrow")]
 macro_rules! push_column {
     ($fn_name:ident, $column_name: tt) => {
         pub(crate) fn $fn_name(&mut self, column: &[Box<str>]) {
-            let codes: Vec<_> = (self.codes.len() as u32..)
-                .zip(column.iter())
-                .map(|(next, term)| *self.codes.entry(term.clone()).or_insert(next))
+            let codes: Vec<_> = column.iter()
+                .map(|term| self.intern_str(term))
                 .collect();
+
             if self.quad_codes.$column_name.len() == 0 {
                 self.quad_codes.$column_name = codes;
             } else {
@@ -315,13 +316,17 @@ impl InterningQuadBuilder {
     pub(crate) fn new() -> Self {
         Self {
             codes: HashMap::new(),
-            quad_codes: QuadCodes::empty(),
+            quad_codes: QuadCodes::default(),
             quads: Vec::new(),
         }
     }
+    #[cfg(feature = "arrow")]
     push_column!(push_s_col, s);
+    #[cfg(feature = "arrow")]
     push_column!(push_p_col, p);
+    #[cfg(feature = "arrow")]
     push_column!(push_o_col, o);
+    #[cfg(feature = "arrow")]
     push_column!(push_g_col, g);
 
     /// A fresh interner fed every quad of `quads_in`; a stream error is

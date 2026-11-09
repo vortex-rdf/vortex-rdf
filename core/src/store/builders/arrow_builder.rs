@@ -14,12 +14,11 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
-use arrow_schema::DataType;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::dictionary::ingest::{InterningQuadBuilder, finish_interned};
 use crate::store::schema::PRIMARY_COLUMNS;
-use crate::{BuiltArray, BuiltStream, Indexes, LayoutStrategy, debug};
+use crate::{BuiltArray, Indexes, LayoutStrategy, debug};
 
 /// The four quad-term columns an Arrow source's schema must carry.
 const QUAD_COLUMNS: [&str; 4] = PRIMARY_COLUMNS;
