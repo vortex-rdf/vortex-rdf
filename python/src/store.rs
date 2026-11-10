@@ -5,8 +5,8 @@ use std::sync::{Arc, LazyLock};
 
 #[cfg(feature = "arrow")]
 use arrow_array::RecordBatchReader;
-#[cfg(feature = "arrow")]
-use arrow_array::ffi_stream::ArrowArrayStreamReader;
+#[cfg(feature="arrow")]
+use arrow_array::ffi_stream::RecordBatchStreamReader;
 #[cfg(feature = "arrow")]
 use arrow_pyarrow::PyArrowType;
 
@@ -15,7 +15,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::{
-    DictReader, SharedQuad, TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore,
+    ArrowBuilder, DictReader, SharedQuad, TermCode, VortexRdfError as CoreError,
+    VortexRdfStore as CoreStore,
 };
 
 use crate::batch::Batch;
@@ -255,10 +256,7 @@ impl VortexRdfStore {
 
     #[cfg(feature = "arrow")]
     #[staticmethod]
-    fn from_pyarrow(
-        py: Python<'_>,
-        data: PyArrowType<ArrowArrayStreamReader>,
-    ) -> PyResult<Self> {
+    fn from_pyarrow(py: Python<'_>, data: PyArrowType<RecordBatchStreamReader>) -> PyResult<Self> {
         let store = py
             .detach(|| {
                 use vortex_rdf_core::LayoutStrategy;
@@ -269,7 +267,7 @@ impl VortexRdfStore {
                 )?;
                 CoreStore::from_built(built)
             })
-            .map_err(store_err)?;
+            .map_err(py_err)?;
         Ok(Self { store, path: None })
     }
 
