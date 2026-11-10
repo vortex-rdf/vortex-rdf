@@ -60,6 +60,30 @@ impl QuadCodes {
         self.o.push(o);
         self.g.push(g);
     }
+
+    /// Reorder the quads into global (s, p, o, g) order, keeping each
+    /// distinct quad once. Codes sort as their terms do and each term has one
+    /// code, so `[TermCode; 4]` order is term order and equal codes are equal
+    /// quads. Sorting as rows keeps the comparisons cache-local; the columns
+    /// keep their capacity, so writing back allocates nothing.
+    pub(crate) fn sort_dedup(&mut self) {
+        let mut rows: Vec<[TermCode; 4]> = self
+            .s
+            .iter()
+            .zip(&self.p)
+            .zip(&self.o)
+            .zip(&self.g)
+            .map(|(((&s, &p), &o), &g)| [s, p, o, g])
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for column in [&mut self.s, &mut self.p, &mut self.o, &mut self.g] {
+            column.clear();
+        }
+        for row in rows {
+            self.push(row);
+        }
+    }
 }
 
 /// Every term of every quad as its code in `code_map`; a `Serialization`

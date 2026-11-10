@@ -299,9 +299,7 @@ pub(crate) struct InterningQuadBuilder {
 macro_rules! push_column {
     ($fn_name:ident, $column_name: tt) => {
         pub(crate) fn $fn_name(&mut self, column: &[Box<str>]) {
-            let codes: Vec<_> = column.iter()
-                .map(|term| self.intern_str(term))
-                .collect();
+            let codes: Vec<_> = column.iter().map(|term| self.intern_str(term)).collect();
 
             if self.quad_codes.$column_name.len() == 0 {
                 self.quad_codes.$column_name = codes;
@@ -369,25 +367,25 @@ impl InterningQuadBuilder {
 
     /// Intern the quad's four terms, keeping only their codes.
     pub(crate) fn push(&mut self, q: RawQuad) {
-        let (s, p, o, g) = (
+        let quad = [
             self.intern(q.s),
             self.intern(q.p),
             self.intern(q.o),
             self.intern(q.g),
-        );
+        ];
 
-        self.quad_codes.s.push(s);
-        self.quad_codes.p.push(p);
-        self.quad_codes.o.push(o);
-        self.quad_codes.g.push(g);
-        self.quads.push([s,p,o,g]); 
+        self.quads.push(quad);
     }
 
     /// Freeze the dictionary and produce the dataset's codes in global
     /// (s, p, o, g) order, each distinct quad once.
     pub(crate) fn finish(mut self) -> Result<(TermDictionary, QuadCodes)> {
         let total_start = debug::timer();
-        let ingested = self.quads.len();
+        let ingested = if !self.quads.is_empty() {
+            self.quads.len()
+        } else {
+            self.quad_codes.s.len()
+        };
 
         let sort_start = debug::timer();
         // Unique terms, so the tuple Ord never reaches the code.
@@ -412,22 +410,34 @@ impl InterningQuadBuilder {
 
         // provisional code → sorted rank → dictionary code.
         let remap_start = debug::timer();
-        for quad in &mut self.quads {
-            for code in quad.iter_mut() {
-                *code = dict.code_at(rank_of[*code as usize]);
+        let codes = if !self.quad_codes.s.is_empty() {
+            // Columnar ingest (Arrow): remap each column in place.
+            let mut codes = self.quad_codes;
+            for column in [&mut codes.s, &mut codes.p, &mut codes.o, &mut codes.g] {
+                for code in column.iter_mut() {
+                    *code = dict.code_at(rank_of[*code as usize]);
+                }
             }
-        }
-        self.quads.sort_unstable();
-        // Equal quads are adjacent now; the dictionary already holds each
-        // term once, so equal codes are equal terms.
-        self.quads.dedup();
+            codes.sort_dedup();
+            codes
+        } else {
+            for quad in &mut self.quads {
+                for code in quad.iter_mut() {
+                    *code = dict.code_at(rank_of[*code as usize]);
+                }
+            }
+            self.quads.sort_unstable();
+            // Equal quads are adjacent now; the dictionary already holds each
+            // term once, so equal codes are equal terms.
+            self.quads.dedup();
+            let mut codes = QuadCodes::with_capacity(self.quads.len());
+            for quad in self.quads {
+                codes.push(quad);
+            }
+            codes
+        };
         let remap_elapsed = debug::elapsed(remap_start);
-        let n = self.quads.len();
-
-        let mut codes = QuadCodes::with_capacity(n);
-        for quad in self.quads {
-            codes.push(quad);
-        }
+        let n = codes.s.len();
 
         log::debug!(
             "[Dictionary] Interned {} quads ({} distinct, {} unique terms): sort terms {:?}, freeze {:?}, remap+sort quads {:?}, total {:?}",

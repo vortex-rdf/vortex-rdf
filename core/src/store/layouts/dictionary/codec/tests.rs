@@ -407,3 +407,20 @@ fn distinct_codes_are_the_sorted_set_of_all_four_columns() {
     // The skip rule leaves the sort far fewer than the 4n codes.
     assert!(distinct.len() < columns[0].len());
 }
+
+#[test]
+fn sort_dedup_orders_rows_and_drops_repeats() {
+    let mut codes = QuadCodes::default();
+    for row in [[2, 0, 1, 0], [1, 3, 0, 0], [2, 0, 1, 0], [1, 2, 5, 1], [1, 3, 0, 0]] {
+        codes.push(row);
+    }
+    codes.sort_dedup();
+    assert_eq!(codes.s, [1, 1, 2]);
+    assert_eq!(codes.p, [2, 3, 0]);
+    assert_eq!(codes.o, [5, 0, 1]);
+    assert_eq!(codes.g, [1, 0, 0]);
+
+    let mut empty = QuadCodes::default();
+    empty.sort_dedup();
+    assert!(empty.s.is_empty() && empty.g.is_empty());
+}
