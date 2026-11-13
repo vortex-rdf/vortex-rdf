@@ -497,14 +497,12 @@ async fn test_file_code_columns_match_memory() {
 }
 
 /// Object codes of 12 bits but for a few past them, which the writer packs at
-/// 12 bits with patches: an `O` or `PO` match over the mapped file compares a
-/// zone-pruned slice of the object leaf through the store session's kernel
-/// ([`crate::kernels`]), and answers as the store built in memory, whose code
-/// columns pack at their full width without patches, does.
+/// 12 bits with patches: an `O` or `PO` match over the mapped file compares
+/// zone-pruned slices of the object leaf, patches and all, and answers as the
+/// store built in memory, whose code columns pack at their full width without
+/// patches, does.
 #[tokio::test]
-async fn test_patched_object_codes_compare_through_the_kernel() {
-    use crate::kernels::Kernel;
-
+async fn test_patched_object_codes_match_as_in_memory() {
     // 4,096 literal objects, each 8,192-row zone holding its own 1,024 of
     // them, scattered through the zone so that no run repeats one; in the
     // last zone every 64th row's object is its subject instead, an IRI,
@@ -545,23 +543,16 @@ async fn test_patched_object_codes_compare_through_the_kernel() {
         ("O s03200", None, None, Some(&s03200), None),
         ("PO p0 s03200", None, Some(&p0), Some(&s03200), None),
     ];
-    let rec = Recorder::start();
     assert_patterns_match(&memory, &[("mapped", &file)], &patterns).await;
-    assert!(
-        rec.count(&Event::Kernel(Kernel::CompareSlicedPatches)) > 0,
-        "the object leaf's slices compared through the kernel"
-    );
 }
 
 /// Subjects in runs of ten rows, which the writer run-end encodes, and the
 /// graph `gd` on every ninth row: a `G` match over the mapped file projects
-/// its kept rows (more than one per 16 rows of the split) and filters the
-/// subject column by its mask through the store session's run-end filter
-/// ([`crate::kernels`]), and answers as the store built in memory does.
+/// its kept rows (more than one per 16 rows of the split), filtering the
+/// run-end subject column by its mask, and answers as the store built in
+/// memory does.
 #[tokio::test]
-async fn test_run_end_subjects_filter_through_the_kernel() {
-    use crate::kernels::Kernel;
-
+async fn test_run_end_subjects_filter_as_in_memory() {
     let gd = iri_graph("gd");
     let quads: Vec<Quad> = (0..16_384usize)
         .map(|i| {
@@ -586,10 +577,5 @@ async fn test_run_end_subjects_filter_through_the_kernel() {
         ("G gd", None, None, None, Some(&gd)),
         ("PG p0 gd", None, Some(&p0), None, Some(&gd)),
     ];
-    let rec = Recorder::start();
     assert_patterns_match(&memory, &[("mapped", &file)], &patterns).await;
-    assert!(
-        rec.count(&Event::Kernel(Kernel::RunEndFilter)) > 0,
-        "the subject column filtered through the kernel"
-    );
 }

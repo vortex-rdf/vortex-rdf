@@ -8,7 +8,7 @@
 //!
 //! A range and an id list are mutually exclusive: a selection is one or the
 //! other, so a file scan gets a row range or row indices, never both (Vortex
-//! 0.90 would read their intersection).
+//! would read their intersection).
 
 use std::ops::Range;
 use std::sync::Arc;

@@ -208,7 +208,7 @@ pub(crate) fn child_strategy_with(
 }
 
 /// An id column's leaf pipeline: the per-column pipeline
-/// `WriteStrategyBuilder::build` assembles (vortex-file 0.90, `strategy.rs`)
+/// `WriteStrategyBuilder::build` assembles (vortex-file 0.93, `strategy.rs`)
 /// step for step (repartition into 8 Ki-row blocks, zone statistics per block,
 /// dictionary encoding or its fallback, coalescing, compression, buffering,
 /// one flat leaf per chunk), with the coalescing target split in two:
@@ -234,7 +234,7 @@ fn id_column_strategy(
     use vortex_layout::layouts::buffered::BufferedStrategy;
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
     use vortex_layout::layouts::compressed::{CompressingStrategy, CompressorPlugin};
-    use vortex_layout::layouts::dict::writer::DictStrategy;
+    use vortex_layout::layouts::dict::writer::{DictLayoutOptions, DictStrategy};
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
     use vortex_layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
     use vortex_layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
@@ -271,7 +271,11 @@ fn id_column_strategy(
         coalescing(codes_target),
         compress_then_flat.clone(),
         coalescing(fallback_target),
-        Default::default(),
+        // The stock builder probes a block's rows for the dictionary.
+        DictLayoutOptions {
+            probe_len: ZONE_ROWS,
+            ..Default::default()
+        },
         stats_compressor,
     );
     let zoned = ZonedStrategy::new(

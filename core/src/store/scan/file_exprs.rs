@@ -8,11 +8,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use vortex_array::dtype::FieldName;
-use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root};
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, IntoArray as _};
 use vortex_buffer::Buffer;
+use vortex_expr::forms::conjuncts;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::array::named_struct;

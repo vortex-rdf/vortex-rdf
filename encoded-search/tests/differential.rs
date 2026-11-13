@@ -424,7 +424,7 @@ fn probes_runend_bitpacked_children() {
     )
     .unwrap()
     .into_array();
-    let arr = vortex_runend::RunEnd::try_new(packed_ends, packed_values, &mut exec)
+    let arr = vortex_array::arrays::RunEnd::try_new(packed_ends, packed_values, &mut exec)
         .unwrap()
         .into_array();
     assert_probe(&arr, &data, &[NodeKind::RunEnd, NodeKind::BitPacked]);

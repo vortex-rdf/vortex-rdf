@@ -24,7 +24,7 @@ use vortex_session::VortexSession;
 #[derive(Debug)]
 pub(crate) struct ValueCountsFalsifier;
 
-impl vortex_array::stats::rewrite::StatsRewriteRule for ValueCountsFalsifier {
+impl vortex_expr::stats::rewrite::StatsRewriteRule for ValueCountsFalsifier {
     fn scalar_fn_id(&self) -> ScalarFnId {
         use vortex_array::scalar_fn::ScalarFnVTable as _;
         vortex_array::scalar_fn::fns::binary::Binary.id()
@@ -40,7 +40,7 @@ impl vortex_array::stats::rewrite::StatsRewriteRule for ValueCountsFalsifier {
         use vortex_array::scalar_fn::fns::binary::Binary;
         use vortex_array::scalar_fn::fns::literal::Literal;
         use vortex_array::scalar_fn::fns::operators::Operator;
-        use vortex_array::stats::expr::bound::stat;
+        use vortex_expr::stats::expr::bound::stat;
 
         if !zones_switch() || !matches!(expr.as_::<Binary>(), Operator::Eq) {
             return Ok(None);
@@ -92,7 +92,7 @@ pub(crate) fn zones_enabled() -> bool {
 
 /// Register the store's rules in `session`.
 pub(crate) fn register(session: &VortexSession) {
-    use vortex_array::stats::session::StatsSessionExt as _;
+    use vortex_expr::stats::session::StatsSessionExt as _;
     session.stats().register_rewrite(ValueCountsFalsifier);
 }
 
@@ -123,6 +123,7 @@ mod tests {
     fn store_session_falsifier_carries_recorded_graphs() {
         use vortex_array::dtype::{DType, Nullability, PType};
         use vortex_array::expr::{eq, lit, root};
+        use vortex_expr::stats::rewrite::BoundExpressionPruneExt as _;
 
         let x = eq(root(), lit(5u64))
             .bind(&DType::Primitive(PType::U64, Nullability::NonNullable))

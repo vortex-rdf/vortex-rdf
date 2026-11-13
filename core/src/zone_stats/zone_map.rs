@@ -333,14 +333,16 @@ pub(crate) fn eq_on_bounds(min: u64, max: u64, code: u64) -> Option<bool> {
 /// when the file keeps no exact bounds for it.
 #[cfg(feature = "file-io")]
 pub(crate) fn footer_bounds(file: &vortex_file::VortexFile, column: &str) -> Option<(u64, u64)> {
+    use vortex_array::dtype::FieldPath;
     use vortex_array::expr::stats::Stat;
 
-    let stats = file.file_stats()?;
-    let index = file.dtype().as_struct_fields_opt()?.find(column)?;
-    let (set, dtype) = stats.get(index);
+    let (aggregates, dtype) = file
+        .file_stats()?
+        .get_by_path(&FieldPath::from_name(column))?;
     if !dtype.is_unsigned_int() {
         return None;
     }
+    let set = aggregates.to_stats_set();
     let min = set.get_as::<u64>(Stat::Min, dtype).as_exact()?;
     let max = set.get_as::<u64>(Stat::Max, dtype).as_exact()?;
     Some((min, max))
@@ -465,6 +467,7 @@ mod tests {
     }
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_array::expr::{eq, lit, root};
+    use vortex_expr::stats::rewrite::BoundExpressionPruneExt as _;
 
     /// Vortex's own zone map of zones with exact bounds `bounds`, `zone_len`
     /// rows each but the last, `row_count` rows in all: the map its scans

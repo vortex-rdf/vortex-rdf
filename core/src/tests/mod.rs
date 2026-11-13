@@ -298,8 +298,15 @@ async fn write_chunked_store(
             use vortex_layout::layouts::dict::writer::DictStrategy;
             use vortex_layout::layouts::table::TableStrategy;
             // Every chunk dictionary-encodes, so each level is a dictionary.
+            // The strategy's probe sample is its first rows, chunked or
+            // sliced, and `dict_encode` takes primitive or string arrays
+            // alone, so a chunk is made canonical first.
             let always = |chunk: &vortex_array::ArrayRef, ctx: &mut vortex_array::ExecutionCtx| {
-                vortex_array::builders::dict::dict_encode(chunk, ctx).map(|dict| dict.into_array())
+                let chunk = chunk
+                    .clone()
+                    .execute::<vortex_array::Canonical>(ctx)?
+                    .into_array();
+                vortex_array::builders::dict::dict_encode(&chunk, ctx).map(|dict| dict.into_array())
             };
             let inner = DictStrategy::new(
                 leaves.clone(),

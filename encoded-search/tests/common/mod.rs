@@ -59,6 +59,7 @@ fn enable_test_editions(session: &VortexSession) {
     static TEST_DECLARATION: EditionDeclaration = EditionDeclaration {
         edition: Edition {
             id: TEST_EDITION,
+            immutable: false,
             min_library_version: None,
         },
         added: &[EditionMember::array(&"fastlanes.delta")],

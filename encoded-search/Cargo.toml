@@ -20,7 +20,6 @@ self_cell = { workspace = true }
 vortex-array = { workspace = true }
 vortex-error = { workspace = true }
 vortex-fastlanes = { workspace = true }
-vortex-runend = { workspace = true }
 vortex-sequence = { workspace = true }
 vortex-sparse = { workspace = true }
 # The transparent `Shared` array the resolver looks through lives here.

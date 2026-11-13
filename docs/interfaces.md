@@ -20,7 +20,7 @@ tests pin each interface
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L246) (from [`dict_reader`](../core/src/store/mod.rs#L193)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L149), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L270) |
-| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L80) ([§6](#6-a-store-file-through-vortexs-reader)) |
+| A store file through vortex's own reader | [`vortex_session`](../core/src/lib.rs#L79) ([§6](#6-a-store-file-through-vortexs-reader)) |
 
 ---
 
@@ -327,7 +327,7 @@ valid.
 
 ## 6. A store file through vortex's reader
 
-[`vortex_session`](../core/src/lib.rs#L80) holds this crate's store layout,
+[`vortex_session`](../core/src/lib.rs#L79) holds this crate's store layout,
 encodings and write editions. vortex's own reader opens a store file through
 it, and the file scans as the quad table: the root hands its dtype, row
 count and scan to child 0
