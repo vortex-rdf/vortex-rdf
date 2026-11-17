@@ -1073,6 +1073,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastlanes"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27b6ffac7ffa7b170248358e13c114d5ace91bfe4135a3f6e590c1548d0e60b5"
+dependencies = [
+ "const_for",
+ "num-traits",
+ "pastey",
+ "seq-macro",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2863,7 +2875,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -3679,7 +3691,7 @@ name = "vortex-rdf-encoded-search"
 version = "0.15.0"
 dependencies = [
  "codspeed-divan-compat",
- "fastlanes 0.7.2",
+ "fastlanes 0.8.1",
  "futures",
  "self_cell",
  "tokio",
