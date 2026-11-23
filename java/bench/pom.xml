@@ -17,7 +17,7 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>25</maven.compiler.release>
-    <jena.version>6.2.0</jena.version>
+    <jena.version>6.3.0</jena.version>
     <rdf4j.version>6.1.0</rdf4j.version>
     <hdt.version>3.0.10</hdt.version>
     <qendpoint.version>2.5.4</qendpoint.version>
