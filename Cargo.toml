@@ -42,7 +42,7 @@ vortex-file = { version = "0.93.0" }
 vortex-scan = "0.93.0"
 vortex-layout = "0.93.0"
 vortex-buffer = "0.93.0"
-fastlanes = "0.7"
+fastlanes = "0.8"
 self_cell = "1.2"
 divan = { package = "codspeed-divan-compat", version = "6.0.0" }
 
